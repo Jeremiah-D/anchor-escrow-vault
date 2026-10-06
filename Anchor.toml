@@ -1,0 +1,16 @@
+[features]
+seeds = true
+skip-lint = false
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/solana/id.json"
+
+[programs.devnet]
+escrow_vault = "EscrowVault1111111111111111111111111111111111"
+
+[scripts]
+test = "anchor test"
