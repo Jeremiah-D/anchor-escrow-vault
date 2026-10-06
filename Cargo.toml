@@ -1,0 +1,3 @@
+[workspace]
+members = ["escrow-state"]
+resolver = "2"

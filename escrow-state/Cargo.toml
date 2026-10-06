@@ -1,0 +1,6 @@
+[package]
+name = "escrow-state"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust escrow state machine (no dependencies); the logic core of the anchor-escrow-vault portfolio project"
+license = "MIT"
