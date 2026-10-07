@@ -43,17 +43,23 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 
 ## State machine
 
-| Transition                | From           | To        | Authority   |
-|---------------------------|----------------|-----------|-------------|
-| `initialize(initializer, taker, amount)` | — | `Uninitialized` | anyone (amount > 0) |
-| `fund(authority)`         | `Uninitialized`| `Funded`  | initializer |
-| `release(authority)`      | `Funded`       | `Released`| initializer |
-| `cancel(authority)`       | `Funded`       | `Cancelled` | initializer |
+| Transition                                  | From           | To        | Authority              |
+|---------------------------------------------|----------------|-----------|------------------------|
+| `initialize(initializer, taker, amount, expires_at)` | — | `Uninitialized` | anyone (amount > 0) |
+| `fund(authority)`                           | `Uninitialized`| `Funded`  | initializer            |
+| `release(authority)`                        | `Funded`       | `Released`| initializer            |
+| `cancel(authority)`                         | `Funded`       | `Cancelled` | initializer          |
+| `cancel_expired(authority, now)`            | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at` |
 
-Rules: only the initializer can drive transitions; any other caller gets
-`Unauthorized`; any illegal transition (e.g. releasing twice, releasing
-before funding) gets `InvalidStateTransition`; zero amounts get
-`AmountMismatch`; `release`/`cancel` preserve `amount` exactly.
+Rules: the initializer drives `fund`/`release`/`cancel`; any other caller
+gets `Unauthorized` (checked before state validity). An escrow that has
+timed out (`now >= expires_at`) may instead be cancelled by *either* party
+via `cancel_expired`, so a stalled counterparty cannot lock funds forever;
+calling it early gets `NotExpired`. Pass `u64::MAX` as `expires_at` for no
+timeout. Any illegal transition (e.g. releasing twice, releasing before
+funding) gets `InvalidStateTransition`; zero amounts get `AmountMismatch`;
+`release`/`cancel`/`cancel_expired` preserve `amount` exactly (refund
+accounting).
 
 ## Run the tests
 

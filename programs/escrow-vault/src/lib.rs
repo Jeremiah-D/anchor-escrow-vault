@@ -20,12 +20,14 @@ declare_id!("EscrowVault1111111111111111111111111111111111");
 pub mod escrow_vault {
     use super::*;
 
-    /// Create the vault account and record initializer / taker / amount.
-    pub fn initialize(ctx: Context<Initialize>, amount: u64) -> Result<()> {
+    /// Create the vault account and record initializer / taker / amount /
+    /// expiry. Pass `u64::MAX` as `expires_at` for no timeout.
+    pub fn initialize(ctx: Context<Initialize>, amount: u64, expires_at: u64) -> Result<()> {
         let escrow = escrow_state::Escrow::initialize(
             ctx.accounts.initializer.key().to_bytes(),
             ctx.accounts.taker.key().to_bytes(),
             amount,
+            expires_at,
         )
         .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
@@ -63,6 +65,21 @@ pub mod escrow_vault {
         write_escrow(&mut ctx.accounts.vault, &escrow);
         Ok(())
     }
+
+    /// Cancel an expired escrow (`Funded -> Cancelled`). Either the
+    /// initializer or the taker may call this once the clock (Solana
+    /// clock sysvar in the real build) has passed `expires_at`.
+    pub fn cancel_expired(ctx: Context<CancelExpired>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        escrow
+            .cancel_expired(ctx.accounts.authority.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Refund of lamports/tokens to the initializer goes here
+        // once real token accounts are wired up.
+        Ok(())
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -72,6 +89,8 @@ pub struct Vault {
     pub initializer: Pubkey,
     pub taker: Pubkey,
     pub amount: u64,
+    /// Unix timestamp after which either party may cancel the escrow.
+    pub expires_at: u64,
     // The authoritative state lives in `escrow_state::EscrowState`;
     // persisted here as a byte until the real build wires the enum.
     pub state: u8,
@@ -79,7 +98,7 @@ pub struct Vault {
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = initializer, space = 8 + 32 + 32 + 8 + 1)]
+    #[account(init, payer = initializer, space = 8 + 32 + 32 + 8 + 8 + 1)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
     #[account(mut)]
@@ -110,10 +129,26 @@ pub struct Cancel<'info> {
     pub initializer: Signer<'info>,
 }
 
+#[derive(Accounts)]
+pub struct CancelExpired<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker; the state machine enforces
+    /// the either-party rule. A constraint in the real build additionally
+    /// asserts `authority.key() == vault.initializer || authority.key() == vault.taker`.
+    pub authority: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the expiry comparison.
+    pub clock: AccountInfo<'info>,
+}
+
 // --- Helpers (finalized during the real Anchor build) ---
 
 fn read_escrow(_vault: &Account<Vault>) -> escrow_state::Escrow {
     unimplemented!("deserialize Vault account into escrow_state::Escrow")
+}
+
+fn read_clock_unix_timestamp(_clock: &AccountInfo) -> u64 {
+    unimplemented!("read Clock::get()?.unix_timestamp as u64 in the real build")
 }
 
 fn write_escrow(_vault: &mut Account<Vault>, _escrow: &escrow_state::Escrow) {

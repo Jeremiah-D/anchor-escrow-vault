@@ -16,11 +16,18 @@ pub enum EscrowState {
 
 /// An escrow vault. Public keys are `[u8; 32]` so this crate stays
 /// dependency-free; the Anchor layer converts `Pubkey` to/from them.
+///
+/// Timestamps are Unix seconds supplied by the caller: this crate has no
+/// clock (no `std::time` on-chain target issues, no hidden ambient
+/// authority). Pass `u64::MAX` as `expires_at` for an escrow with no
+/// timeout; `0` means it is eligible for expiry cancellation as soon as
+/// it is funded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Escrow {
     initializer: [u8; 32],
     taker: [u8; 32],
     amount: u64,
+    expires_at: u64,
     state: EscrowState,
 }
 
@@ -31,16 +38,23 @@ pub enum EscrowError {
     InvalidStateTransition,
     AmountMismatch,
     AlreadyInitialized,
+    /// `cancel_expired` called before `expires_at`.
+    NotExpired,
 }
 
 impl Escrow {
     /// Construct a new escrow in the `Uninitialized` state.
+    ///
+    /// `expires_at` is the Unix timestamp after which either party may
+    /// cancel the escrow via [`Escrow::cancel_expired`]. Pass `u64::MAX`
+    /// for no timeout.
     ///
     /// Returns `AmountMismatch` when `amount == 0`.
     pub fn initialize(
         initializer: [u8; 32],
         taker: [u8; 32],
         amount: u64,
+        expires_at: u64,
     ) -> Result<Self, EscrowError> {
         if amount == 0 {
             return Err(EscrowError::AmountMismatch);
@@ -49,6 +63,7 @@ impl Escrow {
             initializer,
             taker,
             amount,
+            expires_at,
             state: EscrowState::Uninitialized,
         })
     }
@@ -96,9 +111,38 @@ impl Escrow {
         }
     }
 
+    /// Cancel an escrow that has timed out and refund the initializer.
+    /// `Funded -> Cancelled`.
+    ///
+    /// Unlike [`Escrow::cancel`], either party — the initializer or the
+    /// taker — may call this, so a stalled counterparty cannot lock funds
+    /// forever. Requires `now >= expires_at` (the caller supplies the
+    /// clock; on-chain this is the Solana clock sysvar).
+    ///
+    /// Check order is deliberate: authority first, then state, then
+    /// expiry. A stranger never learns whether an escrow is expired from
+    /// the error alone beyond `Unauthorized`.
+    pub fn cancel_expired(&mut self, authority: [u8; 32], now: u64) -> Result<(), EscrowError> {
+        if authority != self.initializer && authority != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if now < self.expires_at {
+            return Err(EscrowError::NotExpired);
+        }
+        self.state = EscrowState::Cancelled;
+        Ok(())
+    }
+
     /// Read-only accessors.
     pub fn initializer(&self) -> [u8; 32] {
         self.initializer
+    }
+    pub fn expires_at(&self) -> u64 {
+        self.expires_at
     }
     pub fn taker(&self) -> [u8; 32] {
         self.taker
@@ -118,9 +162,17 @@ mod tests {
     const ALICE: [u8; 32] = [0xAA; 32];
     const BOB: [u8; 32] = [0xBB; 32];
     const MALLORY: [u8; 32] = [0xCC; 32];
+    /// Expiry timestamp used by most tests.
+    const EXPIRES_AT: u64 = 1_800_000_000;
 
     fn escrow() -> Escrow {
-        Escrow::initialize(ALICE, BOB, 1_000_000).unwrap()
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap()
+    }
+
+    fn funded_escrow() -> Escrow {
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        e
     }
 
     // ---------- initialize ----------
@@ -137,9 +189,17 @@ mod tests {
     #[test]
     fn initialize_rejects_zero_amount() {
         assert_eq!(
-            Escrow::initialize(ALICE, BOB, 0),
+            Escrow::initialize(ALICE, BOB, 0, EXPIRES_AT),
             Err(EscrowError::AmountMismatch)
         );
+    }
+
+    #[test]
+    fn initialize_stores_expires_at() {
+        let e = escrow();
+        assert_eq!(e.expires_at(), EXPIRES_AT);
+        let no_timeout = Escrow::initialize(ALICE, BOB, 1, u64::MAX).unwrap();
+        assert_eq!(no_timeout.expires_at(), u64::MAX);
     }
 
     // ---------- legal transitions ----------
@@ -170,6 +230,92 @@ mod tests {
         e.cancel(ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         assert_eq!(e.amount(), before);
+    }
+
+    // ---------- cancel_expired ----------
+
+    #[test]
+    fn cancel_expired_by_initializer_after_expiry_ok() {
+        let mut e = funded_escrow();
+        let before = e.amount();
+        e.cancel_expired(ALICE, EXPIRES_AT + 1).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(e.amount(), before); // refund accounting preserved
+    }
+
+    #[test]
+    fn cancel_expired_by_taker_after_expiry_ok() {
+        // Either party may cancel an expired escrow: the taker is not
+        // left hostage to an unresponsive initializer.
+        let mut e = funded_escrow();
+        e.cancel_expired(BOB, EXPIRES_AT + 3_600).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn cancel_expired_at_exact_expiry_boundary_ok() {
+        // `now >= expires_at` is the trigger: equality counts as expired.
+        let mut e = funded_escrow();
+        e.cancel_expired(ALICE, EXPIRES_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn cancel_expired_before_expiry_fails_for_both_parties() {
+        for authority in [ALICE, BOB] {
+            let mut e = funded_escrow();
+            assert_eq!(
+                e.cancel_expired(authority, EXPIRES_AT - 1),
+                Err(EscrowError::NotExpired)
+            );
+            assert_eq!(e.state(), EscrowState::Funded);
+        }
+    }
+
+    #[test]
+    fn cancel_expired_by_stranger_after_expiry_is_unauthorized() {
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.cancel_expired(MALLORY, EXPIRES_AT + 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn cancel_expired_on_non_funded_states_is_invalid() {
+        // Uninitialized: authority passes, state rejects.
+        let mut e = escrow();
+        assert_eq!(
+            e.cancel_expired(ALICE, EXPIRES_AT + 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Released: terminal, cannot be cancelled again.
+        let mut e = funded_escrow();
+        e.release(ALICE).unwrap();
+        assert_eq!(
+            e.cancel_expired(BOB, EXPIRES_AT + 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Cancelled: terminal, double-cancel rejected.
+        let mut e = funded_escrow();
+        e.cancel(ALICE).unwrap();
+        assert_eq!(
+            e.cancel_expired(ALICE, EXPIRES_AT + 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn escrow_without_timeout_cannot_be_cancel_expired() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX).unwrap();
+        e.fund(ALICE).unwrap();
+        // Any realistic `now` is below u64::MAX.
+        assert_eq!(
+            e.cancel_expired(ALICE, u64::MAX - 1),
+            Err(EscrowError::NotExpired)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
     }
 
     // ---------- illegal transitions ----------
