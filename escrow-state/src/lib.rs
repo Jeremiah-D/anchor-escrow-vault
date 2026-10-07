@@ -429,3 +429,197 @@ mod tests {
         assert_eq!(e.state(), EscrowState::Funded);
     }
 }
+
+// ---------- AV-02: permission model, full negative coverage ----------
+//
+// Permission matrix (ALICE = initializer, BOB = taker, MALLORY = stranger):
+//
+// | transition     | ALICE (initializer) | BOB (taker)            | MALLORY (stranger) |
+// |----------------|---------------------|------------------------|--------------------|
+// | fund           | ✓                 | ✗ Unauthorized       | ✗ Unauthorized     |
+// | release        | ✓                 | ✗ Unauthorized       | ✗ Unauthorized     |
+// | cancel         | ✓                 | ✗ Unauthorized       | ✗ Unauthorized     |
+// | cancel_expired | ✓ (expired only)  | ✓ (expired only)     | ✗ Unauthorized     |
+//
+// Every test below is a negative test: it asserts that a caller without
+// the required authority gets `Unauthorized` and the state is unchanged.
+// Authority is checked *before* state validity, so even on terminal
+// states a stranger gets `Unauthorized` rather than `InvalidStateTransition`
+// (check-order property pinned by `authority_precedes_state_check`).
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ZERO_KEY: [u8; 32] = [0x00; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    const ALL_STATES: [EscrowState; 4] = [
+        EscrowState::Uninitialized,
+        EscrowState::Funded,
+        EscrowState::Released,
+        EscrowState::Cancelled,
+    ];
+
+    /// Build an escrow in each of the four lifecycle states.
+    fn in_state(state: EscrowState) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        match state {
+            EscrowState::Uninitialized => {}
+            EscrowState::Funded => e.fund(ALICE).unwrap(),
+            EscrowState::Released => {
+                e.fund(ALICE).unwrap();
+                e.release(ALICE).unwrap();
+            }
+            EscrowState::Cancelled => {
+                e.fund(ALICE).unwrap();
+                e.cancel(ALICE).unwrap();
+            }
+        }
+        assert_eq!(e.state(), state);
+        e
+    }
+
+    // ----- fund / release / cancel: stranger and taker denied in every state -----
+
+    #[test]
+    fn stranger_cannot_fund_in_any_state() {
+        for state in ALL_STATES {
+            let mut e = in_state(state);
+            assert_eq!(e.fund(MALLORY), Err(EscrowError::Unauthorized));
+            assert_eq!(e.state(), state, "state must be unchanged");
+        }
+    }
+
+    #[test]
+    fn taker_cannot_fund_in_any_state() {
+        for state in ALL_STATES {
+            let mut e = in_state(state);
+            assert_eq!(e.fund(BOB), Err(EscrowError::Unauthorized));
+            assert_eq!(e.state(), state, "state must be unchanged");
+        }
+    }
+
+    #[test]
+    fn stranger_cannot_release_in_any_state() {
+        for state in ALL_STATES {
+            let mut e = in_state(state);
+            assert_eq!(e.release(MALLORY), Err(EscrowError::Unauthorized));
+            assert_eq!(e.state(), state, "state must be unchanged");
+        }
+    }
+
+    #[test]
+    fn taker_cannot_release_in_any_state() {
+        // The taker is the beneficiary of a release, but only the
+        // initializer may drive the transition.
+        for state in ALL_STATES {
+            let mut e = in_state(state);
+            assert_eq!(e.release(BOB), Err(EscrowError::Unauthorized));
+            assert_eq!(e.state(), state, "state must be unchanged");
+        }
+    }
+
+    #[test]
+    fn stranger_cannot_cancel_in_any_state() {
+        for state in ALL_STATES {
+            let mut e = in_state(state);
+            assert_eq!(e.cancel(MALLORY), Err(EscrowError::Unauthorized));
+            assert_eq!(e.state(), state, "state must be unchanged");
+        }
+    }
+
+    #[test]
+    fn taker_cannot_cancel_in_any_state() {
+        for state in ALL_STATES {
+            let mut e = in_state(state);
+            assert_eq!(e.cancel(BOB), Err(EscrowError::Unauthorized));
+            assert_eq!(e.state(), state, "state must be unchanged");
+        }
+    }
+
+    // ----- cancel_expired: stranger denied everywhere, even after expiry -----
+
+    #[test]
+    fn stranger_cannot_cancel_expired_in_any_state_even_after_expiry() {
+        for state in ALL_STATES {
+            for now in [EXPIRES_AT - 1, EXPIRES_AT, EXPIRES_AT + 1] {
+                let mut e = in_state(state);
+                assert_eq!(
+                    e.cancel_expired(MALLORY, now),
+                    Err(EscrowError::Unauthorized)
+                );
+                assert_eq!(e.state(), state, "state must be unchanged");
+            }
+        }
+    }
+
+    // ----- taker on cancel_expired: authorized party, gated by expiry -----
+
+    #[test]
+    fn taker_cancel_expired_before_expiry_is_not_expired_not_unauthorized() {
+        // The taker IS an authorized caller for cancel_expired; before
+        // expiry the failure is timing, not authority.
+        let mut e = in_state(EscrowState::Funded);
+        assert_eq!(
+            e.cancel_expired(BOB, EXPIRES_AT - 1),
+            Err(EscrowError::NotExpired)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn taker_cancel_expired_on_terminal_states_is_invalid_transition() {
+        // Check order: authority passes for the taker, then the state
+        // check rejects terminal states before expiry is even consulted.
+        for state in [EscrowState::Released, EscrowState::Cancelled] {
+            let mut e = in_state(state);
+            assert_eq!(
+                e.cancel_expired(BOB, EXPIRES_AT + 1),
+                Err(EscrowError::InvalidStateTransition)
+            );
+            assert_eq!(e.state(), state, "state must be unchanged");
+        }
+    }
+
+    #[test]
+    fn taker_can_cancel_expired_after_expiry_positive_control() {
+        // Boundary of the permission matrix: the taker is denied on
+        // fund/release/cancel but allowed here once expired.
+        let mut e = in_state(EscrowState::Funded);
+        e.cancel_expired(BOB, EXPIRES_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    // ----- check order and degenerate callers -----
+
+    #[test]
+    fn authority_precedes_state_check() {
+        // On a terminal state, an illegal transition by the initializer
+        // would be InvalidStateTransition, but a stranger still gets
+        // Unauthorized: authority is checked first. This keeps the error
+        // from leaking state information to unauthorized callers.
+        let mut e = in_state(EscrowState::Released);
+        assert_eq!(e.release(MALLORY), Err(EscrowError::Unauthorized));
+        let mut e = in_state(EscrowState::Cancelled);
+        assert_eq!(e.cancel(MALLORY), Err(EscrowError::Unauthorized));
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn zero_key_caller_is_unauthorized_on_all_transitions() {
+        for state in ALL_STATES {
+            let mut e = in_state(state);
+            assert_eq!(e.fund(ZERO_KEY), Err(EscrowError::Unauthorized));
+            assert_eq!(e.release(ZERO_KEY), Err(EscrowError::Unauthorized));
+            assert_eq!(e.cancel(ZERO_KEY), Err(EscrowError::Unauthorized));
+            assert_eq!(
+                e.cancel_expired(ZERO_KEY, EXPIRES_AT + 1),
+                Err(EscrowError::Unauthorized)
+            );
+            assert_eq!(e.state(), state, "state must be unchanged");
+        }
+    }
+}
