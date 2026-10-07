@@ -623,3 +623,180 @@ mod permission_tests {
         }
     }
 }
+
+// ---------- AV-03: model-based fuzz of amount conservation ----------
+//
+// Property test: across long random operation sequences over a small
+// fleet of escrows, the money is conserved exactly. A vault ledger model
+// tracks the three buckets money can sit in:
+//
+//   inflow   = sum of amounts successfully funded (money entering vaults)
+//   locked   = sum of amounts in `Funded` escrows (recomputed from real states)
+//   released = sum of amounts successfully released (paid out to takers)
+//   refunded  = sum of amounts successfully cancelled (returned to initializers)
+//
+// Invariant after every single operation:
+//   inflow == locked + released + refunded
+// plus field immutability: `amount` / `expires_at` never change through any
+// transition, and failed operations leave state untouched.
+//
+// PRNG is xorshift64* with fixed seeds: deterministic, dependency-free,
+// no network, no wall clock. Boundary amounts (0, 1, u64::MAX) and
+// boundary expiries (0, u64::MAX) are deliberately biased into the stream.
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+
+    const INIT_KEYS: [[u8; 32]; 4] = [[0x11; 32], [0x22; 32], [0x33; 32], [0x44; 32]];
+    const EXPIRY: u64 = 1_800_000_000;
+    const SEEDS: u64 = 24;
+    const ESCROW_COUNT: usize = 6;
+    const OPS_PER_SEED: usize = 48;
+
+    struct XorShift64(u64);
+
+    impl XorShift64 {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
+            xs[self.below(xs.len() as u64) as usize]
+        }
+    }
+
+    struct Slot {
+        escrow: Escrow,
+        amount: u64,
+        expires_at: u64,
+    }
+
+    fn fuzz_amount(rng: &mut XorShift64) -> u64 {
+        match rng.below(8) {
+            0 => 0, // init must reject with AmountMismatch
+            1 => 1,
+            2 => 2,
+            3 => rng.below(1_000_000) + 1,
+            4 => u64::MAX,
+            5 => u64::MAX / 2,
+            6 => u64::MAX - 1,
+            _ => rng.next(),
+        }
+    }
+
+    fn fuzz_expiry(rng: &mut XorShift64) -> u64 {
+        match rng.below(5) {
+            0 => 0, // immediately expirable
+            1 => EXPIRY,
+            2 => EXPIRY + 1,
+            3 => u64::MAX, // never expirable
+            _ => rng.next(),
+        }
+    }
+
+    fn fuzz_now(rng: &mut XorShift64) -> u64 {
+        match rng.below(6) {
+            0 => 0,
+            1 => EXPIRY - 1,
+            2 => EXPIRY,
+            3 => EXPIRY + 1,
+            4 => u64::MAX - 1,
+            _ => rng.next(),
+        }
+    }
+
+    fn run_seed(seed: u64) {
+        let mut rng = XorShift64(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
+        let mut slots: Vec<Option<Slot>> = Vec::with_capacity(ESCROW_COUNT);
+
+        // Initialize a fleet; zero-amount inits fail and leave the slot empty.
+        for _ in 0..ESCROW_COUNT {
+            let init = rng.pick(&INIT_KEYS);
+            let taker = rng.pick(&INIT_KEYS);
+            let amount = fuzz_amount(&mut rng);
+            let expires_at = fuzz_expiry(&mut rng);
+            match Escrow::initialize(init, taker, amount, expires_at) {
+                Ok(escrow) => slots.push(Some(Slot {
+                    escrow,
+                    amount,
+                    expires_at,
+                })),
+                Err(EscrowError::AmountMismatch) => {
+                    assert_eq!(amount, 0, "only zero amounts may fail init");
+                    slots.push(None);
+                }
+                Err(e) => panic!("unexpected init error {e:?} on seed {seed}"),
+            }
+        }
+
+        let mut inflow: u128 = 0;
+        let mut released: u128 = 0;
+        let mut refunded: u128 = 0;
+
+        for _ in 0..OPS_PER_SEED {
+            let i = rng.below(ESCROW_COUNT as u64) as usize;
+            let Some(slot) = slots[i].as_mut() else { continue };
+            let authority = rng.pick(&INIT_KEYS);
+            let state_before = slot.escrow.state();
+
+            let result = match rng.below(4) {
+                0 => slot.escrow.fund(authority),
+                1 => slot.escrow.release(authority),
+                2 => slot.escrow.cancel(authority),
+                _ => slot.escrow.cancel_expired(authority, fuzz_now(&mut rng)),
+            };
+
+            match result {
+                Ok(()) => match state_before {
+                    // From Uninitialized only `fund` can succeed.
+                    EscrowState::Uninitialized => inflow += slot.amount as u128,
+                    EscrowState::Funded => match slot.escrow.state() {
+                        EscrowState::Released => released += slot.amount as u128,
+                        EscrowState::Cancelled => refunded += slot.amount as u128,
+                        s => panic!("unexpected post-op state {s:?} from Funded on seed {seed}"),
+                    },
+                    s => panic!("op succeeded from terminal state {s:?} on seed {seed}"),
+                },
+                Err(_) => {
+                    // Failed ops must leave everything untouched.
+                    assert_eq!(slot.escrow.state(), state_before);
+                }
+            }
+
+            // Field immutability for this escrow ...
+            assert_eq!(slot.escrow.amount(), slot.amount, "amount changed on seed {seed}");
+            assert_eq!(
+                slot.escrow.expires_at(),
+                slot.expires_at,
+                "expires_at changed on seed {seed}"
+            );
+
+            // ... and global conservation across the fleet.
+            let locked: u128 = slots
+                .iter()
+                .flatten()
+                .filter(|s| s.escrow.state() == EscrowState::Funded)
+                .map(|s| s.amount as u128)
+                .sum();
+            assert_eq!(
+                inflow,
+                locked + released + refunded,
+                "conservation violated on seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_amount_conservation_across_random_op_sequences() {
+        for seed in 0..SEEDS {
+            run_seed(seed);
+        }
+    }
+}
