@@ -341,6 +341,137 @@ impl Escrow {
     }
 }
 
+// ---------- AV-10: Anchor account space accounting ----------
+//
+// The Anchor program (`programs/escrow-vault`) persists the vault in one
+// `Vault` account. Anchor serializes accounts with Borsh and prefixes an
+// 8-byte discriminator. This section is the pure-logic, dependency-free
+// half of that layout: exact serialized sizes, the rent-exemption check
+// the program runs at `initialize` time, and the field table the tests
+// cross-check against the IDL parameter mapping in both directions.
+//
+// Field order below is the Borsh serialization order and must match the
+// `Vault` struct field order in the Anchor program.
+
+/// Anchor account discriminator length in bytes: every Anchor `#[account]`
+/// starts with an 8-byte discriminator.
+pub const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
+
+/// Serialized length of a Solana `Pubkey` under Borsh/Anchor: 32 bytes.
+pub const PUBKEY_LEN: usize = 32;
+
+/// Serialized length of `QuorumPolicy` under Borsh/Anchor: 8 registered
+/// attestor pubkeys, the registered count, the threshold, and the approval
+/// bitmask. Fixed-size by design (`MAX_ATTESTORS`), so account space is
+/// known at `initialize` time and never needs a realloc.
+pub const QUORUM_POLICY_LEN: usize = 8 * PUBKEY_LEN + 1 + 1 + 8;
+
+/// (field name, Anchor type, serialized length in bytes) for the `Vault`
+/// account, in Borsh field order. This table is the single source of truth
+/// for account sizing: `ESCROW_BODY_LEN` is derived from it by `const`
+/// summation, and the tests assert the program's `space =` expression and
+/// the IDL parameter mapping against it in both directions. Add a field
+/// here and every derived constant plus the two-way test fail until the
+/// program side is updated too — that is the point.
+pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
+    ("initializer", "Pubkey", PUBKEY_LEN),
+    ("taker", "Pubkey", PUBKEY_LEN),
+    ("amount", "u64", 8),
+    ("expires_at", "u64", 8),
+    // `EscrowState` is a unit-only enum: Borsh writes one discriminant byte.
+    ("state", "u8 (enum discriminant)", 1),
+    // `Option<QuorumPolicy>`: one discriminant byte, then the policy when
+    // `Some`. The space is always reserved (even for plain two-party
+    // escrows) so `initialize_quorum` never needs to grow the account.
+    ("quorum", "Option<QuorumPolicy>", 1 + QUORUM_POLICY_LEN),
+];
+
+/// Sums the serialized lengths of a field table at compile time.
+const fn sum_field_lens(fields: &[(&str, &str, usize)]) -> usize {
+    let mut total = 0;
+    let mut i = 0;
+    while i < fields.len() {
+        total += fields[i].2;
+        i += 1;
+    }
+    total
+}
+
+/// Serialized length of the `Escrow` payload inside the `Vault` account —
+/// everything after the Anchor discriminator. Derived from `VAULT_FIELDS`.
+pub const ESCROW_BODY_LEN: usize = sum_field_lens(VAULT_FIELDS);
+
+/// Full `Vault` account space: discriminator + serialized escrow payload.
+/// The Anchor program passes this (or the no-quorum variant below) as the
+/// `space =` argument when creating the account.
+pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
+
+/// Vault space when the account is created without quorum data
+/// (`quorum: None` serializes as a single discriminant byte). The program
+/// skeleton's `Initialize` constraint uses this exact expression; quorum
+/// data is written in place later without reallocating.
+pub const VAULT_SPACE_NO_QUORUM: usize =
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 1 + 1;
+
+/// Account storage overhead in bytes added by the Solana runtime when
+/// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
+pub const ACCOUNT_STORAGE_OVERHEAD: u64 = 128;
+
+/// Mainnet value of `Rent::lamports_per_byte_year`: 3_480 lamports.
+pub const MAINNET_LAMPORTS_PER_BYTE_YEAR: u64 = 3_480;
+
+/// Mainnet value of `Rent::exemption_threshold`: 2 years of rent prepaid.
+pub const MAINNET_EXEMPTION_THRESHOLD_YEARS: f64 = 2.0;
+
+/// Pure-Rust mirror of `Rent::minimum_balance`: the lamports an account
+/// holding `space` bytes must carry to be rent-exempt, given the rent
+/// parameters. Same arithmetic as the runtime
+/// (`((128 + space) * lamports_per_byte_year) * exemption_threshold`,
+/// truncated to u64), so the numbers match on-chain exactly. The program
+/// layer reads the parameters from the rent sysvar; the mainnet defaults
+/// above are provided for off-chain estimation.
+pub fn rent_exempt_minimum_lamports(
+    space: usize,
+    lamports_per_byte_year: u64,
+    exemption_threshold_years: f64,
+) -> u64 {
+    (((ACCOUNT_STORAGE_OVERHEAD + space as u64) * lamports_per_byte_year) as f64
+        * exemption_threshold_years) as u64
+}
+
+/// Shortfall reported when a vault account is not rent-exempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RentShortfall {
+    /// Lamports the account must carry to be rent-exempt.
+    pub required: u64,
+    /// Lamports the account actually carries.
+    pub provided: u64,
+}
+
+/// Pure-logic half of the rent-exemption check the Anchor program runs at
+/// `initialize` time (on-chain: `Rent::get()?.is_exempt(lamports,
+/// VAULT_SPACE)` before writing the account). Checks against the full
+/// `VAULT_SPACE` — not the no-quorum variant — so a later
+/// `initialize_quorum` never finds the account underfunded for its
+/// reserved quorum bytes. Returns `Ok(())` when `vault_lamports` covers
+/// the rent-exempt minimum, else the exact shortfall.
+pub fn check_vault_rent_exempt(
+    vault_lamports: u64,
+    lamports_per_byte_year: u64,
+    exemption_threshold_years: f64,
+) -> Result<(), RentShortfall> {
+    let required =
+        rent_exempt_minimum_lamports(VAULT_SPACE, lamports_per_byte_year, exemption_threshold_years);
+    if vault_lamports >= required {
+        Ok(())
+    } else {
+        Err(RentShortfall {
+            required,
+            provided: vault_lamports,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1527,6 +1658,125 @@ mod anchor_idl_tests {
         assert_eq!(e.attest(MALLORY), Err(EscrowError::Unauthorized));
         assert_eq!(e.quorum().unwrap().approval_count(), 1);
     }
+
+    // ----- AV-10, second half: two-way vault-field <-> IDL consistency -----
+    //
+    // Direction 1 (IDL -> account): every instruction param must populate
+    // exactly one vault field — a param that writes nothing (or writes an
+    // undocumented field) is a spec lie the program would compile anyway.
+    // Direction 2 (account -> IDL): every vault field must have exactly one
+    // documented source — a field no instruction or account constraint ever
+    // writes is dead space the `space =` rent pays for.
+    //
+    // `PARAM_FIELD_MAP` covers params; `FIELD_SOURCES` covers the rest
+    // (signer accounts, transitions, derived/zeroed fields). The vault
+    // field list itself comes from `VAULT_FIELDS` (expanded: `quorum`
+    // unfolds into its four subfields), so adding a field or a param
+    // breaks one side until the other is updated.
+
+    /// (instruction name, IDL param name) -> vault field path it populates.
+    const PARAM_FIELD_MAP: &[(&str, &str, &str)] = &[
+        ("initialize", "amount", "amount"),
+        ("initialize", "expires_at", "expires_at"),
+        ("initialize_quorum", "attestors", "quorum.attestors"),
+        ("initialize_quorum", "threshold", "quorum.threshold"),
+    ];
+
+    /// Vault field paths not populated by instruction params, with their
+    /// documented source.
+    const FIELD_SOURCES: &[(&str, &str)] = &[
+        (
+            "initializer",
+            "accounts.initializer signer, stored by initialize",
+        ),
+        ("taker", "accounts.taker, stored by initialize"),
+        (
+            "state",
+            "transitions: fund/release/cancel/cancel_expired",
+        ),
+        (
+            "quorum.registered",
+            "derived from attestors.len() by initialize_quorum",
+        ),
+        (
+            "quorum.approvals",
+            "zeroed by initialize_quorum, bits flipped by attest",
+        ),
+    ];
+
+    /// Every vault field path from `VAULT_FIELDS`, with `quorum` unfolded
+    /// into its serialized subfields (order matches Borsh layout).
+    fn vault_field_paths() -> Vec<&'static str> {
+        let mut paths = Vec::new();
+        for (name, _, _) in VAULT_FIELDS {
+            if *name == "quorum" {
+                paths.extend([
+                    "quorum.attestors",
+                    "quorum.registered",
+                    "quorum.threshold",
+                    "quorum.approvals",
+                ]);
+            } else {
+                paths.push(name);
+            }
+        }
+        paths
+    }
+
+    #[test]
+    fn every_idl_param_maps_to_exactly_one_vault_field() {
+        let vault_fields = vault_field_paths();
+        for spec in INSTRUCTIONS {
+            for (param, _, _) in spec.params {
+                let targets: Vec<&&str> = PARAM_FIELD_MAP
+                    .iter()
+                    .filter(|(ix, p, _)| *ix == spec.name && *p == *param)
+                    .map(|(_, _, field)| field)
+                    .collect();
+                assert_eq!(
+                    targets.len(),
+                    1,
+                    "instruction {} param {param}: expected exactly one vault field mapping, found {}",
+                    spec.name,
+                    targets.len()
+                );
+                assert!(
+                    vault_fields.contains(targets[0]),
+                    "instruction {} param {param} maps to unknown vault field {}",
+                    spec.name,
+                    targets[0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_vault_field_has_exactly_one_documented_source() {
+        let from_params: Vec<&str> =
+            PARAM_FIELD_MAP.iter().map(|(_, _, field)| *field).collect();
+        let from_sources: Vec<&str> =
+            FIELD_SOURCES.iter().map(|(field, _)| *field).collect();
+        let mut seen = HashSet::new();
+        for field in vault_field_paths() {
+            let via_param = from_params.iter().filter(|f| **f == field).count();
+            let via_source = from_sources.iter().filter(|f| **f == field).count();
+            assert_eq!(
+                via_param + via_source,
+                1,
+                "vault field {field}: expected exactly one documented source \
+                 (param mapping or field source), found param={via_param} source={via_source}"
+            );
+            assert!(
+                seen.insert(field),
+                "vault field {field} documented twice"
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            from_params.len() + from_sources.len(),
+            "a param mapping or field source names a field outside VAULT_FIELDS"
+        );
+    }
 }
 
 // ---------- AV-06: error code catalog ----------
@@ -1979,5 +2229,243 @@ mod property_tests {
             );
             assert_eq!((policy.registered_count(), policy.threshold()), (m, threshold));
         });
+    }
+}
+
+// ---------- AV-10: account space + rent-exemption tests ----------
+//
+// These tests pin the numbers the Anchor program bakes into its
+// `#[account(init, space = ...)]` constraint and its `initialize`-time
+// rent check. The sizes are asserted three ways so they cannot drift
+// silently:
+//
+// 1. `space_constants_match_hand_computed_layout` hardcodes the byte
+//    math (the same addition the program author does by hand);
+// 2. `manual_borsh_encoding_matches_space_constant` serializes a real
+//    `Escrow` with a test-only Borsh encoder and asserts the byte
+//    length — and the field offsets — equal the constants;
+// 3. the two-way test inside `anchor_idl_tests` ties the field table to
+//    the IDL parameter mapping in both directions.
+//
+// Rent numbers use the real mainnet parameters (3_480 lamports per
+// byte-year, 2-year exemption threshold) so the asserted lamport values
+// are the ones the program will actually demand on-chain.
+#[cfg(test)]
+mod account_space_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    /// Test-only Borsh encoder for `Escrow`, mirroring the field order of
+    /// the Anchor `Vault` account (see `VAULT_FIELDS`). Exists so the
+    /// space constants are checked against a real serialization, not just
+    /// re-derived from the same table.
+    ///
+    /// Note: this encodes the *account layout*, not strict Borsh of the
+    /// Rust struct. Borsh would write `quorum: None` as a single byte, but
+    /// the account always reserves the full quorum region (see
+    /// `VAULT_FIELDS`): a `None` quorum is stored as the `0` discriminant
+    /// followed by zeroed quorum bytes, so `initialize_quorum` can write
+    /// the policy in place without reallocating.
+    fn encode_escrow(e: &Escrow) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ESCROW_BODY_LEN + 8);
+        out.extend_from_slice(&e.initializer);
+        out.extend_from_slice(&e.taker);
+        out.extend_from_slice(&e.amount.to_le_bytes());
+        out.extend_from_slice(&e.expires_at.to_le_bytes());
+        out.push(e.state as u8);
+        match e.quorum {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; QUORUM_POLICY_LEN]);
+            }
+            Some(q) => {
+                out.push(1);
+                for attestor in q.attestors {
+                    out.extend_from_slice(&attestor);
+                }
+                out.push(q.registered);
+                out.push(q.threshold);
+                out.extend_from_slice(&q.approvals.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn space_constants_match_hand_computed_layout() {
+        // Hardcoded on purpose: if the layout ever changes, these numbers
+        // must be updated deliberately — and the Anchor program's
+        // `space =` expression with them.
+        assert_eq!(QUORUM_POLICY_LEN, 8 * 32 + 1 + 1 + 8, "quorum policy bytes");
+        assert_eq!(QUORUM_POLICY_LEN, 266);
+        // 32 + 32 + 8 + 8 + 1 + (1 + 266)
+        assert_eq!(ESCROW_BODY_LEN, 348, "escrow payload bytes");
+        // 8-byte Anchor discriminator + payload.
+        assert_eq!(VAULT_SPACE, 356, "full Vault account space");
+        // Discriminator + payload with `quorum: None` (1-byte discriminant).
+        assert_eq!(
+            VAULT_SPACE_NO_QUORUM,
+            8 + 32 + 32 + 8 + 8 + 1 + 1,
+            "no-quorum Vault account space"
+        );
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 90);
+    }
+
+    #[test]
+    fn field_table_derives_body_len() {
+        // `ESCROW_BODY_LEN` is const-summed from `VAULT_FIELDS`; this pins
+        // the table itself against the hardcoded total above.
+        let summed: usize = VAULT_FIELDS.iter().map(|(_, _, len)| len).sum();
+        assert_eq!(summed, ESCROW_BODY_LEN);
+        assert_eq!(VAULT_SPACE, ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN);
+    }
+
+    #[test]
+    fn state_discriminants_follow_declaration_order() {
+        // Borsh serializes unit enums by declaration order. The manual
+        // encoder above relies on that, so pin it explicitly.
+        assert_eq!(EscrowState::Uninitialized as u8, 0);
+        assert_eq!(EscrowState::Funded as u8, 1);
+        assert_eq!(EscrowState::Released as u8, 2);
+        assert_eq!(EscrowState::Cancelled as u8, 3);
+    }
+
+    #[test]
+    fn manual_borsh_encoding_matches_space_constant() {
+        // Plain two-party escrow, funded.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+
+        // Field offsets: 0..32 initializer, 32..64 taker, 64..72 amount,
+        // 72..80 expires_at, 80 state, 81 quorum discriminant (None).
+        assert_eq!(&bytes[0..32], &ALICE);
+        assert_eq!(&bytes[32..64], &BOB);
+        assert_eq!(u64::from_le_bytes(bytes[64..72].try_into().unwrap()), 1_000_000);
+        assert_eq!(
+            u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
+            EXPIRES_AT
+        );
+        assert_eq!(bytes[80], EscrowState::Funded as u8);
+        assert_eq!(bytes[81], 0, "quorum: None discriminant");
+        assert_eq!(
+            &bytes[82..],
+            &[0u8; QUORUM_POLICY_LEN],
+            "None quorum reserves zeroed quorum bytes in the account layout"
+        );
+
+        // With quorum: same total length (space is always reserved), Some
+        // discriminant, attestor bytes and approval bitmask in place.
+        let policy =
+            QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], 2).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.attest([0xA1; 32]).unwrap();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes[81], 1, "quorum: Some discriminant");
+        // attestors: 82..338 (8 x 32), registered at 338, threshold at 339,
+        // approvals u64 LE at 340..348.
+        assert_eq!(&bytes[82..114], &[0xA1; 32]);
+        assert_eq!(&bytes[114..146], &[0xA2; 32]);
+        assert_eq!(&bytes[146..338], &[0u8; 192], "unused attestor slots are zero");
+        assert_eq!(bytes[338], 2, "registered count");
+        assert_eq!(bytes[339], 2, "threshold");
+        assert_eq!(
+            u64::from_le_bytes(bytes[340..348].try_into().unwrap()),
+            0b01,
+            "approval bitmask after one attestation"
+        );
+    }
+
+    #[test]
+    fn rent_formula_matches_hand_computed_mainnet_numbers() {
+        // ((128 + space) * lamports_per_byte_year) * exemption_threshold.
+        let full = rent_exempt_minimum_lamports(
+            VAULT_SPACE,
+            MAINNET_LAMPORTS_PER_BYTE_YEAR,
+            MAINNET_EXEMPTION_THRESHOLD_YEARS,
+        );
+        // (128 + 356) * 3480 * 2 = 484 * 6960 = 3_368_640 lamports.
+        assert_eq!(full, 3_368_640);
+
+        let no_quorum = rent_exempt_minimum_lamports(
+            VAULT_SPACE_NO_QUORUM,
+            MAINNET_LAMPORTS_PER_BYTE_YEAR,
+            MAINNET_EXEMPTION_THRESHOLD_YEARS,
+        );
+        // (128 + 90) * 3480 * 2 = 218 * 6960 = 1_517_280 lamports.
+        assert_eq!(no_quorum, 1_517_280);
+        assert!(no_quorum < full, "smaller account needs less rent");
+
+        // Zero-byte account: pure storage overhead.
+        assert_eq!(
+            rent_exempt_minimum_lamports(0, 3_480, 2.0),
+            128 * 3_480 * 2,
+            "128 * 3480 * 2 = 890_880"
+        );
+    }
+
+    #[test]
+    fn rent_scales_linearly_with_space() {
+        // Each extra byte costs exactly lamports_per_byte_year * threshold.
+        let one_more = rent_exempt_minimum_lamports(
+            VAULT_SPACE + 1,
+            MAINNET_LAMPORTS_PER_BYTE_YEAR,
+            MAINNET_EXEMPTION_THRESHOLD_YEARS,
+        );
+        let base = rent_exempt_minimum_lamports(
+            VAULT_SPACE,
+            MAINNET_LAMPORTS_PER_BYTE_YEAR,
+            MAINNET_EXEMPTION_THRESHOLD_YEARS,
+        );
+        assert_eq!(one_more - base, 3_480 * 2);
+    }
+
+    #[test]
+    fn rent_formula_accepts_custom_parameters() {
+        // Devnet / test-validator rent configs flow through unchanged.
+        assert_eq!(
+            rent_exempt_minimum_lamports(100, 1_000, 1.0),
+            (128 + 100) * 1_000
+        );
+    }
+
+    #[test]
+    fn check_vault_rent_exempt_boundary() {
+        let params = (
+            MAINNET_LAMPORTS_PER_BYTE_YEAR,
+            MAINNET_EXEMPTION_THRESHOLD_YEARS,
+        );
+        // Exactly the minimum: exempt.
+        assert_eq!(check_vault_rent_exempt(3_368_640, params.0, params.1), Ok(()));
+        // One lamport short: exact shortfall reported.
+        assert_eq!(
+            check_vault_rent_exempt(3_368_639, params.0, params.1),
+            Err(RentShortfall {
+                required: 3_368_640,
+                provided: 3_368_639,
+            })
+        );
+        // Generous funding: exempt.
+        assert_eq!(
+            check_vault_rent_exempt(10_000_000, params.0, params.1),
+            Ok(())
+        );
+        // Zero lamports: the full minimum is the shortfall.
+        assert_eq!(
+            check_vault_rent_exempt(0, params.0, params.1),
+            Err(RentShortfall {
+                required: 3_368_640,
+                provided: 0,
+            })
+        );
     }
 }

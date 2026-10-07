@@ -100,7 +100,9 @@ pub mod escrow_vault {
         let escrow = read_escrow(&ctx.accounts.vault);
         let escrow = escrow.with_quorum(policy).map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
-        // Persist `policy` into `vault.quorum` in the real build.
+        // The vault account already reserves the full quorum region
+        // (`escrow_state::QUORUM_POLICY_LEN`), so the policy is written in
+        // place — no realloc needed in the real build.
         Ok(())
     }
 
@@ -132,14 +134,18 @@ pub struct Vault {
     pub state: u8,
     /// Optional N-of-M attestor quorum gating `release`; mirrors
     /// `escrow_state::QuorumPolicy`. `None` for a plain two-party escrow.
-    /// Serialized layout finalized during the real build.
+    /// The account always reserves the full quorum region
+    /// (`escrow_state::QUORUM_POLICY_LEN` bytes, zeroed when `None`) so
+    /// `initialize_quorum` writes the policy in place without reallocating.
+    /// Full serialized layout: `escrow_state::VAULT_FIELDS`.
     pub quorum: Option<Quorum>,
 }
 
 /// Skeleton mirror of `escrow_state::QuorumPolicy`: up to 8 registered
 /// attestor pubkeys, the N-of-M threshold, and a u64 approval bitmask.
-/// See the state machine docs for the release-gating semantics; serialize
-/// layout finalized in the real build.
+/// See the state machine docs for the release-gating semantics.
+/// Serialized size is pinned by `escrow_state::QUORUM_POLICY_LEN`
+/// (266 bytes); the AV-10 tests assert it against a manual encoding.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
 pub struct Quorum {
     pub attestors: [Pubkey; 8],
@@ -150,8 +156,13 @@ pub struct Quorum {
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = initializer, space = 8 + 32 + 32 + 8 + 8 + 1)]
-    // Space grows by the serialized quorum (`Option<Quorum>`) in the real build.
+    // Full vault space, quorum region included: 8-byte discriminator +
+    // 348-byte payload = 356 bytes (see `escrow_state::VAULT_SPACE`).
+    // The payer must fund at least the rent-exempt minimum for this space
+    // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
+    // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
+    // rent parameters the minimum is 3_368_640 lamports.
+    #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
     #[account(mut)]

@@ -173,6 +173,32 @@ quorum's approval bitmask), and the failed-call invariant holds on every
 path above: any `Err(...)` return leaves the state — and `amount` —
 exactly untouched (pinned by the permission/fuzz/property tests).
 
+## Account space & rent
+
+The `Vault` account layout is pinned in `escrow-state` (`VAULT_FIELDS`;
+Borsh field order) and asserted three ways by the AV-10 tests — hardcoded
+byte math, a test-only manual Borsh encoder against a real `Escrow`, and a
+two-way consistency check against the IDL parameter table:
+
+| field         | type              | bytes |
+|---------------|-------------------|-------|
+| discriminator | Anchor prefix     | 8     |
+| initializer   | Pubkey            | 32    |
+| taker         | Pubkey            | 32    |
+| amount        | u64               | 8     |
+| expires_at    | u64               | 8     |
+| state         | u8 (discriminant) | 1     |
+| quorum        | Option<Quorum>    | 267   |
+| **total**     |                   | **356** |
+
+The quorum region is always reserved (zeroed when `None`), so
+`initialize_quorum` writes the policy in place — the account never needs a
+realloc. `escrow-state` exposes `VAULT_SPACE` (356) and
+`VAULT_SPACE_NO_QUORUM` (90) for the Anchor `space =` constraint, plus a
+pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
+mainnet rent parameters the full vault needs **3,368,640 lamports** to be
+rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
+
 ## Run the tests
 
 ```bash
