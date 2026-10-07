@@ -10,4 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # The escrow-vault integration stubs (programs/escrow-vault/tests/)
+      # are #[ignore]d and require a local solana-test-validator, so CI
+      # intentionally runs escrow-state only; no --ignored flag is passed.
       - run: cargo test -p escrow-state

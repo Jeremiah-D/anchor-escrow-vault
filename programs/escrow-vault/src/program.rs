@@ -2,7 +2,10 @@
 //!
 //! NOTE: This file is not compiled by CI. Building it requires the
 //! Solana/Anchor toolchain (`anchor-lang`), which is intentionally kept out
-//! of the workspace. It shows how the dependency-free state machine in
+//! of the workspace. It is excluded from the `escrow-vault` cargo package
+//! (that package only ships the ignored integration test stubs in
+//! `tests/`); it is kept here as the reference Anchor implementation.
+//! It shows how the dependency-free state machine in
 //! `escrow-state` maps onto Anchor instructions: each instruction converts
 //! the on-chain account into `escrow_state::Escrow`, runs the transition,
 //! and writes it back. State and authority rules live in one place —

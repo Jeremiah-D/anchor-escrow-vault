@@ -1,0 +1,15 @@
+[package]
+name = "escrow-vault"
+version = "0.1.0"
+edition = "2021"
+description = "Anchor escrow vault program stubs: local-validator integration test targets against the escrow-state logic core (on-chain build needs the Solana/Anchor toolchain)"
+license = "MIT"
+
+# The Anchor program source (src/program.rs) is NOT part of this cargo
+# package: it requires `anchor-lang` and the Solana toolchain, which are
+# intentionally unavailable in this environment. This package only ships
+# the #[ignore]d integration test stubs in tests/, which exercise the
+# Anchor instruction -> state machine mapping through escrow-state.
+
+[dependencies]
+escrow-state = { path = "../../escrow-state" }

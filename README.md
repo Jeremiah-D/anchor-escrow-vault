@@ -21,13 +21,18 @@ release/cancel), the same authority checks, the same amount invariants.
 - **What's real:** the `escrow-state` crate is a dependency-free Rust state
   machine (`Uninitialized → Funded → Released/Cancelled`) with initializer
   authority checks and amount invariants, fully covered by unit tests.
-- **What's a skeleton:** `programs/escrow-vault` is an Anchor program source
+- **What's a skeleton:** `programs/escrow-vault/src/program.rs` is an Anchor program source
   file showing how the instructions (`initialize`, `fund`, `release`,
   `cancel`, `cancel_expired`, `initialize_quorum`, `attest`) would wrap the
   `escrow-state` logic on-chain. It is **not
   compiled here** — a full on-chain build and test requires the Solana/Anchor
-  toolchain.
-- **What CI does:** it runs `cargo test -p escrow-state` only.
+  toolchain. The compilable `escrow-vault` cargo package only ships
+  `#[ignore]`d integration test stubs (`tests/local_validator.rs`) that
+  drive the instruction → state machine mapping through `escrow-state`;
+  they need a local `solana-test-validator` and are skipped by CI.
+- **What CI does:** it runs `cargo test -p escrow-state` only. The
+  `escrow-vault` integration stubs are `#[ignore]`d (see below) and never
+  run in CI.
 
 No unverified claims are made about deployments, audits, or performance.
 
@@ -36,8 +41,10 @@ No unverified claims are made about deployments, audits, or performance.
 ```
 escrow-state/               # pure-Rust state machine, zero dependencies
   src/lib.rs                # Escrow, EscrowState, EscrowError + unit tests
-programs/escrow-vault/      # Anchor program skeleton (not in cargo workspace)
-  src/lib.rs                # instructions wrapping escrow-state
+programs/escrow-vault/      # Anchor program skeleton (on-chain part not in cargo build)
+  src/program.rs            # instructions wrapping escrow-state (needs anchor-lang)
+  Cargo.toml                # `escrow-vault` package: local-validator test stubs only
+  tests/local_validator.rs  # #[ignore]d integration stubs (need local validator)
 Anchor.toml                 # Anchor project config (devnet placeholder)
 .github/workflows/ci.yml    # CI: cargo test -p escrow-state
 ```
@@ -173,3 +180,20 @@ cargo test -p escrow-state
 ```
 
 Requires a stable Rust toolchain (`rustup toolchain install stable`).
+
+### Local-validator integration stubs
+
+`tests/local_validator.rs` under `programs/escrow-vault/` holds Anchor
+integration test stubs for the full instruction flows
+(`initialize → fund → release`, the quorum `attest → release` path, and
+failure paths like unauthorized release). They are all `#[ignore]`d, so CI
+skips them. To run them locally:
+
+```bash
+solana-test-validator            # in another terminal
+cargo test -p escrow-vault -- --ignored
+```
+
+Each stub first probes `127.0.0.1:8899`; if no validator is reachable it
+fails with an explicit message rather than pretending to pass. The stubs
+use only the existing `escrow-state` dependency — no new crates.

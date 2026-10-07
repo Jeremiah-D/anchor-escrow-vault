@@ -1,3 +1,3 @@
 [workspace]
-members = ["escrow-state"]
+members = ["escrow-state", "programs/escrow-vault"]
 resolver = "2"
