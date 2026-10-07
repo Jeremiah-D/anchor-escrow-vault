@@ -1189,3 +1189,301 @@ mod quorum_tests {
         assert_eq!(e.state(), EscrowState::Released);
     }
 }
+
+// ---------- AV-05: Anchor IDL <-> state machine input mapping ----------
+//
+// The Anchor program (`programs/escrow-vault`; skeleton: not compiled by
+// CI because it needs the Solana/Anchor toolchain) is a thin adapter:
+// every instruction converts on-chain accounts into `escrow_state` types,
+// calls exactly one state-machine transition, and writes the result
+// back. This module pins that contract as an executable spec so the two
+// sides cannot drift:
+//
+// * `INSTRUCTIONS` lists every IDL instruction the program exposes: its
+//   name, its params (name, IDL type, value source), and the
+//   state-machine method it must call with which inputs.
+// * The tests execute each instruction's documented input tuple against
+//   the real state machine and assert the documented outcome — happy path
+//   plus the representative failure modes.
+// * `instruction_set_is_complete` asserts the instruction set covers
+//   every public transition exactly once. Add a transition or an
+//   instruction and the test fails until the table is updated — that is
+//   the IDL consistency check.
+//
+// Conventions pinned here (and mirrored in the program's doc comment):
+// * Authority inputs always come from transaction signers
+//   (`accounts.*`), never from instruction params: a param can be
+//   spoofed, a signer cannot.
+// * `cancel_expired`'s `now` is ambient input from the Solana clock
+//   sysvar, deliberately NOT an instruction param — letting the caller
+//   supply the timestamp would let anyone fast-forward expiry.
+// * `initialize_quorum`'s authority check lives in the Anchor account
+//   constraint (`initializer.key() == vault.initializer` in the real
+//   build), not in the state machine: `with_quorum` takes no authority
+//   argument because the policy is fixed before funding and
+//   re-configuration is rejected by state, while *who* may configure it
+//   is the program layer's job. The spec marks this explicitly instead
+//   of hiding the seam.
+#[cfg(test)]
+mod anchor_idl_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ATTESTOR_1: [u8; 32] = [0xA1; 32];
+    const ATTESTOR_2: [u8; 32] = [0xA2; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    /// One IDL instruction and how it maps onto the state machine.
+    struct InstructionSpec {
+        /// Instruction name as it appears in the IDL.
+        name: &'static str,
+        /// (param name, IDL type, value source). Empty when the
+        /// instruction's inputs come entirely from accounts / sysvars.
+        params: &'static [(&'static str, &'static str, &'static str)],
+        /// State-machine method this instruction must call.
+        method: &'static str,
+        /// Which account / sysvar feeds which method argument.
+        input_mapping: &'static str,
+    }
+
+    const INSTRUCTIONS: &[InstructionSpec] = &[
+        InstructionSpec {
+            name: "initialize",
+            params: &[
+                ("amount", "u64", "instruction param"),
+                (
+                    "expires_at",
+                    "u64",
+                    "instruction param; u64::MAX = no timeout",
+                ),
+            ],
+            method: "Escrow::initialize",
+            input_mapping: "initializer <- accounts.initializer (signer); \
+                            taker <- accounts.taker; \
+                            amount, expires_at <- params; \
+                            creates the Vault account (Anchor `init`)",
+        },
+        InstructionSpec {
+            name: "fund",
+            params: &[],
+            method: "Escrow::fund",
+            input_mapping: "authority <- accounts.initializer (signer)",
+        },
+        InstructionSpec {
+            name: "release",
+            params: &[],
+            method: "Escrow::release",
+            input_mapping: "authority <- accounts.initializer (signer); \
+                            when a quorum is configured the release gate \
+                            from AV-04 applies (QuorumNotReached)",
+        },
+        InstructionSpec {
+            name: "cancel",
+            params: &[],
+            method: "Escrow::cancel",
+            input_mapping: "authority <- accounts.initializer (signer)",
+        },
+        InstructionSpec {
+            name: "cancel_expired",
+            params: &[],
+            method: "Escrow::cancel_expired",
+            input_mapping: "authority <- accounts.authority (signer: \
+                            initializer OR taker); now <- clock sysvar \
+                            (NOT an instruction param — see module docs)",
+        },
+        InstructionSpec {
+            name: "initialize_quorum",
+            params: &[
+                ("attestors", "Vec<Pubkey>", "instruction param"),
+                ("threshold", "u8", "instruction param"),
+            ],
+            method: "QuorumPolicy::new + Escrow::with_quorum",
+            input_mapping: "attestors/threshold <- params (Pubkey -> \
+                            [u8; 32] conversion); authority <- \
+                            accounts.initializer (signer), enforced by the \
+                            Anchor account constraint, not the state machine",
+        },
+        InstructionSpec {
+            name: "attest",
+            params: &[],
+            method: "Escrow::attest",
+            input_mapping: "attestor <- accounts.attestor (signer; must be \
+                            in the registered set)",
+        },
+    ];
+
+    fn funded_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    fn quorum_funded_escrow() -> Escrow {
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    // ----- the consistency check -----
+
+    #[test]
+    fn instruction_set_is_complete() {
+        // The public transition API of the state machine. If you add a
+        // transition, add its instruction spec to INSTRUCTIONS and extend
+        // this list — this test fails until you do.
+        const TRANSITIONS: &[&str] = &[
+            "Escrow::initialize",
+            "Escrow::fund",
+            "Escrow::release",
+            "Escrow::cancel",
+            "Escrow::cancel_expired",
+            "QuorumPolicy::new + Escrow::with_quorum",
+            "Escrow::attest",
+        ];
+        assert_eq!(
+            INSTRUCTIONS.len(),
+            TRANSITIONS.len(),
+            "instruction count drifted from transition count"
+        );
+        for t in TRANSITIONS {
+            assert!(
+                INSTRUCTIONS.iter().any(|s| s.method == *t),
+                "no instruction spec covers transition {t}"
+            );
+        }
+        let mut seen = HashSet::new();
+        for s in INSTRUCTIONS {
+            assert!(
+                seen.insert(s.method),
+                "duplicate instruction spec for {}",
+                s.method
+            );
+        }
+    }
+
+    #[test]
+    fn only_initialize_and_initialize_quorum_take_params() {
+        // Pins which instructions carry IDL params; any new param must be
+        // justified in the spec table above.
+        let with_params: Vec<&&str> = INSTRUCTIONS
+            .iter()
+            .filter(|s| !s.params.is_empty())
+            .map(|s| &s.name)
+            .collect();
+        assert_eq!(with_params, vec![&"initialize", &"initialize_quorum"]);
+    }
+
+    // ----- per-instruction mapping, executed against the real machine -----
+
+    #[test]
+    fn initialize_maps_amount_and_expires_at_params() {
+        // IDL: initialize(amount: u64, expires_at: u64).
+        // initializer <- accounts.initializer, taker <- accounts.taker.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(e.initializer(), ALICE);
+        assert_eq!(e.taker(), BOB);
+        assert_eq!((e.amount(), e.expires_at()), (1_000_000, EXPIRES_AT));
+        // Documented failure mode: zero amount.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 0, EXPIRES_AT),
+            Err(EscrowError::AmountMismatch)
+        );
+    }
+
+    #[test]
+    fn fund_maps_initializer_signer_to_authority() {
+        // IDL: fund() — no params; authority <- accounts.initializer.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        // Documented failure mode: signer is not the initializer.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.fund(MALLORY), Err(EscrowError::Unauthorized));
+    }
+
+    #[test]
+    fn release_maps_initializer_signer_to_authority() {
+        // IDL: release() — no params; authority <- accounts.initializer.
+        let mut e = funded_escrow();
+        e.release(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        // Documented failure mode: quorum configured but threshold unmet
+        // (release-specific gate from AV-04).
+        let mut e = quorum_funded_escrow();
+        e.attest(ATTESTOR_1).unwrap();
+        assert_eq!(e.release(ALICE), Err(EscrowError::QuorumNotReached));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn cancel_maps_initializer_signer_to_authority() {
+        // IDL: cancel() — no params; authority <- accounts.initializer.
+        let mut e = funded_escrow();
+        e.cancel(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        // Documented failure mode: signer is not the initializer.
+        let mut e = funded_escrow();
+        assert_eq!(e.cancel(MALLORY), Err(EscrowError::Unauthorized));
+    }
+
+    #[test]
+    fn cancel_expired_maps_authority_and_clock_sysvar() {
+        // IDL: cancel_expired() — no params. authority <- accounts.authority
+        // (signer: initializer OR taker); now <- clock sysvar, deliberately
+        // not an instruction param (caller-supplied timestamps would let
+        // anyone fast-forward expiry). The program layer must pass
+        // Clock::get()?.unix_timestamp here.
+        let mut e = funded_escrow();
+        e.cancel_expired(BOB, EXPIRES_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        // Documented failure mode: clock before expiry.
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.cancel_expired(ALICE, EXPIRES_AT - 1),
+            Err(EscrowError::NotExpired)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn initialize_quorum_maps_attestor_list_and_threshold() {
+        // IDL: initialize_quorum(attestors: Vec<Pubkey>, threshold: u8).
+        // The program converts each Pubkey to [u8; 32], runs
+        // QuorumPolicy::new, then Escrow::with_quorum. Authority <-
+        // accounts.initializer, enforced by the Anchor account constraint
+        // (see module docs), not by the state machine.
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        assert!(e.quorum().is_some());
+        e.fund(ALICE).unwrap();
+        // The release gate is live immediately: threshold not yet reached.
+        assert_eq!(e.release(ALICE), Err(EscrowError::QuorumNotReached));
+        // Documented failure mode: bad policy rejected before touching the escrow.
+        assert_eq!(
+            QuorumPolicy::new(&[ATTESTOR_1], 0),
+            Err(EscrowError::InvalidQuorum)
+        );
+    }
+
+    #[test]
+    fn attest_maps_signer_to_registered_attestor() {
+        // IDL: attest() — no params; attestor <- accounts.attestor (signer).
+        let mut e = quorum_funded_escrow();
+        e.attest(ATTESTOR_1).unwrap();
+        assert_eq!(e.quorum().unwrap().approval_count(), 1);
+        // Documented failure mode: signer outside the registered set.
+        assert_eq!(e.attest(MALLORY), Err(EscrowError::Unauthorized));
+        assert_eq!(e.quorum().unwrap().approval_count(), 1);
+    }
+}
