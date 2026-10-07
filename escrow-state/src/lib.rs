@@ -29,6 +29,9 @@ pub struct Escrow {
     amount: u64,
     expires_at: u64,
     state: EscrowState,
+    /// Optional N-of-M attestor quorum gating `release`. `None` means a
+    /// plain two-party escrow (backward compatible).
+    quorum: Option<QuorumPolicy>,
 }
 
 /// Errors the state machine can return.
@@ -40,6 +43,105 @@ pub enum EscrowError {
     AlreadyInitialized,
     /// `cancel_expired` called before `expires_at`.
     NotExpired,
+    /// Quorum policy misconfiguration (empty attestor list, duplicate
+    /// attestor, threshold 0 or larger than the attestor count), or
+    /// [`Escrow::attest`] called on an escrow with no quorum configured.
+    InvalidQuorum,
+    /// `release` attempted while the configured quorum's threshold of
+    /// attestations has not been reached yet.
+    QuorumNotReached,
+}
+
+/// Maximum number of attestors in a [`QuorumPolicy`]. Fixed-size so the
+/// crate stays heap-free and `Copy`.
+pub const MAX_ATTESTORS: usize = 8;
+
+/// N-of-M release policy: `threshold` distinct attestations from the
+/// registered `attestors` must be recorded before [`Escrow::release`]
+/// succeeds. Models arbitrated / oracle-gated escrows (e.g. 2-of-3 with
+/// an arbiter, or M-of-N oracle attestation of delivery), the same
+/// pattern as multi-sig escrow release conditions.
+///
+/// Attestations are a bitmask over the registered attestors, so the
+/// policy is `Copy` and needs no allocation. Deliberately, the quorum
+/// gates *release only*: the `cancel` / `cancel_expired` refund paths
+/// stay initializer-driven so attestors cannot grief funds into a lockup
+/// by withholding approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuorumPolicy {
+    attestors: [[u8; 32]; MAX_ATTESTORS],
+    registered: u8,
+    threshold: u8,
+    approvals: u64,
+}
+
+impl QuorumPolicy {
+    /// Register `attestors` with an N-of-M `threshold`.
+    ///
+    /// Rejects with [`EscrowError::InvalidQuorum`] when the list is
+    /// empty, longer than [`MAX_ATTESTORS`], contains a duplicate, or the
+    /// threshold is 0 / larger than the number of attestors.
+    pub fn new(attestors: &[[u8; 32]], threshold: u8) -> Result<Self, EscrowError> {
+        if attestors.is_empty() || attestors.len() > MAX_ATTESTORS {
+            return Err(EscrowError::InvalidQuorum);
+        }
+        let mut table = [[0u8; 32]; MAX_ATTESTORS];
+        for (i, attestor) in attestors.iter().enumerate() {
+            if table[..i].contains(attestor) {
+                return Err(EscrowError::InvalidQuorum);
+            }
+            table[i] = *attestor;
+        }
+        let registered = attestors.len() as u8;
+        if threshold == 0 || threshold > registered {
+            return Err(EscrowError::InvalidQuorum);
+        }
+        Ok(Self {
+            attestors: table,
+            registered,
+            threshold,
+            approvals: 0,
+        })
+    }
+
+    fn index_of(&self, attestor: [u8; 32]) -> Option<usize> {
+        self.attestors[..self.registered as usize]
+            .iter()
+            .position(|a| *a == attestor)
+    }
+
+    /// Record an attestation. Idempotent: repeat attestations by the same
+    /// attestor count once. Callers outside the registered set get
+    /// `Unauthorized`.
+    pub fn attest(&mut self, attestor: [u8; 32]) -> Result<(), EscrowError> {
+        match self.index_of(attestor) {
+            Some(i) => {
+                self.approvals |= 1u64 << i;
+                Ok(())
+            }
+            None => Err(EscrowError::Unauthorized),
+        }
+    }
+
+    /// True once at least `threshold` distinct attestors have attested.
+    pub fn is_satisfied(&self) -> bool {
+        self.approval_count() >= self.threshold
+    }
+
+    /// Number of distinct attestors that have attested so far.
+    pub fn approval_count(&self) -> u8 {
+        self.approvals.count_ones() as u8
+    }
+
+    /// The N in N-of-M.
+    pub fn threshold(&self) -> u8 {
+        self.threshold
+    }
+
+    /// The M in N-of-M.
+    pub fn registered_count(&self) -> u8 {
+        self.registered
+    }
 }
 
 impl Escrow {
@@ -65,6 +167,7 @@ impl Escrow {
             amount,
             expires_at,
             state: EscrowState::Uninitialized,
+            quorum: None,
         })
     }
 
@@ -88,15 +191,24 @@ impl Escrow {
     }
 
     /// Release the locked funds to the taker. `Funded -> Released`.
+    ///
+    /// When a quorum is configured, additionally requires the quorum's
+    /// threshold of attestations (`QuorumNotReached` otherwise). Check
+    /// order is deliberate: authority, then state, then quorum — an
+    /// unauthorized caller learns nothing about attestation progress.
     pub fn release(&mut self, authority: [u8; 32]) -> Result<(), EscrowError> {
         self.require_initializer(authority)?;
         match self.state {
-            EscrowState::Funded => {
-                self.state = EscrowState::Released;
-                Ok(())
-            }
-            _ => Err(EscrowError::InvalidStateTransition),
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
         }
+        if let Some(policy) = &self.quorum {
+            if !policy.is_satisfied() {
+                return Err(EscrowError::QuorumNotReached);
+            }
+        }
+        self.state = EscrowState::Released;
+        Ok(())
     }
 
     /// Cancel the escrow and return funds. `Funded -> Cancelled`.
@@ -137,7 +249,40 @@ impl Escrow {
         Ok(())
     }
 
+    /// Attach an N-of-M attestor quorum to the release path.
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// release condition is fixed before any funds move. Re-configuring
+    /// a live escrow is rejected with `InvalidStateTransition`.
+    pub fn with_quorum(mut self, policy: QuorumPolicy) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        self.quorum = Some(policy);
+        Ok(self)
+    }
+
+    /// Record an attestation from a registered attestor.
+    ///
+    /// Allowed while the escrow is `Uninitialized` or `Funded` (attestors
+    /// usually vote before release is attempted); rejected on terminal
+    /// states. Errors `InvalidQuorum` when no quorum is configured, and
+    /// `Unauthorized` for callers outside the registered attestor set.
+    pub fn attest(&mut self, attestor: [u8; 32]) -> Result<(), EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        match self.quorum.as_mut() {
+            Some(policy) => policy.attest(attestor),
+            None => Err(EscrowError::InvalidQuorum),
+        }
+    }
+
     /// Read-only accessors.
+    pub fn quorum(&self) -> Option<QuorumPolicy> {
+        self.quorum
+    }
     pub fn initializer(&self) -> [u8; 32] {
         self.initializer
     }
@@ -798,5 +943,249 @@ mod fuzz_tests {
         for seed in 0..SEEDS {
             run_seed(seed);
         }
+    }
+}
+
+
+// ---------- AV-04: attestor quorum, N-of-M release gate ----------
+//
+// | case                                   | fund | release            | cancel/cancel_expired |
+// |----------------------------------------|------|--------------------|-----------------------|
+// | no quorum                              | ✓    | initializer only | initializer / either  |
+// | quorum, threshold not reached          | ✓    | ✗ QuorumNotReached | ungated (anti-grief)  |
+// | quorum, threshold reached              | ✓    | ✓ initializer      | ungated (anti-grief)  |
+//
+// Design pinned below: quorum gates release only; attestations are
+// idempotent and accepted in Uninitialized/Funded; the policy is fixed
+// before funding (with_quorum is Uninitialized-only).
+#[cfg(test)]
+mod quorum_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ATTESTOR_1: [u8; 32] = [0xA1; 32];
+    const ATTESTOR_2: [u8; 32] = [0xA2; 32];
+    const ATTESTOR_3: [u8; 32] = [0xA3; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn quorum_2_of_3() -> QuorumPolicy {
+        QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], 2).unwrap()
+    }
+
+    fn escrow_with_quorum() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(quorum_2_of_3())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    // ---------- policy construction ----------
+
+    #[test]
+    fn policy_rejects_empty_attestor_list() {
+        assert_eq!(
+            QuorumPolicy::new(&[], 1),
+            Err(EscrowError::InvalidQuorum)
+        );
+    }
+
+    #[test]
+    fn policy_rejects_zero_threshold() {
+        assert_eq!(
+            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 0),
+            Err(EscrowError::InvalidQuorum)
+        );
+    }
+
+    #[test]
+    fn policy_rejects_threshold_above_attestor_count() {
+        assert_eq!(
+            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 3),
+            Err(EscrowError::InvalidQuorum)
+        );
+    }
+
+    #[test]
+    fn policy_rejects_duplicate_attestor() {
+        assert_eq!(
+            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_1], 1),
+            Err(EscrowError::InvalidQuorum)
+        );
+    }
+
+    #[test]
+    fn policy_rejects_more_than_max_attestors() {
+        let many: Vec<[u8; 32]> = (0..=MAX_ATTESTORS as u8).map(|i| [i; 32]).collect();
+        assert_eq!(
+            QuorumPolicy::new(&many, 1),
+            Err(EscrowError::InvalidQuorum)
+        );
+    }
+
+    #[test]
+    fn policy_accepts_boundary_configs() {
+        // 1-of-1 and M-of-M are the boundary policies.
+        let one = QuorumPolicy::new(&[ATTESTOR_1], 1).unwrap();
+        assert_eq!((one.registered_count(), one.threshold()), (1, 1));
+        let all = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], 3).unwrap();
+        assert!(!all.is_satisfied());
+    }
+
+    // ---------- attestation recording ----------
+
+    #[test]
+    fn attest_by_non_registered_caller_is_unauthorized() {
+        let mut policy = quorum_2_of_3();
+        assert_eq!(policy.attest(MALLORY), Err(EscrowError::Unauthorized));
+        assert_eq!(policy.approval_count(), 0);
+    }
+
+    #[test]
+    fn duplicate_attestation_counts_once() {
+        let mut policy = quorum_2_of_3();
+        policy.attest(ATTESTOR_1).unwrap();
+        policy.attest(ATTESTOR_1).unwrap();
+        assert_eq!(policy.approval_count(), 1);
+        assert!(!policy.is_satisfied());
+    }
+
+    #[test]
+    fn satisfaction_tracks_distinct_attestors() {
+        let mut policy = quorum_2_of_3();
+        assert!(!policy.is_satisfied());
+        policy.attest(ATTESTOR_1).unwrap();
+        assert!(!policy.is_satisfied());
+        policy.attest(ATTESTOR_2).unwrap();
+        assert!(policy.is_satisfied());
+        assert_eq!(policy.approval_count(), 2);
+    }
+
+    // ---------- release gating ----------
+
+    #[test]
+    fn release_before_quorum_reached_fails_and_preserves_state() {
+        let mut e = escrow_with_quorum();
+        e.attest(ATTESTOR_1).unwrap();
+        assert_eq!(e.release(ALICE), Err(EscrowError::QuorumNotReached));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_000_000);
+    }
+
+    #[test]
+    fn release_after_threshold_reached_succeeds() {
+        let mut e = escrow_with_quorum();
+        e.attest(ATTESTOR_1).unwrap();
+        e.attest(ATTESTOR_3).unwrap();
+        e.release(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.amount(), 1_000_000); // payout accounting preserved
+    }
+
+    #[test]
+    fn quorum_does_not_weaken_initializer_authority() {
+        // Even with a satisfied quorum, a stranger cannot release.
+        let mut e = escrow_with_quorum();
+        e.attest(ATTESTOR_1).unwrap();
+        e.attest(ATTESTOR_2).unwrap();
+        assert_eq!(e.release(MALLORY), Err(EscrowError::Unauthorized));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn quorum_does_not_leak_attestation_progress_to_strangers() {
+        // Check order: authority before quorum. A stranger gets
+        // Unauthorized even with zero attestations recorded.
+        let mut e = escrow_with_quorum();
+        assert_eq!(e.release(MALLORY), Err(EscrowError::Unauthorized));
+        // ... while the initializer sees the quorum gate.
+        assert_eq!(e.release(ALICE), Err(EscrowError::QuorumNotReached));
+    }
+
+    #[test]
+    fn cancel_paths_are_not_gated_by_quorum() {
+        // Anti-griefing: attestors withholding approval cannot lock funds;
+        // the initializer refund path stays quorum-free.
+        let mut e = escrow_with_quorum();
+        e.cancel(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+
+        let mut e = escrow_with_quorum();
+        e.cancel_expired(BOB, EXPIRES_AT + 1).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn escrow_without_quorum_releases_without_attestations() {
+        // Backward compatibility: plain two-party escrow unchanged.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.quorum(), None);
+        e.fund(ALICE).unwrap();
+        e.release(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    // ---------- configuration lifecycle ----------
+
+    #[test]
+    fn with_quorum_rejected_after_funding() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.with_quorum(quorum_2_of_3()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.quorum(), None);
+    }
+
+    #[test]
+    fn attest_without_quorum_configured_is_invalid_quorum() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.attest(ATTESTOR_1), Err(EscrowError::InvalidQuorum));
+    }
+
+    #[test]
+    fn attest_on_terminal_states_is_invalid_transition() {
+        let mut e = escrow_with_quorum();
+        e.attest(ATTESTOR_1).unwrap();
+        e.attest(ATTESTOR_2).unwrap();
+        e.release(ALICE).unwrap();
+        assert_eq!(
+            e.attest(ATTESTOR_3),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn attestations_accepted_before_funding() {
+        // Attestors usually vote during negotiation, before funds move.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(quorum_2_of_3())
+            .unwrap();
+        e.attest(ATTESTOR_1).unwrap();
+        e.attest(ATTESTOR_2).unwrap();
+        e.fund(ALICE).unwrap();
+        e.release(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn initializer_or_taker_as_attestor_is_allowed() {
+        // Parties may double as attestors (e.g. 2-of-3 maker/taker/arbiter).
+        let policy = QuorumPolicy::new(&[ALICE, ATTESTOR_1], 2).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.attest(ALICE).unwrap();
+        e.attest(ATTESTOR_1).unwrap();
+        e.fund(ALICE).unwrap();
+        e.release(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
     }
 }

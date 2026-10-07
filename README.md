@@ -23,7 +23,8 @@ release/cancel), the same authority checks, the same amount invariants.
   authority checks and amount invariants, fully covered by unit tests.
 - **What's a skeleton:** `programs/escrow-vault` is an Anchor program source
   file showing how the instructions (`initialize`, `fund`, `release`,
-  `cancel`) would wrap the `escrow-state` logic on-chain. It is **not
+  `cancel`, `cancel_expired`, `initialize_quorum`, `attest`) would wrap the
+  `escrow-state` logic on-chain. It is **not
   compiled here** — a full on-chain build and test requires the Solana/Anchor
   toolchain.
 - **What CI does:** it runs `cargo test -p escrow-state` only.
@@ -46,8 +47,10 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | Transition                                  | From           | To        | Authority              |
 |---------------------------------------------|----------------|-----------|------------------------|
 | `initialize(initializer, taker, amount, expires_at)` | — | `Uninitialized` | anyone (amount > 0) |
+| `initialize_quorum(attestors, threshold)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
+| `attest(attestor)`                          | `Uninitialized`/`Funded` | — (no state change) | registered attestor |
 | `fund(authority)`                           | `Uninitialized`| `Funded`  | initializer            |
-| `release(authority)`                        | `Funded`       | `Released`| initializer            |
+| `release(authority)`                        | `Funded`       | `Released`| initializer (+ quorum satisfied when configured) |
 | `cancel(authority)`                         | `Funded`       | `Cancelled` | initializer          |
 | `cancel_expired(authority, now)`            | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at` |
 
@@ -60,6 +63,23 @@ timeout. Any illegal transition (e.g. releasing twice, releasing before
 funding) gets `InvalidStateTransition`; zero amounts get `AmountMismatch`;
 `release`/`cancel`/`cancel_expired` preserve `amount` exactly (refund
 accounting).
+
+**Attestor quorum (N-of-M release gate).** An escrow can be created with an
+optional quorum policy (`QuorumPolicy::new(attestors, threshold)`, up to 8
+attestors, heap-free bitmask): `initialize_quorum` attaches it once, before
+funding; registered attestors record idempotent attestations via `attest`
+in `Uninitialized` or `Funded`. `release` then additionally requires
+`threshold` distinct attestations, else `QuorumNotReached`. Check order is
+authority → state → quorum, so strangers learn nothing about attestation
+progress. Deliberately, the quorum gates *release only*: `cancel` and
+`cancel_expired` stay ungated so attestors cannot grief funds into a lockup
+by withholding approval. Without a quorum the escrow behaves exactly as the
+plain two-party machine above.
+
+**Amount conservation** is pinned by a model-based fuzz test: 24
+deterministic seeds × 48 random operations over 6 escrows assert
+`inflow == locked + released + refunded` after every operation, with
+`amount`/`expires_at` immutable and failed operations state-preserving.
 
 ## Run the tests
 

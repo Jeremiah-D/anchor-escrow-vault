@@ -7,7 +7,8 @@
 //! the on-chain account into `escrow_state::Escrow`, runs the transition,
 //! and writes it back. State and authority rules live in one place —
 //! the `escrow-state` crate — so the on-chain program cannot drift from
-//! the tested logic.
+//! the tested logic. The optional N-of-M attestor quorum (`initialize_quorum`
+//! / `attest`) gates `release` exactly as the state machine does.
 //!
 //! To compile for real: `anchor build` with the Solana toolchain installed.
 
@@ -80,6 +81,38 @@ pub mod escrow_vault {
         // once real token accounts are wired up.
         Ok(())
     }
+
+    /// Attach an N-of-M attestor quorum to the release path (`Uninitialized`
+    /// only; mirrors `Escrow::with_quorum`). After this, `release`
+    /// additionally requires `threshold` distinct attestations; the refund
+    /// paths (`cancel` / `cancel_expired`) stay quorum-free by design.
+    pub fn initialize_quorum(
+        ctx: Context<InitializeQuorum>,
+        attestors: Vec<Pubkey>,
+        threshold: u8,
+    ) -> Result<()> {
+        let keys: Vec<[u8; 32]> = attestors.iter().map(|k| k.to_bytes()).collect();
+        let policy =
+            escrow_state::QuorumPolicy::new(&keys, threshold).map_err(|e| escrow_error(e))?;
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow.with_quorum(policy).map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Persist `policy` into `vault.quorum` in the real build.
+        Ok(())
+    }
+
+    /// Record an attestation from a registered attestor (mirrors
+    /// `Escrow::attest`). Idempotent; callers outside the registered set
+    /// get `Unauthorized`.
+    pub fn attest(ctx: Context<Attest>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .attest(ctx.accounts.attestor.key().to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Flip the attestor's bit in `vault.quorum.approvals` in the real build.
+        Ok(())
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -94,11 +127,28 @@ pub struct Vault {
     // The authoritative state lives in `escrow_state::EscrowState`;
     // persisted here as a byte until the real build wires the enum.
     pub state: u8,
+    /// Optional N-of-M attestor quorum gating `release`; mirrors
+    /// `escrow_state::QuorumPolicy`. `None` for a plain two-party escrow.
+    /// Serialized layout finalized during the real build.
+    pub quorum: Option<Quorum>,
+}
+
+/// Skeleton mirror of `escrow_state::QuorumPolicy`: up to 8 registered
+/// attestor pubkeys, the N-of-M threshold, and a u64 approval bitmask.
+/// See the state machine docs for the release-gating semantics; serialize
+/// layout finalized in the real build.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct Quorum {
+    pub attestors: [Pubkey; 8],
+    pub registered: u8,
+    pub threshold: u8,
+    pub approvals: u64,
 }
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
     #[account(init, payer = initializer, space = 8 + 32 + 32 + 8 + 8 + 1)]
+    // Space grows by the serialized quorum (`Option<Quorum>`) in the real build.
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
     #[account(mut)]
@@ -141,6 +191,24 @@ pub struct CancelExpired<'info> {
     pub clock: AccountInfo<'info>,
 }
 
+#[derive(Accounts)]
+pub struct InitializeQuorum<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer configures the quorum; the state machine
+    /// rejects re-configuration once the escrow is funded.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Attest<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Must be one of the registered attestors; the state machine
+    /// rejects anyone else with `Unauthorized`.
+    pub attestor: Signer<'info>,
+}
+
 // --- Helpers (finalized during the real Anchor build) ---
 
 fn read_escrow(_vault: &Account<Vault>) -> escrow_state::Escrow {
@@ -156,7 +224,9 @@ fn write_escrow(_vault: &mut Account<Vault>, _escrow: &escrow_state::Escrow) {
 }
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {
-    // Map to custom program error codes in the real build.
+    // Map to distinct custom program error codes in the real build — one
+    // code per EscrowError variant (Unauthorized, InvalidStateTransition,
+    // AmountMismatch, NotExpired, InvalidQuorum, QuorumNotReached, ...).
     let _ = e;
     error!(ErrorCode::EscrowViolation)
 }
