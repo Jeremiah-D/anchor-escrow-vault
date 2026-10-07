@@ -35,12 +35,21 @@ pub struct Escrow {
 }
 
 /// Errors the state machine can return.
+///
+/// Each variant has a stable numeric code (see [`EscrowError::code`]):
+/// codes are part of the crate's public contract, so never renumber a
+/// variant or reuse a code from a removed variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscrowError {
+    /// The caller is not the authority for the transition. Checked
+    /// before state validity, so strangers learn nothing about state.
     Unauthorized,
+    /// The transition is not allowed from the current state (double
+    /// fund, release before fund, any transition from a terminal
+    /// state, ...).
     InvalidStateTransition,
+    /// [`Escrow::initialize`] called with `amount == 0`.
     AmountMismatch,
-    AlreadyInitialized,
     /// `cancel_expired` called before `expires_at`.
     NotExpired,
     /// Quorum policy misconfiguration (empty attestor list, duplicate
@@ -50,6 +59,38 @@ pub enum EscrowError {
     /// `release` attempted while the configured quorum's threshold of
     /// attestations has not been reached yet.
     QuorumNotReached,
+}
+
+impl EscrowError {
+    /// Stable numeric code for this error.
+    ///
+    /// The mapping is a public contract: off-chain clients and the
+    /// Anchor program match on these numbers (the Anchor layer assigns
+    /// one program error per variant). Codes are never renumbered and
+    /// removed variants' codes are never reused — the AV-06 test module
+    /// below pins the full table.
+    pub fn code(&self) -> u32 {
+        match self {
+            EscrowError::Unauthorized => 100,
+            EscrowError::InvalidStateTransition => 101,
+            EscrowError::AmountMismatch => 102,
+            EscrowError::NotExpired => 103,
+            EscrowError::InvalidQuorum => 104,
+            EscrowError::QuorumNotReached => 105,
+        }
+    }
+
+    /// Every variant of this enum, for completeness assertions.
+    pub fn all() -> &'static [EscrowError] {
+        &[
+            EscrowError::Unauthorized,
+            EscrowError::InvalidStateTransition,
+            EscrowError::AmountMismatch,
+            EscrowError::NotExpired,
+            EscrowError::InvalidQuorum,
+            EscrowError::QuorumNotReached,
+        ]
+    }
 }
 
 /// Maximum number of attestors in a [`QuorumPolicy`]. Fixed-size so the
@@ -1485,5 +1526,172 @@ mod anchor_idl_tests {
         // Documented failure mode: signer outside the registered set.
         assert_eq!(e.attest(MALLORY), Err(EscrowError::Unauthorized));
         assert_eq!(e.quorum().unwrap().approval_count(), 1);
+    }
+}
+
+// ---------- AV-06: error code catalog ----------
+//
+// Every EscrowError variant is pinned to its trigger condition AND its
+// stable numeric code. `code()` is a public contract (the Anchor program
+// maps one program error per variant, off-chain clients match on the
+// numbers), so these tests hardcode the numbers: renumbering a code
+// without a deliberate migration fails here on purpose.
+//
+// Note on `AlreadyInitialized`: the variant used to exist here but no
+// method could ever return it — `initialize` is a constructor and there
+// is no re-initialization path (Anchor's `init` constraint handles
+// double-init at the account layer). It was dead code and has been
+// removed; per the no-reuse rule its code is gone with it.
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ATTESTOR_1: [u8; 32] = [0xA1; 32];
+    const ATTESTOR_2: [u8; 32] = [0xA2; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn escrow() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap()
+    }
+
+    /// The full catalog: (variant, code, one-line trigger description).
+    /// `error_codes_are_stable` asserts this table against `code()`, so a
+    /// silent renumber is impossible.
+    const CATALOG: &[(EscrowError, u32, &str)] = &[
+        (EscrowError::Unauthorized, 100, "caller is not the transition authority"),
+        (
+            EscrowError::InvalidStateTransition,
+            101,
+            "transition illegal from the current state",
+        ),
+        (EscrowError::AmountMismatch, 102, "initialize with amount == 0"),
+        (
+            EscrowError::NotExpired,
+            103,
+            "cancel_expired with now < expires_at",
+        ),
+        (
+            EscrowError::InvalidQuorum,
+            104,
+            "bad quorum config or attest with no quorum",
+        ),
+        (
+            EscrowError::QuorumNotReached,
+            105,
+            "release before quorum threshold reached",
+        ),
+    ];
+
+    #[test]
+    fn catalog_covers_every_variant_exactly_once() {
+        let all = EscrowError::all();
+        assert_eq!(
+            all.len(),
+            CATALOG.len(),
+            "EscrowError::all() drifted from the catalog"
+        );
+        for (variant, _, _) in CATALOG {
+            assert!(all.contains(variant), "{variant:?} missing from all()");
+        }
+    }
+
+    #[test]
+    fn error_codes_are_stable() {
+        // Hardcoded numbers on purpose: the test FAILS if a code moves.
+        for (variant, code, trigger) in CATALOG {
+            assert_eq!(
+                variant.code(),
+                *code,
+                "code for {variant:?} ({trigger}) changed from {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn error_codes_are_unique() {
+        let mut codes: Vec<u32> = CATALOG.iter().map(|(_, c, _)| *c).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), CATALOG.len(), "duplicate error code");
+    }
+
+    // ----- trigger conditions, one per variant -----
+
+    #[test]
+    fn unauthorized_triggered_by_stranger_on_fund() {
+        let mut e = escrow();
+        let err = e.fund(MALLORY).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+    }
+
+    #[test]
+    fn invalid_state_transition_triggered_by_double_fund() {
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        let err = e.fund(ALICE).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+        assert_eq!(err.code(), 101);
+    }
+
+    #[test]
+    fn amount_mismatch_triggered_by_zero_amount_init() {
+        let err = Escrow::initialize(ALICE, BOB, 0, EXPIRES_AT).unwrap_err();
+        assert_eq!(err, EscrowError::AmountMismatch);
+        assert_eq!(err.code(), 102);
+    }
+
+    #[test]
+    fn not_expired_triggered_by_early_cancel_expired() {
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        // Authorized party (initializer), right state, wrong time.
+        let err = e.cancel_expired(ALICE, EXPIRES_AT - 1).unwrap_err();
+        assert_eq!(err, EscrowError::NotExpired);
+        assert_eq!(err.code(), 103);
+    }
+
+    #[test]
+    fn invalid_quorum_triggered_by_attest_without_quorum() {
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        let err = e.attest(ATTESTOR_1).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidQuorum);
+        assert_eq!(err.code(), 104);
+    }
+
+    #[test]
+    fn invalid_quorum_triggered_by_zero_threshold_policy() {
+        let err = QuorumPolicy::new(&[ATTESTOR_1], 0).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidQuorum);
+        assert_eq!(err.code(), 104);
+    }
+
+    #[test]
+    fn quorum_not_reached_triggered_by_premature_release() {
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let mut e = escrow().with_quorum(policy).unwrap();
+        e.fund(ALICE).unwrap();
+        e.attest(ATTESTOR_1).unwrap(); // 1 of 2: not enough
+        let err = e.release(ALICE).unwrap_err();
+        assert_eq!(err, EscrowError::QuorumNotReached);
+        assert_eq!(err.code(), 105);
+    }
+
+    #[test]
+    fn check_order_is_visible_in_codes() {
+        // Authority is checked before state: a stranger on a terminal
+        // state still gets 100 (Unauthorized), not 101.
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        e.release(ALICE).unwrap(); // now Released
+        let err = e.fund(MALLORY).unwrap_err();
+        assert_eq!(err.code(), 100);
+        // ... while the initializer sees the state error, 101.
+        let err = e.fund(ALICE).unwrap_err();
+        assert_eq!(err.code(), 101);
     }
 }

@@ -76,6 +76,18 @@ progress. Deliberately, the quorum gates *release only*: `cancel` and
 by withholding approval. Without a quorum the escrow behaves exactly as the
 plain two-party machine above.
 
+**Error codes** (stable, never renumbered; the Anchor program maps one
+program error per variant):
+
+| Error | Code | Trigger |
+|-------|------|---------|
+| `Unauthorized` | 100 | caller is not the transition authority (checked before state validity) |
+| `InvalidStateTransition` | 101 | transition illegal from the current state (double fund, release before fund, …) |
+| `AmountMismatch` | 102 | `initialize` with `amount == 0` |
+| `NotExpired` | 103 | `cancel_expired` with `now < expires_at` |
+| `InvalidQuorum` | 104 | bad quorum policy config, or `attest` with no quorum configured |
+| `QuorumNotReached` | 105 | `release` before the quorum threshold is reached |
+
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
 `inflow == locked + released + refunded` after every operation, with

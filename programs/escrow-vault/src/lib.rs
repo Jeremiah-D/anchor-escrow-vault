@@ -224,15 +224,32 @@ fn write_escrow(_vault: &mut Account<Vault>, _escrow: &escrow_state::Escrow) {
 }
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {
-    // Map to distinct custom program error codes in the real build — one
-    // code per EscrowError variant (Unauthorized, InvalidStateTransition,
-    // AmountMismatch, NotExpired, InvalidQuorum, QuorumNotReached, ...).
-    let _ = e;
-    error!(ErrorCode::EscrowViolation)
+    // One program error per EscrowError variant, so on-chain failures
+    // surface the exact `escrow_state` reason (code 100–105) to clients.
+    match e {
+        escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
+        escrow_state::EscrowError::InvalidStateTransition => {
+            error!(ErrorCode::InvalidStateTransition)
+        }
+        escrow_state::EscrowError::AmountMismatch => error!(ErrorCode::AmountMismatch),
+        escrow_state::EscrowError::NotExpired => error!(ErrorCode::NotExpired),
+        escrow_state::EscrowError::InvalidQuorum => error!(ErrorCode::InvalidQuorum),
+        escrow_state::EscrowError::QuorumNotReached => error!(ErrorCode::QuorumNotReached),
+    }
 }
 
 #[error_code]
 pub enum ErrorCode {
-    #[msg("Escrow state machine rejected the operation")]
-    EscrowViolation,
+    #[msg("Caller is not the authority for this transition")]
+    Unauthorized,
+    #[msg("Transition not allowed from the current state")]
+    InvalidStateTransition,
+    #[msg("Escrow amount must be greater than zero")]
+    AmountMismatch,
+    #[msg("cancel_expired called before expires_at")]
+    NotExpired,
+    #[msg("Invalid quorum policy or no quorum configured")]
+    InvalidQuorum,
+    #[msg("Release quorum threshold not reached yet")]
+    QuorumNotReached,
 }
