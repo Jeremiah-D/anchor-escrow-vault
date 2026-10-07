@@ -1695,3 +1695,289 @@ mod error_code_tests {
         assert_eq!(err.code(), 101);
     }
 }
+
+// ---------- AV-08: property-based tests with a handwritten generator ----------
+//
+// proptest-style property tests, but the generator is hand-rolled: this
+// crate's zero-dependency policy is a hard design constraint (README:
+// "dependency-free Rust state machine"), so adding proptest as a
+// dev-dependency would trade the crate's defining property for a smaller
+// test file. The generator below is ~50 lines of xorshift64* with heavy
+// boundary bias, and the backlog item explicitly allows it.
+//
+// This module complements the AV-03 fleet fuzz rather than repeating it:
+// AV-03 pins *fleet-level amount conservation across random operation
+// sequences*; this module pins *per-case invariants* in the classic
+// `for_all` style:
+//
+//   P1 amount dichotomy: `initialize` accepts `amount != 0` and rejects
+//      `amount == 0` with `AmountMismatch`; accessors round-trip the
+//      exact value.
+//   P2 lifecycle preservation: for every boundary amount (1, 2,
+//      u64::MAX-1, u64::MAX, arbitrary), all four legal lifecycles
+//      (fund→release, fund→cancel, fund→cancel_expired by the taker,
+//      quorum fund→attest→release) end in the expected terminal state
+//      with `amount()` bit-identical — especially at u64::MAX, where
+//      any accounting arithmetic would overflow.
+//   P3 expiry edge: `cancel_expired` (Funded state, authorized caller
+//      fixed) succeeds iff `now >= expires_at`, over boundary
+//      (expires_at, now) pairs including (0, 0) and
+//      (u64::MAX, u64::MAX).
+//   P4 quorum idempotency under random attestation order: random
+//      sequences with duplicates; `approval_count` == distinct
+//      registered attestors seen; `is_satisfied()` iff distinct >=
+//      threshold; outsiders are `Unauthorized` and change nothing.
+//
+// Every case is deterministic: the PRNG is seeded from a fixed
+// domain-separation constant plus the case index, so a failing case is
+// reproducible by its index.
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRY: u64 = 1_800_000_000;
+    const CASES: u64 = 512;
+
+    struct PropRng(u64);
+
+    impl PropRng {
+        fn for_case(base: u64, case: u64) -> Self {
+            // SplitMix-style domain separation: each (property, case)
+            // gets its own stream so properties don't share sequences.
+            let mut z = base
+                .wrapping_add(case.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                .wrapping_add(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            // Never zero: xorshift with a zero state never advances.
+            Self(z | 1)
+        }
+
+        fn next(&mut self) -> u64 {
+            // xorshift64*
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            debug_assert!(n > 0);
+            self.next() % n
+        }
+    }
+
+    /// Boundary-biased amount generator: 0 (must reject), 1, 2, small,
+    /// u64::MAX-1, u64::MAX, half-MAX, and an arbitrary 64-bit value.
+    fn gen_amount(rng: &mut PropRng) -> u64 {
+        match rng.below(8) {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => rng.below(1_000_000) + 1,
+            4 => u64::MAX - 1,
+            5 => u64::MAX,
+            6 => u64::MAX / 2,
+            _ => rng.next(),
+        }
+    }
+
+    /// Boundary-biased expiry / timestamp generator.
+    fn gen_time(rng: &mut PropRng) -> u64 {
+        match rng.below(8) {
+            0 => 0,
+            1 => 1,
+            2 => EXPIRY - 1,
+            3 => EXPIRY,
+            4 => EXPIRY + 1,
+            5 => u64::MAX - 1,
+            6 => u64::MAX,
+            _ => rng.next(),
+        }
+    }
+
+    fn for_all(base: u64, mut check: impl FnMut(&mut PropRng, u64)) {
+        for case in 0..CASES {
+            let mut rng = PropRng::for_case(base, case);
+            check(&mut rng, case);
+        }
+    }
+
+    // ----- P1: initialize amount dichotomy -----
+
+    #[test]
+    fn property_initialize_amount_dichotomy() {
+        // amount == 0 ⟺ Err(AmountMismatch); amount != 0 ⟹ Ok.
+        for_all(0xA001, |rng, case| {
+            let amount = gen_amount(rng);
+            let expiry = gen_time(rng);
+            match Escrow::initialize(ALICE, BOB, amount, expiry) {
+                Ok(e) => {
+                    assert_ne!(amount, 0, "case {case}: zero amount accepted");
+                    // Accessor round-trips the exact boundary value.
+                    assert_eq!(e.amount(), amount, "case {case}: amount not stored exactly");
+                    assert_eq!(e.expires_at(), expiry, "case {case}: expiry not stored exactly");
+                    assert_eq!(e.state(), EscrowState::Uninitialized);
+                }
+                Err(e) => {
+                    assert_eq!(
+                        amount, 0,
+                        "case {case}: non-zero amount {amount} rejected with {e:?}"
+                    );
+                    assert_eq!(e, EscrowError::AmountMismatch);
+                }
+            }
+        });
+    }
+
+    // ----- P2: lifecycle preservation of the amount -----
+
+    #[test]
+    fn property_lifecycle_preserves_amount() {
+        // For every non-zero boundary amount, all four legal lifecycles
+        // terminate in the expected state with the amount bit-identical.
+        for_all(0xA002, |rng, case| {
+            let amount = gen_amount(rng);
+            if amount == 0 {
+                return; // covered by P1
+            }
+            let expiry = gen_time(rng);
+            let mk = || Escrow::initialize(ALICE, BOB, amount, expiry).unwrap();
+
+            // fund → release.
+            let mut e = mk();
+            e.fund(ALICE).unwrap();
+            e.release(ALICE).unwrap();
+            assert_eq!(e.state(), EscrowState::Released);
+            assert_eq!(e.amount(), amount, "case {case}: amount changed on release path");
+
+            // fund → cancel.
+            let mut e = mk();
+            e.fund(ALICE).unwrap();
+            e.cancel(ALICE).unwrap();
+            assert_eq!(e.state(), EscrowState::Cancelled);
+            assert_eq!(e.amount(), amount, "case {case}: amount changed on cancel path");
+
+            // fund → cancel_expired by the taker at exactly the expiry
+            // edge (now == expires_at satisfies now >= expires_at).
+            let mut e = mk();
+            e.fund(ALICE).unwrap();
+            e.cancel_expired(BOB, expiry).unwrap();
+            assert_eq!(e.state(), EscrowState::Cancelled);
+            assert_eq!(
+                e.amount(),
+                amount,
+                "case {case}: amount changed on cancel_expired path"
+            );
+
+            // quorum fund → attest → release.
+            let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], 2).unwrap();
+            let mut e = mk().with_quorum(policy).unwrap();
+            e.fund(ALICE).unwrap();
+            e.attest([0xA1; 32]).unwrap();
+            e.attest([0xA2; 32]).unwrap();
+            e.release(ALICE).unwrap();
+            assert_eq!(e.state(), EscrowState::Released);
+            assert_eq!(e.amount(), amount, "case {case}: amount changed on quorum path");
+        });
+    }
+
+    // ----- P3: cancel_expired edge matches now >= expires_at -----
+
+    #[test]
+    fn property_cancel_expired_edge_matches_now_ge_expires_at() {
+        // Funded state and authorized caller fixed; cancel_expired
+        // succeeds iff now >= expires_at. Boundary pairs (0, 0),
+        // (u64::MAX, u64::MAX), (expiry, expiry±1) are biased in.
+        for_all(0xA003, |rng, case| {
+            let expiry = gen_time(rng);
+            let now = gen_time(rng);
+            let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, expiry).unwrap();
+            e.fund(ALICE).unwrap();
+            let expected = now >= expiry;
+            match e.cancel_expired(ALICE, now) {
+                Ok(()) => {
+                    assert!(
+                        expected,
+                        "case {case}: succeeded with now={now} < expires_at={expiry}"
+                    );
+                    assert_eq!(e.state(), EscrowState::Cancelled);
+                }
+                Err(EscrowError::NotExpired) => {
+                    assert!(
+                        !expected,
+                        "case {case}: NotExpired with now={now} >= expires_at={expiry}"
+                    );
+                    assert_eq!(e.state(), EscrowState::Funded);
+                }
+                Err(other) => panic!(
+                    "case {case}: unexpected error {other:?} for now={now}, expiry={expiry}"
+                ),
+            }
+        });
+    }
+
+    // ----- P4: quorum idempotency under random attestation order -----
+
+    #[test]
+    fn property_quorum_idempotent_under_random_attestation_order() {
+        // Random attestation sequences with duplicates and outsider
+        // noise: approval_count == distinct registered attestors seen,
+        // is_satisfied() iff distinct >= threshold, outsiders are
+        // Unauthorized and change nothing.
+        for_all(0xA004, |rng, case| {
+            let m = (rng.below(MAX_ATTESTORS as u64) + 1) as u8; // 1..=8
+            let threshold = (rng.below(m as u64) + 1) as u8; // 1..=m
+            let mut attestors = [[0u8; 32]; MAX_ATTESTORS];
+            for i in 0..m {
+                // Distinct, and never colliding with ALICE/MALLORY
+                // (0xAA/0xCC) so the outsider check is sound.
+                attestors[i as usize] = [(i + 1) as u8; 32];
+            }
+            let mut policy = QuorumPolicy::new(&attestors[..m as usize], threshold).unwrap();
+
+            // 2m attestations: duplicates plus outsider noise.
+            let mut distinct = [false; MAX_ATTESTORS];
+            let mut distinct_count = 0u8;
+            for _ in 0..(2 * m as u64) {
+                match rng.below(4) {
+                    // 3/4: a registered attestor (possibly repeated).
+                    0..=2 => {
+                        let idx = rng.below(m as u64) as usize;
+                        policy.attest(attestors[idx]).unwrap();
+                        if !distinct[idx] {
+                            distinct[idx] = true;
+                            distinct_count += 1;
+                        }
+                    }
+                    // 1/4: outsiders — must be Unauthorized and change nothing.
+                    _ => {
+                        let before = policy.approval_count();
+                        assert_eq!(policy.attest(MALLORY), Err(EscrowError::Unauthorized));
+                        assert_eq!(policy.attest(ALICE), Err(EscrowError::Unauthorized));
+                        assert_eq!(policy.approval_count(), before);
+                    }
+                }
+                assert_eq!(
+                    policy.approval_count(),
+                    distinct_count,
+                    "case {case}: approval count drifted from distinct attestor count"
+                );
+            }
+
+            assert_eq!(
+                policy.is_satisfied(),
+                distinct_count >= threshold,
+                "case {case}: satisfaction mismatch \
+                 (distinct={distinct_count}, threshold={threshold})"
+            );
+            assert_eq!((policy.registered_count(), policy.threshold()), (m, threshold));
+        });
+    }
+}

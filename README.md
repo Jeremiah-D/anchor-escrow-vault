@@ -92,6 +92,11 @@ program error per variant):
 deterministic seeds × 48 random operations over 6 escrows assert
 `inflow == locked + released + refunded` after every operation, with
 `amount`/`expires_at` immutable and failed operations state-preserving.
+Property-based tests (hand-rolled generator, boundary-biased amounts
+`0 / 1 / u64::MAX-1 / u64::MAX` and boundary timestamps) additionally pin
+per-case invariants: initialize amount dichotomy, amount preservation
+across all four legal lifecycles, the `cancel_expired` edge (`now >=
+expires_at`), and quorum idempotency under random attestation order.
 
 ## Lifecycle walkthrough (sequence)
 
