@@ -93,6 +93,74 @@ deterministic seeds × 48 random operations over 6 escrows assert
 `inflow == locked + released + refunded` after every operation, with
 `amount`/`expires_at` immutable and failed operations state-preserving.
 
+## Lifecycle walkthrough (sequence)
+
+Who talks to the state machine: the caller supplies every input (authority
+key, `now` timestamp); the escrow holds only its own state.
+
+**A. Happy path — release.** Initializer funds, then releases to the taker:
+
+```
+initializer            escrow                 state
+   |  fund(alice)         |                      |
+   |--------------------->|  Uninitialized→Funded  |
+   |  release(alice)      |                      |
+   |--------------------->|  Funded→Released       |
+   |                      |  (payout: amount,      |
+   |                      |   unchanged, to taker)  |
+```
+
+**B. Quorum-gated release.** Attestors vote (usually before funding); the
+threshold gate applies only to `release`:
+
+```
+initializer   attestors          escrow                 state
+   |  initialize_quorum([a1,a2,a3], 2)  |                   |
+   |---------------------------------->| (policy fixed)    |
+   |              attest(a1), attest(a2)  |                 |
+   |              --------------------->| (approvals 1→2)   |
+   |  fund(alice)  |                     |                   |
+   |---------------------------------->| Uninitialized→Funded|
+   |  release(alice)                     |                   |
+   |---------------------------------->| Funded→Released     |
+   |              (quorum 2-of-3 satisfied → gate passes)    |
+   |  release(alice)  // before threshold reached → Err(QuorumNotReached),
+   |                  // state stays Funded
+```
+
+**C. Cancel.** Initializer refunds before release:
+
+```
+initializer            escrow                 state
+   |  fund(alice)         |                      |
+   |--------------------->|  Uninitialized→Funded  |
+   |  cancel(alice)       |                      |
+   |--------------------->|  Funded→Cancelled      |
+   |                      |  (refund: amount,       |
+   |                      |   unchanged, to initializer) |
+```
+
+**D. Expired — either party can cancel.** Taker cancels a timed-out
+escrow the initializer abandoned:
+
+```
+initializer    taker            escrow                 state
+   |  fund(alice)   |              |                      |
+   |----------------------------->|  Uninitialized→Funded  |
+   |  (silence — never releases/cancels)                    |
+   |               cancel_expired(bob, now)  |              |
+   |               -------------------------->|  now>=expires_at? |
+   |               |             Funded→Cancelled (refund to      |
+   |               |             initializer, amount unchanged)    |
+   |               cancel_expired(bob, early)  // now<expires_at → Err(NotExpired),
+   |                                          // state stays Funded
+```
+
+Note that `attest` never changes `EscrowState` itself (it only grows the
+quorum's approval bitmask), and the failed-call invariant holds on every
+path above: any `Err(...)` return leaves the state — and `amount` —
+exactly untouched (pinned by the permission/fuzz/property tests).
+
 ## Run the tests
 
 ```bash
