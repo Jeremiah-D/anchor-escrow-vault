@@ -114,9 +114,10 @@ fn initialize_fund_release_happy_path() {
     escrow.fund(ALICE).expect("fund by initializer must succeed");
     assert_eq!(escrow.state(), EscrowState::Funded);
 
-    // `release`: authority <- accounts.initializer (signer).
+    // `release(amount)`: authority <- accounts.initializer (signer);
+    // amount <- instruction param.
     escrow
-        .release(ALICE)
+        .release(ALICE, AMOUNT)
         .expect("release by initializer must succeed");
     assert_eq!(escrow.state(), EscrowState::Released);
     assert_eq!(escrow.amount(), AMOUNT, "payout accounting preserved");
@@ -153,7 +154,7 @@ fn quorum_attest_release_happy_path() {
 
     escrow.fund(ALICE).expect("fund by initializer must succeed");
     escrow
-        .release(ALICE)
+        .release(ALICE, AMOUNT)
         .expect("release with satisfied quorum must succeed");
     assert_eq!(escrow.state(), EscrowState::Released);
     assert_eq!(escrow.amount(), AMOUNT, "payout accounting preserved");
@@ -177,12 +178,12 @@ fn release_by_non_initializer_is_rejected() {
 
     let release_call = InstructionCall {
         name: "release",
-        params: vec![],
+        params: vec![("amount", AMOUNT)],
         signers: vec![MALLORY],
     };
     assert!(release_call.signers.contains(&MALLORY));
     assert_eq!(
-        escrow.release(MALLORY),
+        escrow.release(MALLORY, AMOUNT),
         Err(EscrowError::Unauthorized),
         "stranger release must be Unauthorized"
     );
@@ -218,7 +219,7 @@ fn release_before_quorum_threshold_is_rejected() {
         .is_satisfied());
 
     assert_eq!(
-        escrow.release(ALICE),
+        escrow.release(ALICE, AMOUNT),
         Err(EscrowError::QuorumNotReached),
         "release below quorum threshold must be QuorumNotReached"
     );

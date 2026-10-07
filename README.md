@@ -57,7 +57,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_quorum(attestors, threshold)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `attest(attestor)`                          | `Uninitialized`/`Funded` | — (no state change) | registered attestor |
 | `fund(authority)`                           | `Uninitialized`| `Funded`  | initializer            |
-| `release(authority)`                        | `Funded`       | `Released`| initializer (+ quorum satisfied when configured) |
+| `release(authority, amount)`                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured); cumulative releases ≤ locked amount |
 | `cancel(authority)`                         | `Funded`       | `Cancelled` | initializer          |
 | `cancel_expired(authority, now)`            | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at` |
 
@@ -70,6 +70,15 @@ timeout. Any illegal transition (e.g. releasing twice, releasing before
 funding) gets `InvalidStateTransition`; zero amounts get `AmountMismatch`;
 `release`/`cancel`/`cancel_expired` preserve `amount` exactly (refund
 accounting).
+
+**Partial release (staged payouts).** `release(authority, amount)` releases
+in tranches: each call adds to a cumulative `released` counter and leaves
+the escrow `Funded`; when the cumulative total reaches the locked amount
+the escrow moves to `Released`. Cumulative releases must never exceed the
+locked amount (`ReleaseExceedsLocked`, code 106); a zero-amount release is
+`AmountMismatch`. `released_amount()` / `remaining_amount()` expose the
+progress, and `cancel` / `cancel_expired` after partial releases refund
+only the remainder while `released_amount()` stays preserved for audit.
 
 **Attestor quorum (N-of-M release gate).** An escrow can be created with an
 optional quorum policy (`QuorumPolicy::new(attestors, threshold)`, up to 8
@@ -94,12 +103,16 @@ program error per variant):
 | `NotExpired` | 103 | `cancel_expired` with `now < expires_at` |
 | `InvalidQuorum` | 104 | bad quorum policy config, or `attest` with no quorum configured |
 | `QuorumNotReached` | 105 | `release` before the quorum threshold is reached |
+| `ReleaseExceedsLocked` | 106 | cumulative `release` amounts exceeding the locked amount |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
 `inflow == locked + released + refunded` after every operation, with
-`amount`/`expires_at` immutable and failed operations state-preserving.
-Property-based tests (hand-rolled generator, boundary-biased amounts
+`amount`/`expires_at` immutable and failed operations state-preserving
+(the fuzz drives full, partial, over-limit, and zero-amount releases, so
+`locked` is recomputed as the unreleased remainder of `Funded` escrows
+and `released` accumulates partial payouts). Property-based tests
+(hand-rolled generator, boundary-biased amounts
 `0 / 1 / u64::MAX-1 / u64::MAX` and boundary timestamps) additionally pin
 per-case invariants: initialize amount dichotomy, amount preservation
 across all four legal lifecycles, the `cancel_expired` edge (`now >=
@@ -116,7 +129,7 @@ key, `now` timestamp); the escrow holds only its own state.
 initializer            escrow                 state
    |  fund(alice)         |                      |
    |--------------------->|  Uninitialized→Funded  |
-   |  release(alice)      |                      |
+   |  release(alice, amount)  |                   |
    |--------------------->|  Funded→Released       |
    |                      |  (payout: amount,      |
    |                      |   unchanged, to taker)  |
@@ -133,10 +146,10 @@ initializer   attestors          escrow                 state
    |              --------------------->| (approvals 1→2)   |
    |  fund(alice)  |                     |                   |
    |---------------------------------->| Uninitialized→Funded|
-   |  release(alice)                     |                   |
+   |  release(alice, amount)              |                   |
    |---------------------------------->| Funded→Released     |
    |              (quorum 2-of-3 satisfied → gate passes)    |
-   |  release(alice)  // before threshold reached → Err(QuorumNotReached),
+   |  release(alice, amount)  // before threshold reached → Err(QuorumNotReached),
    |                  // state stays Funded
 ```
 
@@ -168,10 +181,35 @@ initializer    taker            escrow                 state
    |                                          // state stays Funded
 ```
 
+**E. Partial release — staged payout.** The initializer releases in
+tranches; the escrow stays `Funded` until the cumulative total reaches
+the locked amount:
+
+```
+initializer            escrow                 state
+   |  fund(alice)         |                      |
+   |--------------------->|  Uninitialized→Funded  |
+   |  release(alice, 400_000)  |                   |
+   |--------------------->|  released=400_000,     |
+   |                      |  remaining=600_000,    |
+   |                      |  stays Funded          |
+   |  release(alice, 600_001)  // → Err(ReleaseExceedsLocked),
+   |                      |   // state + released unchanged
+   |  release(alice, 600_000)  |                   |
+   |--------------------->|  released=1_000_000,   |
+   |                      |  Funded→Released       |
+```
+
+`released_amount()` / `remaining_amount()` report the progress at every
+step (here: 400_000 / 600_000 after the first tranche), and a later
+`cancel` refunds only the remainder while `released_amount()` stays
+preserved for audit.
+
 Note that `attest` never changes `EscrowState` itself (it only grows the
 quorum's approval bitmask), and the failed-call invariant holds on every
-path above: any `Err(...)` return leaves the state — and `amount` —
-exactly untouched (pinned by the permission/fuzz/property tests).
+path above: any `Err(...)` return leaves the state — and `amount` and the
+`released` counter — exactly untouched (pinned by the
+permission/fuzz/property tests).
 
 ## Account space & rent
 
@@ -186,17 +224,18 @@ two-way consistency check against the IDL parameter table:
 | initializer   | Pubkey            | 32    |
 | taker         | Pubkey            | 32    |
 | amount        | u64               | 8     |
+| released      | u64               | 8     |
 | expires_at    | u64               | 8     |
 | state         | u8 (discriminant) | 1     |
 | quorum        | Option<Quorum>    | 267   |
-| **total**     |                   | **356** |
+| **total**     |                   | **364** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
-realloc. `escrow-state` exposes `VAULT_SPACE` (356) and
-`VAULT_SPACE_NO_QUORUM` (90) for the Anchor `space =` constraint, plus a
+realloc. `escrow-state` exposes `VAULT_SPACE` (364) and
+`VAULT_SPACE_NO_QUORUM` (98) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **3,368,640 lamports** to be
+mainnet rent parameters the full vault needs **3,424,320 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ## Run the tests

@@ -27,6 +27,10 @@ pub struct Escrow {
     initializer: [u8; 32],
     taker: [u8; 32],
     amount: u64,
+    /// Cumulative amount released so far via [`Escrow::release`].
+    /// Partial releases accumulate here; always `<= amount`. Exposed
+    /// through [`Escrow::released_amount`] / [`Escrow::remaining_amount`].
+    released: u64,
     expires_at: u64,
     state: EscrowState,
     /// Optional N-of-M attestor quorum gating `release`. `None` means a
@@ -59,6 +63,10 @@ pub enum EscrowError {
     /// `release` attempted while the configured quorum's threshold of
     /// attestations has not been reached yet.
     QuorumNotReached,
+    /// `release` attempted with a cumulative amount that would exceed the
+    /// locked [`Escrow::amount`] — or whose cumulative addition would
+    /// overflow `u64`. Partial releases must never outrun the lockup.
+    ReleaseExceedsLocked,
 }
 
 impl EscrowError {
@@ -77,6 +85,7 @@ impl EscrowError {
             EscrowError::NotExpired => 103,
             EscrowError::InvalidQuorum => 104,
             EscrowError::QuorumNotReached => 105,
+            EscrowError::ReleaseExceedsLocked => 106,
         }
     }
 
@@ -89,6 +98,7 @@ impl EscrowError {
             EscrowError::NotExpired,
             EscrowError::InvalidQuorum,
             EscrowError::QuorumNotReached,
+            EscrowError::ReleaseExceedsLocked,
         ]
     }
 }
@@ -206,6 +216,7 @@ impl Escrow {
             initializer,
             taker,
             amount,
+            released: 0,
             expires_at,
             state: EscrowState::Uninitialized,
             quorum: None,
@@ -231,13 +242,20 @@ impl Escrow {
         }
     }
 
-    /// Release the locked funds to the taker. `Funded -> Released`.
+    /// Release `amount` of the locked funds to the taker. Partial releases
+    /// accumulate in [`Escrow::released_amount`] and leave the escrow
+    /// `Funded`; when the cumulative released total reaches the locked
+    /// [`Escrow::amount`] the escrow moves `Funded -> Released`. Cumulative
+    /// releases must never exceed the locked amount (`ReleaseExceedsLocked`),
+    /// and `amount == 0` is `AmountMismatch`. Models staged payouts
+    /// (e.g. delivery milestones paid out in tranches).
     ///
     /// When a quorum is configured, additionally requires the quorum's
     /// threshold of attestations (`QuorumNotReached` otherwise). Check
-    /// order is deliberate: authority, then state, then quorum — an
-    /// unauthorized caller learns nothing about attestation progress.
-    pub fn release(&mut self, authority: [u8; 32]) -> Result<(), EscrowError> {
+    /// order is deliberate: authority, then state, then quorum, then the
+    /// amount checks — an unauthorized caller learns nothing about
+    /// attestation progress or release history.
+    pub fn release(&mut self, authority: [u8; 32], amount: u64) -> Result<(), EscrowError> {
         self.require_initializer(authority)?;
         match self.state {
             EscrowState::Funded => {}
@@ -248,11 +266,30 @@ impl Escrow {
                 return Err(EscrowError::QuorumNotReached);
             }
         }
-        self.state = EscrowState::Released;
+        if amount == 0 {
+            return Err(EscrowError::AmountMismatch);
+        }
+        // checked_add: a wrapping add would reset the counter and let an
+        // attacker drain past the lockup; overflow is a hard failure.
+        let new_released = self
+            .released
+            .checked_add(amount)
+            .ok_or(EscrowError::ReleaseExceedsLocked)?;
+        if new_released > self.amount {
+            return Err(EscrowError::ReleaseExceedsLocked);
+        }
+        self.released = new_released;
+        if self.released == self.amount {
+            self.state = EscrowState::Released;
+        }
         Ok(())
     }
 
     /// Cancel the escrow and return funds. `Funded -> Cancelled`.
+    ///
+    /// After partial releases the refund is the remainder
+    /// ([`Escrow::remaining_amount`]); [`Escrow::released_amount`] is
+    /// preserved for audit.
     pub fn cancel(&mut self, authority: [u8; 32]) -> Result<(), EscrowError> {
         self.require_initializer(authority)?;
         match self.state {
@@ -275,6 +312,10 @@ impl Escrow {
     /// Check order is deliberate: authority first, then state, then
     /// expiry. A stranger never learns whether an escrow is expired from
     /// the error alone beyond `Unauthorized`.
+    ///
+    /// After partial releases the refund is the remainder
+    /// ([`Escrow::remaining_amount`]); [`Escrow::released_amount`] is
+    /// preserved for audit.
     pub fn cancel_expired(&mut self, authority: [u8; 32], now: u64) -> Result<(), EscrowError> {
         if authority != self.initializer && authority != self.taker {
             return Err(EscrowError::Unauthorized);
@@ -336,6 +377,17 @@ impl Escrow {
     pub fn amount(&self) -> u64 {
         self.amount
     }
+    /// Cumulative amount released so far (AV-11): partial releases
+    /// accumulate here; always `<= amount()`. Progress query for staged
+    /// payouts.
+    pub fn released_amount(&self) -> u64 {
+        self.released
+    }
+    /// Amount still locked: `amount() - released_amount()`. This is what
+    /// `cancel` / `cancel_expired` refund.
+    pub fn remaining_amount(&self) -> u64 {
+        self.amount - self.released
+    }
     pub fn state(&self) -> EscrowState {
         self.state
     }
@@ -377,6 +429,9 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     ("initializer", "Pubkey", PUBKEY_LEN),
     ("taker", "Pubkey", PUBKEY_LEN),
     ("amount", "u64", 8),
+    // Cumulative released amount (AV-11): partial releases accumulate
+    // here so release progress survives serialization; always `<= amount`.
+    ("released", "u64", 8),
     ("expires_at", "u64", 8),
     // `EscrowState` is a unit-only enum: Borsh writes one discriminant byte.
     ("state", "u8 (enum discriminant)", 1),
@@ -411,7 +466,7 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// skeleton's `Initialize` constraint uses this exact expression; quorum
 /// data is written in place later without reallocating.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 1 + 1;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -534,9 +589,11 @@ mod tests {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
         let before = e.amount();
-        e.release(ALICE).unwrap();
+        e.release(ALICE, 1_000_000).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(e.amount(), before); // amount invariant across release
+        assert_eq!(e.released_amount(), before); // full release tracked
+        assert_eq!(e.remaining_amount(), 0);
     }
 
     #[test]
@@ -609,7 +666,7 @@ mod tests {
         );
         // Released: terminal, cannot be cancelled again.
         let mut e = funded_escrow();
-        e.release(ALICE).unwrap();
+        e.release(ALICE, 1_000_000).unwrap();
         assert_eq!(
             e.cancel_expired(BOB, EXPIRES_AT + 1),
             Err(EscrowError::InvalidStateTransition)
@@ -641,7 +698,7 @@ mod tests {
     fn release_from_uninitialized_is_invalid() {
         let mut e = escrow();
         assert_eq!(
-            e.release(ALICE),
+            e.release(ALICE, 1_000_000),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.state(), EscrowState::Uninitialized);
@@ -666,9 +723,9 @@ mod tests {
     fn release_after_release_is_invalid() {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        e.release(ALICE).unwrap();
+        e.release(ALICE, 1_000_000).unwrap();
         assert_eq!(
-            e.release(ALICE),
+            e.release(ALICE, 1_000_000),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.state(), EscrowState::Released);
@@ -678,7 +735,7 @@ mod tests {
     fn cancel_after_release_is_invalid() {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        e.release(ALICE).unwrap();
+        e.release(ALICE, 1_000_000).unwrap();
         assert_eq!(e.cancel(ALICE), Err(EscrowError::InvalidStateTransition));
         assert_eq!(e.state(), EscrowState::Released);
     }
@@ -689,7 +746,7 @@ mod tests {
         e.fund(ALICE).unwrap();
         e.cancel(ALICE).unwrap();
         assert_eq!(
-            e.release(ALICE),
+            e.release(ALICE, 1_000_000),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.state(), EscrowState::Cancelled);
@@ -699,7 +756,7 @@ mod tests {
     fn fund_after_release_is_invalid() {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        e.release(ALICE).unwrap();
+        e.release(ALICE, 1_000_000).unwrap();
         assert_eq!(e.fund(ALICE), Err(EscrowError::InvalidStateTransition));
     }
 
@@ -724,7 +781,7 @@ mod tests {
     fn non_initializer_cannot_release() {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        assert_eq!(e.release(MALLORY), Err(EscrowError::Unauthorized));
+        assert_eq!(e.release(MALLORY, 1_000_000), Err(EscrowError::Unauthorized));
         assert_eq!(e.state(), EscrowState::Funded);
     }
 
@@ -742,7 +799,7 @@ mod tests {
         // The taker is the beneficiary, not the authority: they cannot drive transitions.
         assert_eq!(e.fund(BOB), Err(EscrowError::Unauthorized));
         e.fund(ALICE).unwrap();
-        assert_eq!(e.release(BOB), Err(EscrowError::Unauthorized));
+        assert_eq!(e.release(BOB, 1_000_000), Err(EscrowError::Unauthorized));
         assert_eq!(e.state(), EscrowState::Funded);
     }
 }
@@ -788,7 +845,7 @@ mod permission_tests {
             EscrowState::Funded => e.fund(ALICE).unwrap(),
             EscrowState::Released => {
                 e.fund(ALICE).unwrap();
-                e.release(ALICE).unwrap();
+                e.release(ALICE, 1_000_000).unwrap();
             }
             EscrowState::Cancelled => {
                 e.fund(ALICE).unwrap();
@@ -823,7 +880,7 @@ mod permission_tests {
     fn stranger_cannot_release_in_any_state() {
         for state in ALL_STATES {
             let mut e = in_state(state);
-            assert_eq!(e.release(MALLORY), Err(EscrowError::Unauthorized));
+            assert_eq!(e.release(MALLORY, 1_000_000), Err(EscrowError::Unauthorized));
             assert_eq!(e.state(), state, "state must be unchanged");
         }
     }
@@ -834,7 +891,7 @@ mod permission_tests {
         // initializer may drive the transition.
         for state in ALL_STATES {
             let mut e = in_state(state);
-            assert_eq!(e.release(BOB), Err(EscrowError::Unauthorized));
+            assert_eq!(e.release(BOB, 1_000_000), Err(EscrowError::Unauthorized));
             assert_eq!(e.state(), state, "state must be unchanged");
         }
     }
@@ -919,7 +976,7 @@ mod permission_tests {
         // Unauthorized: authority is checked first. This keeps the error
         // from leaking state information to unauthorized callers.
         let mut e = in_state(EscrowState::Released);
-        assert_eq!(e.release(MALLORY), Err(EscrowError::Unauthorized));
+        assert_eq!(e.release(MALLORY, 1_000_000), Err(EscrowError::Unauthorized));
         let mut e = in_state(EscrowState::Cancelled);
         assert_eq!(e.cancel(MALLORY), Err(EscrowError::Unauthorized));
         assert_eq!(e.state(), EscrowState::Cancelled);
@@ -930,7 +987,7 @@ mod permission_tests {
         for state in ALL_STATES {
             let mut e = in_state(state);
             assert_eq!(e.fund(ZERO_KEY), Err(EscrowError::Unauthorized));
-            assert_eq!(e.release(ZERO_KEY), Err(EscrowError::Unauthorized));
+            assert_eq!(e.release(ZERO_KEY, 1_000_000), Err(EscrowError::Unauthorized));
             assert_eq!(e.cancel(ZERO_KEY), Err(EscrowError::Unauthorized));
             assert_eq!(
                 e.cancel_expired(ZERO_KEY, EXPIRES_AT + 1),
@@ -948,18 +1005,25 @@ mod permission_tests {
 // tracks the three buckets money can sit in:
 //
 //   inflow   = sum of amounts successfully funded (money entering vaults)
-//   locked   = sum of amounts in `Funded` escrows (recomputed from real states)
-//   released = sum of amounts successfully released (paid out to takers)
-//   refunded  = sum of amounts successfully cancelled (returned to initializers)
+//   locked   = sum of unreleased amounts (`amount - released_amount()`) in
+//              `Funded` escrows (recomputed from real states)
+//   released = sum of amounts successfully released (paid out to takers,
+//              including partial releases)
+//   refunded  = sum of remainders successfully cancelled (returned to
+//              initializers)
 //
 // Invariant after every single operation:
 //   inflow == locked + released + refunded
 // plus field immutability: `amount` / `expires_at` never change through any
-// transition, and failed operations leave state untouched.
+// transition, and failed operations leave state — and the released
+// counter — untouched.
 //
 // PRNG is xorshift64* with fixed seeds: deterministic, dependency-free,
 // no network, no wall clock. Boundary amounts (0, 1, u64::MAX) and
 // boundary expiries (0, u64::MAX) are deliberately biased into the stream.
+// Release amounts are boundary-biased too (0, 1, half, full, just over
+// the total, u64::MAX), so partial releases, cumulative caps, and
+// over-release rejections are all exercised.
 #[cfg(test)]
 mod fuzz_tests {
     use super::*;
@@ -1029,6 +1093,31 @@ mod fuzz_tests {
         }
     }
 
+    /// Boundary-biased release amount generator. `total` is the escrow's
+    /// locked amount; the stream covers the zero-amount rejection, a
+    /// minimum partial, a half partial, the full amount, just over the
+    /// total (exceeds unless `total == u64::MAX`), `u64::MAX` (exceeds
+    /// unless `total == u64::MAX`), an rng-based value in `(1, total]`,
+    /// and an arbitrary u64 (usually exceeding the remaining).
+    fn fuzz_release_amount(rng: &mut XorShift64, total: u64) -> u64 {
+        match rng.below(8) {
+            0 => 0, // release must reject with AmountMismatch
+            1 => 1, // minimum partial (full when total == 1)
+            2 => total / 2, // partial (0 -> AmountMismatch when total == 1)
+            3 => total, // full (or exceeds remaining when partially released)
+            4 => total.saturating_add(1), // exceeds (full when total == u64::MAX)
+            5 => u64::MAX, // exceeds unless total == u64::MAX
+            6 => {
+                if total < 2 {
+                    1 // (1, total] is empty when total == 1
+                } else {
+                    rng.below(total - 1) + 2
+                }
+            }
+            _ => rng.next(),
+        }
+    }
+
     fn run_seed(seed: u64) {
         let mut rng = XorShift64(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
         let mut slots: Vec<Option<Slot>> = Vec::with_capacity(ESCROW_COUNT);
@@ -1062,10 +1151,16 @@ mod fuzz_tests {
             let Some(slot) = slots[i].as_mut() else { continue };
             let authority = rng.pick(&INIT_KEYS);
             let state_before = slot.escrow.state();
+            let released_before = slot.escrow.released_amount();
 
-            let result = match rng.below(4) {
+            let op = rng.below(4);
+            let mut rel_amt = 0u64;
+            let result = match op {
                 0 => slot.escrow.fund(authority),
-                1 => slot.escrow.release(authority),
+                1 => {
+                    rel_amt = fuzz_release_amount(&mut rng, slot.amount);
+                    slot.escrow.release(authority, rel_amt)
+                }
                 2 => slot.escrow.cancel(authority),
                 _ => slot.escrow.cancel_expired(authority, fuzz_now(&mut rng)),
             };
@@ -1075,8 +1170,23 @@ mod fuzz_tests {
                     // From Uninitialized only `fund` can succeed.
                     EscrowState::Uninitialized => inflow += slot.amount as u128,
                     EscrowState::Funded => match slot.escrow.state() {
-                        EscrowState::Released => released += slot.amount as u128,
-                        EscrowState::Cancelled => refunded += slot.amount as u128,
+                        // release: a full release closes the escrow, a
+                        // partial release leaves it Funded — either way
+                        // rel_amt left the locked bucket.
+                        EscrowState::Released | EscrowState::Funded => {
+                            assert_eq!(
+                                op, 1,
+                                "only release can succeed from Funded to Funded/Released on seed {seed}"
+                            );
+                            released += rel_amt as u128;
+                        }
+                        // cancel / cancel_expired: the refund is the
+                        // unreleased remainder (partial releases are
+                        // already counted in `released`).
+                        EscrowState::Cancelled => {
+                            refunded +=
+                                (slot.amount - slot.escrow.released_amount()) as u128;
+                        }
                         s => panic!("unexpected post-op state {s:?} from Funded on seed {seed}"),
                     },
                     s => panic!("op succeeded from terminal state {s:?} on seed {seed}"),
@@ -1084,6 +1194,11 @@ mod fuzz_tests {
                 Err(_) => {
                     // Failed ops must leave everything untouched.
                     assert_eq!(slot.escrow.state(), state_before);
+                    assert_eq!(
+                        slot.escrow.released_amount(),
+                        released_before,
+                        "failed op moved the released counter on seed {seed}"
+                    );
                 }
             }
 
@@ -1095,12 +1210,14 @@ mod fuzz_tests {
                 "expires_at changed on seed {seed}"
             );
 
-            // ... and global conservation across the fleet.
+            // ... and global conservation across the fleet. `locked` is the
+            // unreleased remainder of every still-Funded escrow: partial
+            // releases have already moved money into `released`.
             let locked: u128 = slots
                 .iter()
                 .flatten()
                 .filter(|s| s.escrow.state() == EscrowState::Funded)
-                .map(|s| s.amount as u128)
+                .map(|s| s.amount as u128 - s.escrow.released_amount() as u128)
                 .sum();
             assert_eq!(
                 inflow,
@@ -1242,7 +1359,7 @@ mod quorum_tests {
     fn release_before_quorum_reached_fails_and_preserves_state() {
         let mut e = escrow_with_quorum();
         e.attest(ATTESTOR_1).unwrap();
-        assert_eq!(e.release(ALICE), Err(EscrowError::QuorumNotReached));
+        assert_eq!(e.release(ALICE, 1_000_000), Err(EscrowError::QuorumNotReached));
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!(e.amount(), 1_000_000);
     }
@@ -1252,7 +1369,7 @@ mod quorum_tests {
         let mut e = escrow_with_quorum();
         e.attest(ATTESTOR_1).unwrap();
         e.attest(ATTESTOR_3).unwrap();
-        e.release(ALICE).unwrap();
+        e.release(ALICE, 1_000_000).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(e.amount(), 1_000_000); // payout accounting preserved
     }
@@ -1263,7 +1380,7 @@ mod quorum_tests {
         let mut e = escrow_with_quorum();
         e.attest(ATTESTOR_1).unwrap();
         e.attest(ATTESTOR_2).unwrap();
-        assert_eq!(e.release(MALLORY), Err(EscrowError::Unauthorized));
+        assert_eq!(e.release(MALLORY, 1_000_000), Err(EscrowError::Unauthorized));
         assert_eq!(e.state(), EscrowState::Funded);
     }
 
@@ -1272,9 +1389,9 @@ mod quorum_tests {
         // Check order: authority before quorum. A stranger gets
         // Unauthorized even with zero attestations recorded.
         let mut e = escrow_with_quorum();
-        assert_eq!(e.release(MALLORY), Err(EscrowError::Unauthorized));
+        assert_eq!(e.release(MALLORY, 1_000_000), Err(EscrowError::Unauthorized));
         // ... while the initializer sees the quorum gate.
-        assert_eq!(e.release(ALICE), Err(EscrowError::QuorumNotReached));
+        assert_eq!(e.release(ALICE, 1_000_000), Err(EscrowError::QuorumNotReached));
     }
 
     #[test]
@@ -1296,7 +1413,7 @@ mod quorum_tests {
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         assert_eq!(e.quorum(), None);
         e.fund(ALICE).unwrap();
-        e.release(ALICE).unwrap();
+        e.release(ALICE, 1_000_000).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
 
@@ -1325,7 +1442,7 @@ mod quorum_tests {
         let mut e = escrow_with_quorum();
         e.attest(ATTESTOR_1).unwrap();
         e.attest(ATTESTOR_2).unwrap();
-        e.release(ALICE).unwrap();
+        e.release(ALICE, 1_000_000).unwrap();
         assert_eq!(
             e.attest(ATTESTOR_3),
             Err(EscrowError::InvalidStateTransition)
@@ -1342,7 +1459,7 @@ mod quorum_tests {
         e.attest(ATTESTOR_1).unwrap();
         e.attest(ATTESTOR_2).unwrap();
         e.fund(ALICE).unwrap();
-        e.release(ALICE).unwrap();
+        e.release(ALICE, 1_000_000).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
 
@@ -1357,7 +1474,7 @@ mod quorum_tests {
         e.attest(ALICE).unwrap();
         e.attest(ATTESTOR_1).unwrap();
         e.fund(ALICE).unwrap();
-        e.release(ALICE).unwrap();
+        e.release(ALICE, 1_000_000).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
 }
@@ -1446,11 +1563,15 @@ mod anchor_idl_tests {
         },
         InstructionSpec {
             name: "release",
-            params: &[],
+            params: &[("amount", "u64", "instruction param")],
             method: "Escrow::release",
             input_mapping: "authority <- accounts.initializer (signer); \
-                            when a quorum is configured the release gate \
-                            from AV-04 applies (QuorumNotReached)",
+                            amount <- param; partial releases accumulate in \
+                            the `released` field and must not cumulatively \
+                            exceed `amount` (ReleaseExceedsLocked); \
+                            `amount == 0` is AmountMismatch; when a quorum \
+                            is configured the release gate from AV-04 \
+                            applies (QuorumNotReached)",
         },
         InstructionSpec {
             name: "cancel",
@@ -1541,7 +1662,7 @@ mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_initialize_and_initialize_quorum_take_params() {
+    fn only_initialize_release_and_initialize_quorum_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -1549,7 +1670,10 @@ mod anchor_idl_tests {
             .filter(|s| !s.params.is_empty())
             .map(|s| &s.name)
             .collect();
-        assert_eq!(with_params, vec![&"initialize", &"initialize_quorum"]);
+        assert_eq!(
+            with_params,
+            vec![&"initialize", &"release", &"initialize_quorum"]
+        );
     }
 
     // ----- per-instruction mapping, executed against the real machine -----
@@ -1583,15 +1707,22 @@ mod anchor_idl_tests {
 
     #[test]
     fn release_maps_initializer_signer_to_authority() {
-        // IDL: release() — no params; authority <- accounts.initializer.
+        // IDL: release(amount: u64) — authority <- accounts.initializer;
+        // amount <- instruction param (partial releases accumulate in the
+        // `released` field; the cumulative total is capped at `amount`).
         let mut e = funded_escrow();
-        e.release(ALICE).unwrap();
+        e.release(ALICE, 1_000_000).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
+        // Documented partial path: stays Funded, progress tracked.
+        let mut e = funded_escrow();
+        e.release(ALICE, 400_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!((e.released_amount(), e.remaining_amount()), (400_000, 600_000));
         // Documented failure mode: quorum configured but threshold unmet
         // (release-specific gate from AV-04).
         let mut e = quorum_funded_escrow();
         e.attest(ATTESTOR_1).unwrap();
-        assert_eq!(e.release(ALICE), Err(EscrowError::QuorumNotReached));
+        assert_eq!(e.release(ALICE, 1_000_000), Err(EscrowError::QuorumNotReached));
         assert_eq!(e.state(), EscrowState::Funded);
     }
 
@@ -1640,7 +1771,7 @@ mod anchor_idl_tests {
         assert!(e.quorum().is_some());
         e.fund(ALICE).unwrap();
         // The release gate is live immediately: threshold not yet reached.
-        assert_eq!(e.release(ALICE), Err(EscrowError::QuorumNotReached));
+        assert_eq!(e.release(ALICE, 1_000_000), Err(EscrowError::QuorumNotReached));
         // Documented failure mode: bad policy rejected before touching the escrow.
         assert_eq!(
             QuorumPolicy::new(&[ATTESTOR_1], 0),
@@ -1678,6 +1809,7 @@ mod anchor_idl_tests {
     const PARAM_FIELD_MAP: &[(&str, &str, &str)] = &[
         ("initialize", "amount", "amount"),
         ("initialize", "expires_at", "expires_at"),
+        ("release", "amount", "released"),
         ("initialize_quorum", "attestors", "quorum.attestors"),
         ("initialize_quorum", "threshold", "quorum.threshold"),
     ];
@@ -1833,6 +1965,11 @@ mod error_code_tests {
             105,
             "release before quorum threshold reached",
         ),
+        (
+            EscrowError::ReleaseExceedsLocked,
+            106,
+            "release cumulative amount exceeding the locked amount",
+        ),
     ];
 
     #[test]
@@ -1926,18 +2063,40 @@ mod error_code_tests {
         let mut e = escrow().with_quorum(policy).unwrap();
         e.fund(ALICE).unwrap();
         e.attest(ATTESTOR_1).unwrap(); // 1 of 2: not enough
-        let err = e.release(ALICE).unwrap_err();
+        let err = e.release(ALICE, 1_000_000).unwrap_err();
         assert_eq!(err, EscrowError::QuorumNotReached);
         assert_eq!(err.code(), 105);
     }
 
     #[test]
-    fn check_order_is_visible_in_codes() {
-        // Authority is checked before state: a stranger on a terminal
+    fn release_exceeds_locked_triggered_by_over_release() {
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        e.release(ALICE, 600_000).unwrap(); // partial: 400_000 remains
+        let err = e.release(ALICE, 400_001).unwrap_err();
+        assert_eq!(err, EscrowError::ReleaseExceedsLocked);
+        assert_eq!(err.code(), 106);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 600_000, "failed release must not move released");
+    }
+
+    #[test]
+    fn amount_mismatch_triggered_by_zero_amount_release() {
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        let err = e.release(ALICE, 0).unwrap_err();
+        assert_eq!(err, EscrowError::AmountMismatch);
+        assert_eq!(err.code(), 102);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn check_order_is_visible_in_codes() {        // Authority is checked before state: a stranger on a terminal
         // state still gets 100 (Unauthorized), not 101.
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        e.release(ALICE).unwrap(); // now Released
+        e.release(ALICE, 1_000_000).unwrap(); // now Released
         let err = e.fund(MALLORY).unwrap_err();
         assert_eq!(err.code(), 100);
         // ... while the initializer sees the state error, 101.
@@ -2103,9 +2262,19 @@ mod property_tests {
             // fund → release.
             let mut e = mk();
             e.fund(ALICE).unwrap();
-            e.release(ALICE).unwrap();
+            e.release(ALICE, amount).unwrap();
             assert_eq!(e.state(), EscrowState::Released);
             assert_eq!(e.amount(), amount, "case {case}: amount changed on release path");
+            assert_eq!(
+                e.released_amount(),
+                amount,
+                "case {case}: full release not tracked in released_amount"
+            );
+            assert_eq!(
+                e.remaining_amount(),
+                0,
+                "case {case}: remaining not zero after full release"
+            );
 
             // fund → cancel.
             let mut e = mk();
@@ -2132,9 +2301,19 @@ mod property_tests {
             e.fund(ALICE).unwrap();
             e.attest([0xA1; 32]).unwrap();
             e.attest([0xA2; 32]).unwrap();
-            e.release(ALICE).unwrap();
+            e.release(ALICE, amount).unwrap();
             assert_eq!(e.state(), EscrowState::Released);
             assert_eq!(e.amount(), amount, "case {case}: amount changed on quorum path");
+            assert_eq!(
+                e.released_amount(),
+                amount,
+                "case {case}: full release not tracked in released_amount"
+            );
+            assert_eq!(
+                e.remaining_amount(),
+                0,
+                "case {case}: remaining not zero after full release"
+            );
         });
     }
 
@@ -2274,6 +2453,7 @@ mod account_space_tests {
         out.extend_from_slice(&e.initializer);
         out.extend_from_slice(&e.taker);
         out.extend_from_slice(&e.amount.to_le_bytes());
+        out.extend_from_slice(&e.released.to_le_bytes());
         out.extend_from_slice(&e.expires_at.to_le_bytes());
         out.push(e.state as u8);
         match e.quorum {
@@ -2301,17 +2481,17 @@ mod account_space_tests {
         // `space =` expression with them.
         assert_eq!(QUORUM_POLICY_LEN, 8 * 32 + 1 + 1 + 8, "quorum policy bytes");
         assert_eq!(QUORUM_POLICY_LEN, 266);
-        // 32 + 32 + 8 + 8 + 1 + (1 + 266)
-        assert_eq!(ESCROW_BODY_LEN, 348, "escrow payload bytes");
+        // 32 + 32 + 8 + 8 + 8 + 1 + (1 + 266)
+        assert_eq!(ESCROW_BODY_LEN, 356, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 356, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 364, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte discriminant).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 1 + 1,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 90);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 98);
     }
 
     #[test]
@@ -2342,18 +2522,24 @@ mod account_space_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
 
         // Field offsets: 0..32 initializer, 32..64 taker, 64..72 amount,
-        // 72..80 expires_at, 80 state, 81 quorum discriminant (None).
+        // 72..80 released, 80..88 expires_at, 88 state, 89 quorum
+        // discriminant (None).
         assert_eq!(&bytes[0..32], &ALICE);
         assert_eq!(&bytes[32..64], &BOB);
         assert_eq!(u64::from_le_bytes(bytes[64..72].try_into().unwrap()), 1_000_000);
         assert_eq!(
             u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
+            0,
+            "nothing released yet"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
             EXPIRES_AT
         );
-        assert_eq!(bytes[80], EscrowState::Funded as u8);
-        assert_eq!(bytes[81], 0, "quorum: None discriminant");
+        assert_eq!(bytes[88], EscrowState::Funded as u8);
+        assert_eq!(bytes[89], 0, "quorum: None discriminant");
         assert_eq!(
-            &bytes[82..],
+            &bytes[90..],
             &[0u8; QUORUM_POLICY_LEN],
             "None quorum reserves zeroed quorum bytes in the account layout"
         );
@@ -2370,16 +2556,21 @@ mod account_space_tests {
         e.attest([0xA1; 32]).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes[81], 1, "quorum: Some discriminant");
-        // attestors: 82..338 (8 x 32), registered at 338, threshold at 339,
-        // approvals u64 LE at 340..348.
-        assert_eq!(&bytes[82..114], &[0xA1; 32]);
-        assert_eq!(&bytes[114..146], &[0xA2; 32]);
-        assert_eq!(&bytes[146..338], &[0u8; 192], "unused attestor slots are zero");
-        assert_eq!(bytes[338], 2, "registered count");
-        assert_eq!(bytes[339], 2, "threshold");
+        assert_eq!(bytes[89], 1, "quorum: Some discriminant");
         assert_eq!(
-            u64::from_le_bytes(bytes[340..348].try_into().unwrap()),
+            u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
+            0,
+            "released field offset, nothing released yet"
+        );
+        // attestors: 90..346 (8 x 32), registered at 346, threshold at 347,
+        // approvals u64 LE at 348..356.
+        assert_eq!(&bytes[90..122], &[0xA1; 32]);
+        assert_eq!(&bytes[122..154], &[0xA2; 32]);
+        assert_eq!(&bytes[154..346], &[0u8; 192], "unused attestor slots are zero");
+        assert_eq!(bytes[346], 2, "registered count");
+        assert_eq!(bytes[347], 2, "threshold");
+        assert_eq!(
+            u64::from_le_bytes(bytes[348..356].try_into().unwrap()),
             0b01,
             "approval bitmask after one attestation"
         );
@@ -2393,16 +2584,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 356) * 3480 * 2 = 484 * 6960 = 3_368_640 lamports.
-        assert_eq!(full, 3_368_640);
+        // (128 + 364) * 3480 * 2 = 492 * 6960 = 3_424_320 lamports.
+        assert_eq!(full, 3_424_320);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 90) * 3480 * 2 = 218 * 6960 = 1_517_280 lamports.
-        assert_eq!(no_quorum, 1_517_280);
+        // (128 + 98) * 3480 * 2 = 226 * 6960 = 1_572_960 lamports.
+        assert_eq!(no_quorum, 1_572_960);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -2445,13 +2636,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(3_368_640, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(3_424_320, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(3_368_639, params.0, params.1),
+            check_vault_rent_exempt(3_424_319, params.0, params.1),
             Err(RentShortfall {
-                required: 3_368_640,
-                provided: 3_368_639,
+                required: 3_424_320,
+                provided: 3_424_319,
             })
         );
         // Generous funding: exempt.
@@ -2463,9 +2654,186 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 3_368_640,
+                required: 3_424_320,
                 provided: 0,
             })
         );
+    }
+}
+
+// ---------- AV-11: partial release with cumulative cap ----------
+//
+// `release` takes an `amount`: partial releases accumulate in the
+// `released` field and leave the escrow `Funded` until the cumulative
+// released total reaches the locked amount, at which point the escrow
+// becomes `Released`. Cumulative releases must never exceed the locked
+// amount (`ReleaseExceedsLocked`); a zero-amount release is
+// `AmountMismatch`. `released_amount()` / `remaining_amount()` expose the
+// release progress for staged payouts (e.g. delivery milestones paid out
+// in tranches), and `cancel` / `cancel_expired` after partial releases
+// refund only the remainder while preserving `released_amount` for audit.
+#[cfg(test)]
+mod partial_release_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const ATTESTOR_1: [u8; 32] = [0xA1; 32];
+    const ATTESTOR_2: [u8; 32] = [0xA2; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn funded_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.released_amount(),
+            0,
+            "a freshly funded escrow has released nothing"
+        );
+        e
+    }
+
+    #[test]
+    fn partial_release_stays_funded_with_progress_tracked() {
+        let mut e = funded_escrow();
+        e.release(ALICE, 400_000).unwrap();
+        assert_eq!(
+            e.state(),
+            EscrowState::Funded,
+            "a partial release must not close the escrow"
+        );
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.remaining_amount(), 600_000);
+        // A second partial accumulates on top of the first.
+        e.release(ALICE, 100_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 500_000);
+        assert_eq!(e.remaining_amount(), 500_000);
+    }
+
+    #[test]
+    fn final_partial_release_closes_the_escrow() {
+        let mut e = funded_escrow();
+        e.release(ALICE, 400_000).unwrap();
+        e.release(ALICE, 600_000).unwrap(); // reaches the locked amount exactly
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.remaining_amount(), 0);
+    }
+
+    #[test]
+    fn zero_amount_release_is_amount_mismatch_and_changes_nothing() {
+        let mut e = funded_escrow();
+        assert_eq!(e.release(ALICE, 0), Err(EscrowError::AmountMismatch));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn release_beyond_remaining_is_release_exceeds_locked() {
+        let mut e = funded_escrow();
+        e.release(ALICE, 600_000).unwrap();
+        // 400_000 remains: asking for one lamport more must fail.
+        assert_eq!(
+            e.release(ALICE, 400_001),
+            Err(EscrowError::ReleaseExceedsLocked)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            e.released_amount(),
+            600_000,
+            "a failed release must not move the counter"
+        );
+        assert_eq!(e.remaining_amount(), 400_000);
+    }
+
+    #[test]
+    fn cumulative_addition_overflow_is_release_exceeds_locked() {
+        // u64::MAX escrow: release u64::MAX - 10 (stays Funded), then
+        // release(11) would overflow the u64 accumulator — a wrapping add
+        // would reset the counter to 0 and let the lockup be drained past
+        // its amount. The checked_add guard must catch it instead.
+        let mut e = Escrow::initialize(ALICE, BOB, u64::MAX, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        e.release(ALICE, u64::MAX - 10).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), u64::MAX - 10);
+        assert_eq!(
+            e.release(ALICE, 11),
+            Err(EscrowError::ReleaseExceedsLocked)
+        );
+        assert_eq!(
+            e.released_amount(),
+            u64::MAX - 10,
+            "the counter is untouched by the overflow attempt"
+        );
+        // The exact remainder still works and closes the escrow.
+        e.release(ALICE, 10).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.remaining_amount(), 0);
+    }
+
+    #[test]
+    fn quorum_still_gates_partial_release() {
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        // A partial amount changes nothing about the gate: no attestations.
+        assert_eq!(
+            e.release(ALICE, 400_000),
+            Err(EscrowError::QuorumNotReached)
+        );
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn attestations_allowed_between_partial_releases() {
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.attest(ATTESTOR_1).unwrap();
+        // 1 of 2: still gated.
+        assert_eq!(
+            e.release(ALICE, 400_000),
+            Err(EscrowError::QuorumNotReached)
+        );
+        e.attest(ATTESTOR_2).unwrap();
+        // Gate satisfied: the partial release goes through and stays Funded.
+        e.release(ALICE, 400_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 400_000);
+        // The final partial closes the escrow.
+        e.release(ALICE, 600_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn cancel_after_partial_release_refunds_remainder_and_preserves_released() {
+        let mut e = funded_escrow();
+        e.release(ALICE, 400_000).unwrap();
+        e.cancel(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        // Released funds stay released; the refund is the remainder.
+        assert_eq!(e.released_amount(), 400_000, "released preserved for audit");
+        assert_eq!(e.remaining_amount(), 600_000, "refundable remainder");
+    }
+
+    #[test]
+    fn release_after_full_release_is_invalid_transition() {
+        let mut e = funded_escrow();
+        e.release(ALICE, 1_000_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.release(ALICE, 1_000_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.released_amount(), 1_000_000);
     }
 }

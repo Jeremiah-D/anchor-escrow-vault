@@ -48,11 +48,16 @@ pub mod escrow_vault {
         Ok(())
     }
 
-    /// Release locked funds to the taker (`Funded -> Released`).
-    pub fn release(ctx: Context<Release>) -> Result<()> {
+    /// Release `amount` of the locked funds to the taker. Partial releases
+    /// accumulate in `vault.released` and leave the escrow `Funded`; when
+    /// the cumulative released total reaches the locked amount the escrow
+    /// becomes `Released`. Cumulative releases must not exceed the locked
+    /// amount (`ReleaseExceedsLocked`); `amount == 0` is `AmountMismatch`.
+    /// The AV-04 quorum gate applies exactly as the state machine defines.
+    pub fn release(ctx: Context<Release>, amount: u64) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         escrow
-            .release(ctx.accounts.initializer.key().to_bytes())
+            .release(ctx.accounts.initializer.key().to_bytes(), amount)
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // Transfer of lamports/tokens to `ctx.accounts.taker` goes here
@@ -127,6 +132,10 @@ pub struct Vault {
     pub initializer: Pubkey,
     pub taker: Pubkey,
     pub amount: u64,
+    /// Cumulative amount released via `release` so far (AV-11): partial
+    /// releases accumulate here; always `<= amount`. Layout position
+    /// matches `escrow_state::VAULT_FIELDS`.
+    pub released: u64,
     /// Unix timestamp after which either party may cancel the escrow.
     pub expires_at: u64,
     // The authoritative state lives in `escrow_state::EscrowState`;
@@ -157,11 +166,11 @@ pub struct Quorum {
 #[derive(Accounts)]
 pub struct Initialize<'info> {
     // Full vault space, quorum region included: 8-byte discriminator +
-    // 348-byte payload = 356 bytes (see `escrow_state::VAULT_SPACE`).
+    // 356-byte payload = 364 bytes (see `escrow_state::VAULT_SPACE`).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 3_368_640 lamports.
+    // rent parameters the minimum is 3_424_320 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
@@ -239,7 +248,7 @@ fn write_escrow(_vault: &mut Account<Vault>, _escrow: &escrow_state::Escrow) {
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {
     // One program error per EscrowError variant, so on-chain failures
-    // surface the exact `escrow_state` reason (code 100–105) to clients.
+    // surface the exact `escrow_state` reason (code 100–106) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
         escrow_state::EscrowError::InvalidStateTransition => {
@@ -249,6 +258,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {
         escrow_state::EscrowError::NotExpired => error!(ErrorCode::NotExpired),
         escrow_state::EscrowError::InvalidQuorum => error!(ErrorCode::InvalidQuorum),
         escrow_state::EscrowError::QuorumNotReached => error!(ErrorCode::QuorumNotReached),
+        escrow_state::EscrowError::ReleaseExceedsLocked => {
+            error!(ErrorCode::ReleaseExceedsLocked)
+        }
     }
 }
 
@@ -266,4 +278,6 @@ pub enum ErrorCode {
     InvalidQuorum,
     #[msg("Release quorum threshold not reached yet")]
     QuorumNotReached,
+    #[msg("Cumulative release amount exceeds the locked amount")]
+    ReleaseExceedsLocked,
 }
