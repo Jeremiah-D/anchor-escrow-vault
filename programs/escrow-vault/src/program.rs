@@ -123,6 +123,34 @@ pub mod escrow_vault {
         // Flip the attestor's bit in `vault.quorum.approvals` in the real build.
         Ok(())
     }
+
+    /// Opt in to dual-signature activation (AV-12; mirrors
+    /// `Escrow::with_dual_sig`). `Uninitialized` only, like
+    /// `initialize_quorum`. After this, `fund` requires the escrow to be
+    /// `Activated`: a single signature can create the escrow but never
+    /// fund it.
+    pub fn initialize_dual_sig(ctx: Context<InitializeDualSig>) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow.with_dual_sig().map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Sets the required-bit in `vault.activation` in the real build.
+        Ok(())
+    }
+
+    /// Record one party's activation signature (AV-12; mirrors
+    /// `Escrow::activate`). Either the initializer or the taker signs;
+    /// idempotent per party. When both bits are set the escrow moves
+    /// `Uninitialized -> Activated`, unlocking `fund`. A stranger's
+    /// signature is `Unauthorized`.
+    pub fn activate(ctx: Context<Activate>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .activate(ctx.accounts.authority.key().to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Flip the party's bit in `vault.activation` in the real build.
+        Ok(())
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -148,6 +176,11 @@ pub struct Vault {
     /// `initialize_quorum` writes the policy in place without reallocating.
     /// Full serialized layout: `escrow_state::VAULT_FIELDS`.
     pub quorum: Option<Quorum>,
+    /// AV-12: dual-signature activation bitmask (bit 0 initializer, bit 1
+    /// taker, bit 2 dual-sig required); mirrors `escrow_state`'s
+    /// `activation` field. Always present (one byte, zeroed for plain
+    /// escrows). Layout position matches `escrow_state::VAULT_FIELDS`.
+    pub activation: u8,
 }
 
 /// Skeleton mirror of `escrow_state::QuorumPolicy`: up to 8 registered
@@ -166,11 +199,12 @@ pub struct Quorum {
 #[derive(Accounts)]
 pub struct Initialize<'info> {
     // Full vault space, quorum region included: 8-byte discriminator +
-    // 356-byte payload = 364 bytes (see `escrow_state::VAULT_SPACE`).
+    // 357-byte payload = 365 bytes (see `escrow_state::VAULT_SPACE`;
+    // AV-12 added the 1-byte activation bitmask).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 3_424_320 lamports.
+    // rent parameters the minimum is 3_431_280 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
@@ -230,6 +264,27 @@ pub struct Attest<'info> {
     /// Must be one of the registered attestors; the state machine
     /// rejects anyone else with `Unauthorized`.
     pub attestor: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeDualSig<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer opts into dual-signature activation; the
+    /// state machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Activate<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker; the state machine enforces
+    /// the either-party rule and the per-party idempotency. A constraint
+    /// in the real build additionally asserts `authority.key() ==
+    /// vault.initializer || authority.key() == vault.taker`.
+    pub authority: Signer<'info>,
 }
 
 // --- Helpers (finalized during the real Anchor build) ---

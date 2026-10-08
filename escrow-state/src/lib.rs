@@ -12,6 +12,13 @@ pub enum EscrowState {
     Funded,
     Released,
     Cancelled,
+    /// AV-12: both parties of a dual-signature escrow have recorded their
+    /// activation signatures. Lifecycle position is
+    /// `Uninitialized -> Activated -> Funded` (via [`Escrow::activate`],
+    /// then [`Escrow::fund`]). The variant is appended last — not in
+    /// lifecycle order — so the existing Borsh discriminants (0–3) stay
+    /// stable for already-serialized vaults.
+    Activated,
 }
 
 /// An escrow vault. Public keys are `[u8; 32]` so this crate stays
@@ -36,7 +43,24 @@ pub struct Escrow {
     /// Optional N-of-M attestor quorum gating `release`. `None` means a
     /// plain two-party escrow (backward compatible).
     quorum: Option<QuorumPolicy>,
+    /// AV-12: dual-signature activation bitmask (see
+    /// [`ACTIVATION_INITIALIZER_BIT`] etc.). Activation progress must
+    /// survive serialization, so it is a persisted field, not a transient
+    /// flag. `0` for plain escrows — dual-signature activation is opt-in
+    /// via [`Escrow::with_dual_sig`].
+    activation: u8,
 }
+
+/// Bit 0 of [`Escrow::activation`]: the initializer has recorded their
+/// activation signature via [`Escrow::activate`].
+pub const ACTIVATION_INITIALIZER_BIT: u8 = 0b001;
+/// Bit 1 of [`Escrow::activation`]: the taker has recorded their
+/// activation signature via [`Escrow::activate`].
+pub const ACTIVATION_TAKER_BIT: u8 = 0b010;
+/// Bit 2 of [`Escrow::activation`]: dual-signature activation is required
+/// before [`Escrow::fund`]. Set once by [`Escrow::with_dual_sig`] on an
+/// `Uninitialized` escrow; never cleared afterwards.
+pub const ACTIVATION_DUAL_SIG_REQUIRED_BIT: u8 = 0b100;
 
 /// Errors the state machine can return.
 ///
@@ -220,6 +244,7 @@ impl Escrow {
             expires_at,
             state: EscrowState::Uninitialized,
             quorum: None,
+            activation: 0,
         })
     }
 
@@ -230,16 +255,103 @@ impl Escrow {
         Ok(())
     }
 
-    /// Lock funds into the vault. `Uninitialized -> Funded`.
+    /// Lock funds into the vault. `Uninitialized -> Funded` for a plain
+    /// escrow, `Activated -> Funded` for a dual-signature escrow
+    /// (AV-12): a single signature can create the escrow, but only the
+    /// initializer *after both parties activated* may fund it.
     pub fn fund(&mut self, authority: [u8; 32]) -> Result<(), EscrowError> {
         self.require_initializer(authority)?;
         match self.state {
-            EscrowState::Uninitialized => {
+            EscrowState::Uninitialized if !self.dual_sig_required() => {
+                self.state = EscrowState::Funded;
+                Ok(())
+            }
+            // Dual-signature escrows fund only from `Activated`: one party
+            // activating alone leaves the escrow `Uninitialized`, and
+            // `fund` from there is `InvalidStateTransition`.
+            EscrowState::Activated => {
                 self.state = EscrowState::Funded;
                 Ok(())
             }
             _ => Err(EscrowError::InvalidStateTransition),
         }
+    }
+
+    /// Opt in to dual-signature activation (AV-12). Builder-style: only
+    /// valid on an `Uninitialized` escrow, so the activation requirement
+    /// is fixed before any funds move — mirroring [`Escrow::with_quorum`].
+    /// After this, `fund` requires the escrow to be `Activated`
+    /// (both parties recorded via [`Escrow::activate`]); a lone
+    /// initializer signature can create but never fund the escrow.
+    /// Models Solana multisig escrow activation, where each party's
+    /// approval arrives as a separate signed transaction.
+    pub fn with_dual_sig(mut self) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        self.activation |= ACTIVATION_DUAL_SIG_REQUIRED_BIT;
+        Ok(self)
+    }
+
+    /// Record one party's activation signature (AV-12). Only the
+    /// initializer or the taker may call this (`Unauthorized` otherwise);
+    /// only on a dual-signature escrow still `Uninitialized`
+    /// (`InvalidStateTransition` otherwise — including re-activation of
+    /// an already-`Activated` escrow).
+    ///
+    /// Idempotent per party: activating twice sets the same bit again and
+    /// succeeds. When *both* bits are set the escrow moves
+    /// `Uninitialized -> Activated`, unlocking `fund`.
+    ///
+    /// Check order is deliberate: authority first, then state, then the
+    /// dual-sig requirement — a stranger learns nothing about the
+    /// escrow's configuration from the error alone.
+    pub fn activate(&mut self, authority: [u8; 32]) -> Result<(), EscrowError> {
+        if authority != self.initializer && authority != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if !self.dual_sig_required() {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        // Independent `if`s, not `if/else`: when initializer == taker
+        // (degenerate self-escrow) one signature sets both party bits at
+        // once. With distinct keys exactly one bit is set per call.
+        if authority == self.initializer {
+            self.activation |= ACTIVATION_INITIALIZER_BIT;
+        }
+        if authority == self.taker {
+            self.activation |= ACTIVATION_TAKER_BIT;
+        }
+        // Degenerate case initializer == taker: one signature sets both
+        // bits at once and activates immediately. Deterministic and
+        // consistent — a self-escrow needs no counterparty.
+        if self.activation & (ACTIVATION_INITIALIZER_BIT | ACTIVATION_TAKER_BIT)
+            == (ACTIVATION_INITIALIZER_BIT | ACTIVATION_TAKER_BIT)
+        {
+            self.state = EscrowState::Activated;
+        }
+        Ok(())
+    }
+
+    /// True when dual-signature activation was opted in via
+    /// [`Escrow::with_dual_sig`].
+    pub fn dual_sig_required(&self) -> bool {
+        self.activation & ACTIVATION_DUAL_SIG_REQUIRED_BIT != 0
+    }
+
+    /// True when the initializer has recorded their activation signature.
+    pub fn initializer_activated(&self) -> bool {
+        self.activation & ACTIVATION_INITIALIZER_BIT != 0
+    }
+
+    /// True when the taker has recorded their activation signature.
+    pub fn taker_activated(&self) -> bool {
+        self.activation & ACTIVATION_TAKER_BIT != 0
     }
 
     /// Release `amount` of the locked funds to the taker. Partial releases
@@ -346,13 +458,15 @@ impl Escrow {
 
     /// Record an attestation from a registered attestor.
     ///
-    /// Allowed while the escrow is `Uninitialized` or `Funded` (attestors
-    /// usually vote before release is attempted); rejected on terminal
-    /// states. Errors `InvalidQuorum` when no quorum is configured, and
-    /// `Unauthorized` for callers outside the registered attestor set.
+    /// Allowed while the escrow is `Uninitialized`, `Activated` (AV-12:
+    /// attestors may vote after both parties activated but before
+    /// funding), or `Funded` (attestors usually vote before release is
+    /// attempted); rejected on terminal states. Errors `InvalidQuorum`
+    /// when no quorum is configured, and `Unauthorized` for callers
+    /// outside the registered attestor set.
     pub fn attest(&mut self, attestor: [u8; 32]) -> Result<(), EscrowError> {
         match self.state {
-            EscrowState::Uninitialized | EscrowState::Funded => {}
+            EscrowState::Uninitialized | EscrowState::Activated | EscrowState::Funded => {}
             _ => return Err(EscrowError::InvalidStateTransition),
         }
         match self.quorum.as_mut() {
@@ -439,6 +553,10 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // `Some`. The space is always reserved (even for plain two-party
     // escrows) so `initialize_quorum` never needs to grow the account.
     ("quorum", "Option<QuorumPolicy>", 1 + QUORUM_POLICY_LEN),
+    // AV-12: dual-signature activation bitmask (bit 0 initializer, bit 1
+    // taker, bit 2 dual-sig required). One byte; activation progress must
+    // survive serialization.
+    ("activation", "u8 (bitmask)", 1),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -464,9 +582,10 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// Vault space when the account is created without quorum data
 /// (`quorum: None` serializes as a single discriminant byte). The program
 /// skeleton's `Initialize` constraint uses this exact expression; quorum
-/// data is written in place later without reallocating.
+/// data is written in place later without reallocating. The activation
+/// bitmask (AV-12) is always present — one byte, zeroed for plain escrows.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -830,18 +949,26 @@ mod permission_tests {
     const ZERO_KEY: [u8; 32] = [0x00; 32];
     const EXPIRES_AT: u64 = 1_800_000_000;
 
-    const ALL_STATES: [EscrowState; 4] = [
+    const ALL_STATES: [EscrowState; 5] = [
         EscrowState::Uninitialized,
+        EscrowState::Activated,
         EscrowState::Funded,
         EscrowState::Released,
         EscrowState::Cancelled,
     ];
 
-    /// Build an escrow in each of the four lifecycle states.
+    /// Build an escrow in each of the five lifecycle states.
     fn in_state(state: EscrowState) -> Escrow {
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         match state {
             EscrowState::Uninitialized => {}
+            EscrowState::Activated => {
+                // AV-12: dual-signature escrow, both parties activated,
+                // not yet funded.
+                e = e.with_dual_sig().unwrap();
+                e.activate(ALICE).unwrap();
+                e.activate(BOB).unwrap();
+            }
             EscrowState::Funded => e.fund(ALICE).unwrap(),
             EscrowState::Released => {
                 e.fund(ALICE).unwrap();
@@ -1600,11 +1727,32 @@ mod anchor_idl_tests {
                             Anchor account constraint, not the state machine",
         },
         InstructionSpec {
+            // AV-12: dual-signature activation.
+            name: "initialize_dual_sig",
+            params: &[],
+            method: "Escrow::with_dual_sig",
+            input_mapping: "no params; authority <- accounts.initializer \
+                            (signer), enforced by the Anchor account \
+                            constraint, not the state machine; \
+                            Uninitialized only, like initialize_quorum",
+        },
+        InstructionSpec {
+            name: "activate",
+            params: &[],
+            method: "Escrow::activate",
+            input_mapping: "authority <- accounts.authority (signer: \
+                            initializer OR taker); records one party's \
+                            activation bit; both bits set moves the escrow \
+                            Uninitialized -> Activated, unlocking fund",
+        },
+        InstructionSpec {
             name: "attest",
             params: &[],
             method: "Escrow::attest",
             input_mapping: "attestor <- accounts.attestor (signer; must be \
-                            in the registered set)",
+                            in the registered set); allowed in \
+                            Uninitialized, Activated (AV-12: between \
+                            activation and funding), and Funded",
         },
     ];
 
@@ -1638,6 +1786,8 @@ mod anchor_idl_tests {
             "Escrow::cancel",
             "Escrow::cancel_expired",
             "QuorumPolicy::new + Escrow::with_quorum",
+            "Escrow::with_dual_sig",
+            "Escrow::activate",
             "Escrow::attest",
         ];
         assert_eq!(
@@ -1790,6 +1940,63 @@ mod anchor_idl_tests {
         assert_eq!(e.quorum().unwrap().approval_count(), 1);
     }
 
+    #[test]
+    fn initialize_dual_sig_maps_initializer_signer_to_requirement() {
+        // IDL: initialize_dual_sig() — no params; authority <-
+        // accounts.initializer (signer), enforced by the Anchor account
+        // constraint. Mirrors initialize_quorum: Uninitialized only.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        assert!(e.dual_sig_required());
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        // Documented failure mode: re-configuring after activation is a
+        // builder like with_quorum — only valid pre-funding.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        assert_eq!(
+            e.with_dual_sig(),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn activate_maps_either_party_signer_to_activation_bit() {
+        // IDL: activate() — no params; authority <- accounts.authority
+        // (signer: initializer OR taker). One signature alone cannot fund;
+        // both signatures move Uninitialized -> Activated.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        // Single signature (either party) leaves the escrow Uninitialized:
+        // fund is still rejected.
+        e.activate(ALICE).unwrap();
+        assert!(e.initializer_activated());
+        assert!(!e.taker_activated());
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(e.fund(ALICE), Err(EscrowError::InvalidStateTransition));
+        // The second party's signature activates; fund now succeeds.
+        e.activate(BOB).unwrap();
+        assert!(e.taker_activated());
+        assert_eq!(e.state(), EscrowState::Activated);
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        // Documented failure mode: stranger learns nothing (Unauthorized
+        // before any state/config check).
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        assert_eq!(e.activate(MALLORY), Err(EscrowError::Unauthorized));
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+    }
+
     // ----- AV-10, second half: two-way vault-field <-> IDL consistency -----
     //
     // Direction 1 (IDL -> account): every instruction param must populate
@@ -1824,7 +2031,12 @@ mod anchor_idl_tests {
         ("taker", "accounts.taker, stored by initialize"),
         (
             "state",
-            "transitions: fund/release/cancel/cancel_expired",
+            "transitions: fund/release/cancel/cancel_expired/activate",
+        ),
+        (
+            "activation",
+            "zeroed by initialize; required-bit set by initialize_dual_sig, \
+             party bits flipped by activate",
         ),
         (
             "quorum.registered",
@@ -2471,6 +2683,9 @@ mod account_space_tests {
                 out.extend_from_slice(&q.approvals.to_le_bytes());
             }
         }
+        // AV-12: activation bitmask, always present (zeroed for plain
+        // escrows), Borsh field order after `quorum`.
+        out.push(e.activation);
         out
     }
 
@@ -2481,17 +2696,19 @@ mod account_space_tests {
         // `space =` expression with them.
         assert_eq!(QUORUM_POLICY_LEN, 8 * 32 + 1 + 1 + 8, "quorum policy bytes");
         assert_eq!(QUORUM_POLICY_LEN, 266);
-        // 32 + 32 + 8 + 8 + 8 + 1 + (1 + 266)
-        assert_eq!(ESCROW_BODY_LEN, 356, "escrow payload bytes");
+        // 32 + 32 + 8 + 8 + 8 + 1 + (1 + 266) + 1 (AV-12 activation bitmask)
+        assert_eq!(ESCROW_BODY_LEN, 357, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 364, "full Vault account space");
-        // Discriminator + payload with `quorum: None` (1-byte discriminant).
+        assert_eq!(VAULT_SPACE, 365, "full Vault account space");
+        // Discriminator + payload with `quorum: None` (1-byte
+        // discriminant) + 1-byte activation bitmask (AV-12, always
+        // present even for plain escrows).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 98);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 99);
     }
 
     #[test]
@@ -2511,6 +2728,9 @@ mod account_space_tests {
         assert_eq!(EscrowState::Funded as u8, 1);
         assert_eq!(EscrowState::Released as u8, 2);
         assert_eq!(EscrowState::Cancelled as u8, 3);
+        // AV-12: appended last so discriminants 0–3 stay stable for
+        // already-serialized vaults.
+        assert_eq!(EscrowState::Activated as u8, 4);
     }
 
     #[test]
@@ -2523,7 +2743,7 @@ mod account_space_tests {
 
         // Field offsets: 0..32 initializer, 32..64 taker, 64..72 amount,
         // 72..80 released, 80..88 expires_at, 88 state, 89 quorum
-        // discriminant (None).
+        // discriminant (None), 356 activation bitmask (AV-12).
         assert_eq!(&bytes[0..32], &ALICE);
         assert_eq!(&bytes[32..64], &BOB);
         assert_eq!(u64::from_le_bytes(bytes[64..72].try_into().unwrap()), 1_000_000);
@@ -2539,10 +2759,13 @@ mod account_space_tests {
         assert_eq!(bytes[88], EscrowState::Funded as u8);
         assert_eq!(bytes[89], 0, "quorum: None discriminant");
         assert_eq!(
-            &bytes[90..],
+            &bytes[90..356],
             &[0u8; QUORUM_POLICY_LEN],
             "None quorum reserves zeroed quorum bytes in the account layout"
         );
+        // AV-12: activation bitmask trails the quorum region; zero for a
+        // plain escrow.
+        assert_eq!(bytes[356], 0, "activation bitmask offset, plain escrow");
 
         // With quorum: same total length (space is always reserved), Some
         // discriminant, attestor bytes and approval bitmask in place.
@@ -2574,6 +2797,9 @@ mod account_space_tests {
             0b01,
             "approval bitmask after one attestation"
         );
+        // AV-12: activation bitmask trails the quorum region; zero here
+        // (this escrow did not opt into dual-signature activation).
+        assert_eq!(bytes[356], 0, "activation bitmask offset, no dual-sig");
     }
 
     #[test]
@@ -2584,16 +2810,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 364) * 3480 * 2 = 492 * 6960 = 3_424_320 lamports.
-        assert_eq!(full, 3_424_320);
+        // (128 + 365) * 3480 * 2 = 493 * 6960 = 3_431_280 lamports.
+        assert_eq!(full, 3_431_280);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 98) * 3480 * 2 = 226 * 6960 = 1_572_960 lamports.
-        assert_eq!(no_quorum, 1_572_960);
+        // (128 + 99) * 3480 * 2 = 227 * 6960 = 1_579_920 lamports.
+        assert_eq!(no_quorum, 1_579_920);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -2636,13 +2862,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(3_424_320, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(3_431_280, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(3_424_319, params.0, params.1),
+            check_vault_rent_exempt(3_431_279, params.0, params.1),
             Err(RentShortfall {
-                required: 3_424_320,
-                provided: 3_424_319,
+                required: 3_431_280,
+                provided: 3_431_279,
             })
         );
         // Generous funding: exempt.
@@ -2654,7 +2880,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 3_424_320,
+                required: 3_431_280,
                 provided: 0,
             })
         );
@@ -2835,5 +3061,230 @@ mod partial_release_tests {
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.released_amount(), 1_000_000);
+    }
+}
+
+// ---------- AV-12: dual-signature activation ----------
+//
+// A dual-signature escrow requires both the initializer and the taker to
+// record an activation signature before funds can move: one signature
+// creates the escrow, two signatures unlock funding. This mirrors Solana
+// multisig escrow activation, where each party's approval arrives as a
+// separate signed transaction. The requirement is opt-in via the
+// `with_dual_sig` builder (plain escrows behave exactly as before), and
+// activation progress is a persisted bitmask so it survives
+// serialization to the Vault account.
+#[cfg(test)]
+mod dual_sig_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn dual_sig_escrow() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+    }
+
+    fn activated_escrow() -> Escrow {
+        let mut e = dual_sig_escrow();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Activated);
+        e
+    }
+
+    #[test]
+    fn plain_escrow_has_no_dual_sig_requirement() {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert!(!e.dual_sig_required());
+        assert!(!e.initializer_activated());
+        assert!(!e.taker_activated());
+    }
+
+    #[test]
+    fn with_dual_sig_sets_only_the_requirement_bit() {
+        let e = dual_sig_escrow();
+        assert!(e.dual_sig_required());
+        assert!(!e.initializer_activated());
+        assert!(!e.taker_activated());
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+    }
+
+    #[test]
+    fn with_dual_sig_rejected_after_activation() {
+        let e = activated_escrow();
+        assert_eq!(
+            e.with_dual_sig(),
+            Err(EscrowError::InvalidStateTransition),
+            "the requirement is fixed before funds move, like with_quorum"
+        );
+    }
+
+    #[test]
+    fn single_activation_keeps_escrow_uninitialized_and_unfundable() {
+        // Either party alone: bit recorded, state unchanged, fund refused.
+        for party in [ALICE, BOB] {
+            let mut e = dual_sig_escrow();
+            e.activate(party).unwrap();
+            assert_eq!(e.state(), EscrowState::Uninitialized);
+            assert_eq!(e.fund(ALICE), Err(EscrowError::InvalidStateTransition));
+            assert_eq!(e.fund(BOB), Err(EscrowError::Unauthorized));
+        }
+    }
+
+    #[test]
+    fn both_activations_unlock_fund() {
+        let mut e = activated_escrow();
+        // Activation order does not matter; taker-first works too.
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn taker_first_activation_order_also_works() {
+        let mut e = dual_sig_escrow();
+        e.activate(BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        e.activate(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Activated);
+    }
+
+    #[test]
+    fn activate_is_idempotent_per_party() {
+        let mut e = dual_sig_escrow();
+        e.activate(ALICE).unwrap();
+        // Second activation by the same party: same bit, still
+        // Uninitialized, still no error.
+        e.activate(ALICE).unwrap();
+        assert!(e.initializer_activated());
+        assert!(!e.taker_activated());
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+    }
+
+    #[test]
+    fn stranger_activate_is_unauthorized_and_changes_nothing() {
+        let mut e = dual_sig_escrow();
+        assert_eq!(e.activate(MALLORY), Err(EscrowError::Unauthorized));
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert!(!e.initializer_activated());
+        assert!(!e.taker_activated());
+    }
+
+    #[test]
+    fn activate_on_plain_escrow_is_invalid_transition() {
+        // `activate` is meaningless without the opt-in; it must not
+        // silently succeed on a plain escrow.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.activate(ALICE), Err(EscrowError::InvalidStateTransition));
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+    }
+
+    #[test]
+    fn activate_after_activation_is_invalid_transition() {
+        let mut e = activated_escrow();
+        assert_eq!(e.activate(ALICE), Err(EscrowError::InvalidStateTransition));
+        assert_eq!(e.activate(BOB), Err(EscrowError::InvalidStateTransition));
+        assert_eq!(e.state(), EscrowState::Activated);
+    }
+
+    #[test]
+    fn activate_after_fund_is_invalid_transition() {
+        let mut e = activated_escrow();
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.activate(ALICE), Err(EscrowError::InvalidStateTransition));
+        assert_eq!(e.activate(BOB), Err(EscrowError::InvalidStateTransition));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn fund_from_activated_still_requires_initializer() {
+        let mut e = activated_escrow();
+        assert_eq!(e.fund(BOB), Err(EscrowError::Unauthorized));
+        assert_eq!(e.fund(MALLORY), Err(EscrowError::Unauthorized));
+        assert_eq!(e.state(), EscrowState::Activated);
+    }
+
+    #[test]
+    fn dual_sig_full_lifecycle_release_and_cancel() {
+        // The rest of the machine is unchanged once funded.
+        let mut e = activated_escrow();
+        e.fund(ALICE).unwrap();
+        e.release(ALICE, 400_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!((e.released_amount(), e.remaining_amount()), (400_000, 600_000));
+        e.cancel(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn dual_sig_combines_with_quorum() {
+        // Independent builders compose: activation gates fund, quorum
+        // gates release.
+        let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], 2).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.release(ALICE, 1_000_000), Err(EscrowError::QuorumNotReached));
+        e.attest([0xA1; 32]).unwrap();
+        e.attest([0xA2; 32]).unwrap();
+        e.release(ALICE, 1_000_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn attest_allowed_between_activation_and_funding() {
+        let policy = QuorumPolicy::new(&[[0xA1; 32]], 1).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        // Activated but not yet funded: attestors may already vote.
+        e.attest([0xA1; 32]).unwrap();
+        assert!(e.quorum().unwrap().is_satisfied());
+        e.fund(ALICE).unwrap();
+        e.release(ALICE, 1_000_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn activation_bits_are_distinct_and_stable() {
+        assert_eq!(ACTIVATION_INITIALIZER_BIT, 0b001);
+        assert_eq!(ACTIVATION_TAKER_BIT, 0b010);
+        assert_eq!(ACTIVATION_DUAL_SIG_REQUIRED_BIT, 0b100);
+        // No overlap: each bit is independent.
+        assert_eq!(
+            ACTIVATION_INITIALIZER_BIT | ACTIVATION_TAKER_BIT | ACTIVATION_DUAL_SIG_REQUIRED_BIT,
+            0b111
+        );
+    }
+
+    #[test]
+    fn self_escrow_activates_with_one_signature() {
+        // Degenerate initializer == taker: one signature sets both party
+        // bits at once. Deterministic, documented, no special-casing in
+        // callers.
+        let mut e = Escrow::initialize(ALICE, ALICE, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Activated);
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
     }
 }

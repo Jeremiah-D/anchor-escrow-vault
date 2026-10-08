@@ -19,11 +19,13 @@ release/cancel), the same authority checks, the same amount invariants.
 ## Honest scope
 
 - **What's real:** the `escrow-state` crate is a dependency-free Rust state
-  machine (`Uninitialized → Funded → Released/Cancelled`) with initializer
+  machine (`Uninitialized → Funded → Released/Cancelled`, plus the
+  opt-in `Activated` step for dual-signature escrows) with initializer
   authority checks and amount invariants, fully covered by unit tests.
 - **What's a skeleton:** `programs/escrow-vault/src/program.rs` is an Anchor program source
   file showing how the instructions (`initialize`, `fund`, `release`,
-  `cancel`, `cancel_expired`, `initialize_quorum`, `attest`) would wrap the
+  `cancel`, `cancel_expired`, `initialize_quorum`, `attest`,
+  `initialize_dual_sig`, `activate`) would wrap the
   `escrow-state` logic on-chain. It is **not
   compiled here** — a full on-chain build and test requires the Solana/Anchor
   toolchain. The compilable `escrow-vault` cargo package only ships
@@ -55,8 +57,10 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 |---------------------------------------------|----------------|-----------|------------------------|
 | `initialize(initializer, taker, amount, expires_at)` | — | `Uninitialized` | anyone (amount > 0) |
 | `initialize_quorum(attestors, threshold)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
-| `attest(attestor)`                          | `Uninitialized`/`Funded` | — (no state change) | registered attestor |
-| `fund(authority)`                           | `Uninitialized`| `Funded`  | initializer            |
+| `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
+| `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
+| `activate(authority)`                       | `Uninitialized`| `Uninitialized` (one party) / `Activated` (both parties) | initializer **or** taker (dual-sig escrows only) |
+| `fund(authority)`                           | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer            |
 | `release(authority, amount)`                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured); cumulative releases ≤ locked amount |
 | `cancel(authority)`                         | `Funded`       | `Cancelled` | initializer          |
 | `cancel_expired(authority, now)`            | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at` |
@@ -91,6 +95,20 @@ progress. Deliberately, the quorum gates *release only*: `cancel` and
 `cancel_expired` stay ungated so attestors cannot grief funds into a lockup
 by withholding approval. Without a quorum the escrow behaves exactly as the
 plain two-party machine above.
+
+**Dual-signature activation (multisig escrow).** An escrow can require
+*two* signatures to activate (`with_dual_sig`, opt-in on `Uninitialized`,
+like the quorum builder): each party — initializer and taker — records
+their approval with `activate`, and only when *both* bits are set does the
+escrow move `Uninitialized → Activated`, unlocking `fund`. One signature
+can create the escrow but never fund it. `activate` is idempotent per
+party and rejects strangers with `Unauthorized` (checked before state
+validity); on a plain escrow, or once already `Activated`, it is
+`InvalidStateTransition`. Activation progress is a persisted 1-byte
+bitmask (bit 0 initializer, bit 1 taker, bit 2 requirement), so it
+survives serialization; `attest` is allowed in `Activated` too, so
+attestors can vote between activation and funding. Composes with the
+quorum builder: activation gates `fund`, quorum gates `release`.
 
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
@@ -205,6 +223,25 @@ step (here: 400_000 / 600_000 after the first tranche), and a later
 `cancel` refunds only the remainder while `released_amount()` stays
 preserved for audit.
 
+**F. Dual-signature activation.** Both parties must sign before funding;
+one signature alone changes nothing fundable:
+
+```
+initializer    taker            escrow                 state
+   |  initialize_dual_sig()  |  |                      |
+   |----------------------------->| (requirement fixed,  |
+   |                             |  still Uninitialized) |
+   |  activate(alice)  |          |                      |
+   |----------------------------->|  (initializer bit;    |
+   |                             |   stays Uninitialized)|
+   |  fund(alice)  // → Err(InvalidStateTransition):      |
+   |              // one signature cannot fund            |
+   |               activate(bob)  |                      |
+   |               -------------------------->|  Uninitialized→Activated |
+   |  fund(alice)  |                          |           |
+   |------------------------------------------>|  Activated→Funded      |
+```
+
 Note that `attest` never changes `EscrowState` itself (it only grows the
 quorum's approval bitmask), and the failed-call invariant holds on every
 path above: any `Err(...)` return leaves the state — and `amount` and the
@@ -228,14 +265,16 @@ two-way consistency check against the IDL parameter table:
 | expires_at    | u64               | 8     |
 | state         | u8 (discriminant) | 1     |
 | quorum        | Option<Quorum>    | 267   |
-| **total**     |                   | **364** |
+| activation    | u8 (bitmask)      | 1     |
+| **total**     |                   | **365** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
-realloc. `escrow-state` exposes `VAULT_SPACE` (364) and
-`VAULT_SPACE_NO_QUORUM` (98) for the Anchor `space =` constraint, plus a
+realloc. The 1-byte activation bitmask (AV-12) is likewise always present
+(zeroed for plain escrows). `escrow-state` exposes `VAULT_SPACE` (365) and
+`VAULT_SPACE_NO_QUORUM` (99) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **3,424,320 lamports** to be
+mainnet rent parameters the full vault needs **3,431,280 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ## Run the tests
