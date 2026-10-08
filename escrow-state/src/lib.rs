@@ -5,6 +5,13 @@
 //! authority checks and amount invariants. The Anchor program under
 //! `programs/escrow-vault` wraps exactly this logic for the Solana target.
 
+mod events;
+
+// AV-18: typed indexer events — an event-logging adapter over `Escrow`
+// plus the `EscrowEvent` / `EscrowEventKind` / `EventAmounts` record
+// types. Purely additive: no existing signature changed.
+pub use events::{EscrowEvent, EscrowEventKind, EventAmounts, IndexedEscrow};
+
 /// Lifecycle states of an escrow vault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscrowState {

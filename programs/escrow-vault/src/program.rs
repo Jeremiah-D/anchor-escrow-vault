@@ -26,7 +26,11 @@
 //! account's mint against the bound address (`MintMismatch` otherwise);
 //! the optional protocol fee (`initialize_protocol_fee`) routes a
 //! basis-point slice of every taker payout to the protocol fee account
-//! exactly as `Escrow::with_protocol_fee` / `protocol_fee_for` define.
+//! exactly as `Escrow::with_protocol_fee` / `protocol_fee_for` define;
+//! every state transition emits a typed indexer event (`emit!`, AV-18)
+//! mirroring `escrow_state::EscrowEvent`, with a per-vault monotonic
+//! `seq` so an off-chain indexer can subscribe to state changes in
+//! order instead of polling account data.
 //!
 //! To compile for real: `anchor build` with the Solana toolchain installed.
 
@@ -50,16 +54,42 @@ pub mod escrow_vault {
         )
         .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: the constructor has no prior state — from == to ==
+        // Uninitialized by the same convention as `IndexedEscrow`.
+        let state = escrow_state::EscrowState::Uninitialized as u8;
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Initialized,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+        );
         Ok(())
     }
 
     /// Lock funds into the vault (`Uninitialized -> Funded`).
     pub fn fund(ctx: Context<Fund>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
         escrow
             .fund(ctx.accounts.initializer.key().to_bytes())
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: one indexer event per state transition (mirrors
+        // `IndexedEscrow::fund`).
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Funded,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+        );
         Ok(())
     }
 
@@ -77,6 +107,7 @@ pub mod escrow_vault {
     /// path (no mint bound).
     pub fn release(ctx: Context<Release>, amount: u64) -> Result<(u64, u64)> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
         let (payout, fee) = escrow
             .release(
                 ctx.accounts.initializer.key().to_bytes(),
@@ -88,6 +119,19 @@ pub mod escrow_vault {
         // Transfer of `payout` lamports/tokens to `ctx.accounts.taker`
         // and `fee` to the protocol fee account goes here once real
         // token accounts are wired up.
+        // AV-18: `payout + fee` is the gross amount (== the `amount`
+        // param); partial releases carry from == to == Funded, the
+        // closing one to == Released.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Released,
+            from,
+            escrow.state() as u8,
+            payout + fee,
+            fee,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+        );
         Ok((payout, fee))
     }
 
@@ -97,6 +141,7 @@ pub mod escrow_vault {
     /// path (no mint bound).
     pub fn cancel(ctx: Context<Cancel>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
         escrow
             .cancel(
                 ctx.accounts.initializer.key().to_bytes(),
@@ -104,6 +149,17 @@ pub mod escrow_vault {
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: the refund is the remainder after any partial releases.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Cancelled,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            escrow.remaining_amount(),
+            Clock::get()?.unix_timestamp as u64,
+        );
         Ok(())
     }
 
@@ -116,6 +172,7 @@ pub mod escrow_vault {
     pub fn cancel_expired(ctx: Context<CancelExpired>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
         escrow
             .cancel_expired(
                 ctx.accounts.authority.key().to_bytes(),
@@ -126,6 +183,18 @@ pub mod escrow_vault {
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // Refund of lamports/tokens to the initializer goes here
         // once real token accounts are wired up.
+        // AV-18: `now` doubles as the event's `at`, mirroring
+        // `IndexedEscrow::cancel_expired`.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::ExpiredCancelled,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            escrow.remaining_amount(),
+            now,
+        );
         Ok(())
     }
 
@@ -155,11 +224,33 @@ pub mod escrow_vault {
     /// get `Unauthorized`.
     pub fn attest(ctx: Context<Attest>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
+        let approvals_before = escrow
+            .quorum()
+            .map(|q| q.approval_count())
+            .unwrap_or(0);
         escrow
             .attest(ctx.accounts.attestor.key().to_bytes())
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // Flip the attestor's bit in `vault.quorum.approvals` in the real build.
+        // AV-18: emit only for a *new* attestation (mirrors
+        // `IndexedEscrow::attest`); idempotent duplicates emit nothing.
+        // from == to == the current state — the quorum bitmask, not the
+        // lifecycle state, is what changed.
+        let approvals_after = escrow.quorum().map(|q| q.approval_count()).unwrap_or(0);
+        if approvals_after > approvals_before {
+            let state = escrow.state() as u8;
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::Attested,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+            );
+        }
         Ok(())
     }
 
@@ -183,11 +274,28 @@ pub mod escrow_vault {
     /// signature is `Unauthorized`.
     pub fn activate(ctx: Context<Activate>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
         escrow
             .activate(ctx.accounts.authority.key().to_bytes())
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // Flip the party's bit in `vault.activation` in the real build.
+        // AV-18: emit only when the call actually transitioned the escrow
+        // (mirrors `IndexedEscrow::activate`); a single party's signature
+        // emits nothing.
+        let to = escrow.state() as u8;
+        if to != from {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::Activated,
+                from,
+                to,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+            );
+        }
         Ok(())
     }
 
@@ -220,6 +328,7 @@ pub mod escrow_vault {
     pub fn claim(ctx: Context<Claim>) -> Result<(u64, u64)> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
         let (payout, fee) = escrow
             .claim(
                 ctx.accounts.taker.key().to_bytes(),
@@ -231,6 +340,18 @@ pub mod escrow_vault {
         // Transfer of `payout` lamports/tokens to `ctx.accounts.taker`
         // and `fee` to the protocol fee account goes here once real
         // token accounts are wired up.
+        // AV-18: `payout + fee` is the gross claimable; `now` doubles as
+        // the event's `at`, mirroring `IndexedEscrow::claim`.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Claimed,
+            from,
+            escrow.state() as u8,
+            payout + fee,
+            fee,
+            0,
+            now,
+        );
         Ok((payout, fee))
     }
 
@@ -260,10 +381,23 @@ pub mod escrow_vault {
     pub fn escalate(ctx: Context<Escalate>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
         escrow
             .escalate(ctx.accounts.authority.key().to_bytes(), now)
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `now` doubles as the event's `at`, mirroring
+        // `IndexedEscrow::escalate`.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Escalated,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+        );
         Ok(())
     }
 
@@ -280,6 +414,7 @@ pub mod escrow_vault {
     /// native-SOL path (no mint bound).
     pub fn resolve(ctx: Context<Resolve>, taker_amount: u64) -> Result<(u64, u64, u64)> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
         let (payout, fee, refund) = escrow
             .resolve(
                 ctx.accounts.arbiter.key().to_bytes(),
@@ -292,6 +427,18 @@ pub mod escrow_vault {
         // protocol fee account, and `refund` to
         // `ctx.accounts.initializer` goes here once real token accounts
         // are wired up.
+        // AV-18: `taker_amount` is the gross taker share
+        // (`payout + fee`); the refund is never fee'd.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Resolved,
+            from,
+            escrow.state() as u8,
+            taker_amount,
+            fee,
+            refund,
+            Clock::get()?.unix_timestamp as u64,
+        );
         Ok((payout, fee, refund))
     }
 
@@ -324,12 +471,29 @@ pub mod escrow_vault {
     /// acceptance). Strictly in-order and idempotent per party.
     pub fn confirm_milestone(ctx: Context<ConfirmMilestone>, index: u8) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
+        let confirmed_before = escrow.milestone_confirmed(index as usize);
         escrow
             .confirm_milestone(ctx.accounts.authority.key().to_bytes(), index)
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // Flip the party's confirmation bit in `vault.milestone_flags` in
         // the real build.
+        // AV-18: emit only when the milestone became fully confirmed
+        // (mirrors `IndexedEscrow::confirm_milestone`); the first party's
+        // confirmation alone emits nothing.
+        if !confirmed_before && escrow.milestone_confirmed(index as usize) {
+            let state = escrow.state() as u8;
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::MilestoneConfirmed,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+            );
+        }
         Ok(())
     }
 
@@ -344,6 +508,7 @@ pub mod escrow_vault {
     /// otherwise); `None` on the native-SOL path (no mint bound).
     pub fn release_milestone(ctx: Context<ReleaseMilestone>, index: u8) -> Result<(u64, u64)> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
         let (payout, fee) = escrow
             .release_milestone(
                 ctx.accounts.initializer.key().to_bytes(),
@@ -355,6 +520,18 @@ pub mod escrow_vault {
         // Transfer of `payout` lamports/tokens to `ctx.accounts.taker`
         // and `fee` to the protocol fee account goes here once real
         // token accounts are wired up.
+        // AV-18: `payout + fee` is the gross tranche; the final tranche
+        // carries to == Released.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::MilestoneReleased,
+            from,
+            escrow.state() as u8,
+            payout + fee,
+            fee,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+        );
         Ok((payout, fee))
     }
 
@@ -365,6 +542,11 @@ pub mod escrow_vault {
     /// Strictly in-order and idempotent per party.
     pub fn skip_milestone(ctx: Context<SkipMilestone>, index: u8) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
+        let settled_before = escrow.milestone_settled(index as usize);
+        let tranche = escrow
+            .milestone_plan()
+            .and_then(|p| p.amount_at(index as usize))
+            .unwrap_or(0);
         escrow
             .skip_milestone(ctx.accounts.authority.key().to_bytes(), index)
             .map_err(|e| escrow_error(e))?;
@@ -372,6 +554,23 @@ pub mod escrow_vault {
         // Flip the party's skip-approval bit in `vault.milestone_flags`
         // (and the skipped bit plus `vault.skipped` once dual-approved)
         // in the real build.
+        // AV-18: emit only when the skip executed (both approvals
+        // present; mirrors `IndexedEscrow::skip_milestone`); a lone
+        // approval emits nothing. The skipped tranche is the
+        // initializer's refund.
+        if !settled_before && escrow.milestone_settled(index as usize) {
+            let state = escrow.state() as u8;
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::MilestoneSkipped,
+                state,
+                state,
+                0,
+                0,
+                tranche,
+                Clock::get()?.unix_timestamp as u64,
+            );
+        }
         Ok(())
     }
 
@@ -539,6 +738,89 @@ pub struct Quorum {
 pub struct MilestonePlan {
     pub amounts: [u64; 8],
     pub count: u8,
+}
+
+/// AV-18: on-chain indexer event, the `emit!` mirror of
+/// `escrow_state::EscrowEvent`.
+///
+/// Every state transition emits one of these, so an off-chain indexer
+/// can subscribe to state changes in per-vault `seq` order instead of
+/// polling account data. Field-for-field mirror of the state-machine
+/// event: `kind` / vault identity / `seq` / `from_state` → `to_state` /
+/// fund movements / `at`. States are the
+/// `escrow_state::EscrowState` discriminants as `u8`; amounts are the
+/// gross taker payout, the protocol fee slice, and the initializer
+/// refund (zeroed when the kind moves nothing — see
+/// `escrow_state::EventAmounts`).
+#[event]
+pub struct EscrowVaultEvent {
+    pub kind: EscrowVaultEventKind,
+    /// The vault account: the on-chain escrow identity (the
+    /// `IndexedEscrow` wrapper's caller-supplied `escrow_id` off-chain).
+    pub vault: Pubkey,
+    /// Per-vault monotonic sequence (0 = `initialize`); the real build
+    /// persists this counter in the Vault account (`read_event_seq`), so
+    /// replays stay ordered even across transactions.
+    pub seq: u64,
+    pub from_state: u8,
+    pub to_state: u8,
+    /// Gross amount moved to the taker before the protocol-fee split.
+    pub payout: u64,
+    /// Protocol fee (AV-17) sliced from `payout`.
+    pub fee: u64,
+    /// Amount returned to the initializer (cancel / cancel_expired
+    /// remainder, `resolve`'s initializer share, skipped tranche).
+    pub refund: u64,
+    /// Unix seconds from the clock sysvar at emission.
+    pub at: u64,
+}
+
+/// AV-18: on-chain mirror of `escrow_state::EscrowEventKind`, mapped by
+/// `escrow_event_kind` exactly like `escrow_error` maps
+/// `escrow_state::EscrowError` onto `ErrorCode`.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+pub enum EscrowVaultEventKind {
+    Initialized,
+    Activated,
+    Funded,
+    Released,
+    Cancelled,
+    ExpiredCancelled,
+    Attested,
+    Claimed,
+    Escalated,
+    Resolved,
+    MilestoneConfirmed,
+    MilestoneReleased,
+    MilestoneSkipped,
+}
+
+/// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
+/// `EscrowVaultEventKind`, paralleling `escrow_error`.
+fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKind {
+    match kind {
+        escrow_state::EscrowEventKind::Initialized => EscrowVaultEventKind::Initialized,
+        escrow_state::EscrowEventKind::Activated => EscrowVaultEventKind::Activated,
+        escrow_state::EscrowEventKind::Funded => EscrowVaultEventKind::Funded,
+        escrow_state::EscrowEventKind::Released => EscrowVaultEventKind::Released,
+        escrow_state::EscrowEventKind::Cancelled => EscrowVaultEventKind::Cancelled,
+        escrow_state::EscrowEventKind::ExpiredCancelled => {
+            EscrowVaultEventKind::ExpiredCancelled
+        }
+        escrow_state::EscrowEventKind::Attested => EscrowVaultEventKind::Attested,
+        escrow_state::EscrowEventKind::Claimed => EscrowVaultEventKind::Claimed,
+        escrow_state::EscrowEventKind::Escalated => EscrowVaultEventKind::Escalated,
+        escrow_state::EscrowEventKind::Resolved => EscrowVaultEventKind::Resolved,
+        escrow_state::EscrowEventKind::MilestoneConfirmed => {
+            EscrowVaultEventKind::MilestoneConfirmed
+        }
+        escrow_state::EscrowEventKind::MilestoneReleased => {
+            EscrowVaultEventKind::MilestoneReleased
+        }
+        escrow_state::EscrowEventKind::MilestoneSkipped => {
+            EscrowVaultEventKind::MilestoneSkipped
+        }
+    }
 }
 
 #[derive(Accounts)]
@@ -802,6 +1084,46 @@ fn vault_token_mint(_token_account: &AccountInfo) -> Option<[u8; 32]> {
 
 fn write_escrow(_vault: &mut Account<Vault>, _escrow: &escrow_state::Escrow) {
     unimplemented!("serialize escrow_state::Escrow back into the Vault account")
+}
+
+/// AV-18: build and `emit!` the indexer event for one state transition,
+/// mirroring `escrow_state::EscrowEvent`.
+///
+/// `from_state` is the vault's state before the transition, `to_state`
+/// after; `payout` / `fee` / `refund` carry the fund movements (zeroed
+/// when the kind moves nothing); `at` is the clock sysvar's unix
+/// timestamp — the on-chain source of the caller-supplied `at` the
+/// `IndexedEscrow` wrapper takes off-chain. `seq` is the vault's
+/// persisted per-escrow event counter (`read_event_seq`).
+fn emit_transition(
+    vault: &Account<Vault>,
+    kind: escrow_state::EscrowEventKind,
+    from_state: u8,
+    to_state: u8,
+    payout: u64,
+    fee: u64,
+    refund: u64,
+    at: u64,
+) {
+    emit!(EscrowVaultEvent {
+        kind: escrow_event_kind(kind),
+        vault: vault.key(),
+        seq: read_event_seq(vault),
+        from_state,
+        to_state,
+        payout,
+        fee,
+        refund,
+        at,
+    });
+}
+
+/// AV-18: read the vault's persisted per-escrow event sequence counter.
+/// The real build stores it in the Vault account (appended after
+/// `fees_paid`; `VAULT_SPACE` grows 540 → 548) and increments it on
+/// every emission, so `seq` stays monotonic across transactions.
+fn read_event_seq(_vault: &Account<Vault>) -> u64 {
+    unimplemented!("read the vault's persisted event_seq in the real build")
 }
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {

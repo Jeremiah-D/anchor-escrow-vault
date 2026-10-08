@@ -22,6 +22,10 @@ release/cancel), the same authority checks, the same amount invariants.
   machine (`Uninitialized → Funded → Released/Cancelled`, plus the
   opt-in `Activated` step for dual-signature escrows) with initializer
   authority checks and amount invariants, fully covered by unit tests.
+  `IndexedEscrow` (`escrow-state/src/events.rs`) is an event-logging
+  adapter over it: every state transition records one typed
+  `EscrowEvent` (see "Indexer events" below), so an off-chain indexer
+  can subscribe to state changes in per-escrow `seq` order.
 - **What's a skeleton:** `programs/escrow-vault/src/program.rs` is an Anchor program source
   file showing how the instructions (`initialize`, `fund`, `release`,
   `cancel`, `cancel_expired`, `initialize_quorum`, `attest`,
@@ -46,6 +50,7 @@ No unverified claims are made about deployments, audits, or performance.
 ```
 escrow-state/               # pure-Rust state machine, zero dependencies
   src/lib.rs                # Escrow, EscrowState, EscrowError + unit tests
+  src/events.rs             # AV-18: IndexedEscrow event-logging wrapper + EscrowEvent types + event_tests
 programs/escrow-vault/      # Anchor program skeleton (on-chain part not in cargo build)
   src/program.rs            # instructions wrapping escrow-state (needs anchor-lang)
   Cargo.toml                # `escrow-vault` package: local-validator test stubs only
@@ -518,6 +523,59 @@ quorum's approval bitmask), and the failed-call invariant holds on every
 path above: any `Err(...)` return leaves the state — and `amount` and the
 `released` counter — exactly untouched (pinned by the
 permission/fuzz/property tests).
+
+## Indexer events (AV-18)
+
+Every state transition of the escrow state machine emits one typed
+`EscrowEvent` through the `IndexedEscrow` adapter
+(`escrow-state/src/events.rs`) — no existing `Escrow` signature changed,
+and the crate stays dependency-free. A chain indexer subscribes to state
+changes in per-escrow `seq` order instead of polling account data.
+
+**Event shape.** Each event carries:
+
+| field | meaning |
+|-------|---------|
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `Attested`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped` |
+| `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
+| `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
+| `from` → `to` | `EscrowState` before and after the call |
+| `amounts` | one struct for every kind: `payout` (gross taker amount before the fee split), `fee` (AV-17 protocol fee), `refund` (initializer's refund); zeroed when the kind moves no such value |
+| `at` | caller-supplied Unix-seconds timestamp (`cancel_expired` / `escalate` / `claim` reuse their `now`) |
+
+**Emission rule.** Exactly one event per *successful* call that changes
+externally-observable state; failed calls emit nothing, and neither do
+successful calls that change nothing observable:
+
+- `with_*` builders are configuration, not transitions — no events.
+- `activate` emits only when it flips `Uninitialized → Activated`; a
+  single party's signature emits nothing.
+- `attest` emits when it records a *new* attestation (the quorum's
+  approval count grows) — quorum progress is what an indexer watches to
+  know when the release gate opens; duplicate votes emit nothing.
+- `confirm_milestone` emits when the milestone becomes fully confirmed
+  (the completing vote); the first party's confirmation alone emits
+  nothing, paralleling `activate`.
+- `skip_milestone` emits only when the skip executes (both approvals
+  present); a lone approval emits nothing.
+- Partial `release` / `claim` calls emit with `from == to == Funded` so
+  the payout stream is complete in `seq` order; the closing payout has
+  `to == Released`.
+- `drain_events()` takes the recorded events and clears the log; the
+  sequence counter keeps running, so a resuming indexer never sees
+  duplicates.
+
+**Anchor `emit!` mapping.** `programs/escrow-vault/src/program.rs` mirrors
+each kind: `EscrowVaultEvent` (`#[event]`) is the on-chain mirror of
+`EscrowEvent`, `EscrowVaultEventKind` the mirror of `EscrowEventKind`
+(mapped by `escrow_event_kind`, paralleling the `escrow_error` →
+`ErrorCode` mapping), and every transition instruction calls
+`emit_transition` after a successful state change — with the same
+conditional-emission rules (`activate`, `attest`, `confirm_milestone`,
+`skip_milestone` only emit when the observable change completes). `at`
+comes from the clock sysvar; `seq` is the vault's persisted per-escrow
+counter (the real build appends it to the `Vault` account, growing
+`VAULT_SPACE` 540 → 548).
 
 ## Account space & rent
 
