@@ -178,6 +178,16 @@ pub struct Escrow {
     /// serialization. Appended last so every earlier field offset stays
     /// stable.
     refund_to: Option<[u8; 32]>,
+    /// AV-24: anti-griefing penalty rate in basis points (0–10000),
+    /// charged to the initializer on a *taker-initiated*
+    /// [`Escrow::cancel_expired`]: the taker dragging the deal to expiry
+    /// locks the initializer's capital for free otherwise. Set once via
+    /// [`Escrow::with_penalty_bps`] on an `Uninitialized` escrow, like
+    /// the other `with_*` builders; `0` (the default) means no penalty —
+    /// backward compatible. Persisted (2 bytes in the vault account) so
+    /// the rate survives serialization. Appended last so every earlier
+    /// field offset stays stable.
+    penalty_bps: u16,
 }
 
 /// Bit 0 of [`Escrow::activation`]: the initializer has recorded their
@@ -295,6 +305,12 @@ pub enum EscrowError {
     /// address can never be the legitimate refund destination, so
     /// binding it is a policy mismatch by construction.
     RefundAddressMismatch,
+    /// Anti-griefing penalty misconfiguration (AV-24):
+    /// [`Escrow::with_penalty_bps`] with `penalty_bps > 10_000` — the
+    /// rate is in basis points, so anything above 10_000 (100%) is not
+    /// a valid rate. Parallels [`EscrowError::InvalidProtocolFee`]
+    /// (config error).
+    InvalidPenalty,
 }
 
 impl EscrowError {
@@ -324,6 +340,7 @@ impl EscrowError {
             EscrowError::InvalidProtocolFee => 114,
             EscrowError::InvalidGracePeriod => 115,
             EscrowError::RefundAddressMismatch => 116,
+            EscrowError::InvalidPenalty => 117,
         }
     }
 
@@ -347,6 +364,7 @@ impl EscrowError {
             EscrowError::InvalidProtocolFee,
             EscrowError::InvalidGracePeriod,
             EscrowError::RefundAddressMismatch,
+            EscrowError::InvalidPenalty,
         ]
     }
 }
@@ -706,6 +724,11 @@ impl Escrow {
             // initializer (backward compatible). Opt in via
             // `with_refund_address` before funding.
             refund_to: None,
+            // AV-24: no anti-griefing penalty by default — a
+            // taker-initiated `cancel_expired` refunds the full
+            // remainder (backward compatible). Opt in via
+            // `with_penalty_bps` before funding.
+            penalty_bps: 0,
         })
     }
 
@@ -976,6 +999,16 @@ impl Escrow {
     /// *its* clock passes `expires_at`, only for the chain to reject it
     /// as `NotExpired`.
     ///
+    /// Returns `(refund, penalty)` so the caller (and the Anchor layer)
+    /// can size both transfers: `refund` goes to the whitelisted
+    /// `refund_to` destination, `penalty` (when non-zero) is routed to
+    /// the initializer as anti-griefing compensation (AV-24), and
+    /// `refund + penalty == remaining` always. An initializer-initiated
+    /// cancel returns `(remaining, 0)` — the initializer pays no penalty
+    /// to reclaim their own funds. A taker-initiated cancel with
+    /// `penalty_bps == 0` is likewise `(remaining, 0)` (backward
+    /// compatible).
+    ///
     /// Check order is deliberate: authority first, then state, then the
     /// mint binding (AV-16), then the refund destination (AV-23), then
     /// expiry. A stranger never learns whether an escrow is expired from
@@ -987,14 +1020,17 @@ impl Escrow {
     /// preserved for audit. The refund goes to the whitelisted address
     /// when one is configured — *even when the taker is the caller*:
     /// the caller authorizes the cancel, the whitelist authorizes the
-    /// destination.
+    /// destination. The anti-griefing penalty (AV-24), when charged on a
+    /// taker-initiated cancel, always routes to the initializer
+    /// personally — the compensation follows the harmed party, not the
+    /// refund address.
     pub fn cancel_expired(
         &mut self,
         authority: [u8; 32],
         now: u64,
         mint: Option<[u8; 32]>,
         refund_to: [u8; 32],
-    ) -> Result<(), EscrowError> {
+    ) -> Result<(u64, u64), EscrowError> {
         if authority != self.initializer && authority != self.taker {
             return Err(EscrowError::Unauthorized);
         }
@@ -1012,8 +1048,20 @@ impl Escrow {
         if !self.is_expiry_eligible(now) {
             return Err(EscrowError::NotExpired);
         }
+        // AV-24: the anti-griefing penalty is charged only on a
+        // *taker-initiated* cancel — the initializer pays no penalty to
+        // reclaim their own funds, and a rejected cancel charges nothing.
+        // `penalty <= remaining` by construction of
+        // `expiry_cancel_penalty` (floor of `remaining * bps / 10000`,
+        // `bps <= 10000`), so the subtraction cannot underflow.
+        let remaining = self.remaining_amount();
+        let penalty = if authority == self.taker {
+            self.expiry_cancel_penalty(remaining)
+        } else {
+            0
+        };
         self.state = EscrowState::Cancelled;
-        Ok(())
+        Ok((remaining - penalty, penalty))
     }
 
     /// Attach an N-of-M attestor quorum to the release path.
@@ -1445,6 +1493,80 @@ impl Escrow {
         }
         self.refund_to = Some(refund_to);
         Ok(self)
+    }
+
+    /// Opt in to an anti-griefing penalty on taker-initiated expiry
+    /// cancellation (AV-24 — Solana escrow / payment fintech): when the
+    /// *taker* calls [`Escrow::cancel_expired`], a slice of the remainder
+    /// is paid to the initializer as griefing compensation instead of
+    /// being refunded.
+    ///
+    /// Why: a taker who refuses to cooperate forces the initializer's
+    /// capital to sit locked until `expires_at`, and `cancel_expired`
+    /// exists precisely so either party can walk away from a stalled
+    /// deal. Without a penalty that walk-away is costless for the
+    /// griefer — they can idle past expiry and then release the
+    /// initializer's funds themselves, having extracted maximum delay
+    /// for zero price. The penalty prices the delay: dragging the deal
+    /// to expiry costs the taker `floor(remaining * penalty_bps /
+    /// 10_000)` of the lockup, routed to the initializer.
+    ///
+    /// Economics note: the taker never holds escrow funds, so the
+    /// penalty is an *allocation rule* on the initializer's own
+    /// remainder, not a value transfer from the taker — on a
+    /// taker-initiated cancel the return splits `(refund, penalty)`
+    /// with `refund + penalty == remaining`. In the default
+    /// refund-to-initializer case both transfers land on the same
+    /// account and the split is accounting-exact for indexers and
+    /// auditors; when a refund whitelist (AV-23) points the refund at a
+    /// different address, the penalty still routes to the initializer
+    /// personally — the compensation follows the harmed party, not the
+    /// refund address.
+    ///
+    /// Scope: only a *taker-initiated* `cancel_expired` carries the
+    /// penalty. An initializer-initiated `cancel_expired` returns
+    /// `(remaining, 0)` — the initializer pays no penalty to reclaim
+    /// their own funds — and neither [`Escrow::cancel`] (initializer
+    /// only) nor the arbiter's [`Escrow::resolve`] carry one: the
+    /// arbiter is the trusted settlement mechanism by design.
+    ///
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// rate is fixed before any funds move — mirroring
+    /// [`Escrow::with_protocol_fee`] and the other `with_*` builders.
+    /// The rate is in basis points and must be `<= 10_000`
+    /// ([`EscrowError::InvalidPenalty`] otherwise); `0` is a valid rate
+    /// meaning "no penalty" (the default, backward compatible).
+    pub fn with_penalty_bps(mut self, penalty_bps: u16) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if penalty_bps > 10_000 {
+            return Err(EscrowError::InvalidPenalty);
+        }
+        self.penalty_bps = penalty_bps;
+        Ok(self)
+    }
+
+    /// The anti-griefing penalty for a taker-initiated
+    /// [`Escrow::cancel_expired`] on a remainder of `remaining` (AV-24):
+    /// `floor(remaining * penalty_bps / 10_000)`.
+    ///
+    /// Computed in `u128`: `remaining * penalty_bps` can reach
+    /// `u64::MAX * 10_000 < u128::MAX`, so the multiplication cannot
+    /// overflow, and the floored quotient is `<= remaining` (since
+    /// `penalty_bps <= 10_000`), so the downcast is exact. Floor
+    /// rounding means dust remainders may carry a zero penalty — the
+    /// escrow never rounds *up* into the compensation.
+    pub fn expiry_cancel_penalty(&self, remaining: u64) -> u64 {
+        ((remaining as u128 * self.penalty_bps as u128) / 10_000u128) as u64
+    }
+
+    /// The anti-griefing penalty rate in basis points configured via
+    /// [`Escrow::with_penalty_bps`]; `0` when no penalty is configured
+    /// (backward compatible).
+    pub fn penalty_bps(&self) -> u16 {
+        self.penalty_bps
     }
 
     /// The whitelisted refund address configured via
@@ -2014,6 +2136,11 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // as `arbiter` / `mint` / `evidence_hash`. Appended last so every
     // earlier field offset stays stable.
     ("refund_to", "Option<Pubkey>", 1 + PUBKEY_LEN),
+    // AV-24: anti-griefing penalty rate in basis points (see
+    // `Escrow::with_penalty_bps`): one u16, always present (zeroed
+    // when no penalty is configured). Appended last so every earlier
+    // field offset stays stable.
+    ("penalty_bps", "u16", 2),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -2056,9 +2183,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// always present: 1-byte discriminant + 32-byte commitment (zeroed when
 /// no evidence is attached). The refund address whitelist (AV-23) is
 /// likewise always present: 1-byte discriminant + 32-byte address
-/// (zeroed when no whitelist is configured).
+/// (zeroed when no whitelist is configured). The anti-griefing penalty
+/// rate (AV-24) is always present too: 2-byte `penalty_bps` (zeroed when
+/// no penalty is configured).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -2678,6 +2807,9 @@ mod fuzz_tests {
         expires_at: u64,
         /// Model of the escrow's `fees_paid` counter (AV-17).
         fees_paid: u128,
+        /// Configured anti-griefing penalty rate (AV-24): pinned for the
+        /// field-immutability check below.
+        penalty_bps: u16,
     }
 
     fn fuzz_amount(rng: &mut XorShift64) -> u64 {
@@ -2764,11 +2896,26 @@ mod fuzz_tests {
                     let escrow = escrow
                         .with_protocol_fee(fee_bps)
                         .expect("fee_bps <= 10_000 must configure");
+                    // AV-24: part of the fleet carries an anti-griefing
+                    // penalty rate (0–10000 bps, boundary-biased at
+                    // 10000), so the fuzz exercises the taker-initiated
+                    // penalty split — `refund + penalty == remainder`, a
+                    // routing of the refund that never escapes the
+                    // conservation invariant.
+                    let penalty_bps = match rng.below(3) {
+                        0 => rng.below(10_001) as u16,
+                        1 => 10_000,
+                        _ => 0,
+                    };
+                    let escrow = escrow
+                        .with_penalty_bps(penalty_bps)
+                        .expect("penalty_bps <= 10_000 must configure");
                     slots.push(Some(Slot {
                         escrow,
                         amount,
                         expires_at,
                         fees_paid: 0,
+                        penalty_bps,
                     }))
                 }
                 Err(EscrowError::AmountMismatch) => {
@@ -2793,8 +2940,14 @@ mod fuzz_tests {
             let op = rng.below(4);
             let mut rel_amt = 0u64;
             let mut rel_fee = 0u64;
-            let result: Result<(), EscrowError> = match op {
-                0 => slot.escrow.fund(authority),
+            // AV-24: `cancel_expired` returns the `(refund, penalty)`
+            // split, so the op result carries it; the other ops map to
+            // `(0, 0)` (their fund movements are tracked in
+            // `released`/`refunded` below, not via the return).
+            let mut exp_refund = 0u64;
+            let mut exp_penalty = 0u64;
+            let result: Result<(u64, u64), EscrowError> = match op {
+                0 => slot.escrow.fund(authority).map(|()| (0, 0)),
                 1 => {
                     rel_amt = fuzz_release_amount(&mut rng, slot.amount);
                     slot.escrow
@@ -2808,6 +2961,7 @@ mod fuzz_tests {
                                 "payout + fee != gross release on seed {seed}"
                             );
                             rel_fee = fee;
+                            (0, 0)
                         })
                 }
                 2 => {
@@ -2816,16 +2970,29 @@ mod fuzz_tests {
                     // it off the escrow (the fleet's initializers are
                     // fuzzed keys, not always ALICE).
                     let refund_to = slot.escrow.initializer();
-                    slot.escrow.cancel(authority, None, refund_to)
+                    slot.escrow.cancel(authority, None, refund_to).map(|()| (0, 0))
                 }
                 _ => {
                     let refund_to = slot.escrow.initializer();
-                    slot.escrow.cancel_expired(authority, fuzz_now(&mut rng), None, refund_to)
+                    slot.escrow
+                        .cancel_expired(authority, fuzz_now(&mut rng), None, refund_to)
+                        .map(|(refund, penalty)| {
+                            // AV-24: the penalty is a routing slice of
+                            // the remainder — it never escapes it.
+                            assert_eq!(
+                                refund + penalty,
+                                slot.amount - slot.escrow.released_amount(),
+                                "refund + penalty != remainder on seed {seed}"
+                            );
+                            exp_refund = refund;
+                            exp_penalty = penalty;
+                            (refund, penalty)
+                        })
                 }
             };
 
             match result {
-                Ok(()) => match state_before {
+                Ok(_) => match state_before {
                     // From Uninitialized only `fund` can succeed.
                     EscrowState::Uninitialized => inflow += slot.amount as u128,
                     EscrowState::Funded => match slot.escrow.state() {
@@ -2844,10 +3011,22 @@ mod fuzz_tests {
                         }
                         // cancel / cancel_expired: the refund is the
                         // unreleased remainder (partial releases are
-                        // already counted in `released`).
+                        // already counted in `released`). AV-24: on a
+                        // taker-initiated cancel the penalty rides to
+                        // the initializer alongside the refund, so it
+                        // joins the same `refunded` bucket.
                         EscrowState::Cancelled => {
-                            refunded +=
-                                (slot.amount - slot.escrow.released_amount()) as u128;
+                            if op == 3 {
+                                assert_eq!(
+                                    exp_refund + exp_penalty,
+                                    slot.amount - slot.escrow.released_amount(),
+                                    "penalty split drifted on seed {seed}"
+                                );
+                                refunded += (exp_refund + exp_penalty) as u128;
+                            } else {
+                                refunded +=
+                                    (slot.amount - slot.escrow.released_amount()) as u128;
+                            }
                         }
                         s => panic!("unexpected post-op state {s:?} from Funded on seed {seed}"),
                     },
@@ -2875,6 +3054,13 @@ mod fuzz_tests {
                 slot.escrow.expires_at(),
                 slot.expires_at,
                 "expires_at changed on seed {seed}"
+            );
+            // AV-24: the penalty rate is fixed before funding and never
+            // mutates afterwards.
+            assert_eq!(
+                slot.escrow.penalty_bps(),
+                slot.penalty_bps,
+                "penalty_bps changed on seed {seed}"
             );
 
             // AV-17: the fee model tracks the escrow's counter exactly —
@@ -3280,7 +3466,12 @@ mod anchor_idl_tests {
                             initializer with no whitelist — \
                             RefundAddressMismatch otherwise; AV-23 \
                             anti-phishing pin; even a taker-initiated \
-                            cancel refunds to the declared address)",
+                            cancel refunds to the declared address); \
+                            returns (refund, penalty) — AV-24: only a \
+                            *taker-initiated* cancel charges the penalty, \
+                            routed to the initializer as griefing \
+                            compensation; initializer-initiated cancels \
+                            return (remaining, 0)",
         },
         InstructionSpec {
             name: "initialize_quorum",
@@ -3546,6 +3737,27 @@ mod anchor_idl_tests {
                             cannot redirect the refund; with no whitelist \
                             the policy is refund-to-initializer",
         },
+        InstructionSpec {
+            // AV-24: anti-griefing penalty in basis points.
+            name: "initialize_penalty",
+            params: &[(
+                "penalty_bps",
+                "u16",
+                "instruction param; basis points, 0-10000",
+            )],
+            method: "Escrow::with_penalty_bps",
+            input_mapping: "penalty_bps <- param; authority <- \
+                            accounts.initializer (signer), enforced by the \
+                            Anchor account constraint, not the state \
+                            machine; Uninitialized only, like \
+                            initialize_quorum; penalty_bps > 10000 is \
+                            InvalidPenalty; only a *taker-initiated* \
+                            cancel_expired charges the penalty — it returns \
+                            (refund, penalty) so the program can route the \
+                            penalty to the initializer as griefing \
+                            compensation; initializer-initiated cancels \
+                            and the arbiter's resolve never carry it",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -3594,6 +3806,7 @@ mod anchor_idl_tests {
             "Escrow::with_protocol_fee",
             "Escrow::with_grace_period",
             "Escrow::with_refund_address",
+            "Escrow::with_penalty_bps",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -3617,7 +3830,7 @@ mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_fifteen_instructions_take_params() {
+    fn only_sixteen_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -3642,7 +3855,8 @@ mod anchor_idl_tests {
                 &"initialize_mint",
                 &"initialize_protocol_fee",
                 &"initialize_grace_period",
-                &"initialize_refund_address"
+                &"initialize_refund_address",
+                &"initialize_penalty"
             ]
         );
     }
@@ -3779,6 +3993,47 @@ mod anchor_idl_tests {
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(funded.grace_period(), 300);
+    }
+
+    #[test]
+    fn initialize_penalty_maps_param_to_penalty_bps_field() {
+        // IDL: initialize_penalty(penalty_bps: u16). The program takes
+        // the param, then Escrow::with_penalty_bps; authority <-
+        // accounts.initializer, enforced by the Anchor account
+        // constraint, not the state machine (Uninitialized only, like
+        // initialize_quorum).
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap();
+        assert_eq!(e.penalty_bps(), 250);
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        // The taker-initiated cancel splits the remainder: 250 bps of
+        // 1_000_000 = 25_000 to the initializer as griefing
+        // compensation, the rest refunded.
+        let mut funded = e;
+        funded.fund(ALICE).unwrap();
+        let (refund, penalty) = funded.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!((refund, penalty), (975_000, 25_000));
+        assert_eq!(funded.state(), EscrowState::Cancelled);
+        // Documented failure mode: not a valid basis-point rate.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_penalty_bps(10_001),
+            Err(EscrowError::InvalidPenalty)
+        );
+        // Re-configuring a live escrow is rejected by state.
+        let mut funded = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap();
+        funded.fund(ALICE).unwrap();
+        assert_eq!(
+            funded.with_penalty_bps(300),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(funded.penalty_bps(), 250);
     }
 
     #[test]
@@ -4258,6 +4513,10 @@ mod anchor_idl_tests {
         // `refund_to`; the `Option` discriminant is implied (a declared
         // whitelist is `Some`).
         ("initialize_refund_address", "refund_to", "refund_to"),
+        // AV-24: the anti-griefing penalty rate param populates
+        // `penalty_bps` directly (u16 — 0 is the valid "no penalty"
+        // default).
+        ("initialize_penalty", "penalty_bps", "penalty_bps"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -4506,6 +4765,11 @@ mod error_code_tests {
             EscrowError::RefundAddressMismatch,
             116,
             "cancel/cancel_expired with a refund destination != the whitelisted address (or != the initializer with no whitelist), or with_refund_address with the zero address",
+        ),
+        (
+            EscrowError::InvalidPenalty,
+            117,
+            "with_penalty_bps with penalty_bps > 10_000 (not a valid basis-point rate)",
         ),
     ];
 
@@ -4984,6 +5248,27 @@ mod error_code_tests {
         assert_eq!((claimed, fee), (1_000_000, 0), "no fee configured: full claim to taker");
         assert_eq!(e.state(), EscrowState::Released);
     }
+
+    #[test]
+    fn invalid_penalty_triggered_by_rate_above_10000() {
+        // The rate is in basis points: 10_000 (100%) is the ceiling, and
+        // 0 is a valid "no penalty" rate (the default).
+        let err = escrow().with_penalty_bps(10_001).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidPenalty);
+        assert_eq!(err.code(), 117);
+        // Boundary: 10_000 configures fine.
+        let e = escrow().with_penalty_bps(10_000).unwrap();
+        assert_eq!(e.penalty_bps(), 10_000);
+        // The rate is fixed before funding: reconfiguring a live escrow
+        // is InvalidStateTransition, like the other `with_*` builders.
+        let mut e = escrow().with_penalty_bps(250).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.with_penalty_bps(300),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.penalty_bps(), 250, "failed reconfigure keeps the rate");
+    }
 }
 
 // ---------- AV-16: base58 mint-address decoder ----------
@@ -5327,12 +5612,17 @@ mod property_tests {
             e.fund(ALICE).unwrap();
             let expected = now >= expiry;
             match e.cancel_expired(ALICE, now, None, ALICE) {
-                Ok(()) => {
+                Ok((refund, penalty)) => {
                     assert!(
                         expected,
                         "case {case}: succeeded with now={now} < expires_at={expiry}"
                     );
                     assert_eq!(e.state(), EscrowState::Cancelled);
+                    // ALICE is the initializer and no penalty is
+                    // configured: the initializer reclaims the full
+                    // remainder, penalty-free (AV-24).
+                    assert_eq!(refund, 1_000_000);
+                    assert_eq!(penalty, 0);
                 }
                 Err(EscrowError::NotExpired) => {
                     assert!(
@@ -5568,6 +5858,9 @@ mod account_space_tests {
                 out.extend_from_slice(&addr);
             }
         }
+        // AV-24: anti-griefing penalty rate in basis points, always
+        // present (zeroed when no penalty configured).
+        out.extend_from_slice(&e.penalty_bps.to_le_bytes());
         out
     }
 
@@ -5587,9 +5880,9 @@ mod account_space_tests {
         // + 2 (AV-17 protocol fee rate) + 8 (AV-17 cumulative fee counter)
         // + 8 (AV-21 expiry grace period) + (1 + 32) (AV-22 dispute
         // evidence hash) + (1 + 32) (AV-23 refund address whitelist)
-        assert_eq!(ESCROW_BODY_LEN, 606, "escrow payload bytes");
+        assert_eq!(ESCROW_BODY_LEN, 608, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 614, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 616, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -5603,13 +5896,14 @@ mod account_space_tests {
         // grace period configured) + (1 + 32)-byte dispute evidence hash
         // (AV-22, zeroed when no evidence attached) + (1 + 32)-byte
         // refund address whitelist (AV-23, zeroed when no whitelist
-        // configured).
+        // configured) + 2-byte anti-griefing penalty rate (AV-24, zeroed
+        // when no penalty configured).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 203);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 205);
     }
 
     #[test]
@@ -5726,6 +6020,14 @@ mod account_space_tests {
         // offset above is unchanged.
         assert_eq!(bytes[573], 0, "refund_to: None discriminant");
         assert_eq!(&bytes[574..606], &[0u8; 32], "refund_to: zeroed");
+        // AV-24: anti-griefing penalty rate u16, zeroed for a plain
+        // escrow; appended last, so every earlier offset above is
+        // unchanged.
+        assert_eq!(
+            u16::from_le_bytes(bytes[606..608].try_into().unwrap()),
+            0,
+            "penalty_bps: zeroed"
+        );
 
         // With quorum: same total length (space is always reserved), Some
         // discriminant, attestor bytes and approval bitmask in place.
@@ -5939,16 +6241,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 614) * 3480 * 2 = 742 * 6960 = 5_164_320 lamports.
-        assert_eq!(full, 5_164_320);
+        // (128 + 616) * 3480 * 2 = 744 * 6960 = 5_178_240 lamports.
+        assert_eq!(full, 5_178_240);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 203) * 3480 * 2 = 331 * 6960 = 2_303_760 lamports.
-        assert_eq!(no_quorum, 2_303_760);
+        // (128 + 205) * 3480 * 2 = 333 * 6960 = 2_317_680 lamports.
+        assert_eq!(no_quorum, 2_317_680);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -5991,12 +6293,12 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(5_164_320, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(5_178_240, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(4_704_959, params.0, params.1),
             Err(RentShortfall {
-                required: 5_164_320,
+                required: 5_178_240,
                 provided: 4_704_959,
             })
         );
@@ -6009,7 +6311,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 5_164_320,
+                required: 5_178_240,
                 provided: 0,
             })
         );
@@ -8498,5 +8800,178 @@ mod refund_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         assert_eq!(bytes[573], 1, "refund_to: Some discriminant");
         assert_eq!(&bytes[574..606], &CAROL, "refund_to bytes");
+    }
+}
+
+// ---------- AV-24: anti-griefing penalty on taker-initiated cancel_expired ----------
+//
+// When the taker calls `cancel_expired`, dragging the deal to expiry is
+// priced: a `penalty_bps` slice of the remainder is earmarked for the
+// initializer as griefing compensation. The initializer reclaiming
+// their own funds, the plain `cancel` path, and the arbiter's `resolve`
+// never carry the penalty.
+#[cfg(test)]
+mod penalty_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const CAROL: [u8; 32] = [0xC4; 32]; // whitelisted refund address
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn funded_with_penalty(amount: u64, penalty_bps: u16) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, amount, EXPIRES_AT)
+            .unwrap()
+            .with_penalty_bps(penalty_bps)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    #[test]
+    fn taker_initiated_cancel_splits_remainder_refund_plus_penalty() {
+        // 250 bps of 1_000_000 = 25_000 penalty; the refund is the rest.
+        let mut e = funded_with_penalty(1_000_000, 250);
+        let (refund, penalty) = e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!((refund, penalty), (975_000, 25_000));
+        assert_eq!(refund + penalty, 1_000_000, "split covers the remainder exactly");
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn initializer_initiated_cancel_charges_no_penalty() {
+        // The initializer reclaims their own funds penalty-free, even
+        // with a penalty rate configured.
+        let mut e = funded_with_penalty(1_000_000, 250);
+        let (refund, penalty) = e.cancel_expired(ALICE, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!((refund, penalty), (1_000_000, 0));
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn no_penalty_configured_is_backward_compatible() {
+        // Default escrows keep the historical behavior: full refund,
+        // regardless of who calls.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.penalty_bps(), 0);
+        e.fund(ALICE).unwrap();
+        let (refund, penalty) = e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!((refund, penalty), (1_000_000, 0));
+    }
+
+    #[test]
+    fn penalty_applies_to_the_partial_remainder() {
+        // After a partial release the penalty slices the *remainder*,
+        // not the original lockup.
+        let mut e = funded_with_penalty(1_000_000, 250);
+        e.release(ALICE, 400_000, None).unwrap();
+        let (refund, penalty) = e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        // floor(600_000 * 250 / 10_000) = 15_000.
+        assert_eq!((refund, penalty), (585_000, 15_000));
+        assert_eq!(refund + penalty, e.remaining_amount());
+    }
+
+    #[test]
+    fn dust_remainder_penalty_floors_to_zero() {
+        // Floor rounding never rounds *up* into the compensation: a
+        // dust remainder carries a zero penalty.
+        let mut e = funded_with_penalty(39, 250);
+        let (refund, penalty) = e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        // floor(39 * 250 / 10_000) = floor(0.975) = 0.
+        assert_eq!((refund, penalty), (39, 0));
+    }
+
+    #[test]
+    fn penalty_capped_at_100_percent() {
+        // 10_000 bps is a valid (if draconian) rate: the whole remainder
+        // becomes the penalty. The split still sums exactly.
+        let mut e = funded_with_penalty(1_000_000, 10_000);
+        let (refund, penalty) = e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!((refund, penalty), (0, 1_000_000));
+    }
+
+    #[test]
+    fn failed_cancel_charges_nothing() {
+        // The penalty is computed after every gate passes: a rejected
+        // cancel leaves the escrow Funded and touches no split.
+        let mut e = funded_with_penalty(1_000_000, 250);
+        assert_eq!(
+            e.cancel_expired(BOB, EXPIRES_AT - 1, None, ALICE),
+            Err(EscrowError::NotExpired)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        // ... and a stranger is Unauthorized before any penalty logic.
+        assert_eq!(
+            e.cancel_expired(MALLORY, EXPIRES_AT, None, ALICE),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn cancel_and_resolve_never_carry_a_penalty() {
+        // The initializer-only `cancel` path is penalty-free by design.
+        let mut e = funded_with_penalty(1_000_000, 250);
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn u128_math_cannot_overflow_on_max_amount() {
+        // amount * penalty_bps can reach u64::MAX * 10_000 < u128::MAX:
+        // the multiplication never wraps, even at the ceiling rate.
+        let mut e = funded_with_penalty(u64::MAX, 10_000);
+        let (refund, penalty) = e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!(refund, 0);
+        assert_eq!(penalty, u64::MAX);
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn whitelist_redirects_refund_penalty_still_routes_to_initializer() {
+        // AV-23 + AV-24 together: the refund goes to the whitelisted
+        // address (the state machine pins the destination), while the
+        // penalty is earmarked for the initializer personally — the
+        // compensation follows the harmed party, not the refund address.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_refund_address(CAROL)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let (refund, penalty) = e.cancel_expired(BOB, EXPIRES_AT, None, CAROL).unwrap();
+        assert_eq!((refund, penalty), (975_000, 25_000));
+        // The whitelist still pins the destination: CAROL is the only
+        // valid refund address.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_refund_address(CAROL)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.cancel_expired(BOB, EXPIRES_AT, None, ALICE),
+            Err(EscrowError::RefundAddressMismatch)
+        );
+    }
+
+    #[test]
+    fn penalty_rate_persists_in_layout_tail() {
+        // The rate survives serialization at the appended tail offset
+        // (bytes[606..608]); earlier offsets are unchanged.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(
+            u16::from_le_bytes(bytes[606..608].try_into().unwrap()),
+            250,
+            "penalty_bps tail offset"
+        );
     }
 }

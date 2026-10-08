@@ -67,13 +67,14 @@
 //! indexers deserialize a single shape for every kind. Fields are zero
 //! when the kind moves no such value:
 //!
-//! | kind | `payout` | `fee` | `refund` |
-//! |------|----------|-------|----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed | 0 | 0 | 0 |
-//! | Released, Claimed, MilestoneReleased | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 |
-//! | Cancelled, ExpiredCancelled | 0 | 0 | remainder refunded to the initializer |
-//! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's share of the split |
-//! | MilestoneSkipped | 0 | 0 | skipped tranche (the initializer's refund) |
+//! | kind | `payout` | `fee` | `refund` | `penalty` |
+//! |------|----------|-------|----------|-----------|
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed | 0 | 0 | 0 | 0 |
+//! | Released, Claimed, MilestoneReleased | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
+//! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
+//! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
+//! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
+//! | MilestoneSkipped | 0 | 0 | skipped tranche (the initializer's refund) | 0 |
 //!
 //! # Backward compatibility
 //!
@@ -111,14 +112,17 @@ pub enum EscrowEventKind {
 /// A single shape for every kind (see the module docs for the per-kind
 /// table): `payout` is the gross amount moved to the taker *before* the
 /// protocol-fee split (`payout - fee` is the taker's net), `fee` is the
-/// AV-17 protocol fee sliced from `payout`, and `refund` is the amount
-/// returned to the initializer. All three are zero when the kind moves
-/// no funds.
+/// AV-17 protocol fee sliced from `payout`, `refund` is the amount
+/// returned to the initializer, and `penalty` is the AV-24 anti-griefing
+/// penalty sliced from the remainder on a taker-initiated
+/// `cancel_expired` (routed to the initializer as griefing compensation).
+/// All four are zero when the kind moves no such value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventAmounts {
     pub payout: u64,
     pub fee: u64,
     pub refund: u64,
+    pub penalty: u64,
 }
 
 impl EventAmounts {
@@ -128,6 +132,7 @@ impl EventAmounts {
             payout: 0,
             fee: 0,
             refund: 0,
+            penalty: 0,
         }
     }
 
@@ -137,6 +142,7 @@ impl EventAmounts {
             payout: gross,
             fee,
             refund: 0,
+            penalty: 0,
         }
     }
 
@@ -146,6 +152,19 @@ impl EventAmounts {
             payout: 0,
             fee: 0,
             refund,
+            penalty: 0,
+        }
+    }
+
+    /// A taker-initiated expiry cancel (AV-24): the remainder splits
+    /// into the whitelisted `refund` and the anti-griefing `penalty`
+    /// routed to the initializer; `refund + penalty == remaining`.
+    fn expired_cancel(refund: u64, penalty: u64) -> Self {
+        Self {
+            payout: 0,
+            fee: 0,
+            refund,
+            penalty,
         }
     }
 }
@@ -354,6 +373,14 @@ impl IndexedEscrow {
         Ok(self)
     }
 
+    /// Opt in to an anti-griefing penalty on taker-initiated expiry
+    /// cancellation (mirrors [`Escrow::with_penalty_bps`]).
+    /// Configuration: emits no event.
+    pub fn with_penalty_bps(mut self, penalty_bps: u16) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_penalty_bps(penalty_bps)?;
+        Ok(self)
+    }
+
     // ----- transitions: exactly one event per successful transition -----
 
     /// Record one party's activation signature (mirrors
@@ -442,28 +469,29 @@ impl IndexedEscrow {
     /// Cancel an expired escrow (mirrors [`Escrow::cancel_expired`]).
     /// Emits `ExpiredCancelled`; `now` doubles as the event's `at`.
     /// `refund_to` is the refund destination, pinned against the
-    /// escrow's refund policy (AV-23).
+    /// escrow's refund policy (AV-23). Returns the `(refund, penalty)`
+    /// split (AV-24): only a taker-initiated cancel charges the penalty.
     pub fn cancel_expired(
         &mut self,
         authority: [u8; 32],
         now: u64,
         mint: Option<[u8; 32]>,
         refund_to: [u8; 32],
-    ) -> Result<(), EscrowError> {
+    ) -> Result<(u64, u64), EscrowError> {
         let from = self.inner.state();
-        self.inner
+        let (refund, penalty) = self
+            .inner
             .cancel_expired(authority, now, mint, refund_to)?;
         let to = self.inner.state();
-        let refund = self.inner.remaining_amount();
         self.push_event(
             EscrowEventKind::ExpiredCancelled,
             from,
             to,
-            EventAmounts::refund(refund),
+            EventAmounts::expired_cancel(refund, penalty),
             now,
             None,
         );
-        Ok(())
+        Ok((refund, penalty))
     }
 
     /// Record an attestation from a registered attestor (mirrors
@@ -563,6 +591,7 @@ impl IndexedEscrow {
             payout: taker_amount,
             fee,
             refund,
+            penalty: 0,
         };
         // AV-22: the evidence hash survives `resolve` on the escrow, so
         // the settlement event carries the same commitment the
@@ -733,7 +762,8 @@ mod event_tests {
             EventAmounts {
                 payout,
                 fee,
-                refund
+                refund,
+                penalty: 0,
             },
             "amounts"
         );
@@ -902,6 +932,36 @@ mod event_tests {
             1_000_000,
             EXPIRES_AT,
         );
+    }
+
+    #[test]
+    fn taker_initiated_cancel_emits_penalty_split() {
+        // AV-24: a taker-initiated cancel with a penalty rate emits the
+        // exact (refund, penalty) split — refund + penalty == remainder —
+        // so indexers see the compensation routing.
+        let mut e = indexed(1_000_000).with_penalty_bps(250).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let (refund, penalty) = e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!((refund, penalty), (975_000, 25_000));
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::ExpiredCancelled);
+        assert_eq!(event.amounts.refund, 975_000);
+        assert_eq!(event.amounts.penalty, 25_000);
+        assert_eq!(event.amounts.payout, 0);
+        assert_eq!(event.amounts.fee, 0);
+    }
+
+    #[test]
+    fn initializer_initiated_cancel_emits_zero_penalty() {
+        // Same penalty rate, but the initializer calls: no penalty, the
+        // event carries the full remainder as refund.
+        let mut e = indexed(1_000_000).with_penalty_bps(250).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.cancel_expired(ALICE, EXPIRES_AT, None, ALICE).unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::ExpiredCancelled);
+        assert_eq!(event.amounts.refund, 1_000_000);
+        assert_eq!(event.amounts.penalty, 0);
     }
 
     #[test]

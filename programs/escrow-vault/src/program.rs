@@ -186,11 +186,16 @@ pub mod escrow_vault {
     /// state machine against the escrow's refund policy — even when the
     /// taker is the caller, the refund goes to the declared address,
     /// never to the caller (`RefundAddressMismatch` otherwise).
+    /// AV-24: on a *taker-initiated* cancel the state machine returns
+    /// the `(refund, penalty)` split — the penalty is routed to the
+    /// initializer as griefing compensation (a separate transfer in the
+    /// real build); initializer-initiated cancels return
+    /// `(remaining, 0)`.
     pub fn cancel_expired(ctx: Context<CancelExpired>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
         let from = escrow.state() as u8;
-        escrow
+        let (refund, _penalty) = escrow
             .cancel_expired(
                 ctx.accounts.authority.key().to_bytes(),
                 now,
@@ -200,9 +205,16 @@ pub mod escrow_vault {
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // Refund of lamports/tokens to the initializer goes here
-        // once real token accounts are wired up.
+        // once real token accounts are wired up. AV-24: `refund` goes to
+        // `accounts.refund_to`; `penalty` (non-zero only on a
+        // taker-initiated cancel) is a second transfer to the
+        // initializer — the griefing compensation.
         // AV-18: `now` doubles as the event's `at`, mirroring
-        // `IndexedEscrow::cancel_expired`.
+        // `IndexedEscrow::cancel_expired`. The real build's
+        // `EscrowVaultEvent` gains a `penalty` amounts field mirroring
+        // `escrow_state::EventAmounts::penalty`; the skeleton's
+        // `emit_transition` keeps its current shape until the real
+        // build wires the event struct.
         emit_transition(
             &ctx.accounts.vault,
             escrow_state::EscrowEventKind::ExpiredCancelled,
@@ -210,7 +222,7 @@ pub mod escrow_vault {
             escrow.state() as u8,
             0,
             0,
-            escrow.remaining_amount(),
+            refund,
             now,
             None,
         );
@@ -701,6 +713,28 @@ pub mod escrow_vault {
         // needed in the real build.
         Ok(())
     }
+
+    /// Opt in to an anti-griefing penalty on taker-initiated expiry
+    /// cancellation (AV-24; mirrors `Escrow::with_penalty_bps`).
+    /// `Uninitialized` only, like `initialize_quorum`: the rate is fixed
+    /// before funds move. The rate is in basis points (`penalty_bps <=
+    /// 10_000`; `InvalidPenalty` otherwise); `0` means no penalty (the
+    /// default). After this, a *taker-initiated* `cancel_expired` splits
+    /// the remainder into a refund (to the whitelisted destination) and
+    /// a penalty routed to the initializer as griefing compensation;
+    /// initializer-initiated cancels and the arbiter's `resolve` never
+    /// carry it.
+    pub fn initialize_penalty(ctx: Context<InitializePenalty>, penalty_bps: u16) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_penalty_bps(penalty_bps)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.penalty_bps` is always present (2 bytes, zeroed by
+        // default), so the rate is written in place — no realloc needed
+        // in the real build.
+        Ok(())
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -808,6 +842,13 @@ pub struct Vault {
     /// matches `escrow_state::VAULT_FIELDS` (appended last, after
     /// `evidence_hash`).
     pub refund_to: Option<Pubkey>,
+    /// AV-24: anti-griefing penalty rate in basis points; mirrors
+    /// `escrow_state`'s `penalty_bps`. `0` for an escrow with no penalty
+    /// configured. Always present (2 bytes, zeroed by default) so
+    /// `initialize_penalty` writes the rate in place without
+    /// reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after `refund_to`).
+    pub penalty_bps: u16,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -1168,6 +1209,16 @@ pub struct InitializeRefundAddress<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitializePenalty<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer declares the anti-griefing penalty rate;
+    /// the state machine rejects re-configuration once the escrow
+    /// leaves `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct SkipMilestone<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
@@ -1277,7 +1328,7 @@ fn read_event_seq(_vault: &Account<Vault>) -> u64 {
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {
     // One program error per EscrowError variant, so on-chain failures
-    // surface the exact `escrow_state` reason (code 100–116) to clients.
+    // surface the exact `escrow_state` reason (code 100–117) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
         escrow_state::EscrowError::InvalidStateTransition => {
@@ -1306,6 +1357,7 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {
         escrow_state::EscrowError::RefundAddressMismatch => {
             error!(ErrorCode::RefundAddressMismatch)
         },
+        escrow_state::EscrowError::InvalidPenalty => error!(ErrorCode::InvalidPenalty),
     }
 }
 
@@ -1345,4 +1397,6 @@ pub enum ErrorCode {
     InvalidGracePeriod,
     #[msg("Refund destination does not match the escrow's refund policy (whitelisted address, or the initializer with no whitelist)")]
     RefundAddressMismatch,
+    #[msg("Invalid anti-griefing penalty rate: penalty_bps must be 0-10000 (basis points)")]
+    InvalidPenalty,
 }

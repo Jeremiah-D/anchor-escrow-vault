@@ -82,7 +82,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `fund(authority)`                           | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer            |
 | `release(authority, amount)`                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured); cumulative releases ≤ locked amount |
 | `cancel(authority, refund_to)`               | `Funded`       | `Cancelled` | initializer; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise |
-| `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); the refund still goes to the whitelisted address even when the taker calls |
+| `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); the refund still goes to the whitelisted address even when the taker calls; returns `(refund, penalty)` — a taker-initiated cancel with `penalty_bps > 0` slices an anti-griefing penalty for the initializer (see below) |
 
 Rules: the initializer drives `fund`/`release`/`cancel`; any other caller
 gets `Unauthorized` (checked before state validity). An escrow that has
@@ -113,6 +113,22 @@ declared address, never to the caller: the caller authorizes the cancel,
 the whitelist authorizes the destination. The whitelist covers the
 unilateral refund paths only; the arbiter's `resolve` split keeps its
 existing semantics by design.
+
+**Anti-griefing penalty (taker-initiated expiry cancel).** An escrow can
+opt into a penalty rate (`with_penalty_bps`, basis points, `0`–`10000`,
+`0` by default) charged when the *taker* calls `cancel_expired` — the
+taker dragging the deal to expiry otherwise locks the initializer's
+capital for free. The cancel returns `(refund, penalty)` with
+`refund + penalty == remaining`: the refund goes to the whitelisted
+destination, the penalty (`floor(remaining * penalty_bps / 10000)`,
+computed in `u128` so it cannot overflow) is routed to the initializer
+as griefing compensation. An initializer-initiated `cancel_expired`
+returns `(remaining, 0)` — the initializer pays no penalty to reclaim
+their own funds — and neither `cancel` nor the arbiter's `resolve`
+carry one. With a refund whitelist pointing elsewhere, the penalty
+still routes to the initializer personally: the compensation follows
+the harmed party, not the refund address. `InvalidPenalty`, code 117,
+rejects rates above 10_000.
 
 **Partial release (staged payouts).** `release(authority, amount)` releases
 in tranches: each call adds to a cumulative `released` counter and leaves
@@ -323,6 +339,7 @@ program error per variant):
 | `InvalidProtocolFee` | 114 | `with_protocol_fee` with `fee_bps` > 10_000 (not a valid basis-point rate) |
 | `InvalidGracePeriod` | 115 | `with_grace_period` where `expires_at + grace_period` would overflow `u64` (grace on a no-timeout escrow) |
 | `RefundAddressMismatch` | 116 | `cancel`/`cancel_expired` with a refund destination ≠ the whitelisted address (or ≠ the initializer with no whitelist), or `with_refund_address` with the zero address |
+| `InvalidPenalty` | 117 | `with_penalty_bps` with `penalty_bps` > 10_000 (not a valid basis-point rate) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -570,7 +587,7 @@ changes in per-escrow `seq` order instead of polling account data.
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
-| `amounts` | one struct for every kind: `payout` (gross taker amount before the fee split), `fee` (AV-17 protocol fee), `refund` (initializer's refund); zeroed when the kind moves no such value |
+| `amounts` | one struct for every kind: `payout` (gross taker amount before the fee split), `fee` (AV-17 protocol fee), `refund` (initializer's refund), `penalty` (AV-24 anti-griefing penalty on a taker-initiated `cancel_expired`); zeroed when the kind moves no such value |
 | `at` | caller-supplied Unix-seconds timestamp (`cancel_expired` / `escalate` / `claim` reuse their `now`) |
 
 **Emission rule.** Exactly one event per *successful* call that changes
@@ -591,6 +608,10 @@ successful calls that change nothing observable:
 - Partial `release` / `claim` calls emit with `from == to == Funded` so
   the payout stream is complete in `seq` order; the closing payout has
   `to == Released`.
+- `cancel_expired` emits `ExpiredCancelled` with the exact
+  `(refund, penalty)` split in `amounts` (AV-24): a taker-initiated
+  cancel carries the penalty earmarked for the initializer, an
+  initializer-initiated cancel carries `penalty == 0`.
 - `drain_events()` takes the recorded events and clears the log; the
   sequence counter keeps running, so a resuming indexer never sees
   duplicates.
@@ -668,7 +689,8 @@ two-way consistency check against the IDL parameter table:
 | grace_period  | u64               | 8     |
 | evidence_hash | Option<[u8; 32]>  | 33    |
 | refund_to     | Option<Pubkey>    | 33    |
-| **total**     |                   | **614** |
+| penalty_bps   | u16               | 2     |
+| **total**     |                   | **616** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -692,11 +714,13 @@ does the 8-byte expiry grace period `grace_period` (AV-21, zeroed when no
 grace period is configured) — and the 33-byte dispute evidence hash region
 (AV-22: 1-byte discriminant + 32-byte commitment, zeroed when no evidence
 is attached) — and the 33-byte refund whitelist region (AV-23: 1-byte
-discriminant + 32-byte address, zeroed when no whitelist is configured).
-`escrow-state` exposes `VAULT_SPACE` (614) and
-`VAULT_SPACE_NO_QUORUM` (203) for the Anchor `space =` constraint, plus a
+discriminant + 32-byte address, zeroed when no whitelist is configured)
+— and the 2-byte anti-griefing penalty rate `penalty_bps` (AV-24, zeroed
+when no penalty is configured).
+`escrow-state` exposes `VAULT_SPACE` (616) and
+`VAULT_SPACE_NO_QUORUM` (205) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **5,164,320 lamports** to be
+mainnet rent parameters the full vault needs **5,178,240 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ## Run the tests
