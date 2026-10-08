@@ -76,6 +76,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_quorum(attestors, threshold)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
+| `update_quorum(initializer, taker, threshold)` | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance); `0` or `> registered` is `InvalidQuorum` |
 | `activate(authority)`                       | `Uninitialized`| `Uninitialized` (one party) / `Activated` (both parties) | initializer **or** taker (dual-sig escrows only) |
 | `initialize_vesting(start, end)`            | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `start < end`) |
 | `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured) |
@@ -150,6 +151,21 @@ progress. Deliberately, the quorum gates *release only*: `cancel` and
 `cancel_expired` stay ungated so attestors cannot grief funds into a lockup
 by withholding approval. Without a quorum the escrow behaves exactly as the
 plain two-party machine above.
+
+**Quorum threshold governance (dual-signed).** The quorum threshold is
+fixed before funding — but attestors can go dark (a lost key, an
+unresponsive oracle), which would lock the funds behind an unreachable
+threshold forever. `update_quorum(initializer, taker, threshold)` lets
+*both* parties move the threshold together, on an `Uninitialized` or
+`Funded` escrow: lower it to restore liveness, or raise it by mutual
+agreement when they want a stricter gate. One party alone gets
+`Unauthorized` — the gate can never be weakened unilaterally. The
+attestor set and recorded votes are untouched; only the threshold moves,
+in place, so the account layout never changes. If the new threshold is
+at or below the current approval count, `release` becomes legal
+immediately — that is the intended unlock. `0`, above the registered
+count, or no quorum configured is `InvalidQuorum`; the change emits a
+`QuorumUpdated` indexer event (no-op re-affirmations emit nothing).
 
 **Dual-signature activation (multisig escrow).** An escrow can require
 *two* signatures to activate (`with_dual_sig`, opt-in on `Uninitialized`,
@@ -583,7 +599,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `Attested`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped` |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `Attested`, `QuorumUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped` |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -600,6 +616,11 @@ successful calls that change nothing observable:
 - `attest` emits when it records a *new* attestation (the quorum's
   approval count grows) — quorum progress is what an indexer watches to
   know when the release gate opens; duplicate votes emit nothing.
+- `update_quorum` emits `QuorumUpdated` when the threshold actually
+  changes (`from == to ==` the current state, all amounts zero) — the
+  event is the ordering signal that the release gate moved, the new
+  threshold is read from the vault; a no-op re-affirmation emits
+  nothing.
 - `confirm_milestone` emits when the milestone becomes fully confirmed
   (the completing vote); the first party's confirmation alone emits
   nothing, paralleling `activate`.

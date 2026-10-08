@@ -286,6 +286,47 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Adjust the quorum's attestation threshold by dual-signed
+    /// governance (AV-25; mirrors `Escrow::update_quorum`). Both the
+    /// initializer and the taker must sign — one party alone cannot
+    /// weaken the gate. Allowed on `Uninitialized` or `Funded` escrows;
+    /// `0` or above the registered attestor count is `InvalidQuorum`, as
+    /// is calling with no quorum configured. The attestor set and
+    /// existing attestations are untouched — only the threshold moves,
+    /// in place, so the account needs no realloc. Emits `QuorumUpdated`
+    /// when the threshold actually changes (a no-op re-affirmation
+    /// emits nothing), mirroring `IndexedEscrow::update_quorum`.
+    pub fn update_quorum(ctx: Context<UpdateQuorum>, threshold: u8) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let threshold_before = escrow.quorum().map(|q| q.threshold()).unwrap_or(0);
+        escrow
+            .update_quorum(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                threshold,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Write the new threshold into `vault.quorum.threshold` in the
+        // real build (in place — the quorum region is always reserved).
+        let threshold_after = escrow.quorum().map(|q| q.threshold()).unwrap_or(0);
+        if threshold_after != threshold_before {
+            let state = escrow.state() as u8;
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::QuorumUpdated,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Opt in to dual-signature activation (AV-12; mirrors
     /// `Escrow::with_dual_sig`). `Uninitialized` only, like
     /// `initialize_quorum`. After this, `fund` requires the escrow to be
@@ -1073,6 +1114,17 @@ pub struct Attest<'info> {
     /// Must be one of the registered attestors; the state machine
     /// rejects anyone else with `Unauthorized`.
     pub attestor: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateQuorum<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone is `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker.
+    pub taker: Signer<'info>,
 }
 
 #[derive(Accounts)]

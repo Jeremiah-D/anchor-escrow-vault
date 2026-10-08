@@ -1096,6 +1096,60 @@ impl Escrow {
         }
     }
 
+    /// Adjust the quorum's attestation threshold by mutual agreement
+    /// (AV-25 — Solana quorum governance): both the initializer and the
+    /// taker must authorize the change (dual-signature governance,
+    /// reusing the AV-12 concept), on an escrow that is `Uninitialized`
+    /// or `Funded`.
+    ///
+    /// Why: the quorum is fixed before funding ([`Escrow::with_quorum`]),
+    /// but attestors can go dark — a lost key or an unresponsive oracle
+    /// would otherwise lock the funds behind an unreachable threshold
+    /// forever, since the refund paths deliberately stay quorum-free and
+    /// cannot release to the taker. Dual-signed governance lets the two
+    /// parties lower the threshold to restore liveness (or raise it by
+    /// mutual agreement when they want a stricter gate), without any
+    /// single party being able to weaken the gate unilaterally.
+    ///
+    /// The attestor set and existing attestations are untouched: only
+    /// the threshold moves, in place within the already-reserved quorum
+    /// region (no layout change, no realloc). If the new threshold is at
+    /// or below the current approval count, `release` becomes legal
+    /// immediately — that is the intended unlock. Setting the same
+    /// threshold again succeeds as a no-op.
+    ///
+    /// Check order is deliberate: authority (both parties) first, then
+    /// state, then quorum configuration, then threshold validity — a
+    /// stranger learns nothing about the quorum from the error alone.
+    /// A `0` threshold or one above the registered attestor count is
+    /// [`EscrowError::InvalidQuorum`], reusing the quorum configuration
+    /// error; calling on an escrow with no quorum configured is
+    /// `InvalidQuorum` too.
+    pub fn update_quorum(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_threshold: u8,
+    ) -> Result<(), EscrowError> {
+        // Both parties must sign: either key alone (or a stranger) is
+        // Unauthorized. Independent `==` checks (not `||`): the
+        // degenerate initializer == taker self-escrow authorizes with
+        // one key passed twice, like AV-12's activation.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let policy = self.quorum.as_mut().ok_or(EscrowError::InvalidQuorum)?;
+        if new_threshold == 0 || new_threshold > policy.registered_count() {
+            return Err(EscrowError::InvalidQuorum);
+        }
+        policy.threshold = new_threshold;
+        Ok(())
+    }
+
     /// Attach a linear vesting schedule (AV-13). Builder-style: only valid
     /// on an `Uninitialized` escrow, so the unlock curve is fixed before
     /// any funds move — mirroring [`Escrow::with_quorum`]. After this, the
@@ -3486,6 +3540,23 @@ mod anchor_idl_tests {
                             Anchor account constraint, not the state machine",
         },
         InstructionSpec {
+            // AV-25: dual-signed quorum threshold governance.
+            name: "update_quorum",
+            params: &[("threshold", "u8", "instruction param; the new N in N-of-M")],
+            method: "Escrow::update_quorum",
+            input_mapping: "authority <- accounts.initializer AND \
+                            accounts.taker (BOTH signers — dual-signature \
+                            governance; one party alone is Unauthorized); \
+                            threshold <- param; Uninitialized or Funded \
+                            only; 0 or > registered attestor count is \
+                            InvalidQuorum, and no quorum configured is \
+                            InvalidQuorum; the attestor set and existing \
+                            attestations are untouched — only the threshold \
+                            moves, in place, so the account needs no \
+                            realloc; lowering an unreachable threshold \
+                            restores liveness when attestors go dark",
+        },
+        InstructionSpec {
             // AV-12: dual-signature activation.
             name: "initialize_dual_sig",
             params: &[],
@@ -3790,6 +3861,7 @@ mod anchor_idl_tests {
             "Escrow::cancel",
             "Escrow::cancel_expired",
             "QuorumPolicy::new + Escrow::with_quorum",
+            "Escrow::update_quorum",
             "Escrow::with_dual_sig",
             "Escrow::activate",
             "VestingSchedule::new + Escrow::with_vesting",
@@ -3830,7 +3902,7 @@ mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_sixteen_instructions_take_params() {
+    fn only_seventeen_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -3844,6 +3916,7 @@ mod anchor_idl_tests {
                 &"initialize",
                 &"release",
                 &"initialize_quorum",
+                &"update_quorum",
                 &"initialize_vesting",
                 &"initialize_arbiter",
                 &"escalate",
@@ -4034,6 +4107,62 @@ mod anchor_idl_tests {
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(funded.penalty_bps(), 250);
+    }
+
+    #[test]
+    fn update_quorum_maps_dual_signers_and_threshold_param() {
+        // IDL: update_quorum(threshold: u8). The program passes
+        // accounts.initializer and accounts.taker (BOTH signers) plus
+        // the param, then Escrow::update_quorum.
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 2);
+        // Both parties sign: the threshold moves.
+        e.update_quorum(ALICE, BOB, 1).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+        // One party alone is Unauthorized — the gate cannot be weakened
+        // unilaterally. A stranger learns nothing either.
+        assert_eq!(
+            e.update_quorum(ALICE, MALLORY, 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.update_quorum(MALLORY, BOB, 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.quorum().unwrap().threshold(), 1, "failed update keeps the threshold");
+        // Documented failure modes: no quorum configured ...
+        let mut plain = funded_escrow();
+        assert_eq!(
+            plain.update_quorum(ALICE, BOB, 1),
+            Err(EscrowError::InvalidQuorum)
+        );
+        // ... a zero threshold, or one above the registered count.
+        assert_eq!(
+            e.update_quorum(ALICE, BOB, 0),
+            Err(EscrowError::InvalidQuorum)
+        );
+        assert_eq!(
+            e.update_quorum(ALICE, BOB, 3),
+            Err(EscrowError::InvalidQuorum)
+        );
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+        // Terminal states are locked out.
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(
+            e.update_quorum(ALICE, BOB, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
     }
 
     #[test]
@@ -4475,6 +4604,9 @@ mod anchor_idl_tests {
         ("release", "amount", "released"),
         ("initialize_quorum", "attestors", "quorum.attestors"),
         ("initialize_quorum", "threshold", "quorum.threshold"),
+        // AV-25: the dual-signed governance update writes the same
+        // field (a second param source is allowed — see `released`).
+        ("update_quorum", "threshold", "quorum.threshold"),
         ("initialize_vesting", "start", "vesting.start"),
         ("initialize_vesting", "end", "vesting.end"),
         ("initialize_arbiter", "arbiter", "arbiter"),
@@ -8972,6 +9104,158 @@ mod penalty_tests {
             u16::from_le_bytes(bytes[606..608].try_into().unwrap()),
             250,
             "penalty_bps tail offset"
+        );
+    }
+}
+
+// ---------- AV-25: dual-signed quorum threshold governance ----------
+//
+// The quorum threshold is fixed before funding (`with_quorum`), but
+// attestors can go dark — a lost key or an unresponsive oracle would
+// otherwise lock funds behind an unreachable threshold forever. Both
+// parties together may move the threshold (`update_quorum`, on
+// `Uninitialized` or `Funded`): lower it to restore liveness, or raise
+// it by mutual agreement. Neither party can weaken the gate alone.
+#[cfg(test)]
+mod quorum_governance_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const ATTESTOR_1: [u8; 32] = [0xA1; 32];
+    const ATTESTOR_2: [u8; 32] = [0xA2; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn funded_quorum(threshold: u8) -> Escrow {
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], threshold).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    #[test]
+    fn lowering_threshold_restores_liveness_when_attestor_goes_dark() {
+        // The core scenario: 2-of-2 with one attestor unresponsive. One
+        // attestation lands, the other never will — `release` is stuck
+        // behind the gate. Both parties agree to drop to 1-of-2, and the
+        // release goes through.
+        let mut e = funded_quorum(2);
+        e.attest(ATTESTOR_1).unwrap();
+        assert_eq!(
+            e.release(ALICE, 1_000_000, None),
+            Err(EscrowError::QuorumNotReached)
+        );
+        e.update_quorum(ALICE, BOB, 1).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+        e.release(ALICE, 1_000_000, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn raising_threshold_by_mutual_agreement() {
+        // Governance is symmetric: both parties may also tighten the
+        // gate when they want a stricter release condition.
+        let mut e = funded_quorum(1);
+        e.attest(ATTESTOR_1).unwrap();
+        e.update_quorum(ALICE, BOB, 2).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 2);
+        // One vote no longer satisfies the gate.
+        assert_eq!(
+            e.release(ALICE, 1_000_000, None),
+            Err(EscrowError::QuorumNotReached)
+        );
+        // The second attestor's vote restores the release path.
+        e.attest(ATTESTOR_2).unwrap();
+        e.release(ALICE, 1_000_000, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn governance_works_before_funding() {
+        // The threshold can be adjusted on an `Uninitialized` escrow —
+        // e.g. the parties renegotiate the gate before locking funds.
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.update_quorum(ALICE, BOB, 1).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+        e.fund(ALICE).unwrap();
+        e.attest(ATTESTOR_1).unwrap();
+        e.release(ALICE, 1_000_000, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn attestations_survive_the_threshold_update() {
+        // Only the threshold moves — the attestor set and the recorded
+        // votes are untouched, in place, with no layout change.
+        let mut e = funded_quorum(2);
+        e.attest(ATTESTOR_1).unwrap();
+        e.update_quorum(ALICE, BOB, 1).unwrap();
+        assert_eq!(e.quorum().unwrap().approval_count(), 1);
+        assert_eq!(e.quorum().unwrap().registered_count(), 2);
+        assert!(e.quorum().unwrap().is_satisfied());
+    }
+
+    #[test]
+    fn same_threshold_is_a_noop_success() {
+        // Re-affirming the current threshold succeeds and changes
+        // nothing (the event layer treats it as a no-op, paralleling
+        // `attest`'s idempotent duplicates).
+        let mut e = funded_quorum(2);
+        e.update_quorum(ALICE, BOB, 2).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 2);
+    }
+
+    #[test]
+    fn dual_sig_self_escrow_authorizes_with_one_key_twice() {
+        // Degenerate initializer == taker escrow: one key passed for both
+        // slots authorizes, paralleling AV-12's activation.
+        const SELF: [u8; 32] = [0x5E; 32];
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let mut e = Escrow::initialize(SELF, SELF, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.update_quorum(SELF, SELF, 1).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+        // A stranger still cannot.
+        assert_eq!(
+            e.update_quorum(MALLORY, MALLORY, 2),
+            Err(EscrowError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn check_order_authority_then_state_then_config_then_threshold() {
+        // A stranger gets Unauthorized before any config check — they
+        // learn nothing about whether a quorum exists.
+        let mut e = funded_quorum(2);
+        assert_eq!(
+            e.update_quorum(MALLORY, MALLORY, 1),
+            Err(EscrowError::Unauthorized)
+        );
+        // State before configuration: a stranger-shaped error must not
+        // leak the quorum's existence on a terminal escrow either.
+        let mut e = funded_quorum(2);
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(
+            e.update_quorum(ALICE, BOB, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Configuration before threshold validity.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE).unwrap();
+        assert_eq!(
+            plain.update_quorum(ALICE, BOB, 0),
+            Err(EscrowError::InvalidQuorum),
+            "no quorum configured: InvalidQuorum, not a threshold complaint"
         );
     }
 }

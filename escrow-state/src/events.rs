@@ -36,6 +36,13 @@
 //!   when the skip executes (both approvals present). A lone approval
 //!   emits nothing; `from == to == Funded`, and `amounts.refund` carries
 //!   the skipped tranche (the initializer's refund).
+//! - `update_quorum` emits [`EscrowEventKind::QuorumUpdated`] when the
+//!   threshold actually changes (AV-25) — `from == to ==` the current
+//!   state, all amounts zero: the event is the ordering signal that the
+//!   release gate moved, and the indexer reads the new threshold from
+//!   the vault (paralleling `Attested`, which likewise does not carry
+//!   the vote itself). A no-op update (same threshold) emits nothing,
+//!   paralleling `attest`'s idempotent duplicates.
 //! - Partial `release` / `claim` calls emit [`EscrowEventKind::Released`]
 //!   / [`EscrowEventKind::Claimed`] with `from == to == Funded`: the
 //!   `EscrowState` variant does not change, but funds moved and the
@@ -69,7 +76,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
@@ -105,6 +112,11 @@ pub enum EscrowEventKind {
     MilestoneConfirmed,
     MilestoneReleased,
     MilestoneSkipped,
+    /// AV-25: the quorum's attestation threshold changed by dual-signed
+    /// governance ([`Escrow::update_quorum`]). `from == to ==` the
+    /// current state; the new threshold is read from the vault, the
+    /// event is the ordering signal.
+    QuorumUpdated,
 }
 
 /// Fund movements carried by an [`EscrowEvent`].
@@ -202,13 +214,13 @@ pub struct EscrowEvent {
 /// An event-logging adapter over [`Escrow`] (AV-18).
 ///
 /// Exposes the same mutating transitions (`initialize` as the
-/// constructor, then `activate`, `fund`, `attest`, `release`, `cancel`,
-/// `cancel_expired`, `claim`, `escalate`, `resolve`,
-/// `confirm_milestone`, `release_milestone`, `skip_milestone`) plus the
-/// `with_*` configuration builders, delegating every call to the inner
-/// state machine. Exactly one [`EscrowEvent`] is recorded per
-/// successful transition (see the module docs for the emission rule);
-/// failed calls record nothing.
+/// constructor, then `activate`, `fund`, `attest`, `update_quorum`,
+/// `release`, `cancel`, `cancel_expired`, `claim`, `escalate`,
+/// `resolve`, `confirm_milestone`, `release_milestone`,
+/// `skip_milestone`) plus the `with_*` configuration builders,
+/// delegating every call to the inner state machine. Exactly one
+/// [`EscrowEvent`] is recorded per successful transition (see the module
+/// docs for the emission rule); failed calls record nothing.
 ///
 /// Timestamps are caller-supplied Unix seconds, like the rest of the
 /// crate: transitions whose inner method takes no `now` take an
@@ -518,6 +530,40 @@ impl IndexedEscrow {
         if after > before {
             let state = self.inner.state();
             self.push_event(EscrowEventKind::Attested, state, state, EventAmounts::none(), at, None);
+        }
+        Ok(())
+    }
+
+    /// Adjust the quorum's attestation threshold by dual-signed
+    /// governance (mirrors [`Escrow::update_quorum`]). Emits
+    /// `QuorumUpdated` when the threshold actually changes; a no-op
+    /// update (same threshold) emits nothing. `from == to ==` the
+    /// current state — the quorum gate, not the lifecycle state, is
+    /// what changed. `at` is the caller-supplied timestamp (on-chain:
+    /// the clock sysvar).
+    pub fn update_quorum(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_threshold: u8,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.quorum().map(|q| q.threshold()).unwrap_or(0);
+        self.inner.update_quorum(initializer, taker, new_threshold)?;
+        let after = self.inner.quorum().map(|q| q.threshold()).unwrap_or(0);
+        // The inner call succeeds with a configured quorum or fails
+        // (no quorum / bad threshold / wrong authority / bad state), so
+        // a changed threshold here always means real governance.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::QuorumUpdated,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+            );
         }
         Ok(())
     }
@@ -1203,6 +1249,57 @@ mod event_tests {
     }
 
     #[test]
+    fn update_quorum_emits_governance_event() {
+        // AV-25: a real threshold change emits QuorumUpdated with
+        // from == to == the current state and zero amounts — the event
+        // is the ordering signal, the new threshold is read from the
+        // vault.
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.update_quorum(ALICE, BOB, 1, T0 + 2).unwrap();
+        assert_event(
+            &last(&e),
+            EscrowEventKind::QuorumUpdated,
+            2,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            0,
+            0,
+            0,
+            T0 + 2,
+        );
+    }
+
+    #[test]
+    fn update_quorum_noop_emits_nothing() {
+        // Same threshold: the state machine succeeds but nothing
+        // observable changed, so no event — paralleling `attest`'s
+        // idempotent duplicates.
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        assert_eq!(e.event_count(), 2);
+        e.update_quorum(ALICE, BOB, 2, T0 + 2).unwrap();
+        assert_eq!(e.event_count(), 2);
+        assert_eq!(e.next_seq(), 2);
+    }
+
+    #[test]
+    fn failed_update_quorum_emits_nothing() {
+        // One party alone is Unauthorized: the failed governance call
+        // emits no event and the threshold is untouched.
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        assert_eq!(
+            e.update_quorum(ALICE, MALLORY, 1, T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert!(e.drain_events().len() == 2, "failed update emitted an event");
+    }
+
+    #[test]
     fn builders_emit_nothing() {
         let e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
             .unwrap()
@@ -1217,6 +1314,8 @@ mod event_tests {
             .with_mint([0xD0; 32])
             .unwrap()
             .with_protocol_fee(250)
+            .unwrap()
+            .with_penalty_bps(250)
             .unwrap()
             .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
             .unwrap();
