@@ -25,7 +25,7 @@ release/cancel), the same authority checks, the same amount invariants.
 - **What's a skeleton:** `programs/escrow-vault/src/program.rs` is an Anchor program source
   file showing how the instructions (`initialize`, `fund`, `release`,
   `cancel`, `cancel_expired`, `initialize_quorum`, `attest`,
-  `initialize_dual_sig`, `activate`) would wrap the
+  `initialize_dual_sig`, `activate`, `initialize_vesting`, `claim`) would wrap the
   `escrow-state` logic on-chain. It is **not
   compiled here** — a full on-chain build and test requires the Solana/Anchor
   toolchain. The compilable `escrow-vault` cargo package only ships
@@ -60,6 +60,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
 | `activate(authority)`                       | `Uninitialized`| `Uninitialized` (one party) / `Activated` (both parties) | initializer **or** taker (dual-sig escrows only) |
+| `initialize_vesting(start, end)`            | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `start < end`) |
+| `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured) |
 | `fund(authority)`                           | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer            |
 | `release(authority, amount)`                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured); cumulative releases ≤ locked amount |
 | `cancel(authority)`                         | `Funded`       | `Cancelled` | initializer          |
@@ -110,6 +112,24 @@ survives serialization; `attest` is allowed in `Activated` too, so
 attestors can vote between activation and funding. Composes with the
 quorum builder: activation gates `fund`, quorum gates `release`.
 
+**Streaming release (linear vesting).** An escrow can attach a vesting
+schedule (`VestingSchedule::new(start, end)`, opt-in on `Uninitialized`,
+like the quorum builder): the locked amount unlocks linearly between
+`start` and `end`, and the taker pulls the vested-but-unreleased portion
+at any time with `claim(authority, now)` — the streaming-payments
+pattern (salary streams, linear token unlocks). `claim` returns the
+claimed amount so the program can size the transfer; claims accumulate in
+the same `released` counter as `release`, so conservation and audit stay
+unified, and the escrow moves to `Released` once everything is out. Only
+the taker may claim (`Unauthorized` otherwise); `claim` needs `Funded`
+state and a configured schedule (`InvalidVesting` when `start >= end` or
+no schedule), and a configured quorum gates `claim` exactly like
+`release` — otherwise the taker could bypass attestation. Claiming with
+nothing newly vested is `AmountMismatch` (paralleling zero-amount
+release). The initializer keeps the `release` push path and may release
+ahead of the curve; the schedule itself is immutable once set, and
+`cancel` / `cancel_expired` still refund the unreleased remainder.
+
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
 
@@ -122,6 +142,7 @@ program error per variant):
 | `InvalidQuorum` | 104 | bad quorum policy config, or `attest` with no quorum configured |
 | `QuorumNotReached` | 105 | `release` before the quorum threshold is reached |
 | `ReleaseExceedsLocked` | 106 | cumulative `release` amounts exceeding the locked amount |
+| `InvalidVesting` | 107 | bad vesting schedule (`start >= end`), or `claim` with no vesting configured |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -242,6 +263,30 @@ initializer    taker            escrow                 state
    |------------------------------------------>|  Activated→Funded      |
 ```
 
+**G. Streaming release — taker pulls the vested stream.** The unlock
+curve is fixed before funding; the taker claims whatever newly vested
+since the last claim:
+
+```
+initializer    taker            escrow                 state
+   |  initialize_vesting(t0, t1)  |  |                 |
+   |-------------------------------->| (curve fixed,    |
+   |                               |  still Uninitialized)|
+   |  fund(alice)   |              |                      |
+   |----------------------------->|  Uninitialized→Funded  |
+   |               claim(bob, t0+(t1-t0)/2)  |            |
+   |               -------------------------->|  vested=amount/2,|
+   |                                          |  released=amount/2,|
+   |                                          |  stays Funded      |
+   |  release(alice, amount/4)  |             |           |
+   |----------------------------->|  (initializer push   |
+   |                             |   ahead of the curve)  |
+   |               claim(bob, t1) |                      |
+   |               -------------------------->|  vested=amount,  |
+   |                                          |  released=amount,  |
+   |                                          |  Funded→Released   |
+```
+
 Note that `attest` never changes `EscrowState` itself (it only grows the
 quorum's approval bitmask), and the failed-call invariant holds on every
 path above: any `Err(...)` return leaves the state — and `amount` and the
@@ -266,15 +311,18 @@ two-way consistency check against the IDL parameter table:
 | state         | u8 (discriminant) | 1     |
 | quorum        | Option<Quorum>    | 267   |
 | activation    | u8 (bitmask)      | 1     |
-| **total**     |                   | **365** |
+| vesting       | Option<VestingSchedule> | 17 |
+| **total**     |                   | **382** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
 realloc. The 1-byte activation bitmask (AV-12) is likewise always present
-(zeroed for plain escrows). `escrow-state` exposes `VAULT_SPACE` (365) and
-`VAULT_SPACE_NO_QUORUM` (99) for the Anchor `space =` constraint, plus a
+(zeroed for plain escrows), as is the 17-byte vesting region (AV-13:
+1-byte discriminant + `start`/`end` u64, zeroed when no schedule is
+attached). `escrow-state` exposes `VAULT_SPACE` (382) and
+`VAULT_SPACE_NO_QUORUM` (100) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **3,431,280 lamports** to be
+mainnet rent parameters the full vault needs **3,549,600 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ## Run the tests

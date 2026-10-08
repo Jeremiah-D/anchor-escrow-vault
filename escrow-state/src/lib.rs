@@ -49,6 +49,10 @@ pub struct Escrow {
     /// flag. `0` for plain escrows — dual-signature activation is opt-in
     /// via [`Escrow::with_dual_sig`].
     activation: u8,
+    /// AV-13: optional linear vesting schedule gating [`Escrow::claim`].
+    /// `None` means no vesting (backward compatible): the taker cannot
+    /// claim, and `release` keeps its existing semantics.
+    vesting: Option<VestingSchedule>,
 }
 
 /// Bit 0 of [`Escrow::activation`]: the initializer has recorded their
@@ -91,6 +95,11 @@ pub enum EscrowError {
     /// locked [`Escrow::amount`] — or whose cumulative addition would
     /// overflow `u64`. Partial releases must never outrun the lockup.
     ReleaseExceedsLocked,
+    /// Vesting misconfiguration or misuse (AV-13): `VestingSchedule::new`
+    /// with `start >= end`, or [`Escrow::claim`] on an escrow with no
+    /// vesting schedule attached. Parallels [`EscrowError::InvalidQuorum`]
+    /// (config error, plus the no-config call path).
+    InvalidVesting,
 }
 
 impl EscrowError {
@@ -110,6 +119,7 @@ impl EscrowError {
             EscrowError::InvalidQuorum => 104,
             EscrowError::QuorumNotReached => 105,
             EscrowError::ReleaseExceedsLocked => 106,
+            EscrowError::InvalidVesting => 107,
         }
     }
 
@@ -123,6 +133,7 @@ impl EscrowError {
             EscrowError::InvalidQuorum,
             EscrowError::QuorumNotReached,
             EscrowError::ReleaseExceedsLocked,
+            EscrowError::InvalidVesting,
         ]
     }
 }
@@ -219,6 +230,61 @@ impl QuorumPolicy {
     }
 }
 
+/// Linear vesting schedule (AV-13): the locked [`Escrow::amount`] unlocks
+/// uniformly between `start` and `end` (Unix seconds, caller-supplied
+/// clock like `expires_at`). The taker claims the vested-but-unreleased
+/// portion at any time via [`Escrow::claim`] — the streaming-payments
+/// pattern (salary streams, linear token unlocks).
+///
+/// `Copy` and heap-free like the rest of the crate. The schedule is fixed
+/// before funding via [`Escrow::with_vesting`]; it never changes
+/// afterwards, so both parties can reason about the unlock curve
+/// off-chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VestingSchedule {
+    start: u64,
+    end: u64,
+}
+
+impl VestingSchedule {
+    /// Build a schedule unlocking linearly from `start` (inclusive) to
+    /// `end` (exclusive boundary: at `now >= end` everything is vested).
+    /// Rejects `start >= end` with [`EscrowError::InvalidVesting`] — a
+    /// zero-length window would divide by zero in
+    /// [`VestingSchedule::vested_amount`].
+    pub fn new(start: u64, end: u64) -> Result<Self, EscrowError> {
+        if start >= end {
+            return Err(EscrowError::InvalidVesting);
+        }
+        Ok(Self { start, end })
+    }
+
+    /// Unix timestamp at which unlocking begins.
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    /// Unix timestamp at which unlocking completes (everything vested).
+    pub fn end(&self) -> u64 {
+        self.end
+    }
+
+    /// Amount vested at `now` for a locked total of `amount`: linear
+    /// interpolation `amount * elapsed / duration`, clamped to
+    /// `[0, amount]`. Before `start` nothing is vested; at or after `end`
+    /// everything is.
+    ///
+    /// Computed in `u128`: `amount * elapsed` can reach
+    /// `(u64::MAX)^2 < u128::MAX`, so the multiplication cannot overflow,
+    /// and the result is `<= amount <= u64::MAX`, so the downcast is
+    /// exact.
+    pub fn vested_amount(&self, amount: u64, now: u64) -> u64 {
+        let duration = self.end - self.start; // > 0 by construction
+        let elapsed = now.saturating_sub(self.start).min(duration);
+        ((amount as u128 * elapsed as u128) / duration as u128) as u64
+    }
+}
+
 impl Escrow {
     /// Construct a new escrow in the `Uninitialized` state.
     ///
@@ -245,6 +311,7 @@ impl Escrow {
             state: EscrowState::Uninitialized,
             quorum: None,
             activation: 0,
+            vesting: None,
         })
     }
 
@@ -475,6 +542,77 @@ impl Escrow {
         }
     }
 
+    /// Attach a linear vesting schedule (AV-13). Builder-style: only valid
+    /// on an `Uninitialized` escrow, so the unlock curve is fixed before
+    /// any funds move — mirroring [`Escrow::with_quorum`]. After this, the
+    /// taker may [`Escrow::claim`] the vested-but-unreleased portion at
+    /// any time; `cancel` / `cancel_expired` still refund the unreleased
+    /// remainder regardless of vesting.
+    pub fn with_vesting(mut self, schedule: VestingSchedule) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        self.vesting = Some(schedule);
+        Ok(self)
+    }
+
+    /// Claim the vested-but-unreleased portion of the locked funds
+    /// (AV-13, streaming payments). Returns the claimed amount — the
+    /// caller (and the Anchor layer) needs it to size the actual transfer.
+    ///
+    /// Only the taker may claim (`Unauthorized` otherwise): vesting is the
+    /// taker's pull path, while [`Escrow::release`] stays the initializer's
+    /// push path. The initializer may still `release` ahead of the curve
+    /// (e.g. a milestone completed early); in that case a later `claim`
+    /// sees `vested <= released`, claims nothing, and reports
+    /// `AmountMismatch` instead of going negative.
+    ///
+    /// When a quorum is configured it gates `claim` exactly like
+    /// `release` (`QuorumNotReached`): the quorum guards every release
+    /// path, otherwise the taker could bypass attestation via `claim`.
+    /// Claims accumulate in the same `released` counter as `release`, so
+    /// the conservation invariant and the audit trail are shared; when the
+    /// cumulative released total reaches the locked amount the escrow
+    /// moves `Funded -> Released`.
+    ///
+    /// Check order is deliberate: authority, then state, then vesting
+    /// configuration, then quorum, then the claimable amount — a stranger
+    /// learns nothing, and a misconfigured call fails before a
+    /// not-yet-satisfied gate.
+    pub fn claim(&mut self, authority: [u8; 32], now: u64) -> Result<u64, EscrowError> {
+        if authority != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let schedule = self.vesting.ok_or(EscrowError::InvalidVesting)?;
+        if let Some(policy) = &self.quorum {
+            if !policy.is_satisfied() {
+                return Err(EscrowError::QuorumNotReached);
+            }
+        }
+        let vested = schedule.vested_amount(self.amount, now);
+        // `released` only grows via `release`/`claim`, and `vested` is a
+        // pure function of (amount, now): saturating keeps the counter
+        // monotonic even if the initializer released ahead of the curve.
+        let claimable = vested.saturating_sub(self.released);
+        if claimable == 0 {
+            // Nothing unlocked yet, or everything vested is already
+            // released — parallels `release` with `amount == 0`.
+            return Err(EscrowError::AmountMismatch);
+        }
+        // `released + claimable <= vested <= amount`: no overflow, no cap
+        // breach — the `release` checked_add path is not needed here.
+        self.released += claimable;
+        if self.released == self.amount {
+            self.state = EscrowState::Released;
+        }
+        Ok(claimable)
+    }
+
     /// Read-only accessors.
     pub fn quorum(&self) -> Option<QuorumPolicy> {
         self.quorum
@@ -501,6 +639,23 @@ impl Escrow {
     /// `cancel` / `cancel_expired` refund.
     pub fn remaining_amount(&self) -> u64 {
         self.amount - self.released
+    }
+    /// The vesting schedule attached via [`Escrow::with_vesting`], if any.
+    pub fn vesting_schedule(&self) -> Option<VestingSchedule> {
+        self.vesting
+    }
+    /// Amount vested at `now` under the attached schedule, or `0` when no
+    /// vesting is configured.
+    pub fn vested_amount(&self, now: u64) -> u64 {
+        self.vesting
+            .map(|s| s.vested_amount(self.amount, now))
+            .unwrap_or(0)
+    }
+    /// Amount the taker could [`Escrow::claim`] right now: vested minus
+    /// already released, saturating at zero. `0` when no vesting is
+    /// configured.
+    pub fn claimable_amount(&self, now: u64) -> u64 {
+        self.vested_amount(now).saturating_sub(self.released)
     }
     pub fn state(&self) -> EscrowState {
         self.state
@@ -557,6 +712,11 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // taker, bit 2 dual-sig required). One byte; activation progress must
     // survive serialization.
     ("activation", "u8 (bitmask)", 1),
+    // AV-13: linear vesting schedule gating `claim`: one discriminant
+    // byte, then start/end u64. The region is always reserved (zeroed
+    // when `None`) so `with_vesting` never needs a realloc — same
+    // treatment as `quorum`.
+    ("vesting", "Option<VestingSchedule>", 1 + 16),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -583,9 +743,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// (`quorum: None` serializes as a single discriminant byte). The program
 /// skeleton's `Initialize` constraint uses this exact expression; quorum
 /// data is written in place later without reallocating. The activation
-/// bitmask (AV-12) is always present — one byte, zeroed for plain escrows.
+/// bitmask (AV-12) is always present — one byte, zeroed for plain escrows —
+/// and so is the vesting discriminant (AV-13): one byte, zeroed when no
+/// schedule is attached.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -1746,6 +1908,30 @@ mod anchor_idl_tests {
                             Uninitialized -> Activated, unlocking fund",
         },
         InstructionSpec {
+            // AV-13: streaming release (linear vesting).
+            name: "initialize_vesting",
+            params: &[
+                ("start", "u64", "instruction param; unlock begins"),
+                ("end", "u64", "instruction param; fully vested at now >= end"),
+            ],
+            method: "VestingSchedule::new + Escrow::with_vesting",
+            input_mapping: "start/end <- params; authority <- \
+                            accounts.initializer (signer), enforced by the \
+                            Anchor account constraint, not the state machine; \
+                            Uninitialized only, like initialize_quorum; \
+                            start >= end is InvalidVesting",
+        },
+        InstructionSpec {
+            name: "claim",
+            params: &[],
+            method: "Escrow::claim",
+            input_mapping: "authority <- accounts.taker (signer); now <- \
+                            clock sysvar (NOT an instruction param — see \
+                            cancel_expired rationale); returns the claimed \
+                            amount so the program can size the transfer; \
+                            the quorum gate applies exactly as for release",
+        },
+        InstructionSpec {
             name: "attest",
             params: &[],
             method: "Escrow::attest",
@@ -1788,6 +1974,8 @@ mod anchor_idl_tests {
             "QuorumPolicy::new + Escrow::with_quorum",
             "Escrow::with_dual_sig",
             "Escrow::activate",
+            "VestingSchedule::new + Escrow::with_vesting",
+            "Escrow::claim",
             "Escrow::attest",
         ];
         assert_eq!(
@@ -1812,7 +2000,7 @@ mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_initialize_release_and_initialize_quorum_take_params() {
+    fn only_four_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -1822,7 +2010,7 @@ mod anchor_idl_tests {
             .collect();
         assert_eq!(
             with_params,
-            vec![&"initialize", &"release", &"initialize_quorum"]
+            vec![&"initialize", &"release", &"initialize_quorum", &"initialize_vesting"]
         );
     }
 
@@ -1997,6 +2185,57 @@ mod anchor_idl_tests {
         assert_eq!(e.state(), EscrowState::Uninitialized);
     }
 
+    #[test]
+    fn initialize_vesting_maps_start_end_params_to_schedule() {
+        // IDL: initialize_vesting(start: u64, end: u64). The program runs
+        // VestingSchedule::new then Escrow::with_vesting; authority <-
+        // accounts.initializer, enforced by the Anchor account constraint.
+        let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap();
+        assert_eq!(
+            e.vesting_schedule(),
+            Some(VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap())
+        );
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        // Documented failure mode: inverted window rejected at
+        // construction, before touching the escrow.
+        assert_eq!(
+            VestingSchedule::new(1_800_000_000, 1_700_000_000),
+            Err(EscrowError::InvalidVesting)
+        );
+    }
+
+    #[test]
+    fn claim_maps_taker_signer_and_clock_sysvar() {
+        // IDL: claim() — no params. authority <- accounts.taker (signer);
+        // now <- clock sysvar, deliberately not an instruction param
+        // (caller-supplied timestamps would let anyone fast-forward the
+        // unlock curve). The program layer must pass
+        // Clock::get()?.unix_timestamp here, and uses the returned amount
+        // to size the transfer.
+        let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        // Half the window elapsed: half vested.
+        let claimed = e.claim(BOB, 1_750_000_000).unwrap();
+        assert_eq!(claimed, 500_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!((e.released_amount(), e.remaining_amount()), (500_000, 500_000));
+        // Documented failure mode: initializer cannot pull the taker's
+        // stream, even funded.
+        assert_eq!(
+            e.claim(ALICE, 1_800_000_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.released_amount(), 500_000);
+    }
+
     // ----- AV-10, second half: two-way vault-field <-> IDL consistency -----
     //
     // Direction 1 (IDL -> account): every instruction param must populate
@@ -2019,6 +2258,8 @@ mod anchor_idl_tests {
         ("release", "amount", "released"),
         ("initialize_quorum", "attestors", "quorum.attestors"),
         ("initialize_quorum", "threshold", "quorum.threshold"),
+        ("initialize_vesting", "start", "vesting.start"),
+        ("initialize_vesting", "end", "vesting.end"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -2049,7 +2290,8 @@ mod anchor_idl_tests {
     ];
 
     /// Every vault field path from `VAULT_FIELDS`, with `quorum` unfolded
-    /// into its serialized subfields (order matches Borsh layout).
+    /// into its serialized subfields and `vesting` unfolded into
+    /// start/end (order matches Borsh layout).
     fn vault_field_paths() -> Vec<&'static str> {
         let mut paths = Vec::new();
         for (name, _, _) in VAULT_FIELDS {
@@ -2060,6 +2302,8 @@ mod anchor_idl_tests {
                     "quorum.threshold",
                     "quorum.approvals",
                 ]);
+            } else if *name == "vesting" {
+                paths.extend(["vesting.start", "vesting.end"]);
             } else {
                 paths.push(name);
             }
@@ -2182,6 +2426,11 @@ mod error_code_tests {
             106,
             "release cumulative amount exceeding the locked amount",
         ),
+        (
+            EscrowError::InvalidVesting,
+            107,
+            "bad vesting schedule (start >= end) or claim with no vesting",
+        ),
     ];
 
     #[test]
@@ -2299,6 +2548,30 @@ mod error_code_tests {
         let err = e.release(ALICE, 0).unwrap_err();
         assert_eq!(err, EscrowError::AmountMismatch);
         assert_eq!(err.code(), 102);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn invalid_vesting_triggered_by_inverted_schedule() {
+        // start >= end: the window has zero length (would divide by zero
+        // in vested_amount).
+        let err = VestingSchedule::new(1_000, 1_000).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidVesting);
+        assert_eq!(err.code(), 107);
+        let err = VestingSchedule::new(2_000, 1_000).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidVesting);
+    }
+
+    #[test]
+    fn invalid_vesting_triggered_by_claim_without_schedule() {
+        // No schedule attached: claim is a programming error, reported
+        // before any time/quorum logic runs.
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        let err = e.claim(BOB, EXPIRES_AT).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidVesting);
+        assert_eq!(err.code(), 107);
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!(e.released_amount(), 0);
     }
@@ -2686,6 +2959,20 @@ mod account_space_tests {
         // AV-12: activation bitmask, always present (zeroed for plain
         // escrows), Borsh field order after `quorum`.
         out.push(e.activation);
+        // AV-13: vesting schedule, always reserved like `quorum`: the
+        // `None` discriminant followed by zeroed start/end, so
+        // `with_vesting` writes in place without reallocating.
+        match e.vesting {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; 16]);
+            }
+            Some(v) => {
+                out.push(1);
+                out.extend_from_slice(&v.start.to_le_bytes());
+                out.extend_from_slice(&v.end.to_le_bytes());
+            }
+        }
         out
     }
 
@@ -2697,18 +2984,19 @@ mod account_space_tests {
         assert_eq!(QUORUM_POLICY_LEN, 8 * 32 + 1 + 1 + 8, "quorum policy bytes");
         assert_eq!(QUORUM_POLICY_LEN, 266);
         // 32 + 32 + 8 + 8 + 8 + 1 + (1 + 266) + 1 (AV-12 activation bitmask)
-        assert_eq!(ESCROW_BODY_LEN, 357, "escrow payload bytes");
+        // + (1 + 16) (AV-13 vesting schedule)
+        assert_eq!(ESCROW_BODY_LEN, 374, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 365, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 382, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
-        // discriminant) + 1-byte activation bitmask (AV-12, always
-        // present even for plain escrows).
+        // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
+        // vesting discriminant (AV-13, zeroed when no schedule).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 99);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 100);
     }
 
     #[test]
@@ -2766,6 +3054,9 @@ mod account_space_tests {
         // AV-12: activation bitmask trails the quorum region; zero for a
         // plain escrow.
         assert_eq!(bytes[356], 0, "activation bitmask offset, plain escrow");
+        // AV-13: vesting discriminant + zeroed schedule (no vesting here).
+        assert_eq!(bytes[357], 0, "vesting: None discriminant");
+        assert_eq!(&bytes[358..374], &[0u8; 16], "vesting: zeroed schedule");
 
         // With quorum: same total length (space is always reserved), Some
         // discriminant, attestor bytes and approval bitmask in place.
@@ -2800,6 +3091,43 @@ mod account_space_tests {
         // AV-12: activation bitmask trails the quorum region; zero here
         // (this escrow did not opt into dual-signature activation).
         assert_eq!(bytes[356], 0, "activation bitmask offset, no dual-sig");
+        // AV-13: vesting discriminant + zeroed schedule (no vesting here).
+        assert_eq!(bytes[357], 0, "vesting: None discriminant");
+        assert_eq!(&bytes[358..374], &[0u8; 16], "vesting: zeroed schedule");
+    }
+
+    #[test]
+    fn manual_borsh_encoding_places_vesting_schedule() {
+        // AV-13: a vesting escrow serializes the schedule after the
+        // activation byte: discriminant 1, then start/end u64 LE.
+        let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes[357], 1, "vesting: Some discriminant");
+        assert_eq!(
+            u64::from_le_bytes(bytes[358..366].try_into().unwrap()),
+            1_700_000_000,
+            "vesting.start offset"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[366..374].try_into().unwrap()),
+            1_800_000_000,
+            "vesting.end offset"
+        );
+        // The schedule survives a state transition (claim moves money,
+        // never the curve).
+        e.claim(BOB, 1_750_000_000).unwrap();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes[357], 1, "vesting discriminant unchanged by claim");
+        assert_eq!(
+            u64::from_le_bytes(bytes[358..366].try_into().unwrap()),
+            1_700_000_000
+        );
     }
 
     #[test]
@@ -2810,16 +3138,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 365) * 3480 * 2 = 493 * 6960 = 3_431_280 lamports.
-        assert_eq!(full, 3_431_280);
+        // (128 + 382) * 3480 * 2 = 510 * 6960 = 3_549_600 lamports.
+        assert_eq!(full, 3_549_600);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 99) * 3480 * 2 = 227 * 6960 = 1_579_920 lamports.
-        assert_eq!(no_quorum, 1_579_920);
+        // (128 + 100) * 3480 * 2 = 228 * 6960 = 1_586_880 lamports.
+        assert_eq!(no_quorum, 1_586_880);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -2862,13 +3190,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(3_431_280, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(3_549_600, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(3_431_279, params.0, params.1),
+            check_vault_rent_exempt(3_549_599, params.0, params.1),
             Err(RentShortfall {
-                required: 3_431_280,
-                provided: 3_431_279,
+                required: 3_549_600,
+                provided: 3_549_599,
             })
         );
         // Generous funding: exempt.
@@ -2880,7 +3208,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 3_431_280,
+                required: 3_549_600,
                 provided: 0,
             })
         );
@@ -3286,5 +3614,282 @@ mod dual_sig_tests {
         assert_eq!(e.state(), EscrowState::Activated);
         e.fund(ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Funded);
+    }
+}
+
+// ---------- AV-13: streaming release (linear vesting) ----------
+//
+// A vesting schedule unlocks the locked amount linearly between `start`
+// and `end`; the taker pulls the vested-but-unreleased portion at any
+// time via `claim` (the streaming-payments pattern). The schedule is
+// fixed before funding, the initializer keeps their `release` push path,
+// and both paths share the `released` counter so conservation and audit
+// stay unified.
+#[cfg(test)]
+mod vesting_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const START: u64 = 1_700_000_000;
+    const END: u64 = 1_800_000_000;
+
+    fn vesting_escrow() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(START, END).unwrap())
+            .unwrap()
+    }
+
+    fn funded_vesting_escrow() -> Escrow {
+        let mut e = vesting_escrow();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    // ----- schedule construction and math -----
+
+    #[test]
+    fn schedule_rejects_inverted_or_empty_window() {
+        assert_eq!(
+            VestingSchedule::new(END, START),
+            Err(EscrowError::InvalidVesting)
+        );
+        assert_eq!(
+            VestingSchedule::new(START, START),
+            Err(EscrowError::InvalidVesting),
+            "a zero-length window would divide by zero"
+        );
+        assert!(VestingSchedule::new(START, END).is_ok());
+        assert!(VestingSchedule::new(0, 1).is_ok());
+    }
+
+    #[test]
+    fn vested_amount_interpolates_linearly_and_clamps() {
+        let s = VestingSchedule::new(START, END).unwrap();
+        assert_eq!(s.vested_amount(1_000_000, START - 1), 0, "nothing before start");
+        assert_eq!(s.vested_amount(1_000_000, START), 0, "zero elapsed at start");
+        assert_eq!(
+            s.vested_amount(1_000_000, (START + END) / 2),
+            500_000,
+            "half the window -> half vested"
+        );
+        assert_eq!(s.vested_amount(1_000_000, END - 1), 999_999);
+        assert_eq!(s.vested_amount(1_000_000, END), 1_000_000, "fully vested at end");
+        assert_eq!(
+            s.vested_amount(1_000_000, END + 1_000_000),
+            1_000_000,
+            "clamped after end"
+        );
+    }
+
+    #[test]
+    fn vested_amount_handles_u64_max_without_overflow() {
+        // amount * elapsed can reach (u64::MAX)^2: the u128 path must not
+        // overflow, and the result is exact.
+        let s = VestingSchedule::new(0, 1_000_000).unwrap();
+        assert_eq!(s.vested_amount(u64::MAX, 500_000), u64::MAX / 2);
+        assert_eq!(s.vested_amount(u64::MAX, 1_000_000), u64::MAX);
+        // Degenerate one-second window: all-or-nothing.
+        let s = VestingSchedule::new(100, 101).unwrap();
+        assert_eq!(s.vested_amount(u64::MAX, 100), 0);
+        assert_eq!(s.vested_amount(u64::MAX, 101), u64::MAX);
+    }
+
+    // ----- claim lifecycle -----
+
+    #[test]
+    fn claim_streams_linearly_and_closes_at_full_vest() {
+        let mut e = funded_vesting_escrow();
+        // Quarter points of the window.
+        let q1 = e.claim(BOB, START + (END - START) / 4).unwrap();
+        assert_eq!(q1, 250_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+        let q2 = e.claim(BOB, START + (END - START) / 2).unwrap();
+        assert_eq!(q2, 250_000, "only the newly vested portion");
+        assert_eq!(e.released_amount(), 500_000);
+        assert_eq!(e.remaining_amount(), 500_000);
+        let rest = e.claim(BOB, END).unwrap();
+        assert_eq!(rest, 500_000);
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.released_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn claim_returns_the_claimed_amount_for_transfer_sizing() {
+        let mut e = funded_vesting_escrow();
+        // The Anchor layer needs the exact payout to size the transfer.
+        assert_eq!(e.claim(BOB, END).unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn claim_with_nothing_vested_is_amount_mismatch() {
+        let mut e = funded_vesting_escrow();
+        assert_eq!(e.claim(BOB, START - 1), Err(EscrowError::AmountMismatch));
+        assert_eq!(e.claim(BOB, START), Err(EscrowError::AmountMismatch));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0, "failed claim moves nothing");
+    }
+
+    #[test]
+    fn claim_twice_at_same_timestamp_claims_once() {
+        let mut e = funded_vesting_escrow();
+        e.claim(BOB, END).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        // Terminal now; but even mid-stream a second claim at the same
+        // timestamp finds nothing newly vested.
+        let mut e = funded_vesting_escrow();
+        e.claim(BOB, START + (END - START) / 2).unwrap();
+        assert_eq!(
+            e.claim(BOB, START + (END - START) / 2),
+            Err(EscrowError::AmountMismatch)
+        );
+        assert_eq!(e.released_amount(), 500_000);
+    }
+
+    #[test]
+    fn only_taker_can_claim() {
+        let mut e = funded_vesting_escrow();
+        // The initializer keeps the release push path, not the claim path.
+        assert_eq!(e.claim(ALICE, END), Err(EscrowError::Unauthorized));
+        assert_eq!(e.claim(MALLORY, END), Err(EscrowError::Unauthorized));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn claim_before_fund_is_invalid_transition() {
+        let mut e = vesting_escrow();
+        assert_eq!(e.claim(BOB, END), Err(EscrowError::InvalidStateTransition));
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+    }
+
+    #[test]
+    fn claim_on_terminal_states_is_invalid_transition() {
+        let mut e = funded_vesting_escrow();
+        e.cancel(ALICE).unwrap();
+        assert_eq!(e.claim(BOB, END), Err(EscrowError::InvalidStateTransition));
+    }
+
+    #[test]
+    fn with_vesting_rejected_after_funding() {
+        let mut e = funded_vesting_escrow();
+        let s = VestingSchedule::new(START, END).unwrap();
+        assert_eq!(
+            e.with_vesting(s),
+            Err(EscrowError::InvalidStateTransition),
+            "the unlock curve is fixed before funds move, like with_quorum"
+        );
+    }
+
+    // ----- interaction with release / cancel / quorum -----
+
+    #[test]
+    fn release_ahead_of_curve_then_claim_claims_nothing() {
+        // The initializer's push path is not capped by the curve: an early
+        // release is their prerogative. A later claim sees
+        // vested <= released, saturates to zero, and reports
+        // AmountMismatch instead of going negative.
+        let mut e = funded_vesting_escrow();
+        e.release(ALICE, 800_000).unwrap(); // only 500_000 vested at midpoint
+        assert_eq!(
+            e.claim(BOB, START + (END - START) / 2),
+            Err(EscrowError::AmountMismatch)
+        );
+        // Once the curve catches up past 800_000, the remainder is
+        // claimable again.
+        let claimed = e.claim(BOB, END).unwrap();
+        assert_eq!(claimed, 200_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn cancel_after_claims_refunds_remainder_and_preserves_released() {
+        let mut e = funded_vesting_escrow();
+        e.claim(BOB, START + (END - START) / 2).unwrap();
+        e.cancel(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(e.released_amount(), 500_000, "claims preserved for audit");
+        assert_eq!(e.remaining_amount(), 500_000, "refundable remainder");
+    }
+
+    #[test]
+    fn quorum_gates_claim_like_release() {
+        // Otherwise the taker could bypass attestation via claim.
+        let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], 2).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(START, END).unwrap())
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.claim(BOB, END), Err(EscrowError::QuorumNotReached));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+        e.attest([0xA1; 32]).unwrap();
+        e.attest([0xA2; 32]).unwrap();
+        assert_eq!(e.claim(BOB, END).unwrap(), 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn vesting_combines_with_dual_sig() {
+        // Independent builders compose: activation gates fund, the curve
+        // gates claim.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_vesting(VestingSchedule::new(START, END).unwrap())
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.claim(BOB, START + (END - START) / 2).unwrap(), 500_000);
+    }
+
+    // ----- observers -----
+
+    #[test]
+    fn claimable_amount_tracks_curve_minus_released() {
+        let mut e = funded_vesting_escrow();
+        assert_eq!(e.claimable_amount(START - 1), 0);
+        assert_eq!(e.claimable_amount((START + END) / 2), 500_000);
+        e.release(ALICE, 200_000).unwrap();
+        assert_eq!(
+            e.claimable_amount((START + END) / 2),
+            300_000,
+            "releases (either path) reduce what is claimable"
+        );
+        assert_eq!(e.claimable_amount(END), 800_000);
+    }
+
+    #[test]
+    fn vested_amount_is_zero_without_schedule() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.vested_amount(END), 0);
+        assert_eq!(e.claimable_amount(END), 0);
+        assert_eq!(e.vesting_schedule(), None);
+    }
+
+    #[test]
+    fn claim_conserves_amounts_like_release() {
+        // Claims share the `released` counter: inflow == released +
+        // refunded holds across mixed claim/release/cancel flows.
+        let mut e = funded_vesting_escrow();
+        e.claim(BOB, START + (END - START) / 2).unwrap(); // 500_000
+        e.release(ALICE, 200_000).unwrap();
+        e.cancel(ALICE).unwrap();
+        assert_eq!(e.released_amount(), 700_000);
+        assert_eq!(e.remaining_amount(), 300_000);
+        assert_eq!(
+            e.released_amount() + e.remaining_amount(),
+            1_000_000,
+            "conservation across mixed release paths"
+        );
     }
 }

@@ -11,7 +11,9 @@
 //! and writes it back. State and authority rules live in one place —
 //! the `escrow-state` crate — so the on-chain program cannot drift from
 //! the tested logic. The optional N-of-M attestor quorum (`initialize_quorum`
-//! / `attest`) gates `release` exactly as the state machine does.
+//! / `attest`) gates `release` exactly as the state machine does; the
+//! optional linear vesting schedule (`initialize_vesting` / `claim`) lets
+//! the taker pull the vested stream exactly as `Escrow::claim` defines.
 //!
 //! To compile for real: `anchor build` with the Solana toolchain installed.
 
@@ -151,6 +153,41 @@ pub mod escrow_vault {
         // Flip the party's bit in `vault.activation` in the real build.
         Ok(())
     }
+
+    /// Attach a linear vesting schedule (AV-13; mirrors
+    /// `VestingSchedule::new` + `Escrow::with_vesting`). `Uninitialized`
+    /// only, like `initialize_quorum`: the unlock curve is fixed before
+    /// funds move. `start >= end` is `InvalidVesting`.
+    pub fn initialize_vesting(ctx: Context<InitializeVesting>, start: u64, end: u64) -> Result<()> {
+        let schedule =
+            escrow_state::VestingSchedule::new(start, end).map_err(|e| escrow_error(e))?;
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow.with_vesting(schedule).map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the full vesting region
+        // (1 + 16 bytes, zeroed when `None`), so the schedule is written
+        // in place — no realloc needed in the real build.
+        Ok(())
+    }
+
+    /// Claim the vested-but-unreleased portion (AV-13; mirrors
+    /// `Escrow::claim`). Only the taker may call this; `now` comes from
+    /// the Solana clock sysvar (never an instruction param — a
+    /// caller-supplied timestamp would let anyone fast-forward the unlock
+    /// curve). Returns the claimed amount so the real build can size the
+    /// transfer of lamports/tokens to the taker. The AV-04 quorum gate
+    /// applies exactly as for `release`.
+    pub fn claim(ctx: Context<Claim>) -> Result<u64> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let claimed = escrow
+            .claim(ctx.accounts.taker.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Transfer of `claimed` lamports/tokens to `ctx.accounts.taker`
+        // goes here once real token accounts are wired up.
+        Ok(claimed)
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -181,6 +218,23 @@ pub struct Vault {
     /// `activation` field. Always present (one byte, zeroed for plain
     /// escrows). Layout position matches `escrow_state::VAULT_FIELDS`.
     pub activation: u8,
+    /// AV-13: optional linear vesting schedule gating `claim`; mirrors
+    /// `escrow_state::VestingSchedule`. `None` for an escrow with no
+    /// vesting. The account always reserves the full 17-byte region
+    /// (1-byte discriminant + start/end u64, zeroed when `None`) so
+    /// `initialize_vesting` writes the schedule in place without
+    /// reallocating. Full serialized layout: `escrow_state::VAULT_FIELDS`.
+    pub vesting: Option<Vesting>,
+}
+
+/// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
+/// window `[start, end)` in Unix seconds. See the state machine docs for
+/// the claim semantics. Serialized size is pinned by the AV-10/AV-13
+/// tests (17 bytes: 1-byte `Option` discriminant + two u64s).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct Vesting {
+    pub start: u64,
+    pub end: u64,
 }
 
 /// Skeleton mirror of `escrow_state::QuorumPolicy`: up to 8 registered
@@ -198,13 +252,13 @@ pub struct Quorum {
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    // Full vault space, quorum region included: 8-byte discriminator +
-    // 357-byte payload = 365 bytes (see `escrow_state::VAULT_SPACE`;
-    // AV-12 added the 1-byte activation bitmask).
+    // Full vault space: 8-byte discriminator + 374-byte payload = 382
+    // bytes (see `escrow_state::VAULT_SPACE`; AV-12 added the 1-byte
+    // activation bitmask, AV-13 the 17-byte vesting region).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 3_431_280 lamports.
+    // rent parameters the minimum is 3_549_600 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
@@ -287,6 +341,27 @@ pub struct Activate<'info> {
     pub authority: Signer<'info>,
 }
 
+#[derive(Accounts)]
+pub struct InitializeVesting<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer fixes the unlock curve; the state machine
+    /// rejects re-configuration once the escrow leaves `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Claim<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the taker may pull the vested stream; the state machine
+    /// rejects anyone else with `Unauthorized`.
+    pub taker: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the vesting curve (never an
+    /// instruction param).
+    pub clock: AccountInfo<'info>,
+}
+
 // --- Helpers (finalized during the real Anchor build) ---
 
 fn read_escrow(_vault: &Account<Vault>) -> escrow_state::Escrow {
@@ -303,7 +378,7 @@ fn write_escrow(_vault: &mut Account<Vault>, _escrow: &escrow_state::Escrow) {
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {
     // One program error per EscrowError variant, so on-chain failures
-    // surface the exact `escrow_state` reason (code 100–106) to clients.
+    // surface the exact `escrow_state` reason (code 100–107) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
         escrow_state::EscrowError::InvalidStateTransition => {
@@ -316,6 +391,7 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {
         escrow_state::EscrowError::ReleaseExceedsLocked => {
             error!(ErrorCode::ReleaseExceedsLocked)
         }
+        escrow_state::EscrowError::InvalidVesting => error!(ErrorCode::InvalidVesting),
     }
 }
 
@@ -335,4 +411,6 @@ pub enum ErrorCode {
     QuorumNotReached,
     #[msg("Cumulative release amount exceeds the locked amount")]
     ReleaseExceedsLocked,
+    #[msg("Invalid vesting schedule (start >= end) or claim with no vesting configured")]
+    InvalidVesting,
 }
