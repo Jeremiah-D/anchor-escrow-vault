@@ -72,6 +72,29 @@ pub struct Escrow {
     /// quorum and vesting builders. Persisted (33 bytes in the vault
     /// account) so the arbiter's identity survives serialization.
     arbiter: Option<[u8; 32]>,
+    /// AV-15: optional milestone tranche plan (see
+    /// [`Escrow::with_milestones`]). `None` means no milestone schedule
+    /// (backward compatible): `confirm_milestone` / `release_milestone` /
+    /// `skip_milestone` fail with [`EscrowError::InvalidMilestones`], and
+    /// plain [`Escrow::release`] / [`Escrow::claim`] keep their existing
+    /// semantics. Set once on an `Uninitialized` escrow, like the quorum
+    /// and vesting builders. Persisted (66 bytes in the vault account)
+    /// so the tranche schedule survives serialization.
+    milestones: Option<MilestonePlan>,
+    /// AV-15: per-milestone confirmation bitmap, persisted so
+    /// confirmation progress survives serialization. Six bits per
+    /// milestone (see the `MILESTONE_*` bit constants): the two parties'
+    /// release-path confirmations, the released bit, the two parties'
+    /// skip approvals, and the skipped bit. Always present (zeroed for
+    /// escrows without a milestone plan).
+    milestone_flags: u64,
+    /// AV-15: cumulative amount skipped by mutual agreement (see
+    /// [`Escrow::skip_milestone`]). Skipped tranches join the refundable
+    /// remainder — visible in [`Escrow::remaining_amount`] — not the
+    /// taker-payout [`Escrow::released_amount`] counter. Always `<=
+    /// amount`; `released + skipped <= amount` is the milestone
+    /// accounting invariant.
+    skipped: u64,
 }
 
 /// Bit 0 of [`Escrow::activation`]: the initializer has recorded their
@@ -131,6 +154,24 @@ pub enum EscrowError {
     /// escrow is expiry-eligible the unilateral `cancel_expired` path is
     /// the way out, so arbitration can no longer start.
     DisputeWindowClosed,
+    /// Milestone plan misconfiguration or misuse (AV-15):
+    /// [`MilestonePlan::new`] with an empty list, more than
+    /// [`MAX_MILESTONES`] tranches, or a zero-amount tranche;
+    /// [`Escrow::with_milestones`] whose tranche amounts do not sum to
+    /// the locked amount (summed in `u128`, so the sum can never wrap);
+    /// re-configuring the plan after funding; any milestone operation on
+    /// an escrow with no plan attached; an out-of-range milestone index;
+    /// or plain [`Escrow::release`] / [`Escrow::claim`] on an escrow with
+    /// a milestone plan (the plan owns the release schedule). Parallels
+    /// [`EscrowError::InvalidQuorum`], [`EscrowError::InvalidVesting`]
+    /// and [`EscrowError::InvalidArbiter`] (config error, plus the
+    /// no-config call path).
+    InvalidMilestones,
+    /// [`Escrow::release_milestone`] attempted before both parties
+    /// confirmed the milestone via [`Escrow::confirm_milestone`].
+    /// Parallels [`EscrowError::QuorumNotReached`]: the dual-confirmation
+    /// gate is the milestone analogue of the quorum gate.
+    MilestoneNotConfirmed,
 }
 
 impl EscrowError {
@@ -153,6 +194,8 @@ impl EscrowError {
             EscrowError::InvalidVesting => 107,
             EscrowError::InvalidArbiter => 108,
             EscrowError::DisputeWindowClosed => 109,
+            EscrowError::InvalidMilestones => 110,
+            EscrowError::MilestoneNotConfirmed => 111,
         }
     }
 
@@ -169,6 +212,8 @@ impl EscrowError {
             EscrowError::InvalidVesting,
             EscrowError::InvalidArbiter,
             EscrowError::DisputeWindowClosed,
+            EscrowError::InvalidMilestones,
+            EscrowError::MilestoneNotConfirmed,
         ]
     }
 }
@@ -320,6 +365,94 @@ impl VestingSchedule {
     }
 }
 
+/// Maximum number of tranches in a [`MilestonePlan`]. Fixed-size so the
+/// crate stays heap-free and `Copy` — the same bound as
+/// [`MAX_ATTESTORS`]: eight tranches cover staged settlements without
+/// bloating the vault account (the plan reserves 65 bytes).
+pub const MAX_MILESTONES: usize = 8;
+
+/// Bit offsets inside [`Escrow::milestone_flags`]: six bits per milestone
+/// (48 bits for [`MAX_MILESTONES`] milestones fit in a `u64`). Bit
+/// `index * 6 + offset`:
+/// - 0: the initializer confirmed the milestone (release path)
+/// - 1: the taker confirmed the milestone (release path)
+/// - 2: the milestone's tranche was released
+/// - 3: the initializer approved skipping the milestone
+/// - 4: the taker approved skipping the milestone
+/// - 5: the milestone was skipped (its tranche refunded to the
+///   initializer)
+const MILESTONE_BIT_WIDTH: u32 = 6;
+const MILESTONE_CONFIRM_INIT_BIT: u32 = 0;
+const MILESTONE_CONFIRM_TAKER_BIT: u32 = 1;
+const MILESTONE_RELEASED_BIT: u32 = 2;
+const MILESTONE_SKIP_INIT_BIT: u32 = 3;
+const MILESTONE_SKIP_TAKER_BIT: u32 = 4;
+const MILESTONE_SKIPPED_BIT: u32 = 5;
+
+/// Milestone tranche plan (AV-15): the locked [`Escrow::amount`] split
+/// into at most [`MAX_MILESTONES`] ordered tranches, released one by one
+/// as the two parties confirm each milestone — the staged-settlement
+/// pattern (Solana milestone payments: construction tranches, grant
+/// disbursements, gated unlocks).
+///
+/// The plan is fixed before funding via [`Escrow::with_milestones`],
+/// which additionally requires the tranche amounts to sum to exactly the
+/// locked amount (accumulated in `u128`, so the sum can never wrap): the
+/// plan is the *complete* release schedule. `Copy` and heap-free like the
+/// rest of the crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MilestonePlan {
+    amounts: [u64; MAX_MILESTONES],
+    count: u8,
+}
+
+impl MilestonePlan {
+    /// Build a plan from the tranche amounts, in release order.
+    ///
+    /// Rejects an empty list, more than [`MAX_MILESTONES`] tranches, and
+    /// zero-amount tranches (a tranche that releases nothing is a config
+    /// error — it would stall the in-order sequence) with
+    /// [`EscrowError::InvalidMilestones`]. The sum-to-locked check happens
+    /// in [`Escrow::with_milestones`], which knows the locked amount.
+    pub fn new(amounts: &[u64]) -> Result<Self, EscrowError> {
+        if amounts.is_empty() || amounts.len() > MAX_MILESTONES {
+            return Err(EscrowError::InvalidMilestones);
+        }
+        let mut table = [0u64; MAX_MILESTONES];
+        for (i, amount) in amounts.iter().enumerate() {
+            if *amount == 0 {
+                return Err(EscrowError::InvalidMilestones);
+            }
+            table[i] = *amount;
+        }
+        Ok(Self {
+            amounts: table,
+            count: amounts.len() as u8,
+        })
+    }
+
+    /// Number of tranches in the plan.
+    pub fn count(&self) -> u8 {
+        self.count
+    }
+
+    /// The tranche amount at `index`, or `None` when out of range.
+    pub fn amount_at(&self, index: usize) -> Option<u64> {
+        (index < self.count as usize).then_some(self.amounts[index])
+    }
+
+    /// Exact sum of the tranche amounts. Accumulated in `u128`:
+    /// `MAX_MILESTONES * u64::MAX < u128::MAX`, so the sum can never wrap
+    /// — a wrapping `u64` sum could alias a wrong total onto the locked
+    /// amount and accept a plan that over- or under-covers the lockup.
+    pub fn total(&self) -> u128 {
+        self.amounts[..self.count as usize]
+            .iter()
+            .map(|a| *a as u128)
+            .sum()
+    }
+}
+
 impl Escrow {
     /// Construct a new escrow in the `Uninitialized` state.
     ///
@@ -348,6 +481,9 @@ impl Escrow {
             activation: 0,
             vesting: None,
             arbiter: None,
+            milestones: None,
+            milestone_flags: 0,
+            skipped: 0,
         })
     }
 
@@ -465,16 +601,29 @@ impl Escrow {
     /// and `amount == 0` is `AmountMismatch`. Models staged payouts
     /// (e.g. delivery milestones paid out in tranches).
     ///
+    /// AV-15: when a milestone plan is attached (see
+    /// [`Escrow::with_milestones`), the plan owns the release schedule and
+    /// plain `release` is disabled (`InvalidMilestones`) — arbitrary
+    /// tranche amounts would release funds outside the plan and break
+    /// per-tranche accounting. Use [`Escrow::release_milestone`] instead.
+    ///
     /// When a quorum is configured, additionally requires the quorum's
     /// threshold of attestations (`QuorumNotReached` otherwise). Check
-    /// order is deliberate: authority, then state, then quorum, then the
-    /// amount checks — an unauthorized caller learns nothing about
-    /// attestation progress or release history.
+    /// order is deliberate: authority, then state, then the milestone
+    /// plan, then quorum, then the amount checks — an unauthorized caller
+    /// learns nothing about attestation progress or release history.
     pub fn release(&mut self, authority: [u8; 32], amount: u64) -> Result<(), EscrowError> {
         self.require_initializer(authority)?;
         match self.state {
             EscrowState::Funded => {}
             _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // AV-15: a milestone plan owns the release schedule (see
+        // `with_milestones`): arbitrary tranche amounts would break the
+        // per-tranche accounting, so plain `release` is a config error
+        // once a plan is attached.
+        if self.milestones.is_some() {
+            return Err(EscrowError::InvalidMilestones);
         }
         if let Some(policy) = &self.quorum {
             if !policy.is_satisfied() {
@@ -612,9 +761,10 @@ impl Escrow {
     /// cumulative released total reaches the locked amount the escrow
     /// moves `Funded -> Released`.
     ///
-    /// Check order is deliberate: authority, then state, then vesting
-    /// configuration, then quorum, then the claimable amount — a stranger
-    /// learns nothing, and a misconfigured call fails before a
+    /// Check order is deliberate: authority, then state, then the
+    /// milestone plan (AV-15: the plan owns the release schedule), then
+    /// vesting configuration, then quorum, then the claimable amount — a
+    /// stranger learns nothing, and a misconfigured call fails before a
     /// not-yet-satisfied gate.
     pub fn claim(&mut self, authority: [u8; 32], now: u64) -> Result<u64, EscrowError> {
         if authority != self.taker {
@@ -623,6 +773,14 @@ impl Escrow {
         match self.state {
             EscrowState::Funded => {}
             _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // AV-15: a milestone plan and a vesting curve are alternative
+        // release schedules, not composable ones. Time-based claims would
+        // pull funds outside the tranche plan and break per-tranche
+        // accounting, so `claim` is disabled once a plan is attached —
+        // use `release_milestone` for acceptance-gated tranches.
+        if self.milestones.is_some() {
+            return Err(EscrowError::InvalidMilestones);
         }
         let schedule = self.vesting.ok_or(EscrowError::InvalidVesting)?;
         if let Some(policy) = &self.quorum {
@@ -729,7 +887,9 @@ impl Escrow {
     /// by design (the dispute exists precisely because the schedule is
     /// contested). Partial releases made before the dispute are honored:
     /// the split applies to the remainder, never to already-released
-    /// funds.
+    /// funds. A milestone plan (AV-15) is likewise overridden, not
+    /// honored: unsettled tranches are part of the remainder the arbiter
+    /// splits.
     ///
     /// Check order is deliberate: arbiter configuration, then state,
     /// then authority, then the amount. The arbiter's identity is the
@@ -762,6 +922,247 @@ impl Escrow {
         Ok((taker_amount, remaining - taker_amount))
     }
 
+    /// Attach a milestone tranche plan (AV-15). Builder-style: only valid
+    /// on an `Uninitialized` escrow, so the release schedule is fixed
+    /// before any funds move — mirroring [`Escrow::with_quorum`],
+    /// [`Escrow::with_vesting`] and [`Escrow::with_arbiter`].
+    ///
+    /// The tranche amounts must sum to exactly the locked amount: the
+    /// plan is the *complete* release schedule. The sum is accumulated in
+    /// `u128` (see [`MilestonePlan::total`]), which cannot wrap for at
+    /// most [`MAX_MILESTONES`] `u64` tranches — a wrapping `u64` sum could
+    /// alias a wrong total onto the locked amount (e.g. two `u64::MAX`
+    /// tranches wrapping to `u64::MAX - 1`) and accept a plan that over- or
+    /// under-covers the lockup.
+    ///
+    /// Once a plan is attached it owns the release schedule: plain
+    /// [`Escrow::release`] and [`Escrow::claim`] return
+    /// [`EscrowError::InvalidMilestones`] — arbitrary or time-based pulls
+    /// would release funds outside the tranche plan and break the
+    /// per-tranche accounting. Tranches release via
+    /// [`Escrow::release_milestone`] after dual confirmation
+    /// ([`Escrow::confirm_milestone`]), or are refunded to the initializer
+    /// via a dual-signed [`Escrow::skip_milestone`]. The refund paths
+    /// (`cancel` / `cancel_expired`) stay available and refund the
+    /// remainder; [`Escrow::resolve`] overrides the plan by design, like
+    /// it overrides vesting (unsettled tranches are part of the split
+    /// remainder).
+    pub fn with_milestones(mut self, plan: MilestonePlan) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if plan.total() != self.amount as u128 {
+            return Err(EscrowError::InvalidMilestones);
+        }
+        self.milestones = Some(plan);
+        Ok(self)
+    }
+
+    /// Confirm milestone `index` for the release path (AV-15): records the
+    /// calling party's acceptance of the milestone's deliverable. Either
+    /// the initializer or the taker may confirm (`Unauthorized`
+    /// otherwise); a stranger learns nothing about the plan from the
+    /// error. The milestone is *confirmed* — releasable via
+    /// [`Escrow::release_milestone`] — once *both* parties have confirmed
+    /// it: each confirmation is a separate signature, reusing the AV-12
+    /// dual-signature concept for per-tranche acceptance (one party
+    /// accepts the deliverable, the other agrees it is complete).
+    ///
+    /// Confirmations are strictly in-order: only the first unsettled
+    /// milestone may be confirmed; confirming ahead is
+    /// `InvalidStateTransition`. Confirming is idempotent per party.
+    /// Requires `Funded` state and a configured plan (`InvalidMilestones`
+    /// without one, or for an out-of-range index).
+    ///
+    /// Design note on attestors: when a quorum is configured it gates
+    /// `release_milestone` exactly like `release` / `claim` (the quorum
+    /// guards every release path), so attestors keep their AV-04 role as
+    /// the release gate while the two parties own milestone acceptance.
+    pub fn confirm_milestone(&mut self, authority: [u8; 32], index: u8) -> Result<(), EscrowError> {
+        if authority != self.initializer && authority != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let plan = self.milestones.ok_or(EscrowError::InvalidMilestones)?;
+        let i = index as usize;
+        if i >= plan.count as usize {
+            return Err(EscrowError::InvalidMilestones);
+        }
+        if Some(i) != self.next_milestone_index() {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        // Independent `if`s, not `if/else`: the degenerate
+        // initializer == taker self-escrow confirms with one signature,
+        // like AV-12's activation.
+        if authority == self.initializer {
+            self.milestone_flags |= Self::milestone_bit(i, MILESTONE_CONFIRM_INIT_BIT);
+        }
+        if authority == self.taker {
+            self.milestone_flags |= Self::milestone_bit(i, MILESTONE_CONFIRM_TAKER_BIT);
+        }
+        Ok(())
+    }
+
+    /// Release milestone `index`'s tranche to the taker (AV-15). Returns
+    /// the tranche amount so the caller (and the Anchor layer) can size
+    /// the transfer.
+    ///
+    /// Only the initializer may drive the release (`Unauthorized`
+    /// otherwise): like [`Escrow::release`], tranche release is the
+    /// initializer's push path, executed after the milestone earned its
+    /// dual confirmation. Requires `Funded` state, a configured plan, an
+    /// in-range index, strictly in-order settlement (every earlier
+    /// milestone released or skipped), and both parties' confirmation
+    /// ([`EscrowError::MilestoneNotConfirmed`] otherwise). A configured
+    /// quorum gates this exactly like `release` / `claim`
+    /// (`QuorumNotReached`) — the quorum guards every release path.
+    ///
+    /// The tranche accumulates in the shared `released` counter, so the
+    /// conservation invariant and the audit trail stay unified with
+    /// `release` / `claim` / `resolve`; when the cumulative released total
+    /// reaches the locked amount the escrow moves `Funded -> Released`.
+    /// Each tranche releases at most once (the released bit) and the
+    /// tranches sum to the locked amount, so the cumulative total can
+    /// never exceed it — the `checked_add` is a backstop, paralleling
+    /// `release`.
+    ///
+    /// Check order is deliberate: authority, then state, then plan
+    /// configuration, then index, then quorum, then sequence, then
+    /// confirmation — a stranger learns nothing, and a misconfigured call
+    /// fails before the gates run.
+    pub fn release_milestone(
+        &mut self,
+        authority: [u8; 32],
+        index: u8,
+    ) -> Result<u64, EscrowError> {
+        self.require_initializer(authority)?;
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let plan = self.milestones.ok_or(EscrowError::InvalidMilestones)?;
+        let i = index as usize;
+        if i >= plan.count as usize {
+            return Err(EscrowError::InvalidMilestones);
+        }
+        if let Some(policy) = &self.quorum {
+            if !policy.is_satisfied() {
+                return Err(EscrowError::QuorumNotReached);
+            }
+        }
+        if Some(i) != self.next_milestone_index() {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        if !self.milestone_confirmed(i) {
+            return Err(EscrowError::MilestoneNotConfirmed);
+        }
+        let tranche = plan.amounts[i];
+        // Each tranche releases at most once (the released bit) and the
+        // tranches sum to the locked amount: released + tranche <= amount
+        // always. The checked_add and the cap are backstops, paralleling
+        // `release`.
+        self.released = self
+            .released
+            .checked_add(tranche)
+            .ok_or(EscrowError::ReleaseExceedsLocked)?;
+        if self.released > self.amount {
+            return Err(EscrowError::ReleaseExceedsLocked);
+        }
+        self.milestone_flags |= Self::milestone_bit(i, MILESTONE_RELEASED_BIT);
+        if self.released == self.amount {
+            self.state = EscrowState::Released;
+        }
+        Ok(tranche)
+    }
+
+    /// Skip milestone `index` by mutual agreement (AV-15): the milestone's
+    /// tranche is *not* released to the taker — it is refunded to the
+    /// initializer's claim instead. Skipping requires a dual signature:
+    /// each party — the initializer or the taker — records their skip
+    /// approval with a separate call (reusing the AV-12 dual-signature
+    /// concept), and the skip executes only once *both* approvals are
+    /// present. Approvals are idempotent per party; a stranger gets
+    /// `Unauthorized`.
+    ///
+    /// Requires `Funded` state, a configured plan, an in-range index, and
+    /// strictly in-order settlement (only the first unsettled milestone
+    /// may be skipped). The skipped amount accumulates in
+    /// [`Escrow::skipped_amount`] and joins the refundable remainder
+    /// (visible in [`Escrow::remaining_amount`]) — it never enters the
+    /// taker-payout `released` counter. Skipping does not close the
+    /// escrow: later milestones continue, and `cancel` / `cancel_expired`
+    /// refund whatever remains.
+    ///
+    /// A milestone one party confirmed (release path) and the other
+    /// skip-approved stays unsettled until both parties align on one path:
+    /// neither path completes on a single party's word.
+    pub fn skip_milestone(&mut self, authority: [u8; 32], index: u8) -> Result<(), EscrowError> {
+        if authority != self.initializer && authority != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let plan = self.milestones.ok_or(EscrowError::InvalidMilestones)?;
+        let i = index as usize;
+        if i >= plan.count as usize {
+            return Err(EscrowError::InvalidMilestones);
+        }
+        if Some(i) != self.next_milestone_index() {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        // Independent `if`s: the degenerate initializer == taker
+        // self-escrow skip-approves with one signature, like AV-12's
+        // activation.
+        if authority == self.initializer {
+            self.milestone_flags |= Self::milestone_bit(i, MILESTONE_SKIP_INIT_BIT);
+        }
+        if authority == self.taker {
+            self.milestone_flags |= Self::milestone_bit(i, MILESTONE_SKIP_TAKER_BIT);
+        }
+        let approvals = Self::milestone_bit(i, MILESTONE_SKIP_INIT_BIT)
+            | Self::milestone_bit(i, MILESTONE_SKIP_TAKER_BIT);
+        if self.milestone_flags & approvals == approvals {
+            self.milestone_flags |= Self::milestone_bit(i, MILESTONE_SKIPPED_BIT);
+            // Skipped tranches are refundable, never taker payouts:
+            // released + skipped <= amount is the milestone accounting
+            // invariant (each tranche settles at most once, Σ == amount).
+            // Checked arithmetic as a backstop.
+            self.skipped = self
+                .skipped
+                .checked_add(plan.amounts[i])
+                .ok_or(EscrowError::ReleaseExceedsLocked)?;
+            let accounted = self
+                .released
+                .checked_add(self.skipped)
+                .ok_or(EscrowError::ReleaseExceedsLocked)?;
+            if accounted > self.amount {
+                return Err(EscrowError::ReleaseExceedsLocked);
+            }
+        }
+        Ok(())
+    }
+
+    /// Bit position of milestone `index`'s `offset` bit inside
+    /// `milestone_flags`. Callers guarantee `index < MAX_MILESTONES`
+    /// (plan counts are capped there), so the shift cannot overflow.
+    fn milestone_bit(index: usize, offset: u32) -> u64 {
+        1u64 << (index as u32 * MILESTONE_BIT_WIDTH + offset)
+    }
+
+    /// Index of the first unsettled (neither released nor skipped)
+    /// milestone, or `None` when no plan is configured or every tranche
+    /// is settled.
+    fn next_milestone_index(&self) -> Option<usize> {
+        let plan = self.milestones?;
+        (0..plan.count as usize).find(|&i| !self.milestone_settled(i))
+    }
+
     /// Read-only accessors.
     pub fn quorum(&self) -> Option<QuorumPolicy> {
         self.quorum
@@ -770,6 +1171,45 @@ impl Escrow {
     /// The dispute arbiter attached via [`Escrow::with_arbiter`], if any.
     pub fn arbiter(&self) -> Option<[u8; 32]> {
         self.arbiter
+    }
+    /// The milestone tranche plan attached via
+    /// [`Escrow::with_milestones`], if any.
+    pub fn milestone_plan(&self) -> Option<MilestonePlan> {
+        self.milestones
+    }
+    /// Cumulative amount skipped by mutual agreement (AV-15, see
+    /// [`Escrow::skip_milestone`]). Skipped tranches join the refundable
+    /// remainder — they are the initializer's refund, not the taker's
+    /// payout.
+    pub fn skipped_amount(&self) -> u64 {
+        self.skipped
+    }
+    /// True when milestone `index` was released or skipped. Out-of-range
+    /// indices report `false`.
+    pub fn milestone_settled(&self, index: usize) -> bool {
+        if index >= MAX_MILESTONES {
+            return false;
+        }
+        let mask = Self::milestone_bit(index, MILESTONE_RELEASED_BIT)
+            | Self::milestone_bit(index, MILESTONE_SKIPPED_BIT);
+        self.milestone_flags & mask != 0
+    }
+    /// True when both parties confirmed milestone `index` for the release
+    /// path (see [`Escrow::confirm_milestone`]). Out-of-range indices
+    /// report `false`.
+    pub fn milestone_confirmed(&self, index: usize) -> bool {
+        if index >= MAX_MILESTONES {
+            return false;
+        }
+        let mask = Self::milestone_bit(index, MILESTONE_CONFIRM_INIT_BIT)
+            | Self::milestone_bit(index, MILESTONE_CONFIRM_TAKER_BIT);
+        self.milestone_flags & mask == mask
+    }
+    /// Index of the first unsettled milestone, or `None` when no plan is
+    /// configured or every tranche is settled. The next milestone to
+    /// confirm, release, or skip.
+    pub fn next_milestone(&self) -> Option<usize> {
+        self.next_milestone_index()
     }
     pub fn initializer(&self) -> [u8; 32] {
         self.initializer
@@ -794,6 +1234,10 @@ impl Escrow {
     /// or `resolve` the escrow is terminal and nothing is locked anymore —
     /// the value is then the initializer's refund, preserved for audit
     /// (for `resolve`, the taker's share sits in `released_amount()`).
+    ///
+    /// AV-15: with a milestone plan, skipped tranches join this remainder
+    /// — a skipped tranche is the initializer's refund, never the taker's
+    /// payout (see [`Escrow::skipped_amount`]).
     pub fn remaining_amount(&self) -> u64 {
         self.amount - self.released
     }
@@ -844,6 +1288,12 @@ pub const PUBKEY_LEN: usize = 32;
 /// known at `initialize` time and never needs a realloc.
 pub const QUORUM_POLICY_LEN: usize = 8 * PUBKEY_LEN + 1 + 1 + 8;
 
+/// Serialized length of [`MilestonePlan`] under Borsh/Anchor (AV-15):
+/// `MAX_MILESTONES` tranche-amount u64s plus the tranche count byte.
+/// Fixed-size by design, so account space is known at `initialize` time
+/// and never needs a realloc.
+pub const MILESTONE_PLAN_LEN: usize = MAX_MILESTONES * 8 + 1;
+
 /// (field name, Anchor type, serialized length in bytes) for the `Vault`
 /// account, in Borsh field order. This table is the single source of truth
 /// for account sizing: `ESCROW_BODY_LEN` is derived from it by `const`
@@ -880,6 +1330,23 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // same treatment as `quorum` / `vesting`. Appended last so every
     // earlier field offset stays stable.
     ("arbiter", "Option<Pubkey>", 1 + PUBKEY_LEN),
+    // AV-15: milestone tranche plan: one discriminant byte, then the
+    // tranche amounts and the tranche count byte. The region is always
+    // reserved (zeroed when `None`) so `with_milestones` writes in place
+    // — same treatment as `quorum` / `vesting` / `arbiter`. Appended last
+    // so every earlier field offset stays stable.
+    ("milestones", "Option<MilestonePlan>", 1 + MILESTONE_PLAN_LEN),
+    // AV-15: per-milestone confirmation bitmap (see the `MILESTONE_*`
+    // bit constants): six bits per milestone — the two parties'
+    // release-path confirmations, the released bit, the two parties'
+    // skip approvals, and the skipped bit. One u64, always present
+    // (zeroed for escrows without a milestone plan).
+    ("milestone_flags", "u64 (bitmask)", 8),
+    // AV-15: cumulative amount skipped by mutual agreement (see
+    // `Escrow::skip_milestone`): skipped tranches join the refundable
+    // remainder, not the taker-payout `released` counter. Always present
+    // (zeroed when nothing was skipped).
+    ("skipped", "u64", 8),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -909,9 +1376,12 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// bitmask (AV-12) is always present — one byte, zeroed for plain escrows —
 /// and so is the vesting discriminant (AV-13): one byte, zeroed when no
 /// schedule is attached. The arbiter discriminant (AV-14) is likewise
-/// always present: one byte, zeroed when no arbiter is configured.
+/// always present: one byte, zeroed when no arbiter is configured. The
+/// milestones discriminant (AV-15) is likewise always present: one byte,
+/// zeroed when no plan is configured — followed by the always-present
+/// 8-byte confirmation bitmap and 8-byte skipped counter.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -2164,6 +2634,60 @@ mod anchor_idl_tests {
                             quorum gate does NOT apply (the arbiter is \
                             the resolution mechanism)",
         },
+        InstructionSpec {
+            // AV-15: milestone tranche schedule.
+            name: "initialize_milestones",
+            params: &[(
+                "milestones",
+                "Vec<u64>",
+                "instruction param; tranche amounts in release order, \
+                 Σ must equal the locked amount",
+            )],
+            method: "MilestonePlan::new + Escrow::with_milestones",
+            input_mapping: "milestones <- param (Vec<u64> -> tranche \
+                            table); authority <- accounts.initializer \
+                            (signer), enforced by the Anchor account \
+                            constraint, not the state machine; \
+                            Uninitialized only, like initialize_quorum; \
+                            the Σ == locked check accumulates in u128 so \
+                            the sum can never wrap; once attached, the \
+                            plan owns the release schedule (plain \
+                            release / claim become InvalidMilestones)",
+        },
+        InstructionSpec {
+            name: "confirm_milestone",
+            params: &[("index", "u8", "instruction param; milestone index")],
+            method: "Escrow::confirm_milestone",
+            input_mapping: "authority <- accounts.authority (signer: \
+                            initializer OR taker); index <- param; \
+                            records one party's acceptance; the milestone \
+                            is confirmed only once BOTH parties confirmed \
+                            (dual-signature acceptance, the AV-12 \
+                            concept); strictly in-order, idempotent per \
+                            party",
+        },
+        InstructionSpec {
+            name: "release_milestone",
+            params: &[("index", "u8", "instruction param; milestone index")],
+            method: "Escrow::release_milestone",
+            input_mapping: "authority <- accounts.initializer (signer); \
+                            index <- param; releases the tranche only \
+                            after dual confirmation (MilestoneNotConfirmed \
+                            otherwise) and in-order; returns the tranche \
+                            amount so the program can size the transfer; \
+                            the quorum gate applies exactly as for release",
+        },
+        InstructionSpec {
+            name: "skip_milestone",
+            params: &[("index", "u8", "instruction param; milestone index")],
+            method: "Escrow::skip_milestone",
+            input_mapping: "authority <- accounts.authority (signer: \
+                            initializer OR taker); index <- param; \
+                            records one party's skip approval; the skip \
+                            executes (tranche refunded to the initializer) \
+                            only after BOTH parties approved (dual-sig \
+                            skip); strictly in-order, idempotent per party",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -2204,6 +2728,10 @@ mod anchor_idl_tests {
             "Escrow::with_arbiter",
             "Escrow::escalate",
             "Escrow::resolve",
+            "MilestonePlan::new + Escrow::with_milestones",
+            "Escrow::confirm_milestone",
+            "Escrow::release_milestone",
+            "Escrow::skip_milestone",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -2227,7 +2755,7 @@ mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_six_instructions_take_params() {
+    fn only_ten_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -2243,7 +2771,11 @@ mod anchor_idl_tests {
                 &"initialize_quorum",
                 &"initialize_vesting",
                 &"initialize_arbiter",
-                &"resolve"
+                &"resolve",
+                &"initialize_milestones",
+                &"confirm_milestone",
+                &"release_milestone",
+                &"skip_milestone"
             ]
         );
     }
@@ -2445,6 +2977,132 @@ mod anchor_idl_tests {
         assert_eq!(e.state(), EscrowState::Disputed);
     }
 
+    fn milestone_escrow() -> Escrow {
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    #[test]
+    fn initialize_milestones_maps_tranche_list_to_plan() {
+        // IDL: initialize_milestones(milestones: Vec<u64>). The program
+        // runs MilestonePlan::new then Escrow::with_milestones; authority
+        // <- accounts.initializer, enforced by the Anchor account
+        // constraint. The tranche amounts must sum to the locked amount.
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        assert_eq!(e.milestone_plan(), Some(plan));
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        // Documented failure mode: the plan does not cover the lockup.
+        let short = MilestonePlan::new(&[400_000, 500_000]).unwrap();
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_milestones(short),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // Documented failure mode: zero-amount tranche rejected at
+        // construction, before touching the escrow.
+        assert_eq!(
+            MilestonePlan::new(&[400_000, 0]),
+            Err(EscrowError::InvalidMilestones)
+        );
+    }
+
+    #[test]
+    fn confirm_milestone_maps_either_party_signer_to_confirmation() {
+        // IDL: confirm_milestone(index: u8) — no other params; authority
+        // <- accounts.authority (signer: initializer OR taker). Records
+        // one party's acceptance; the milestone is confirmed once BOTH
+        // parties confirmed.
+        let mut e = milestone_escrow();
+        // One party alone: recorded, but the milestone is not confirmed.
+        e.confirm_milestone(ALICE, 0).unwrap();
+        assert!(!e.milestone_confirmed(0));
+        assert_eq!(e.next_milestone(), Some(0));
+        // The second party's confirmation completes it.
+        e.confirm_milestone(BOB, 0).unwrap();
+        assert!(e.milestone_confirmed(0));
+        // Documented failure mode: stranger learns nothing (Unauthorized
+        // before any state/config check).
+        assert_eq!(
+            e.confirm_milestone(MALLORY, 0),
+            Err(EscrowError::Unauthorized)
+        );
+        // Documented failure mode: confirming ahead of the sequence.
+        assert_eq!(
+            e.confirm_milestone(ALICE, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn release_milestone_maps_initializer_signer_and_index_to_tranche() {
+        // IDL: release_milestone(index: u8) — authority <-
+        // accounts.initializer (signer); index <- param. Returns the
+        // tranche amount so the program can size the transfer; the
+        // tranche accumulates in the shared `released` counter.
+        let mut e = milestone_escrow();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        let tranche = e.release_milestone(ALICE, 0).unwrap();
+        assert_eq!(tranche, 400_000);
+        assert_eq!((e.released_amount(), e.remaining_amount()), (400_000, 600_000));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert!(e.milestone_settled(0));
+        // Documented failure mode: releasing before dual confirmation.
+        let mut e = milestone_escrow();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        assert_eq!(
+            e.release_milestone(ALICE, 0),
+            Err(EscrowError::MilestoneNotConfirmed)
+        );
+        assert_eq!(e.released_amount(), 0);
+        // Documented failure mode: the taker cannot drive the release.
+        assert_eq!(
+            e.release_milestone(BOB, 0),
+            Err(EscrowError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn skip_milestone_maps_dual_approval_to_refund() {
+        // IDL: skip_milestone(index: u8) — authority <-
+        // accounts.authority (signer: initializer OR taker). Records one
+        // party's skip approval per call; the skip executes (tranche
+        // refunded to the initializer) only once BOTH parties approved.
+        let mut e = milestone_escrow();
+        // One approval: nothing happens yet — the milestone stays
+        // unsettled.
+        e.skip_milestone(ALICE, 0).unwrap();
+        assert!(!e.milestone_settled(0));
+        assert_eq!(e.skipped_amount(), 0);
+        // The second approval executes the skip.
+        e.skip_milestone(BOB, 0).unwrap();
+        assert!(e.milestone_settled(0));
+        assert_eq!(e.skipped_amount(), 400_000);
+        assert_eq!(e.released_amount(), 0, "skips never pay the taker");
+        // The skipped tranche stays inside the refundable remainder
+        // (remaining = amount - released; skipped is sub-accounting of
+        // the remainder, not a separate bucket).
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+        // Documented failure mode: stranger cannot approve a skip.
+        let mut e = milestone_escrow();
+        assert_eq!(
+            e.skip_milestone(MALLORY, 0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.skipped_amount(), 0);
+    }
+
     #[test]
     fn initialize_dual_sig_maps_initializer_signer_to_requirement() {
         // IDL: initialize_dual_sig() — no params; authority <-
@@ -2586,6 +3244,20 @@ mod anchor_idl_tests {
         // remaining funds; the taker's share accumulates in `released`,
         // like `release`'s amount param.
         ("resolve", "taker_amount", "released"),
+        // AV-15: the tranche list populates the plan's amounts; the count
+        // is derived (see FIELD_SOURCES). The plan region is zeroed by
+        // `initialize`.
+        ("initialize_milestones", "milestones", "milestones.amounts"),
+        // AV-15: the index selects the milestone whose confirmation bits
+        // (or skip-approval bits) are flipped in the bitmap; the bitmap
+        // itself is zeroed by `initialize`.
+        ("confirm_milestone", "index", "milestone_flags"),
+        // AV-15: the index selects the tranche whose amount accumulates
+        // in `released` — the same dual-writing the direction-2 note
+        // allows for `resolve`'s taker_amount (the released bit in
+        // `milestone_flags` is covered by that field's source entry).
+        ("release_milestone", "index", "released"),
+        ("skip_milestone", "index", "milestone_flags"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -2618,11 +3290,24 @@ mod anchor_idl_tests {
             "quorum.approvals",
             "zeroed by initialize_quorum, bits flipped by attest",
         ),
+        // AV-15: the plan's tranche count is not an instruction param —
+        // it is derived from the list length, like `quorum.registered`.
+        (
+            "milestones.count",
+            "derived from milestones.len() by initialize_milestones",
+        ),
+        // AV-15: the skip counter is an accumulator, like `released`.
+        (
+            "skipped",
+            "accumulated by skip_milestone once both parties approved; \
+             zeroed by initialize",
+        ),
     ];
 
     /// Every vault field path from `VAULT_FIELDS`, with `quorum` unfolded
-    /// into its serialized subfields and `vesting` unfolded into
-    /// start/end (order matches Borsh layout).
+    /// into its serialized subfields, `vesting` unfolded into start/end,
+    /// and `milestones` unfolded into amounts/count (order matches Borsh
+    /// layout).
     fn vault_field_paths() -> Vec<&'static str> {
         let mut paths = Vec::new();
         for (name, _, _) in VAULT_FIELDS {
@@ -2635,6 +3320,8 @@ mod anchor_idl_tests {
                 ]);
             } else if *name == "vesting" {
                 paths.extend(["vesting.start", "vesting.end"]);
+            } else if *name == "milestones" {
+                paths.extend(["milestones.amounts", "milestones.count"]);
             } else {
                 paths.push(name);
             }
@@ -2777,6 +3464,16 @@ mod error_code_tests {
             EscrowError::DisputeWindowClosed,
             109,
             "escalate with now >= expires_at (past the dispute window)",
+        ),
+        (
+            EscrowError::InvalidMilestones,
+            110,
+            "bad milestone plan (empty list, too many tranches, zero-amount tranche, tranche sum != locked amount), milestone op with no plan attached, out-of-range milestone index, or release/claim with a milestone plan attached",
+        ),
+        (
+            EscrowError::MilestoneNotConfirmed,
+            111,
+            "release_milestone before both parties confirmed the milestone",
         ),
     ];
 
@@ -2981,6 +3678,113 @@ mod error_code_tests {
         // ... while the initializer sees the state error, 101.
         let err = e.fund(ALICE).unwrap_err();
         assert_eq!(err.code(), 101);
+    }
+
+    fn milestone_escrow() -> Escrow {
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    #[test]
+    fn invalid_milestones_triggered_by_sum_mismatch() {
+        // Σ = 900_000 != locked 1_000_000: the plan does not cover the
+        // lockup, so it can never be the complete release schedule.
+        let short = MilestonePlan::new(&[400_000, 500_000]).unwrap();
+        let err = escrow().with_milestones(short).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMilestones);
+        assert_eq!(err.code(), 110);
+        // Over-covering is rejected too.
+        let over = MilestonePlan::new(&[400_000, 700_000]).unwrap();
+        assert_eq!(
+            escrow().with_milestones(over),
+            Err(EscrowError::InvalidMilestones)
+        );
+    }
+
+    #[test]
+    fn invalid_milestones_triggered_by_wrapping_sum() {
+        // The u128 accumulation is load-bearing: two u64::MAX tranches
+        // sum to 2^65 - 2, which a wrapping u64 sum would alias to
+        // u64::MAX - 1 — wrongly accepting the plan against a locked
+        // amount of u64::MAX - 1.
+        let plan = MilestonePlan::new(&[u64::MAX, u64::MAX]).unwrap();
+        let err = Escrow::initialize(ALICE, BOB, u64::MAX - 1, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMilestones);
+        assert_eq!(err.code(), 110);
+    }
+
+    #[test]
+    fn invalid_milestones_triggered_by_bad_plan_shape() {
+        // Empty plan, too many tranches, and zero-amount tranches are all
+        // config errors, rejected before touching the escrow.
+        assert_eq!(
+            MilestonePlan::new(&[]),
+            Err(EscrowError::InvalidMilestones)
+        );
+        let too_many = [1u64; MAX_MILESTONES + 1];
+        assert_eq!(
+            MilestonePlan::new(&too_many),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(
+            MilestonePlan::new(&[400_000, 0]),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // The exact-sum boundary is accepted.
+        assert!(MilestonePlan::new(&[400_000, 600_000]).is_ok());
+    }
+
+    #[test]
+    fn invalid_milestones_triggered_by_release_with_plan() {
+        // The plan owns the release schedule: plain `release` is disabled
+        // once a plan is attached.
+        let mut e = milestone_escrow();
+        let err = e.release(ALICE, 400_000).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMilestones);
+        assert_eq!(err.code(), 110);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0, "failed release moves nothing");
+    }
+
+    #[test]
+    fn invalid_milestones_triggered_by_milestone_op_without_plan() {
+        // Authorized party, right state — but no plan was ever attached.
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.confirm_milestone(ALICE, 0),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(
+            e.release_milestone(ALICE, 0),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(
+            e.skip_milestone(BOB, 0),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn milestone_not_confirmed_triggered_by_early_tranche_release() {
+        // Only the initializer confirmed: the taker's acceptance is
+        // missing, so the tranche is not releasable.
+        let mut e = milestone_escrow();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        let err = e.release_milestone(ALICE, 0).unwrap_err();
+        assert_eq!(err, EscrowError::MilestoneNotConfirmed);
+        assert_eq!(err.code(), 111);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0, "failed tranche release moves nothing");
     }
 }
 
@@ -3380,6 +4184,27 @@ mod account_space_tests {
                 out.extend_from_slice(&key);
             }
         }
+        // AV-15: milestone plan, always reserved like `quorum`: the
+        // `None` discriminant followed by zeroed amounts+count, so
+        // `with_milestones` writes in place without reallocating.
+        match e.milestones {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; MILESTONE_PLAN_LEN]);
+            }
+            Some(p) => {
+                out.push(1);
+                for amount in p.amounts {
+                    out.extend_from_slice(&amount.to_le_bytes());
+                }
+                out.push(p.count);
+            }
+        }
+        // AV-15: confirmation bitmap, always present (zeroed when no
+        // milestone plan is configured).
+        out.extend_from_slice(&e.milestone_flags.to_le_bytes());
+        // AV-15: cumulative skipped amount, always present.
+        out.extend_from_slice(&e.skipped.to_le_bytes());
         out
     }
 
@@ -3390,21 +4215,27 @@ mod account_space_tests {
         // `space =` expression with them.
         assert_eq!(QUORUM_POLICY_LEN, 8 * 32 + 1 + 1 + 8, "quorum policy bytes");
         assert_eq!(QUORUM_POLICY_LEN, 266);
+        assert_eq!(MILESTONE_PLAN_LEN, 8 * 8 + 1, "milestone plan bytes");
+        assert_eq!(MILESTONE_PLAN_LEN, 65);
         // 32 + 32 + 8 + 8 + 8 + 1 + (1 + 266) + 1 (AV-12 activation bitmask)
         // + (1 + 16) (AV-13 vesting schedule) + (1 + 32) (AV-14 arbiter)
-        assert_eq!(ESCROW_BODY_LEN, 407, "escrow payload bytes");
+        // + (1 + 65) (AV-15 milestone plan) + 8 (AV-15 confirmation bitmap)
+        // + 8 (AV-15 skipped counter)
+        assert_eq!(ESCROW_BODY_LEN, 489, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 415, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 497, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
-        // arbiter discriminant (AV-14, zeroed when no arbiter).
+        // arbiter discriminant (AV-14, zeroed when no arbiter) + 1-byte
+        // milestones discriminant (AV-15, zeroed when no plan) + 8-byte
+        // confirmation bitmap + 8-byte skipped counter.
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 101);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 118);
     }
 
     #[test]
@@ -3472,6 +4303,24 @@ mod account_space_tests {
         // AV-14: arbiter discriminant + zeroed key (no arbiter here).
         assert_eq!(bytes[374], 0, "arbiter: None discriminant");
         assert_eq!(&bytes[375..407], &[0u8; 32], "arbiter: zeroed key");
+        // AV-15: milestones discriminant + zeroed plan (no plan here),
+        // zeroed confirmation bitmap, zero skipped.
+        assert_eq!(bytes[407], 0, "milestones: None discriminant");
+        assert_eq!(
+            &bytes[408..473],
+            &[0u8; MILESTONE_PLAN_LEN],
+            "milestones: zeroed plan"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[473..481].try_into().unwrap()),
+            0,
+            "milestone_flags: zeroed"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[481..489].try_into().unwrap()),
+            0,
+            "skipped: zero"
+        );
 
         // With quorum: same total length (space is always reserved), Some
         // discriminant, attestor bytes and approval bitmask in place.
@@ -3512,6 +4361,25 @@ mod account_space_tests {
         // AV-14: arbiter discriminant + zeroed key (no arbiter here).
         assert_eq!(bytes[374], 0, "arbiter: None discriminant");
         assert_eq!(&bytes[375..407], &[0u8; 32], "arbiter: zeroed key");
+        // AV-15: the tail is untouched by the quorum region: milestones
+        // discriminant + zeroed plan, zeroed confirmation bitmap, zero
+        // skipped.
+        assert_eq!(bytes[407], 0, "milestones: None discriminant");
+        assert_eq!(
+            &bytes[408..473],
+            &[0u8; MILESTONE_PLAN_LEN],
+            "milestones: zeroed plan"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[473..481].try_into().unwrap()),
+            0,
+            "milestone_flags: zeroed"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[481..489].try_into().unwrap()),
+            0,
+            "skipped: zero"
+        );
     }
 
     #[test]
@@ -3568,6 +4436,65 @@ mod account_space_tests {
     }
 
     #[test]
+    fn manual_borsh_encoding_places_milestone_plan() {
+        // AV-15: an escrow with a milestone plan serializes the plan after
+        // the arbiter region, then the confirmation bitmap, then the
+        // skipped counter.
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        // Confirm milestone 0 with both parties, release its tranche.
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        e.release_milestone(ALICE, 0).unwrap();
+        // Skip milestone 1 by dual approval: the tranche is refunded to
+        // the initializer's claim, not released.
+        e.skip_milestone(ALICE, 1).unwrap();
+        e.skip_milestone(BOB, 1).unwrap();
+
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        // The head of the layout is untouched.
+        assert_eq!(bytes[88], EscrowState::Funded as u8);
+        assert_eq!(&bytes[375..407], &[0u8; 32], "arbiter: zeroed key");
+        // Milestone plan: discriminant 1, amounts, count.
+        assert_eq!(bytes[407], 1, "milestones: Some discriminant");
+        assert_eq!(
+            u64::from_le_bytes(bytes[408..416].try_into().unwrap()),
+            400_000,
+            "milestones.amounts[0] offset"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[416..424].try_into().unwrap()),
+            600_000,
+            "milestones.amounts[1] offset"
+        );
+        assert_eq!(&bytes[424..472], &[0u8; 48], "unused tranche slots are zero");
+        assert_eq!(bytes[472], 2, "milestones.count offset");
+        // Confirmation bitmap: milestone 0 has both confirmations + the
+        // released bit (bits 0,1,2); milestone 1 has both skip approvals +
+        // the skipped bit (bits 6*1+3, 6*1+4, 6*1+5 = 9,10,11).
+        let flags = u64::from_le_bytes(bytes[473..481].try_into().unwrap());
+        assert_eq!(flags, 0b111 | (0b111 << 9), "milestone_flags offsets");
+        assert_eq!(flags, 3_591);
+        // Skipped counter: the refunded tranche.
+        assert_eq!(
+            u64::from_le_bytes(bytes[481..489].try_into().unwrap()),
+            600_000,
+            "skipped offset"
+        );
+        // The state-machine view agrees with the bytes.
+        assert_eq!(
+            (e.released_amount(), e.skipped_amount(), e.remaining_amount()),
+            (400_000, 600_000, 600_000)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
     fn rent_formula_matches_hand_computed_mainnet_numbers() {
         // ((128 + space) * lamports_per_byte_year) * exemption_threshold.
         let full = rent_exempt_minimum_lamports(
@@ -3575,16 +4502,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 415) * 3480 * 2 = 543 * 6960 = 3_779_280 lamports.
-        assert_eq!(full, 3_779_280);
+        // (128 + 497) * 3480 * 2 = 625 * 6960 = 4_350_000 lamports.
+        assert_eq!(full, 4_350_000);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 101) * 3480 * 2 = 229 * 6960 = 1_593_840 lamports.
-        assert_eq!(no_quorum, 1_593_840);
+        // (128 + 118) * 3480 * 2 = 246 * 6960 = 1_712_160 lamports.
+        assert_eq!(no_quorum, 1_712_160);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -3627,13 +4554,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(3_779_280, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(4_350_000, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(3_779_279, params.0, params.1),
+            check_vault_rent_exempt(4_349_999, params.0, params.1),
             Err(RentShortfall {
-                required: 3_779_280,
-                provided: 3_779_279,
+                required: 4_350_000,
+                provided: 4_349_999,
             })
         );
         // Generous funding: exempt.
@@ -3645,7 +4572,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 3_779_280,
+                required: 4_350_000,
                 provided: 0,
             })
         );
@@ -4615,5 +5542,431 @@ mod arbitration_tests {
         assert_eq!(e.arbiter(), None);
         e.fund(ALICE).unwrap();
         assert_eq!(e.arbiter(), None, "funding does not invent an arbiter");
+    }
+}
+
+// ---------- AV-15: milestone tranche release ----------
+//
+// A milestone plan splits the locked amount into ordered tranches that
+// release one by one as both parties confirm each milestone (staged
+// settlement: construction tranches, grant disbursements). The plan is
+// fixed before funding and must sum to exactly the locked amount (u128
+// accumulation, so the sum can never wrap); once attached it owns the
+// release schedule — plain `release` / `claim` are disabled. Skipping a
+// milestone needs both parties' approval (dual-sig skip): the skipped
+// tranche is refunded to the initializer, never paid out to the taker.
+#[cfg(test)]
+mod milestone_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn plan_2() -> MilestonePlan {
+        MilestonePlan::new(&[400_000, 600_000]).unwrap()
+    }
+
+    fn milestone_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    /// Confirm milestone `index` with both parties.
+    fn confirm_both(e: &mut Escrow, index: u8) {
+        e.confirm_milestone(ALICE, index).unwrap();
+        e.confirm_milestone(BOB, index).unwrap();
+        assert!(e.milestone_confirmed(index as usize));
+    }
+
+    // ----- plan construction -----
+
+    #[test]
+    fn plan_total_is_exact_and_rejects_bad_shapes() {
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        assert_eq!(plan.count(), 2);
+        assert_eq!(plan.total(), 1_000_000);
+        assert_eq!(plan.amount_at(0), Some(400_000));
+        assert_eq!(plan.amount_at(1), Some(600_000));
+        assert_eq!(plan.amount_at(2), None, "out-of-range index");
+        // u128 total: no wrapping, exact even at the u64 boundary.
+        let big = MilestonePlan::new(&[u64::MAX - 5, 5]).unwrap();
+        assert_eq!(big.total(), u64::MAX as u128);
+    }
+
+    #[test]
+    fn with_milestones_rejected_after_funding() {
+        // The release schedule is fixed before funds move, like the
+        // quorum and vesting builders.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.with_milestones(plan_2()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.milestone_plan(), None);
+    }
+
+    #[test]
+    fn with_milestones_accessor_round_trips() {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap();
+        assert_eq!(e.milestone_plan(), Some(plan_2()));
+        assert_eq!(e.next_milestone(), Some(0));
+        assert_eq!(e.skipped_amount(), 0);
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(plain.milestone_plan(), None);
+        assert_eq!(plain.next_milestone(), None, "no plan: no next milestone");
+        assert!(!plain.milestone_confirmed(0));
+        assert!(!plain.milestone_settled(0));
+        assert!(!plain.milestone_confirmed(99), "out-of-range reports false");
+        assert!(!plain.milestone_settled(99), "out-of-range reports false");
+    }
+
+    // ----- confirmation -----
+
+    #[test]
+    fn confirm_needs_dual_confirmation() {
+        let mut e = milestone_escrow();
+        // Initializer alone: recorded, not confirmed.
+        e.confirm_milestone(ALICE, 0).unwrap();
+        assert!(!e.milestone_confirmed(0));
+        assert!(!e.milestone_settled(0));
+        // Taker alone: recorded, not confirmed.
+        let mut e = milestone_escrow();
+        e.confirm_milestone(BOB, 0).unwrap();
+        assert!(!e.milestone_confirmed(0));
+        // Both: confirmed.
+        e.confirm_milestone(ALICE, 0).unwrap();
+        assert!(e.milestone_confirmed(0));
+    }
+
+    #[test]
+    fn confirm_is_idempotent_per_party() {
+        let mut e = milestone_escrow();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        assert!(!e.milestone_confirmed(0), "still waiting on the taker");
+        e.confirm_milestone(BOB, 0).unwrap();
+        assert!(e.milestone_confirmed(0));
+    }
+
+    #[test]
+    fn confirm_is_strictly_in_order() {
+        let mut e = milestone_escrow();
+        // Milestone 1 cannot be confirmed while milestone 0 is unsettled.
+        assert_eq!(
+            e.confirm_milestone(ALICE, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.confirm_milestone(BOB, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(!e.milestone_confirmed(1));
+        // After milestone 0 settles, milestone 1 is confirmable.
+        confirm_both(&mut e, 0);
+        e.release_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(ALICE, 1).unwrap();
+        assert!(!e.milestone_confirmed(1));
+    }
+
+    #[test]
+    fn confirm_rejects_strangers_and_bad_states() {
+        let mut e = milestone_escrow();
+        assert_eq!(
+            e.confirm_milestone(MALLORY, 0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert!(!e.milestone_confirmed(0));
+        // Before funding: the milestone schedule exists, but acceptance
+        // happens after funds move.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap();
+        assert_eq!(
+            e.confirm_milestone(ALICE, 0),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Out-of-range index.
+        let mut e = milestone_escrow();
+        assert_eq!(
+            e.confirm_milestone(ALICE, 2),
+            Err(EscrowError::InvalidMilestones)
+        );
+    }
+
+    // ----- tranche release -----
+
+    #[test]
+    fn release_milestone_full_sequence_closes_the_escrow() {
+        let mut e = milestone_escrow();
+        confirm_both(&mut e, 0);
+        let t0 = e.release_milestone(ALICE, 0).unwrap();
+        assert_eq!(t0, 400_000, "the tranche amount is returned for transfer sizing");
+        assert_eq!(e.state(), EscrowState::Funded, "more tranches remain");
+        assert_eq!((e.released_amount(), e.remaining_amount()), (400_000, 600_000));
+        assert_eq!(e.next_milestone(), Some(1));
+
+        confirm_both(&mut e, 1);
+        let t1 = e.release_milestone(ALICE, 1).unwrap();
+        assert_eq!(t1, 600_000);
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.remaining_amount(), 0);
+        assert_eq!(e.next_milestone(), None, "every tranche settled");
+    }
+
+    #[test]
+    fn release_milestone_is_initializer_only_and_in_order() {
+        let mut e = milestone_escrow();
+        confirm_both(&mut e, 0);
+        // The taker is the beneficiary, not the authority.
+        assert_eq!(
+            e.release_milestone(BOB, 0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.release_milestone(MALLORY, 0),
+            Err(EscrowError::Unauthorized)
+        );
+        // Releasing milestone 1 while milestone 0 is unsettled.
+        assert_eq!(
+            e.release_milestone(ALICE, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn release_milestone_cannot_double_release() {
+        let mut e = milestone_escrow();
+        confirm_both(&mut e, 0);
+        e.release_milestone(ALICE, 0).unwrap();
+        // Milestone 0 is settled: re-releasing it is out-of-order now.
+        assert_eq!(
+            e.release_milestone(ALICE, 0),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.released_amount(), 400_000);
+    }
+
+    #[test]
+    fn quorum_gates_release_milestone_like_release() {
+        // Otherwise the initializer could bypass attestation by routing
+        // the payout through a milestone.
+        let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], 2).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        confirm_both(&mut e, 0);
+        assert_eq!(
+            e.release_milestone(ALICE, 0),
+            Err(EscrowError::QuorumNotReached)
+        );
+        assert_eq!(e.released_amount(), 0);
+        e.attest([0xA1; 32]).unwrap();
+        e.attest([0xA2; 32]).unwrap();
+        assert_eq!(e.release_milestone(ALICE, 0).unwrap(), 400_000);
+    }
+
+    #[test]
+    fn plain_release_and_claim_disabled_with_plan() {
+        // The plan is the sole release schedule: arbitrary tranches and
+        // time-based claims would break per-tranche accounting.
+        let mut e = milestone_escrow();
+        assert_eq!(
+            e.release(ALICE, 400_000),
+            Err(EscrowError::InvalidMilestones)
+        );
+        let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.claim(BOB, 1_800_000_000),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    // ----- dual-signed skip -----
+
+    #[test]
+    fn skip_needs_both_parties_and_refunds_the_tranche() {
+        let mut e = milestone_escrow();
+        // One approval: recorded, not executed.
+        e.skip_milestone(ALICE, 0).unwrap();
+        assert!(!e.milestone_settled(0));
+        assert_eq!(e.skipped_amount(), 0);
+        assert_eq!(e.next_milestone(), Some(0));
+        // The second approval executes the skip.
+        e.skip_milestone(BOB, 0).unwrap();
+        assert!(e.milestone_settled(0));
+        assert_eq!(e.skipped_amount(), 400_000);
+        assert_eq!(e.released_amount(), 0, "skips never pay the taker");
+        // The skipped tranche stays inside the refundable remainder
+        // (remaining = amount - released; skipped is sub-accounting of
+        // the remainder, not a separate bucket).
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.state(), EscrowState::Funded, "the plan continues");
+        assert_eq!(e.next_milestone(), Some(1));
+    }
+
+    #[test]
+    fn skip_is_idempotent_per_party_and_in_order() {
+        let mut e = milestone_escrow();
+        e.skip_milestone(ALICE, 0).unwrap();
+        e.skip_milestone(ALICE, 0).unwrap();
+        assert_eq!(e.skipped_amount(), 0, "still one approval short");
+        // Skipping ahead of the sequence is rejected.
+        assert_eq!(
+            e.skip_milestone(BOB, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.skipped_amount(), 0);
+        // A stranger cannot approve a skip.
+        assert_eq!(
+            e.skip_milestone(MALLORY, 0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.skipped_amount(), 0);
+    }
+
+    #[test]
+    fn mixed_confirm_and_skip_approval_stalls_until_aligned() {
+        // One party confirmed (release path), the other skip-approved:
+        // neither path completes on a single party's word — the milestone
+        // stays unsettled until both parties align on one path.
+        let mut e = milestone_escrow();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.skip_milestone(BOB, 0).unwrap();
+        assert!(!e.milestone_confirmed(0));
+        assert!(!e.milestone_settled(0));
+        assert_eq!(
+            e.release_milestone(ALICE, 0),
+            Err(EscrowError::MilestoneNotConfirmed)
+        );
+        // The taker aligns with the release path: now it is confirmed.
+        e.confirm_milestone(BOB, 0).unwrap();
+        assert!(e.milestone_confirmed(0));
+        assert_eq!(e.release_milestone(ALICE, 0).unwrap(), 400_000);
+    }
+
+    #[test]
+    fn skip_then_continue_and_cancel_refunds_remainder() {
+        // Skip milestone 0 by dual approval, then release milestone 1.
+        // The skipped tranche is sub-accounting of the refundable
+        // remainder: released + remaining == amount always holds.
+        let mut e = milestone_escrow();
+        e.skip_milestone(ALICE, 0).unwrap();
+        e.skip_milestone(BOB, 0).unwrap();
+        confirm_both(&mut e, 1);
+        e.release_milestone(ALICE, 1).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 600_000);
+        assert_eq!(e.skipped_amount(), 400_000);
+        assert_eq!(e.remaining_amount(), 400_000);
+        assert_eq!(
+            e.released_amount() + e.remaining_amount(),
+            1_000_000,
+            "conservation: released + remaining == amount"
+        );
+        // Cancel refunds the remainder (including the skipped tranche);
+        // both counters are preserved for audit.
+        e.cancel(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(e.released_amount(), 600_000);
+        assert_eq!(e.skipped_amount(), 400_000);
+        assert_eq!(e.remaining_amount(), 400_000);
+    }
+
+    // ----- composition -----
+
+    #[test]
+    fn resolve_overrides_the_milestone_plan() {
+        // Arbitration overrides the tranche schedule by design, like it
+        // overrides vesting: unsettled tranches are part of the remainder
+        // the arbiter splits.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        confirm_both(&mut e, 0);
+        e.release_milestone(ALICE, 0).unwrap(); // 400_000 to the taker
+        e.escalate(BOB, EXPIRES_AT - 1).unwrap();
+        let (payout, refund) = e.resolve(ARBITER, 300_000).unwrap();
+        assert_eq!((payout, refund), (300_000, 300_000));
+        assert_eq!(e.released_amount(), 700_000, "taker share in released");
+        assert_eq!(e.remaining_amount(), 300_000, "initializer refund");
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn milestone_escrow_at_u64_max_boundary() {
+        // The u128 sum check accepts the exact boundary; both tranches
+        // release and close the escrow with no overflow.
+        let plan = MilestonePlan::new(&[u64::MAX - 5, 5]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, u64::MAX, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        confirm_both(&mut e, 0);
+        assert_eq!(e.release_milestone(ALICE, 0).unwrap(), u64::MAX - 5);
+        assert_eq!(e.state(), EscrowState::Funded);
+        confirm_both(&mut e, 1);
+        assert_eq!(e.release_milestone(ALICE, 1).unwrap(), 5);
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.released_amount(), u64::MAX);
+        assert_eq!(e.remaining_amount(), 0);
+    }
+
+    #[test]
+    fn dispute_locks_milestone_ops() {
+        // Milestone ops are Funded-only, so the Disputed lock covers them
+        // with no extra code: the lock is a property of the state match.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1).unwrap();
+        assert_eq!(
+            e.confirm_milestone(ALICE, 0),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.release_milestone(ALICE, 0),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.skip_milestone(BOB, 0),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.state(), EscrowState::Disputed);
     }
 }

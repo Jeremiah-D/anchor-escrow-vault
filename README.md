@@ -25,7 +25,9 @@ release/cancel), the same authority checks, the same amount invariants.
 - **What's a skeleton:** `programs/escrow-vault/src/program.rs` is an Anchor program source
   file showing how the instructions (`initialize`, `fund`, `release`,
   `cancel`, `cancel_expired`, `initialize_quorum`, `attest`,
-  `initialize_dual_sig`, `activate`, `initialize_vesting`, `claim`) would wrap the
+  `initialize_dual_sig`, `activate`, `initialize_vesting`, `claim`,
+  `initialize_arbiter`, `escalate`, `resolve`, `initialize_milestones`,
+  `confirm_milestone`, `release_milestone`, `skip_milestone`) would wrap the
   `escrow-state` logic on-chain. It is **not
   compiled here** — a full on-chain build and test requires the Solana/Anchor
   toolchain. The compilable `escrow-vault` cargo package only ships
@@ -59,6 +61,10 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_arbiter(arbiter)`               | `Uninitialized`| `Uninitialized` | initializer (once, before funding; zero key rejected) |
 | `escalate(authority, now)`                   | `Funded`       | `Disputed` | initializer **or** taker, only when `now < expires_at` (locks `release`/`cancel`/`cancel_expired`/`claim`) |
 | `resolve(authority, taker_amount)`           | `Disputed`     | `Settled` | arbiter only; atomic split of the remainder (taker payout / initializer refund) |
+| `initialize_milestones(milestones)`          | `Uninitialized`| `Uninitialized` | initializer (once, before funding; tranche amounts must sum to the locked amount) |
+| `confirm_milestone(authority, index)`        | `Funded`       | — (no state change) | initializer **or** taker (in order; a milestone is confirmed once *both* parties confirmed) |
+| `release_milestone(authority, index)`        | `Funded`       | `Funded` (partial) / `Released` (final tranche) | initializer; milestone dual-confirmed (+ quorum satisfied when configured) |
+| `skip_milestone(authority, index)`           | `Funded`       | — (no state change) | initializer **or** taker, **both** must approve (dual-sig skip; skipped tranche refunded to the initializer) |
 | `initialize_quorum(attestors, threshold)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
@@ -157,6 +163,56 @@ settlement), and vesting does not gate it either (the dispute exists
 precisely because the schedule is contested; `claim` stays locked while
 `Disputed`).
 
+**Milestone tranche release (staged settlement).** An escrow can declare a
+milestone plan at creation (`MilestonePlan::new(amounts)`, opt-in on
+`Uninitialized` via `with_milestones`, like the quorum builder): the
+locked amount is split into at most 8 ordered tranches — the staged
+settlement pattern (construction tranches, grant disbursements, gated
+unlocks; Solana stream/milestone payments). The tranche amounts must sum
+to *exactly* the locked amount: the plan is the *complete* release
+schedule. The sum is accumulated in `u128`, which cannot wrap for 8
+`u64` tranches — a wrapping `u64` sum could alias a wrong total onto the
+locked amount (e.g. two `u64::MAX` tranches wrapping to `u64::MAX - 1`)
+and wrongly accept a plan that over- or under-covers the lockup.
+
+Each tranche releases only after *both* parties confirmed its milestone:
+`confirm_milestone(authority, index)` records one party's acceptance
+(either party may confirm; strangers get `Unauthorized`), and the
+milestone is confirmed once both confirmed — each confirmation is a
+separate signature, reusing the dual-signature concept from activation.
+Confirmations, releases, and skips are all strictly in-order (only the
+first unsettled milestone is actionable), and confirming is idempotent
+per party. `release_milestone(authority, index)` is the initializer's
+push path (like `release`): it returns the tranche amount so the program
+can size the transfer, accumulates it in the shared `released` counter
+(conservation and audit stay unified with `release` / `claim` /
+`resolve`), and moves the escrow to `Released` once everything is out.
+Releasing before dual confirmation is `MilestoneNotConfirmed`; a
+configured quorum gates `release_milestone` exactly like `release` /
+`claim` (the quorum guards every release path), while the two parties own
+milestone acceptance.
+
+Skipping a milestone requires a dual signature: `skip_milestone` records
+one party's skip approval per call, and the skip executes only once
+*both* parties approved. The skipped tranche is *not* paid out — it joins
+the refundable remainder (`skipped_amount()` tracks it for audit;
+`remaining_amount()` includes it), so the initializer is refunded, never
+the taker. Skipping never closes the escrow: later tranches continue, and
+`cancel` / `cancel_expired` refund whatever remains. A milestone one
+party confirmed and the other skip-approved stays unsettled until both
+parties align on one path — neither path completes on a single party's
+word.
+
+Design choice, documented deliberately: once a plan is attached, plain
+`release` and `claim` return `InvalidMilestones` — the plan and the
+vesting curve are *alternative* release schedules, not composable ones.
+Arbitrary or time-based pulls would release funds outside the tranche
+plan and break per-tranche accounting; the refund paths stay available,
+and `resolve` overrides the plan by design (unsettled tranches are part
+of the split remainder), like it overrides vesting. Confirmation progress
+is persisted in a 6-bits-per-milestone bitmap in the vault account (see
+the layout table), so it survives serialization.
+
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
 
@@ -172,6 +228,8 @@ program error per variant):
 | `InvalidVesting` | 107 | bad vesting schedule (`start >= end`), or `claim` with no vesting configured |
 | `InvalidArbiter` | 108 | `with_arbiter` with the zero key, or `escalate`/`resolve` with no arbiter configured |
 | `DisputeWindowClosed` | 109 | `escalate` with `now >= expires_at` (past the dispute window) |
+| `InvalidMilestones` | 110 | bad milestone plan (empty list, > 8 tranches, zero-amount tranche, tranche sum ≠ locked amount), milestone op with no plan attached, out-of-range milestone index, or `release`/`claim` with a milestone plan attached |
+| `MilestoneNotConfirmed` | 111 | `release_milestone` before both parties confirmed the milestone |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -339,6 +397,44 @@ initializer    taker         arbiter            escrow                 state
    |                                                      |  initializer←400_000 |
 ```
 
+**I. Milestone tranches — dual-confirmed releases, dual-signed skip.**
+The tranche schedule is fixed before funding; each tranche releases after
+both parties confirmed its milestone, in order. Skipping needs both
+parties' approval and refunds the tranche to the initializer:
+
+```
+initializer    taker            escrow                 state
+   |  initialize_milestones([400_000, 600_000])  |      |
+   |-------------------------------------------->|  (plan fixed,    |
+   |                                           |  still Uninitialized)|
+   |  fund(alice)   |              |                      |
+   |----------------------------->|  Uninitialized→Funded  |
+   |  confirm_milestone(alice, 0)  |                      |
+   |----------------------------->|  (initializer bit)     |
+   |               confirm_milestone(bob, 0)  |            |
+   |               -------------------------->|  milestone 0     |
+   |                                          |  confirmed (dual) |
+   |  release_milestone(alice, 0)  |           |           |
+   |----------------------------->|  released=400_000,    |
+   |                             |  stays Funded          |
+   |  release_milestone(alice, 1)  // → Err(MilestoneNotConfirmed):
+   |                             // milestone 1 unconfirmed
+   |  skip_milestone(alice, 1)  |             |           |
+   |----------------------------->|  (one approval:      |
+   |                             |   nothing executes)    |
+   |               skip_milestone(bob, 1)  |              |
+   |               -------------------------->|  milestone 1     |
+   |                                          |  skipped:        |
+   |                                          |  skipped=600_000,|
+   |                                          |  released=400_000,|
+   |                                          |  stays Funded     |
+```
+
+After the skip, `remaining_amount()` is 600_000 (amount − released; the
+skipped tranche stays in the refundable remainder), and a later `cancel`
+refunds it while `released_amount()` / `skipped_amount()` stay preserved
+for audit.
+
 Note that `attest` never changes `EscrowState` itself (it only grows the
 quorum's approval bitmask), and the failed-call invariant holds on every
 path above: any `Err(...)` return leaves the state — and `amount` and the
@@ -365,20 +461,28 @@ two-way consistency check against the IDL parameter table:
 | activation    | u8 (bitmask)      | 1     |
 | vesting       | Option<VestingSchedule> | 17 |
 | arbiter       | Option<Pubkey>    | 33    |
-| **total**     |                   | **415** |
+| milestones    | Option<MilestonePlan> | 66 |
+| milestone_flags | u64 (bitmask)   | 8     |
+| skipped       | u64               | 8     |
+| **total**     |                   | **497** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
 realloc. The 1-byte activation bitmask (AV-12) is likewise always present
 (zeroed for plain escrows), as is the 17-byte vesting region (AV-13:
 1-byte discriminant + `start`/`end` u64, zeroed when no schedule is
-attached), and the 33-byte arbiter region (AV-14: 1-byte discriminant +
-32-byte key, zeroed when no arbiter is configured) — all appended after
-the earlier fields, so every earlier field offset stays stable.
-`escrow-state` exposes `VAULT_SPACE` (415) and
-`VAULT_SPACE_NO_QUORUM` (101) for the Anchor `space =` constraint, plus a
+attached), the 33-byte arbiter region (AV-14: 1-byte discriminant +
+32-byte key, zeroed when no arbiter is configured) — and the 66-byte
+milestone plan region (AV-15: 1-byte discriminant + eight tranche u64s +
+count byte, zeroed when no plan is attached), the 8-byte confirmation
+bitmap (six bits per milestone: the two parties' release-path
+confirmations, the released bit, the two parties' skip approvals, the
+skipped bit), and the 8-byte skipped counter — all appended after the
+earlier fields, so every earlier field offset stays stable.
+`escrow-state` exposes `VAULT_SPACE` (497) and
+`VAULT_SPACE_NO_QUORUM` (118) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **3,779,280 lamports** to be
+mainnet rent parameters the full vault needs **4,350,000 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ## Run the tests

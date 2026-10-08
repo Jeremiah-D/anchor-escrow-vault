@@ -16,7 +16,11 @@
 //! the taker pull the vested stream exactly as `Escrow::claim` defines;
 //! the optional dispute arbiter (`initialize_arbiter` / `escalate` /
 //! `resolve`) settles contested escrows with one atomic split exactly as
-//! `Escrow::escalate` / `Escrow::resolve` define.
+//! `Escrow::escalate` / `Escrow::resolve` define; the optional milestone
+//! tranche plan (`initialize_milestones` / `confirm_milestone` /
+//! `release_milestone` / `skip_milestone`) releases the lockup in
+//! dual-confirmed tranches exactly as `Escrow::with_milestones` and
+//! friends define.
 //!
 //! To compile for real: `anchor build` with the Solana toolchain installed.
 
@@ -243,6 +247,79 @@ pub mod escrow_vault {
         // are wired up.
         Ok((payout, refund))
     }
+
+    /// Attach a milestone tranche plan (AV-15; mirrors
+    /// `MilestonePlan::new` + `Escrow::with_milestones`). `Uninitialized`
+    /// only, like `initialize_quorum`: the tranche schedule is fixed
+    /// before funds move. The tranche amounts must sum to exactly the
+    /// locked amount (checked in u128, so the sum can never wrap); once
+    /// attached, the plan owns the release schedule — plain `release` and
+    /// `claim` become `InvalidMilestones`.
+    pub fn initialize_milestones(
+        ctx: Context<InitializeMilestones>,
+        milestones: Vec<u64>,
+    ) -> Result<()> {
+        let plan =
+            escrow_state::MilestonePlan::new(&milestones).map_err(|e| escrow_error(e))?;
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow.with_milestones(plan).map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the full milestone region
+        // (1 + 65 bytes, zeroed when `None`), so the plan is written in
+        // place — no realloc needed in the real build.
+        Ok(())
+    }
+
+    /// Confirm a milestone for the release path (AV-15; mirrors
+    /// `Escrow::confirm_milestone`). Either the initializer or the taker
+    /// signs; each confirmation is a separate signature and the milestone
+    /// is confirmed only once BOTH parties confirmed (dual-signature
+    /// acceptance). Strictly in-order and idempotent per party.
+    pub fn confirm_milestone(ctx: Context<ConfirmMilestone>, index: u8) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .confirm_milestone(ctx.accounts.authority.key().to_bytes(), index)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Flip the party's confirmation bit in `vault.milestone_flags` in
+        // the real build.
+        Ok(())
+    }
+
+    /// Release a milestone's tranche to the taker (AV-15; mirrors
+    /// `Escrow::release_milestone`). Only the initializer signs; the
+    /// milestone must be dual-confirmed (`MilestoneNotConfirmed`
+    /// otherwise) and every earlier milestone settled. Returns the
+    /// tranche amount so the real build can size the transfer of
+    /// lamports/tokens to the taker. The AV-04 quorum gate applies
+    /// exactly as for `release`.
+    pub fn release_milestone(ctx: Context<ReleaseMilestone>, index: u8) -> Result<u64> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let tranche = escrow
+            .release_milestone(ctx.accounts.initializer.key().to_bytes(), index)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Transfer of `tranche` lamports/tokens to `ctx.accounts.taker`
+        // goes here once real token accounts are wired up.
+        Ok(tranche)
+    }
+
+    /// Skip a milestone by mutual agreement (AV-15; mirrors
+    /// `Escrow::skip_milestone`). Either the initializer or the taker
+    /// signs; the skip executes (tranche refunded to the initializer)
+    /// only after BOTH parties approved — a dual-signature skip.
+    /// Strictly in-order and idempotent per party.
+    pub fn skip_milestone(ctx: Context<SkipMilestone>, index: u8) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .skip_milestone(ctx.accounts.authority.key().to_bytes(), index)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Flip the party's skip-approval bit in `vault.milestone_flags`
+        // (and the skipped bit plus `vault.skipped` once dual-approved)
+        // in the real build.
+        Ok(())
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -288,6 +365,27 @@ pub struct Vault {
     /// Layout position matches `escrow_state::VAULT_FIELDS` (appended
     /// last, after `vesting`).
     pub arbiter: Option<Pubkey>,
+    /// AV-15: optional milestone tranche plan; mirrors
+    /// `escrow_state::MilestonePlan`. `None` for an escrow with no
+    /// milestone schedule. The account always reserves the full 66-byte
+    /// region (1-byte discriminant + eight tranche u64s + count byte,
+    /// zeroed when `None`) so `initialize_milestones` writes the plan in
+    /// place without reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after `arbiter`).
+    pub milestones: Option<MilestonePlan>,
+    /// AV-15: per-milestone confirmation bitmap (six bits per milestone:
+    /// the two parties' release-path confirmations, the released bit,
+    /// the two parties' skip approvals, the skipped bit); mirrors
+    /// `escrow_state`'s `milestone_flags`. Always present (one u64,
+    /// zeroed for escrows without a milestone plan). Layout position
+    /// matches `escrow_state::VAULT_FIELDS`.
+    pub milestone_flags: u64,
+    /// AV-15: cumulative amount skipped by mutual agreement; mirrors
+    /// `escrow_state`'s `skipped`. Skipped tranches join the refundable
+    /// remainder, not the taker-payout `released` counter. Always present
+    /// (one u64, zeroed when nothing was skipped). Layout position
+    /// matches `escrow_state::VAULT_FIELDS`.
+    pub skipped: u64,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -313,16 +411,29 @@ pub struct Quorum {
     pub approvals: u64,
 }
 
+/// Skeleton mirror of `escrow_state::MilestonePlan`: up to
+/// `escrow_state::MAX_MILESTONES` tranche amounts in release order plus
+/// the tranche count. See the state machine docs for the confirmation /
+/// release / skip semantics. Serialized size is pinned by
+/// `escrow_state::MILESTONE_PLAN_LEN` (65 bytes); the AV-10/AV-15 tests
+/// assert it against a manual encoding.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct MilestonePlan {
+    pub amounts: [u64; 8],
+    pub count: u8,
+}
+
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    // Full vault space: 8-byte discriminator + 407-byte payload = 415
+    // Full vault space: 8-byte discriminator + 489-byte payload = 497
     // bytes (see `escrow_state::VAULT_SPACE`; AV-12 added the 1-byte
     // activation bitmask, AV-13 the 17-byte vesting region, AV-14 the
-    // 33-byte arbiter region).
+    // 33-byte arbiter region, AV-15 the 66-byte milestone plan + the
+    // 8-byte confirmation bitmap + the 8-byte skipped counter).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 3_779_280 lamports.
+    // rent parameters the minimum is 4_350_000 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
@@ -464,6 +575,49 @@ pub struct Resolve<'info> {
     pub initializer: AccountInfo<'info>,
 }
 
+#[derive(Accounts)]
+pub struct InitializeMilestones<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer fixes the tranche schedule; the state machine
+    /// rejects re-configuration once the escrow leaves `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ConfirmMilestone<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker; the state machine enforces
+    /// the either-party rule and the per-party idempotency. A constraint
+    /// in the real build additionally asserts `authority.key() ==
+    /// vault.initializer || authority.key() == vault.taker`.
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ReleaseMilestone<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer drives tranche releases; the state machine
+    /// enforces the dual-confirmation gate.
+    pub initializer: Signer<'info>,
+    /// CHECK: beneficiary of the tranche; receives the funds.
+    pub taker: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SkipMilestone<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker; the state machine records one
+    /// party's skip approval per call and executes the skip only once
+    /// both approved. A constraint in the real build additionally asserts
+    /// `authority.key() == vault.initializer || authority.key() ==
+    /// vault.taker`.
+    pub authority: Signer<'info>,
+}
+
 // --- Helpers (finalized during the real Anchor build) ---
 
 fn read_escrow(_vault: &Account<Vault>) -> escrow_state::Escrow {
@@ -480,7 +634,7 @@ fn write_escrow(_vault: &mut Account<Vault>, _escrow: &escrow_state::Escrow) {
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {
     // One program error per EscrowError variant, so on-chain failures
-    // surface the exact `escrow_state` reason (code 100–109) to clients.
+    // surface the exact `escrow_state` reason (code 100–111) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
         escrow_state::EscrowError::InvalidStateTransition => {
@@ -497,6 +651,10 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {
         escrow_state::EscrowError::InvalidArbiter => error!(ErrorCode::InvalidArbiter),
         escrow_state::EscrowError::DisputeWindowClosed => {
             error!(ErrorCode::DisputeWindowClosed)
+        }
+        escrow_state::EscrowError::InvalidMilestones => error!(ErrorCode::InvalidMilestones),
+        escrow_state::EscrowError::MilestoneNotConfirmed => {
+            error!(ErrorCode::MilestoneNotConfirmed)
         }
     }
 }
@@ -523,4 +681,8 @@ pub enum ErrorCode {
     InvalidArbiter,
     #[msg("Dispute window closed: escalate called at or after expires_at")]
     DisputeWindowClosed,
+    #[msg("Invalid milestone plan (empty/too many/zero tranche, tranche sum != locked amount), milestone operation with no plan, or release/claim with a milestone plan attached")]
+    InvalidMilestones,
+    #[msg("release_milestone called before both parties confirmed the milestone")]
+    MilestoneNotConfirmed,
 }
