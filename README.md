@@ -27,7 +27,8 @@ release/cancel), the same authority checks, the same amount invariants.
   `cancel`, `cancel_expired`, `initialize_quorum`, `attest`,
   `initialize_dual_sig`, `activate`, `initialize_vesting`, `claim`,
   `initialize_arbiter`, `escalate`, `resolve`, `initialize_milestones`,
-  `confirm_milestone`, `release_milestone`, `skip_milestone`) would wrap the
+  `confirm_milestone`, `release_milestone`, `skip_milestone`,
+  `initialize_mint`) would wrap the
   `escrow-state` logic on-chain. It is **not
   compiled here** — a full on-chain build and test requires the Solana/Anchor
   toolchain. The compilable `escrow-vault` cargo package only ships
@@ -65,6 +66,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `confirm_milestone(authority, index)`        | `Funded`       | — (no state change) | initializer **or** taker (in order; a milestone is confirmed once *both* parties confirmed) |
 | `release_milestone(authority, index)`        | `Funded`       | `Funded` (partial) / `Released` (final tranche) | initializer; milestone dual-confirmed (+ quorum satisfied when configured) |
 | `skip_milestone(authority, index)`           | `Funded`       | — (no state change) | initializer **or** taker, **both** must approve (dual-sig skip; skipped tranche refunded to the initializer) |
+| `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
 | `initialize_quorum(attestors, threshold)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
@@ -213,6 +215,28 @@ of the split remainder), like it overrides vesting. Confirmation progress
 is persisted in a 6-bits-per-milestone bitmap in the vault account (see
 the layout table), so it survives serialization.
 
+**SPL token mint binding (token-scoped escrows).** An escrow can bind one
+SPL token mint at creation (`initialize_mint(mint)`, opt-in on
+`Uninitialized`, like the quorum builder): the `mint` param is the base58
+mint address, decoded by a handwritten base58 decoder (the crate is
+dependency-free, so no `bs58` crate) into 32 raw bytes. Empty strings,
+non-alphabet characters, and encodings that do not decode to exactly 32
+bytes are `InvalidMint` (code 112); the zero address is well-formed but
+rejected too — it is not a real mint (paralleling the arbiter's zero-key
+rejection). Without a bound mint the escrow is the native-SOL path and
+behaves exactly as before.
+
+Once bound, every fund-moving transition — `release`, `cancel`,
+`cancel_expired`, `claim`, `release_milestone`, `resolve` — takes the
+vault token account's mint and requires it to equal the bound address;
+any mismatch is `MintMismatch` (code 113), and the failed call leaves
+state and amounts untouched like every other rejection. `None` vs `Some`
+mismatches as well: a bound escrow never exits through the native-SOL
+path, and a SOL escrow never exits through a token mint — so the wrong
+token type can never be moved out of (or refunded from) the vault. The
+binding is a persisted 33-byte region in the vault account (see the
+layout table), appended last so every earlier field offset stays stable.
+
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
 
@@ -230,6 +254,8 @@ program error per variant):
 | `DisputeWindowClosed` | 109 | `escalate` with `now >= expires_at` (past the dispute window) |
 | `InvalidMilestones` | 110 | bad milestone plan (empty list, > 8 tranches, zero-amount tranche, tranche sum ≠ locked amount), milestone op with no plan attached, out-of-range milestone index, or `release`/`claim` with a milestone plan attached |
 | `MilestoneNotConfirmed` | 111 | `release_milestone` before both parties confirmed the milestone |
+| `InvalidMint` | 112 | bad mint address (empty, non-base58, or not 32 bytes), or `with_mint` with the zero address |
+| `MintMismatch` | 113 | exit-path token mint ≠ the escrow's bound mint (`None` vs `Some` mismatches too) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -435,6 +461,26 @@ skipped tranche stays in the refundable remainder), and a later `cancel`
 refunds it while `released_amount()` / `skipped_amount()` stay preserved
 for audit.
 
+**J. Token-scoped escrow — mint binding and mismatch.** The mint is bound
+before funding; every fund-moving call then carries the vault token
+account's mint, and a mismatch fails closed:
+
+```
+initializer            escrow                 state
+   |  initialize_mint("TokenkegQfe…")  |      |
+   |---------------------------------->|  (mint bound,      |
+   |                                 |  still Uninitialized)|
+   |  fund(alice)         |                      |
+   |--------------------->|  Uninitialized→Funded  |
+   |  release(alice, amount, Some(WRONG_MINT))    |
+   |---------------------------------->|  → Err(MintMismatch),
+   |                                 |  state + released unchanged
+   |  release(alice, amount, None)  // → Err(MintMismatch):
+   |                             // bound escrow, SOL path refused
+   |  release(alice, amount, Some(BOUND_MINT))    |
+   |---------------------------------->|  Funded→Released     |
+```
+
 Note that `attest` never changes `EscrowState` itself (it only grows the
 quorum's approval bitmask), and the failed-call invariant holds on every
 path above: any `Err(...)` return leaves the state — and `amount` and the
@@ -464,7 +510,8 @@ two-way consistency check against the IDL parameter table:
 | milestones    | Option<MilestonePlan> | 66 |
 | milestone_flags | u64 (bitmask)   | 8     |
 | skipped       | u64               | 8     |
-| **total**     |                   | **497** |
+| mint          | Option<Pubkey>    | 33    |
+| **total**     |                   | **530** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -477,12 +524,14 @@ milestone plan region (AV-15: 1-byte discriminant + eight tranche u64s +
 count byte, zeroed when no plan is attached), the 8-byte confirmation
 bitmap (six bits per milestone: the two parties' release-path
 confirmations, the released bit, the two parties' skip approvals, the
-skipped bit), and the 8-byte skipped counter — all appended after the
+skipped bit), and the 8-byte skipped counter — and the 33-byte mint
+binding (AV-16: 1-byte discriminant + 32-byte address, zeroed when no
+mint is bound) — all appended after the
 earlier fields, so every earlier field offset stays stable.
-`escrow-state` exposes `VAULT_SPACE` (497) and
-`VAULT_SPACE_NO_QUORUM` (118) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (530) and
+`VAULT_SPACE_NO_QUORUM` (119) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **4,350,000 lamports** to be
+mainnet rent parameters the full vault needs **4,579,680 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ## Run the tests

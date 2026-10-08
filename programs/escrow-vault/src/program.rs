@@ -20,7 +20,10 @@
 //! tranche plan (`initialize_milestones` / `confirm_milestone` /
 //! `release_milestone` / `skip_milestone`) releases the lockup in
 //! dual-confirmed tranches exactly as `Escrow::with_milestones` and
-//! friends define.
+//! friends define; the optional SPL token mint binding (`initialize_mint`)
+//! scopes the escrow to one token mint exactly as `Escrow::with_mint`
+//! defines, with every fund-moving instruction verifying the vault token
+//! account's mint against the bound address (`MintMismatch` otherwise).
 //!
 //! To compile for real: `anchor build` with the Solana toolchain installed.
 
@@ -63,10 +66,17 @@ pub mod escrow_vault {
     /// becomes `Released`. Cumulative releases must not exceed the locked
     /// amount (`ReleaseExceedsLocked`); `amount == 0` is `AmountMismatch`.
     /// The AV-04 quorum gate applies exactly as the state machine defines.
+    /// AV-16: the vault token account's mint must equal the bound
+    /// `vault.mint` (`MintMismatch` otherwise); `None` on the native-SOL
+    /// path (no mint bound).
     pub fn release(ctx: Context<Release>, amount: u64) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         escrow
-            .release(ctx.accounts.initializer.key().to_bytes(), amount)
+            .release(
+                ctx.accounts.initializer.key().to_bytes(),
+                amount,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+            )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // Transfer of lamports/tokens to `ctx.accounts.taker` goes here
@@ -75,10 +85,16 @@ pub mod escrow_vault {
     }
 
     /// Cancel the escrow and return funds (`Funded -> Cancelled`).
+    /// AV-16: the vault token account's mint must equal the bound
+    /// `vault.mint` (`MintMismatch` otherwise); `None` on the native-SOL
+    /// path (no mint bound).
     pub fn cancel(ctx: Context<Cancel>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         escrow
-            .cancel(ctx.accounts.initializer.key().to_bytes())
+            .cancel(
+                ctx.accounts.initializer.key().to_bytes(),
+                vault_token_mint(&ctx.accounts.vault_token_account),
+            )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         Ok(())
@@ -87,11 +103,18 @@ pub mod escrow_vault {
     /// Cancel an expired escrow (`Funded -> Cancelled`). Either the
     /// initializer or the taker may call this once the clock (Solana
     /// clock sysvar in the real build) has passed `expires_at`.
+    /// AV-16: the vault token account's mint must equal the bound
+    /// `vault.mint` (`MintMismatch` otherwise); `None` on the native-SOL
+    /// path (no mint bound).
     pub fn cancel_expired(ctx: Context<CancelExpired>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
         escrow
-            .cancel_expired(ctx.accounts.authority.key().to_bytes(), now)
+            .cancel_expired(
+                ctx.accounts.authority.key().to_bytes(),
+                now,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+            )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // Refund of lamports/tokens to the initializer goes here
@@ -183,12 +206,18 @@ pub mod escrow_vault {
     /// caller-supplied timestamp would let anyone fast-forward the unlock
     /// curve). Returns the claimed amount so the real build can size the
     /// transfer of lamports/tokens to the taker. The AV-04 quorum gate
-    /// applies exactly as for `release`.
+    /// applies exactly as for `release`. AV-16: the vault token account's
+    /// mint must equal the bound `vault.mint` (`MintMismatch` otherwise);
+    /// `None` on the native-SOL path (no mint bound).
     pub fn claim(ctx: Context<Claim>) -> Result<u64> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
         let claimed = escrow
-            .claim(ctx.accounts.taker.key().to_bytes(), now)
+            .claim(
+                ctx.accounts.taker.key().to_bytes(),
+                now,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+            )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // Transfer of `claimed` lamports/tokens to `ctx.accounts.taker`
@@ -235,11 +264,18 @@ pub mod escrow_vault {
     /// (the initializer is refunded the rest) in one atomic settlement.
     /// Returns `(taker_payout, initializer_refund)` so the real build can
     /// size both transfers of lamports/tokens. The quorum gate does not
-    /// apply: the arbiter is the resolution mechanism.
+    /// apply: the arbiter is the resolution mechanism. AV-16: the vault
+    /// token account's mint must equal the bound `vault.mint`
+    /// (`MintMismatch` otherwise); `None` on the native-SOL path (no mint
+    /// bound).
     pub fn resolve(ctx: Context<Resolve>, taker_amount: u64) -> Result<(u64, u64)> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let (payout, refund) = escrow
-            .resolve(ctx.accounts.arbiter.key().to_bytes(), taker_amount)
+            .resolve(
+                ctx.accounts.arbiter.key().to_bytes(),
+                taker_amount,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+            )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // Transfer of `payout` to `ctx.accounts.taker` and `refund` to
@@ -292,11 +328,17 @@ pub mod escrow_vault {
     /// otherwise) and every earlier milestone settled. Returns the
     /// tranche amount so the real build can size the transfer of
     /// lamports/tokens to the taker. The AV-04 quorum gate applies
-    /// exactly as for `release`.
+    /// exactly as for `release`. AV-16: the vault token account's mint
+    /// must equal the bound `vault.mint` (`MintMismatch` otherwise);
+    /// `None` on the native-SOL path (no mint bound).
     pub fn release_milestone(ctx: Context<ReleaseMilestone>, index: u8) -> Result<u64> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let tranche = escrow
-            .release_milestone(ctx.accounts.initializer.key().to_bytes(), index)
+            .release_milestone(
+                ctx.accounts.initializer.key().to_bytes(),
+                index,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+            )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // Transfer of `tranche` lamports/tokens to `ctx.accounts.taker`
@@ -318,6 +360,31 @@ pub mod escrow_vault {
         // Flip the party's skip-approval bit in `vault.milestone_flags`
         // (and the skipped bit plus `vault.skipped` once dual-approved)
         // in the real build.
+        Ok(())
+    }
+
+    /// Bind one SPL token mint to the escrow (AV-16; mirrors
+    /// `escrow_state::parse_mint_address` + `Escrow::with_mint`).
+    /// `Uninitialized` only, like `initialize_quorum`: the token scope is
+    /// fixed before funds move. The `mint` param is the base58 SPL mint
+    /// address; it must decode to exactly 32 bytes (`InvalidMint`
+    /// otherwise — empty string, non-alphabet characters, or a value
+    /// that is not 32 bytes), and the zero address is rejected (it is
+    /// well-formed but not a real mint). After this, the fund-moving
+    /// instructions (`release` / `cancel` / `cancel_expired` / `claim` /
+    /// `release_milestone` / `resolve`) require the vault token
+    /// account's mint to equal this address (`MintMismatch` otherwise).
+    /// Without a bound mint the escrow is the native-SOL path and those
+    /// instructions take no token mint.
+    pub fn initialize_mint(ctx: Context<InitializeMint>, mint: String) -> Result<()> {
+        let bytes =
+            escrow_state::parse_mint_address(&mint).map_err(|e| escrow_error(e))?;
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow.with_mint(bytes).map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the full mint region
+        // (33 bytes, zeroed when `None`), so the address is written in
+        // place — no realloc needed in the real build.
         Ok(())
     }
 }
@@ -386,6 +453,14 @@ pub struct Vault {
     /// (one u64, zeroed when nothing was skipped). Layout position
     /// matches `escrow_state::VAULT_FIELDS`.
     pub skipped: u64,
+    /// AV-16: optional SPL token mint this escrow is bound to; mirrors
+    /// `escrow_state`'s `mint`. `None` for a native-SOL escrow. The
+    /// account always reserves the full 33-byte region (1-byte
+    /// discriminant + 32-byte address, zeroed when `None`) so
+    /// `initialize_mint` writes the address in place without
+    /// reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after `skipped`).
+    pub mint: Option<Pubkey>,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -425,15 +500,16 @@ pub struct MilestonePlan {
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    // Full vault space: 8-byte discriminator + 489-byte payload = 497
+    // Full vault space: 8-byte discriminator + 522-byte payload = 530
     // bytes (see `escrow_state::VAULT_SPACE`; AV-12 added the 1-byte
     // activation bitmask, AV-13 the 17-byte vesting region, AV-14 the
     // 33-byte arbiter region, AV-15 the 66-byte milestone plan + the
-    // 8-byte confirmation bitmap + the 8-byte skipped counter).
+    // 8-byte confirmation bitmap + the 8-byte skipped counter, AV-16 the
+    // 33-byte mint region).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 4_350_000 lamports.
+    // rent parameters the minimum is 4_579_680 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
@@ -456,6 +532,11 @@ pub struct Release<'info> {
     pub initializer: Signer<'info>,
     /// CHECK: beneficiary of the release; receives the funds.
     pub taker: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account. The real build reads this
+    /// account's `mint` and the state machine requires it to equal the
+    /// bound `vault.mint` (`MintMismatch` otherwise). Unused on the
+    /// native-SOL path — the state machine then requires `None`.
+    pub vault_token_account: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -463,6 +544,10 @@ pub struct Cancel<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     pub initializer: Signer<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build reads its `mint` for the state machine's `MintMismatch`
+    /// check; unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -475,6 +560,10 @@ pub struct CancelExpired<'info> {
     pub authority: Signer<'info>,
     /// CHECK: Solana clock sysvar, read for the expiry comparison.
     pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build reads its `mint` for the state machine's `MintMismatch`
+    /// check; unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -535,6 +624,10 @@ pub struct Claim<'info> {
     /// CHECK: Solana clock sysvar, read for the vesting curve (never an
     /// instruction param).
     pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build reads its `mint` for the state machine's `MintMismatch`
+    /// check; unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -573,6 +666,10 @@ pub struct Resolve<'info> {
     pub taker: AccountInfo<'info>,
     /// CHECK: beneficiary of the initializer's refund share of the split.
     pub initializer: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build reads its `mint` for the state machine's `MintMismatch`
+    /// check; unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -604,6 +701,10 @@ pub struct ReleaseMilestone<'info> {
     pub initializer: Signer<'info>,
     /// CHECK: beneficiary of the tranche; receives the funds.
     pub taker: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build reads its `mint` for the state machine's `MintMismatch`
+    /// check; unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -618,6 +719,15 @@ pub struct SkipMilestone<'info> {
     pub authority: Signer<'info>,
 }
 
+#[derive(Accounts)]
+pub struct InitializeMint<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer binds the token mint; the state machine
+    /// rejects re-configuration once the escrow leaves `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
 // --- Helpers (finalized during the real Anchor build) ---
 
 fn read_escrow(_vault: &Account<Vault>) -> escrow_state::Escrow {
@@ -628,13 +738,21 @@ fn read_clock_unix_timestamp(_clock: &AccountInfo) -> u64 {
     unimplemented!("read Clock::get()?.unix_timestamp as u64 in the real build")
 }
 
+/// Read the vault's SPL token account mint for the state machine's
+/// `MintMismatch` check (AV-16). Returns `None` on the native-SOL path
+/// (no mint bound, no token accounts) — the state machine then requires
+/// `vault.mint` to be `None` too.
+fn vault_token_mint(_token_account: &AccountInfo) -> Option<[u8; 32]> {
+    unimplemented!("read the SPL token account's mint in the real build; None on the native-SOL path")
+}
+
 fn write_escrow(_vault: &mut Account<Vault>, _escrow: &escrow_state::Escrow) {
     unimplemented!("serialize escrow_state::Escrow back into the Vault account")
 }
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {
     // One program error per EscrowError variant, so on-chain failures
-    // surface the exact `escrow_state` reason (code 100–111) to clients.
+    // surface the exact `escrow_state` reason (code 100–113) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
         escrow_state::EscrowError::InvalidStateTransition => {
@@ -656,6 +774,8 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {
         escrow_state::EscrowError::MilestoneNotConfirmed => {
             error!(ErrorCode::MilestoneNotConfirmed)
         }
+        escrow_state::EscrowError::InvalidMint => error!(ErrorCode::InvalidMint),
+        escrow_state::EscrowError::MintMismatch => error!(ErrorCode::MintMismatch),
     }
 }
 
@@ -685,4 +805,8 @@ pub enum ErrorCode {
     InvalidMilestones,
     #[msg("release_milestone called before both parties confirmed the milestone")]
     MilestoneNotConfirmed,
+    #[msg("Invalid SPL mint address (not base58 / not 32 bytes) or the zero address")]
+    InvalidMint,
+    #[msg("Token account mint does not match the escrow's bound mint")]
+    MintMismatch,
 }
