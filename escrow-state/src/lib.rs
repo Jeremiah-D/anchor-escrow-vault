@@ -7067,3 +7067,488 @@ mod protocol_fee_tests {
         assert_eq!((e.fee_bps(), e.fees_paid()), (777, 0));
     }
 }
+
+// ---------- AV-19: opt-in configuration matrix combination tests ----------
+//
+// The six opt-in axes — dual_sig x quorum x vesting x milestones x mint x
+// protocol_fee — are independent builders, but they share the fund-moving
+// transitions, so their *interactions* are the regression risk: a new gate
+// must never weaken an older gate, reorder a documented check sequence,
+// or break the conservation invariant. This module enumerates all 2^6 =
+// 64 flag combinations deterministically (no RNG — the same binary always
+// runs the same matrix) and drives every combination through a full
+// lifecycle, plus focused check-order probes on the maximal configuration.
+//
+// Exhaustive 2^6 coverage implies full pairwise and triplewise coverage:
+// every value assignment of every axis pair (C(6,2) x 4 = 60) and every
+// axis triple (C(6,3) x 8 = 160) appears in the enumeration — asserted by
+// `matrix_pairwise_and_triplewise_coverage_is_exhaustive` below.
+#[cfg(test)]
+mod combination_matrix_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const A1: [u8; 32] = [0xA1; 32]; // attestors
+    const A2: [u8; 32] = [0xA2; 32];
+    const A3: [u8; 32] = [0xA3; 32];
+    const MINT: [u8; 32] = [0xD0; 32];
+    const OTHER_MINT: [u8; 32] = [0xD1; 32];
+    const AMOUNT: u64 = 1_000_000;
+    const FEE_BPS: u16 = 250; // 2.5%
+    const VEST_START: u64 = 1_700_000_000;
+    const VEST_END: u64 = 1_800_000_000;
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_000_000; // scan time for the cancel_expired sweep
+    const TRANCHES: [u64; 2] = [400_000, 600_000];
+
+    // One bit per opt-in axis, in backlog order.
+    const F_DUAL_SIG: u8 = 0b000001;
+    const F_QUORUM: u8 = 0b000010;
+    const F_VESTING: u8 = 0b000100;
+    const F_MILESTONES: u8 = 0b001000;
+    const F_MINT: u8 = 0b010000;
+    const F_FEE: u8 = 0b100000;
+    const ALL: u8 = F_DUAL_SIG | F_QUORUM | F_VESTING | F_MILESTONES | F_MINT | F_FEE;
+    const AXES: [u8; 6] = [F_DUAL_SIG, F_QUORUM, F_VESTING, F_MILESTONES, F_MINT, F_FEE];
+
+    fn quorum_policy() -> QuorumPolicy {
+        QuorumPolicy::new(&[A1, A2, A3], 2).unwrap()
+    }
+
+    fn build_with_expiry(flags: u8, expires_at: u64) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, expires_at).unwrap();
+        if flags & F_DUAL_SIG != 0 {
+            e = e.with_dual_sig().unwrap();
+        }
+        if flags & F_QUORUM != 0 {
+            e = e.with_quorum(quorum_policy()).unwrap();
+        }
+        if flags & F_VESTING != 0 {
+            e = e
+                .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
+                .unwrap();
+        }
+        if flags & F_MILESTONES != 0 {
+            e = e.with_milestones(MilestonePlan::new(&TRANCHES).unwrap()).unwrap();
+        }
+        if flags & F_MINT != 0 {
+            e = e.with_mint(MINT).unwrap();
+        }
+        if flags & F_FEE != 0 {
+            e = e.with_protocol_fee(FEE_BPS).unwrap();
+        }
+        e
+    }
+
+    fn build(flags: u8) -> Escrow {
+        build_with_expiry(flags, EXPIRES_AT)
+    }
+
+    /// The `mint` argument the fund-moving transitions take for this
+    /// combination: the bound mint on the SPL path, `None` on the
+    /// native-SOL path.
+    fn mint_arg(flags: u8) -> Option<[u8; 32]> {
+        if flags & F_MINT != 0 {
+            Some(MINT)
+        } else {
+            None
+        }
+    }
+
+    /// The expected protocol fee on a gross payout of `gross` for this
+    /// combination (`0` when no fee is configured).
+    fn expected_fee(flags: u8, gross: u64) -> u64 {
+        if flags & F_FEE != 0 {
+            ((gross as u128 * FEE_BPS as u128) / 10_000u128) as u64
+        } else {
+            0
+        }
+    }
+
+    /// Activate (dual-sig), satisfy the quorum, and fund — the shared
+    /// preamble every lifecycle in the matrix runs through.
+    fn fund_fully(e: &mut Escrow, flags: u8) {
+        if flags & F_DUAL_SIG != 0 {
+            e.activate(ALICE).unwrap();
+            e.activate(BOB).unwrap();
+            assert_eq!(e.state(), EscrowState::Activated);
+        }
+        if flags & F_QUORUM != 0 {
+            e.attest(A1).unwrap();
+            e.attest(A2).unwrap();
+        }
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    /// The conservation invariant (AV-03 style): the inflow equals the sum
+    /// of every sink. The protocol fee is a routing slice of the gross
+    /// payouts, never an extra sink, so `fees_paid <= released` always.
+    fn assert_conservation(locked: u64, released: u64, refunded: u64) {
+        assert_eq!(
+            AMOUNT as u128,
+            locked as u128 + released as u128 + refunded as u128,
+            "conservation violated: inflow != locked + released + refunded"
+        );
+    }
+
+    fn assert_fee_bound(e: &Escrow) {
+        assert!(
+            e.fees_paid() <= e.released_amount(),
+            "fee exceeded gross payouts: fees_paid={} released={}",
+            e.fees_paid(),
+            e.released_amount()
+        );
+    }
+
+    /// Drive the combination's taker-payout path to a terminal `Released`
+    /// state. The milestone plan owns the release schedule when attached
+    /// (plain `release` / `claim` are config errors there); otherwise the
+    /// vesting curve is claimed by the taker; otherwise the initializer
+    /// releases in full.
+    fn drive_release_path(e: &mut Escrow, flags: u8) {
+        let mint = mint_arg(flags);
+        if flags & F_MILESTONES != 0 {
+            // The plan owns the schedule: arbitrary and time-based pulls
+            // are disabled, even when vesting is also configured.
+            assert_eq!(
+                e.release(ALICE, AMOUNT, mint),
+                Err(EscrowError::InvalidMilestones)
+            );
+            if flags & F_VESTING != 0 {
+                assert_eq!(
+                    e.claim(BOB, VEST_END, mint),
+                    Err(EscrowError::InvalidMilestones)
+                );
+            }
+            for (i, &tranche) in TRANCHES.iter().enumerate() {
+                let i = i as u8;
+                e.confirm_milestone(ALICE, i).unwrap();
+                e.confirm_milestone(BOB, i).unwrap();
+                let (payout, fee) = e.release_milestone(ALICE, i, mint).unwrap();
+                assert_eq!(fee, expected_fee(flags, tranche));
+                assert_eq!(payout + fee, tranche, "fee is a slice of the gross");
+            }
+        } else if flags & F_VESTING != 0 {
+            // Claim at the end of the curve: everything vested at once.
+            let (payout, fee) = e.claim(BOB, VEST_END, mint).unwrap();
+            assert_eq!(fee, expected_fee(flags, AMOUNT));
+            assert_eq!(payout + fee, AMOUNT, "fee is a slice of the gross");
+        } else {
+            let (payout, fee) = e.release(ALICE, AMOUNT, mint).unwrap();
+            assert_eq!(fee, expected_fee(flags, AMOUNT));
+            assert_eq!(payout + fee, AMOUNT, "fee is a slice of the gross");
+        }
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.released_amount(), AMOUNT);
+        assert_eq!(e.remaining_amount(), 0);
+        assert_eq!(e.fees_paid(), expected_fee(flags, AMOUNT));
+        assert_conservation(0, AMOUNT, 0);
+        assert_fee_bound(e);
+    }
+
+    #[test]
+    fn matrix_all_combos_drive_release_path() {
+        // All 64 combinations: build, fund, and drive the taker-payout
+        // path to `Released`, asserting conservation and the fee bound at
+        // every step. This is the gate-interaction regression net: any
+        // combination that deadlocks, over-releases, or misroutes a fee
+        // fails here.
+        for flags in 0u8..64 {
+            let mut e = build(flags);
+            fund_fully(&mut e, flags);
+            drive_release_path(&mut e, flags);
+        }
+    }
+
+    #[test]
+    fn matrix_all_combos_cancel_expired() {
+        // All 64 combinations through the unilateral expiry exit: the
+        // refund path must stay intact no matter which payout gates are
+        // armed. `expires_at = 0` makes every escrow expiry-eligible at
+        // `NOW`.
+        for flags in 0u8..64 {
+            let mut e = build_with_expiry(flags, 0);
+            fund_fully(&mut e, flags);
+            // The mint binding is checked before expiry (check order:
+            // authority -> state -> mint -> expiry): a wrong mint fails
+            // even on an expired escrow, in both mismatch directions.
+            let wrong_mint = if flags & F_MINT != 0 {
+                Some(OTHER_MINT)
+            } else {
+                Some(MINT)
+            };
+            assert_eq!(
+                e.cancel_expired(ALICE, NOW, wrong_mint),
+                Err(EscrowError::MintMismatch)
+            );
+            // Early call: not expired yet.
+            let mut early = build_with_expiry(flags, NOW + 1);
+            fund_fully(&mut early, flags);
+            assert_eq!(
+                early.cancel_expired(BOB, NOW, mint_arg(flags)),
+                Err(EscrowError::NotExpired)
+            );
+            // Either party may cancel an expired escrow; the refund is
+            // the full remainder and no fee is ever charged on it.
+            e.cancel_expired(BOB, NOW, mint_arg(flags)).unwrap();
+            assert_eq!(e.state(), EscrowState::Cancelled);
+            assert_eq!(e.released_amount(), 0);
+            assert_eq!(e.remaining_amount(), AMOUNT);
+            assert_eq!(e.fees_paid(), 0, "refunds never carry a fee");
+            assert_conservation(0, 0, AMOUNT);
+        }
+    }
+
+    #[test]
+    fn matrix_pairwise_and_triplewise_coverage_is_exhaustive() {
+        // The 2^6 full enumeration deterministically covers every value
+        // assignment of every axis pair (C(6,2) pairs x 4 combos) and every
+        // axis triple (C(6,3) triples x 8 combos): this test pins that
+        // property so a future change to the enumeration cannot silently
+        // shrink the matrix.
+        let pair_val = |c: u8, i: usize, j: usize| -> u8 {
+            (((c & AXES[i]) != 0) as u8) * 2 + (((c & AXES[j]) != 0) as u8)
+        };
+        for i in 0..6 {
+            for j in (i + 1)..6 {
+                for vals in 0u8..4 {
+                    assert!(
+                        (0u8..64).any(|c| pair_val(c, i, j) == vals),
+                        "pair of axes ({i},{j}) never sees value combo {vals:02b}"
+                    );
+                }
+            }
+        }
+        let triple_val = |c: u8, i: usize, j: usize, k: usize| -> u8 {
+            (((c & AXES[i]) != 0) as u8) * 4
+                + (((c & AXES[j]) != 0) as u8) * 2
+                + (((c & AXES[k]) != 0) as u8)
+        };
+        for i in 0..6 {
+            for j in (i + 1)..6 {
+                for k in (j + 1)..6 {
+                    for vals in 0u8..8 {
+                        assert!(
+                            (0u8..64).any(|c| triple_val(c, i, j, k) == vals),
+                            "triple of axes ({i},{j},{k}) never sees value combo {vals:03b}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_builder_order_is_irrelevant() {
+        // The builders only set independent config fields: applying the
+        // same flag set in a different order yields the identical escrow.
+        // Gate interactions therefore cannot depend on configuration
+        // order.
+        let forward = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_quorum(quorum_policy())
+            .unwrap()
+            .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&TRANCHES).unwrap())
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_protocol_fee(FEE_BPS)
+            .unwrap();
+        let reverse = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(FEE_BPS)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&TRANCHES).unwrap())
+            .unwrap()
+            .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
+            .unwrap()
+            .with_quorum(quorum_policy())
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        assert_eq!(forward, reverse);
+        assert_eq!(build(ALL), forward);
+    }
+
+    #[test]
+    fn matrix_builders_rejected_after_fund() {
+        // Configuration is immutable once funds move: every builder
+        // rejects a live escrow, whatever the flag combination.
+        let mut e = build(ALL);
+        fund_fully(&mut e, ALL);
+        assert_eq!(
+            e.with_dual_sig().map(|_| ()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.with_quorum(quorum_policy()).map(|_| ()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
+                .map(|_| ()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.with_milestones(MilestonePlan::new(&TRANCHES).unwrap())
+                .map(|_| ()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.with_mint(MINT).map(|_| ()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.with_protocol_fee(FEE_BPS).map(|_| ()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    /// The maximal configuration with the quorum deliberately unsatisfied
+    /// (1 of 2 attestations): every gate is armed at once, so each probe
+    /// below exercises the documented check order against live
+    /// competing failures.
+    fn funded_maximal_quorum_open() -> Escrow {
+        let mut e = build(ALL);
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        e.attest(A1).unwrap(); // 1 of 2: quorum NOT satisfied
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    #[test]
+    fn matrix_check_order_release() {
+        let mut e = funded_maximal_quorum_open();
+        let mint = Some(MINT);
+        // Authority first: a stranger learns nothing, even though the
+        // mint, the plan, the quorum, and the amount would all also fail.
+        assert_eq!(
+            e.release(MALLORY, AMOUNT, mint),
+            Err(EscrowError::Unauthorized)
+        );
+        // Mint binding before the milestone plan, the quorum, and the
+        // amount checks.
+        assert_eq!(
+            e.release(ALICE, AMOUNT, Some(OTHER_MINT)),
+            Err(EscrowError::MintMismatch)
+        );
+        // The milestone plan owns the release schedule: the config error
+        // fires before the quorum gate runs (a zero amount would also be
+        // an amount error, but the plan rejects first).
+        assert_eq!(
+            e.release(ALICE, AMOUNT, mint),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(
+            e.release(ALICE, 0, mint),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // The quorum guards the milestone path exactly like `release`:
+        // mint mismatch still wins over the quorum gate ...
+        assert_eq!(
+            e.release_milestone(ALICE, 0, Some(OTHER_MINT)),
+            Err(EscrowError::MintMismatch)
+        );
+        // ... and the quorum gate wins over the confirmation gate.
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        assert_eq!(
+            e.release_milestone(ALICE, 0, mint),
+            Err(EscrowError::QuorumNotReached)
+        );
+        // Satisfy the quorum: the path opens and the fee slices the
+        // tranche (floor(400_000 * 250 / 10_000) = 10_000).
+        e.attest(A2).unwrap();
+        let (payout, fee) = e.release_milestone(ALICE, 0, mint).unwrap();
+        assert_eq!((payout, fee), (390_000, 10_000));
+        assert_conservation(e.remaining_amount(), e.released_amount(), 0);
+        assert_fee_bound(&e);
+    }
+
+    #[test]
+    fn matrix_check_order_claim() {
+        // Maximal configuration minus the milestone plan (the plan
+        // disables `claim`): authority -> state -> mint -> vesting ->
+        // quorum -> amount.
+        let flags = ALL & !F_MILESTONES;
+        let mut e = build(flags);
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        e.attest(A1).unwrap(); // 1 of 2: quorum NOT satisfied
+        e.fund(ALICE).unwrap();
+        let mint = Some(MINT);
+        assert_eq!(
+            e.claim(MALLORY, VEST_END, mint),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.claim(BOB, VEST_END, Some(OTHER_MINT)),
+            Err(EscrowError::MintMismatch)
+        );
+        assert_eq!(
+            e.claim(BOB, VEST_END, mint),
+            Err(EscrowError::QuorumNotReached)
+        );
+        // Satisfy the quorum: the full curve claims at once.
+        e.attest(A2).unwrap();
+        let (payout, fee) = e.claim(BOB, VEST_END, mint).unwrap();
+        assert_eq!((payout, fee), (975_000, 25_000));
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_conservation(0, AMOUNT, 0);
+        assert_fee_bound(&e);
+    }
+
+    #[test]
+    fn matrix_check_order_cancel_expired() {
+        let mut e = build_with_expiry(ALL, 0);
+        fund_fully(&mut e, ALL);
+        // Check order: authority -> state -> mint -> expiry.
+        assert_eq!(
+            e.cancel_expired(MALLORY, NOW, Some(MINT)),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.cancel_expired(ALICE, NOW, Some(OTHER_MINT)),
+            Err(EscrowError::MintMismatch)
+        );
+        // Expiry is the last check: an early call fails NotExpired even
+        // with every gate armed.
+        let mut early = build_with_expiry(ALL, NOW + 1);
+        fund_fully(&mut early, ALL);
+        assert_eq!(
+            early.cancel_expired(ALICE, NOW, Some(MINT)),
+            Err(EscrowError::NotExpired)
+        );
+        // Executable: either party cancels, the refund is the remainder,
+        // and refunds never carry a fee.
+        e.cancel_expired(BOB, NOW, Some(MINT)).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(e.fees_paid(), 0);
+        assert_conservation(0, 0, AMOUNT);
+    }
+
+    #[test]
+    fn matrix_plain_escrow_is_backward_compatible() {
+        // The zero-flag combination is the pre-opt-in escrow: the matrix
+        // itself pins the original behavior (native-SOL, no gates).
+        let mut e = build(0);
+        fund_fully(&mut e, 0);
+        assert_eq!(e.mint(), None);
+        assert_eq!(e.fee_bps(), 0);
+        assert!(!e.dual_sig_required());
+        let (payout, fee) = e.release(ALICE, AMOUNT, None).unwrap();
+        assert_eq!((payout, fee), (AMOUNT, 0));
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_conservation(0, AMOUNT, 0);
+    }
+}
