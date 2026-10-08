@@ -19,6 +19,18 @@ pub enum EscrowState {
     /// lifecycle order — so the existing Borsh discriminants (0–3) stay
     /// stable for already-serialized vaults.
     Activated,
+    /// AV-14: either party escalated the escrow into arbitration
+    /// (via [`Escrow::escalate`]). While `Disputed`, every unilateral
+    /// exit is locked — `release`, `cancel`, `cancel_expired`, and
+    /// `claim` all return `InvalidStateTransition` — so neither party
+    /// can move funds while the arbiter deliberates. Only
+    /// [`Escrow::resolve`] leaves this state.
+    Disputed,
+    /// AV-14: the arbiter settled the dispute (via [`Escrow::resolve`])
+    /// with a single atomic split of the remaining locked funds between
+    /// taker (payout) and initializer (refund). Terminal: no transition
+    /// leaves `Settled`.
+    Settled,
 }
 
 /// An escrow vault. Public keys are `[u8; 32]` so this crate stays
@@ -53,6 +65,13 @@ pub struct Escrow {
     /// `None` means no vesting (backward compatible): the taker cannot
     /// claim, and `release` keeps its existing semantics.
     vesting: Option<VestingSchedule>,
+    /// AV-14: optional dispute arbiter. `None` means no arbitration
+    /// (backward compatible): `escalate` / `resolve` fail with
+    /// [`EscrowError::InvalidArbiter`]. Set once via
+    /// [`Escrow::with_arbiter`] on an `Uninitialized` escrow, like the
+    /// quorum and vesting builders. Persisted (33 bytes in the vault
+    /// account) so the arbiter's identity survives serialization.
+    arbiter: Option<[u8; 32]>,
 }
 
 /// Bit 0 of [`Escrow::activation`]: the initializer has recorded their
@@ -100,6 +119,18 @@ pub enum EscrowError {
     /// vesting schedule attached. Parallels [`EscrowError::InvalidQuorum`]
     /// (config error, plus the no-config call path).
     InvalidVesting,
+    /// Arbiter misconfiguration or misuse (AV-14): `with_arbiter` with a
+    /// zero key, or [`Escrow::escalate`] / [`Escrow::resolve`] on an
+    /// escrow with no arbiter configured. Parallels
+    /// [`EscrowError::InvalidQuorum`] and [`EscrowError::InvalidVesting`]
+    /// (config error, plus the no-config call path).
+    InvalidArbiter,
+    /// [`Escrow::escalate`] called after the dispute window closed
+    /// (`now >= expires_at`). The dispute window is the escrow's live
+    /// window: before expiry either party may escalate, but once the
+    /// escrow is expiry-eligible the unilateral `cancel_expired` path is
+    /// the way out, so arbitration can no longer start.
+    DisputeWindowClosed,
 }
 
 impl EscrowError {
@@ -120,6 +151,8 @@ impl EscrowError {
             EscrowError::QuorumNotReached => 105,
             EscrowError::ReleaseExceedsLocked => 106,
             EscrowError::InvalidVesting => 107,
+            EscrowError::InvalidArbiter => 108,
+            EscrowError::DisputeWindowClosed => 109,
         }
     }
 
@@ -134,6 +167,8 @@ impl EscrowError {
             EscrowError::QuorumNotReached,
             EscrowError::ReleaseExceedsLocked,
             EscrowError::InvalidVesting,
+            EscrowError::InvalidArbiter,
+            EscrowError::DisputeWindowClosed,
         ]
     }
 }
@@ -312,6 +347,7 @@ impl Escrow {
             quorum: None,
             activation: 0,
             vesting: None,
+            arbiter: None,
         })
     }
 
@@ -613,9 +649,127 @@ impl Escrow {
         Ok(claimable)
     }
 
+    /// Opt in to dispute arbitration (AV-14). Builder-style: only valid
+    /// on an `Uninitialized` escrow, so the arbiter's identity is fixed
+    /// before any funds move — mirroring [`Escrow::with_quorum`] and
+    /// [`Escrow::with_vesting`]. A zero key is `InvalidArbiter`: the
+    /// arbiter must be a real identity, since `resolve` authenticates
+    /// against it. Re-configuring a live escrow is rejected with
+    /// `InvalidStateTransition`.
+    pub fn with_arbiter(mut self, arbiter: [u8; 32]) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if arbiter == [0u8; 32] {
+            return Err(EscrowError::InvalidArbiter);
+        }
+        self.arbiter = Some(arbiter);
+        Ok(self)
+    }
+
+    /// Escalate the escrow into arbitration: `Funded -> Disputed`
+    /// (AV-14). Either party — the initializer or the taker — may call
+    /// this, so a counterparty who stops cooperating cannot block the
+    /// dispute path.
+    ///
+    /// The dispute window is the escrow's live window: `escalate`
+    /// requires `now < expires_at` (`DisputeWindowClosed` otherwise).
+    /// Before expiry either party may escalate; once the escrow is
+    /// expiry-eligible the unilateral `cancel_expired` path is the way
+    /// out, so arbitration can no longer start. Pass `u64::MAX` as
+    /// `expires_at` for an escrow that is always escalatable.
+    ///
+    /// While `Disputed`, every unilateral exit is locked: `release`,
+    /// `cancel`, `cancel_expired`, and `claim` all return
+    /// `InvalidStateTransition` from `Disputed` (their state matches
+    /// only accept `Funded`), so neither party can move funds while the
+    /// arbiter deliberates. Only [`Escrow::resolve`] leaves `Disputed`.
+    ///
+    /// Check order is deliberate: authority, then state, then arbiter
+    /// configuration, then the window — a stranger learns nothing, and
+    /// a misconfigured call fails before the time logic runs.
+    pub fn escalate(&mut self, authority: [u8; 32], now: u64) -> Result<(), EscrowError> {
+        if authority != self.initializer && authority != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if self.arbiter.is_none() {
+            return Err(EscrowError::InvalidArbiter);
+        }
+        if now >= self.expires_at {
+            return Err(EscrowError::DisputeWindowClosed);
+        }
+        self.state = EscrowState::Disputed;
+        Ok(())
+    }
+
+    /// Settle a disputed escrow: `Disputed -> Settled` (AV-14). Only the
+    /// configured arbiter may call this (`Unauthorized` otherwise); the
+    /// settlement is a single atomic split of the *remaining* locked
+    /// funds — the taker is paid `taker_amount`, the initializer is
+    /// refunded the rest. Returns `(taker_payout, initializer_refund)`
+    /// so the caller (and the Anchor layer) can size both transfers.
+    ///
+    /// `taker_amount` may be anything from `0` (full refund to the
+    /// initializer) to the full remainder (full payout to the taker);
+    /// exceeding the remainder is `ReleaseExceedsLocked`, paralleling
+    /// `release`'s cumulative cap. The taker's share accumulates in the
+    /// same `released` counter as `release` / `claim`, so the
+    /// conservation invariant and the audit trail stay unified;
+    /// `remaining_amount()` is zero afterwards.
+    ///
+    /// Deliberately, a configured quorum does *not* gate `resolve`: the
+    /// arbiter is the resolution mechanism, and requiring attestations
+    /// on top would let attestors veto the settlement. Vesting likewise
+    /// does not gate `resolve` — arbitration overrides the unlock curve
+    /// by design (the dispute exists precisely because the schedule is
+    /// contested). Partial releases made before the dispute are honored:
+    /// the split applies to the remainder, never to already-released
+    /// funds.
+    ///
+    /// Check order is deliberate: arbiter configuration, then state,
+    /// then authority, then the amount. The arbiter's identity is the
+    /// authority being verified, so the configuration check comes first;
+    /// a stranger on an arbiter-less escrow gets `InvalidArbiter` (the
+    /// arbiter field is public on-chain account data anyway, so nothing
+    /// sensitive leaks).
+    pub fn resolve(
+        &mut self,
+        authority: [u8; 32],
+        taker_amount: u64,
+    ) -> Result<(u64, u64), EscrowError> {
+        let arbiter = self.arbiter.ok_or(EscrowError::InvalidArbiter)?;
+        match self.state {
+            EscrowState::Disputed => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if authority != arbiter {
+            return Err(EscrowError::Unauthorized);
+        }
+        // `released <= amount` is the crate invariant, so `remaining`
+        // cannot underflow; `taker_amount <= remaining` keeps
+        // `released + taker_amount <= amount` without a checked add.
+        let remaining = self.amount - self.released;
+        if taker_amount > remaining {
+            return Err(EscrowError::ReleaseExceedsLocked);
+        }
+        self.released += taker_amount;
+        self.state = EscrowState::Settled;
+        Ok((taker_amount, remaining - taker_amount))
+    }
+
     /// Read-only accessors.
     pub fn quorum(&self) -> Option<QuorumPolicy> {
         self.quorum
+    }
+
+    /// The dispute arbiter attached via [`Escrow::with_arbiter`], if any.
+    pub fn arbiter(&self) -> Option<[u8; 32]> {
+        self.arbiter
     }
     pub fn initializer(&self) -> [u8; 32] {
         self.initializer
@@ -636,7 +790,10 @@ impl Escrow {
         self.released
     }
     /// Amount still locked: `amount() - released_amount()`. This is what
-    /// `cancel` / `cancel_expired` refund.
+    /// `cancel` / `cancel_expired` refund. After `cancel`, `cancel_expired`,
+    /// or `resolve` the escrow is terminal and nothing is locked anymore —
+    /// the value is then the initializer's refund, preserved for audit
+    /// (for `resolve`, the taker's share sits in `released_amount()`).
     pub fn remaining_amount(&self) -> u64 {
         self.amount - self.released
     }
@@ -717,6 +874,12 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // when `None`) so `with_vesting` never needs a realloc — same
     // treatment as `quorum`.
     ("vesting", "Option<VestingSchedule>", 1 + 16),
+    // AV-14: optional dispute arbiter (see `Escrow::with_arbiter`):
+    // one discriminant byte, then the 32-byte key. The region is always
+    // reserved (zeroed when `None`) so `with_arbiter` writes in place —
+    // same treatment as `quorum` / `vesting`. Appended last so every
+    // earlier field offset stays stable.
+    ("arbiter", "Option<Pubkey>", 1 + PUBKEY_LEN),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -745,9 +908,10 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// data is written in place later without reallocating. The activation
 /// bitmask (AV-12) is always present — one byte, zeroed for plain escrows —
 /// and so is the vesting discriminant (AV-13): one byte, zeroed when no
-/// schedule is attached.
+/// schedule is attached. The arbiter discriminant (AV-14) is likewise
+/// always present: one byte, zeroed when no arbiter is configured.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -1111,15 +1275,20 @@ mod permission_tests {
     const ZERO_KEY: [u8; 32] = [0x00; 32];
     const EXPIRES_AT: u64 = 1_800_000_000;
 
-    const ALL_STATES: [EscrowState; 5] = [
+    const ALL_STATES: [EscrowState; 7] = [
         EscrowState::Uninitialized,
         EscrowState::Activated,
         EscrowState::Funded,
         EscrowState::Released,
         EscrowState::Cancelled,
+        EscrowState::Disputed,
+        EscrowState::Settled,
     ];
 
-    /// Build an escrow in each of the five lifecycle states.
+    /// Arbiter key used to build the disputed / settled states.
+    const ARBITER: [u8; 32] = [0xA8; 32];
+
+    /// Build an escrow in each of the seven lifecycle states.
     fn in_state(state: EscrowState) -> Escrow {
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         match state {
@@ -1139,6 +1308,20 @@ mod permission_tests {
             EscrowState::Cancelled => {
                 e.fund(ALICE).unwrap();
                 e.cancel(ALICE).unwrap();
+            }
+            EscrowState::Disputed => {
+                // AV-14: arbitration in progress; every unilateral exit
+                // is locked.
+                e = e.with_arbiter(ARBITER).unwrap();
+                e.fund(ALICE).unwrap();
+                e.escalate(ALICE, EXPIRES_AT - 1).unwrap();
+            }
+            EscrowState::Settled => {
+                // AV-14: arbiter split the remainder 600k / 400k.
+                e = e.with_arbiter(ARBITER).unwrap();
+                e.fund(ALICE).unwrap();
+                e.escalate(ALICE, EXPIRES_AT - 1).unwrap();
+                e.resolve(ARBITER, 600_000).unwrap();
             }
         }
         assert_eq!(e.state(), state);
@@ -1940,6 +2123,47 @@ mod anchor_idl_tests {
                             Uninitialized, Activated (AV-12: between \
                             activation and funding), and Funded",
         },
+        InstructionSpec {
+            // AV-14: dispute arbitration, opt-in arbiter.
+            name: "initialize_arbiter",
+            params: &[("arbiter", "Pubkey", "instruction param")],
+            method: "Escrow::with_arbiter",
+            input_mapping: "arbiter <- param (Pubkey -> [u8; 32] \
+                            conversion); authority <- accounts.initializer \
+                            (signer), enforced by the Anchor account \
+                            constraint, not the state machine; \
+                            Uninitialized only, like initialize_quorum; \
+                            the zero key is InvalidArbiter",
+        },
+        InstructionSpec {
+            name: "escalate",
+            params: &[],
+            method: "Escrow::escalate",
+            input_mapping: "authority <- accounts.authority (signer: \
+                            initializer OR taker); now <- clock sysvar \
+                            (NOT an instruction param — a caller-supplied \
+                            timestamp could rewind past the dispute \
+                            window, same rationale as cancel_expired); \
+                            Funded -> Disputed, locks every unilateral \
+                            exit until resolve",
+        },
+        InstructionSpec {
+            name: "resolve",
+            params: &[(
+                "taker_amount",
+                "u64",
+                "instruction param; taker's share of the remaining funds",
+            )],
+            method: "Escrow::resolve",
+            input_mapping: "authority <- accounts.arbiter (signer; must \
+                            equal the configured arbiter); taker_amount <- \
+                            param, capped at the remaining locked amount \
+                            (ReleaseExceedsLocked); Disputed -> Settled; \
+                            returns (taker_payout, initializer_refund) so \
+                            the program can size both transfers; the \
+                            quorum gate does NOT apply (the arbiter is \
+                            the resolution mechanism)",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -1977,6 +2201,9 @@ mod anchor_idl_tests {
             "VestingSchedule::new + Escrow::with_vesting",
             "Escrow::claim",
             "Escrow::attest",
+            "Escrow::with_arbiter",
+            "Escrow::escalate",
+            "Escrow::resolve",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -2000,7 +2227,7 @@ mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_four_instructions_take_params() {
+    fn only_six_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -2010,7 +2237,14 @@ mod anchor_idl_tests {
             .collect();
         assert_eq!(
             with_params,
-            vec![&"initialize", &"release", &"initialize_quorum", &"initialize_vesting"]
+            vec![
+                &"initialize",
+                &"release",
+                &"initialize_quorum",
+                &"initialize_vesting",
+                &"initialize_arbiter",
+                &"resolve"
+            ]
         );
     }
 
@@ -2129,6 +2363,89 @@ mod anchor_idl_tests {
     }
 
     #[test]
+    fn initialize_arbiter_maps_param_to_arbiter_field() {
+        // IDL: initialize_arbiter(arbiter: Pubkey) — arbiter <- param;
+        // authority <- accounts.initializer (Anchor constraint).
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        assert_eq!(e.arbiter(), Some(ARBITER));
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        // Documented failure mode: zero key is not an identity.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter([0u8; 32]),
+            Err(EscrowError::InvalidArbiter)
+        );
+    }
+
+    #[test]
+    fn escalate_maps_authority_and_clock_sysvar() {
+        // IDL: escalate() — no params. authority <- accounts.authority
+        // (signer: initializer OR taker); now <- clock sysvar, deliberately
+        // not an instruction param (a caller-supplied timestamp could
+        // rewind past the dispute window). The program layer must pass
+        // Clock::get()?.unix_timestamp here.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        // The taker may escalate too: either party can open the dispute.
+        e.escalate(BOB, EXPIRES_AT - 1).unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        // Documented failure mode: the dispute window is closed once the
+        // escrow is expiry-eligible.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.escalate(ALICE, EXPIRES_AT),
+            Err(EscrowError::DisputeWindowClosed)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn resolve_maps_arbiter_signer_and_taker_amount_param() {
+        // IDL: resolve(taker_amount: u64) — authority <-
+        // accounts.arbiter (signer); taker_amount <- instruction param.
+        // Returns (taker_payout, initializer_refund) so the program can
+        // size both transfers.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1).unwrap();
+        let (payout, refund) = e.resolve(ARBITER, 600_000).unwrap();
+        assert_eq!((payout, refund), (600_000, 400_000));
+        assert_eq!(e.state(), EscrowState::Settled);
+        // Taker's share in `released`, initializer's refund in
+        // `remaining` — the same split the `cancel` path reports.
+        assert_eq!((e.released_amount(), e.remaining_amount()), (600_000, 400_000));
+        // Documented failure mode: the initializer is not the arbiter.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1).unwrap();
+        assert_eq!(
+            e.resolve(ALICE, 600_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.state(), EscrowState::Disputed);
+    }
+
+    #[test]
     fn initialize_dual_sig_maps_initializer_signer_to_requirement() {
         // IDL: initialize_dual_sig() — no params; authority <-
         // accounts.initializer (signer), enforced by the Anchor account
@@ -2241,9 +2558,13 @@ mod anchor_idl_tests {
     // Direction 1 (IDL -> account): every instruction param must populate
     // exactly one vault field — a param that writes nothing (or writes an
     // undocumented field) is a spec lie the program would compile anyway.
-    // Direction 2 (account -> IDL): every vault field must have exactly one
-    // documented source — a field no instruction or account constraint ever
-    // writes is dead space the `space =` rent pays for.
+    // Direction 2 (account -> IDL): every vault field must have a
+    // documented source — a field no instruction or account constraint
+    // ever writes is dead space the `space =` rent pays for. A field may
+    // be written by more than one instruction param (`release`'s `amount`
+    // and `resolve`'s `taker_amount` both accumulate into `released`),
+    // but never by both a param and a field source: exactly one *kind*
+    // of source per field.
     //
     // `PARAM_FIELD_MAP` covers params; `FIELD_SOURCES` covers the rest
     // (signer accounts, transitions, derived/zeroed fields). The vault
@@ -2260,6 +2581,11 @@ mod anchor_idl_tests {
         ("initialize_quorum", "threshold", "quorum.threshold"),
         ("initialize_vesting", "start", "vesting.start"),
         ("initialize_vesting", "end", "vesting.end"),
+        ("initialize_arbiter", "arbiter", "arbiter"),
+        // The arbiter's split awards the taker `taker_amount` out of the
+        // remaining funds; the taker's share accumulates in `released`,
+        // like `release`'s amount param.
+        ("resolve", "taker_amount", "released"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -2272,8 +2598,13 @@ mod anchor_idl_tests {
         ("taker", "accounts.taker, stored by initialize"),
         (
             "state",
-            "transitions: fund/release/cancel/cancel_expired/activate",
+            "transitions: fund/release/cancel/cancel_expired/activate/escalate/resolve",
         ),
+        // `arbiter` is populated by the `initialize_arbiter` instruction
+        // param (see PARAM_FIELD_MAP), so it is not listed here — like
+        // `quorum.attestors`, every field gets exactly one source.
+        // `initialize` zeroes the region; `initialize_arbiter` is
+        // Uninitialized-only, like `initialize_quorum`.
         (
             "activation",
             "zeroed by initialize; required-bit set by initialize_dual_sig, \
@@ -2339,31 +2670,37 @@ mod anchor_idl_tests {
     }
 
     #[test]
-    fn every_vault_field_has_exactly_one_documented_source() {
+    fn every_vault_field_has_a_documented_source() {
         let from_params: Vec<&str> =
             PARAM_FIELD_MAP.iter().map(|(_, _, field)| *field).collect();
         let from_sources: Vec<&str> =
             FIELD_SOURCES.iter().map(|(field, _)| *field).collect();
+        let vault_fields = vault_field_paths();
+        // Every field source must name a real vault field (param mappings
+        // are checked against the field list in the direction-1 test).
+        for field in &from_sources {
+            assert!(
+                vault_fields.contains(field),
+                "field source names a field outside VAULT_FIELDS: {field}"
+            );
+        }
         let mut seen = HashSet::new();
         for field in vault_field_paths() {
             let via_param = from_params.iter().filter(|f| **f == field).count();
             let via_source = from_sources.iter().filter(|f| **f == field).count();
-            assert_eq!(
-                via_param + via_source,
-                1,
-                "vault field {field}: expected exactly one documented source \
-                 (param mapping or field source), found param={via_param} source={via_source}"
+            // Exactly one *kind* of source: params (possibly several, see
+            // `released`) xor one field source. A field with neither is
+            // dead space; a field with both is double-documented.
+            assert!(
+                (via_param > 0) ^ (via_source == 1),
+                "vault field {field}: expected params xor one field source, \
+                 found param={via_param} source={via_source}"
             );
             assert!(
                 seen.insert(field),
                 "vault field {field} documented twice"
             );
         }
-        assert_eq!(
-            seen.len(),
-            from_params.len() + from_sources.len(),
-            "a param mapping or field source names a field outside VAULT_FIELDS"
-        );
     }
 }
 
@@ -2430,6 +2767,16 @@ mod error_code_tests {
             EscrowError::InvalidVesting,
             107,
             "bad vesting schedule (start >= end) or claim with no vesting",
+        ),
+        (
+            EscrowError::InvalidArbiter,
+            108,
+            "with_arbiter with a zero key, or escalate/resolve with no arbiter configured",
+        ),
+        (
+            EscrowError::DisputeWindowClosed,
+            109,
+            "escalate with now >= expires_at (past the dispute window)",
         ),
     ];
 
@@ -2574,6 +2921,53 @@ mod error_code_tests {
         assert_eq!(err.code(), 107);
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn invalid_arbiter_triggered_by_zero_key_config() {
+        // The arbiter must be a real identity: `resolve` authenticates
+        // against it, so a zero key is a config error, not a wildcard.
+        let err = escrow().with_arbiter([0u8; 32]).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidArbiter);
+        assert_eq!(err.code(), 108);
+    }
+
+    #[test]
+    fn invalid_arbiter_triggered_by_escalate_without_arbiter() {
+        // Authorized party, right state — but no arbiter was ever
+        // configured, so there is nobody to arbitrate.
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        let err = e.escalate(ALICE, EXPIRES_AT - 1).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidArbiter);
+        assert_eq!(err.code(), 108);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn invalid_arbiter_triggered_by_resolve_without_arbiter() {
+        // Config is checked before state here (the arbiter's identity is
+        // the authority being verified), so this reports 108 even though
+        // the state is not Disputed.
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        let err = e.resolve([0xA8; 32], 100).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidArbiter);
+        assert_eq!(err.code(), 108);
+    }
+
+    #[test]
+    fn dispute_window_closed_triggered_by_late_escalate() {
+        // Once the escrow is expiry-eligible the unilateral
+        // cancel_expired path is the way out; arbitration can no longer
+        // start.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        let mut e = escrow().with_arbiter(ARBITER).unwrap();
+        e.fund(ALICE).unwrap();
+        let err = e.escalate(BOB, EXPIRES_AT).unwrap_err();
+        assert_eq!(err, EscrowError::DisputeWindowClosed);
+        assert_eq!(err.code(), 109);
+        assert_eq!(e.state(), EscrowState::Funded);
     }
 
     #[test]
@@ -2973,6 +3367,19 @@ mod account_space_tests {
                 out.extend_from_slice(&v.end.to_le_bytes());
             }
         }
+        // AV-14: dispute arbiter, always reserved like `quorum`: the
+        // `None` discriminant followed by a zeroed key, so
+        // `with_arbiter` writes in place without reallocating.
+        match e.arbiter {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; 32]);
+            }
+            Some(key) => {
+                out.push(1);
+                out.extend_from_slice(&key);
+            }
+        }
         out
     }
 
@@ -2984,19 +3391,20 @@ mod account_space_tests {
         assert_eq!(QUORUM_POLICY_LEN, 8 * 32 + 1 + 1 + 8, "quorum policy bytes");
         assert_eq!(QUORUM_POLICY_LEN, 266);
         // 32 + 32 + 8 + 8 + 8 + 1 + (1 + 266) + 1 (AV-12 activation bitmask)
-        // + (1 + 16) (AV-13 vesting schedule)
-        assert_eq!(ESCROW_BODY_LEN, 374, "escrow payload bytes");
+        // + (1 + 16) (AV-13 vesting schedule) + (1 + 32) (AV-14 arbiter)
+        assert_eq!(ESCROW_BODY_LEN, 407, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 382, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 415, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
-        // vesting discriminant (AV-13, zeroed when no schedule).
+        // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
+        // arbiter discriminant (AV-14, zeroed when no arbiter).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 100);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 101);
     }
 
     #[test]
@@ -3019,6 +3427,10 @@ mod account_space_tests {
         // AV-12: appended last so discriminants 0–3 stay stable for
         // already-serialized vaults.
         assert_eq!(EscrowState::Activated as u8, 4);
+        // AV-14: appended after Activated so discriminants 0–4 stay
+        // stable for already-serialized vaults.
+        assert_eq!(EscrowState::Disputed as u8, 5);
+        assert_eq!(EscrowState::Settled as u8, 6);
     }
 
     #[test]
@@ -3057,6 +3469,9 @@ mod account_space_tests {
         // AV-13: vesting discriminant + zeroed schedule (no vesting here).
         assert_eq!(bytes[357], 0, "vesting: None discriminant");
         assert_eq!(&bytes[358..374], &[0u8; 16], "vesting: zeroed schedule");
+        // AV-14: arbiter discriminant + zeroed key (no arbiter here).
+        assert_eq!(bytes[374], 0, "arbiter: None discriminant");
+        assert_eq!(&bytes[375..407], &[0u8; 32], "arbiter: zeroed key");
 
         // With quorum: same total length (space is always reserved), Some
         // discriminant, attestor bytes and approval bitmask in place.
@@ -3094,6 +3509,28 @@ mod account_space_tests {
         // AV-13: vesting discriminant + zeroed schedule (no vesting here).
         assert_eq!(bytes[357], 0, "vesting: None discriminant");
         assert_eq!(&bytes[358..374], &[0u8; 16], "vesting: zeroed schedule");
+        // AV-14: arbiter discriminant + zeroed key (no arbiter here).
+        assert_eq!(bytes[374], 0, "arbiter: None discriminant");
+        assert_eq!(&bytes[375..407], &[0u8; 32], "arbiter: zeroed key");
+    }
+
+    #[test]
+    fn manual_borsh_encoding_places_arbiter_key() {
+        // AV-14: an escrow with an arbiter serializes the key after the
+        // vesting region: discriminant 1, then the 32-byte key.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        // Everything before the arbiter region is untouched.
+        assert_eq!(bytes[88], EscrowState::Funded as u8);
+        assert_eq!(&bytes[358..374], &[0u8; 16], "vesting: zeroed schedule");
+        assert_eq!(bytes[374], 1, "arbiter: Some discriminant");
+        assert_eq!(&bytes[375..407], &ARBITER, "arbiter key offset");
     }
 
     #[test]
@@ -3138,16 +3575,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 382) * 3480 * 2 = 510 * 6960 = 3_549_600 lamports.
-        assert_eq!(full, 3_549_600);
+        // (128 + 415) * 3480 * 2 = 543 * 6960 = 3_779_280 lamports.
+        assert_eq!(full, 3_779_280);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 100) * 3480 * 2 = 228 * 6960 = 1_586_880 lamports.
-        assert_eq!(no_quorum, 1_586_880);
+        // (128 + 101) * 3480 * 2 = 229 * 6960 = 1_593_840 lamports.
+        assert_eq!(no_quorum, 1_593_840);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -3190,13 +3627,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(3_549_600, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(3_779_280, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(3_549_599, params.0, params.1),
+            check_vault_rent_exempt(3_779_279, params.0, params.1),
             Err(RentShortfall {
-                required: 3_549_600,
-                provided: 3_549_599,
+                required: 3_779_280,
+                provided: 3_779_279,
             })
         );
         // Generous funding: exempt.
@@ -3208,7 +3645,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 3_549_600,
+                required: 3_779_280,
                 provided: 0,
             })
         );
@@ -3891,5 +4328,292 @@ mod vesting_tests {
             1_000_000,
             "conservation across mixed release paths"
         );
+    }
+}
+
+// ---------- AV-14: dispute arbitration ----------
+//
+// Opt-in arbiter role: `with_arbiter` fixes the arbiter's identity before
+// funding; either party may `escalate` while `Funded` and inside the
+// dispute window (`now < expires_at`), moving the escrow to `Disputed`;
+// the arbiter then `resolve`s with a single atomic split of the remaining
+// locked funds (taker payout / initializer refund), moving to `Settled`.
+// While `Disputed`, every unilateral exit — `release`, `cancel`,
+// `cancel_expired`, `claim` — is locked with `InvalidStateTransition`,
+// so neither party can move funds mid-deliberation.
+#[cfg(test)]
+mod arbitration_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn funded_arbitrated_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    fn disputed_escrow() -> Escrow {
+        let mut e = funded_arbitrated_escrow();
+        e.escalate(ALICE, EXPIRES_AT - 1).unwrap();
+        e
+    }
+
+    // ----- builder -----
+
+    #[test]
+    fn with_arbiter_only_before_funding() {
+        // The arbiter's identity is fixed before funds move, like the
+        // quorum and vesting builders: re-configuring a live escrow is
+        // rejected.
+        // `with_arbiter` takes `self` by value, so a rejected
+        // re-configuration cannot mutate anything: the owned copy is
+        // simply dropped with the Err.
+        let e = funded_arbitrated_escrow();
+        assert_eq!(
+            e.with_arbiter([0xA9; 32]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn with_arbiter_rejects_zero_key() {
+        // The arbiter must be a real identity: `resolve` authenticates
+        // against it, so a zero key is a config error, not a wildcard.
+        let err = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter([0u8; 32])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidArbiter);
+    }
+
+    // ----- escalate -----
+
+    #[test]
+    fn either_party_may_escalate_inside_the_window() {
+        for authority in [ALICE, BOB] {
+            let mut e = funded_arbitrated_escrow();
+            e.escalate(authority, EXPIRES_AT - 1).unwrap();
+            assert_eq!(e.state(), EscrowState::Disputed);
+            // Amounts untouched by the escalation itself.
+            assert_eq!((e.released_amount(), e.remaining_amount()), (0, 1_000_000));
+        }
+    }
+
+    #[test]
+    fn escalate_rejects_strangers_before_state() {
+        // Authority first: a stranger gets Unauthorized, not
+        // InvalidArbiter or InvalidStateTransition.
+        let mut e = funded_arbitrated_escrow();
+        assert_eq!(
+            e.escalate(MALLORY, EXPIRES_AT - 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn escalate_rejects_non_funded_states() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        assert_eq!(
+            e.escalate(ALICE, EXPIRES_AT - 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Double escalation: already Disputed.
+        let mut e = disputed_escrow();
+        assert_eq!(
+            e.escalate(BOB, EXPIRES_AT - 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.state(), EscrowState::Disputed);
+    }
+
+    #[test]
+    fn escalate_boundary_now_equals_expires_at_is_closed() {
+        // The window is `now < expires_at`; at the boundary the escrow is
+        // expiry-eligible, so cancel_expired is the way out.
+        let mut e = funded_arbitrated_escrow();
+        assert_eq!(
+            e.escalate(ALICE, EXPIRES_AT),
+            Err(EscrowError::DisputeWindowClosed)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    // ----- the Disputed lock: every unilateral exit frozen -----
+
+    #[test]
+    fn disputed_locks_all_unilateral_exits() {
+        // release / cancel / cancel_expired / claim are all Funded-only,
+        // so from Disputed each is InvalidStateTransition — and each
+        // leaves state and money untouched.
+        let mut e = disputed_escrow();
+        assert_eq!(
+            e.release(ALICE, 100_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.cancel(ALICE), Err(EscrowError::InvalidStateTransition));
+        assert_eq!(
+            e.cancel_expired(ALICE, EXPIRES_AT + 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.claim(BOB, EXPIRES_AT + 1), Err(EscrowError::InvalidStateTransition));
+        assert_eq!(e.attest([0xA1; 32]), Err(EscrowError::InvalidStateTransition));
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!((e.released_amount(), e.remaining_amount()), (0, 1_000_000));
+        assert_eq!(e.amount(), 1_000_000);
+    }
+
+    #[test]
+    fn disputed_blocks_cancel_even_after_expiry() {
+        // The expiry clock keeps ticking during a dispute, but
+        // cancel_expired must not become available: the arbiter owns the
+        // outcome once escalated.
+        let mut e = disputed_escrow();
+        assert_eq!(
+            e.cancel_expired(BOB, EXPIRES_AT + 1_000_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.state(), EscrowState::Disputed);
+    }
+
+    // ----- resolve -----
+
+    #[test]
+    fn resolve_splits_the_remainder_atomically() {
+        let mut e = disputed_escrow();
+        let (payout, refund) = e.resolve(ARBITER, 600_000).unwrap();
+        assert_eq!((payout, refund), (600_000, 400_000));
+        assert_eq!(e.state(), EscrowState::Settled);
+        // The taker's share joins the released counter (shared audit
+        // trail); the initializer's refund stays visible in
+        // `remaining_amount()`, like `cancel`'s refund accounting.
+        assert_eq!(e.released_amount(), 600_000);
+        assert_eq!(e.remaining_amount(), 400_000);
+        assert_eq!(e.amount(), 1_000_000, "locked amount immutable");
+    }
+
+    #[test]
+    fn resolve_honors_boundary_splits() {
+        // Full payout to the taker.
+        let mut e = disputed_escrow();
+        assert_eq!(e.resolve(ARBITER, 1_000_000).unwrap(), (1_000_000, 0));
+        assert_eq!(e.state(), EscrowState::Settled);
+        // Full refund to the initializer.
+        let mut e = disputed_escrow();
+        assert_eq!(e.resolve(ARBITER, 0).unwrap(), (0, 1_000_000));
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn resolve_rejects_over_split() {
+        let mut e = disputed_escrow();
+        assert_eq!(
+            e.resolve(ARBITER, 1_000_001),
+            Err(EscrowError::ReleaseExceedsLocked)
+        );
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(e.released_amount(), 0, "failed resolve moves nothing");
+    }
+
+    #[test]
+    fn resolve_rejects_non_arbiter_and_wrong_state() {
+        // Parties cannot settle their own dispute.
+        let mut e = disputed_escrow();
+        for authority in [ALICE, BOB, MALLORY] {
+            assert_eq!(
+                e.resolve(authority, 100_000),
+                Err(EscrowError::Unauthorized)
+            );
+            assert_eq!(e.state(), EscrowState::Disputed);
+        }
+        // Not disputed yet: state rejects before authority is consulted.
+        let mut e = funded_arbitrated_escrow();
+        assert_eq!(
+            e.resolve(ARBITER, 100_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Settled is terminal: no second settlement.
+        let mut e = disputed_escrow();
+        e.resolve(ARBITER, 600_000).unwrap();
+        assert_eq!(
+            e.resolve(ARBITER, 100_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.released_amount(), 600_000, "second resolve moved nothing");
+    }
+
+    #[test]
+    fn resolve_splits_the_remainder_after_partial_release() {
+        // Partial releases made before the dispute are honored: the
+        // arbiter splits only what is still locked.
+        let mut e = funded_arbitrated_escrow();
+        e.release(ALICE, 400_000).unwrap();
+        e.escalate(BOB, EXPIRES_AT - 1).unwrap();
+        let (payout, refund) = e.resolve(ARBITER, 600_000).unwrap();
+        assert_eq!((payout, refund), (600_000, 0));
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.remaining_amount(), 0);
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    // ----- composition with quorum / vesting / dual-sig -----
+
+    #[test]
+    fn resolve_is_not_gated_by_quorum_by_design() {
+        // A 2-of-2 quorum gates release, but the arbiter settles without
+        // attestations: requiring them would let attestors veto the
+        // settlement.
+        let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], 2).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1).unwrap();
+        assert_eq!(e.resolve(ARBITER, 500_000).unwrap(), (500_000, 500_000));
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn dispute_overrides_vesting_curve_by_design() {
+        // The vesting curve is contested — that is why there is a
+        // dispute — so resolve splits the remainder regardless of what
+        // has vested; claim stays locked while Disputed.
+        let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(BOB, EXPIRES_AT - 1).unwrap();
+        assert_eq!(
+            e.claim(BOB, 1_750_000_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.resolve(ARBITER, 200_000).unwrap(), (200_000, 800_000));
+    }
+
+    #[test]
+    fn arbiter_accessor_round_trips() {
+        assert_eq!(funded_arbitrated_escrow().arbiter(), Some(ARBITER));
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.arbiter(), None);
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.arbiter(), None, "funding does not invent an arbiter");
     }
 }

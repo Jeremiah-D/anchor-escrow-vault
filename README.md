@@ -56,6 +56,9 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | Transition                                  | From           | To        | Authority              |
 |---------------------------------------------|----------------|-----------|------------------------|
 | `initialize(initializer, taker, amount, expires_at)` | — | `Uninitialized` | anyone (amount > 0) |
+| `initialize_arbiter(arbiter)`               | `Uninitialized`| `Uninitialized` | initializer (once, before funding; zero key rejected) |
+| `escalate(authority, now)`                   | `Funded`       | `Disputed` | initializer **or** taker, only when `now < expires_at` (locks `release`/`cancel`/`cancel_expired`/`claim`) |
+| `resolve(authority, taker_amount)`           | `Disputed`     | `Settled` | arbiter only; atomic split of the remainder (taker payout / initializer refund) |
 | `initialize_quorum(attestors, threshold)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
@@ -130,6 +133,30 @@ release). The initializer keeps the `release` push path and may release
 ahead of the curve; the schedule itself is immutable once set, and
 `cancel` / `cancel_expired` still refund the unreleased remainder.
 
+**Dispute arbitration (escrowed payments with a judge).** An escrow can
+name an arbiter (`with_arbiter`, opt-in on `Uninitialized`, like the
+quorum builder; the zero key is rejected since `resolve` authenticates
+against it). While `Funded`, *either* party may `escalate(authority, now)`
+into `Disputed` — the dispute window is the escrow's live window
+(`now < expires_at`; at/after expiry the unilateral `cancel_expired` path
+is the way out, so `escalate` reports `DisputeWindowClosed`). While
+`Disputed`, every unilateral exit is locked: `release`, `cancel`,
+`cancel_expired`, and `claim` all return `InvalidStateTransition`, so
+neither party can move funds mid-deliberation. The arbiter then
+`resolve`s with a single atomic split of the *remaining* locked funds —
+`taker_amount` to the taker, the rest refunded to the initializer —
+moving the escrow to the terminal `Settled` state and returning
+`(taker_payout, initializer_refund)` so the program can size both
+transfers. Partial releases made before the dispute are honored (the
+split applies to the remainder); the taker's share accumulates in the
+shared `released` counter while `remaining_amount()` preserves the
+initializer's refund for audit, exactly like `cancel`'s refund
+accounting. Deliberately, a configured quorum does *not* gate `resolve`
+(the arbiter is the resolution mechanism — attestors must not veto the
+settlement), and vesting does not gate it either (the dispute exists
+precisely because the schedule is contested; `claim` stays locked while
+`Disputed`).
+
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
 
@@ -143,6 +170,8 @@ program error per variant):
 | `QuorumNotReached` | 105 | `release` before the quorum threshold is reached |
 | `ReleaseExceedsLocked` | 106 | cumulative `release` amounts exceeding the locked amount |
 | `InvalidVesting` | 107 | bad vesting schedule (`start >= end`), or `claim` with no vesting configured |
+| `InvalidArbiter` | 108 | `with_arbiter` with the zero key, or `escalate`/`resolve` with no arbiter configured |
+| `DisputeWindowClosed` | 109 | `escalate` with `now >= expires_at` (past the dispute window) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -287,6 +316,29 @@ initializer    taker            escrow                 state
    |                                          |  Funded→Released   |
 ```
 
+**H. Disputed — arbitration locks the exits, the arbiter splits the
+remainder.** Either party escalates inside the dispute window; every
+unilateral exit is then frozen until the arbiter rules:
+
+```
+initializer    taker         arbiter            escrow                 state
+   |  initialize_arbiter(judge)  |  |                              |
+   |-------------------------------->| (arbiter fixed,             |
+   |                                |  still Uninitialized)         |
+   |  fund(alice)   |              |  |                            |
+   |----------------------------->|  Uninitialized→Funded          |
+   |               escalate(bob, now<expires_at)  |                  |
+   |               ------------------------------>|  Funded→Disputed |
+   |  release(alice, …)  // → Err(InvalidStateTransition):         |
+   |                    // exits locked while Disputed             |
+   |               cancel_expired(bob, late)  // → Err(InvalidStateTransition), |
+   |                                         // even after expiry  |
+   |                             resolve(judge, 600_000)  |         |
+   |                             ------------------------>|  Disputed→Settled, |
+   |                                                      |  taker←600_000,   |
+   |                                                      |  initializer←400_000 |
+```
+
 Note that `attest` never changes `EscrowState` itself (it only grows the
 quorum's approval bitmask), and the failed-call invariant holds on every
 path above: any `Err(...)` return leaves the state — and `amount` and the
@@ -312,17 +364,21 @@ two-way consistency check against the IDL parameter table:
 | quorum        | Option<Quorum>    | 267   |
 | activation    | u8 (bitmask)      | 1     |
 | vesting       | Option<VestingSchedule> | 17 |
-| **total**     |                   | **382** |
+| arbiter       | Option<Pubkey>    | 33    |
+| **total**     |                   | **415** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
 realloc. The 1-byte activation bitmask (AV-12) is likewise always present
 (zeroed for plain escrows), as is the 17-byte vesting region (AV-13:
 1-byte discriminant + `start`/`end` u64, zeroed when no schedule is
-attached). `escrow-state` exposes `VAULT_SPACE` (382) and
-`VAULT_SPACE_NO_QUORUM` (100) for the Anchor `space =` constraint, plus a
+attached), and the 33-byte arbiter region (AV-14: 1-byte discriminant +
+32-byte key, zeroed when no arbiter is configured) — all appended after
+the earlier fields, so every earlier field offset stays stable.
+`escrow-state` exposes `VAULT_SPACE` (415) and
+`VAULT_SPACE_NO_QUORUM` (101) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **3,549,600 lamports** to be
+mainnet rent parameters the full vault needs **3,779,280 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ## Run the tests

@@ -13,7 +13,10 @@
 //! the tested logic. The optional N-of-M attestor quorum (`initialize_quorum`
 //! / `attest`) gates `release` exactly as the state machine does; the
 //! optional linear vesting schedule (`initialize_vesting` / `claim`) lets
-//! the taker pull the vested stream exactly as `Escrow::claim` defines.
+//! the taker pull the vested stream exactly as `Escrow::claim` defines;
+//! the optional dispute arbiter (`initialize_arbiter` / `escalate` /
+//! `resolve`) settles contested escrows with one atomic split exactly as
+//! `Escrow::escalate` / `Escrow::resolve` define.
 //!
 //! To compile for real: `anchor build` with the Solana toolchain installed.
 
@@ -188,6 +191,58 @@ pub mod escrow_vault {
         // goes here once real token accounts are wired up.
         Ok(claimed)
     }
+
+    /// Opt in to dispute arbitration (AV-14; mirrors
+    /// `Escrow::with_arbiter`). `Uninitialized` only, like
+    /// `initialize_quorum`: the arbiter's identity is fixed before funds
+    /// move. The zero key is `InvalidArbiter` — the arbiter must be a real
+    /// identity, since `resolve` authenticates against it.
+    pub fn initialize_arbiter(ctx: Context<InitializeArbiter>, arbiter: Pubkey) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_arbiter(arbiter.to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the full arbiter region
+        // (33 bytes, zeroed when `None`), so the key is written in place
+        // — no realloc needed in the real build.
+        Ok(())
+    }
+
+    /// Escalate the escrow into arbitration (AV-14; mirrors
+    /// `Escrow::escalate`): `Funded -> Disputed`. Either the initializer
+    /// or the taker signs; `now` comes from the Solana clock sysvar (never
+    /// an instruction param — a caller-supplied timestamp could rewind
+    /// past the dispute window). While `Disputed`, every unilateral exit
+    /// (`release` / `cancel` / `cancel_expired` / `claim`) is locked.
+    pub fn escalate(ctx: Context<Escalate>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        escrow
+            .escalate(ctx.accounts.authority.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
+    /// Settle a disputed escrow (AV-14; mirrors `Escrow::resolve`):
+    /// `Disputed -> Settled`. Only the configured arbiter signs;
+    /// `taker_amount` is the taker's share of the remaining locked funds
+    /// (the initializer is refunded the rest) in one atomic settlement.
+    /// Returns `(taker_payout, initializer_refund)` so the real build can
+    /// size both transfers of lamports/tokens. The quorum gate does not
+    /// apply: the arbiter is the resolution mechanism.
+    pub fn resolve(ctx: Context<Resolve>, taker_amount: u64) -> Result<(u64, u64)> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let (payout, refund) = escrow
+            .resolve(ctx.accounts.arbiter.key().to_bytes(), taker_amount)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Transfer of `payout` to `ctx.accounts.taker` and `refund` to
+        // `ctx.accounts.initializer` goes here once real token accounts
+        // are wired up.
+        Ok((payout, refund))
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -225,6 +280,14 @@ pub struct Vault {
     /// `initialize_vesting` writes the schedule in place without
     /// reallocating. Full serialized layout: `escrow_state::VAULT_FIELDS`.
     pub vesting: Option<Vesting>,
+    /// AV-14: optional dispute arbiter; mirrors the `arbiter` field of
+    /// `escrow_state::Escrow`. `None` for an escrow with no arbitration.
+    /// The account always reserves the full 33-byte region (1-byte
+    /// discriminant + 32-byte key, zeroed when `None`) so
+    /// `initialize_arbiter` writes the key in place without reallocating.
+    /// Layout position matches `escrow_state::VAULT_FIELDS` (appended
+    /// last, after `vesting`).
+    pub arbiter: Option<Pubkey>,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -252,13 +315,14 @@ pub struct Quorum {
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    // Full vault space: 8-byte discriminator + 374-byte payload = 382
+    // Full vault space: 8-byte discriminator + 407-byte payload = 415
     // bytes (see `escrow_state::VAULT_SPACE`; AV-12 added the 1-byte
-    // activation bitmask, AV-13 the 17-byte vesting region).
+    // activation bitmask, AV-13 the 17-byte vesting region, AV-14 the
+    // 33-byte arbiter region).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 3_549_600 lamports.
+    // rent parameters the minimum is 3_779_280 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
@@ -362,6 +426,44 @@ pub struct Claim<'info> {
     pub clock: AccountInfo<'info>,
 }
 
+#[derive(Accounts)]
+pub struct InitializeArbiter<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer opts into arbitration; the state machine
+    /// rejects re-configuration once the escrow leaves `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Escalate<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker; the state machine enforces
+    /// the either-party rule. A constraint in the real build additionally
+    /// asserts `authority.key() == vault.initializer || authority.key() ==
+    /// vault.taker`.
+    pub authority: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the dispute-window check
+    /// (never an instruction param — a caller-supplied timestamp could
+    /// rewind past the window).
+    pub clock: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Resolve<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Must equal the configured arbiter; the state machine rejects
+    /// anyone else with `Unauthorized`. A constraint in the real build
+    /// additionally asserts `arbiter.key() == vault.arbiter`.
+    pub arbiter: Signer<'info>,
+    /// CHECK: beneficiary of the taker's share of the split.
+    pub taker: AccountInfo<'info>,
+    /// CHECK: beneficiary of the initializer's refund share of the split.
+    pub initializer: AccountInfo<'info>,
+}
+
 // --- Helpers (finalized during the real Anchor build) ---
 
 fn read_escrow(_vault: &Account<Vault>) -> escrow_state::Escrow {
@@ -378,7 +480,7 @@ fn write_escrow(_vault: &mut Account<Vault>, _escrow: &escrow_state::Escrow) {
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {
     // One program error per EscrowError variant, so on-chain failures
-    // surface the exact `escrow_state` reason (code 100–107) to clients.
+    // surface the exact `escrow_state` reason (code 100–109) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
         escrow_state::EscrowError::InvalidStateTransition => {
@@ -392,6 +494,10 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {
             error!(ErrorCode::ReleaseExceedsLocked)
         }
         escrow_state::EscrowError::InvalidVesting => error!(ErrorCode::InvalidVesting),
+        escrow_state::EscrowError::InvalidArbiter => error!(ErrorCode::InvalidArbiter),
+        escrow_state::EscrowError::DisputeWindowClosed => {
+            error!(ErrorCode::DisputeWindowClosed)
+        }
     }
 }
 
@@ -413,4 +519,8 @@ pub enum ErrorCode {
     ReleaseExceedsLocked,
     #[msg("Invalid vesting schedule (start >= end) or claim with no vesting configured")]
     InvalidVesting,
+    #[msg("Invalid arbiter (zero key) or no arbiter configured for escalate/resolve")]
+    InvalidArbiter,
+    #[msg("Dispute window closed: escalate called at or after expires_at")]
+    DisputeWindowClosed,
 }
