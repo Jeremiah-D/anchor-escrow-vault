@@ -804,6 +804,26 @@ pub mod escrow_vault {
         // needed in the real build.
         Ok(())
     }
+
+    /// Declare the token decimal metadata (AV-28; mirrors
+    /// `Escrow::with_decimals`): the SPL mint's decimal places, used
+    /// only to render human-readable amounts in the keeper report and
+    /// the AV-26 snapshot export — it never gates a transition and never
+    /// moves funds. `decimals > 18` is `InvalidDecimals` (the largest
+    /// precision any SPL/EVM token convention needs; SPL mints declare
+    /// at most 9). `decimals == 0` means no decimal metadata (the
+    /// default — amounts render as bare integers). `Uninitialized` only.
+    pub fn initialize_decimals(ctx: Context<InitializeDecimals>, decimals: u8) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_decimals(decimals)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.decimals` is always present (1 byte, zeroed by
+        // default), so the precision is written in place — no realloc
+        // needed in the real build.
+        Ok(())
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -926,6 +946,14 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `penalty_bps`).
     pub timelock: u64,
+    /// AV-28: token decimal metadata; mirrors `escrow_state`'s
+    /// `decimals` (the SPL mint's decimal places, `0` = no decimal
+    /// metadata). Always present (1 byte, zeroed by default) so
+    /// `initialize_decimals` writes the precision in place without
+    /// reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after `timelock`).
+    /// Display-only: it never gates a transition and never moves funds.
+    pub decimals: u8,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -1054,17 +1082,20 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    // Full vault space: 8-byte discriminator + 532-byte payload = 540
+    // Full vault space: 8-byte discriminator + 617-byte payload = 625
     // bytes (see `escrow_state::VAULT_SPACE`; AV-12 added the 1-byte
     // activation bitmask, AV-13 the 17-byte vesting region, AV-14 the
     // 33-byte arbiter region, AV-15 the 66-byte milestone plan + the
     // 8-byte confirmation bitmap + the 8-byte skipped counter, AV-16 the
     // 33-byte mint region, AV-17 the 2-byte fee rate + the 8-byte
-    // cumulative fee counter).
+    // cumulative fee counter, AV-21 the 8-byte grace period, AV-22 the
+    // 33-byte evidence hash region, AV-23 the 33-byte refund whitelist
+    // region, AV-24 the 2-byte penalty rate, AV-27 the 8-byte timelock,
+    // AV-28 the 1-byte decimals metadata).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 4_649_280 lamports.
+    // rent parameters the minimum is 5_240_880 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
@@ -1323,6 +1354,16 @@ pub struct InitializeTimelock<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitializeDecimals<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer declares the token decimal metadata; the
+    /// state machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct SkipMilestone<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
@@ -1463,6 +1504,7 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {
         },
         escrow_state::EscrowError::InvalidPenalty => error!(ErrorCode::InvalidPenalty),
         escrow_state::EscrowError::TimelockNotReached => error!(ErrorCode::TimelockNotReached),
+        escrow_state::EscrowError::InvalidDecimals => error!(ErrorCode::InvalidDecimals),
     }
 }
 
@@ -1506,4 +1548,6 @@ pub enum ErrorCode {
     InvalidPenalty,
     #[msg("Timelock not reached: release/claim/release_milestone called before unlock_at")]
     TimelockNotReached,
+    #[msg("Invalid token decimals: with_decimals decimals must be 0-18")]
+    InvalidDecimals,
 }

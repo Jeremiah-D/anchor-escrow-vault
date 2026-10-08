@@ -215,6 +215,21 @@ pub struct Escrow {
     /// `expires_at` either party can still walk the `cancel_expired` path,
     /// and a live dispute still settles via arbitration.
     timelock: u64,
+    /// AV-28: token decimal metadata — the SPL mint's decimal places.
+    /// `0` (the default) means no decimal metadata was declared: a
+    /// native-SOL escrow, or a vault created before this metadata
+    /// existed — amounts render as bare integers (backward compatible).
+    /// Set once via [`Escrow::with_decimals`] on an `Uninitialized`
+    /// escrow, like the other `with_*` builders. Persisted (1 byte in
+    /// the vault account) so the precision survives serialization.
+    /// Appended last so every earlier field offset stays stable.
+    ///
+    /// Design: the metadata never moves funds — it only feeds
+    /// [`Escrow::display_amount`] and the human-readable amounts in the
+    /// keeper report and the AV-26 snapshot export. SPL mints declare at
+    /// most 9 decimals; 18 is the hard ceiling
+    /// ([`EscrowError::InvalidDecimals`]).
+    decimals: u8,
 }
 
 /// Bit 0 of [`Escrow::activation`]: the initializer has recorded their
@@ -346,6 +361,13 @@ pub enum EscrowError {
     /// [`Escrow::resolve`] are deliberately *not* gated by the timelock,
     /// so a misconfigured lock can never trap funds forever.
     TimelockNotReached,
+    /// Token decimal metadata misconfiguration (AV-28):
+    /// [`Escrow::with_decimals`] with `decimals > 18` — beyond the
+    /// largest precision any SPL/EVM token convention needs. Parallels
+    /// [`EscrowError::InvalidQuorum`], [`EscrowError::InvalidVesting`],
+    /// [`EscrowError::InvalidArbiter`], [`EscrowError::InvalidMint`] and
+    /// [`EscrowError::InvalidProtocolFee`] (config error).
+    InvalidDecimals,
 }
 
 impl EscrowError {
@@ -377,6 +399,7 @@ impl EscrowError {
             EscrowError::RefundAddressMismatch => 116,
             EscrowError::InvalidPenalty => 117,
             EscrowError::TimelockNotReached => 118,
+            EscrowError::InvalidDecimals => 119,
         }
     }
 
@@ -402,6 +425,7 @@ impl EscrowError {
             EscrowError::RefundAddressMismatch,
             EscrowError::InvalidPenalty,
             EscrowError::TimelockNotReached,
+            EscrowError::InvalidDecimals,
         ]
     }
 }
@@ -770,6 +794,10 @@ impl Escrow {
             // (backward compatible). Opt in via `with_timelock` before
             // funding.
             timelock: 0,
+            // AV-28: no decimal metadata by default — amounts render as
+            // bare integers (backward compatible). Opt in via
+            // `with_decimals` before funding.
+            decimals: 0,
         })
     }
 
@@ -1727,6 +1755,51 @@ impl Escrow {
         now >= self.timelock
     }
 
+    /// Opt in to token decimal metadata (AV-28). Builder-style: only
+    /// valid on an `Uninitialized` escrow, so the precision is fixed
+    /// before any funds move — mirroring [`Escrow::with_timelock`] and
+    /// the other `with_*` builders. `decimals` is the SPL mint's decimal
+    /// places (SPL mints declare at most 9); anything above 18 is
+    /// [`EscrowError::InvalidDecimals`]. `decimals == 0` is a valid
+    /// no-op meaning "no decimal metadata" (the default — native-SOL
+    /// escrows keep rendering bare integers).
+    ///
+    /// The metadata never gates a transition and never moves funds: it
+    /// only feeds [`Escrow::display_amount`] and the human-readable
+    /// amounts in the keeper report (`keeper::KeeperReport::to_json`)
+    /// and the AV-26 snapshot export
+    /// (`snapshot::EscrowSnapshot::to_json`), so a payment operator
+    /// sees `1.000000` instead of `1000000` for a 6-decimal token.
+    pub fn with_decimals(mut self, decimals: u8) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if decimals > 18 {
+            return Err(EscrowError::InvalidDecimals);
+        }
+        self.decimals = decimals;
+        Ok(self)
+    }
+
+    /// The token decimal places configured via
+    /// [`Escrow::with_decimals`]; `0` when no decimal metadata is
+    /// configured (backward compatible — amounts render as bare
+    /// integers).
+    pub fn decimals(&self) -> u8 {
+        self.decimals
+    }
+
+    /// The locked [`Escrow::amount`] rendered in human units with this
+    /// escrow's configured decimals (AV-28): `amount = 1_000_000`,
+    /// `decimals = 6` → `"1.000000"`. Exact fixed-point rendering — the
+    /// raw amount is already the smallest unit, so no rounding ever
+    /// occurs; `decimals == 0` (the default) renders the bare integer.
+    /// See [`format_amount`] for the formatting rules.
+    pub fn display_amount(&self) -> String {
+        format_amount(self.amount, self.decimals)
+    }
+
     /// The whitelisted refund address configured via
     /// [`Escrow::with_refund_address`], or `None` when no whitelist is
     /// configured (refunds go to the initializer — backward compatible).
@@ -2212,6 +2285,41 @@ pub const QUORUM_POLICY_LEN: usize = 8 * PUBKEY_LEN + 1 + 1 + 8;
 /// and never needs a realloc.
 pub const MILESTONE_PLAN_LEN: usize = MAX_MILESTONES * 8 + 1;
 
+/// Render a raw token amount as a human-readable decimal string given
+/// the mint's decimal places (AV-28). The single formatting primitive
+/// behind [`Escrow::display_amount`], the keeper report's
+/// `display_amount` fields, and the AV-26 snapshot export.
+///
+/// Rules (exact fixed-point, no rounding ever):
+/// - `decimals == 0` renders the bare integer (`1000000` → `"1000000"`);
+/// - otherwise the fractional part is zero-padded to *exactly*
+///   `decimals` digits (`1_000_000` with 6 → `"1.000000"`, `5` with 9 →
+///   `"0.000000005"`). Trailing zeros are kept: the rendering is the
+///   exact value of the raw amount in whole units, and trimming them
+///   would suggest a precision the mint does not promise;
+/// - the integer part is never empty (`0` with 6 → `"0.000000"`,
+///   never `".000000"`).
+///
+/// Total on all inputs: the string is built from the amount's decimal
+/// digits, so no power-of-ten arithmetic can overflow (any `u8`
+/// `decimals` renders, far beyond the 18 the
+/// [`Escrow::with_decimals`] builder accepts).
+pub fn format_amount(amount: u64, decimals: u8) -> String {
+    let digits = amount.to_string();
+    let d = decimals as usize;
+    if d == 0 {
+        return digits;
+    }
+    if digits.len() > d {
+        let (int, frac) = digits.split_at(digits.len() - d);
+        format!("{int}.{frac}")
+    } else {
+        // The amount is smaller than one whole unit: left-pad the
+        // fraction with zeros after the point.
+        format!("0.{digits:0>d$}")
+    }
+}
+
 /// (field name, Anchor type, serialized length in bytes) for the `Vault`
 /// account, in Borsh field order. This table is the single source of truth
 /// for account sizing: `ESCROW_BODY_LEN` is derived from it by `const`
@@ -2309,6 +2417,11 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // one u64, always present (zeroed when no timelock is configured).
     // Appended last so every earlier field offset stays stable.
     ("timelock", "u64", 8),
+    // AV-28: token decimal metadata (see `Escrow::with_decimals`): one
+    // u8, always present (zeroed when no decimal metadata is
+    // configured). Appended last so every earlier field offset stays
+    // stable.
+    ("decimals", "u8", 1),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -2355,9 +2468,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// rate (AV-24) is always present too: 2-byte `penalty_bps` (zeroed when
 /// no penalty is configured). The timelock unlock timestamp (AV-27) is
 /// always present too: 8-byte `timelock` (zeroed when no timelock is
+/// configured). The token decimal metadata (AV-28) is always present
+/// too: 1-byte `decimals` (zeroed when no decimal metadata is
 /// configured).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -3981,6 +4096,26 @@ mod anchor_idl_tests {
                             gated, so a misconfigured lock can never trap \\
                             funds forever",
         },
+        InstructionSpec {
+            // AV-28: token decimal metadata.
+            name: "initialize_decimals",
+            params: &[(
+                "decimals",
+                "u8",
+                "instruction param; the SPL mint's decimal places (SPL mints declare at most 9); 0 = no decimal metadata",
+            )],
+            method: "Escrow::with_decimals",
+            input_mapping: "decimals <- param; authority <- \\
+                            accounts.initializer (signer), enforced by the \\
+                            Anchor account constraint, not the state \\
+                            machine; Uninitialized only, like \\
+                            initialize_quorum; decimals > 18 is \\
+                            InvalidDecimals; the metadata never gates a \\
+                            transition and never moves funds — it only \\
+                            feeds Escrow::display_amount and the \\
+                            human-readable amounts in the keeper report \\
+                            and the AV-26 snapshot export",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -4032,6 +4167,7 @@ mod anchor_idl_tests {
             "Escrow::with_refund_address",
             "Escrow::with_penalty_bps",
             "Escrow::with_timelock",
+            "Escrow::with_decimals",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -4055,7 +4191,7 @@ mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_eighteen_instructions_take_params() {
+    fn only_nineteen_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -4083,7 +4219,8 @@ mod anchor_idl_tests {
                 &"initialize_grace_period",
                 &"initialize_refund_address",
                 &"initialize_penalty",
-                &"initialize_timelock"
+                &"initialize_timelock",
+                &"initialize_decimals"
             ]
         );
     }
@@ -4309,6 +4446,53 @@ mod anchor_idl_tests {
             .unwrap();
         assert_eq!(e.unlock_at(), 0);
         assert!(e.is_unlock_eligible(0));
+    }
+
+    #[test]
+    fn initialize_decimals_maps_param_to_decimals_field() {
+        // IDL: initialize_decimals(decimals: u8). The program takes
+        // the param, then Escrow::with_decimals; authority <-
+        // accounts.initializer, enforced by the Anchor account
+        // constraint, not the state machine (Uninitialized only, like
+        // initialize_quorum).
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_decimals(6)
+            .unwrap();
+        assert_eq!(e.decimals(), 6);
+        assert_eq!(e.display_amount(), "1.000000");
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        // Documented failure mode: beyond the 18-decimal ceiling.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_decimals(19),
+            Err(EscrowError::InvalidDecimals)
+        );
+        // The metadata never gates a transition: a 6-decimal escrow
+        // releases exactly like a plain one.
+        let mut funded = e;
+        funded.fund(ALICE).unwrap();
+        funded.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
+        assert_eq!(funded.state(), EscrowState::Released);
+        // Re-configuring a live escrow is rejected by state.
+        let mut funded = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_decimals(6)
+            .unwrap();
+        funded.fund(ALICE).unwrap();
+        assert_eq!(
+            funded.with_decimals(9),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(funded.decimals(), 6);
+        // decimals == 0 is the valid no-op: bare-integer rendering.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_decimals(0)
+            .unwrap();
+        assert_eq!(e.decimals(), 0);
+        assert_eq!(e.display_amount(), "1000000");
     }
 
     #[test]
@@ -4854,6 +5038,9 @@ mod anchor_idl_tests {
         // AV-27: the unlock timestamp param populates `timelock`
         // directly (u64 — 0 is the valid "no lock" default).
         ("initialize_timelock", "unlock_at", "timelock"),
+        // AV-28: the decimal-places param populates `decimals` directly
+        // (u8 — 0 is the valid "no decimal metadata" default).
+        ("initialize_decimals", "decimals", "decimals"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -5112,6 +5299,11 @@ mod error_code_tests {
             EscrowError::TimelockNotReached,
             118,
             "release/claim/release_milestone while now < unlock_at (AV-27 timelock); cancel/cancel_expired/resolve are never gated",
+        ),
+        (
+            EscrowError::InvalidDecimals,
+            119,
+            "with_decimals with decimals > 18 (not a valid token precision)",
         ),
     ];
 
@@ -6207,6 +6399,10 @@ mod account_space_tests {
         // no timelock is configured); appended last so every earlier
         // offset above is unchanged.
         out.extend_from_slice(&e.timelock.to_le_bytes());
+        // AV-28: token decimal metadata, always present (zeroed when no
+        // decimal metadata is configured); appended last so every
+        // earlier offset above is unchanged.
+        out.push(e.decimals);
         out
     }
 
@@ -6226,10 +6422,11 @@ mod account_space_tests {
         // + 2 (AV-17 protocol fee rate) + 8 (AV-17 cumulative fee counter)
         // + 8 (AV-21 expiry grace period) + (1 + 32) (AV-22 dispute
         // evidence hash) + (1 + 32) (AV-23 refund address whitelist)
-        // + 2 (AV-24 anti-griefing penalty rate) + 8 (AV-27 timelock).
-        assert_eq!(ESCROW_BODY_LEN, 616, "escrow payload bytes");
+        // + 2 (AV-24 anti-griefing penalty rate) + 8 (AV-27 timelock)
+        // + 1 (AV-28 token decimal metadata).
+        assert_eq!(ESCROW_BODY_LEN, 617, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 624, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 625, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -6245,13 +6442,15 @@ mod account_space_tests {
         // refund address whitelist (AV-23, zeroed when no whitelist
         // configured) + 2-byte anti-griefing penalty rate (AV-24, zeroed
         // when no penalty configured) + 8-byte timelock unlock timestamp
-        // (AV-27, zeroed when no timelock configured).
+        // (AV-27, zeroed when no timelock configured) + 1-byte token
+        // decimal metadata (AV-28, zeroed when no decimal metadata is
+        // configured).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 213);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 214);
     }
 
     #[test]
@@ -6384,6 +6583,11 @@ mod account_space_tests {
             0,
             "timelock: zeroed"
         );
+        // AV-28: token decimal metadata u8, zeroed for a plain escrow
+        // (no decimal metadata declared); appended last, so every
+        // earlier offset above is unchanged.
+        assert_eq!(bytes[616], 0, "decimals: zeroed");
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN, "tail byte is the last byte");
 
         // With quorum: same total length (space is always reserved), Some
         // discriminant, attestor bytes and approval bitmask in place.
@@ -6597,16 +6801,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 624) * 3480 * 2 = 752 * 6960 = 5_233_920 lamports.
-        assert_eq!(full, 5_233_920);
+        // (128 + 625) * 3480 * 2 = 753 * 6960 = 5_240_880 lamports.
+        assert_eq!(full, 5_240_880);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 213) * 3480 * 2 = 341 * 6960 = 2_373_360 lamports.
-        assert_eq!(no_quorum, 2_373_360);
+        // (128 + 214) * 3480 * 2 = 342 * 6960 = 2_380_320 lamports.
+        assert_eq!(no_quorum, 2_380_320);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -6649,13 +6853,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(5_233_920, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(5_240_880, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(4_704_959, params.0, params.1),
+            check_vault_rent_exempt(5_240_879, params.0, params.1),
             Err(RentShortfall {
-                required: 5_233_920,
-                provided: 4_704_959,
+                required: 5_240_880,
+                provided: 5_240_879,
             })
         );
         // Generous funding: exempt.
@@ -6667,7 +6871,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 5_233_920,
+                required: 5_240_880,
                 provided: 0,
             })
         );
@@ -9542,6 +9746,191 @@ mod timelock_tests {
             UNLOCK_AT,
             "timelock tail offset"
         );
+    }
+}
+
+// ---------- AV-28: token decimal metadata ----------
+//
+// The SPL mint's decimal places, declared once before funding via
+// `with_decimals`. The metadata never gates a transition and never
+// moves funds: it only renders human-readable amounts (a payment
+// operator reads `1.000000`, not `1000000`, for a 6-decimal token) in
+// `Escrow::display_amount`, the keeper report, and the AV-26 snapshot
+// export. Persisted as one trailing byte in the vault account.
+#[cfg(test)]
+mod decimals_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn initialized() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap()
+    }
+
+    #[test]
+    fn error_code_is_119_and_stable() {
+        assert_eq!(EscrowError::InvalidDecimals.code(), 119);
+    }
+
+    #[test]
+    fn with_decimals_is_uninitialized_only() {
+        let mut e = initialized().with_decimals(6).unwrap();
+        assert_eq!(e.decimals(), 6);
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.with_decimals(9),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.decimals(), 6, "rejected reconfig changes nothing");
+    }
+
+    #[test]
+    fn decimals_above_18_are_rejected() {
+        // The ceiling is 18: the largest precision any SPL/EVM token
+        // convention needs (SPL mints declare at most 9).
+        for bad in [19u8, 20, 100, u8::MAX] {
+            assert_eq!(
+                initialized().with_decimals(bad),
+                Err(EscrowError::InvalidDecimals),
+                "decimals={bad} must be rejected"
+            );
+        }
+        // The boundary itself is valid.
+        assert_eq!(initialized().with_decimals(18).unwrap().decimals(), 18);
+        // And 0 is the valid no-op (no decimal metadata).
+        assert_eq!(initialized().with_decimals(0).unwrap().decimals(), 0);
+    }
+
+    #[test]
+    fn builder_order_is_independent() {
+        // `with_decimals` composes with every other opt-in builder in
+        // any order — the metadata is orthogonal to the other config.
+        let a = initialized()
+            .with_decimals(6)
+            .unwrap()
+            .with_timelock(1_900_000_000)
+            .unwrap()
+            .with_penalty_bps(500)
+            .unwrap();
+        let b = initialized()
+            .with_penalty_bps(500)
+            .unwrap()
+            .with_timelock(1_900_000_000)
+            .unwrap()
+            .with_decimals(6)
+            .unwrap();
+        assert_eq!(a.decimals(), b.decimals());
+        assert_eq!(a.unlock_at(), b.unlock_at());
+        assert_eq!(a.penalty_bps(), b.penalty_bps());
+        assert_eq!(a.display_amount(), "1.000000");
+        assert_eq!(b.display_amount(), "1.000000");
+    }
+
+    #[test]
+    fn format_amount_vectors() {
+        // Zero decimals: bare integer, no decimal point.
+        assert_eq!(format_amount(0, 0), "0");
+        assert_eq!(format_amount(1_000_000, 0), "1000000");
+        assert_eq!(format_amount(u64::MAX, 0), "18446744073709551615");
+        // The spec example: full zero-padding, no trimming.
+        assert_eq!(format_amount(1_000_000, 6), "1.000000");
+        // Sub-unit amounts: the integer part is never empty.
+        assert_eq!(format_amount(0, 6), "0.000000");
+        assert_eq!(format_amount(5, 9), "0.000000005");
+        assert_eq!(format_amount(1, 18), "0.000000000000000001");
+        // Common token precisions.
+        assert_eq!(format_amount(1_000_000_000, 9), "1.000000000");
+        assert_eq!(format_amount(1_500_000, 6), "1.500000");
+        assert_eq!(format_amount(123_456_789, 6), "123.456789");
+        // u64::MAX at the 18-decimal ceiling: exact, no rounding.
+        assert_eq!(
+            format_amount(u64::MAX, 18),
+            "18.446744073709551615"
+        );
+        // Exactly one whole unit at high precision.
+        assert_eq!(format_amount(10u64.pow(18), 18), "1.000000000000000000");
+    }
+
+    #[test]
+    fn display_amount_uses_the_escrows_decimals() {
+        let e = initialized().with_decimals(6).unwrap();
+        assert_eq!(e.display_amount(), "1.000000");
+        // No metadata: the default renders the bare integer.
+        assert_eq!(initialized().display_amount(), "1000000");
+    }
+
+    #[test]
+    fn decimals_metadata_never_moves_funds() {
+        // A decimal-declared escrow behaves exactly like a plain one:
+        // the metadata is display-only.
+        let mut e = initialized().with_decimals(6).unwrap();
+        e.fund(ALICE).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.display_amount(), "1.000000");
+    }
+
+    #[test]
+    fn decimals_persists_in_serialized_layout_tail() {
+        let e = initialized().with_decimals(9).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(ESCROW_BODY_LEN, 617, "one byte appended by AV-28");
+        assert_eq!(bytes[616], 9, "decimals tail offset");
+        // The timelock offset is unchanged by the append.
+        assert_eq!(
+            u64::from_le_bytes(bytes[608..616].try_into().unwrap()),
+            0,
+            "timelock offset stable"
+        );
+        // A funded escrow without the metadata keeps the zeroed byte.
+        let mut plain = initialized();
+        plain.fund(ALICE).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&plain);
+        assert_eq!(bytes[616], 0, "decimals zeroed without the builder");
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+    }
+
+    #[test]
+    fn rent_accounts_for_the_extra_byte() {
+        // (128 + 625) * 3480 * 2 = 753 * 6960 = 5_240_880 lamports.
+        assert_eq!(
+            rent_exempt_minimum_lamports(
+                VAULT_SPACE,
+                MAINNET_LAMPORTS_PER_BYTE_YEAR,
+                MAINNET_EXEMPTION_THRESHOLD_YEARS
+            ),
+            5_240_880
+        );
+        // (128 + 214) * 3480 * 2 = 342 * 6960 = 2_380_320 lamports.
+        assert_eq!(
+            rent_exempt_minimum_lamports(
+                VAULT_SPACE_NO_QUORUM,
+                MAINNET_LAMPORTS_PER_BYTE_YEAR,
+                MAINNET_EXEMPTION_THRESHOLD_YEARS
+            ),
+            2_380_320
+        );
+        // Exactly one byte's rent above the AV-27 numbers.
+        assert_eq!(VAULT_SPACE, 625);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 214);
+        assert!(check_vault_rent_exempt(5_240_880, 3_480, 2.0).is_ok());
+        assert!(check_vault_rent_exempt(5_240_879, 3_480, 2.0).is_err());
+    }
+
+    #[test]
+    fn unauthorized_caller_learns_nothing_about_decimals() {
+        // `with_decimals` is a builder (no authority check — the
+        // program's account constraint owns that), but once funded the
+        // metadata is readable and immutable: no transition reports it.
+        let mut e = initialized().with_decimals(6).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.release(MALLORY, 1_750_000_000, 1, None), Err(EscrowError::Unauthorized));
+        assert_eq!(e.decimals(), 6, "failed call changes nothing");
     }
 }
 

@@ -83,6 +83,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `fund(authority)`                           | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer            |
 | `release(authority, now, amount)`                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise); cumulative releases ≤ locked amount |
 | `initialize_timelock(unlock_at)`            | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `unlock_at` is the Unix timestamp before which no taker payout may leave; `0` = no lock) |
+| `initialize_decimals(decimals)`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `decimals` is the SPL mint's decimal places — SPL mints declare at most 9, `> 18` is rejected; `0` = no decimal metadata; display-only, never gates a transition or moves funds) |
 | `cancel(authority, refund_to)`               | `Funded`       | `Cancelled` | initializer; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise |
 | `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); the refund still goes to the whitelisted address even when the taker calls; returns `(refund, penalty)` — a taker-initiated cancel with `penalty_bps > 0` slices an anti-griefing penalty for the initializer (see below) |
 
@@ -145,6 +146,16 @@ a misconfigured or abandoned timelock can never trap funds forever — after
 dispute still settles via arbitration. The keeper report lists a `claim`
 action only once the timelock is unlocked, and the state snapshot exposes
 `unlock_at` / `unlock_eligible` for indexers.
+
+**Token decimals.** An escrow can declare its SPL mint's decimal places
+(`with_decimals(decimals)`, once, before funding; SPL mints declare at most
+9, and `decimals > 18` is rejected as `InvalidDecimals`, code 119 —
+`decimals == 0` means no metadata, the default). The metadata never gates a
+transition and never moves funds: it only renders human-readable amounts —
+`Escrow::display_amount()` (`1_000_000` raw units at 6 decimals →
+`"1.000000"`), the keeper report's per-action `display_amount`, and the
+state snapshot's `decimals` / `display_*` fields. Raw fields stay untouched,
+so indexers keep diffing numbers while payment operators read whole tokens.
 
 **Partial release (staged payouts).** `release(authority, now, amount)` releases
 in tranches: each call adds to a cumulative `released` counter and leaves
@@ -372,6 +383,7 @@ program error per variant):
 | `RefundAddressMismatch` | 116 | `cancel`/`cancel_expired` with a refund destination ≠ the whitelisted address (or ≠ the initializer with no whitelist), or `with_refund_address` with the zero address |
 | `InvalidPenalty` | 117 | `with_penalty_bps` with `penalty_bps` > 10_000 (not a valid basis-point rate) |
 | `TimelockNotReached` | 118 | `release`/`claim`/`release_milestone` while `now < unlock_at` (AV-27 timelock); `cancel`/`cancel_expired`/`resolve` are never gated |
+| `InvalidDecimals` | 119 | `with_decimals` with `decimals` > 18 (not a valid token precision) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -689,12 +701,16 @@ build the `cancel_expired` / `claim` instruction directly. The scan is a pure re
 over `&Escrow` snapshots: dry-run by construction, zero side effects,
 deterministic output in input order. `KeeperReport::to_json()` emits
 hand-serialized JSON (the crate stays dependency-free; keys are 64-char
-lowercase hex).
+lowercase hex). Every action also carries `decimals` (the escrow's token
+decimal metadata, `0` when none is declared) and `display_amount` — the
+same `amount` rendered in human units (`500000` at 6 decimals →
+`"0.500000"`); the instruction itself always moves the raw `amount`.
 
 ```json
 {"at":1750000000,"scanned":1,"actions":[
   {"escrow_id":"...","action":"claim","caller":"...","caller_role":"taker",
-   "mint":null,"refund_to":null,"amount":500000,"reason":"vesting_unlocked"}
+   "mint":null,"refund_to":null,"amount":500000,"decimals":6,
+   "display_amount":"0.500000","reason":"vesting_unlocked"}
 ]}
 ```
 
@@ -711,7 +727,8 @@ them directly. The snapshot is a pure read: no state changes, no events.
 
 Raw fields: `initializer`, `taker`, `state` (`uninitialized` / `activated` /
 `funded` / `released` / `cancelled` / `disputed` / `settled`), `amount`,
-`released`, `expires_at`, `grace_period`, `dual_sig`
+`decimals` (AV-28; `0` = no decimal metadata declared), `released`,
+`expires_at`, `grace_period`, `dual_sig`
 (`required` / `initializer_activated` / `taker_activated`), `fee_bps`,
 `fees_paid`, `skipped`, `penalty_bps`, `unlock_at` (AV-27; `0` = no
 timelock), plus the optional `quorum`,
@@ -730,14 +747,26 @@ grace included — the same predicate the keeper scan uses, so a snapshot
 never disagrees with the scan), and `unlock_eligible` (the AV-27 timelock
 gate at `at` — the same predicate the keeper scan uses for `claim`).
 
+Human-readable companions (AV-28): alongside every raw amount the
+snapshot renders a `display_*` string in whole-token units —
+`display_amount`, `display_released`, `display_remaining`,
+`display_vested`, `display_claimable`, `display_fees_paid`,
+`display_skipped`, and per-tranche `display_amount` — formatted with the
+escrow's `decimals` (`1000000` at 6 decimals → `"1.000000"`; `0` decimals
+renders the bare integer). Raw fields stay untouched, so indexers keep
+diffing numbers while operators read whole tokens.
+
 ```json
 {"at":1750000000,"initializer":"...","taker":"...","state":"funded",
- "amount":1000000,"released":0,"remaining":1000000,
+ "amount":1000000,"decimals":6,"display_amount":"1.000000",
+ "released":0,"display_released":"0.000000",
+ "remaining":1000000,"display_remaining":"1.000000",
  "expires_at":0,"grace_period":0,"expiry_eligible":true,
  "dual_sig":{"required":false,"initializer_activated":false,"taker_activated":false},
- "quorum":null,"vesting":null,"vested":0,"claimable":0,
- "arbiter":null,"mint":null,"fee_bps":0,"fees_paid":0,
- "milestones":null,"skipped":0,
+ "quorum":null,"vesting":null,"vested":0,"display_vested":"0.000000",
+ "claimable":0,"display_claimable":"0.000000",
+ "arbiter":null,"mint":null,"fee_bps":0,"fees_paid":0,"display_fees_paid":"0.000000",
+ "milestones":null,"skipped":0,"display_skipped":"0.000000",
  "evidence_hash":null,"refund_to":null,"refund_recipient":"...",
  "penalty_bps":0,"unlock_at":0,"unlock_eligible":true}
 ```
@@ -773,7 +802,8 @@ two-way consistency check against the IDL parameter table:
 | refund_to     | Option<Pubkey>    | 33    |
 | penalty_bps   | u16               | 2     |
 | timelock      | u64               | 8     |
-| **total**     |                   | **624** |
+| decimals      | u8                | 1     |
+| **total**     |                   | **625** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -800,11 +830,13 @@ is attached) — and the 33-byte refund whitelist region (AV-23: 1-byte
 discriminant + 32-byte address, zeroed when no whitelist is configured)
 — and the 2-byte anti-griefing penalty rate `penalty_bps` (AV-24, zeroed
 when no penalty is configured) — and the 8-byte timelock unlock timestamp
-`timelock` (AV-27, zeroed when no timelock is configured).
-`escrow-state` exposes `VAULT_SPACE` (624) and
-`VAULT_SPACE_NO_QUORUM` (213) for the Anchor `space =` constraint, plus a
+`timelock` (AV-27, zeroed when no timelock is configured) — and the 1-byte
+token decimal metadata `decimals` (AV-28, zeroed when no decimal metadata
+is declared).
+`escrow-state` exposes `VAULT_SPACE` (625) and
+`VAULT_SPACE_NO_QUORUM` (214) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **5,233,920 lamports** to be
+mainnet rent parameters the full vault needs **5,240,880 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ## Run the tests

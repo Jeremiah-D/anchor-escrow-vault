@@ -21,7 +21,12 @@
 //!   keeper scan uses, so a snapshot never disagrees with the scan);
 //! - `unlock_at` / `unlock_eligible`: the timelock (AV-27) and whether the
 //!   payout gates pass at the snapshot time — the same predicate the
-//!   keeper scan uses for `claim` actions.
+//!   keeper scan uses for `claim` actions;
+//! - `decimals` / `display_*`: the token decimal metadata (AV-28) and
+//!   every shown amount rendered in human units (`amount`, `released`,
+//!   `remaining`, `vested`, `claimable`, `fees_paid`, `skipped`, and
+//!   per-tranche amounts) — the raw fields stay untouched, so indexers
+//!   keep diffing numbers while operators read whole tokens.
 //!
 //! Like [`crate::KeeperReport::to_json`], [`EscrowSnapshot::to_json`]
 //! hand-serializes (the crate is dependency-free): deterministic field
@@ -32,7 +37,7 @@
 //! The snapshot is a pure read: it borrows the escrow, emits no events,
 //! and advances no state — a dry run by construction.
 
-use crate::{Escrow, EscrowState};
+use crate::{format_amount, Escrow, EscrowState};
 
 /// Render 32 bytes as 64 lowercase hex characters (same convention as
 /// [`crate::keeper`]'s serializer).
@@ -141,6 +146,10 @@ pub struct EscrowSnapshot {
     pub state: &'static str,
     /// Total amount ever locked.
     pub amount: u64,
+    /// Token decimal metadata (AV-28): the SPL mint's decimal places,
+    /// `0` when none is declared. Feeds the `display_*` renderings in
+    /// [`EscrowSnapshot::to_json`]; the raw amount fields are untouched.
+    pub decimals: u8,
     /// Cumulative amount released to the taker so far.
     pub released: u64,
     /// Amount still locked: `amount - released`. This is what `cancel` /
@@ -245,6 +254,7 @@ impl Escrow {
             taker: self.taker(),
             state: state_name(self.state()),
             amount: self.amount(),
+            decimals: self.decimals(),
             released: self.released_amount(),
             remaining: self.remaining_amount(),
             expires_at: self.expires_at(),
@@ -313,11 +323,23 @@ impl EscrowSnapshot {
         s.push_str(self.state);
         s.push_str("\",\"amount\":");
         s.push_str(&self.amount.to_string());
-        s.push_str(",\"released\":");
+        // AV-28: token decimal metadata and the human-readable amount
+        // renderings. The raw fields are untouched — operators and
+        // indexers read the `display_*` companions; the chain moves the
+        // raw values.
+        s.push_str(",\"decimals\":");
+        s.push_str(&self.decimals.to_string());
+        s.push_str(",\"display_amount\":\"");
+        s.push_str(&format_amount(self.amount, self.decimals));
+        s.push_str("\",\"released\":");
         s.push_str(&self.released.to_string());
-        s.push_str(",\"remaining\":");
+        s.push_str(",\"display_released\":\"");
+        s.push_str(&format_amount(self.released, self.decimals));
+        s.push_str("\",\"remaining\":");
         s.push_str(&self.remaining.to_string());
-        s.push_str(",\"expires_at\":");
+        s.push_str(",\"display_remaining\":\"");
+        s.push_str(&format_amount(self.remaining, self.decimals));
+        s.push_str("\",\"expires_at\":");
         s.push_str(&self.expires_at.to_string());
         s.push_str(",\"grace_period\":");
         s.push_str(&self.grace_period.to_string());
@@ -369,9 +391,13 @@ impl EscrowSnapshot {
         }
         s.push_str(",\"vested\":");
         s.push_str(&self.vested.to_string());
-        s.push_str(",\"claimable\":");
+        s.push_str(",\"display_vested\":\"");
+        s.push_str(&format_amount(self.vested, self.decimals));
+        s.push_str("\",\"claimable\":");
         s.push_str(&self.claimable.to_string());
-        s.push_str(",\"arbiter\":");
+        s.push_str(",\"display_claimable\":\"");
+        s.push_str(&format_amount(self.claimable, self.decimals));
+        s.push_str("\",\"arbiter\":");
         write_opt_hex(&mut s, self.arbiter);
         s.push_str(",\"mint\":");
         write_opt_hex(&mut s, self.mint);
@@ -379,8 +405,10 @@ impl EscrowSnapshot {
         s.push_str(&self.fee_bps.to_string());
         s.push_str(",\"fees_paid\":");
         s.push_str(&self.fees_paid.to_string());
+        s.push_str(",\"display_fees_paid\":\"");
+        s.push_str(&format_amount(self.fees_paid, self.decimals));
         // AV-15: milestone plan progress.
-        s.push_str(",\"milestones\":");
+        s.push_str("\",\"milestones\":");
         match &self.milestones {
             Some(m) => {
                 s.push_str("{\"count\":");
@@ -405,7 +433,10 @@ impl EscrowSnapshot {
                     s.push_str(&t.index.to_string());
                     s.push_str(",\"amount\":");
                     s.push_str(&t.amount.to_string());
-                    s.push_str(",\"confirmed\":");
+                    // AV-28: the tranche amount in human units.
+                    s.push_str(",\"display_amount\":\"");
+                    s.push_str(&format_amount(t.amount, self.decimals));
+                    s.push_str("\",\"confirmed\":");
                     s.push_str(if t.confirmed { "true" } else { "false" });
                     s.push_str(",\"settled\":");
                     s.push_str(if t.settled { "true" } else { "false" });
@@ -417,7 +448,9 @@ impl EscrowSnapshot {
         }
         s.push_str(",\"skipped\":");
         s.push_str(&self.skipped.to_string());
-        s.push_str(",\"evidence_hash\":");
+        s.push_str(",\"display_skipped\":\"");
+        s.push_str(&format_amount(self.skipped, self.decimals));
+        s.push_str("\",\"evidence_hash\":");
         write_opt_hex(&mut s, self.evidence_hash);
         s.push_str(",\"refund_to\":");
         write_opt_hex(&mut s, self.refund_to);
@@ -471,15 +504,17 @@ mod snapshot_tests {
              \"at\":1750000000,\
              \"initializer\":\"{init}\",\"taker\":\"{taker}\",\
              \"state\":\"funded\",\
-             \"amount\":1000000,\"released\":0,\"remaining\":1000000,\
+             \"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\
+             \"released\":0,\"display_released\":\"0\",\
+             \"remaining\":1000000,\"display_remaining\":\"1000000\",\
              \"expires_at\":0,\"grace_period\":0,\"expiry_eligible\":true,\
              \"dual_sig\":{{\"required\":false,\"initializer_activated\":false,\"taker_activated\":false}},\
              \"quorum\":null,\
-             \"vesting\":null,\"vested\":0,\"claimable\":0,\
+             \"vesting\":null,\"vested\":0,\"display_vested\":\"0\",\"claimable\":0,\"display_claimable\":\"0\",\
              \"arbiter\":null,\"mint\":null,\
-             \"fee_bps\":0,\"fees_paid\":0,\
+             \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\
              \"milestones\":null,\
-             \"skipped\":0,\
+             \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
              \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true\
              }}",
@@ -526,7 +561,7 @@ mod snapshot_tests {
             json.contains("\"vesting\":{\"start\":1700000000,\"end\":1800000000}"),
             "vesting window must serialize, got: {json}"
         );
-        assert!(json.contains("\"vested\":1000000,\"claimable\":1000000"));
+        assert!(json.contains("\"vested\":1000000,\"display_vested\":\"1000000\",\"claimable\":1000000,\"display_claimable\":\"1000000\""));
     }
 
     #[test]
@@ -610,7 +645,7 @@ mod snapshot_tests {
         assert_eq!(snap.remaining, 600_000);
         let json = snap.to_json();
         assert!(
-            json.contains("\"milestones\":{\"count\":2,\"total\":1000000,\"settled\":1,\"confirmed\":1,\"next\":1,\"tranches\":[{\"index\":0,\"amount\":400000,\"confirmed\":true,\"settled\":true},{\"index\":1,\"amount\":600000,\"confirmed\":false,\"settled\":false}]}"),
+            json.contains("\"milestones\":{\"count\":2,\"total\":1000000,\"settled\":1,\"confirmed\":1,\"next\":1,\"tranches\":[{\"index\":0,\"amount\":400000,\"display_amount\":\"400000\",\"confirmed\":true,\"settled\":true},{\"index\":1,\"amount\":600000,\"display_amount\":\"600000\",\"confirmed\":false,\"settled\":false}]}"),
             "milestone progress must serialize, got: {json}"
         );
     }
@@ -721,5 +756,100 @@ mod snapshot_tests {
         assert_eq!(snap.state, "uninitialized");
         assert_eq!(snap.remaining, AMOUNT);
         assert!(!snap.expiry_eligible);
+    }
+
+    #[test]
+    fn decimals_metadata_flows_into_the_snapshot() {
+        // AV-28: a 6-decimal escrow's snapshot carries the metadata and
+        // renders every shown amount in human units; the raw fields are
+        // untouched for indexers.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_decimals(6)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.release(ALICE, MID, 250_000, None).unwrap();
+        let snap = e.snapshot(MID);
+        assert_eq!(snap.decimals, 6);
+        assert_eq!(snap.amount, AMOUNT);
+        assert_eq!(snap.released, 250_000);
+        assert_eq!(snap.remaining, 750_000);
+        let json = snap.to_json();
+        assert!(
+            json.contains("\"decimals\":6,\"display_amount\":\"1.000000\""),
+            "locked amount must render in human units, got: {json}"
+        );
+        assert!(
+            json.contains("\"released\":250000,\"display_released\":\"0.250000\""),
+            "released must render in human units, got: {json}"
+        );
+        assert!(
+            json.contains("\"remaining\":750000,\"display_remaining\":\"0.750000\""),
+            "remaining must render in human units, got: {json}"
+        );
+    }
+
+    #[test]
+    fn vesting_and_fee_amounts_render_with_decimals() {
+        // AV-28: derived amounts (vested / claimable / fees_paid) use the
+        // same rendering — one primitive, one rule.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
+            .unwrap()
+            .with_decimals(6)
+            .unwrap()
+            .with_protocol_fee(100)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let snap = e.snapshot(MID);
+        assert_eq!(snap.vested, 500_000);
+        assert_eq!(snap.claimable, 500_000);
+        let json = snap.to_json();
+        assert!(json.contains("\"vested\":500000,\"display_vested\":\"0.500000\""), "got: {json}");
+        assert!(
+            json.contains("\"claimable\":500000,\"display_claimable\":\"0.500000\""),
+            "got: {json}"
+        );
+        // A 1% fee'd claim: fees_paid renders too.
+        e.claim(BOB, MID, None).unwrap();
+        let json = e.snapshot(MID).to_json();
+        assert!(
+            json.contains("\"fees_paid\":5000,\"display_fees_paid\":\"0.005000\""),
+            "fee rendering must follow the metadata, got: {json}"
+        );
+    }
+
+    #[test]
+    fn milestone_tranche_amounts_render_with_decimals() {
+        // AV-28: per-tranche amounts in the milestone plan render in
+        // human units as well.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap()
+            .with_decimals(6)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let json = e.snapshot(MID).to_json();
+        assert!(
+            json.contains("\"amount\":400000,\"display_amount\":\"0.400000\""),
+            "tranche 0 must render in human units, got: {json}"
+        );
+        assert!(
+            json.contains("\"amount\":600000,\"display_amount\":\"0.600000\""),
+            "tranche 1 must render in human units, got: {json}"
+        );
+    }
+
+    #[test]
+    fn snapshot_without_decimals_renders_bare_integers() {
+        // Backward compatible: no metadata declared — every display
+        // field is the bare integer, no decimal point.
+        let snap = funded(AMOUNT, 0).snapshot(MID);
+        assert_eq!(snap.decimals, 0);
+        let json = snap.to_json();
+        assert!(json.contains("\"display_amount\":\"1000000\""), "got: {json}");
+        assert!(!json.contains("\"display_amount\":\"1."), "no decimal point without metadata");
     }
 }

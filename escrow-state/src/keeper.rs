@@ -49,7 +49,7 @@
 //! hex, `mint` as a hex string or `null`. Actions keep the input order so
 //! a keeper feeding a stable watch list gets a stable call list.
 
-use crate::{Escrow, EscrowState};
+use crate::{format_amount, Escrow, EscrowState};
 
 /// Render 32 bytes as 64 lowercase hex characters.
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -120,6 +120,11 @@ pub struct KeeperAction {
     /// amount (the protocol fee slices it; `payout + fee == amount`).
     /// Always `> 0` — zero-value actions are never listed.
     pub amount: u64,
+    /// The escrow's token decimal metadata (AV-28): the SPL mint's
+    /// decimal places, `0` when none is declared. Feeds the report's
+    /// `display_amount` rendering only — the instruction itself always
+    /// moves the raw `amount`.
+    pub decimals: u8,
     /// Machine-readable reason: `"expired"` or `"vesting_unlocked"`.
     pub reason: &'static str,
 }
@@ -149,10 +154,17 @@ impl KeeperReport {
     /// {"at":1000000,"scanned":1,"actions":[
     ///   {"escrow_id":"...","action":"cancel_expired","caller":"...",
     ///    "caller_role":"initializer","mint":null,
-    ///    "refund_to":"...","amount":1000000,
+    ///    "refund_to":"...","amount":1000000,"decimals":6,
+    ///    "display_amount":"1.000000",
     ///    "reason":"expired"}
     /// ]}
     /// ```
+    ///
+    /// AV-28: every action also carries `decimals` (the escrow's token
+    /// decimal metadata, `0` when none is declared) and `display_amount`
+    /// — the same `amount` rendered in human units via
+    /// [`crate::format_amount`]. The instruction itself always moves the
+    /// raw `amount`; the display field is for operators and logs only.
     pub fn to_json(&self) -> String {
         let mut s = String::with_capacity(128 + self.actions.len() * 360);
         s.push_str("{\"at\":");
@@ -194,7 +206,14 @@ impl KeeperReport {
             }
             s.push_str(",\"amount\":");
             s.push_str(&a.amount.to_string());
-            s.push_str(",\"reason\":\"");
+            // AV-28: human-readable amount alongside the raw value (the
+            // instruction moves `amount`; `display_amount` is for
+            // operators and logs only).
+            s.push_str(",\"decimals\":");
+            s.push_str(&a.decimals.to_string());
+            s.push_str(",\"display_amount\":\"");
+            s.push_str(&format_amount(a.amount, a.decimals));
+            s.push_str("\",\"reason\":\"");
             s.push_str(a.reason);
             s.push_str("\"}");
         }
@@ -243,6 +262,9 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 // effective recipient so the keeper builds a valid call.
                 refund_to: Some(e.refund_recipient()),
                 amount: e.remaining_amount(),
+                // AV-28: the report renders the amount in human units
+                // alongside the raw value.
+                decimals: e.decimals(),
                 reason: "expired",
             });
         }
@@ -267,6 +289,9 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 // destination applies.
                 refund_to: None,
                 amount: e.claimable_amount(now),
+                // AV-28: the report renders the amount in human units
+                // alongside the raw value.
+                decimals: e.decimals(),
                 reason: "vesting_unlocked",
             });
         }
@@ -589,6 +614,8 @@ mod keeper_tests {
                 // initializer (AV-23 default policy).
                 refund_to: Some(ALICE),
                 amount: AMOUNT,
+                // No decimal metadata declared: bare-integer rendering.
+                decimals: 0,
                 reason: "expired",
             }
         );
@@ -601,7 +628,7 @@ mod keeper_tests {
         let watched = [watch(ID1, funded(AMOUNT, 0))];
         let report = scan_keeper_actions(&watched, 1_000_000);
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"reason\":\"expired\"}}]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\"}}]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -621,7 +648,7 @@ mod keeper_tests {
         let watched = [watch(ID2, e)];
         let report = scan_keeper_actions(&watched, MID);
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"reason\":\"vesting_unlocked\"}}]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\"}}]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),
@@ -671,5 +698,53 @@ mod keeper_tests {
         assert_eq!(report.actions[0].amount, AMOUNT);
         assert_eq!(report.actions[1].kind, KeeperActionKind::Claim);
         assert_eq!(report.actions[1].amount, 500_000);
+    }
+
+    #[test]
+    fn actions_render_human_amounts_with_decimals() {
+        // AV-28: a 6-decimal escrow's report carries the raw amount for
+        // the instruction and the human amount for the operator.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, 0)
+            .unwrap()
+            .with_decimals(6)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let watched = [watch(ID1, e)];
+        let report = scan_keeper_actions(&watched, 1_000_000);
+        assert_eq!(report.actions.len(), 1);
+        let a = report.actions[0];
+        assert_eq!(a.kind, KeeperActionKind::CancelExpired);
+        assert_eq!(a.amount, AMOUNT, "the instruction moves raw units");
+        assert_eq!(a.decimals, 6);
+        let json = report.to_json();
+        assert!(
+            json.contains("\"amount\":1000000,\"decimals\":6,\"display_amount\":\"1.000000\""),
+            "human amount must serialize alongside the raw amount, got: {json}"
+        );
+    }
+
+    #[test]
+    fn claim_action_renders_human_amount_with_decimals() {
+        // AV-28: same for the claim path — half of 1_000_000 raw units
+        // at 6 decimals is 0.500000 whole tokens.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
+            .unwrap()
+            .with_decimals(6)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let watched = [watch(ID2, e)];
+        let report = scan_keeper_actions(&watched, MID);
+        assert_eq!(report.actions.len(), 1);
+        let a = report.actions[0];
+        assert_eq!(a.kind, KeeperActionKind::Claim);
+        assert_eq!(a.amount, 500_000);
+        assert_eq!(a.decimals, 6);
+        let json = report.to_json();
+        assert!(
+            json.contains("\"amount\":500000,\"decimals\":6,\"display_amount\":\"0.500000\""),
+            "claim display amount must serialize, got: {json}"
+        );
     }
 }
