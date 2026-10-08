@@ -430,6 +430,9 @@ impl IndexedEscrow {
     /// partial releases carry `from == to == Funded`, the closing one
     /// `to == Released` — so the payout stream is complete in `seq`
     /// order. Returns `(taker_payout, fee)` like the inner method.
+    /// `at` is both the event timestamp and the state machine's `now`
+    /// (so the AV-27 timelock gate sees the same clock the event log
+    /// records).
     pub fn release(
         &mut self,
         authority: [u8; 32],
@@ -438,7 +441,7 @@ impl IndexedEscrow {
         at: u64,
     ) -> Result<(u64, u64), EscrowError> {
         let from = self.inner.state();
-        let (payout, fee) = self.inner.release(authority, amount, mint)?;
+        let (payout, fee) = self.inner.release(authority, at, amount, mint)?;
         // `amount` is the gross payout by construction
         // (`payout + fee == amount`); it cannot overflow u64 addition.
         self.push_event(
@@ -686,7 +689,8 @@ impl IndexedEscrow {
     /// [`Escrow::release_milestone`]). Emits `MilestoneReleased` with the
     /// gross tranche in `amounts.payout`; the final tranche carries
     /// `to == Released`. Returns `(taker_payout, fee)` like the inner
-    /// method.
+    /// method. `at` is both the event timestamp and the state machine's
+    /// `now` (AV-27 timelock gate).
     pub fn release_milestone(
         &mut self,
         authority: [u8; 32],
@@ -695,7 +699,7 @@ impl IndexedEscrow {
         at: u64,
     ) -> Result<(u64, u64), EscrowError> {
         let from = self.inner.state();
-        let (payout, fee) = self.inner.release_milestone(authority, index, mint)?;
+        let (payout, fee) = self.inner.release_milestone(authority, at, index, mint)?;
         // `payout + fee` is the gross tranche (`<= amount`); no overflow
         // possible.
         self.push_event(

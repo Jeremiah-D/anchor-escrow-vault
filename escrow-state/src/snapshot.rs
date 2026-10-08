@@ -18,7 +18,10 @@
 //!   settlement bits, plus the index of the next unsettled tranche;
 //! - `expiry_eligible`: whether the chain's `cancel_expired` gate passes
 //!   at the snapshot time (grace period included — the same predicate the
-//!   keeper scan uses, so a snapshot never disagrees with the scan).
+//!   keeper scan uses, so a snapshot never disagrees with the scan);
+//! - `unlock_at` / `unlock_eligible`: the timelock (AV-27) and whether the
+//!   payout gates pass at the snapshot time — the same predicate the
+//!   keeper scan uses for `claim` actions.
 //!
 //! Like [`crate::KeeperReport::to_json`], [`EscrowSnapshot::to_json`]
 //! hand-serializes (the crate is dependency-free): deterministic field
@@ -190,6 +193,13 @@ pub struct EscrowSnapshot {
     /// Anti-griefing penalty rate in basis points charged on
     /// taker-initiated `cancel_expired` (AV-24).
     pub penalty_bps: u16,
+    /// Timelock unlock timestamp, or `0` when no timelock is configured
+    /// (AV-27).
+    pub unlock_at: u64,
+    /// Whether the chain's payout gates (`release` / `claim` /
+    /// `release_milestone`) pass the timelock at [`EscrowSnapshot::at`]:
+    /// `at >= unlock_at`. Same predicate the keeper scan uses (AV-27).
+    pub unlock_eligible: bool,
 }
 
 impl Escrow {
@@ -267,6 +277,8 @@ impl Escrow {
             refund_to: self.refund_to(),
             refund_recipient: self.refund_recipient(),
             penalty_bps: self.penalty_bps(),
+            unlock_at: self.unlock_at(),
+            unlock_eligible: self.is_unlock_eligible(now),
         }
     }
 }
@@ -413,6 +425,11 @@ impl EscrowSnapshot {
         s.push_str(&hex32(&self.refund_recipient));
         s.push_str("\",\"penalty_bps\":");
         s.push_str(&self.penalty_bps.to_string());
+        // AV-27: timelock.
+        s.push_str(",\"unlock_at\":");
+        s.push_str(&self.unlock_at.to_string());
+        s.push_str(",\"unlock_eligible\":");
+        s.push_str(if self.unlock_eligible { "true" } else { "false" });
         s.push('}');
         s
     }
@@ -464,7 +481,7 @@ mod snapshot_tests {
              \"milestones\":null,\
              \"skipped\":0,\
              \"evidence_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
-             \"penalty_bps\":0\
+             \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),
@@ -519,7 +536,7 @@ mod snapshot_tests {
             .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
             .unwrap();
         e.fund(ALICE).unwrap();
-        e.release(ALICE, 200_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 200_000, None).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.released, 200_000);
         assert_eq!(snap.remaining, 800_000);
@@ -583,7 +600,7 @@ mod snapshot_tests {
         // Release tranche 0: it settles, tranche 1 becomes next. The
         // confirmation bits persist — they record that the tranche was
         // duly confirmed, even after settlement.
-        e.release_milestone(ALICE, 0, None).unwrap();
+        e.release_milestone(ALICE, 1_750_000_000, 0, None).unwrap();
         let snap = e.snapshot(MID);
         let m = snap.milestones.as_ref().expect("plan must snapshot");
         assert_eq!(m.settled, 1);
@@ -689,7 +706,7 @@ mod snapshot_tests {
     #[test]
     fn terminal_states_snapshot_honestly() {
         let mut e = funded(AMOUNT, NEVER);
-        e.release(ALICE, AMOUNT, None).unwrap();
+        e.release(ALICE, 1_750_000_000, AMOUNT, None).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.state, "released");
         assert_eq!(snap.released, AMOUNT);

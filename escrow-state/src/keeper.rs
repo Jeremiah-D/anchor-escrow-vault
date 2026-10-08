@@ -16,8 +16,10 @@
 //! - `claim`: the escrow is `Funded`, a vesting schedule is attached, no
 //!   milestone plan is attached (the plan owns the release schedule, so
 //!   `claim` is disabled there), the vested-minus-released amount is
-//!   positive, and any configured quorum is satisfied — otherwise the
-//!   call would fail with `QuorumNotReached` and would not be executable.
+//!   positive, any configured quorum is satisfied, and the timelock
+//!   (AV-27) is unlocked — otherwise the call would fail with
+//!   `QuorumNotReached` / `TimelockNotReached` and would not be
+//!   executable.
 //!
 //! Every listed action carries the exact arguments the keeper needs to
 //! build the instruction: `caller` (the signing key), `mint` (the bound
@@ -246,12 +248,14 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         }
         // The taker's pull path: vesting attached, no milestone plan (the
         // plan owns the release schedule and disables `claim`), something
-        // vested-but-unreleased, and any configured quorum satisfied —
-        // otherwise the call would fail and is not executable.
+        // vested-but-unreleased, any configured quorum satisfied, and the
+        // timelock (AV-27) already unlocked — otherwise the call would
+        // fail and is not executable.
         if e.vesting_schedule().is_some()
             && e.milestone_plan().is_none()
             && e.claimable_amount(now) > 0
             && e.quorum().map(|q| q.is_satisfied()).unwrap_or(true)
+            && e.is_unlock_eligible(now)
         {
             actions.push(KeeperAction {
                 escrow_id: w.escrow_id,
@@ -333,7 +337,7 @@ mod keeper_tests {
     fn unfunded_and_terminal_escrows_yield_no_actions() {
         let uninit = Escrow::initialize(ALICE, BOB, AMOUNT, 0).unwrap();
         let mut released = funded(AMOUNT, NEVER);
-        released.release(ALICE, AMOUNT, None).unwrap();
+        released.release(ALICE, 1_750_000_000, AMOUNT, None).unwrap();
         let mut cancelled = funded(AMOUNT, NEVER);
         cancelled.cancel(ALICE, None, ALICE).unwrap();
         let watched = [watch(ID1, uninit), watch(ID2, released), watch(ID3, cancelled)];
@@ -419,7 +423,7 @@ mod keeper_tests {
     #[test]
     fn cancel_expired_refunds_the_remainder_after_partial_release() {
         let mut e = funded(AMOUNT, 0);
-        e.release(ALICE, 400_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
         assert_eq!(report.actions.len(), 1);
@@ -471,7 +475,7 @@ mod keeper_tests {
         // The initializer released ahead of the curve: the claimable
         // remainder is what is vested but not yet released.
         let mut e = funded_vesting(NEVER);
-        e.release(ALICE, 200_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 200_000, None).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
         assert_eq!(report.actions.len(), 1);

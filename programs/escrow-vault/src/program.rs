@@ -110,9 +110,14 @@ pub mod escrow_vault {
     pub fn release(ctx: Context<Release>, amount: u64) -> Result<(u64, u64)> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let from = escrow.state() as u8;
+        // AV-27: the timelock gate reads the Solana clock sysvar — never
+        // an instruction param, so the initializer cannot fast-forward
+        // the lock they configured.
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
         let (payout, fee) = escrow
             .release(
                 ctx.accounts.initializer.key().to_bytes(),
+                now,
                 amount,
                 vault_token_mint(&ctx.accounts.vault_token_account),
             )
@@ -598,9 +603,13 @@ pub mod escrow_vault {
     pub fn release_milestone(ctx: Context<ReleaseMilestone>, index: u8) -> Result<(u64, u64)> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let from = escrow.state() as u8;
+        // AV-27: the timelock gate reads the Solana clock sysvar (see
+        // `release`).
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
         let (payout, fee) = escrow
             .release_milestone(
                 ctx.accounts.initializer.key().to_bytes(),
+                now,
                 index,
                 vault_token_mint(&ctx.accounts.vault_token_account),
             )
@@ -776,6 +785,25 @@ pub mod escrow_vault {
         // in the real build.
         Ok(())
     }
+
+    /// Declare the timelock (AV-27; mirrors `Escrow::with_timelock`):
+    /// after this, `release` / `claim` / `release_milestone` require the
+    /// Solana clock to have passed `unlock_at` (`TimelockNotReached`
+    /// otherwise). `unlock_at == 0` means no lock (the default).
+    /// `Uninitialized` only. `cancel` / `cancel_expired` / `resolve` are
+    /// deliberately NOT gated, so a misconfigured lock can never trap
+    /// funds forever.
+    pub fn initialize_timelock(ctx: Context<InitializeTimelock>, unlock_at: u64) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_timelock(unlock_at)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.timelock` is always present (8 bytes, zeroed by
+        // default), so the timestamp is written in place — no realloc
+        // needed in the real build.
+        Ok(())
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -890,6 +918,14 @@ pub struct Vault {
     /// reallocating. Layout position matches
     /// `escrow_state::VAULT_FIELDS` (appended last, after `refund_to`).
     pub penalty_bps: u16,
+    /// AV-27: timelock unlock timestamp; mirrors `escrow_state`'s
+    /// `timelock`. `0` for an escrow with no timelock configured.
+    /// Always present (8 bytes, zeroed by default) so
+    /// `initialize_timelock` writes the timestamp in place without
+    /// reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `penalty_bps`).
+    pub timelock: u64,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -1051,6 +1087,10 @@ pub struct Release<'info> {
     pub initializer: Signer<'info>,
     /// CHECK: beneficiary of the release; receives the funds.
     pub taker: AccountInfo<'info>,
+    /// CHECK: Solana clock sysvar, read for the AV-27 timelock gate
+    /// (never an instruction param — a caller-supplied timestamp would
+    /// let the initializer fast-forward the lock).
+    pub clock: AccountInfo<'info>,
     /// CHECK: the vault's SPL token account. The real build reads this
     /// account's `mint` and the state machine requires it to equal the
     /// bound `vault.mint` (`MintMismatch` otherwise). Unused on the
@@ -1244,6 +1284,9 @@ pub struct ReleaseMilestone<'info> {
     pub initializer: Signer<'info>,
     /// CHECK: beneficiary of the tranche; receives the funds.
     pub taker: AccountInfo<'info>,
+    /// CHECK: Solana clock sysvar, read for the AV-27 timelock gate
+    /// (never an instruction param — see `Release`).
+    pub clock: AccountInfo<'info>,
     /// CHECK: the vault's SPL token account (see `Release`). The real
     /// build reads its `mint` for the state machine's `MintMismatch`
     /// check; unused on the native-SOL path.
@@ -1267,6 +1310,15 @@ pub struct InitializePenalty<'info> {
     /// Only the initializer declares the anti-griefing penalty rate;
     /// the state machine rejects re-configuration once the escrow
     /// leaves `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeTimelock<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer declares the timelock; the state machine
+    /// rejects re-configuration once the escrow leaves `Uninitialized`.
     pub initializer: Signer<'info>,
 }
 
@@ -1380,7 +1432,7 @@ fn read_event_seq(_vault: &Account<Vault>) -> u64 {
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {
     // One program error per EscrowError variant, so on-chain failures
-    // surface the exact `escrow_state` reason (code 100–117) to clients.
+    // surface the exact `escrow_state` reason (code 100–118) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
         escrow_state::EscrowError::InvalidStateTransition => {
@@ -1410,6 +1462,7 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {
             error!(ErrorCode::RefundAddressMismatch)
         },
         escrow_state::EscrowError::InvalidPenalty => error!(ErrorCode::InvalidPenalty),
+        escrow_state::EscrowError::TimelockNotReached => error!(ErrorCode::TimelockNotReached),
     }
 }
 
@@ -1451,4 +1504,6 @@ pub enum ErrorCode {
     RefundAddressMismatch,
     #[msg("Invalid anti-griefing penalty rate: penalty_bps must be 0-10000 (basis points)")]
     InvalidPenalty,
+    #[msg("Timelock not reached: release/claim/release_milestone called before unlock_at")]
+    TimelockNotReached,
 }

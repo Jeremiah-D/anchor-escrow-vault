@@ -198,6 +198,23 @@ pub struct Escrow {
     /// the rate survives serialization. Appended last so every earlier
     /// field offset stays stable.
     penalty_bps: u16,
+    /// AV-27: timelock — Unix timestamp before which no taker payout may
+    /// leave the escrow. [`Escrow::release`], [`Escrow::claim`] and
+    /// [`Escrow::release_milestone`] require `now >= unlock_at`
+    /// ([`EscrowError::TimelockNotReached`] otherwise). `0` (the default)
+    /// means no lock — backward compatible. Set once via
+    /// [`Escrow::with_timelock`] on an `Uninitialized` escrow, like the
+    /// other `with_*` builders. Persisted (8 bytes in the vault account)
+    /// so the lock survives serialization. Appended last so every earlier
+    /// field offset stays stable.
+    ///
+    /// Design: the lock gates only *payout* paths. The unilateral exits
+    /// ([`Escrow::cancel`], [`Escrow::cancel_expired`]) and the arbiter's
+    /// [`Escrow::resolve`] are deliberately *not* gated — a misconfigured
+    /// or abandoned timelock must never trap funds forever; after
+    /// `expires_at` either party can still walk the `cancel_expired` path,
+    /// and a live dispute still settles via arbitration.
+    timelock: u64,
 }
 
 /// Bit 0 of [`Escrow::activation`]: the initializer has recorded their
@@ -321,6 +338,14 @@ pub enum EscrowError {
     /// a valid rate. Parallels [`EscrowError::InvalidProtocolFee`]
     /// (config error).
     InvalidPenalty,
+    /// Timelock not reached (AV-27): [`Escrow::release`],
+    /// [`Escrow::claim`] or [`Escrow::release_milestone`] called while
+    /// `now < unlock_at` — the payout paths stay locked until the
+    /// timelock configured via [`Escrow::with_timelock`] passes. The
+    /// unilateral exits (`cancel`, `cancel_expired`) and the arbiter's
+    /// [`Escrow::resolve`] are deliberately *not* gated by the timelock,
+    /// so a misconfigured lock can never trap funds forever.
+    TimelockNotReached,
 }
 
 impl EscrowError {
@@ -351,6 +376,7 @@ impl EscrowError {
             EscrowError::InvalidGracePeriod => 115,
             EscrowError::RefundAddressMismatch => 116,
             EscrowError::InvalidPenalty => 117,
+            EscrowError::TimelockNotReached => 118,
         }
     }
 
@@ -375,6 +401,7 @@ impl EscrowError {
             EscrowError::InvalidGracePeriod,
             EscrowError::RefundAddressMismatch,
             EscrowError::InvalidPenalty,
+            EscrowError::TimelockNotReached,
         ]
     }
 }
@@ -739,6 +766,10 @@ impl Escrow {
             // remainder (backward compatible). Opt in via
             // `with_penalty_bps` before funding.
             penalty_bps: 0,
+            // AV-27: no timelock by default — payouts are not time-gated
+            // (backward compatible). Opt in via `with_timelock` before
+            // funding.
+            timelock: 0,
         })
     }
 
@@ -886,14 +917,20 @@ impl Escrow {
     /// per-tranche accounting. Use [`Escrow::release_milestone`] instead.
     ///
     /// When a quorum is configured, additionally requires the quorum's
-    /// threshold of attestations (`QuorumNotReached` otherwise). Check
+    /// threshold of attestations (`QuorumNotReached` otherwise). AV-27:
+    /// when a timelock is configured, additionally requires
+    /// `now >= unlock_at` (`TimelockNotReached` otherwise) — the clock
+    /// comes from the caller (on-chain: the Solana clock sysvar, never an
+    /// instruction param — a caller-supplied timestamp would let the
+    /// initializer fast-forward the lock). Check
     /// order is deliberate: authority, then state, then the mint
     /// binding (AV-16), then the milestone plan, then quorum, then the
-    /// amount checks — an unauthorized caller learns nothing about
-    /// attestation progress or release history.
+    /// timelock, then the amount checks — an unauthorized caller learns
+    /// nothing about attestation progress, release history, or the lock.
     pub fn release(
         &mut self,
         authority: [u8; 32],
+        now: u64,
         amount: u64,
         mint: Option<[u8; 32]>,
     ) -> Result<(u64, u64), EscrowError> {
@@ -917,6 +954,13 @@ impl Escrow {
             if !policy.is_satisfied() {
                 return Err(EscrowError::QuorumNotReached);
             }
+        }
+        // AV-27: the timelock gates every taker payout path. Checked
+        // after the config gates so a misconfigured escrow still reports
+        // its misconfiguration first; checked before the amount math so
+        // a locked escrow never touches the `released` counter.
+        if !self.is_unlock_eligible(now) {
+            return Err(EscrowError::TimelockNotReached);
         }
         if amount == 0 {
             return Err(EscrowError::AmountMismatch);
@@ -1199,8 +1243,9 @@ impl Escrow {
     /// Check order is deliberate: authority, then state, then the
     /// milestone plan (AV-15: the plan owns the release schedule), then
     /// the mint binding (AV-16), then vesting configuration, then
-    /// quorum, then the claimable amount — a stranger learns nothing,
-    /// and a misconfigured call fails before the gates run.
+    /// quorum, then the timelock (AV-27), then the claimable amount — a
+    /// stranger learns nothing, and a misconfigured call fails before the
+    /// gates run.
     pub fn claim(
         &mut self,
         authority: [u8; 32],
@@ -1230,6 +1275,12 @@ impl Escrow {
             if !policy.is_satisfied() {
                 return Err(EscrowError::QuorumNotReached);
             }
+        }
+        // AV-27: the timelock gates every taker payout path, including
+        // the taker's pull path — otherwise the lock would be trivially
+        // bypassable via `claim`.
+        if !self.is_unlock_eligible(now) {
+            return Err(EscrowError::TimelockNotReached);
         }
         let vested = schedule.vested_amount(self.amount, now);
         // `released` only grows via `release`/`claim`, and `vested` is a
@@ -1633,6 +1684,49 @@ impl Escrow {
         self.penalty_bps
     }
 
+    /// Opt in to a timelock (AV-27). Builder-style: only valid on an
+    /// `Uninitialized` escrow, so the unlock timestamp is fixed before
+    /// any funds move — mirroring [`Escrow::with_grace_period`] and the
+    /// other `with_*` builders. After this, the taker payout paths
+    /// ([`Escrow::release`], [`Escrow::claim`],
+    /// [`Escrow::release_milestone`]) require `now >= unlock_at`
+    /// ([`EscrowError::TimelockNotReached`] otherwise); `unlock_at == 0`
+    /// is a valid no-op meaning "no lock" (the default).
+    ///
+    /// The unilateral exits ([`Escrow::cancel`],
+    /// [`Escrow::cancel_expired`]) and the arbiter's
+    /// [`Escrow::resolve`] are deliberately *not* gated: a timelock that
+    /// also locked refunds could trap funds forever if the initializer
+    /// disappeared, so the lock only ever delays *payouts*, never exits.
+    pub fn with_timelock(mut self, unlock_at: u64) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        self.timelock = unlock_at;
+        Ok(self)
+    }
+
+    /// The timelock unlock timestamp configured via
+    /// [`Escrow::with_timelock`]; `0` when no timelock is configured
+    /// (backward compatible — no payout is ever time-gated).
+    pub fn unlock_at(&self) -> u64 {
+        self.timelock
+    }
+
+    /// True when the timelock gate of the taker payout paths
+    /// ([`Escrow::release`], [`Escrow::claim`],
+    /// [`Escrow::release_milestone`]) passes at `now`: `now >= unlock_at`.
+    ///
+    /// The single source of truth for unlock eligibility: the state
+    /// machine's payout gates and the off-chain keeper report
+    /// (`keeper::scan_keeper_actions`) both evaluate this predicate, so
+    /// the keeper can never list a `claim` call the chain would reject
+    /// as `TimelockNotReached`.
+    pub fn is_unlock_eligible(&self, now: u64) -> bool {
+        now >= self.timelock
+    }
+
     /// The whitelisted refund address configured via
     /// [`Escrow::with_refund_address`], or `None` when no whitelist is
     /// configured (refunds go to the initializer — backward compatible).
@@ -1839,6 +1933,7 @@ impl Escrow {
     pub fn release_milestone(
         &mut self,
         authority: [u8; 32],
+        now: u64,
         index: u8,
         mint: Option<[u8; 32]>,
     ) -> Result<(u64, u64), EscrowError> {
@@ -1859,6 +1954,11 @@ impl Escrow {
             if !policy.is_satisfied() {
                 return Err(EscrowError::QuorumNotReached);
             }
+        }
+        // AV-27: the timelock gates every taker payout path, including
+        // milestone tranches.
+        if !self.is_unlock_eligible(now) {
+            return Err(EscrowError::TimelockNotReached);
         }
         if Some(i) != self.next_milestone_index() {
             return Err(EscrowError::InvalidStateTransition);
@@ -2205,6 +2305,10 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // when no penalty is configured). Appended last so every earlier
     // field offset stays stable.
     ("penalty_bps", "u16", 2),
+    // AV-27: timelock unlock timestamp (see `Escrow::with_timelock`):
+    // one u64, always present (zeroed when no timelock is configured).
+    // Appended last so every earlier field offset stays stable.
+    ("timelock", "u64", 8),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -2249,9 +2353,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// likewise always present: 1-byte discriminant + 32-byte address
 /// (zeroed when no whitelist is configured). The anti-griefing penalty
 /// rate (AV-24) is always present too: 2-byte `penalty_bps` (zeroed when
-/// no penalty is configured).
+/// no penalty is configured). The timelock unlock timestamp (AV-27) is
+/// always present too: 8-byte `timelock` (zeroed when no timelock is
+/// configured).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -2374,7 +2480,7 @@ mod tests {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
         let before = e.amount();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(e.amount(), before); // amount invariant across release
         assert_eq!(e.released_amount(), before); // full release tracked
@@ -2451,7 +2557,7 @@ mod tests {
         );
         // Released: terminal, cannot be cancelled again.
         let mut e = funded_escrow();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(
             e.cancel_expired(BOB, EXPIRES_AT + 1, None, ALICE),
             Err(EscrowError::InvalidStateTransition)
@@ -2483,7 +2589,7 @@ mod tests {
     fn release_from_uninitialized_is_invalid() {
         let mut e = escrow();
         assert_eq!(
-            e.release(ALICE, 1_000_000, None),
+            e.release(ALICE, 1_750_000_000, 1_000_000, None),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.state(), EscrowState::Uninitialized);
@@ -2508,9 +2614,9 @@ mod tests {
     fn release_after_release_is_invalid() {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(
-            e.release(ALICE, 1_000_000, None),
+            e.release(ALICE, 1_750_000_000, 1_000_000, None),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.state(), EscrowState::Released);
@@ -2520,7 +2626,7 @@ mod tests {
     fn cancel_after_release_is_invalid() {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.cancel(ALICE, None, ALICE), Err(EscrowError::InvalidStateTransition));
         assert_eq!(e.state(), EscrowState::Released);
     }
@@ -2531,7 +2637,7 @@ mod tests {
         e.fund(ALICE).unwrap();
         e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(
-            e.release(ALICE, 1_000_000, None),
+            e.release(ALICE, 1_750_000_000, 1_000_000, None),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.state(), EscrowState::Cancelled);
@@ -2541,7 +2647,7 @@ mod tests {
     fn fund_after_release_is_invalid() {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.fund(ALICE), Err(EscrowError::InvalidStateTransition));
     }
 
@@ -2566,7 +2672,7 @@ mod tests {
     fn non_initializer_cannot_release() {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        assert_eq!(e.release(MALLORY, 1_000_000, None), Err(EscrowError::Unauthorized));
+        assert_eq!(e.release(MALLORY, 1_750_000_000, 1_000_000, None), Err(EscrowError::Unauthorized));
         assert_eq!(e.state(), EscrowState::Funded);
     }
 
@@ -2584,7 +2690,7 @@ mod tests {
         // The taker is the beneficiary, not the authority: they cannot drive transitions.
         assert_eq!(e.fund(BOB), Err(EscrowError::Unauthorized));
         e.fund(ALICE).unwrap();
-        assert_eq!(e.release(BOB, 1_000_000, None), Err(EscrowError::Unauthorized));
+        assert_eq!(e.release(BOB, 1_750_000_000, 1_000_000, None), Err(EscrowError::Unauthorized));
         assert_eq!(e.state(), EscrowState::Funded);
     }
 }
@@ -2643,7 +2749,7 @@ mod permission_tests {
             EscrowState::Funded => e.fund(ALICE).unwrap(),
             EscrowState::Released => {
                 e.fund(ALICE).unwrap();
-                e.release(ALICE, 1_000_000, None).unwrap();
+                e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
             }
             EscrowState::Cancelled => {
                 e.fund(ALICE).unwrap();
@@ -2692,7 +2798,7 @@ mod permission_tests {
     fn stranger_cannot_release_in_any_state() {
         for state in ALL_STATES {
             let mut e = in_state(state);
-            assert_eq!(e.release(MALLORY, 1_000_000, None), Err(EscrowError::Unauthorized));
+            assert_eq!(e.release(MALLORY, 1_750_000_000, 1_000_000, None), Err(EscrowError::Unauthorized));
             assert_eq!(e.state(), state, "state must be unchanged");
         }
     }
@@ -2703,7 +2809,7 @@ mod permission_tests {
         // initializer may drive the transition.
         for state in ALL_STATES {
             let mut e = in_state(state);
-            assert_eq!(e.release(BOB, 1_000_000, None), Err(EscrowError::Unauthorized));
+            assert_eq!(e.release(BOB, 1_750_000_000, 1_000_000, None), Err(EscrowError::Unauthorized));
             assert_eq!(e.state(), state, "state must be unchanged");
         }
     }
@@ -2788,7 +2894,7 @@ mod permission_tests {
         // Unauthorized: authority is checked first. This keeps the error
         // from leaking state information to unauthorized callers.
         let mut e = in_state(EscrowState::Released);
-        assert_eq!(e.release(MALLORY, 1_000_000, None), Err(EscrowError::Unauthorized));
+        assert_eq!(e.release(MALLORY, 1_750_000_000, 1_000_000, None), Err(EscrowError::Unauthorized));
         let mut e = in_state(EscrowState::Cancelled);
         assert_eq!(e.cancel(MALLORY, None, ALICE), Err(EscrowError::Unauthorized));
         assert_eq!(e.state(), EscrowState::Cancelled);
@@ -2799,7 +2905,7 @@ mod permission_tests {
         for state in ALL_STATES {
             let mut e = in_state(state);
             assert_eq!(e.fund(ZERO_KEY), Err(EscrowError::Unauthorized));
-            assert_eq!(e.release(ZERO_KEY, 1_000_000, None), Err(EscrowError::Unauthorized));
+            assert_eq!(e.release(ZERO_KEY, 1_750_000_000, 1_000_000, None), Err(EscrowError::Unauthorized));
             assert_eq!(e.cancel(ZERO_KEY, None, ALICE), Err(EscrowError::Unauthorized));
             assert_eq!(
                 e.cancel_expired(ZERO_KEY, EXPIRES_AT + 1, None, ALICE),
@@ -3015,7 +3121,7 @@ mod fuzz_tests {
                 1 => {
                     rel_amt = fuzz_release_amount(&mut rng, slot.amount);
                     slot.escrow
-                        .release(authority, rel_amt, None)
+                        .release(authority, 1_750_000_000, rel_amt, None)
                         .map(|(payout, fee)| {
                             // AV-17: the fee is a routing slice of the
                             // gross payout — it never escapes it.
@@ -3290,7 +3396,7 @@ mod quorum_tests {
     fn release_before_quorum_reached_fails_and_preserves_state() {
         let mut e = escrow_with_quorum();
         e.attest(ATTESTOR_1).unwrap();
-        assert_eq!(e.release(ALICE, 1_000_000, None), Err(EscrowError::QuorumNotReached));
+        assert_eq!(e.release(ALICE, 1_750_000_000, 1_000_000, None), Err(EscrowError::QuorumNotReached));
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!(e.amount(), 1_000_000);
     }
@@ -3300,7 +3406,7 @@ mod quorum_tests {
         let mut e = escrow_with_quorum();
         e.attest(ATTESTOR_1).unwrap();
         e.attest(ATTESTOR_3).unwrap();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(e.amount(), 1_000_000); // payout accounting preserved
     }
@@ -3311,7 +3417,7 @@ mod quorum_tests {
         let mut e = escrow_with_quorum();
         e.attest(ATTESTOR_1).unwrap();
         e.attest(ATTESTOR_2).unwrap();
-        assert_eq!(e.release(MALLORY, 1_000_000, None), Err(EscrowError::Unauthorized));
+        assert_eq!(e.release(MALLORY, 1_750_000_000, 1_000_000, None), Err(EscrowError::Unauthorized));
         assert_eq!(e.state(), EscrowState::Funded);
     }
 
@@ -3320,9 +3426,9 @@ mod quorum_tests {
         // Check order: authority before quorum. A stranger gets
         // Unauthorized even with zero attestations recorded.
         let mut e = escrow_with_quorum();
-        assert_eq!(e.release(MALLORY, 1_000_000, None), Err(EscrowError::Unauthorized));
+        assert_eq!(e.release(MALLORY, 1_750_000_000, 1_000_000, None), Err(EscrowError::Unauthorized));
         // ... while the initializer sees the quorum gate.
-        assert_eq!(e.release(ALICE, 1_000_000, None), Err(EscrowError::QuorumNotReached));
+        assert_eq!(e.release(ALICE, 1_750_000_000, 1_000_000, None), Err(EscrowError::QuorumNotReached));
     }
 
     #[test]
@@ -3344,7 +3450,7 @@ mod quorum_tests {
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         assert_eq!(e.quorum(), None);
         e.fund(ALICE).unwrap();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
 
@@ -3373,7 +3479,7 @@ mod quorum_tests {
         let mut e = escrow_with_quorum();
         e.attest(ATTESTOR_1).unwrap();
         e.attest(ATTESTOR_2).unwrap();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(
             e.attest(ATTESTOR_3),
             Err(EscrowError::InvalidStateTransition)
@@ -3390,7 +3496,7 @@ mod quorum_tests {
         e.attest(ATTESTOR_1).unwrap();
         e.attest(ATTESTOR_2).unwrap();
         e.fund(ALICE).unwrap();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
 
@@ -3405,7 +3511,7 @@ mod quorum_tests {
         e.attest(ALICE).unwrap();
         e.attest(ATTESTOR_1).unwrap();
         e.fund(ALICE).unwrap();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
 }
@@ -3436,7 +3542,11 @@ mod quorum_tests {
 //   spoofed, a signer cannot.
 // * `cancel_expired`'s `now` is ambient input from the Solana clock
 //   sysvar, deliberately NOT an instruction param — letting the caller
-//   supply the timestamp would let anyone fast-forward expiry.
+//   supply the timestamp would let anyone fast-forward expiry. The same
+//   holds for the AV-27 timelock gate: `release`, `claim` and
+//   `release_milestone` read `now` from the clock sysvar, never from a
+//   param — a caller-supplied timestamp would let the initializer
+//   fast-forward the lock they configured.
 // * `initialize_quorum`'s authority check lives in the Anchor account
 //   constraint (`initializer.key() == vault.initializer` in the real
 //   build), not in the state machine: `with_quorum` takes no authority
@@ -3497,7 +3607,9 @@ mod anchor_idl_tests {
             params: &[("amount", "u64", "instruction param")],
             method: "Escrow::release",
             input_mapping: "authority <- accounts.initializer (signer); \
-                            amount <- param; partial releases accumulate in \
+                            amount <- param; now <- clock sysvar (NOT an \
+                            instruction param — see module docs); partial \
+                            releases accumulate in \
                             the `released` field and must not cumulatively \
                             exceed `amount` (ReleaseExceedsLocked); \
                             `amount == 0` is AmountMismatch; returns \
@@ -3505,7 +3617,9 @@ mod anchor_idl_tests {
                             slices the payout and accumulates in \
                             `fees_paid`; when a quorum \
                             is configured the release gate from AV-04 \
-                            applies (QuorumNotReached)",
+                            applies (QuorumNotReached); when a timelock \
+                            is configured the AV-27 gate applies \
+                            (TimelockNotReached while now < unlock_at)",
         },
         InstructionSpec {
             name: "cancel",
@@ -3707,12 +3821,17 @@ mod anchor_idl_tests {
             params: &[("index", "u8", "instruction param; milestone index")],
             method: "Escrow::release_milestone",
             input_mapping: "authority <- accounts.initializer (signer); \
-                            index <- param; releases the tranche only \
+                            index <- param; now <- clock sysvar (NOT an \
+                            instruction param — see module docs); releases \
+                            the tranche only \
                             after dual confirmation (MilestoneNotConfirmed \
                             otherwise) and in-order; returns (taker_payout, \
                             fee) so the program can size both transfers \
                             (AV-17); \
-                            the quorum gate applies exactly as for release",
+                            the quorum gate applies exactly as for release; \
+                            the AV-27 timelock gate applies exactly as for \
+                            release (TimelockNotReached while \
+                            now < unlock_at)",
         },
         InstructionSpec {
             name: "skip_milestone",
@@ -3839,6 +3958,29 @@ mod anchor_idl_tests {
                             compensation; initializer-initiated cancels \
                             and the arbiter's resolve never carry it",
         },
+        InstructionSpec {
+            // AV-27: timelock.
+            name: "initialize_timelock",
+            params: &[(
+                "unlock_at",
+                "u64",
+                "instruction param; Unix timestamp before which no taker payout may leave the escrow; 0 = no lock",
+            )],
+            method: "Escrow::with_timelock",
+            input_mapping: "unlock_at <- param; authority <- \\
+                            accounts.initializer (signer), enforced by the \\
+                            Anchor account constraint, not the state \\
+                            machine; Uninitialized only, like \\
+                            initialize_quorum; after this, release / claim \\
+                            / release_milestone require now >= unlock_at \\
+                            (TimelockNotReached otherwise), where now <- \\
+                            clock sysvar (NOT an instruction param — a \\
+                            caller-supplied timestamp would let the \\
+                            initializer fast-forward the lock); cancel / \\
+                            cancel_expired / resolve are deliberately NOT \\
+                            gated, so a misconfigured lock can never trap \\
+                            funds forever",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -3889,6 +4031,7 @@ mod anchor_idl_tests {
             "Escrow::with_grace_period",
             "Escrow::with_refund_address",
             "Escrow::with_penalty_bps",
+            "Escrow::with_timelock",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -3912,7 +4055,7 @@ mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_seventeen_instructions_take_params() {
+    fn only_eighteen_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -3939,7 +4082,8 @@ mod anchor_idl_tests {
                 &"initialize_protocol_fee",
                 &"initialize_grace_period",
                 &"initialize_refund_address",
-                &"initialize_penalty"
+                &"initialize_penalty",
+                &"initialize_timelock"
             ]
         );
     }
@@ -4120,6 +4264,54 @@ mod anchor_idl_tests {
     }
 
     #[test]
+    fn initialize_timelock_maps_param_to_timelock_field() {
+        // IDL: initialize_timelock(unlock_at: u64). The program takes
+        // the param, then Escrow::with_timelock; authority <-
+        // accounts.initializer, enforced by the Anchor account
+        // constraint, not the state machine (Uninitialized only, like
+        // initialize_quorum).
+        const UNLOCK_AT: u64 = 1_900_000_000;
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap();
+        assert_eq!(e.unlock_at(), UNLOCK_AT);
+        assert!(!e.is_unlock_eligible(UNLOCK_AT - 1));
+        assert!(e.is_unlock_eligible(UNLOCK_AT));
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        // The gate moves: release / claim / release_milestone need
+        // now >= unlock_at. A vesting escrow exercises the claim path.
+        let mut funded = e;
+        funded.fund(ALICE).unwrap();
+        assert_eq!(
+            funded.release(ALICE, UNLOCK_AT - 1, 1_000_000, None),
+            Err(EscrowError::TimelockNotReached)
+        );
+        assert_eq!(funded.state(), EscrowState::Funded);
+        assert_eq!(funded.released_amount(), 0, "a locked release moves nothing");
+        funded.release(ALICE, UNLOCK_AT, 1_000_000, None).unwrap();
+        assert_eq!(funded.state(), EscrowState::Released);
+        // Re-configuring a live escrow is rejected by state.
+        let mut funded = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap();
+        funded.fund(ALICE).unwrap();
+        assert_eq!(
+            funded.with_timelock(UNLOCK_AT + 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(funded.unlock_at(), UNLOCK_AT);
+        // unlock_at == 0 is the valid no-op: payouts are never gated.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(0)
+            .unwrap();
+        assert_eq!(e.unlock_at(), 0);
+        assert!(e.is_unlock_eligible(0));
+    }
+
+    #[test]
     fn update_quorum_maps_dual_signers_and_threshold_param() {
         // IDL: update_quorum(threshold: u8). The program passes
         // accounts.initializer and accounts.taker (BOTH signers) plus
@@ -4192,18 +4384,18 @@ mod anchor_idl_tests {
         // amount <- instruction param (partial releases accumulate in the
         // `released` field; the cumulative total is capped at `amount`).
         let mut e = funded_escrow();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
         // Documented partial path: stays Funded, progress tracked.
         let mut e = funded_escrow();
-        e.release(ALICE, 400_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!((e.released_amount(), e.remaining_amount()), (400_000, 600_000));
         // Documented failure mode: quorum configured but threshold unmet
         // (release-specific gate from AV-04).
         let mut e = quorum_funded_escrow();
         e.attest(ATTESTOR_1).unwrap();
-        assert_eq!(e.release(ALICE, 1_000_000, None), Err(EscrowError::QuorumNotReached));
+        assert_eq!(e.release(ALICE, 1_750_000_000, 1_000_000, None), Err(EscrowError::QuorumNotReached));
         assert_eq!(e.state(), EscrowState::Funded);
     }
 
@@ -4252,7 +4444,7 @@ mod anchor_idl_tests {
         assert!(e.quorum().is_some());
         e.fund(ALICE).unwrap();
         // The release gate is live immediately: threshold not yet reached.
-        assert_eq!(e.release(ALICE, 1_000_000, None), Err(EscrowError::QuorumNotReached));
+        assert_eq!(e.release(ALICE, 1_750_000_000, 1_000_000, None), Err(EscrowError::QuorumNotReached));
         // Documented failure mode: bad policy rejected before touching the escrow.
         assert_eq!(
             QuorumPolicy::new(&[ATTESTOR_1], 0),
@@ -4429,7 +4621,7 @@ mod anchor_idl_tests {
         let mut e = milestone_escrow();
         e.confirm_milestone(ALICE, 0).unwrap();
         e.confirm_milestone(BOB, 0).unwrap();
-        let (tranche, fee) = e.release_milestone(ALICE, 0, None).unwrap();
+        let (tranche, fee) = e.release_milestone(ALICE, 1_750_000_000, 0, None).unwrap();
         assert_eq!((tranche, fee), (400_000, 0), "no fee configured: full tranche to taker");
         assert_eq!((e.released_amount(), e.remaining_amount()), (400_000, 600_000));
         assert_eq!(e.state(), EscrowState::Funded);
@@ -4438,13 +4630,13 @@ mod anchor_idl_tests {
         let mut e = milestone_escrow();
         e.confirm_milestone(ALICE, 0).unwrap();
         assert_eq!(
-            e.release_milestone(ALICE, 0, None),
+            e.release_milestone(ALICE, 1_750_000_000, 0, None),
             Err(EscrowError::MilestoneNotConfirmed)
         );
         assert_eq!(e.released_amount(), 0);
         // Documented failure mode: the taker cannot drive the release.
         assert_eq!(
-            e.release_milestone(BOB, 0, None),
+            e.release_milestone(BOB, 1_750_000_000, 0, None),
             Err(EscrowError::Unauthorized)
         );
     }
@@ -4659,6 +4851,9 @@ mod anchor_idl_tests {
         // `penalty_bps` directly (u16 — 0 is the valid "no penalty"
         // default).
         ("initialize_penalty", "penalty_bps", "penalty_bps"),
+        // AV-27: the unlock timestamp param populates `timelock`
+        // directly (u64 — 0 is the valid "no lock" default).
+        ("initialize_timelock", "unlock_at", "timelock"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -4913,6 +5108,11 @@ mod error_code_tests {
             117,
             "with_penalty_bps with penalty_bps > 10_000 (not a valid basis-point rate)",
         ),
+        (
+            EscrowError::TimelockNotReached,
+            118,
+            "release/claim/release_milestone while now < unlock_at (AV-27 timelock); cancel/cancel_expired/resolve are never gated",
+        ),
     ];
 
     #[test]
@@ -5006,7 +5206,7 @@ mod error_code_tests {
         let mut e = escrow().with_quorum(policy).unwrap();
         e.fund(ALICE).unwrap();
         e.attest(ATTESTOR_1).unwrap(); // 1 of 2: not enough
-        let err = e.release(ALICE, 1_000_000, None).unwrap_err();
+        let err = e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap_err();
         assert_eq!(err, EscrowError::QuorumNotReached);
         assert_eq!(err.code(), 105);
     }
@@ -5015,8 +5215,8 @@ mod error_code_tests {
     fn release_exceeds_locked_triggered_by_over_release() {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        e.release(ALICE, 600_000, None).unwrap(); // partial: 400_000 remains
-        let err = e.release(ALICE, 400_001, None).unwrap_err();
+        e.release(ALICE, 1_750_000_000, 600_000, None).unwrap(); // partial: 400_000 remains
+        let err = e.release(ALICE, 1_750_000_000, 400_001, None).unwrap_err();
         assert_eq!(err, EscrowError::ReleaseExceedsLocked);
         assert_eq!(err.code(), 106);
         assert_eq!(e.state(), EscrowState::Funded);
@@ -5027,7 +5227,7 @@ mod error_code_tests {
     fn amount_mismatch_triggered_by_zero_amount_release() {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        let err = e.release(ALICE, 0, None).unwrap_err();
+        let err = e.release(ALICE, 1_750_000_000, 0, None).unwrap_err();
         assert_eq!(err, EscrowError::AmountMismatch);
         assert_eq!(err.code(), 102);
         assert_eq!(e.state(), EscrowState::Funded);
@@ -5110,7 +5310,7 @@ mod error_code_tests {
         // state still gets 100 (Unauthorized), not 101.
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        e.release(ALICE, 1_000_000, None).unwrap(); // now Released
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap(); // now Released
         let err = e.fund(MALLORY).unwrap_err();
         assert_eq!(err.code(), 100);
         // ... while the initializer sees the state error, 101.
@@ -5185,7 +5385,7 @@ mod error_code_tests {
         // The plan owns the release schedule: plain `release` is disabled
         // once a plan is attached.
         let mut e = milestone_escrow();
-        let err = e.release(ALICE, 400_000, None).unwrap_err();
+        let err = e.release(ALICE, 1_750_000_000, 400_000, None).unwrap_err();
         assert_eq!(err, EscrowError::InvalidMilestones);
         assert_eq!(err.code(), 110);
         assert_eq!(e.state(), EscrowState::Funded);
@@ -5202,7 +5402,7 @@ mod error_code_tests {
             Err(EscrowError::InvalidMilestones)
         );
         assert_eq!(
-            e.release_milestone(ALICE, 0, None),
+            e.release_milestone(ALICE, 1_750_000_000, 0, None),
             Err(EscrowError::InvalidMilestones)
         );
         assert_eq!(
@@ -5218,7 +5418,7 @@ mod error_code_tests {
         // missing, so the tranche is not releasable.
         let mut e = milestone_escrow();
         e.confirm_milestone(ALICE, 0).unwrap();
-        let err = e.release_milestone(ALICE, 0, None).unwrap_err();
+        let err = e.release_milestone(ALICE, 1_750_000_000, 0, None).unwrap_err();
         assert_eq!(err, EscrowError::MilestoneNotConfirmed);
         assert_eq!(err.code(), 111);
         assert_eq!(e.state(), EscrowState::Funded);
@@ -5274,7 +5474,7 @@ mod error_code_tests {
         // not the bound mint: the release must fail without moving
         // anything.
         let mut e = mint_escrow();
-        let err = e.release(ALICE, 1_000_000, Some(MINT_B)).unwrap_err();
+        let err = e.release(ALICE, 1_750_000_000, 1_000_000, Some(MINT_B)).unwrap_err();
         assert_eq!(err, EscrowError::MintMismatch);
         assert_eq!(err.code(), 113);
         assert_eq!(e.state(), EscrowState::Funded);
@@ -5297,7 +5497,7 @@ mod error_code_tests {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
         assert_eq!(
-            e.release(ALICE, 1_000_000, Some(MINT_A)),
+            e.release(ALICE, 1_750_000_000, 1_000_000, Some(MINT_A)),
             Err(EscrowError::MintMismatch)
         );
         assert_eq!(e.state(), EscrowState::Funded);
@@ -5367,7 +5567,7 @@ mod error_code_tests {
         // The matching mint opens every fund-moving exit: release,
         // cancel, cancel_expired, and claim (here on a vesting escrow).
         let mut e = mint_escrow();
-        e.release(ALICE, 400_000, Some(MINT_A)).unwrap();
+        e.release(ALICE, 1_750_000_000, 400_000, Some(MINT_A)).unwrap();
         assert_eq!(e.released_amount(), 400_000);
 
         let mut e = mint_escrow();
@@ -5685,7 +5885,7 @@ mod property_tests {
             // fund → release.
             let mut e = mk();
             e.fund(ALICE).unwrap();
-            e.release(ALICE, amount, None).unwrap();
+            e.release(ALICE, 1_750_000_000, amount, None).unwrap();
             assert_eq!(e.state(), EscrowState::Released);
             assert_eq!(e.amount(), amount, "case {case}: amount changed on release path");
             assert_eq!(
@@ -5724,7 +5924,7 @@ mod property_tests {
             e.fund(ALICE).unwrap();
             e.attest([0xA1; 32]).unwrap();
             e.attest([0xA2; 32]).unwrap();
-            e.release(ALICE, amount, None).unwrap();
+            e.release(ALICE, 1_750_000_000, amount, None).unwrap();
             assert_eq!(e.state(), EscrowState::Released);
             assert_eq!(e.amount(), amount, "case {case}: amount changed on quorum path");
             assert_eq!(
@@ -6003,6 +6203,10 @@ mod account_space_tests {
         // AV-24: anti-griefing penalty rate in basis points, always
         // present (zeroed when no penalty configured).
         out.extend_from_slice(&e.penalty_bps.to_le_bytes());
+        // AV-27: timelock unlock timestamp, always present (zeroed when
+        // no timelock is configured); appended last so every earlier
+        // offset above is unchanged.
+        out.extend_from_slice(&e.timelock.to_le_bytes());
         out
     }
 
@@ -6022,9 +6226,10 @@ mod account_space_tests {
         // + 2 (AV-17 protocol fee rate) + 8 (AV-17 cumulative fee counter)
         // + 8 (AV-21 expiry grace period) + (1 + 32) (AV-22 dispute
         // evidence hash) + (1 + 32) (AV-23 refund address whitelist)
-        assert_eq!(ESCROW_BODY_LEN, 608, "escrow payload bytes");
+        // + 2 (AV-24 anti-griefing penalty rate) + 8 (AV-27 timelock).
+        assert_eq!(ESCROW_BODY_LEN, 616, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 616, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 624, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -6039,13 +6244,14 @@ mod account_space_tests {
         // (AV-22, zeroed when no evidence attached) + (1 + 32)-byte
         // refund address whitelist (AV-23, zeroed when no whitelist
         // configured) + 2-byte anti-griefing penalty rate (AV-24, zeroed
-        // when no penalty configured).
+        // when no penalty configured) + 8-byte timelock unlock timestamp
+        // (AV-27, zeroed when no timelock configured).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 205);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 213);
     }
 
     #[test]
@@ -6169,6 +6375,14 @@ mod account_space_tests {
             u16::from_le_bytes(bytes[606..608].try_into().unwrap()),
             0,
             "penalty_bps: zeroed"
+        );
+        // AV-27: timelock unlock timestamp u64, zeroed for a plain
+        // escrow; appended last, so every earlier offset above is
+        // unchanged.
+        assert_eq!(
+            u64::from_le_bytes(bytes[608..616].try_into().unwrap()),
+            0,
+            "timelock: zeroed"
         );
 
         // With quorum: same total length (space is always reserved), Some
@@ -6302,7 +6516,7 @@ mod account_space_tests {
         // Confirm milestone 0 with both parties, release its tranche.
         e.confirm_milestone(ALICE, 0).unwrap();
         e.confirm_milestone(BOB, 0).unwrap();
-        e.release_milestone(ALICE, 0, None).unwrap();
+        e.release_milestone(ALICE, 1_750_000_000, 0, None).unwrap();
         // Skip milestone 1 by dual approval: the tranche is refunded to
         // the initializer's claim, not released.
         e.skip_milestone(ALICE, 1).unwrap();
@@ -6368,7 +6582,7 @@ mod account_space_tests {
         assert_eq!(e.mint(), Some(MINT));
         // A bound mint survives a state transition (release moves money,
         // never the binding).
-        e.release(ALICE, 1_000_000, Some(MINT)).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, Some(MINT)).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes[489], 1, "mint discriminant unchanged by release");
         assert_eq!(&bytes[490..522], &MINT);
@@ -6383,16 +6597,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 616) * 3480 * 2 = 744 * 6960 = 5_178_240 lamports.
-        assert_eq!(full, 5_178_240);
+        // (128 + 624) * 3480 * 2 = 752 * 6960 = 5_233_920 lamports.
+        assert_eq!(full, 5_233_920);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 205) * 3480 * 2 = 333 * 6960 = 2_317_680 lamports.
-        assert_eq!(no_quorum, 2_317_680);
+        // (128 + 213) * 3480 * 2 = 341 * 6960 = 2_373_360 lamports.
+        assert_eq!(no_quorum, 2_373_360);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -6435,12 +6649,12 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(5_178_240, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(5_233_920, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(4_704_959, params.0, params.1),
             Err(RentShortfall {
-                required: 5_178_240,
+                required: 5_233_920,
                 provided: 4_704_959,
             })
         );
@@ -6453,7 +6667,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 5_178_240,
+                required: 5_233_920,
                 provided: 0,
             })
         );
@@ -6495,7 +6709,7 @@ mod partial_release_tests {
     #[test]
     fn partial_release_stays_funded_with_progress_tracked() {
         let mut e = funded_escrow();
-        e.release(ALICE, 400_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
         assert_eq!(
             e.state(),
             EscrowState::Funded,
@@ -6504,7 +6718,7 @@ mod partial_release_tests {
         assert_eq!(e.released_amount(), 400_000);
         assert_eq!(e.remaining_amount(), 600_000);
         // A second partial accumulates on top of the first.
-        e.release(ALICE, 100_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 100_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!(e.released_amount(), 500_000);
         assert_eq!(e.remaining_amount(), 500_000);
@@ -6513,8 +6727,8 @@ mod partial_release_tests {
     #[test]
     fn final_partial_release_closes_the_escrow() {
         let mut e = funded_escrow();
-        e.release(ALICE, 400_000, None).unwrap();
-        e.release(ALICE, 600_000, None).unwrap(); // reaches the locked amount exactly
+        e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 600_000, None).unwrap(); // reaches the locked amount exactly
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(e.released_amount(), 1_000_000);
         assert_eq!(e.remaining_amount(), 0);
@@ -6523,7 +6737,7 @@ mod partial_release_tests {
     #[test]
     fn zero_amount_release_is_amount_mismatch_and_changes_nothing() {
         let mut e = funded_escrow();
-        assert_eq!(e.release(ALICE, 0, None), Err(EscrowError::AmountMismatch));
+        assert_eq!(e.release(ALICE, 1_750_000_000, 0, None), Err(EscrowError::AmountMismatch));
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!(e.released_amount(), 0);
         assert_eq!(e.remaining_amount(), 1_000_000);
@@ -6532,10 +6746,10 @@ mod partial_release_tests {
     #[test]
     fn release_beyond_remaining_is_release_exceeds_locked() {
         let mut e = funded_escrow();
-        e.release(ALICE, 600_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 600_000, None).unwrap();
         // 400_000 remains: asking for one lamport more must fail.
         assert_eq!(
-            e.release(ALICE, 400_001, None),
+            e.release(ALICE, 1_750_000_000, 400_001, None),
             Err(EscrowError::ReleaseExceedsLocked)
         );
         assert_eq!(e.state(), EscrowState::Funded);
@@ -6555,11 +6769,11 @@ mod partial_release_tests {
         // its amount. The checked_add guard must catch it instead.
         let mut e = Escrow::initialize(ALICE, BOB, u64::MAX, EXPIRES_AT).unwrap();
         e.fund(ALICE).unwrap();
-        e.release(ALICE, u64::MAX - 10, None).unwrap();
+        e.release(ALICE, 1_750_000_000, u64::MAX - 10, None).unwrap();
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!(e.released_amount(), u64::MAX - 10);
         assert_eq!(
-            e.release(ALICE, 11, None),
+            e.release(ALICE, 1_750_000_000, 11, None),
             Err(EscrowError::ReleaseExceedsLocked)
         );
         assert_eq!(
@@ -6568,7 +6782,7 @@ mod partial_release_tests {
             "the counter is untouched by the overflow attempt"
         );
         // The exact remainder still works and closes the escrow.
-        e.release(ALICE, 10, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 10, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(e.remaining_amount(), 0);
     }
@@ -6583,7 +6797,7 @@ mod partial_release_tests {
         e.fund(ALICE).unwrap();
         // A partial amount changes nothing about the gate: no attestations.
         assert_eq!(
-            e.release(ALICE, 400_000, None),
+            e.release(ALICE, 1_750_000_000, 400_000, None),
             Err(EscrowError::QuorumNotReached)
         );
         assert_eq!(e.released_amount(), 0);
@@ -6600,23 +6814,23 @@ mod partial_release_tests {
         e.attest(ATTESTOR_1).unwrap();
         // 1 of 2: still gated.
         assert_eq!(
-            e.release(ALICE, 400_000, None),
+            e.release(ALICE, 1_750_000_000, 400_000, None),
             Err(EscrowError::QuorumNotReached)
         );
         e.attest(ATTESTOR_2).unwrap();
         // Gate satisfied: the partial release goes through and stays Funded.
-        e.release(ALICE, 400_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!(e.released_amount(), 400_000);
         // The final partial closes the escrow.
-        e.release(ALICE, 600_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 600_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
 
     #[test]
     fn cancel_after_partial_release_refunds_remainder_and_preserves_released() {
         let mut e = funded_escrow();
-        e.release(ALICE, 400_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
         e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         // Released funds stay released; the refund is the remainder.
@@ -6627,10 +6841,10 @@ mod partial_release_tests {
     #[test]
     fn release_after_full_release_is_invalid_transition() {
         let mut e = funded_escrow();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(
-            e.release(ALICE, 1_000_000, None),
+            e.release(ALICE, 1_750_000_000, 1_000_000, None),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.released_amount(), 1_000_000);
@@ -6787,7 +7001,7 @@ mod dual_sig_tests {
         // The rest of the machine is unchanged once funded.
         let mut e = activated_escrow();
         e.fund(ALICE).unwrap();
-        e.release(ALICE, 400_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!((e.released_amount(), e.remaining_amount()), (400_000, 600_000));
         e.cancel(ALICE, None, ALICE).unwrap();
@@ -6808,10 +7022,10 @@ mod dual_sig_tests {
         e.activate(ALICE).unwrap();
         e.activate(BOB).unwrap();
         e.fund(ALICE).unwrap();
-        assert_eq!(e.release(ALICE, 1_000_000, None), Err(EscrowError::QuorumNotReached));
+        assert_eq!(e.release(ALICE, 1_750_000_000, 1_000_000, None), Err(EscrowError::QuorumNotReached));
         e.attest([0xA1; 32]).unwrap();
         e.attest([0xA2; 32]).unwrap();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
 
@@ -6830,7 +7044,7 @@ mod dual_sig_tests {
         e.attest([0xA1; 32]).unwrap();
         assert!(e.quorum().unwrap().is_satisfied());
         e.fund(ALICE).unwrap();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
 
@@ -7038,7 +7252,7 @@ mod vesting_tests {
         // vested <= released, saturates to zero, and reports
         // AmountMismatch instead of going negative.
         let mut e = funded_vesting_escrow();
-        e.release(ALICE, 800_000, None).unwrap(); // only 500_000 vested at midpoint
+        e.release(ALICE, 1_750_000_000, 800_000, None).unwrap(); // only 500_000 vested at midpoint
         assert_eq!(
             e.claim(BOB, START + (END - START) / 2, None),
             Err(EscrowError::AmountMismatch)
@@ -7103,7 +7317,7 @@ mod vesting_tests {
         let mut e = funded_vesting_escrow();
         assert_eq!(e.claimable_amount(START - 1), 0);
         assert_eq!(e.claimable_amount((START + END) / 2), 500_000);
-        e.release(ALICE, 200_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 200_000, None).unwrap();
         assert_eq!(
             e.claimable_amount((START + END) / 2),
             300_000,
@@ -7127,7 +7341,7 @@ mod vesting_tests {
         // refunded holds across mixed claim/release/cancel flows.
         let mut e = funded_vesting_escrow();
         e.claim(BOB, START + (END - START) / 2, None).unwrap(); // 500_000
-        e.release(ALICE, 200_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 200_000, None).unwrap();
         e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(e.released_amount(), 700_000);
         assert_eq!(e.remaining_amount(), 300_000);
@@ -7267,7 +7481,7 @@ mod arbitration_tests {
         // leaves state and money untouched.
         let mut e = disputed_escrow();
         assert_eq!(
-            e.release(ALICE, 100_000, None),
+            e.release(ALICE, 1_750_000_000, 100_000, None),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.cancel(ALICE, None, ALICE), Err(EscrowError::InvalidStateTransition));
@@ -7366,7 +7580,7 @@ mod arbitration_tests {
         // Partial releases made before the dispute are honored: the
         // arbiter splits only what is still locked.
         let mut e = funded_arbitrated_escrow();
-        e.release(ALICE, 400_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
         e.escalate(BOB, EXPIRES_AT - 1, None).unwrap();
         let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None).unwrap();
         assert_eq!((payout, fee, refund), (600_000, 0, 0));
@@ -7554,7 +7768,7 @@ mod milestone_tests {
         assert!(!e.milestone_confirmed(1));
         // After milestone 0 settles, milestone 1 is confirmable.
         confirm_both(&mut e, 0);
-        e.release_milestone(ALICE, 0, None).unwrap();
+        e.release_milestone(ALICE, 1_750_000_000, 0, None).unwrap();
         e.confirm_milestone(ALICE, 1).unwrap();
         assert!(!e.milestone_confirmed(1));
     }
@@ -7591,14 +7805,14 @@ mod milestone_tests {
     fn release_milestone_full_sequence_closes_the_escrow() {
         let mut e = milestone_escrow();
         confirm_both(&mut e, 0);
-        let (t0, fee0) = e.release_milestone(ALICE, 0, None).unwrap();
+        let (t0, fee0) = e.release_milestone(ALICE, 1_750_000_000, 0, None).unwrap();
         assert_eq!((t0, fee0), (400_000, 0), "the net tranche is returned for transfer sizing");
         assert_eq!(e.state(), EscrowState::Funded, "more tranches remain");
         assert_eq!((e.released_amount(), e.remaining_amount()), (400_000, 600_000));
         assert_eq!(e.next_milestone(), Some(1));
 
         confirm_both(&mut e, 1);
-        let (t1, fee1) = e.release_milestone(ALICE, 1, None).unwrap();
+        let (t1, fee1) = e.release_milestone(ALICE, 1_750_000_000, 1, None).unwrap();
         assert_eq!((t1, fee1), (600_000, 0));
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(e.released_amount(), 1_000_000);
@@ -7612,16 +7826,16 @@ mod milestone_tests {
         confirm_both(&mut e, 0);
         // The taker is the beneficiary, not the authority.
         assert_eq!(
-            e.release_milestone(BOB, 0, None),
+            e.release_milestone(BOB, 1_750_000_000, 0, None),
             Err(EscrowError::Unauthorized)
         );
         assert_eq!(
-            e.release_milestone(MALLORY, 0, None),
+            e.release_milestone(MALLORY, 1_750_000_000, 0, None),
             Err(EscrowError::Unauthorized)
         );
         // Releasing milestone 1 while milestone 0 is unsettled.
         assert_eq!(
-            e.release_milestone(ALICE, 1, None),
+            e.release_milestone(ALICE, 1_750_000_000, 1, None),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.released_amount(), 0);
@@ -7631,10 +7845,10 @@ mod milestone_tests {
     fn release_milestone_cannot_double_release() {
         let mut e = milestone_escrow();
         confirm_both(&mut e, 0);
-        e.release_milestone(ALICE, 0, None).unwrap();
+        e.release_milestone(ALICE, 1_750_000_000, 0, None).unwrap();
         // Milestone 0 is settled: re-releasing it is out-of-order now.
         assert_eq!(
-            e.release_milestone(ALICE, 0, None),
+            e.release_milestone(ALICE, 1_750_000_000, 0, None),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.released_amount(), 400_000);
@@ -7654,13 +7868,13 @@ mod milestone_tests {
         e.fund(ALICE).unwrap();
         confirm_both(&mut e, 0);
         assert_eq!(
-            e.release_milestone(ALICE, 0, None),
+            e.release_milestone(ALICE, 1_750_000_000, 0, None),
             Err(EscrowError::QuorumNotReached)
         );
         assert_eq!(e.released_amount(), 0);
         e.attest([0xA1; 32]).unwrap();
         e.attest([0xA2; 32]).unwrap();
-        assert_eq!(e.release_milestone(ALICE, 0, None).unwrap(), (400_000, 0));
+        assert_eq!(e.release_milestone(ALICE, 1_750_000_000, 0, None).unwrap(), (400_000, 0));
     }
 
     #[test]
@@ -7669,7 +7883,7 @@ mod milestone_tests {
         // time-based claims would break per-tranche accounting.
         let mut e = milestone_escrow();
         assert_eq!(
-            e.release(ALICE, 400_000, None),
+            e.release(ALICE, 1_750_000_000, 400_000, None),
             Err(EscrowError::InvalidMilestones)
         );
         let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
@@ -7741,13 +7955,13 @@ mod milestone_tests {
         assert!(!e.milestone_confirmed(0));
         assert!(!e.milestone_settled(0));
         assert_eq!(
-            e.release_milestone(ALICE, 0, None),
+            e.release_milestone(ALICE, 1_750_000_000, 0, None),
             Err(EscrowError::MilestoneNotConfirmed)
         );
         // The taker aligns with the release path: now it is confirmed.
         e.confirm_milestone(BOB, 0).unwrap();
         assert!(e.milestone_confirmed(0));
-        assert_eq!(e.release_milestone(ALICE, 0, None).unwrap(), (400_000, 0));
+        assert_eq!(e.release_milestone(ALICE, 1_750_000_000, 0, None).unwrap(), (400_000, 0));
     }
 
     #[test]
@@ -7759,7 +7973,7 @@ mod milestone_tests {
         e.skip_milestone(ALICE, 0).unwrap();
         e.skip_milestone(BOB, 0).unwrap();
         confirm_both(&mut e, 1);
-        e.release_milestone(ALICE, 1, None).unwrap();
+        e.release_milestone(ALICE, 1_750_000_000, 1, None).unwrap();
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!(e.released_amount(), 600_000);
         assert_eq!(e.skipped_amount(), 400_000);
@@ -7794,7 +8008,7 @@ mod milestone_tests {
             .unwrap();
         e.fund(ALICE).unwrap();
         confirm_both(&mut e, 0);
-        e.release_milestone(ALICE, 0, None).unwrap(); // 400_000 to the taker
+        e.release_milestone(ALICE, 1_750_000_000, 0, None).unwrap(); // 400_000 to the taker
         e.escalate(BOB, EXPIRES_AT - 1, None).unwrap();
         let (payout, fee, refund) = e.resolve(ARBITER, 300_000, None).unwrap();
         assert_eq!((payout, fee, refund), (300_000, 0, 300_000));
@@ -7814,10 +8028,10 @@ mod milestone_tests {
             .unwrap();
         e.fund(ALICE).unwrap();
         confirm_both(&mut e, 0);
-        assert_eq!(e.release_milestone(ALICE, 0, None).unwrap(), (u64::MAX - 5, 0));
+        assert_eq!(e.release_milestone(ALICE, 1_750_000_000, 0, None).unwrap(), (u64::MAX - 5, 0));
         assert_eq!(e.state(), EscrowState::Funded);
         confirm_both(&mut e, 1);
-        assert_eq!(e.release_milestone(ALICE, 1, None).unwrap(), (5, 0));
+        assert_eq!(e.release_milestone(ALICE, 1_750_000_000, 1, None).unwrap(), (5, 0));
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(e.released_amount(), u64::MAX);
         assert_eq!(e.remaining_amount(), 0);
@@ -7841,7 +8055,7 @@ mod milestone_tests {
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(
-            e.release_milestone(ALICE, 0, None),
+            e.release_milestone(ALICE, 1_750_000_000, 0, None),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(
@@ -7909,7 +8123,7 @@ mod protocol_fee_tests {
     #[test]
     fn release_splits_payout_and_fee() {
         let mut e = funded_fee_escrow(250); // 2.5%
-        let (payout, fee) = e.release(ALICE, 400_000, None).unwrap();
+        let (payout, fee) = e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
         assert_eq!((payout, fee), (390_000, 10_000));
         assert_eq!(payout + fee, 400_000, "fee is a slice of the gross");
         assert_eq!(e.fees_paid(), 10_000);
@@ -7919,7 +8133,7 @@ mod protocol_fee_tests {
         assert_eq!(e.remaining_amount(), 600_000);
         assert_eq!(e.state(), EscrowState::Funded);
         // Fees accumulate across partial releases.
-        let (payout2, fee2) = e.release(ALICE, 600_000, None).unwrap();
+        let (payout2, fee2) = e.release(ALICE, 1_750_000_000, 600_000, None).unwrap();
         assert_eq!((payout2, fee2), (585_000, 15_000));
         assert_eq!(e.fees_paid(), 25_000);
         assert_eq!(e.state(), EscrowState::Released);
@@ -7930,7 +8144,7 @@ mod protocol_fee_tests {
     fn full_rate_routes_everything_to_the_fee_account() {
         // 10_000 bps (100%) is a valid config: the taker nets zero.
         let mut e = funded_fee_escrow(10_000);
-        let (payout, fee) = e.release(ALICE, 1_000_000, None).unwrap();
+        let (payout, fee) = e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!((payout, fee), (0, 1_000_000));
         assert_eq!(e.fees_paid(), 1_000_000);
         assert_eq!(e.state(), EscrowState::Released);
@@ -7965,7 +8179,7 @@ mod protocol_fee_tests {
         e.fund(ALICE).unwrap();
         e.confirm_milestone(ALICE, 0).unwrap();
         e.confirm_milestone(BOB, 0).unwrap();
-        let (payout, fee) = e.release_milestone(ALICE, 0, None).unwrap();
+        let (payout, fee) = e.release_milestone(ALICE, 1_750_000_000, 0, None).unwrap();
         assert_eq!((payout, fee), (380_000, 20_000));
         assert_eq!(e.fees_paid(), 20_000);
         assert_eq!(e.released_amount(), 400_000, "released keeps the gross");
@@ -8007,19 +8221,19 @@ mod protocol_fee_tests {
         // Unauthorized release.
         let mut e = funded_fee_escrow(250);
         assert_eq!(
-            e.release(MALLORY, 400_000, None),
+            e.release(MALLORY, 1_750_000_000, 400_000, None),
             Err(EscrowError::Unauthorized)
         );
         assert_eq!(e.fees_paid(), 0);
         // Over-release: the cap check runs before any fee is charged.
         assert_eq!(
-            e.release(ALICE, 1_000_001, None),
+            e.release(ALICE, 1_750_000_000, 1_000_001, None),
             Err(EscrowError::ReleaseExceedsLocked)
         );
         assert_eq!(e.fees_paid(), 0);
         assert_eq!(e.released_amount(), 0);
         // Zero amount.
-        assert_eq!(e.release(ALICE, 0, None), Err(EscrowError::AmountMismatch));
+        assert_eq!(e.release(ALICE, 1_750_000_000, 0, None), Err(EscrowError::AmountMismatch));
         assert_eq!(e.fees_paid(), 0);
         // Claim before anything is vested.
         let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
@@ -8195,7 +8409,7 @@ mod combination_matrix_tests {
             // The plan owns the schedule: arbitrary and time-based pulls
             // are disabled, even when vesting is also configured.
             assert_eq!(
-                e.release(ALICE, AMOUNT, mint),
+                e.release(ALICE, 1_750_000_000, AMOUNT, mint),
                 Err(EscrowError::InvalidMilestones)
             );
             if flags & F_VESTING != 0 {
@@ -8208,7 +8422,7 @@ mod combination_matrix_tests {
                 let i = i as u8;
                 e.confirm_milestone(ALICE, i).unwrap();
                 e.confirm_milestone(BOB, i).unwrap();
-                let (payout, fee) = e.release_milestone(ALICE, i, mint).unwrap();
+                let (payout, fee) = e.release_milestone(ALICE, 1_750_000_000, i, mint).unwrap();
                 assert_eq!(fee, expected_fee(flags, tranche));
                 assert_eq!(payout + fee, tranche, "fee is a slice of the gross");
             }
@@ -8218,7 +8432,7 @@ mod combination_matrix_tests {
             assert_eq!(fee, expected_fee(flags, AMOUNT));
             assert_eq!(payout + fee, AMOUNT, "fee is a slice of the gross");
         } else {
-            let (payout, fee) = e.release(ALICE, AMOUNT, mint).unwrap();
+            let (payout, fee) = e.release(ALICE, 1_750_000_000, AMOUNT, mint).unwrap();
             assert_eq!(fee, expected_fee(flags, AMOUNT));
             assert_eq!(payout + fee, AMOUNT, "fee is a slice of the gross");
         }
@@ -8415,43 +8629,43 @@ mod combination_matrix_tests {
         // Authority first: a stranger learns nothing, even though the
         // mint, the plan, the quorum, and the amount would all also fail.
         assert_eq!(
-            e.release(MALLORY, AMOUNT, mint),
+            e.release(MALLORY, 1_750_000_000, AMOUNT, mint),
             Err(EscrowError::Unauthorized)
         );
         // Mint binding before the milestone plan, the quorum, and the
         // amount checks.
         assert_eq!(
-            e.release(ALICE, AMOUNT, Some(OTHER_MINT)),
+            e.release(ALICE, 1_750_000_000, AMOUNT, Some(OTHER_MINT)),
             Err(EscrowError::MintMismatch)
         );
         // The milestone plan owns the release schedule: the config error
         // fires before the quorum gate runs (a zero amount would also be
         // an amount error, but the plan rejects first).
         assert_eq!(
-            e.release(ALICE, AMOUNT, mint),
+            e.release(ALICE, 1_750_000_000, AMOUNT, mint),
             Err(EscrowError::InvalidMilestones)
         );
         assert_eq!(
-            e.release(ALICE, 0, mint),
+            e.release(ALICE, 1_750_000_000, 0, mint),
             Err(EscrowError::InvalidMilestones)
         );
         // The quorum guards the milestone path exactly like `release`:
         // mint mismatch still wins over the quorum gate ...
         assert_eq!(
-            e.release_milestone(ALICE, 0, Some(OTHER_MINT)),
+            e.release_milestone(ALICE, 1_750_000_000, 0, Some(OTHER_MINT)),
             Err(EscrowError::MintMismatch)
         );
         // ... and the quorum gate wins over the confirmation gate.
         e.confirm_milestone(ALICE, 0).unwrap();
         e.confirm_milestone(BOB, 0).unwrap();
         assert_eq!(
-            e.release_milestone(ALICE, 0, mint),
+            e.release_milestone(ALICE, 1_750_000_000, 0, mint),
             Err(EscrowError::QuorumNotReached)
         );
         // Satisfy the quorum: the path opens and the fee slices the
         // tranche (floor(400_000 * 250 / 10_000) = 10_000).
         e.attest(A2).unwrap();
-        let (payout, fee) = e.release_milestone(ALICE, 0, mint).unwrap();
+        let (payout, fee) = e.release_milestone(ALICE, 1_750_000_000, 0, mint).unwrap();
         assert_eq!((payout, fee), (390_000, 10_000));
         assert_conservation(e.remaining_amount(), e.released_amount(), 0);
         assert_fee_bound(&e);
@@ -8528,7 +8742,7 @@ mod combination_matrix_tests {
         assert_eq!(e.mint(), None);
         assert_eq!(e.fee_bps(), 0);
         assert!(!e.dual_sig_required());
-        let (payout, fee) = e.release(ALICE, AMOUNT, None).unwrap();
+        let (payout, fee) = e.release(ALICE, 1_750_000_000, AMOUNT, None).unwrap();
         assert_eq!((payout, fee), (AMOUNT, 0));
         assert_eq!(e.state(), EscrowState::Released);
         assert_conservation(0, AMOUNT, 0);
@@ -8658,7 +8872,7 @@ mod grace_tests {
         // The grace period composes with partial releases: the refund is
         // the remainder, and released progress is preserved for audit.
         let mut e = funded_with_grace();
-        e.release(ALICE, 400_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
         assert_eq!(
             e.cancel_expired(ALICE, EXPIRES_AT + GRACE - 1, None, ALICE),
             Err(EscrowError::NotExpired)
@@ -9007,7 +9221,7 @@ mod penalty_tests {
         // After a partial release the penalty slices the *remainder*,
         // not the original lockup.
         let mut e = funded_with_penalty(1_000_000, 250);
-        e.release(ALICE, 400_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
         let (refund, penalty) = e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
         // floor(600_000 * 250 / 10_000) = 15_000.
         assert_eq!((refund, penalty), (585_000, 15_000));
@@ -9118,6 +9332,219 @@ mod penalty_tests {
     }
 }
 
+// ---------- AV-27: timelock ----------
+
+#[cfg(test)]
+mod timelock_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const UNLOCK_AT: u64 = 1_900_000_000;
+
+    fn funded_with_timelock() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    fn funded_vesting_with_timelock() -> Escrow {
+        let schedule = VestingSchedule::new(UNLOCK_AT - 1_000, UNLOCK_AT + 1_000).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    #[test]
+    fn error_code_is_118_and_stable() {
+        assert_eq!(EscrowError::TimelockNotReached.code(), 118);
+    }
+
+    #[test]
+    fn with_timelock_is_uninitialized_only() {
+        let mut e = funded_with_timelock();
+        assert_eq!(
+            e.with_timelock(UNLOCK_AT + 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.unlock_at(), UNLOCK_AT, "rejected reconfig changes nothing");
+    }
+
+    #[test]
+    fn release_is_gated_until_unlock() {
+        let mut e = funded_with_timelock();
+        // One second early: locked, and the failed call moves nothing.
+        assert_eq!(
+            e.release(ALICE, UNLOCK_AT - 1, 1_000_000, None),
+            Err(EscrowError::TimelockNotReached)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!((e.released_amount(), e.remaining_amount()), (0, 1_000_000));
+        // At the unlock timestamp: the gate passes.
+        e.release(ALICE, UNLOCK_AT, 400_000, None).unwrap();
+        assert_eq!((e.released_amount(), e.remaining_amount()), (400_000, 600_000));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn timelock_check_order_comes_after_authority_state_and_config() {
+        let mut e = funded_with_timelock();
+        // Authority first: a stranger learns nothing about the lock.
+        assert_eq!(
+            e.release(MALLORY, UNLOCK_AT - 1, 1_000_000, None),
+            Err(EscrowError::Unauthorized)
+        );
+        // State before the lock: an unfunded escrow reports state, not
+        // the timelock.
+        let mut unfunded = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap();
+        assert_eq!(
+            unfunded.release(ALICE, UNLOCK_AT - 1, 1_000_000, None),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn claim_is_gated_until_unlock() {
+        let mut e = funded_vesting_with_timelock();
+        // Fully vested at UNLOCK_AT, but the timelock still holds.
+        assert_eq!(
+            e.claim(BOB, UNLOCK_AT - 1, None),
+            Err(EscrowError::TimelockNotReached)
+        );
+        assert_eq!(e.released_amount(), 0);
+        let (payout, fee) = e.claim(BOB, UNLOCK_AT, None).unwrap();
+        assert_eq!(payout + fee, 500_000, "half vested at the unlock midpoint");
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn release_milestone_is_gated_until_unlock() {
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        assert_eq!(
+            e.release_milestone(ALICE, UNLOCK_AT - 1, 0, None),
+            Err(EscrowError::TimelockNotReached)
+        );
+        assert!(!e.milestone_settled(0));
+        let (tranche, _) = e.release_milestone(ALICE, UNLOCK_AT, 0, None).unwrap();
+        assert_eq!(tranche, 400_000);
+        assert!(e.milestone_settled(0));
+    }
+
+    #[test]
+    fn cancel_is_not_gated_by_the_timelock() {
+        // The initializer can always walk away, even before unlock —
+        // the lock delays payouts, never exits.
+        let mut e = funded_with_timelock();
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn cancel_expired_is_not_gated_by_the_timelock() {
+        // A misconfigured far-future timelock must never trap funds:
+        // after expiry either party still walks the cancel_expired path.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(u64::MAX - 1)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn arbiter_resolve_is_not_gated_by_the_timelock() {
+        // Arbitration is the trusted settlement mechanism: it settles
+        // even under a lock. (The timelock here sits past expiry to prove
+        // the point; the dispute is escalated while the window is open.)
+        const LATE_UNLOCK: u64 = EXPIRES_AT + 100;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_timelock(LATE_UNLOCK)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        let (payout, _fee, _refund) = e.resolve(ARBITER, 600_000, None).unwrap();
+        assert_eq!(payout, 600_000);
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn zero_unlock_at_means_no_lock() {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(0)
+            .unwrap();
+        assert!(e.is_unlock_eligible(0));
+        let mut funded = e;
+        funded.fund(ALICE).unwrap();
+        funded.release(ALICE, 0, 1_000_000, None).unwrap();
+        assert_eq!(funded.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn keeper_lists_claim_only_after_unlock() {
+        use crate::{scan_keeper_actions, KeeperActionKind, WatchedEscrow};
+        let e = funded_vesting_with_timelock();
+        let watched = [WatchedEscrow {
+            escrow_id: [0x01; 32],
+            escrow: e,
+        }];
+        // Before unlock: the claim call would fail, so it is not listed.
+        let early = scan_keeper_actions(&watched, UNLOCK_AT - 1);
+        assert!(
+            !early.actions.iter().any(|a| a.kind == KeeperActionKind::Claim),
+            "a locked claim is not an executable keeper call"
+        );
+        // At unlock: listed.
+        let at_unlock = scan_keeper_actions(&watched, UNLOCK_AT);
+        assert!(
+            at_unlock.actions.iter().any(|a| a.kind == KeeperActionKind::Claim),
+            "an unlocked claim is executable"
+        );
+    }
+
+    #[test]
+    fn timelock_persists_in_serialized_layout_tail() {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(
+            u64::from_le_bytes(bytes[608..616].try_into().unwrap()),
+            UNLOCK_AT,
+            "timelock tail offset"
+        );
+    }
+}
+
 // ---------- AV-25: dual-signed quorum threshold governance ----------
 //
 // The quorum threshold is fixed before funding (`with_quorum`), but
@@ -9156,12 +9583,12 @@ mod quorum_governance_tests {
         let mut e = funded_quorum(2);
         e.attest(ATTESTOR_1).unwrap();
         assert_eq!(
-            e.release(ALICE, 1_000_000, None),
+            e.release(ALICE, 1_750_000_000, 1_000_000, None),
             Err(EscrowError::QuorumNotReached)
         );
         e.update_quorum(ALICE, BOB, 1).unwrap();
         assert_eq!(e.quorum().unwrap().threshold(), 1);
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
 
@@ -9175,12 +9602,12 @@ mod quorum_governance_tests {
         assert_eq!(e.quorum().unwrap().threshold(), 2);
         // One vote no longer satisfies the gate.
         assert_eq!(
-            e.release(ALICE, 1_000_000, None),
+            e.release(ALICE, 1_750_000_000, 1_000_000, None),
             Err(EscrowError::QuorumNotReached)
         );
         // The second attestor's vote restores the release path.
         e.attest(ATTESTOR_2).unwrap();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
 
@@ -9197,7 +9624,7 @@ mod quorum_governance_tests {
         assert_eq!(e.quorum().unwrap().threshold(), 1);
         e.fund(ALICE).unwrap();
         e.attest(ATTESTOR_1).unwrap();
-        e.release(ALICE, 1_000_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
 
