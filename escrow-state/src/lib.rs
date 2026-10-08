@@ -6,11 +6,19 @@
 //! `programs/escrow-vault` wraps exactly this logic for the Solana target.
 
 mod events;
+mod keeper;
 
 // AV-18: typed indexer events — an event-logging adapter over `Escrow`
 // plus the `EscrowEvent` / `EscrowEventKind` / `EventAmounts` record
 // types. Purely additive: no existing signature changed.
 pub use events::{EscrowEvent, EscrowEventKind, EventAmounts, IndexedEscrow};
+
+// AV-20: off-chain keeper report — scan a batch of escrows for executable
+// `cancel_expired` / `claim` calls and serialize the call list as JSON.
+// Purely additive and read-only (dry-run by construction).
+pub use keeper::{
+    scan_keeper_actions, KeeperAction, KeeperActionKind, KeeperReport, WatchedEscrow,
+};
 
 /// Lifecycle states of an escrow vault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -577,6 +577,36 @@ comes from the clock sysvar; `seq` is the vault's persisted per-escrow
 counter (the real build appends it to the `Vault` account, growing
 `VAULT_SPACE` 540 → 548).
 
+## Keeper report (AV-20)
+
+A keeper bot watches many vaults and needs the executable call list, not
+raw account data. `escrow-state/src/keeper.rs` scans a batch of
+`WatchedEscrow { escrow_id, escrow }` snapshots at a given `now` and
+returns a `KeeperReport` of immediately executable calls:
+
+| action | listed when | caller | `amount` |
+|--------|-------------|--------|----------|
+| `cancel_expired(authority, now, mint)` | `Funded`, `now >= expires_at`, remainder > 0 | initializer (canonical; the taker may also call) | refundable remainder (never fee'd) |
+| `claim(taker, now, mint)` | `Funded`, vesting attached, no milestone plan, vested − released > 0, quorum satisfied if configured | taker | gross vested-but-unreleased (`payout + fee == amount`) |
+
+Only *executable* calls are listed: a vesting claim behind an unsatisfied
+quorum is withheld (the call would fail), and a milestone-plan escrow
+never lists `claim` (the plan owns the release schedule). Each action
+carries the exact instruction arguments — `caller`, `mint` (the bound SPL
+mint, or `null` on the native-SOL path) — so the keeper can build the
+`cancel_expired` / `claim` instruction directly. The scan is a pure read
+over `&Escrow` snapshots: dry-run by construction, zero side effects,
+deterministic output in input order. `KeeperReport::to_json()` emits
+hand-serialized JSON (the crate stays dependency-free; keys are 64-char
+lowercase hex).
+
+```json
+{"at":1750000000,"scanned":1,"actions":[
+  {"escrow_id":"...","action":"claim","caller":"...","caller_role":"taker",
+   "mint":null,"amount":500000,"reason":"vesting_unlocked"}
+]}
+```
+
 ## Account space & rent
 
 The `Vault` account layout is pinned in `escrow-state` (`VAULT_FIELDS`;
@@ -636,6 +666,19 @@ cargo test -p escrow-state
 ```
 
 Requires a stable Rust toolchain (`rustup toolchain install stable`).
+
+**Configuration matrix (AV-19).** `combination_matrix_tests` in
+`escrow-state/src/lib.rs` deterministically enumerates all 2⁶ = 64
+combinations of the opt-in axes (dual_sig × quorum × vesting × milestones
+× mint × protocol_fee — no RNG) and drives every combination through its
+taker-payout path to `Released` and through `cancel_expired` to
+`Cancelled`, asserting the conservation invariant
+(`inflow == locked + released + refunded`) and the fee bound
+(`fees_paid <= released`) throughout; a coverage self-test pins that the
+enumeration hits every pairwise and triplewise value assignment, and
+focused probes on the maximal configuration verify the documented check
+orders, builder immutability after funding, and builder-order
+irrelevance.
 
 ### Local-validator integration stubs
 
