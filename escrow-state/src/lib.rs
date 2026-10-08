@@ -142,6 +142,17 @@ pub struct Escrow {
     /// charged no fee). Appended last so every earlier field offset
     /// stays stable.
     fees_paid: u64,
+    /// AV-21: expiry grace period in seconds. `cancel_expired` requires
+    /// `now >= expires_at + grace_period` (see
+    /// [`Escrow::is_expiry_eligible`]): the keeper's off-chain clock can
+    /// drift from the Solana cluster clock, and without a grace period
+    /// the keeper would submit `cancel_expired` the moment *its* clock
+    /// passes `expires_at`, only for the chain to reject it as
+    /// `NotExpired`. Opt-in via [`Escrow::with_grace_period`]; `0` (the
+    /// default) means no grace — backward compatible. Always present
+    /// (one u64, zeroed when no grace configured). Appended last so
+    /// every earlier field offset stays stable.
+    grace_period: u64,
 }
 
 /// Bit 0 of [`Escrow::activation`]: the initializer has recorded their
@@ -171,7 +182,9 @@ pub enum EscrowError {
     InvalidStateTransition,
     /// [`Escrow::initialize`] called with `amount == 0`.
     AmountMismatch,
-    /// `cancel_expired` called before `expires_at`.
+    /// `cancel_expired` called before the expiry gate passes
+    /// (`now < expires_at + grace_period` — see
+    /// [`Escrow::is_expiry_eligible`]).
     NotExpired,
     /// Quorum policy misconfiguration (empty attestor list, duplicate
     /// attestor, threshold 0 or larger than the attestor count), or
@@ -241,6 +254,13 @@ pub enum EscrowError {
     /// [`EscrowError::InvalidVesting`], [`EscrowError::InvalidArbiter`]
     /// and [`EscrowError::InvalidMint`] (config error).
     InvalidProtocolFee,
+    /// Grace period misconfiguration (AV-21):
+    /// [`Escrow::with_grace_period`] where `expires_at + grace_period`
+    /// would overflow `u64` — in particular a grace period cannot be
+    /// combined with the no-timeout convention
+    /// (`expires_at == u64::MAX`), where it would be meaningless: an
+    /// escrow that can never expire has no expiry gate to grace.
+    InvalidGracePeriod,
 }
 
 impl EscrowError {
@@ -268,6 +288,7 @@ impl EscrowError {
             EscrowError::InvalidMint => 112,
             EscrowError::MintMismatch => 113,
             EscrowError::InvalidProtocolFee => 114,
+            EscrowError::InvalidGracePeriod => 115,
         }
     }
 
@@ -289,6 +310,7 @@ impl EscrowError {
             EscrowError::InvalidMint,
             EscrowError::MintMismatch,
             EscrowError::InvalidProtocolFee,
+            EscrowError::InvalidGracePeriod,
         ]
     }
 }
@@ -636,6 +658,10 @@ impl Escrow {
             // `with_protocol_fee` before funding.
             fee_bps: 0,
             fees_paid: 0,
+            // AV-21: no expiry grace period by default — `cancel_expired`
+            // keeps its historical `now >= expires_at` gate (backward
+            // compatible). Opt in via `with_grace_period` before funding.
+            grace_period: 0,
         })
     }
 
@@ -866,8 +892,15 @@ impl Escrow {
     ///
     /// Unlike [`Escrow::cancel`], either party — the initializer or the
     /// taker — may call this, so a stalled counterparty cannot lock funds
-    /// forever. Requires `now >= expires_at` (the caller supplies the
-    /// clock; on-chain this is the Solana clock sysvar).
+    /// forever. Requires the expiry gate to pass (see
+    /// [`Escrow::is_expiry_eligible`]): `now >= expires_at + grace_period`
+    /// — the caller supplies the clock; on-chain this is the Solana clock
+    /// sysvar. The grace period (AV-21, opt-in via
+    /// [`Escrow::with_grace_period`], `0` by default) absorbs clock drift
+    /// between an off-chain keeper and the cluster: without it a keeper
+    /// whose clock runs ahead would submit `cancel_expired` the moment
+    /// *its* clock passes `expires_at`, only for the chain to reject it
+    /// as `NotExpired`.
     ///
     /// Check order is deliberate: authority first, then state, then the
     /// mint binding (AV-16), then expiry. A stranger never learns
@@ -893,7 +926,7 @@ impl Escrow {
         // AV-16: the refunded tokens must be the tokens this escrow
         // locks (`MintMismatch` otherwise).
         self.require_mint_match(mint)?;
-        if now < self.expires_at {
+        if !self.is_expiry_eligible(now) {
             return Err(EscrowError::NotExpired);
         }
         self.state = EscrowState::Cancelled;
@@ -1156,6 +1189,67 @@ impl Escrow {
     /// gross payouts, and `payout + fee == gross` for every payout.
     pub fn fees_paid(&self) -> u64 {
         self.fees_paid
+    }
+
+    /// Opt in to an expiry grace period (AV-21 — Solana operations /
+    /// backend engineering): [`Escrow::cancel_expired`] then requires
+    /// `now >= expires_at + grace_period` (see
+    /// [`Escrow::is_expiry_eligible`]) instead of `now >= expires_at`.
+    ///
+    /// Why: the off-chain keeper watches vaults with its own clock,
+    /// which can drift from the Solana cluster clock. Without a grace
+    /// period the keeper submits `cancel_expired` the moment *its* clock
+    /// passes `expires_at`, and the chain — whose clock runs behind —
+    /// rejects it as `NotExpired`: a wasted transaction and a confused
+    /// operator. Set the grace period to cover the worst-case keeper /
+    /// cluster clock skew (e.g. `300` for five minutes).
+    ///
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// grace period is fixed before any funds move — mirroring
+    /// [`Escrow::with_quorum`], [`Escrow::with_vesting`],
+    /// [`Escrow::with_arbiter`], [`Escrow::with_mint`] and
+    /// [`Escrow::with_protocol_fee`]. Re-configuring a live escrow is
+    /// rejected with `InvalidStateTransition`.
+    ///
+    /// [`EscrowError::InvalidGracePeriod`] when
+    /// `expires_at + grace_period` would overflow `u64`: in particular a
+    /// grace period cannot be combined with the no-timeout convention
+    /// (`expires_at == u64::MAX`), where it would be meaningless — an
+    /// escrow that can never expire has no expiry gate to grace. `0`
+    /// (the default) means no grace period — backward compatible.
+    pub fn with_grace_period(mut self, grace_period: u64) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        self.expires_at
+            .checked_add(grace_period)
+            .ok_or(EscrowError::InvalidGracePeriod)?;
+        self.grace_period = grace_period;
+        Ok(self)
+    }
+
+    /// The expiry grace period in seconds configured via
+    /// [`Escrow::with_grace_period`]; `0` when none is configured
+    /// (backward compatible).
+    pub fn grace_period(&self) -> u64 {
+        self.grace_period
+    }
+
+    /// True when the expiry gate of [`Escrow::cancel_expired`] passes at
+    /// `now`: `now >= expires_at + grace_period`.
+    ///
+    /// The single source of truth for expiry eligibility: both
+    /// [`Escrow::cancel_expired`] and the off-chain keeper report
+    /// (`keeper::scan_keeper_actions`) evaluate this predicate, so the
+    /// keeper can never list a `cancel_expired` call the chain would
+    /// reject as `NotExpired` — and the event log
+    /// (`IndexedEscrow::cancel_expired`) inherits it by delegating to
+    /// the state machine. The addition saturates: `with_grace_period`
+    /// already rejects configurations that would overflow `u64`, so
+    /// saturation is a backstop, never a behavior.
+    pub fn is_expiry_eligible(&self, now: u64) -> bool {
+        now >= self.expires_at.saturating_add(self.grace_period)
     }
 
     /// Escalate the escrow into arbitration: `Funded -> Disputed`
@@ -1724,6 +1818,11 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // fee was charged). Appended last so every earlier field offset
     // stays stable.
     ("fees_paid", "u64", 8),
+    // AV-21: expiry grace period in seconds (see
+    // `Escrow::with_grace_period`): one u64, always present (zeroed
+    // when no grace period is configured). Appended last so every
+    // earlier field offset stays stable.
+    ("grace_period", "u64", 8),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -1760,9 +1859,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// discriminant (AV-16) is likewise always present: one byte, zeroed when
 /// no mint is bound. The protocol fee fields (AV-17) are always present
 /// too: 2-byte `fee_bps` (zeroed when no fee configured) and 8-byte
-/// `fees_paid` (zeroed when no fee was charged).
+/// `fees_paid` (zeroed when no fee was charged). The grace period (AV-21)
+/// is always present too: 8-byte `grace_period` (zeroed when no grace
+/// period is configured).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -3174,6 +3275,30 @@ mod anchor_idl_tests {
                             program routes each payout's fee to the \
                             protocol fee account",
         },
+        InstructionSpec {
+            // AV-21: expiry grace period in seconds.
+            name: "initialize_grace_period",
+            params: &[(
+                "grace_period",
+                "u64",
+                "instruction param; seconds added to expires_at for the cancel_expired gate",
+            )],
+            method: "Escrow::with_grace_period",
+            input_mapping: "grace_period <- param; authority <- \
+                            accounts.initializer (signer), enforced by the \
+                            Anchor account constraint, not the state \
+                            machine; Uninitialized only, like \
+                            initialize_quorum; expires_at + grace_period \
+                            overflowing u64 is InvalidGracePeriod (in \
+                            particular a grace period cannot be combined \
+                            with the no-timeout convention expires_at == \
+                            u64::MAX); after this, cancel_expired requires \
+                            now >= expires_at + grace_period \
+                            (NotExpired otherwise), so a keeper whose \
+                            clock runs ahead of the cluster clock cannot \
+                            submit a premature cancel; 0 is the valid \
+                            \"no grace\" default",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -3220,6 +3345,7 @@ mod anchor_idl_tests {
             "Escrow::skip_milestone",
             "Escrow::with_mint",
             "Escrow::with_protocol_fee",
+            "Escrow::with_grace_period",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -3243,7 +3369,7 @@ mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_twelve_instructions_take_params() {
+    fn only_thirteen_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -3265,7 +3391,8 @@ mod anchor_idl_tests {
                 &"release_milestone",
                 &"skip_milestone",
                 &"initialize_mint",
-                &"initialize_protocol_fee"
+                &"initialize_protocol_fee",
+                &"initialize_grace_period"
             ]
         );
     }
@@ -3361,6 +3488,47 @@ mod anchor_idl_tests {
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(funded.fee_bps(), 250);
+    }
+
+    #[test]
+    fn initialize_grace_period_maps_param_to_grace_period_field() {
+        // IDL: initialize_grace_period(grace_period: u64). The program
+        // takes the param, then Escrow::with_grace_period; authority <-
+        // accounts.initializer, enforced by the Anchor account
+        // constraint, not the state machine (Uninitialized only, like
+        // initialize_quorum).
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_grace_period(300)
+            .unwrap();
+        assert_eq!(e.grace_period(), 300);
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        // The gate moves: cancel_expired now needs expires_at + grace.
+        let mut funded = e;
+        funded.fund(ALICE).unwrap();
+        assert_eq!(
+            funded.cancel_expired(ALICE, EXPIRES_AT, None),
+            Err(EscrowError::NotExpired)
+        );
+        funded.cancel_expired(ALICE, EXPIRES_AT + 300, None).unwrap();
+        // Documented failure mode: expires_at + grace_period overflows.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+                .unwrap()
+                .with_grace_period(1),
+            Err(EscrowError::InvalidGracePeriod)
+        );
+        // Re-configuring a live escrow is rejected by state.
+        let mut funded = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_grace_period(300)
+            .unwrap();
+        funded.fund(ALICE).unwrap();
+        assert_eq!(
+            funded.with_grace_period(600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(funded.grace_period(), 300);
     }
 
     #[test]
@@ -3829,6 +3997,9 @@ mod anchor_idl_tests {
         // AV-17: the fee rate param populates `fee_bps` directly (u16,
         // not an Option — 0 is the valid "no fee" rate).
         ("initialize_protocol_fee", "fee_bps", "fee_bps"),
+        // AV-21: the grace period param populates `grace_period`
+        // directly (u64 — 0 is the valid "no grace" default).
+        ("initialize_grace_period", "grace_period", "grace_period"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -4067,6 +4238,11 @@ mod error_code_tests {
             EscrowError::InvalidProtocolFee,
             114,
             "with_protocol_fee with fee_bps > 10_000 (not a valid basis-point rate)",
+        ),
+        (
+            EscrowError::InvalidGracePeriod,
+            115,
+            "with_grace_period where expires_at + grace_period would overflow u64 (grace on a no-timeout escrow)",
         ),
     ];
 
@@ -4478,6 +4654,43 @@ mod error_code_tests {
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.fee_bps(), 250, "failed reconfigure keeps the rate");
+    }
+
+    #[test]
+    fn invalid_grace_period_triggered_by_overflow() {
+        // expires_at + grace_period must fit in u64. A grace period on a
+        // no-timeout escrow (expires_at == u64::MAX) always overflows, so
+        // it is rejected as misconfiguration — an escrow that can never
+        // expire has no expiry gate to grace.
+        let never = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX).unwrap();
+        let err = never.with_grace_period(1).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidGracePeriod);
+        assert_eq!(err.code(), 115);
+        // Boundary: u64::MAX - 1 + 1 fits, and is accepted.
+        let edge = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX - 1).unwrap();
+        let e = edge.with_grace_period(1).unwrap();
+        assert_eq!(e.grace_period(), 1);
+        // Same boundary one second further: overflows, rejected.
+        let edge = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX - 1).unwrap();
+        assert_eq!(
+            edge.with_grace_period(2).unwrap_err(),
+            EscrowError::InvalidGracePeriod
+        );
+        // A zero grace period is always accepted, even on a no-timeout
+        // escrow (it is the default — backward compatible).
+        let never = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX).unwrap();
+        let e = never.with_grace_period(0).unwrap();
+        assert_eq!(e.grace_period(), 0);
+        // The grace period is fixed before funding: reconfiguring a live
+        // escrow is InvalidStateTransition, like the other `with_*`
+        // builders.
+        let mut e = escrow().with_grace_period(300).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.with_grace_period(600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.grace_period(), 300, "failed reconfigure keeps the grace");
     }
 
     #[test]
@@ -5061,6 +5274,9 @@ mod account_space_tests {
         // AV-17: cumulative protocol fee charged, always present
         // (zeroed when no fee was charged).
         out.extend_from_slice(&e.fees_paid.to_le_bytes());
+        // AV-21: expiry grace period in seconds, always present
+        // (zeroed when no grace period is configured).
+        out.extend_from_slice(&e.grace_period.to_le_bytes());
         out
     }
 
@@ -5078,9 +5294,10 @@ mod account_space_tests {
         // + (1 + 65) (AV-15 milestone plan) + 8 (AV-15 confirmation bitmap)
         // + 8 (AV-15 skipped counter) + (1 + 32) (AV-16 mint binding)
         // + 2 (AV-17 protocol fee rate) + 8 (AV-17 cumulative fee counter)
-        assert_eq!(ESCROW_BODY_LEN, 532, "escrow payload bytes");
+        // + 8 (AV-21 expiry grace period)
+        assert_eq!(ESCROW_BODY_LEN, 540, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 540, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 548, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -5090,13 +5307,14 @@ mod account_space_tests {
         // discriminant (AV-16, zeroed when no mint bound) + 2-byte
         // protocol fee rate (AV-17, zeroed when no fee configured) +
         // 8-byte cumulative fee counter (AV-17, zeroed when no fee
-        // charged).
+        // charged) + 8-byte expiry grace period (AV-21, zeroed when no
+        // grace period configured).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 129);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 137);
     }
 
     #[test]
@@ -5196,6 +5414,13 @@ mod account_space_tests {
             u64::from_le_bytes(bytes[524..532].try_into().unwrap()),
             0,
             "fees_paid: zero"
+        );
+        // AV-21: expiry grace period u64, zeroed for a plain escrow;
+        // appended last, so every earlier offset above is unchanged.
+        assert_eq!(
+            u64::from_le_bytes(bytes[532..540].try_into().unwrap()),
+            0,
+            "grace_period: zeroed"
         );
 
         // With quorum: same total length (space is always reserved), Some
@@ -5410,16 +5635,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 540) * 3480 * 2 = 668 * 6960 = 4_649_280 lamports.
-        assert_eq!(full, 4_649_280);
+        // (128 + 548) * 3480 * 2 = 676 * 6960 = 4_704_960 lamports.
+        assert_eq!(full, 4_704_960);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 129) * 3480 * 2 = 257 * 6960 = 1_788_720 lamports.
-        assert_eq!(no_quorum, 1_788_720);
+        // (128 + 137) * 3480 * 2 = 265 * 6960 = 1_844_400 lamports.
+        assert_eq!(no_quorum, 1_844_400);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -5462,13 +5687,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(4_649_280, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(4_704_960, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(4_649_279, params.0, params.1),
+            check_vault_rent_exempt(4_704_959, params.0, params.1),
             Err(RentShortfall {
-                required: 4_649_280,
-                provided: 4_649_279,
+                required: 4_704_960,
+                provided: 4_704_959,
             })
         );
         // Generous funding: exempt.
@@ -5480,7 +5705,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 4_649_280,
+                required: 4_704_960,
                 provided: 0,
             })
         );
@@ -7558,5 +7783,140 @@ mod combination_matrix_tests {
         assert_eq!((payout, fee), (AMOUNT, 0));
         assert_eq!(e.state(), EscrowState::Released);
         assert_conservation(0, AMOUNT, 0);
+    }
+}
+
+// ---------- AV-21: expiry grace period tests ----------
+//
+// `cancel_expired` requires `now >= expires_at + grace_period`
+// (opt-in via `with_grace_period`, `0` by default). These tests pin the
+// gate boundary, the builder validation, the check order inside the
+// grace window, and backward compatibility of the default.
+#[cfg(test)]
+mod grace_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const AMOUNT: u64 = 1_000_000;
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const GRACE: u64 = 300; // five minutes of clock-skew cover
+
+    fn funded_no_grace() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    fn funded_with_grace() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_grace_period(GRACE)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    #[test]
+    fn grace_period_defaults_to_zero_backward_compatible() {
+        // No builder: the historical `now >= expires_at` gate is intact.
+        let e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        assert_eq!(e.grace_period(), 0);
+        assert!(e.is_expiry_eligible(EXPIRES_AT));
+        assert!(!e.is_expiry_eligible(EXPIRES_AT - 1));
+        let mut e = funded_no_grace();
+        e.cancel_expired(ALICE, EXPIRES_AT, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn cancel_expired_requires_expires_at_plus_grace() {
+        let mut e = funded_with_grace();
+        assert_eq!(e.grace_period(), GRACE);
+        // At expires_at itself: still NotExpired — the whole point of the
+        // grace period (the keeper's clock may be ahead of the chain's).
+        assert_eq!(
+            e.cancel_expired(ALICE, EXPIRES_AT, None),
+            Err(EscrowError::NotExpired)
+        );
+        // One second before the gate: still NotExpired.
+        assert_eq!(
+            e.cancel_expired(ALICE, EXPIRES_AT + GRACE - 1, None),
+            Err(EscrowError::NotExpired)
+        );
+        assert_eq!(e.state(), EscrowState::Funded, "failed cancels change nothing");
+        // At expires_at + grace: the gate passes.
+        e.cancel_expired(ALICE, EXPIRES_AT + GRACE, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn taker_may_cancel_after_grace() {
+        // Either party may cancel an expired escrow — the grace period
+        // does not change who may call, only when.
+        let mut e = funded_with_grace();
+        e.cancel_expired(BOB, EXPIRES_AT + GRACE, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn grace_window_keeps_authority_first_check_order() {
+        // Inside the grace window (expired by expires_at, not yet by the
+        // gate) a stranger still learns nothing beyond Unauthorized —
+        // the grace period did not reorder the checks.
+        let mut e = funded_with_grace();
+        assert_eq!(
+            e.cancel_expired(MALLORY, EXPIRES_AT + 1, None),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn is_expiry_eligible_agrees_with_cancel_expired() {
+        // The predicate the keeper evaluates must agree with the
+        // transition's gate at every boundary — this is the sync the
+        // keeper report depends on.
+        for now in [
+            EXPIRES_AT - 1,
+            EXPIRES_AT,
+            EXPIRES_AT + 1,
+            EXPIRES_AT + GRACE - 1,
+            EXPIRES_AT + GRACE,
+            EXPIRES_AT + GRACE + 1,
+            u64::MAX,
+        ] {
+            let eligible = funded_with_grace().is_expiry_eligible(now);
+            let mut e = funded_with_grace();
+            let res = e.cancel_expired(ALICE, now, None);
+            assert_eq!(
+                res.is_ok(),
+                eligible,
+                "predicate/transition disagree at now={now}"
+            );
+            // And without grace the predicate is the historical gate.
+            assert_eq!(
+                funded_no_grace().is_expiry_eligible(now),
+                now >= EXPIRES_AT,
+                "no-grace predicate drifted at now={now}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_release_then_cancel_expired_after_grace_refunds_remainder() {
+        // The grace period composes with partial releases: the refund is
+        // the remainder, and released progress is preserved for audit.
+        let mut e = funded_with_grace();
+        e.release(ALICE, 400_000, None).unwrap();
+        assert_eq!(
+            e.cancel_expired(ALICE, EXPIRES_AT + GRACE - 1, None),
+            Err(EscrowError::NotExpired)
+        );
+        e.cancel_expired(ALICE, EXPIRES_AT + GRACE, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.remaining_amount(), AMOUNT - 400_000);
     }
 }

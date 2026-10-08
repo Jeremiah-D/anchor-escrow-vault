@@ -330,6 +330,13 @@ impl IndexedEscrow {
         Ok(self)
     }
 
+    /// Opt in to an expiry grace period (mirrors
+    /// [`Escrow::with_grace_period`]). Configuration: emits no event.
+    pub fn with_grace_period(mut self, grace_period: u64) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_grace_period(grace_period)?;
+        Ok(self)
+    }
+
     /// Attach a milestone tranche plan (mirrors
     /// [`Escrow::with_milestones`]). Configuration: emits no event.
     pub fn with_milestones(mut self, plan: MilestonePlan) -> Result<Self, EscrowError> {
@@ -851,6 +858,35 @@ mod event_tests {
             0,
             1_000_000,
             EXPIRES_AT,
+        );
+    }
+
+    #[test]
+    fn cancel_expired_inside_grace_window_fails_and_emits_nothing() {
+        // AV-21: the grace gate is enforced by the state machine, so the
+        // event log inherits it — a premature cancel emits no event and
+        // the log still ends at the funding event.
+        let mut e = indexed(1_000_000).with_grace_period(300).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        let before = e.drain_events().len();
+        assert_eq!(
+            e.cancel_expired(BOB, EXPIRES_AT, None),
+            Err(EscrowError::NotExpired)
+        );
+        assert!(e.drain_events().is_empty(), "failed cancel emitted an event");
+        assert_eq!(before, 2, "Initialized + Funded before the failed call");
+        // After the grace period the same call succeeds and emits.
+        e.cancel_expired(BOB, EXPIRES_AT + 300, None).unwrap();
+        assert_event(
+            &last(&e),
+            EscrowEventKind::ExpiredCancelled,
+            2,
+            EscrowState::Funded,
+            EscrowState::Cancelled,
+            0,
+            0,
+            1_000_000,
+            EXPIRES_AT + 300,
         );
     }
 

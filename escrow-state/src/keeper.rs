@@ -4,10 +4,15 @@
 //! A keeper bot watches many vaults and needs to know, at a given `now`,
 //! which ones have an *immediately executable* keeper action:
 //!
-//! - `cancel_expired`: the escrow is `Funded`, `now >= expires_at`, and a
-//!   refundable remainder exists. Either party may call it; the report
-//!   names the initializer as the canonical caller (the taker may also
-//!   call — the on-chain instruction accepts either).
+//! - `cancel_expired`: the escrow is `Funded`, the expiry gate passes at
+//!   `now` (`now >= expires_at + grace_period` — see
+//!   [`Escrow::is_expiry_eligible`]), and a refundable remainder exists.
+//!   Either party may call it; the report names the initializer as the
+//!   canonical caller (the taker may also call — the on-chain instruction
+//!   accepts either). The grace period (AV-21) is honored here exactly as
+//!   on-chain: the keeper never lists a `cancel_expired` call the chain
+//!   would reject as `NotExpired`, which is the whole point of the grace
+//!   period (keeper/cluster clock drift).
 //! - `claim`: the escrow is `Funded`, a vesting schedule is attached, no
 //!   milestone plan is attached (the plan owns the release schedule, so
 //!   `claim` is disabled there), the vested-minus-released amount is
@@ -187,7 +192,12 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         if e.state() != EscrowState::Funded {
             continue;
         }
-        if now >= e.expires_at() && e.remaining_amount() > 0 {
+        // The expiry gate is the state machine's own predicate
+        // (`Escrow::is_expiry_eligible`): the keeper honors the grace
+        // period exactly as `cancel_expired` enforces it on-chain, so a
+        // listed call is always executable — never a `NotExpired`
+        // rejection caused by keeper/cluster clock drift.
+        if e.is_expiry_eligible(now) && e.remaining_amount() > 0 {
             // Either party may cancel an expired escrow; the initializer
             // is the canonical keeper caller. The refund is the remainder
             // — never fee'd, so no fee accounting is needed here.
@@ -328,6 +338,39 @@ mod keeper_tests {
         // One second earlier: not eligible.
         let report = scan_keeper_actions(&watched, MID - 1);
         assert!(report.is_empty());
+    }
+
+    #[test]
+    fn grace_period_defers_cancel_expired_listing() {
+        // AV-21: the keeper honors the grace period exactly as the chain
+        // enforces it — a listed `cancel_expired` is always executable,
+        // never a `NotExpired` rejection from clock drift.
+        const GRACE: u64 = 300;
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, MID)
+            .unwrap()
+            .with_grace_period(GRACE)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let watched = [watch(ID1, e)];
+        // At expires_at: the chain would reject — the keeper lists nothing.
+        let report = scan_keeper_actions(&watched, MID);
+        assert!(report.is_empty(), "keeper must not list a premature cancel");
+        // Inside the grace window: still nothing.
+        let report = scan_keeper_actions(&watched, MID + GRACE - 1);
+        assert!(report.is_empty());
+        // At expires_at + grace: executable, listed.
+        let report = scan_keeper_actions(&watched, MID + GRACE);
+        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions[0].kind, KeeperActionKind::CancelExpired);
+        assert_eq!(report.actions[0].reason, "expired");
+        // Cross-check against the real transition at every boundary: the
+        // keeper's predicate and the chain's gate never disagree.
+        for now in [MID - 1, MID, MID + 1, MID + GRACE - 1, MID + GRACE, MID + GRACE + 1] {
+            let listed = !scan_keeper_actions(&watched, now).is_empty();
+            let mut probe = e;
+            let executable = probe.cancel_expired(ALICE, now, None).is_ok();
+            assert_eq!(listed, executable, "keeper/chain disagree at now={now}");
+        }
     }
 
     #[test]

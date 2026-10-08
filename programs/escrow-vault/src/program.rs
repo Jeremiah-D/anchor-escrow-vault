@@ -165,7 +165,10 @@ pub mod escrow_vault {
 
     /// Cancel an expired escrow (`Funded -> Cancelled`). Either the
     /// initializer or the taker may call this once the clock (Solana
-    /// clock sysvar in the real build) has passed `expires_at`.
+    /// clock sysvar in the real build) has passed `expires_at` plus the
+    /// opt-in grace period (`initialize_grace_period`; `NotExpired`
+    /// otherwise) — the grace period absorbs keeper/cluster clock drift
+    /// so a keeper cannot submit a premature cancel.
     /// AV-16: the vault token account's mint must equal the bound
     /// `vault.mint` (`MintMismatch` otherwise); `None` on the native-SOL
     /// path (no mint bound).
@@ -619,6 +622,29 @@ pub mod escrow_vault {
         // in the real build.
         Ok(())
     }
+
+    /// Opt in to an expiry grace period (AV-21; mirrors
+    /// `Escrow::with_grace_period`). `Uninitialized` only, like
+    /// `initialize_quorum`: the grace period is fixed before funds move.
+    /// After this, `cancel_expired` requires the clock to have passed
+    /// `expires_at + grace_period` (`NotExpired` otherwise), so a keeper
+    /// whose off-chain clock runs ahead of the cluster clock cannot
+    /// submit a premature cancel. `grace_period == 0` means no grace
+    /// (the default). `expires_at + grace_period` overflowing `u64` is
+    /// `InvalidGracePeriod` — in particular a grace period cannot be
+    /// combined with the no-timeout convention (`expires_at ==
+    /// u64::MAX`).
+    pub fn initialize_grace_period(ctx: Context<InitializeGracePeriod>, grace_period: u64) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_grace_period(grace_period)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.grace_period` is always present (8 bytes, zeroed by
+        // default), so the period is written in place — no realloc needed
+        // in the real build.
+        Ok(())
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -703,6 +729,11 @@ pub struct Vault {
     /// when no fee was charged). Layout position matches
     /// `escrow_state::VAULT_FIELDS` (appended last, after `fee_bps`).
     pub fees_paid: u64,
+    /// AV-21: expiry grace period in seconds; mirrors `escrow_state`'s
+    /// `grace_period`. Always present (one u64, zeroed when no grace
+    /// period is configured). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after `fees_paid`).
+    pub grace_period: u64,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -1064,6 +1095,16 @@ pub struct InitializeProtocolFee<'info> {
     pub initializer: Signer<'info>,
 }
 
+#[derive(Accounts)]
+pub struct InitializeGracePeriod<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer configures the grace period; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
 // --- Helpers (finalized during the real Anchor build) ---
 
 fn read_escrow(_vault: &Account<Vault>) -> escrow_state::Escrow {
@@ -1128,7 +1169,7 @@ fn read_event_seq(_vault: &Account<Vault>) -> u64 {
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {
     // One program error per EscrowError variant, so on-chain failures
-    // surface the exact `escrow_state` reason (code 100–114) to clients.
+    // surface the exact `escrow_state` reason (code 100–115) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
         escrow_state::EscrowError::InvalidStateTransition => {
@@ -1153,6 +1194,7 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {
         escrow_state::EscrowError::InvalidMint => error!(ErrorCode::InvalidMint),
         escrow_state::EscrowError::MintMismatch => error!(ErrorCode::MintMismatch),
         escrow_state::EscrowError::InvalidProtocolFee => error!(ErrorCode::InvalidProtocolFee),
+        escrow_state::EscrowError::InvalidGracePeriod => error!(ErrorCode::InvalidGracePeriod),
     }
 }
 
@@ -1188,4 +1230,6 @@ pub enum ErrorCode {
     MintMismatch,
     #[msg("Invalid protocol fee rate: fee_bps must be 0-10000 (basis points)")]
     InvalidProtocolFee,
+    #[msg("Invalid grace period: expires_at + grace_period overflows u64 (no grace on a no-timeout escrow)")]
+    InvalidGracePeriod,
 }

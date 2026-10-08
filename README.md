@@ -82,16 +82,22 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `fund(authority)`                           | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer            |
 | `release(authority, amount)`                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured); cumulative releases ≤ locked amount |
 | `cancel(authority)`                         | `Funded`       | `Cancelled` | initializer          |
-| `cancel_expired(authority, now)`            | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at` |
+| `cancel_expired(authority, now)`            | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default) |
 
 Rules: the initializer drives `fund`/`release`/`cancel`; any other caller
 gets `Unauthorized` (checked before state validity). An escrow that has
-timed out (`now >= expires_at`) may instead be cancelled by *either* party
-via `cancel_expired`, so a stalled counterparty cannot lock funds forever;
-calling it early gets `NotExpired`. Pass `u64::MAX` as `expires_at` for no
-timeout. Any illegal transition (e.g. releasing twice, releasing before
-funding) gets `InvalidStateTransition`; zero amounts get `AmountMismatch`;
-`release`/`cancel`/`cancel_expired` preserve `amount` exactly (refund
+timed out (`now >= expires_at + grace_period`) may instead be cancelled by
+*either* party via `cancel_expired`, so a stalled counterparty cannot lock
+funds forever; calling it early gets `NotExpired`. The opt-in grace period
+(`with_grace_period`, seconds, `0` by default) absorbs clock drift between
+an off-chain keeper and the Solana cluster — without it a keeper whose
+clock runs ahead would submit `cancel_expired` the moment *its* clock
+passes `expires_at`, only for the chain to reject it. Pass `u64::MAX` as
+`expires_at` for no timeout (a grace period cannot be combined with it:
+`InvalidGracePeriod`, code 115). Any illegal transition (e.g. releasing
+twice, releasing before funding) gets `InvalidStateTransition`; zero
+amounts get `AmountMismatch`; `release`/`cancel`/`cancel_expired` preserve
+`amount` exactly (refund
 accounting).
 
 **Partial release (staged payouts).** `release(authority, amount)` releases
@@ -281,7 +287,7 @@ program error per variant):
 | `Unauthorized` | 100 | caller is not the transition authority (checked before state validity) |
 | `InvalidStateTransition` | 101 | transition illegal from the current state (double fund, release before fund, …) |
 | `AmountMismatch` | 102 | `initialize` with `amount == 0` |
-| `NotExpired` | 103 | `cancel_expired` with `now < expires_at` |
+| `NotExpired` | 103 | `cancel_expired` with `now < expires_at + grace_period` |
 | `InvalidQuorum` | 104 | bad quorum policy config, or `attest` with no quorum configured |
 | `QuorumNotReached` | 105 | `release` before the quorum threshold is reached |
 | `ReleaseExceedsLocked` | 106 | cumulative `release` amounts exceeding the locked amount |
@@ -293,6 +299,7 @@ program error per variant):
 | `InvalidMint` | 112 | bad mint address (empty, non-base58, or not 32 bytes), or `with_mint` with the zero address |
 | `MintMismatch` | 113 | exit-path token mint ≠ the escrow's bound mint (`None` vs `Some` mismatches too) |
 | `InvalidProtocolFee` | 114 | `with_protocol_fee` with `fee_bps` > 10_000 (not a valid basis-point rate) |
+| `InvalidGracePeriod` | 115 | `with_grace_period` where `expires_at + grace_period` would overflow `u64` (grace on a no-timeout escrow) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -305,7 +312,7 @@ and `released` accumulates partial payouts). Property-based tests
 `0 / 1 / u64::MAX-1 / u64::MAX` and boundary timestamps) additionally pin
 per-case invariants: initialize amount dichotomy, amount preservation
 across all four legal lifecycles, the `cancel_expired` edge (`now >=
-expires_at`), and quorum idempotency under random attestation order.
+expires_at + grace_period`), and quorum idempotency under random attestation order.
 
 ## Lifecycle walkthrough (sequence)
 
@@ -586,7 +593,7 @@ returns a `KeeperReport` of immediately executable calls:
 
 | action | listed when | caller | `amount` |
 |--------|-------------|--------|----------|
-| `cancel_expired(authority, now, mint)` | `Funded`, `now >= expires_at`, remainder > 0 | initializer (canonical; the taker may also call) | refundable remainder (never fee'd) |
+| `cancel_expired(authority, now, mint)` | `Funded`, `now >= expires_at + grace_period` (grace-aware: the keeper never lists a call the chain would reject as `NotExpired`), remainder > 0 | initializer (canonical; the taker may also call) | refundable remainder (never fee'd) |
 | `claim(taker, now, mint)` | `Funded`, vesting attached, no milestone plan, vested − released > 0, quorum satisfied if configured | taker | gross vested-but-unreleased (`payout + fee == amount`) |
 
 Only *executable* calls are listed: a vesting claim behind an unsatisfied
@@ -633,7 +640,8 @@ two-way consistency check against the IDL parameter table:
 | mint          | Option<Pubkey>    | 33    |
 | fee_bps       | u16               | 2     |
 | fees_paid     | u64               | 8     |
-| **total**     |                   | **540** |
+| grace_period  | u64               | 8     |
+| **total**     |                   | **548** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -652,11 +660,13 @@ mint is bound) — all appended after the
 earlier fields, so every earlier field offset stays stable. The 2-byte
 protocol fee rate `fee_bps` (AV-17, zeroed when no fee is configured) and
 the 8-byte cumulative fee counter `fees_paid` (AV-17, zeroed when no fee
-was charged) follow the same always-present, appended-last treatment.
-`escrow-state` exposes `VAULT_SPACE` (540) and
-`VAULT_SPACE_NO_QUORUM` (129) for the Anchor `space =` constraint, plus a
+was charged) follow the same always-present, appended-last treatment, as
+does the 8-byte expiry grace period `grace_period` (AV-21, zeroed when no
+grace period is configured).
+`escrow-state` exposes `VAULT_SPACE` (548) and
+`VAULT_SPACE_NO_QUORUM` (137) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **4,649,280 lamports** to be
+mainnet rent parameters the full vault needs **4,704,960 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ## Run the tests
