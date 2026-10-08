@@ -7,6 +7,7 @@
 
 mod events;
 mod keeper;
+mod snapshot;
 
 // AV-18: typed indexer events — an event-logging adapter over `Escrow`
 // plus the `EscrowEvent` / `EscrowEventKind` / `EventAmounts` record
@@ -18,6 +19,15 @@ pub use events::{EscrowEvent, EscrowEventKind, EventAmounts, IndexedEscrow};
 // Purely additive and read-only (dry-run by construction).
 pub use keeper::{
     scan_keeper_actions, KeeperAction, KeeperActionKind, KeeperReport, WatchedEscrow,
+};
+
+// AV-26: off-chain state snapshot — a point-in-time, read-only view of
+// an `Escrow` as canonical JSON (all fields + derived remaining /
+// vested-claimable / quorum progress), for keeper bots and indexers
+// reconciling off-chain state. Purely additive and read-only.
+pub use snapshot::{
+    DualSigSnapshot, EscrowSnapshot, MilestoneSnapshot, MilestoneTrancheSnapshot, QuorumSnapshot,
+    VestingSnapshot,
 };
 
 /// Lifecycle states of an escrow vault.

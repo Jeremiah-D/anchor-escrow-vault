@@ -681,6 +681,48 @@ lowercase hex).
 ]}
 ```
 
+## State snapshot (AV-26)
+
+Keeper bots and indexers need one more primitive than the call list: *"what
+does this escrow look like right now?"* `escrow.snapshot(now)` answers with
+a point-in-time, read-only `EscrowSnapshot` — every raw field plus the
+derived quantities an operator reasons about — serialized by
+`EscrowSnapshot::to_json()` as canonical hand-written JSON (dependency-free,
+deterministic field order, 64-char lowercase hex keys). Two snapshots of
+equal state at equal `now` are byte-identical, so indexers can hash or diff
+them directly. The snapshot is a pure read: no state changes, no events.
+
+Raw fields: `initializer`, `taker`, `state` (`uninitialized` / `activated` /
+`funded` / `released` / `cancelled` / `disputed` / `settled`), `amount`,
+`released`, `expires_at`, `grace_period`, `dual_sig`
+(`required` / `initializer_activated` / `taker_activated`), `fee_bps`,
+`fees_paid`, `skipped`, `penalty_bps`, plus the optional `quorum`,
+`vesting`, `arbiter`, `mint`, `evidence_hash`, `refund_to` (hex or `null`)
+and the effective `refund_recipient` (whitelist when configured, else the
+initializer).
+
+Derived at the snapshot time (`at`): `remaining` (`amount − released`:
+what `cancel` / `cancel_expired` would refund, skipped tranches included),
+`vested` / `claimable` (schedule unlock vs. vested-minus-released — what
+`claim` would move), quorum progress (`registered` / `threshold` /
+`approvals` / `satisfied`), milestone progress (per-tranche
+`amount` / `confirmed` / `settled`, counts, and the `next` unsettled
+tranche), and `expiry_eligible` (the chain's `cancel_expired` gate at `at`,
+grace included — the same predicate the keeper scan uses, so a snapshot
+never disagrees with the scan).
+
+```json
+{"at":1750000000,"initializer":"...","taker":"...","state":"funded",
+ "amount":1000000,"released":0,"remaining":1000000,
+ "expires_at":0,"grace_period":0,"expiry_eligible":true,
+ "dual_sig":{"required":false,"initializer_activated":false,"taker_activated":false},
+ "quorum":null,"vesting":null,"vested":0,"claimable":0,
+ "arbiter":null,"mint":null,"fee_bps":0,"fees_paid":0,
+ "milestones":null,"skipped":0,
+ "evidence_hash":null,"refund_to":null,"refund_recipient":"...",
+ "penalty_bps":0}
+```
+
 ## Account space & rent
 
 The `Vault` account layout is pinned in `escrow-state` (`VAULT_FIELDS`;
