@@ -159,6 +159,12 @@ impl EventAmounts {
 /// `from == to`. `at` is the caller-supplied Unix-seconds timestamp —
 /// for `cancel_expired` / `escalate` / `claim` it is the `now` the
 /// transition itself ran on.
+///
+/// `evidence_hash` (AV-22) carries the dispute-evidence commitment on
+/// the two dispute events: `Escalated` carries the hash attached at
+/// escalation, `Resolved` carries the hash the escrow still holds (the
+/// arbiter's settlement references the evidence it reviewed). It is
+/// `None` on every other kind — the event log never invents evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EscrowEvent {
     pub kind: EscrowEventKind,
@@ -171,6 +177,7 @@ pub struct EscrowEvent {
     pub to: EscrowState,
     pub amounts: EventAmounts,
     pub at: u64,
+    pub evidence_hash: Option<[u8; 32]>,
 }
 
 /// An event-logging adapter over [`Escrow`] (AV-18).
@@ -225,6 +232,7 @@ impl IndexedEscrow {
             EscrowState::Uninitialized,
             EventAmounts::none(),
             at,
+            None,
         );
         Ok(indexed)
     }
@@ -237,6 +245,7 @@ impl IndexedEscrow {
         to: EscrowState,
         amounts: EventAmounts,
         at: u64,
+        evidence_hash: Option<[u8; 32]>,
     ) {
         let event = EscrowEvent {
             kind,
@@ -246,6 +255,7 @@ impl IndexedEscrow {
             to,
             amounts,
             at,
+            evidence_hash,
         };
         self.next_seq += 1;
         self.events.push(event);
@@ -355,7 +365,7 @@ impl IndexedEscrow {
         self.inner.activate(authority)?;
         let to = self.inner.state();
         if to != from {
-            self.push_event(EscrowEventKind::Activated, from, to, EventAmounts::none(), at);
+            self.push_event(EscrowEventKind::Activated, from, to, EventAmounts::none(), at, None);
         }
         Ok(())
     }
@@ -371,6 +381,7 @@ impl IndexedEscrow {
             self.inner.state(),
             EventAmounts::none(),
             at,
+            None,
         );
         Ok(())
     }
@@ -397,6 +408,7 @@ impl IndexedEscrow {
             self.inner.state(),
             EventAmounts::payout(amount, fee),
             at,
+            None,
         );
         Ok((payout, fee))
     }
@@ -420,6 +432,7 @@ impl IndexedEscrow {
             to,
             EventAmounts::refund(refund),
             at,
+            None,
         );
         Ok(())
     }
@@ -442,6 +455,7 @@ impl IndexedEscrow {
             to,
             EventAmounts::refund(refund),
             now,
+            None,
         );
         Ok(())
     }
@@ -469,7 +483,7 @@ impl IndexedEscrow {
         // on the error path.
         if after > before {
             let state = self.inner.state();
-            self.push_event(EscrowEventKind::Attested, state, state, EventAmounts::none(), at);
+            self.push_event(EscrowEventKind::Attested, state, state, EventAmounts::none(), at, None);
         }
         Ok(())
     }
@@ -494,22 +508,29 @@ impl IndexedEscrow {
             self.inner.state(),
             EventAmounts::payout(payout + fee, fee),
             now,
+            None,
         );
         Ok((payout, fee))
     }
 
     /// Escalate the escrow into arbitration (mirrors [`Escrow::escalate`]).
-    /// Emits `Escalated` (`Funded -> Disputed`); `now` doubles as the
-    /// event's `at`.
-    pub fn escalate(&mut self, authority: [u8; 32], now: u64) -> Result<(), EscrowError> {
+    /// Emits `Escalated` (`Funded -> Disputed`) carrying the evidence
+    /// hash attached at escalation; `now` doubles as the event's `at`.
+    pub fn escalate(
+        &mut self,
+        authority: [u8; 32],
+        now: u64,
+        evidence_hash: Option<[u8; 32]>,
+    ) -> Result<(), EscrowError> {
         let from = self.inner.state();
-        self.inner.escalate(authority, now)?;
+        self.inner.escalate(authority, now, evidence_hash)?;
         self.push_event(
             EscrowEventKind::Escalated,
             from,
             self.inner.state(),
             EventAmounts::none(),
             now,
+            evidence_hash,
         );
         Ok(())
     }
@@ -517,7 +538,9 @@ impl IndexedEscrow {
     /// Settle a disputed escrow (mirrors [`Escrow::resolve`]). Emits
     /// `Resolved` (`Disputed -> Settled`) with the gross taker share in
     /// `amounts.payout`, the protocol fee in `amounts.fee`, and the
-    /// initializer's share in `amounts.refund`. Returns
+    /// initializer's share in `amounts.refund` — and the dispute
+    /// evidence hash the escrow still holds, so the settlement
+    /// references the evidence the arbiter reviewed. Returns
     /// `(taker_payout, fee, initializer_refund)` like the inner method.
     pub fn resolve(
         &mut self,
@@ -535,7 +558,18 @@ impl IndexedEscrow {
             fee,
             refund,
         };
-        self.push_event(EscrowEventKind::Resolved, from, self.inner.state(), amounts, at);
+        // AV-22: the evidence hash survives `resolve` on the escrow, so
+        // the settlement event carries the same commitment the
+        // `Escalated` event carried.
+        let evidence_hash = self.inner.evidence_hash();
+        self.push_event(
+            EscrowEventKind::Resolved,
+            from,
+            self.inner.state(),
+            amounts,
+            at,
+            evidence_hash,
+        );
         Ok((payout, fee, refund))
     }
 
@@ -561,6 +595,7 @@ impl IndexedEscrow {
                 state,
                 EventAmounts::none(),
                 at,
+                None,
             );
         }
         Ok(())
@@ -588,6 +623,7 @@ impl IndexedEscrow {
             self.inner.state(),
             EventAmounts::payout(payout + fee, fee),
             at,
+            None,
         );
         Ok((payout, fee))
     }
@@ -623,6 +659,7 @@ impl IndexedEscrow {
                 state,
                 EventAmounts::refund(tranche),
                 at,
+                None,
             );
         }
         Ok(())
@@ -932,7 +969,7 @@ mod event_tests {
     fn escalate_and_resolve_emit_with_split_amounts() {
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(BOB, EXPIRES_AT - 1).unwrap();
+        e.escalate(BOB, EXPIRES_AT - 1, None).unwrap();
         assert_event(
             &last(&e),
             EscrowEventKind::Escalated,
@@ -957,6 +994,53 @@ mod event_tests {
             400_000,
             T0 + 3,
         );
+    }
+
+    #[test]
+    fn escalated_event_carries_attached_evidence_hash() {
+        // AV-22: the Escalated event carries the commitment attached at
+        // escalation, so an indexer learns the evidence reference from
+        // the event stream without a second account read.
+        const EVIDENCE: [u8; 32] = [0xE1; 32];
+        let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.escalate(BOB, EXPIRES_AT - 1, Some(EVIDENCE)).unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::Escalated);
+        assert_eq!(event.evidence_hash, Some(EVIDENCE));
+        // Without evidence the event carries None — the log never
+        // invents evidence.
+        let mut e2 = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
+        e2.fund(ALICE, T0 + 1).unwrap();
+        e2.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        assert_eq!(last(&e2).evidence_hash, None);
+    }
+
+    #[test]
+    fn resolved_event_carries_the_stored_evidence_hash() {
+        // AV-22: resolve does not take an evidence hash — the escrow
+        // already holds it — and the Resolved event carries the stored
+        // commitment, so the settlement references what the arbiter
+        // reviewed.
+        const EVIDENCE: [u8; 32] = [0xE1; 32];
+        let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE)).unwrap();
+        e.resolve(ARBITER, 600_000, None, T0 + 3).unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::Resolved);
+        assert_eq!(event.from, EscrowState::Disputed);
+        assert_eq!(event.to, EscrowState::Settled);
+        assert_eq!(event.evidence_hash, Some(EVIDENCE));
+        // Non-dispute events never carry a hash.
+        assert!(e
+            .events()
+            .iter()
+            .filter(|ev| !matches!(
+                ev.kind,
+                EscrowEventKind::Escalated | EscrowEventKind::Resolved
+            ))
+            .all(|ev| ev.evidence_hash.is_none()));
     }
 
     #[test]
@@ -1027,7 +1111,7 @@ mod event_tests {
         // Attest with no quorum configured.
         assert!(e.attest(ATTESTOR_1, T0 + 9).is_err());
         // Escalate with no arbiter configured.
-        assert!(e.escalate(ALICE, T0 + 9).is_err());
+        assert!(e.escalate(ALICE, T0 + 9, None).is_err());
         // Resolve outside a dispute.
         assert!(e.resolve(ARBITER, 1, None, T0 + 9).is_err());
         // Milestone ops with no plan attached.
@@ -1105,7 +1189,7 @@ mod event_tests {
             .with_protocol_fee(1_000)
             .unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
         let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, T0 + 3).unwrap();
         // 1000 bps of 600_000 = 60_000; the refund is never fee'd.
         assert_eq!((payout, fee, refund), (540_000, 60_000, 400_000));

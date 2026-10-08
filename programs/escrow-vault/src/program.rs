@@ -66,6 +66,7 @@ pub mod escrow_vault {
             0,
             0,
             Clock::get()?.unix_timestamp as u64,
+            None,
         );
         Ok(())
     }
@@ -89,6 +90,7 @@ pub mod escrow_vault {
             0,
             0,
             Clock::get()?.unix_timestamp as u64,
+            None,
         );
         Ok(())
     }
@@ -131,6 +133,7 @@ pub mod escrow_vault {
             fee,
             0,
             Clock::get()?.unix_timestamp as u64,
+            None,
         );
         Ok((payout, fee))
     }
@@ -159,6 +162,7 @@ pub mod escrow_vault {
             0,
             escrow.remaining_amount(),
             Clock::get()?.unix_timestamp as u64,
+            None,
         );
         Ok(())
     }
@@ -197,6 +201,7 @@ pub mod escrow_vault {
             0,
             escrow.remaining_amount(),
             now,
+            None,
         );
         Ok(())
     }
@@ -252,6 +257,7 @@ pub mod escrow_vault {
                 0,
                 0,
                 Clock::get()?.unix_timestamp as u64,
+                None,
             );
         }
         Ok(())
@@ -297,6 +303,7 @@ pub mod escrow_vault {
                 0,
                 0,
                 Clock::get()?.unix_timestamp as u64,
+                None,
             );
         }
         Ok(())
@@ -354,6 +361,7 @@ pub mod escrow_vault {
             fee,
             0,
             now,
+            None,
         );
         Ok((payout, fee))
     }
@@ -381,16 +389,24 @@ pub mod escrow_vault {
     /// an instruction param — a caller-supplied timestamp could rewind
     /// past the dispute window). While `Disputed`, every unilateral exit
     /// (`release` / `cancel` / `cancel_expired` / `claim`) is locked.
-    pub fn escalate(ctx: Context<Escalate>) -> Result<()> {
+    /// AV-22: `evidence_hash` is the optional 32-byte commitment to the
+    /// off-chain dispute evidence (e.g. the SHA-256 of an IPFS CID),
+    /// persisted on the vault so the arbiter and indexers can read it.
+    pub fn escalate(ctx: Context<Escalate>, evidence_hash: Option<[u8; 32]>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
         let from = escrow.state() as u8;
         escrow
-            .escalate(ctx.accounts.authority.key().to_bytes(), now)
+            .escalate(
+                ctx.accounts.authority.key().to_bytes(),
+                now,
+                evidence_hash,
+            )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // AV-18: `now` doubles as the event's `at`, mirroring
-        // `IndexedEscrow::escalate`.
+        // `IndexedEscrow::escalate`. AV-22: the Escalated event carries
+        // the attached evidence hash.
         emit_transition(
             &ctx.accounts.vault,
             escrow_state::EscrowEventKind::Escalated,
@@ -400,6 +416,7 @@ pub mod escrow_vault {
             0,
             0,
             now,
+            evidence_hash,
         );
         Ok(())
     }
@@ -432,6 +449,9 @@ pub mod escrow_vault {
         // are wired up.
         // AV-18: `taker_amount` is the gross taker share
         // (`payout + fee`); the refund is never fee'd.
+        // AV-22: the Resolved event carries the dispute evidence hash
+        // the escrow still holds — the settlement references the
+        // evidence the arbiter reviewed.
         emit_transition(
             &ctx.accounts.vault,
             escrow_state::EscrowEventKind::Resolved,
@@ -441,6 +461,7 @@ pub mod escrow_vault {
             fee,
             refund,
             Clock::get()?.unix_timestamp as u64,
+            escrow.evidence_hash(),
         );
         Ok((payout, fee, refund))
     }
@@ -495,6 +516,7 @@ pub mod escrow_vault {
                 0,
                 0,
                 Clock::get()?.unix_timestamp as u64,
+                None,
             );
         }
         Ok(())
@@ -534,6 +556,7 @@ pub mod escrow_vault {
             fee,
             0,
             Clock::get()?.unix_timestamp as u64,
+            None,
         );
         Ok((payout, fee))
     }
@@ -572,6 +595,7 @@ pub mod escrow_vault {
                 0,
                 tranche,
                 Clock::get()?.unix_timestamp as u64,
+                None,
             );
         }
         Ok(())
@@ -734,6 +758,15 @@ pub struct Vault {
     /// period is configured). Layout position matches
     /// `escrow_state::VAULT_FIELDS` (appended last, after `fees_paid`).
     pub grace_period: u64,
+    /// AV-22: 32-byte commitment to the off-chain dispute evidence
+    /// attached at `escalate`; mirrors `escrow_state`'s `evidence_hash`.
+    /// `None` when no evidence was attached. The account always reserves
+    /// the full 33-byte region (1-byte discriminant + 32-byte
+    /// commitment, zeroed when `None`) so `escalate` writes the hash in
+    /// place without reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `grace_period`).
+    pub evidence_hash: Option<[u8; 32]>,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -804,6 +837,12 @@ pub struct EscrowVaultEvent {
     pub refund: u64,
     /// Unix seconds from the clock sysvar at emission.
     pub at: u64,
+    /// AV-22: dispute-evidence commitment carried by the `Escalated`
+    /// and `Resolved` events (`None` for every other kind); mirrors
+    /// `escrow_state::EscrowEvent::evidence_hash`, so an off-chain
+    /// indexer learns the evidence reference from the event stream
+    /// without a second account read.
+    pub evidence_hash: Option<[u8; 32]>,
 }
 
 /// AV-18: on-chain mirror of `escrow_state::EscrowEventKind`, mapped by
@@ -1136,6 +1175,9 @@ fn write_escrow(_vault: &mut Account<Vault>, _escrow: &escrow_state::Escrow) {
 /// timestamp — the on-chain source of the caller-supplied `at` the
 /// `IndexedEscrow` wrapper takes off-chain. `seq` is the vault's
 /// persisted per-escrow event counter (`read_event_seq`).
+/// `evidence_hash` (AV-22) is the dispute-evidence commitment carried by
+/// the `Escalated` and `Resolved` events (`None` for every other kind),
+/// mirroring `escrow_state::EscrowEvent::evidence_hash`.
 fn emit_transition(
     vault: &Account<Vault>,
     kind: escrow_state::EscrowEventKind,
@@ -1145,6 +1187,7 @@ fn emit_transition(
     fee: u64,
     refund: u64,
     at: u64,
+    evidence_hash: Option<[u8; 32]>,
 ) {
     emit!(EscrowVaultEvent {
         kind: escrow_event_kind(kind),
@@ -1156,6 +1199,7 @@ fn emit_transition(
         fee,
         refund,
         at,
+        evidence_hash,
     });
 }
 

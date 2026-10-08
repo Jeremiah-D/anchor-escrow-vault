@@ -26,6 +26,12 @@
 //! gross vested-but-unreleased amount a `claim` would move — the protocol
 //! fee slices it, `payout + fee == amount`).
 //!
+//! `Disputed` escrows list no action — their unilateral exits are locked
+//! — but the scan never drops their state: the dispute evidence hash
+//! attached at `escalate` (AV-22) stays readable on the watched snapshot
+//! ([`Escrow::evidence_hash`]) so operator tooling can fetch the
+//! off-chain evidence for the arbiter.
+//!
 //! # Dry-run by construction
 //!
 //! The scan only reads `&Escrow` snapshots: it cannot mutate anything,
@@ -491,13 +497,36 @@ mod keeper_tests {
             .with_arbiter([0xA8; 32])
             .unwrap();
         e.fund(ALICE).unwrap();
-        e.escalate(ALICE, MID).unwrap();
+        e.escalate(ALICE, MID, None).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
         assert!(
             report.is_empty(),
             "unilateral exits are locked while disputed"
+        );
+    }
+
+    #[test]
+    fn disputed_evidence_hash_survives_keeper_scan() {
+        // AV-22 passthrough: the keeper lists no action for a disputed
+        // escrow, but the scan pipeline must not drop the dispute
+        // evidence hash — operator tooling reads it from the watched
+        // snapshot to fetch the off-chain evidence for the arbiter.
+        const EVIDENCE: [u8; 32] = [0xE1; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_arbiter([0xA8; 32])
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(BOB, MID, Some(EVIDENCE)).unwrap();
+        let watched = [watch(ID1, e)];
+        let report = scan_keeper_actions(&watched, MID);
+        assert!(report.is_empty());
+        assert_eq!(
+            watched[0].escrow.evidence_hash(),
+            Some(EVIDENCE),
+            "keeper scan dropped the dispute evidence hash"
         );
     }
 

@@ -65,7 +65,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 |---------------------------------------------|----------------|-----------|------------------------|
 | `initialize(initializer, taker, amount, expires_at)` | — | `Uninitialized` | anyone (amount > 0) |
 | `initialize_arbiter(arbiter)`               | `Uninitialized`| `Uninitialized` | initializer (once, before funding; zero key rejected) |
-| `escalate(authority, now)`                   | `Funded`       | `Disputed` | initializer **or** taker, only when `now < expires_at` (locks `release`/`cancel`/`cancel_expired`/`claim`) |
+| `escalate(authority, now, evidence_hash)`   | `Funded`       | `Disputed` | initializer **or** taker, only when `now < expires_at` (locks `release`/`cancel`/`cancel_expired`/`claim`); `evidence_hash` is the optional 32-byte off-chain-evidence commitment, persisted |
 | `resolve(authority, taker_amount)`           | `Disputed`     | `Settled` | arbiter only; atomic split of the remainder (taker payout / initializer refund) |
 | `initialize_milestones(milestones)`          | `Uninitialized`| `Uninitialized` | initializer (once, before funding; tranche amounts must sum to the locked amount) |
 | `confirm_milestone(authority, index)`        | `Funded`       | — (no state change) | initializer **or** taker (in order; a milestone is confirmed once *both* parties confirmed) |
@@ -175,7 +175,15 @@ accounting. Deliberately, a configured quorum does *not* gate `resolve`
 (the arbiter is the resolution mechanism — attestors must not veto the
 settlement), and vesting does not gate it either (the dispute exists
 precisely because the schedule is contested; `claim` stays locked while
-`Disputed`).
+`Disputed`). The escalating party may attach a 32-byte **dispute evidence
+hash** (`escalate(authority, now, evidence_hash)`) — a commitment to the
+off-chain evidence (e.g. the SHA-256 of an IPFS CID holding chat logs,
+delivery photos, or an oracle report) — persisted on the escrow so the
+arbiter and indexers can read it without trusting the escalator to
+re-supply it; `None` attaches no evidence (backward compatible). The hash
+is never cleared: it survives `resolve` into `Settled` as the audit trail
+of what the arbiter reviewed, and both the `Escalated` and `Resolved`
+indexer events carry it.
 
 **Milestone tranche release (staged settlement).** An escrow can declare a
 milestone plan at creation (`MilestonePlan::new(amounts)`, opt-in on
@@ -641,7 +649,8 @@ two-way consistency check against the IDL parameter table:
 | fee_bps       | u16               | 2     |
 | fees_paid     | u64               | 8     |
 | grace_period  | u64               | 8     |
-| **total**     |                   | **548** |
+| evidence_hash | Option<[u8; 32]>  | 33    |
+| **total**     |                   | **581** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -662,11 +671,13 @@ protocol fee rate `fee_bps` (AV-17, zeroed when no fee is configured) and
 the 8-byte cumulative fee counter `fees_paid` (AV-17, zeroed when no fee
 was charged) follow the same always-present, appended-last treatment, as
 does the 8-byte expiry grace period `grace_period` (AV-21, zeroed when no
-grace period is configured).
-`escrow-state` exposes `VAULT_SPACE` (548) and
-`VAULT_SPACE_NO_QUORUM` (137) for the Anchor `space =` constraint, plus a
+grace period is configured) — and the 33-byte dispute evidence hash region
+(AV-22: 1-byte discriminant + 32-byte commitment, zeroed when no evidence
+is attached).
+`escrow-state` exposes `VAULT_SPACE` (581) and
+`VAULT_SPACE_NO_QUORUM` (170) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **4,704,960 lamports** to be
+mainnet rent parameters the full vault needs **4,934,640 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ## Run the tests
