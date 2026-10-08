@@ -23,7 +23,10 @@
 //! friends define; the optional SPL token mint binding (`initialize_mint`)
 //! scopes the escrow to one token mint exactly as `Escrow::with_mint`
 //! defines, with every fund-moving instruction verifying the vault token
-//! account's mint against the bound address (`MintMismatch` otherwise).
+//! account's mint against the bound address (`MintMismatch` otherwise);
+//! the optional protocol fee (`initialize_protocol_fee`) routes a
+//! basis-point slice of every taker payout to the protocol fee account
+//! exactly as `Escrow::with_protocol_fee` / `protocol_fee_for` define.
 //!
 //! To compile for real: `anchor build` with the Solana toolchain installed.
 
@@ -66,12 +69,15 @@ pub mod escrow_vault {
     /// becomes `Released`. Cumulative releases must not exceed the locked
     /// amount (`ReleaseExceedsLocked`); `amount == 0` is `AmountMismatch`.
     /// The AV-04 quorum gate applies exactly as the state machine defines.
+    /// Returns `(taker_payout, fee)`: the taker's net payout and the
+    /// protocol fee (AV-17), so the real build can transfer each to its
+    /// destination (taker account / protocol fee account).
     /// AV-16: the vault token account's mint must equal the bound
     /// `vault.mint` (`MintMismatch` otherwise); `None` on the native-SOL
     /// path (no mint bound).
-    pub fn release(ctx: Context<Release>, amount: u64) -> Result<()> {
+    pub fn release(ctx: Context<Release>, amount: u64) -> Result<(u64, u64)> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
-        escrow
+        let (payout, fee) = escrow
             .release(
                 ctx.accounts.initializer.key().to_bytes(),
                 amount,
@@ -79,9 +85,10 @@ pub mod escrow_vault {
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
-        // Transfer of lamports/tokens to `ctx.accounts.taker` goes here
-        // once real token accounts are wired up.
-        Ok(())
+        // Transfer of `payout` lamports/tokens to `ctx.accounts.taker`
+        // and `fee` to the protocol fee account goes here once real
+        // token accounts are wired up.
+        Ok((payout, fee))
     }
 
     /// Cancel the escrow and return funds (`Funded -> Cancelled`).
@@ -204,15 +211,16 @@ pub mod escrow_vault {
     /// `Escrow::claim`). Only the taker may call this; `now` comes from
     /// the Solana clock sysvar (never an instruction param — a
     /// caller-supplied timestamp would let anyone fast-forward the unlock
-    /// curve). Returns the claimed amount so the real build can size the
-    /// transfer of lamports/tokens to the taker. The AV-04 quorum gate
-    /// applies exactly as for `release`. AV-16: the vault token account's
-    /// mint must equal the bound `vault.mint` (`MintMismatch` otherwise);
-    /// `None` on the native-SOL path (no mint bound).
-    pub fn claim(ctx: Context<Claim>) -> Result<u64> {
+    /// curve). Returns `(taker_payout, fee)` so the real build can size
+    /// the taker's transfer and the protocol fee (AV-17). The AV-04
+    /// quorum gate applies exactly as for `release`. AV-16: the vault
+    /// token account's mint must equal the bound `vault.mint`
+    /// (`MintMismatch` otherwise); `None` on the native-SOL path (no
+    /// mint bound).
+    pub fn claim(ctx: Context<Claim>) -> Result<(u64, u64)> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
-        let claimed = escrow
+        let (payout, fee) = escrow
             .claim(
                 ctx.accounts.taker.key().to_bytes(),
                 now,
@@ -220,9 +228,10 @@ pub mod escrow_vault {
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
-        // Transfer of `claimed` lamports/tokens to `ctx.accounts.taker`
-        // goes here once real token accounts are wired up.
-        Ok(claimed)
+        // Transfer of `payout` lamports/tokens to `ctx.accounts.taker`
+        // and `fee` to the protocol fee account goes here once real
+        // token accounts are wired up.
+        Ok((payout, fee))
     }
 
     /// Opt in to dispute arbitration (AV-14; mirrors
@@ -262,15 +271,16 @@ pub mod escrow_vault {
     /// `Disputed -> Settled`. Only the configured arbiter signs;
     /// `taker_amount` is the taker's share of the remaining locked funds
     /// (the initializer is refunded the rest) in one atomic settlement.
-    /// Returns `(taker_payout, initializer_refund)` so the real build can
-    /// size both transfers of lamports/tokens. The quorum gate does not
-    /// apply: the arbiter is the resolution mechanism. AV-16: the vault
-    /// token account's mint must equal the bound `vault.mint`
-    /// (`MintMismatch` otherwise); `None` on the native-SOL path (no mint
-    /// bound).
-    pub fn resolve(ctx: Context<Resolve>, taker_amount: u64) -> Result<(u64, u64)> {
+    /// Returns `(taker_payout, fee, initializer_refund)` so the real
+    /// build can size all three transfers: the protocol fee (AV-17)
+    /// slices the taker's share, the refund is never fee'd. The quorum
+    /// gate does not apply: the arbiter is the resolution mechanism.
+    /// AV-16: the vault token account's mint must equal the bound
+    /// `vault.mint` (`MintMismatch` otherwise); `None` on the
+    /// native-SOL path (no mint bound).
+    pub fn resolve(ctx: Context<Resolve>, taker_amount: u64) -> Result<(u64, u64, u64)> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
-        let (payout, refund) = escrow
+        let (payout, fee, refund) = escrow
             .resolve(
                 ctx.accounts.arbiter.key().to_bytes(),
                 taker_amount,
@@ -278,10 +288,11 @@ pub mod escrow_vault {
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
-        // Transfer of `payout` to `ctx.accounts.taker` and `refund` to
+        // Transfer of `payout` to `ctx.accounts.taker`, `fee` to the
+        // protocol fee account, and `refund` to
         // `ctx.accounts.initializer` goes here once real token accounts
         // are wired up.
-        Ok((payout, refund))
+        Ok((payout, fee, refund))
     }
 
     /// Attach a milestone tranche plan (AV-15; mirrors
@@ -325,15 +336,15 @@ pub mod escrow_vault {
     /// Release a milestone's tranche to the taker (AV-15; mirrors
     /// `Escrow::release_milestone`). Only the initializer signs; the
     /// milestone must be dual-confirmed (`MilestoneNotConfirmed`
-    /// otherwise) and every earlier milestone settled. Returns the
-    /// tranche amount so the real build can size the transfer of
-    /// lamports/tokens to the taker. The AV-04 quorum gate applies
-    /// exactly as for `release`. AV-16: the vault token account's mint
-    /// must equal the bound `vault.mint` (`MintMismatch` otherwise);
-    /// `None` on the native-SOL path (no mint bound).
-    pub fn release_milestone(ctx: Context<ReleaseMilestone>, index: u8) -> Result<u64> {
+    /// otherwise) and every earlier milestone settled. Returns
+    /// `(taker_payout, fee)` so the real build can size the taker's
+    /// transfer and the protocol fee (AV-17). The AV-04 quorum gate
+    /// applies exactly as for `release`. AV-16: the vault token
+    /// account's mint must equal the bound `vault.mint` (`MintMismatch`
+    /// otherwise); `None` on the native-SOL path (no mint bound).
+    pub fn release_milestone(ctx: Context<ReleaseMilestone>, index: u8) -> Result<(u64, u64)> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
-        let tranche = escrow
+        let (payout, fee) = escrow
             .release_milestone(
                 ctx.accounts.initializer.key().to_bytes(),
                 index,
@@ -341,9 +352,10 @@ pub mod escrow_vault {
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
-        // Transfer of `tranche` lamports/tokens to `ctx.accounts.taker`
-        // goes here once real token accounts are wired up.
-        Ok(tranche)
+        // Transfer of `payout` lamports/tokens to `ctx.accounts.taker`
+        // and `fee` to the protocol fee account goes here once real
+        // token accounts are wired up.
+        Ok((payout, fee))
     }
 
     /// Skip a milestone by mutual agreement (AV-15; mirrors
@@ -385,6 +397,27 @@ pub mod escrow_vault {
         // The vault account already reserves the full mint region
         // (33 bytes, zeroed when `None`), so the address is written in
         // place — no realloc needed in the real build.
+        Ok(())
+    }
+
+    /// Opt in to a protocol fee on taker payouts (AV-17; mirrors
+    /// `Escrow::with_protocol_fee`). `Uninitialized` only, like
+    /// `initialize_quorum`: the fee rate is fixed before funds move.
+    /// The rate is in basis points (`fee_bps <= 10_000`;
+    /// `InvalidProtocolFee` otherwise); `0` means no fee (the default).
+    /// After this, every taker payout (`release` / `claim` /
+    /// `release_milestone` / the taker's share of `resolve`) splits
+    /// into a net payout and a protocol fee routed to the protocol fee
+    /// account; the fee accumulates in `vault.fees_paid`.
+    pub fn initialize_protocol_fee(ctx: Context<InitializeProtocolFee>, fee_bps: u16) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_protocol_fee(fee_bps)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.fee_bps` is always present (2 bytes, zeroed by
+        // default), so the rate is written in place — no realloc needed
+        // in the real build.
         Ok(())
     }
 }
@@ -461,6 +494,16 @@ pub struct Vault {
     /// reallocating. Layout position matches
     /// `escrow_state::VAULT_FIELDS` (appended last, after `skipped`).
     pub mint: Option<Pubkey>,
+    /// AV-17: protocol fee rate in basis points (0-10000); mirrors
+    /// `escrow_state`'s `fee_bps`. Always present (one u16, zeroed when
+    /// no fee is configured). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after `mint`).
+    pub fee_bps: u16,
+    /// AV-17: cumulative protocol fee charged across payouts; mirrors
+    /// `escrow_state`'s `fees_paid`. Always present (one u64, zeroed
+    /// when no fee was charged). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after `fee_bps`).
+    pub fees_paid: u64,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -500,16 +543,17 @@ pub struct MilestonePlan {
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    // Full vault space: 8-byte discriminator + 522-byte payload = 530
+    // Full vault space: 8-byte discriminator + 532-byte payload = 540
     // bytes (see `escrow_state::VAULT_SPACE`; AV-12 added the 1-byte
     // activation bitmask, AV-13 the 17-byte vesting region, AV-14 the
     // 33-byte arbiter region, AV-15 the 66-byte milestone plan + the
     // 8-byte confirmation bitmap + the 8-byte skipped counter, AV-16 the
-    // 33-byte mint region).
+    // 33-byte mint region, AV-17 the 2-byte fee rate + the 8-byte
+    // cumulative fee counter).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 4_579_680 lamports.
+    // rent parameters the minimum is 4_649_280 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
@@ -728,6 +772,16 @@ pub struct InitializeMint<'info> {
     pub initializer: Signer<'info>,
 }
 
+#[derive(Accounts)]
+pub struct InitializeProtocolFee<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer configures the protocol fee; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
 // --- Helpers (finalized during the real Anchor build) ---
 
 fn read_escrow(_vault: &Account<Vault>) -> escrow_state::Escrow {
@@ -752,7 +806,7 @@ fn write_escrow(_vault: &mut Account<Vault>, _escrow: &escrow_state::Escrow) {
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {
     // One program error per EscrowError variant, so on-chain failures
-    // surface the exact `escrow_state` reason (code 100–113) to clients.
+    // surface the exact `escrow_state` reason (code 100–114) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
         escrow_state::EscrowError::InvalidStateTransition => {
@@ -776,6 +830,7 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {
         }
         escrow_state::EscrowError::InvalidMint => error!(ErrorCode::InvalidMint),
         escrow_state::EscrowError::MintMismatch => error!(ErrorCode::MintMismatch),
+        escrow_state::EscrowError::InvalidProtocolFee => error!(ErrorCode::InvalidProtocolFee),
     }
 }
 
@@ -809,4 +864,6 @@ pub enum ErrorCode {
     InvalidMint,
     #[msg("Token account mint does not match the escrow's bound mint")]
     MintMismatch,
+    #[msg("Invalid protocol fee rate: fee_bps must be 0-10000 (basis points)")]
+    InvalidProtocolFee,
 }

@@ -109,6 +109,24 @@ pub struct Escrow {
     /// quorum and vesting builders. Persisted (33 bytes in the vault
     /// account) so the binding survives serialization.
     mint: Option<[u8; 32]>,
+    /// AV-17: protocol fee rate in basis points (0–10000), charged on
+    /// every taker payout ([`Escrow::release`], [`Escrow::claim`],
+    /// [`Escrow::release_milestone`], and the taker's share of
+    /// [`Escrow::resolve`]). Set once via
+    /// [`Escrow::with_protocol_fee`] on an `Uninitialized` escrow, like
+    /// the other `with_*` builders; `0` (the default) means no fee —
+    /// backward compatible. Persisted (2 bytes in the vault account) so
+    /// the rate survives serialization. Appended last so every earlier
+    /// field offset stays stable.
+    fee_bps: u16,
+    /// AV-17: cumulative protocol fee charged across all payouts
+    /// (always `<= released`): the fee is a routing slice of the gross
+    /// payout, not an extra deduction from the lockup. Audit trail for
+    /// the protocol; the Anchor program routes each payout's fee to the
+    /// protocol fee account. Always present (zeroed for escrows that
+    /// charged no fee). Appended last so every earlier field offset
+    /// stays stable.
+    fees_paid: u64,
 }
 
 /// Bit 0 of [`Escrow::activation`]: the initializer has recorded their
@@ -201,6 +219,13 @@ pub enum EscrowError {
     /// `None` vs `Some` also mismatches — a native-SOL escrow and a
     /// token-bound escrow never share an exit path.
     MintMismatch,
+    /// Protocol fee misconfiguration (AV-17):
+    /// [`Escrow::with_protocol_fee`] with `fee_bps > 10_000` — the rate
+    /// is in basis points, so anything above 10_000 (100%) is not a
+    /// valid rate. Parallels [`EscrowError::InvalidQuorum`],
+    /// [`EscrowError::InvalidVesting`], [`EscrowError::InvalidArbiter`]
+    /// and [`EscrowError::InvalidMint`] (config error).
+    InvalidProtocolFee,
 }
 
 impl EscrowError {
@@ -227,6 +252,7 @@ impl EscrowError {
             EscrowError::MilestoneNotConfirmed => 111,
             EscrowError::InvalidMint => 112,
             EscrowError::MintMismatch => 113,
+            EscrowError::InvalidProtocolFee => 114,
         }
     }
 
@@ -247,6 +273,7 @@ impl EscrowError {
             EscrowError::MilestoneNotConfirmed,
             EscrowError::InvalidMint,
             EscrowError::MintMismatch,
+            EscrowError::InvalidProtocolFee,
         ]
     }
 }
@@ -589,6 +616,11 @@ impl Escrow {
             // native-SOL path (backward compatible). Bind one SPL mint
             // via `with_mint` before funding.
             mint: None,
+            // AV-17: no protocol fee by default — a plain escrow pays
+            // takers in full (backward compatible). Configure a rate via
+            // `with_protocol_fee` before funding.
+            fee_bps: 0,
+            fees_paid: 0,
         })
     }
 
@@ -720,6 +752,15 @@ impl Escrow {
     /// and `amount == 0` is `AmountMismatch`. Models staged payouts
     /// (e.g. delivery milestones paid out in tranches).
     ///
+    /// Returns `(taker_payout, fee)`: the taker's net payout and the
+    /// protocol fee (AV-17) routed to the protocol fee account, so the
+    /// caller (and the Anchor layer) can size both transfers.
+    /// `taker_payout + fee == amount` always; the fee is
+    /// `floor(amount * fee_bps / 10_000)` and accumulates in
+    /// [`Escrow::fees_paid`]. With no fee configured (`fee_bps == 0`)
+    /// the fee is `0` and the taker receives the full amount — the
+    /// pre-AV-17 behavior.
+    ///
     /// AV-15: when a milestone plan is attached (see
     /// [`Escrow::with_milestones`), the plan owns the release schedule and
     /// plain `release` is disabled (`InvalidMilestones`) — arbitrary
@@ -737,7 +778,7 @@ impl Escrow {
         authority: [u8; 32],
         amount: u64,
         mint: Option<[u8; 32]>,
-    ) -> Result<(), EscrowError> {
+    ) -> Result<(u64, u64), EscrowError> {
         self.require_initializer(authority)?;
         match self.state {
             EscrowState::Funded => {}
@@ -762,6 +803,11 @@ impl Escrow {
         if amount == 0 {
             return Err(EscrowError::AmountMismatch);
         }
+        // AV-17: charge the protocol fee only after every gate passes —
+        // a rejected release must not touch `fees_paid`. The `released`
+        // counter still accumulates the *gross* amount (taker payout +
+        // fee), so the conservation invariant
+        // inflow == locked + released + refunded is untouched by fees.
         // checked_add: a wrapping add would reset the counter and let an
         // attacker drain past the lockup; overflow is a hard failure.
         let new_released = self
@@ -771,11 +817,12 @@ impl Escrow {
         if new_released > self.amount {
             return Err(EscrowError::ReleaseExceedsLocked);
         }
+        let fee = self.charge_protocol_fee(amount)?;
         self.released = new_released;
         if self.released == self.amount {
             self.state = EscrowState::Released;
         }
-        Ok(())
+        Ok((amount - fee, fee))
     }
 
     /// Cancel the escrow and return funds. `Funded -> Cancelled`.
@@ -886,8 +933,10 @@ impl Escrow {
     }
 
     /// Claim the vested-but-unreleased portion of the locked funds
-    /// (AV-13, streaming payments). Returns the claimed amount — the
-    /// caller (and the Anchor layer) needs it to size the actual transfer.
+    /// (AV-13, streaming payments). Returns `(taker_payout, fee)` — the
+    /// taker's net payout and the protocol fee (AV-17) — so the caller
+    /// (and the Anchor layer) can size both transfers;
+    /// `taker_payout + fee == claimable` always.
     ///
     /// Only the taker may claim (`Unauthorized` otherwise): vesting is the
     /// taker's pull path, while [`Escrow::release`] stays the initializer's
@@ -914,7 +963,7 @@ impl Escrow {
         authority: [u8; 32],
         now: u64,
         mint: Option<[u8; 32]>,
-    ) -> Result<u64, EscrowError> {
+    ) -> Result<(u64, u64), EscrowError> {
         if authority != self.taker {
             return Err(EscrowError::Unauthorized);
         }
@@ -951,11 +1000,15 @@ impl Escrow {
         }
         // `released + claimable <= vested <= amount`: no overflow, no cap
         // breach — the `release` checked_add path is not needed here.
+        // AV-17: the protocol fee slices the gross claimable; the
+        // `released` counter keeps the gross so conservation is
+        // untouched.
+        let fee = self.charge_protocol_fee(claimable)?;
         self.released += claimable;
         if self.released == self.amount {
             self.state = EscrowState::Released;
         }
-        Ok(claimable)
+        Ok((claimable - fee, fee))
     }
 
     /// Opt in to dispute arbitration (AV-14). Builder-style: only valid
@@ -1009,6 +1062,87 @@ impl Escrow {
         Ok(self)
     }
 
+    /// Opt in to a protocol fee on taker payouts (AV-17 — Solana/DeFi
+    /// protocol revenue: a few basis points of every payout route to
+    /// the protocol's fee account instead of the taker).
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// fee rate is fixed before any funds move — mirroring
+    /// [`Escrow::with_quorum`], [`Escrow::with_vesting`],
+    /// [`Escrow::with_arbiter`] and [`Escrow::with_mint`].
+    /// Re-configuring a live escrow is rejected with
+    /// `InvalidStateTransition`.
+    ///
+    /// The rate is in basis points and must be `<= 10_000`
+    /// ([`EscrowError::InvalidProtocolFee`] otherwise); `0` is a valid
+    /// rate meaning "no fee" (the default, backward compatible).
+    ///
+    /// The fee is charged on every taker payout — [`Escrow::release`],
+    /// [`Escrow::claim`], [`Escrow::release_milestone`] and the taker's
+    /// share of [`Escrow::resolve`] — as
+    /// `floor(gross_payout * fee_bps / 10_000)` (see
+    /// [`Escrow::protocol_fee_for`]), accumulated in the `fees_paid`
+    /// counter. The refund paths (`cancel`, `cancel_expired`), the
+    /// initializer's `resolve` share, and skipped milestones never
+    /// carry a fee: only value the taker receives is feeable, and the
+    /// fee is always a routing slice of the gross payout — it never
+    /// takes the cumulative released total past the locked amount.
+    pub fn with_protocol_fee(mut self, fee_bps: u16) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if fee_bps > 10_000 {
+            return Err(EscrowError::InvalidProtocolFee);
+        }
+        self.fee_bps = fee_bps;
+        Ok(self)
+    }
+
+    /// The protocol fee for a gross taker payout of `amount` (AV-17):
+    /// `floor(amount * fee_bps / 10_000)`.
+    ///
+    /// Computed in `u128`: `amount * fee_bps` can reach
+    /// `u64::MAX * 10_000 < u128::MAX`, so the multiplication cannot
+    /// overflow, and the floored quotient is `<= amount` (since
+    /// `fee_bps <= 10_000`), so the downcast is exact. Floor rounding
+    /// means dust payouts may carry a zero fee — the protocol never
+    /// rounds *up* into the taker's pocket.
+    pub fn protocol_fee_for(&self, amount: u64) -> u64 {
+        ((amount as u128 * self.fee_bps as u128) / 10_000u128) as u64
+    }
+
+    /// Charge the protocol fee on a gross taker payout of `amount`
+    /// (AV-17): accumulate it in `fees_paid` and return it. Called after
+    /// all gates pass, immediately before mutating `released` — a failed
+    /// payout never touches the fee counter.
+    ///
+    /// `fees_paid` provably cannot overflow: each fee is `<=` its gross
+    /// payout and the gross payouts cumulatively cap at `amount <=
+    /// u64::MAX`; the `checked_add` is a backstop, paralleling
+    /// `release`'s.
+    fn charge_protocol_fee(&mut self, amount: u64) -> Result<u64, EscrowError> {
+        let fee = self.protocol_fee_for(amount);
+        self.fees_paid = self
+            .fees_paid
+            .checked_add(fee)
+            .ok_or(EscrowError::ReleaseExceedsLocked)?;
+        Ok(fee)
+    }
+
+    /// The protocol fee rate in basis points configured via
+    /// [`Escrow::with_protocol_fee`]; `0` when no fee is configured
+    /// (backward compatible).
+    pub fn fee_bps(&self) -> u16 {
+        self.fee_bps
+    }
+
+    /// Cumulative protocol fee charged across all payouts (AV-17).
+    /// Always `<= released_amount()`: the fee is a routing slice of the
+    /// gross payouts, and `payout + fee == gross` for every payout.
+    pub fn fees_paid(&self) -> u64 {
+        self.fees_paid
+    }
+
     /// Escalate the escrow into arbitration: `Funded -> Disputed`
     /// (AV-14). Either party — the initializer or the taker — may call
     /// this, so a counterparty who stops cooperating cannot block the
@@ -1052,8 +1186,11 @@ impl Escrow {
     /// configured arbiter may call this (`Unauthorized` otherwise); the
     /// settlement is a single atomic split of the *remaining* locked
     /// funds — the taker is paid `taker_amount`, the initializer is
-    /// refunded the rest. Returns `(taker_payout, initializer_refund)`
-    /// so the caller (and the Anchor layer) can size both transfers.
+    /// refunded the rest. Returns `(taker_payout, fee,
+    /// initializer_refund)` so the caller (and the Anchor layer) can
+    /// size all three transfers: the protocol fee (AV-17) slices the
+    /// taker's share (`taker_payout + fee == taker_amount`), the
+    /// initializer's refund is never fee'd.
     ///
     /// `taker_amount` may be anything from `0` (full refund to the
     /// initializer) to the full remainder (full payout to the taker);
@@ -1085,7 +1222,7 @@ impl Escrow {
         authority: [u8; 32],
         taker_amount: u64,
         mint: Option<[u8; 32]>,
-    ) -> Result<(u64, u64), EscrowError> {
+    ) -> Result<(u64, u64, u64), EscrowError> {
         let arbiter = self.arbiter.ok_or(EscrowError::InvalidArbiter)?;
         match self.state {
             EscrowState::Disputed => {}
@@ -1104,9 +1241,13 @@ impl Escrow {
         if taker_amount > remaining {
             return Err(EscrowError::ReleaseExceedsLocked);
         }
+        // AV-17: the fee slices the taker's share; the `released`
+        // counter keeps the gross so conservation is untouched. The
+        // initializer's refund is never fee'd.
+        let fee = self.charge_protocol_fee(taker_amount)?;
         self.released += taker_amount;
         self.state = EscrowState::Settled;
-        Ok((taker_amount, remaining - taker_amount))
+        Ok((taker_amount - fee, fee, remaining - taker_amount))
     }
 
     /// Attach a milestone tranche plan (AV-15). Builder-style: only valid
@@ -1195,8 +1336,9 @@ impl Escrow {
     }
 
     /// Release milestone `index`'s tranche to the taker (AV-15). Returns
-    /// the tranche amount so the caller (and the Anchor layer) can size
-    /// the transfer.
+    /// `(taker_payout, fee)` — the taker's net payout and the protocol
+    /// fee (AV-17) — so the caller (and the Anchor layer) can size both
+    /// transfers; `taker_payout + fee == tranche` always.
     ///
     /// Only the initializer may drive the release (`Unauthorized`
     /// otherwise): like [`Escrow::release`], tranche release is the
@@ -1226,7 +1368,7 @@ impl Escrow {
         authority: [u8; 32],
         index: u8,
         mint: Option<[u8; 32]>,
-    ) -> Result<u64, EscrowError> {
+    ) -> Result<(u64, u64), EscrowError> {
         self.require_initializer(authority)?;
         match self.state {
             EscrowState::Funded => {}
@@ -1256,18 +1398,24 @@ impl Escrow {
         // tranches sum to the locked amount: released + tranche <= amount
         // always. The checked_add and the cap are backstops, paralleling
         // `release`.
-        self.released = self
+        let new_released = self
             .released
             .checked_add(tranche)
             .ok_or(EscrowError::ReleaseExceedsLocked)?;
-        if self.released > self.amount {
+        if new_released > self.amount {
             return Err(EscrowError::ReleaseExceedsLocked);
         }
+        // AV-17: the protocol fee slices the tranche; the `released`
+        // counter keeps the gross so conservation is untouched. Charged
+        // only after every gate passes — a rejected payout never
+        // touches `fees_paid`.
+        let fee = self.charge_protocol_fee(tranche)?;
+        self.released = new_released;
         self.milestone_flags |= Self::milestone_bit(i, MILESTONE_RELEASED_BIT);
         if self.released == self.amount {
             self.state = EscrowState::Released;
         }
-        Ok(tranche)
+        Ok((tranche - fee, fee))
     }
 
     /// Skip milestone `index` by mutual agreement (AV-15): the milestone's
@@ -1551,6 +1699,16 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // `milestones`. Appended last so every earlier field offset stays
     // stable.
     ("mint", "Option<Pubkey>", 1 + PUBKEY_LEN),
+    // AV-17: protocol fee rate in basis points (see
+    // `Escrow::with_protocol_fee`): one u16, always present (zeroed
+    // when no fee is configured). Appended last so every earlier field
+    // offset stays stable.
+    ("fee_bps", "u16", 2),
+    // AV-17: cumulative protocol fee charged across payouts (see
+    // `Escrow::fees_paid`): one u64, always present (zeroed when no
+    // fee was charged). Appended last so every earlier field offset
+    // stays stable.
+    ("fees_paid", "u64", 8),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -1585,9 +1743,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// zeroed when no plan is configured — followed by the always-present
 /// 8-byte confirmation bitmap and 8-byte skipped counter. The mint
 /// discriminant (AV-16) is likewise always present: one byte, zeroed when
-/// no mint is bound.
+/// no mint is bound. The protocol fee fields (AV-17) are always present
+/// too: 2-byte `fee_bps` (zeroed when no fee configured) and 8-byte
+/// `fees_paid` (zeroed when no fee was charged).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -2205,6 +2365,8 @@ mod fuzz_tests {
         escrow: Escrow,
         amount: u64,
         expires_at: u64,
+        /// Model of the escrow's `fees_paid` counter (AV-17).
+        fees_paid: u128,
     }
 
     fn fuzz_amount(rng: &mut XorShift64) -> u64 {
@@ -2277,11 +2439,27 @@ mod fuzz_tests {
             let amount = fuzz_amount(&mut rng);
             let expires_at = fuzz_expiry(&mut rng);
             match Escrow::initialize(init, taker, amount, expires_at) {
-                Ok(escrow) => slots.push(Some(Slot {
-                    escrow,
-                    amount,
-                    expires_at,
-                })),
+                Ok(escrow) => {
+                    // AV-17: part of the fleet carries a protocol fee
+                    // (0–10000 bps, boundary-biased at 10000), so the
+                    // fuzz exercises fee charging under the conservation
+                    // invariant — `released` stays gross, so the
+                    // invariant is untouched by fees.
+                    let fee_bps = match rng.below(3) {
+                        0 => rng.below(10_001) as u16,
+                        1 => 10_000,
+                        _ => 0,
+                    };
+                    let escrow = escrow
+                        .with_protocol_fee(fee_bps)
+                        .expect("fee_bps <= 10_000 must configure");
+                    slots.push(Some(Slot {
+                        escrow,
+                        amount,
+                        expires_at,
+                        fees_paid: 0,
+                    }))
+                }
                 Err(EscrowError::AmountMismatch) => {
                     assert_eq!(amount, 0, "only zero amounts may fail init");
                     slots.push(None);
@@ -2303,11 +2481,23 @@ mod fuzz_tests {
 
             let op = rng.below(4);
             let mut rel_amt = 0u64;
-            let result = match op {
+            let mut rel_fee = 0u64;
+            let result: Result<(), EscrowError> = match op {
                 0 => slot.escrow.fund(authority),
                 1 => {
                     rel_amt = fuzz_release_amount(&mut rng, slot.amount);
-                    slot.escrow.release(authority, rel_amt, None)
+                    slot.escrow
+                        .release(authority, rel_amt, None)
+                        .map(|(payout, fee)| {
+                            // AV-17: the fee is a routing slice of the
+                            // gross payout — it never escapes it.
+                            assert_eq!(
+                                payout + fee,
+                                rel_amt,
+                                "payout + fee != gross release on seed {seed}"
+                            );
+                            rel_fee = fee;
+                        })
                 }
                 2 => slot.escrow.cancel(authority, None),
                 _ => slot.escrow.cancel_expired(authority, fuzz_now(&mut rng), None),
@@ -2320,13 +2510,16 @@ mod fuzz_tests {
                     EscrowState::Funded => match slot.escrow.state() {
                         // release: a full release closes the escrow, a
                         // partial release leaves it Funded — either way
-                        // rel_amt left the locked bucket.
+                        // rel_amt left the locked bucket. AV-17: the
+                        // gross amount (payout + fee) left the bucket,
+                        // so the conservation invariant is unchanged.
                         EscrowState::Released | EscrowState::Funded => {
                             assert_eq!(
                                 op, 1,
                                 "only release can succeed from Funded to Funded/Released on seed {seed}"
                             );
                             released += rel_amt as u128;
+                            slot.fees_paid += rel_fee as u128;
                         }
                         // cancel / cancel_expired: the refund is the
                         // unreleased remainder (partial releases are
@@ -2347,6 +2540,11 @@ mod fuzz_tests {
                         released_before,
                         "failed op moved the released counter on seed {seed}"
                     );
+                    assert_eq!(
+                        slot.escrow.fees_paid() as u128,
+                        slot.fees_paid,
+                        "failed op moved the fee counter on seed {seed}"
+                    );
                 }
             }
 
@@ -2358,6 +2556,12 @@ mod fuzz_tests {
                 "expires_at changed on seed {seed}"
             );
 
+            // AV-17: the fee model tracks the escrow's counter exactly —
+            // the fee is a routing slice of the gross payout, so it
+            // rides along inside `released` and the invariant above is
+            // unchanged by fees. (Read before the `slots` borrow below.)
+            let escrow_fees: u128 = slot.escrow.fees_paid() as u128;
+            let model_fees: u128 = slot.fees_paid;
             // ... and global conservation across the fleet. `locked` is the
             // unreleased remainder of every still-Funded escrow: partial
             // releases have already moved money into `released`.
@@ -2371,6 +2575,14 @@ mod fuzz_tests {
                 inflow,
                 locked + released + refunded,
                 "conservation violated on seed {seed}"
+            );
+            // AV-17: the fee model tracks the escrow's counter exactly —
+            // the fee is a routing slice of the gross payout, so it
+            // rides along inside `released` and the invariant above is
+            // unchanged by fees.
+            assert_eq!(
+                escrow_fees, model_fees,
+                "fee counter drifted from model on seed {seed}"
             );
         }
     }
@@ -2717,7 +2929,10 @@ mod anchor_idl_tests {
                             amount <- param; partial releases accumulate in \
                             the `released` field and must not cumulatively \
                             exceed `amount` (ReleaseExceedsLocked); \
-                            `amount == 0` is AmountMismatch; when a quorum \
+                            `amount == 0` is AmountMismatch; returns \
+                            (taker_payout, fee) — AV-17: the protocol fee \
+                            slices the payout and accumulates in \
+                            `fees_paid`; when a quorum \
                             is configured the release gate from AV-04 \
                             applies (QuorumNotReached)",
         },
@@ -2786,9 +3001,10 @@ mod anchor_idl_tests {
             method: "Escrow::claim",
             input_mapping: "authority <- accounts.taker (signer); now <- \
                             clock sysvar (NOT an instruction param — see \
-                            cancel_expired rationale); returns the claimed \
-                            amount so the program can size the transfer; \
-                            the quorum gate applies exactly as for release",
+                            cancel_expired rationale); returns (taker_payout, \
+                            fee) so the program can size both transfers \
+                            (AV-17); the quorum gate applies exactly as \
+                            for release",
         },
         InstructionSpec {
             name: "attest",
@@ -2835,8 +3051,10 @@ mod anchor_idl_tests {
                             equal the configured arbiter); taker_amount <- \
                             param, capped at the remaining locked amount \
                             (ReleaseExceedsLocked); Disputed -> Settled; \
-                            returns (taker_payout, initializer_refund) so \
-                            the program can size both transfers; the \
+                            returns (taker_payout, fee, initializer_refund) \
+                            so the program can size all three transfers \
+                            (AV-17: the fee slices the taker's share, the \
+                            refund is never fee'd); the \
                             quorum gate does NOT apply (the arbiter is \
                             the resolution mechanism)",
         },
@@ -2879,8 +3097,9 @@ mod anchor_idl_tests {
             input_mapping: "authority <- accounts.initializer (signer); \
                             index <- param; releases the tranche only \
                             after dual confirmation (MilestoneNotConfirmed \
-                            otherwise) and in-order; returns the tranche \
-                            amount so the program can size the transfer; \
+                            otherwise) and in-order; returns (taker_payout, \
+                            fee) so the program can size both transfers \
+                            (AV-17); \
                             the quorum gate applies exactly as for release",
         },
         InstructionSpec {
@@ -2918,6 +3137,27 @@ mod anchor_idl_tests {
                             otherwise); without a bound mint the escrow is \
                             the native-SOL path and those instructions \
                             take no token mint",
+        },
+        InstructionSpec {
+            // AV-17: protocol fee in basis points.
+            name: "initialize_protocol_fee",
+            params: &[(
+                "fee_bps",
+                "u16",
+                "instruction param; basis points, 0-10000",
+            )],
+            method: "Escrow::with_protocol_fee",
+            input_mapping: "fee_bps <- param; authority <- \
+                            accounts.initializer (signer), enforced by the \
+                            Anchor account constraint, not the state \
+                            machine; Uninitialized only, like \
+                            initialize_quorum; fee_bps > 10000 is \
+                            InvalidProtocolFee; the fee slices every taker \
+                            payout (release / claim / release_milestone / \
+                            resolve) as floor(payout * fee_bps / 10000) \
+                            and accumulates in vault.fees_paid — the \
+                            program routes each payout's fee to the \
+                            protocol fee account",
         },
     ];
 
@@ -2964,6 +3204,7 @@ mod anchor_idl_tests {
             "Escrow::release_milestone",
             "Escrow::skip_milestone",
             "Escrow::with_mint",
+            "Escrow::with_protocol_fee",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -2987,7 +3228,7 @@ mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_eleven_instructions_take_params() {
+    fn only_twelve_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -3008,7 +3249,8 @@ mod anchor_idl_tests {
                 &"confirm_milestone",
                 &"release_milestone",
                 &"skip_milestone",
-                &"initialize_mint"
+                &"initialize_mint",
+                &"initialize_protocol_fee"
             ]
         );
     }
@@ -3070,6 +3312,40 @@ mod anchor_idl_tests {
             funded.with_mint(bytes),
             Err(EscrowError::InvalidStateTransition)
         );
+    }
+
+    #[test]
+    fn initialize_protocol_fee_maps_param_to_fee_bps_field() {
+        // IDL: initialize_protocol_fee(fee_bps: u16). The program takes
+        // the param, then Escrow::with_protocol_fee; authority <-
+        // accounts.initializer, enforced by the Anchor account constraint,
+        // not the state machine (Uninitialized only, like
+        // initialize_quorum).
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(250)
+            .unwrap();
+        assert_eq!(e.fee_bps(), 250);
+        assert_eq!(e.fees_paid(), 0);
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        // Documented failure mode: not a valid basis-point rate.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_protocol_fee(10_001),
+            Err(EscrowError::InvalidProtocolFee)
+        );
+        // Re-configuring a live escrow is rejected by state.
+        let mut funded = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(250)
+            .unwrap();
+        funded.fund(ALICE).unwrap();
+        assert_eq!(
+            funded.with_protocol_fee(300),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(funded.fee_bps(), 250);
     }
 
     #[test]
@@ -3231,8 +3507,8 @@ mod anchor_idl_tests {
             .unwrap();
         e.fund(ALICE).unwrap();
         e.escalate(ALICE, EXPIRES_AT - 1).unwrap();
-        let (payout, refund) = e.resolve(ARBITER, 600_000, None).unwrap();
-        assert_eq!((payout, refund), (600_000, 400_000));
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None).unwrap();
+        assert_eq!((payout, fee, refund), (600_000, 0, 400_000));
         assert_eq!(e.state(), EscrowState::Settled);
         // Taker's share in `released`, initializer's refund in
         // `remaining` — the same split the `cancel` path reports.
@@ -3326,8 +3602,8 @@ mod anchor_idl_tests {
         let mut e = milestone_escrow();
         e.confirm_milestone(ALICE, 0).unwrap();
         e.confirm_milestone(BOB, 0).unwrap();
-        let tranche = e.release_milestone(ALICE, 0, None).unwrap();
-        assert_eq!(tranche, 400_000);
+        let (tranche, fee) = e.release_milestone(ALICE, 0, None).unwrap();
+        assert_eq!((tranche, fee), (400_000, 0), "no fee configured: full tranche to taker");
         assert_eq!((e.released_amount(), e.remaining_amount()), (400_000, 600_000));
         assert_eq!(e.state(), EscrowState::Funded);
         assert!(e.milestone_settled(0));
@@ -3472,8 +3748,8 @@ mod anchor_idl_tests {
             .unwrap();
         e.fund(ALICE).unwrap();
         // Half the window elapsed: half vested.
-        let claimed = e.claim(BOB, 1_750_000_000, None).unwrap();
-        assert_eq!(claimed, 500_000);
+        let (claimed, fee) = e.claim(BOB, 1_750_000_000, None).unwrap();
+        assert_eq!((claimed, fee), (500_000, 0), "no fee configured: full claim to taker");
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!((e.released_amount(), e.remaining_amount()), (500_000, 500_000));
         // Documented failure mode: initializer cannot pull the taker's
@@ -3535,6 +3811,9 @@ mod anchor_idl_tests {
         // AV-16: the base58 mint param populates the bound mint address;
         // the `Option` discriminant is implied (a bound mint is `Some`).
         ("initialize_mint", "mint", "mint"),
+        // AV-17: the fee rate param populates `fee_bps` directly (u16,
+        // not an Option — 0 is the valid "no fee" rate).
+        ("initialize_protocol_fee", "fee_bps", "fee_bps"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -3578,6 +3857,13 @@ mod anchor_idl_tests {
             "skipped",
             "accumulated by skip_milestone once both parties approved; \
              zeroed by initialize",
+        ),
+        // AV-17: the cumulative fee counter is an accumulator, like
+        // `released` and `skipped`: every taker payout adds its fee.
+        (
+            "fees_paid",
+            "accumulated by release / claim / release_milestone / resolve \
+             (the taker's share); zeroed by initialize",
         ),
     ];
 
@@ -3761,6 +4047,11 @@ mod error_code_tests {
             EscrowError::MintMismatch,
             113,
             "exit-path token mint != the escrow's bound mint (None vs Some mismatches too)",
+        ),
+        (
+            EscrowError::InvalidProtocolFee,
+            114,
+            "with_protocol_fee with fee_bps > 10_000 (not a valid basis-point rate)",
         ),
     ];
 
@@ -4154,6 +4445,27 @@ mod error_code_tests {
     }
 
     #[test]
+    fn invalid_protocol_fee_triggered_by_rate_above_10000() {
+        // The rate is in basis points: 10_000 (100%) is the ceiling, and
+        // 0 is a valid "no fee" rate (the default).
+        let err = escrow().with_protocol_fee(10_001).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidProtocolFee);
+        assert_eq!(err.code(), 114);
+        // Boundary: 10_000 configures fine.
+        let e = escrow().with_protocol_fee(10_000).unwrap();
+        assert_eq!(e.fee_bps(), 10_000);
+        // The rate is fixed before funding: reconfiguring a live escrow
+        // is InvalidStateTransition, like the other `with_*` builders.
+        let mut e = escrow().with_protocol_fee(250).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.with_protocol_fee(300),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.fee_bps(), 250, "failed reconfigure keeps the rate");
+    }
+
+    #[test]
     fn mint_match_allows_all_exit_paths() {
         // The matching mint opens every fund-moving exit: release,
         // cancel, cancel_expired, and claim (here on a vesting escrow).
@@ -4177,8 +4489,8 @@ mod error_code_tests {
             .with_vesting(schedule)
             .unwrap();
         e.fund(ALICE).unwrap();
-        let claimed = e.claim(BOB, 1_800_000_000, Some(MINT_A)).unwrap();
-        assert_eq!(claimed, 1_000_000);
+        let (claimed, fee) = e.claim(BOB, 1_800_000_000, Some(MINT_A)).unwrap();
+        assert_eq!((claimed, fee), (1_000_000, 0), "no fee configured: full claim to taker");
         assert_eq!(e.state(), EscrowState::Released);
     }
 }
@@ -4728,6 +5040,12 @@ mod account_space_tests {
                 out.extend_from_slice(&m);
             }
         }
+        // AV-17: protocol fee rate in basis points, always present
+        // (zeroed when no fee configured).
+        out.extend_from_slice(&e.fee_bps.to_le_bytes());
+        // AV-17: cumulative protocol fee charged, always present
+        // (zeroed when no fee was charged).
+        out.extend_from_slice(&e.fees_paid.to_le_bytes());
         out
     }
 
@@ -4744,22 +5062,26 @@ mod account_space_tests {
         // + (1 + 16) (AV-13 vesting schedule) + (1 + 32) (AV-14 arbiter)
         // + (1 + 65) (AV-15 milestone plan) + 8 (AV-15 confirmation bitmap)
         // + 8 (AV-15 skipped counter) + (1 + 32) (AV-16 mint binding)
-        assert_eq!(ESCROW_BODY_LEN, 522, "escrow payload bytes");
+        // + 2 (AV-17 protocol fee rate) + 8 (AV-17 cumulative fee counter)
+        assert_eq!(ESCROW_BODY_LEN, 532, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 530, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 540, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
         // arbiter discriminant (AV-14, zeroed when no arbiter) + 1-byte
         // milestones discriminant (AV-15, zeroed when no plan) + 8-byte
         // confirmation bitmap + 8-byte skipped counter + 1-byte mint
-        // discriminant (AV-16, zeroed when no mint bound).
+        // discriminant (AV-16, zeroed when no mint bound) + 2-byte
+        // protocol fee rate (AV-17, zeroed when no fee configured) +
+        // 8-byte cumulative fee counter (AV-17, zeroed when no fee
+        // charged).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 119);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 129);
     }
 
     #[test]
@@ -4848,6 +5170,18 @@ mod account_space_tests {
         // AV-16: mint discriminant + zeroed address (no mint bound here).
         assert_eq!(bytes[489], 0, "mint: None discriminant");
         assert_eq!(&bytes[490..522], &[0u8; 32], "mint: zeroed address");
+        // AV-17: fee rate u16 + cumulative fee u64 (no fee configured,
+        // none charged).
+        assert_eq!(
+            u16::from_le_bytes(bytes[522..524].try_into().unwrap()),
+            0,
+            "fee_bps: zeroed"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[524..532].try_into().unwrap()),
+            0,
+            "fees_paid: zero"
+        );
 
         // With quorum: same total length (space is always reserved), Some
         // discriminant, attestor bytes and approval bitmask in place.
@@ -5061,16 +5395,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 530) * 3480 * 2 = 658 * 6960 = 4_579_680 lamports.
-        assert_eq!(full, 4_579_680);
+        // (128 + 540) * 3480 * 2 = 668 * 6960 = 4_649_280 lamports.
+        assert_eq!(full, 4_649_280);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 119) * 3480 * 2 = 247 * 6960 = 1_719_120 lamports.
-        assert_eq!(no_quorum, 1_719_120);
+        // (128 + 129) * 3480 * 2 = 257 * 6960 = 1_788_720 lamports.
+        assert_eq!(no_quorum, 1_788_720);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -5113,13 +5447,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(4_579_680, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(4_649_280, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(4_579_679, params.0, params.1),
+            check_vault_rent_exempt(4_649_279, params.0, params.1),
             Err(RentShortfall {
-                required: 4_579_680,
-                provided: 4_579_679,
+                required: 4_649_280,
+                provided: 4_649_279,
             })
         );
         // Generous funding: exempt.
@@ -5131,7 +5465,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 4_579_680,
+                required: 4_649_280,
                 provided: 0,
             })
         );
@@ -5627,15 +5961,15 @@ mod vesting_tests {
     fn claim_streams_linearly_and_closes_at_full_vest() {
         let mut e = funded_vesting_escrow();
         // Quarter points of the window.
-        let q1 = e.claim(BOB, START + (END - START) / 4, None).unwrap();
-        assert_eq!(q1, 250_000);
+        let (q1, fee1) = e.claim(BOB, START + (END - START) / 4, None).unwrap();
+        assert_eq!((q1, fee1), (250_000, 0));
         assert_eq!(e.state(), EscrowState::Funded);
-        let q2 = e.claim(BOB, START + (END - START) / 2, None).unwrap();
-        assert_eq!(q2, 250_000, "only the newly vested portion");
+        let (q2, fee2) = e.claim(BOB, START + (END - START) / 2, None).unwrap();
+        assert_eq!((q2, fee2), (250_000, 0), "only the newly vested portion");
         assert_eq!(e.released_amount(), 500_000);
         assert_eq!(e.remaining_amount(), 500_000);
-        let rest = e.claim(BOB, END, None).unwrap();
-        assert_eq!(rest, 500_000);
+        let (rest, fee_rest) = e.claim(BOB, END, None).unwrap();
+        assert_eq!((rest, fee_rest), (500_000, 0));
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(e.released_amount(), 1_000_000);
     }
@@ -5644,7 +5978,7 @@ mod vesting_tests {
     fn claim_returns_the_claimed_amount_for_transfer_sizing() {
         let mut e = funded_vesting_escrow();
         // The Anchor layer needs the exact payout to size the transfer.
-        assert_eq!(e.claim(BOB, END, None).unwrap(), 1_000_000);
+        assert_eq!(e.claim(BOB, END, None).unwrap(), (1_000_000, 0));
     }
 
     #[test]
@@ -5698,7 +6032,7 @@ mod vesting_tests {
 
     #[test]
     fn with_vesting_rejected_after_funding() {
-        let mut e = funded_vesting_escrow();
+        let e = funded_vesting_escrow();
         let s = VestingSchedule::new(START, END).unwrap();
         assert_eq!(
             e.with_vesting(s),
@@ -5723,8 +6057,8 @@ mod vesting_tests {
         );
         // Once the curve catches up past 800_000, the remainder is
         // claimable again.
-        let claimed = e.claim(BOB, END, None).unwrap();
-        assert_eq!(claimed, 200_000);
+        let (claimed, fee) = e.claim(BOB, END, None).unwrap();
+        assert_eq!((claimed, fee), (200_000, 0), "no fee configured: full claim to taker");
         assert_eq!(e.state(), EscrowState::Released);
     }
 
@@ -5754,7 +6088,7 @@ mod vesting_tests {
         assert_eq!(e.released_amount(), 0);
         e.attest([0xA1; 32]).unwrap();
         e.attest([0xA2; 32]).unwrap();
-        assert_eq!(e.claim(BOB, END, None).unwrap(), 1_000_000);
+        assert_eq!(e.claim(BOB, END, None).unwrap(), (1_000_000, 0));
         assert_eq!(e.state(), EscrowState::Released);
     }
 
@@ -5771,7 +6105,7 @@ mod vesting_tests {
         e.activate(ALICE).unwrap();
         e.activate(BOB).unwrap();
         e.fund(ALICE).unwrap();
-        assert_eq!(e.claim(BOB, START + (END - START) / 2, None).unwrap(), 500_000);
+        assert_eq!(e.claim(BOB, START + (END - START) / 2, None).unwrap(), (500_000, 0));
     }
 
     // ----- observers -----
@@ -5978,8 +6312,8 @@ mod arbitration_tests {
     #[test]
     fn resolve_splits_the_remainder_atomically() {
         let mut e = disputed_escrow();
-        let (payout, refund) = e.resolve(ARBITER, 600_000, None).unwrap();
-        assert_eq!((payout, refund), (600_000, 400_000));
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None).unwrap();
+        assert_eq!((payout, fee, refund), (600_000, 0, 400_000));
         assert_eq!(e.state(), EscrowState::Settled);
         // The taker's share joins the released counter (shared audit
         // trail); the initializer's refund stays visible in
@@ -5993,11 +6327,11 @@ mod arbitration_tests {
     fn resolve_honors_boundary_splits() {
         // Full payout to the taker.
         let mut e = disputed_escrow();
-        assert_eq!(e.resolve(ARBITER, 1_000_000, None).unwrap(), (1_000_000, 0));
+        assert_eq!(e.resolve(ARBITER, 1_000_000, None).unwrap(), (1_000_000, 0, 0));
         assert_eq!(e.state(), EscrowState::Settled);
         // Full refund to the initializer.
         let mut e = disputed_escrow();
-        assert_eq!(e.resolve(ARBITER, 0, None).unwrap(), (0, 1_000_000));
+        assert_eq!(e.resolve(ARBITER, 0, None).unwrap(), (0, 0, 1_000_000));
         assert_eq!(e.state(), EscrowState::Settled);
     }
 
@@ -6046,8 +6380,8 @@ mod arbitration_tests {
         let mut e = funded_arbitrated_escrow();
         e.release(ALICE, 400_000, None).unwrap();
         e.escalate(BOB, EXPIRES_AT - 1).unwrap();
-        let (payout, refund) = e.resolve(ARBITER, 600_000, None).unwrap();
-        assert_eq!((payout, refund), (600_000, 0));
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None).unwrap();
+        assert_eq!((payout, fee, refund), (600_000, 0, 0));
         assert_eq!(e.released_amount(), 1_000_000);
         assert_eq!(e.remaining_amount(), 0);
         assert_eq!(e.state(), EscrowState::Settled);
@@ -6069,7 +6403,7 @@ mod arbitration_tests {
             .unwrap();
         e.fund(ALICE).unwrap();
         e.escalate(ALICE, EXPIRES_AT - 1).unwrap();
-        assert_eq!(e.resolve(ARBITER, 500_000, None).unwrap(), (500_000, 500_000));
+        assert_eq!(e.resolve(ARBITER, 500_000, None).unwrap(), (500_000, 0, 500_000));
         assert_eq!(e.state(), EscrowState::Settled);
     }
 
@@ -6091,7 +6425,7 @@ mod arbitration_tests {
             e.claim(BOB, 1_750_000_000, None),
             Err(EscrowError::InvalidStateTransition)
         );
-        assert_eq!(e.resolve(ARBITER, 200_000, None).unwrap(), (200_000, 800_000));
+        assert_eq!(e.resolve(ARBITER, 200_000, None).unwrap(), (200_000, 0, 800_000));
     }
 
     #[test]
@@ -6269,15 +6603,15 @@ mod milestone_tests {
     fn release_milestone_full_sequence_closes_the_escrow() {
         let mut e = milestone_escrow();
         confirm_both(&mut e, 0);
-        let t0 = e.release_milestone(ALICE, 0, None).unwrap();
-        assert_eq!(t0, 400_000, "the tranche amount is returned for transfer sizing");
+        let (t0, fee0) = e.release_milestone(ALICE, 0, None).unwrap();
+        assert_eq!((t0, fee0), (400_000, 0), "the net tranche is returned for transfer sizing");
         assert_eq!(e.state(), EscrowState::Funded, "more tranches remain");
         assert_eq!((e.released_amount(), e.remaining_amount()), (400_000, 600_000));
         assert_eq!(e.next_milestone(), Some(1));
 
         confirm_both(&mut e, 1);
-        let t1 = e.release_milestone(ALICE, 1, None).unwrap();
-        assert_eq!(t1, 600_000);
+        let (t1, fee1) = e.release_milestone(ALICE, 1, None).unwrap();
+        assert_eq!((t1, fee1), (600_000, 0));
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(e.released_amount(), 1_000_000);
         assert_eq!(e.remaining_amount(), 0);
@@ -6338,7 +6672,7 @@ mod milestone_tests {
         assert_eq!(e.released_amount(), 0);
         e.attest([0xA1; 32]).unwrap();
         e.attest([0xA2; 32]).unwrap();
-        assert_eq!(e.release_milestone(ALICE, 0, None).unwrap(), 400_000);
+        assert_eq!(e.release_milestone(ALICE, 0, None).unwrap(), (400_000, 0));
     }
 
     #[test]
@@ -6425,7 +6759,7 @@ mod milestone_tests {
         // The taker aligns with the release path: now it is confirmed.
         e.confirm_milestone(BOB, 0).unwrap();
         assert!(e.milestone_confirmed(0));
-        assert_eq!(e.release_milestone(ALICE, 0, None).unwrap(), 400_000);
+        assert_eq!(e.release_milestone(ALICE, 0, None).unwrap(), (400_000, 0));
     }
 
     #[test]
@@ -6474,8 +6808,8 @@ mod milestone_tests {
         confirm_both(&mut e, 0);
         e.release_milestone(ALICE, 0, None).unwrap(); // 400_000 to the taker
         e.escalate(BOB, EXPIRES_AT - 1).unwrap();
-        let (payout, refund) = e.resolve(ARBITER, 300_000, None).unwrap();
-        assert_eq!((payout, refund), (300_000, 300_000));
+        let (payout, fee, refund) = e.resolve(ARBITER, 300_000, None).unwrap();
+        assert_eq!((payout, fee, refund), (300_000, 0, 300_000));
         assert_eq!(e.released_amount(), 700_000, "taker share in released");
         assert_eq!(e.remaining_amount(), 300_000, "initializer refund");
         assert_eq!(e.state(), EscrowState::Settled);
@@ -6492,10 +6826,10 @@ mod milestone_tests {
             .unwrap();
         e.fund(ALICE).unwrap();
         confirm_both(&mut e, 0);
-        assert_eq!(e.release_milestone(ALICE, 0, None).unwrap(), u64::MAX - 5);
+        assert_eq!(e.release_milestone(ALICE, 0, None).unwrap(), (u64::MAX - 5, 0));
         assert_eq!(e.state(), EscrowState::Funded);
         confirm_both(&mut e, 1);
-        assert_eq!(e.release_milestone(ALICE, 1, None).unwrap(), 5);
+        assert_eq!(e.release_milestone(ALICE, 1, None).unwrap(), (5, 0));
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(e.released_amount(), u64::MAX);
         assert_eq!(e.remaining_amount(), 0);
@@ -6527,5 +6861,202 @@ mod milestone_tests {
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.state(), EscrowState::Disputed);
+    }
+}
+
+// ---------- AV-17: protocol fee on taker payouts ----------
+//
+// `with_protocol_fee` fixes a basis-point rate (0-10000) before funding.
+// Every taker payout — `release`, `claim`, `release_milestone`, and the
+// taker's share of `resolve` — is split into a net payout and a protocol
+// fee (`floor(gross * fee_bps / 10000)`, computed in u128 so it cannot
+// overflow). The fee accumulates in `fees_paid` and rides along inside
+// the gross `released` counter, so the crate's conservation invariant
+// (inflow == locked + released + refunded) is untouched by fees.
+// Refunds (`cancel`, `cancel_expired`), the initializer's `resolve`
+// share, and skipped milestones are never fee'd.
+#[cfg(test)]
+mod protocol_fee_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn fee_escrow(fee_bps: u16) -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(fee_bps)
+            .unwrap()
+    }
+
+    fn funded_fee_escrow(fee_bps: u16) -> Escrow {
+        let mut e = fee_escrow(fee_bps);
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    #[test]
+    fn fee_math_is_floor_and_overflow_free() {
+        let e = fee_escrow(250); // 2.5%
+        // floor(1_000_000 * 250 / 10_000) = 25_000.
+        assert_eq!(e.protocol_fee_for(1_000_000), 25_000);
+        // floor(999 * 250 / 10_000) = floor(24.975) = 24: the protocol
+        // never rounds up into the taker's pocket.
+        assert_eq!(e.protocol_fee_for(999), 24);
+        // Dust payouts carry a zero fee.
+        assert_eq!(e.protocol_fee_for(1), 0);
+        // u64::MAX * 10_000 < u128::MAX: no overflow at the boundary.
+        let full = fee_escrow(10_000);
+        assert_eq!(full.protocol_fee_for(u64::MAX), u64::MAX);
+        // A zero rate charges nothing.
+        let none = fee_escrow(0);
+        assert_eq!(none.protocol_fee_for(u64::MAX), 0);
+        // 1 bp of u64::MAX: floor((2^64 - 1) / 10_000).
+        assert_eq!(fee_escrow(1).protocol_fee_for(u64::MAX), 1_844_674_407_370_955);
+    }
+
+    #[test]
+    fn release_splits_payout_and_fee() {
+        let mut e = funded_fee_escrow(250); // 2.5%
+        let (payout, fee) = e.release(ALICE, 400_000, None).unwrap();
+        assert_eq!((payout, fee), (390_000, 10_000));
+        assert_eq!(payout + fee, 400_000, "fee is a slice of the gross");
+        assert_eq!(e.fees_paid(), 10_000);
+        // The released counter keeps the gross: conservation is
+        // untouched.
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.remaining_amount(), 600_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+        // Fees accumulate across partial releases.
+        let (payout2, fee2) = e.release(ALICE, 600_000, None).unwrap();
+        assert_eq!((payout2, fee2), (585_000, 15_000));
+        assert_eq!(e.fees_paid(), 25_000);
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.released_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn full_rate_routes_everything_to_the_fee_account() {
+        // 10_000 bps (100%) is a valid config: the taker nets zero.
+        let mut e = funded_fee_escrow(10_000);
+        let (payout, fee) = e.release(ALICE, 1_000_000, None).unwrap();
+        assert_eq!((payout, fee), (0, 1_000_000));
+        assert_eq!(e.fees_paid(), 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn claim_splits_vested_payout_and_fee() {
+        let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(1_000) // 10%
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        // Half the window elapsed: 500_000 vested; 10% -> 50_000 fee.
+        let (payout, fee) = e.claim(BOB, 1_750_000_000, None).unwrap();
+        assert_eq!((payout, fee), (450_000, 50_000));
+        assert_eq!(e.fees_paid(), 50_000);
+        assert_eq!(e.released_amount(), 500_000, "released keeps the gross");
+    }
+
+    #[test]
+    fn milestone_release_splits_tranche_and_fee() {
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(500) // 5%
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        let (payout, fee) = e.release_milestone(ALICE, 0, None).unwrap();
+        assert_eq!((payout, fee), (380_000, 20_000));
+        assert_eq!(e.fees_paid(), 20_000);
+        assert_eq!(e.released_amount(), 400_000, "released keeps the gross");
+    }
+
+    #[test]
+    fn resolve_fees_only_the_takers_share() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(1_000) // 10%
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1).unwrap();
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None).unwrap();
+        assert_eq!((payout, fee, refund), (540_000, 60_000, 400_000));
+        assert_eq!(payout + fee, 600_000, "fee slices the taker's share");
+        assert_eq!(e.fees_paid(), 60_000);
+        assert_eq!(e.released_amount(), 600_000, "released keeps the gross");
+        assert_eq!(e.remaining_amount(), 400_000, "refund untouched by fee");
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn refunds_and_skips_never_carry_a_fee() {
+        // cancel.
+        let mut e = funded_fee_escrow(10_000);
+        e.cancel(ALICE, None).unwrap();
+        assert_eq!(e.fees_paid(), 0);
+        // cancel_expired.
+        let mut e = funded_fee_escrow(10_000);
+        e.cancel_expired(BOB, EXPIRES_AT, None).unwrap();
+        assert_eq!(e.fees_paid(), 0);
+    }
+
+    #[test]
+    fn failed_payouts_leave_the_fee_counter_untouched() {
+        // Unauthorized release.
+        let mut e = funded_fee_escrow(250);
+        assert_eq!(
+            e.release(MALLORY, 400_000, None),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.fees_paid(), 0);
+        // Over-release: the cap check runs before any fee is charged.
+        assert_eq!(
+            e.release(ALICE, 1_000_001, None),
+            Err(EscrowError::ReleaseExceedsLocked)
+        );
+        assert_eq!(e.fees_paid(), 0);
+        assert_eq!(e.released_amount(), 0);
+        // Zero amount.
+        assert_eq!(e.release(ALICE, 0, None), Err(EscrowError::AmountMismatch));
+        assert_eq!(e.fees_paid(), 0);
+        // Claim before anything is vested.
+        let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(250)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.claim(BOB, 1_700_000_000, None),
+            Err(EscrowError::AmountMismatch)
+        );
+        assert_eq!(e.fees_paid(), 0);
+    }
+
+    #[test]
+    fn fee_defaults_to_zero_and_config_is_immutable() {
+        // Plain escrows pay takers in full: pre-AV-17 behavior.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.fee_bps(), 0);
+        assert_eq!(e.fees_paid(), 0);
+        // The fee is part of the initialized config: visible before fund.
+        let e = fee_escrow(777);
+        assert_eq!((e.fee_bps(), e.fees_paid()), (777, 0));
     }
 }

@@ -67,6 +67,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `release_milestone(authority, index)`        | `Funded`       | `Funded` (partial) / `Released` (final tranche) | initializer; milestone dual-confirmed (+ quorum satisfied when configured) |
 | `skip_milestone(authority, index)`           | `Funded`       | — (no state change) | initializer **or** taker, **both** must approve (dual-sig skip; skipped tranche refunded to the initializer) |
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
+| `initialize_protocol_fee(fee_bps)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `fee_bps` in 0–10000 basis points; the fee slices every taker payout into net payout + protocol fee) |
 | `initialize_quorum(attestors, threshold)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
@@ -237,6 +238,36 @@ token type can never be moved out of (or refunded from) the vault. The
 binding is a persisted 33-byte region in the vault account (see the
 layout table), appended last so every earlier field offset stays stable.
 
+**Protocol fee (basis points).** An escrow can opt in to a protocol fee
+at creation (`initialize_protocol_fee(fee_bps)`, opt-in on
+`Uninitialized`, like the quorum builder): the rate is in basis points
+and must be `0`–`10_000` (`InvalidProtocolFee`, code 114, otherwise);
+`0` is a valid "no fee" rate (the default), so plain escrows pay takers
+in full — the pre-AV-17 behavior. The rate is fixed before funding and
+immutable afterwards, like every other `with_*` builder.
+
+The fee is charged on every taker payout — `release`, `claim`,
+`release_milestone`, and the taker's share of `resolve` — as
+`floor(gross_payout × fee_bps / 10_000)`, computed in `u128` so the
+multiplication can never overflow (the quotient is always `<=` the gross,
+so the downcast is exact). Floor rounding means dust payouts may carry a
+zero fee: the protocol never rounds *up* into the taker's pocket. Each
+payout returns `(taker_payout, fee)` (`resolve` returns
+`(taker_payout, fee, initializer_refund)`), so the program can route each
+leg to its destination (taker account / protocol fee account /
+initializer). The fee always slices the gross payout: `taker_payout + fee
+== gross` for every payout, and the cumulative `fees_paid` counter is a
+routing slice of the gross `released` counter — so the conservation
+invariant (`inflow == locked + released + refunded`, pinned by the
+model-based fuzz test) is untouched by fees. Refunds (`cancel`,
+`cancel_expired`), the initializer's `resolve` share, and skipped
+milestones are never fee'd: only value the taker receives carries a fee.
+The rate (`fee_bps`, 2 bytes) and the cumulative counter (`fees_paid`,
+8 bytes) are persisted in the vault account (see the layout table),
+appended last so every earlier field offset stays stable; with the fee
+region the full vault is 540 bytes and needs **4,649,280 lamports** to be
+rent-exempt on mainnet.
+
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
 
@@ -256,6 +287,7 @@ program error per variant):
 | `MilestoneNotConfirmed` | 111 | `release_milestone` before both parties confirmed the milestone |
 | `InvalidMint` | 112 | bad mint address (empty, non-base58, or not 32 bytes), or `with_mint` with the zero address |
 | `MintMismatch` | 113 | exit-path token mint ≠ the escrow's bound mint (`None` vs `Some` mismatches too) |
+| `InvalidProtocolFee` | 114 | `with_protocol_fee` with `fee_bps` > 10_000 (not a valid basis-point rate) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -511,7 +543,9 @@ two-way consistency check against the IDL parameter table:
 | milestone_flags | u64 (bitmask)   | 8     |
 | skipped       | u64               | 8     |
 | mint          | Option<Pubkey>    | 33    |
-| **total**     |                   | **530** |
+| fee_bps       | u16               | 2     |
+| fees_paid     | u64               | 8     |
+| **total**     |                   | **540** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -527,11 +561,14 @@ confirmations, the released bit, the two parties' skip approvals, the
 skipped bit), and the 8-byte skipped counter — and the 33-byte mint
 binding (AV-16: 1-byte discriminant + 32-byte address, zeroed when no
 mint is bound) — all appended after the
-earlier fields, so every earlier field offset stays stable.
-`escrow-state` exposes `VAULT_SPACE` (530) and
-`VAULT_SPACE_NO_QUORUM` (119) for the Anchor `space =` constraint, plus a
+earlier fields, so every earlier field offset stays stable. The 2-byte
+protocol fee rate `fee_bps` (AV-17, zeroed when no fee is configured) and
+the 8-byte cumulative fee counter `fees_paid` (AV-17, zeroed when no fee
+was charged) follow the same always-present, appended-last treatment.
+`escrow-state` exposes `VAULT_SPACE` (540) and
+`VAULT_SPACE_NO_QUORUM` (129) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **4,579,680 lamports** to be
+mainnet rent parameters the full vault needs **4,649,280 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ## Run the tests
