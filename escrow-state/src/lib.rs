@@ -164,6 +164,20 @@ pub struct Escrow {
     /// what the arbiter reviewed. Appended last so every earlier field
     /// offset stays stable.
     evidence_hash: Option<[u8; 32]>,
+    /// AV-23: opt-in refund address whitelist (see
+    /// [`Escrow::with_refund_address`]). `None` means no whitelist
+    /// (backward compatible): refunds go to the initializer. `Some(addr)`
+    /// pins every refund on the unilateral exit paths
+    /// ([`Escrow::cancel`], [`Escrow::cancel_expired`]) to `addr` — the
+    /// transitions take the destination explicitly and reject anything
+    /// else with [`EscrowError::RefundAddressMismatch`], so a phishing
+    /// frontend cannot redirect the refund by swapping the destination
+    /// account. Set once via [`Escrow::with_refund_address`] on an
+    /// `Uninitialized` escrow, like the quorum and vesting builders.
+    /// Persisted (33 bytes in the vault account) so the policy survives
+    /// serialization. Appended last so every earlier field offset stays
+    /// stable.
+    refund_to: Option<[u8; 32]>,
 }
 
 /// Bit 0 of [`Escrow::activation`]: the initializer has recorded their
@@ -272,6 +286,15 @@ pub enum EscrowError {
     /// (`expires_at == u64::MAX`), where it would be meaningless: an
     /// escrow that can never expire has no expiry gate to grace.
     InvalidGracePeriod,
+    /// Refund destination mismatch (AV-23): [`Escrow::cancel`] or
+    /// [`Escrow::cancel_expired`] called with a `refund_to` destination
+    /// that does not equal the escrow's whitelisted refund address
+    /// ([`Escrow::with_refund_address`]) — or, with no whitelist
+    /// configured, that does not equal the initializer. Also returned by
+    /// [`Escrow::with_refund_address`] for the zero address: a zero
+    /// address can never be the legitimate refund destination, so
+    /// binding it is a policy mismatch by construction.
+    RefundAddressMismatch,
 }
 
 impl EscrowError {
@@ -300,6 +323,7 @@ impl EscrowError {
             EscrowError::MintMismatch => 113,
             EscrowError::InvalidProtocolFee => 114,
             EscrowError::InvalidGracePeriod => 115,
+            EscrowError::RefundAddressMismatch => 116,
         }
     }
 
@@ -322,6 +346,7 @@ impl EscrowError {
             EscrowError::MintMismatch,
             EscrowError::InvalidProtocolFee,
             EscrowError::InvalidGracePeriod,
+            EscrowError::RefundAddressMismatch,
         ]
     }
 }
@@ -677,6 +702,10 @@ impl Escrow {
             // is only `Some` once `escalate` stores an evidence hash
             // (backward compatible).
             evidence_hash: None,
+            // AV-23: no refund whitelist by default — refunds go to the
+            // initializer (backward compatible). Opt in via
+            // `with_refund_address` before funding.
+            refund_to: None,
         })
     }
 
@@ -890,16 +919,46 @@ impl Escrow {
     /// AV-16: `mint` is the token account's mint (`None` on the
     /// native-SOL path) and must equal the escrow's bound mint
     /// (`MintMismatch` otherwise).
-    pub fn cancel(&mut self, authority: [u8; 32], mint: Option<[u8; 32]>) -> Result<(), EscrowError> {
+    ///
+    /// AV-23: `refund_to` is the address the refund will be sent to, and
+    /// it must equal the escrow's refund policy — the whitelisted
+    /// address configured via [`Escrow::with_refund_address`], or the
+    /// initializer when no whitelist is configured
+    /// ([`EscrowError::RefundAddressMismatch`] otherwise). The caller
+    /// names the destination explicitly (on-chain: the refund
+    /// account's key) and the state machine pins it, so a phishing
+    /// frontend cannot redirect the refund by swapping the destination
+    /// account. Check order: authority, then state, then the mint
+    /// binding, then the refund destination — a misconfigured call
+    /// fails before any state changes.
+    pub fn cancel(
+        &mut self,
+        authority: [u8; 32],
+        mint: Option<[u8; 32]>,
+        refund_to: [u8; 32],
+    ) -> Result<(), EscrowError> {
         self.require_initializer(authority)?;
         match self.state {
             EscrowState::Funded => {
                 self.require_mint_match(mint)?;
+                self.require_refund_recipient(refund_to)?;
                 self.state = EscrowState::Cancelled;
                 Ok(())
             }
             _ => Err(EscrowError::InvalidStateTransition),
         }
+    }
+
+    /// Require the refund destination to equal the escrow's refund
+    /// policy (AV-23): the whitelisted address when one is configured
+    /// via [`Escrow::with_refund_address`], otherwise the initializer
+    /// (backward compatible). See [`Escrow::with_refund_address`] for
+    /// the anti-phishing rationale.
+    fn require_refund_recipient(&self, refund_to: [u8; 32]) -> Result<(), EscrowError> {
+        if refund_to != self.refund_recipient() {
+            return Err(EscrowError::RefundAddressMismatch);
+        }
+        Ok(())
     }
 
     /// Cancel an escrow that has timed out and refund the initializer.
@@ -918,18 +977,23 @@ impl Escrow {
     /// as `NotExpired`.
     ///
     /// Check order is deliberate: authority first, then state, then the
-    /// mint binding (AV-16), then expiry. A stranger never learns
-    /// whether an escrow is expired from the error alone beyond
-    /// `Unauthorized`.
+    /// mint binding (AV-16), then the refund destination (AV-23), then
+    /// expiry. A stranger never learns whether an escrow is expired from
+    /// the error alone beyond `Unauthorized`, and a misconfigured call
+    /// fails before the time logic runs.
     ///
     /// After partial releases the refund is the remainder
     /// ([`Escrow::remaining_amount`]); [`Escrow::released_amount`] is
-    /// preserved for audit.
+    /// preserved for audit. The refund goes to the whitelisted address
+    /// when one is configured — *even when the taker is the caller*:
+    /// the caller authorizes the cancel, the whitelist authorizes the
+    /// destination.
     pub fn cancel_expired(
         &mut self,
         authority: [u8; 32],
         now: u64,
         mint: Option<[u8; 32]>,
+        refund_to: [u8; 32],
     ) -> Result<(), EscrowError> {
         if authority != self.initializer && authority != self.taker {
             return Err(EscrowError::Unauthorized);
@@ -941,6 +1005,10 @@ impl Escrow {
         // AV-16: the refunded tokens must be the tokens this escrow
         // locks (`MintMismatch` otherwise).
         self.require_mint_match(mint)?;
+        // AV-23: the refund destination must match the escrow's refund
+        // policy (`RefundAddressMismatch` otherwise) — checked before
+        // the expiry gate, like the mint binding.
+        self.require_refund_recipient(refund_to)?;
         if !self.is_expiry_eligible(now) {
             return Err(EscrowError::NotExpired);
         }
@@ -1330,6 +1398,69 @@ impl Escrow {
     /// the audit trail of what the arbiter reviewed.
     pub fn evidence_hash(&self) -> Option<[u8; 32]> {
         self.evidence_hash
+    }
+
+    /// Opt in to a refund address whitelist (AV-23 — Solana security /
+    /// payment fintech): declare the address every refund on the
+    /// unilateral exit paths ([`Escrow::cancel`],
+    /// [`Escrow::cancel_expired`]) must go to.
+    ///
+    /// Why: the refund destination is the highest-value parameter a
+    /// phishing frontend can tamper with — it swaps the destination
+    /// account in the cancel instruction and the user's refund lands in
+    /// the attacker's wallet. With a whitelist, the state machine itself
+    /// rejects any destination that is not the declared address
+    /// ([`EscrowError::RefundAddressMismatch`]), so the UI cannot
+    /// redirect the refund no matter what account it passes. With no
+    /// whitelist configured the policy is "refund to the initializer"
+    /// (backward compatible) — and crucially, *even the taker-initiated*
+    /// `cancel_expired` refunds to the declared address, never to the
+    /// caller: the caller authorizes the cancel, the whitelist
+    /// authorizes the destination.
+    ///
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// policy is fixed before any funds move — mirroring
+    /// [`Escrow::with_quorum`], [`Escrow::with_vesting`],
+    /// [`Escrow::with_arbiter`], [`Escrow::with_mint`],
+    /// [`Escrow::with_protocol_fee`] and [`Escrow::with_grace_period`].
+    /// Re-configuring a live escrow is rejected with
+    /// `InvalidStateTransition`. The zero address is
+    /// [`EscrowError::RefundAddressMismatch`]: it can never be the
+    /// legitimate refund destination, so binding it is a policy mismatch
+    /// by construction (parallels `with_arbiter`'s / `with_mint`'s
+    /// zero-key rejections).
+    ///
+    /// Scope note: the whitelist covers the *unilateral* refund paths
+    /// only. The arbiter's [`Escrow::resolve`] split and the milestone
+    /// skip refunds keep their existing semantics — the arbiter is the
+    /// trusted settlement mechanism by design, and widening the pin to
+    /// those paths would let a stale whitelist veto a settlement.
+    pub fn with_refund_address(mut self, refund_to: [u8; 32]) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if refund_to == [0u8; 32] {
+            return Err(EscrowError::RefundAddressMismatch);
+        }
+        self.refund_to = Some(refund_to);
+        Ok(self)
+    }
+
+    /// The whitelisted refund address configured via
+    /// [`Escrow::with_refund_address`], or `None` when no whitelist is
+    /// configured (refunds go to the initializer — backward compatible).
+    pub fn refund_to(&self) -> Option<[u8; 32]> {
+        self.refund_to
+    }
+
+    /// The address the unilateral refund paths
+    /// ([`Escrow::cancel`], [`Escrow::cancel_expired`]) must send the
+    /// refund to: the whitelisted address when configured, otherwise the
+    /// initializer. The Anchor program sends the refund transfer here
+    /// after the state machine's destination check passes.
+    pub fn refund_recipient(&self) -> [u8; 32] {
+        self.refund_to.unwrap_or(self.initializer)
     }
 
     /// Settle a disputed escrow: `Disputed -> Settled` (AV-14). Only the
@@ -1876,6 +2007,13 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // place — same treatment as `arbiter` / `mint`. Appended last so
     // every earlier field offset stays stable.
     ("evidence_hash", "Option<[u8; 32]>", 1 + 32),
+    // AV-23: refund address whitelist (see
+    // `Escrow::with_refund_address`): one discriminant byte, then the
+    // 32-byte address. The region is always reserved (zeroed when
+    // `None`) so `with_refund_address` writes in place — same treatment
+    // as `arbiter` / `mint` / `evidence_hash`. Appended last so every
+    // earlier field offset stays stable.
+    ("refund_to", "Option<Pubkey>", 1 + PUBKEY_LEN),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -1916,9 +2054,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// is always present too: 8-byte `grace_period` (zeroed when no grace
 /// period is configured). The dispute evidence hash (AV-22) is likewise
 /// always present: 1-byte discriminant + 32-byte commitment (zeroed when
-/// no evidence is attached).
+/// no evidence is attached). The refund address whitelist (AV-23) is
+/// likewise always present: 1-byte discriminant + 32-byte address
+/// (zeroed when no whitelist is configured).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -2053,7 +2193,7 @@ mod tests {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
         let before = e.amount();
-        e.cancel(ALICE, None).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         assert_eq!(e.amount(), before);
     }
@@ -2064,7 +2204,7 @@ mod tests {
     fn cancel_expired_by_initializer_after_expiry_ok() {
         let mut e = funded_escrow();
         let before = e.amount();
-        e.cancel_expired(ALICE, EXPIRES_AT + 1, None).unwrap();
+        e.cancel_expired(ALICE, EXPIRES_AT + 1, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         assert_eq!(e.amount(), before); // refund accounting preserved
     }
@@ -2074,7 +2214,7 @@ mod tests {
         // Either party may cancel an expired escrow: the taker is not
         // left hostage to an unresponsive initializer.
         let mut e = funded_escrow();
-        e.cancel_expired(BOB, EXPIRES_AT + 3_600, None).unwrap();
+        e.cancel_expired(BOB, EXPIRES_AT + 3_600, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
     }
 
@@ -2082,7 +2222,7 @@ mod tests {
     fn cancel_expired_at_exact_expiry_boundary_ok() {
         // `now >= expires_at` is the trigger: equality counts as expired.
         let mut e = funded_escrow();
-        e.cancel_expired(ALICE, EXPIRES_AT, None).unwrap();
+        e.cancel_expired(ALICE, EXPIRES_AT, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
     }
 
@@ -2091,7 +2231,7 @@ mod tests {
         for authority in [ALICE, BOB] {
             let mut e = funded_escrow();
             assert_eq!(
-                e.cancel_expired(authority, EXPIRES_AT - 1, None),
+                e.cancel_expired(authority, EXPIRES_AT - 1, None, ALICE),
                 Err(EscrowError::NotExpired)
             );
             assert_eq!(e.state(), EscrowState::Funded);
@@ -2102,7 +2242,7 @@ mod tests {
     fn cancel_expired_by_stranger_after_expiry_is_unauthorized() {
         let mut e = funded_escrow();
         assert_eq!(
-            e.cancel_expired(MALLORY, EXPIRES_AT + 1, None),
+            e.cancel_expired(MALLORY, EXPIRES_AT + 1, None, ALICE),
             Err(EscrowError::Unauthorized)
         );
         assert_eq!(e.state(), EscrowState::Funded);
@@ -2113,21 +2253,21 @@ mod tests {
         // Uninitialized: authority passes, state rejects.
         let mut e = escrow();
         assert_eq!(
-            e.cancel_expired(ALICE, EXPIRES_AT + 1, None),
+            e.cancel_expired(ALICE, EXPIRES_AT + 1, None, ALICE),
             Err(EscrowError::InvalidStateTransition)
         );
         // Released: terminal, cannot be cancelled again.
         let mut e = funded_escrow();
         e.release(ALICE, 1_000_000, None).unwrap();
         assert_eq!(
-            e.cancel_expired(BOB, EXPIRES_AT + 1, None),
+            e.cancel_expired(BOB, EXPIRES_AT + 1, None, ALICE),
             Err(EscrowError::InvalidStateTransition)
         );
         // Cancelled: terminal, double-cancel rejected.
         let mut e = funded_escrow();
-        e.cancel(ALICE, None).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(
-            e.cancel_expired(ALICE, EXPIRES_AT + 1, None),
+            e.cancel_expired(ALICE, EXPIRES_AT + 1, None, ALICE),
             Err(EscrowError::InvalidStateTransition)
         );
     }
@@ -2138,7 +2278,7 @@ mod tests {
         e.fund(ALICE).unwrap();
         // Any realistic `now` is below u64::MAX.
         assert_eq!(
-            e.cancel_expired(ALICE, u64::MAX - 1, None),
+            e.cancel_expired(ALICE, u64::MAX - 1, None, ALICE),
             Err(EscrowError::NotExpired)
         );
         assert_eq!(e.state(), EscrowState::Funded);
@@ -2159,7 +2299,7 @@ mod tests {
     #[test]
     fn cancel_from_uninitialized_is_invalid() {
         let mut e = escrow();
-        assert_eq!(e.cancel(ALICE, None), Err(EscrowError::InvalidStateTransition));
+        assert_eq!(e.cancel(ALICE, None, ALICE), Err(EscrowError::InvalidStateTransition));
         assert_eq!(e.state(), EscrowState::Uninitialized);
     }
 
@@ -2188,7 +2328,7 @@ mod tests {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
         e.release(ALICE, 1_000_000, None).unwrap();
-        assert_eq!(e.cancel(ALICE, None), Err(EscrowError::InvalidStateTransition));
+        assert_eq!(e.cancel(ALICE, None, ALICE), Err(EscrowError::InvalidStateTransition));
         assert_eq!(e.state(), EscrowState::Released);
     }
 
@@ -2196,7 +2336,7 @@ mod tests {
     fn release_after_cancel_is_invalid() {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        e.cancel(ALICE, None).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(
             e.release(ALICE, 1_000_000, None),
             Err(EscrowError::InvalidStateTransition)
@@ -2216,7 +2356,7 @@ mod tests {
     fn fund_after_cancel_is_invalid() {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        e.cancel(ALICE, None).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(e.fund(ALICE), Err(EscrowError::InvalidStateTransition));
     }
 
@@ -2241,7 +2381,7 @@ mod tests {
     fn non_initializer_cannot_cancel() {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        assert_eq!(e.cancel(MALLORY, None), Err(EscrowError::Unauthorized));
+        assert_eq!(e.cancel(MALLORY, None, ALICE), Err(EscrowError::Unauthorized));
         assert_eq!(e.state(), EscrowState::Funded);
     }
 
@@ -2314,7 +2454,7 @@ mod permission_tests {
             }
             EscrowState::Cancelled => {
                 e.fund(ALICE).unwrap();
-                e.cancel(ALICE, None).unwrap();
+                e.cancel(ALICE, None, ALICE).unwrap();
             }
             EscrowState::Disputed => {
                 // AV-14: arbitration in progress; every unilateral exit
@@ -2379,7 +2519,7 @@ mod permission_tests {
     fn stranger_cannot_cancel_in_any_state() {
         for state in ALL_STATES {
             let mut e = in_state(state);
-            assert_eq!(e.cancel(MALLORY, None), Err(EscrowError::Unauthorized));
+            assert_eq!(e.cancel(MALLORY, None, ALICE), Err(EscrowError::Unauthorized));
             assert_eq!(e.state(), state, "state must be unchanged");
         }
     }
@@ -2388,7 +2528,7 @@ mod permission_tests {
     fn taker_cannot_cancel_in_any_state() {
         for state in ALL_STATES {
             let mut e = in_state(state);
-            assert_eq!(e.cancel(BOB, None), Err(EscrowError::Unauthorized));
+            assert_eq!(e.cancel(BOB, None, ALICE), Err(EscrowError::Unauthorized));
             assert_eq!(e.state(), state, "state must be unchanged");
         }
     }
@@ -2401,7 +2541,7 @@ mod permission_tests {
             for now in [EXPIRES_AT - 1, EXPIRES_AT, EXPIRES_AT + 1] {
                 let mut e = in_state(state);
                 assert_eq!(
-                    e.cancel_expired(MALLORY, now, None),
+                    e.cancel_expired(MALLORY, now, None, ALICE),
                     Err(EscrowError::Unauthorized)
                 );
                 assert_eq!(e.state(), state, "state must be unchanged");
@@ -2417,7 +2557,7 @@ mod permission_tests {
         // expiry the failure is timing, not authority.
         let mut e = in_state(EscrowState::Funded);
         assert_eq!(
-            e.cancel_expired(BOB, EXPIRES_AT - 1, None),
+            e.cancel_expired(BOB, EXPIRES_AT - 1, None, ALICE),
             Err(EscrowError::NotExpired)
         );
         assert_eq!(e.state(), EscrowState::Funded);
@@ -2430,7 +2570,7 @@ mod permission_tests {
         for state in [EscrowState::Released, EscrowState::Cancelled] {
             let mut e = in_state(state);
             assert_eq!(
-                e.cancel_expired(BOB, EXPIRES_AT + 1, None),
+                e.cancel_expired(BOB, EXPIRES_AT + 1, None, ALICE),
                 Err(EscrowError::InvalidStateTransition)
             );
             assert_eq!(e.state(), state, "state must be unchanged");
@@ -2442,7 +2582,7 @@ mod permission_tests {
         // Boundary of the permission matrix: the taker is denied on
         // fund/release/cancel but allowed here once expired.
         let mut e = in_state(EscrowState::Funded);
-        e.cancel_expired(BOB, EXPIRES_AT, None).unwrap();
+        e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
     }
 
@@ -2457,7 +2597,7 @@ mod permission_tests {
         let mut e = in_state(EscrowState::Released);
         assert_eq!(e.release(MALLORY, 1_000_000, None), Err(EscrowError::Unauthorized));
         let mut e = in_state(EscrowState::Cancelled);
-        assert_eq!(e.cancel(MALLORY, None), Err(EscrowError::Unauthorized));
+        assert_eq!(e.cancel(MALLORY, None, ALICE), Err(EscrowError::Unauthorized));
         assert_eq!(e.state(), EscrowState::Cancelled);
     }
 
@@ -2467,9 +2607,9 @@ mod permission_tests {
             let mut e = in_state(state);
             assert_eq!(e.fund(ZERO_KEY), Err(EscrowError::Unauthorized));
             assert_eq!(e.release(ZERO_KEY, 1_000_000, None), Err(EscrowError::Unauthorized));
-            assert_eq!(e.cancel(ZERO_KEY, None), Err(EscrowError::Unauthorized));
+            assert_eq!(e.cancel(ZERO_KEY, None, ALICE), Err(EscrowError::Unauthorized));
             assert_eq!(
-                e.cancel_expired(ZERO_KEY, EXPIRES_AT + 1, None),
+                e.cancel_expired(ZERO_KEY, EXPIRES_AT + 1, None, ALICE),
                 Err(EscrowError::Unauthorized)
             );
             assert_eq!(e.state(), state, "state must be unchanged");
@@ -2670,8 +2810,18 @@ mod fuzz_tests {
                             rel_fee = fee;
                         })
                 }
-                2 => slot.escrow.cancel(authority, None),
-                _ => slot.escrow.cancel_expired(authority, fuzz_now(&mut rng), None),
+                2 => {
+                    // The fuzz fleet configures no refund whitelist, so
+                    // the policy is "refund to the initializer" — read
+                    // it off the escrow (the fleet's initializers are
+                    // fuzzed keys, not always ALICE).
+                    let refund_to = slot.escrow.initializer();
+                    slot.escrow.cancel(authority, None, refund_to)
+                }
+                _ => {
+                    let refund_to = slot.escrow.initializer();
+                    slot.escrow.cancel_expired(authority, fuzz_now(&mut rng), None, refund_to)
+                }
             };
 
             match result {
@@ -2930,11 +3080,11 @@ mod quorum_tests {
         // Anti-griefing: attestors withholding approval cannot lock funds;
         // the initializer refund path stays quorum-free.
         let mut e = escrow_with_quorum();
-        e.cancel(ALICE, None).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
 
         let mut e = escrow_with_quorum();
-        e.cancel_expired(BOB, EXPIRES_AT + 1, None).unwrap();
+        e.cancel_expired(BOB, EXPIRES_AT + 1, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
     }
 
@@ -3111,7 +3261,12 @@ mod anchor_idl_tests {
             name: "cancel",
             params: &[],
             method: "Escrow::cancel",
-            input_mapping: "authority <- accounts.initializer (signer)",
+            input_mapping: "authority <- accounts.initializer (signer); \
+                            refund destination <- accounts.refund_to \
+                            (must equal the whitelisted address, or the \
+                            initializer with no whitelist — \
+                            RefundAddressMismatch otherwise; AV-23 \
+                            anti-phishing pin)",
         },
         InstructionSpec {
             name: "cancel_expired",
@@ -3119,7 +3274,13 @@ mod anchor_idl_tests {
             method: "Escrow::cancel_expired",
             input_mapping: "authority <- accounts.authority (signer: \
                             initializer OR taker); now <- clock sysvar \
-                            (NOT an instruction param — see module docs)",
+                            (NOT an instruction param — see module docs); \
+                            refund destination <- accounts.refund_to \
+                            (must equal the whitelisted address, or the \
+                            initializer with no whitelist — \
+                            RefundAddressMismatch otherwise; AV-23 \
+                            anti-phishing pin; even a taker-initiated \
+                            cancel refunds to the declared address)",
         },
         InstructionSpec {
             name: "initialize_quorum",
@@ -3362,6 +3523,29 @@ mod anchor_idl_tests {
                             submit a premature cancel; 0 is the valid \
                             \"no grace\" default",
         },
+        InstructionSpec {
+            // AV-23: refund address whitelist.
+            name: "initialize_refund_address",
+            params: &[(
+                "refund_to",
+                "Pubkey",
+                "instruction param; every unilateral refund (cancel / \
+                 cancel_expired) must go to this address",
+            )],
+            method: "Escrow::with_refund_address",
+            input_mapping: "refund_to <- param (Pubkey -> [u8; 32] \
+                            conversion); authority <- accounts.initializer \
+                            (signer), enforced by the Anchor account \
+                            constraint, not the state machine; \
+                            Uninitialized only, like initialize_quorum; \
+                            the zero address is RefundAddressMismatch; \
+                            after this, cancel / cancel_expired take the \
+                            refund destination explicitly and reject \
+                            anything but the whitelisted address \
+                            (RefundAddressMismatch) — a phishing frontend \
+                            cannot redirect the refund; with no whitelist \
+                            the policy is refund-to-initializer",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -3409,6 +3593,7 @@ mod anchor_idl_tests {
             "Escrow::with_mint",
             "Escrow::with_protocol_fee",
             "Escrow::with_grace_period",
+            "Escrow::with_refund_address",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -3432,7 +3617,7 @@ mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_fourteen_instructions_take_params() {
+    fn only_fifteen_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -3456,7 +3641,8 @@ mod anchor_idl_tests {
                 &"skip_milestone",
                 &"initialize_mint",
                 &"initialize_protocol_fee",
-                &"initialize_grace_period"
+                &"initialize_grace_period",
+                &"initialize_refund_address"
             ]
         );
     }
@@ -3571,10 +3757,10 @@ mod anchor_idl_tests {
         let mut funded = e;
         funded.fund(ALICE).unwrap();
         assert_eq!(
-            funded.cancel_expired(ALICE, EXPIRES_AT, None),
+            funded.cancel_expired(ALICE, EXPIRES_AT, None, ALICE),
             Err(EscrowError::NotExpired)
         );
-        funded.cancel_expired(ALICE, EXPIRES_AT + 300, None).unwrap();
+        funded.cancel_expired(ALICE, EXPIRES_AT + 300, None, ALICE).unwrap();
         // Documented failure mode: expires_at + grace_period overflows.
         assert_eq!(
             Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
@@ -3631,11 +3817,11 @@ mod anchor_idl_tests {
     fn cancel_maps_initializer_signer_to_authority() {
         // IDL: cancel() — no params; authority <- accounts.initializer.
         let mut e = funded_escrow();
-        e.cancel(ALICE, None).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         // Documented failure mode: signer is not the initializer.
         let mut e = funded_escrow();
-        assert_eq!(e.cancel(MALLORY, None), Err(EscrowError::Unauthorized));
+        assert_eq!(e.cancel(MALLORY, None, ALICE), Err(EscrowError::Unauthorized));
     }
 
     #[test]
@@ -3646,12 +3832,12 @@ mod anchor_idl_tests {
         // anyone fast-forward expiry). The program layer must pass
         // Clock::get()?.unix_timestamp here.
         let mut e = funded_escrow();
-        e.cancel_expired(BOB, EXPIRES_AT, None).unwrap();
+        e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         // Documented failure mode: clock before expiry.
         let mut e = funded_escrow();
         assert_eq!(
-            e.cancel_expired(ALICE, EXPIRES_AT - 1, None),
+            e.cancel_expired(ALICE, EXPIRES_AT - 1, None, ALICE),
             Err(EscrowError::NotExpired)
         );
         assert_eq!(e.state(), EscrowState::Funded);
@@ -4068,6 +4254,10 @@ mod anchor_idl_tests {
         // `evidence_hash`; the `Option` discriminant is implied (an
         // attached hash is `Some`).
         ("escalate", "evidence_hash", "evidence_hash"),
+        // AV-23: the refund address whitelist param populates
+        // `refund_to`; the `Option` discriminant is implied (a declared
+        // whitelist is `Some`).
+        ("initialize_refund_address", "refund_to", "refund_to"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -4312,6 +4502,11 @@ mod error_code_tests {
             115,
             "with_grace_period where expires_at + grace_period would overflow u64 (grace on a no-timeout escrow)",
         ),
+        (
+            EscrowError::RefundAddressMismatch,
+            116,
+            "cancel/cancel_expired with a refund destination != the whitelisted address (or != the initializer with no whitelist), or with_refund_address with the zero address",
+        ),
     ];
 
     #[test]
@@ -4378,7 +4573,7 @@ mod error_code_tests {
         let mut e = escrow();
         e.fund(ALICE).unwrap();
         // Authorized party (initializer), right state, wrong time.
-        let err = e.cancel_expired(ALICE, EXPIRES_AT - 1, None).unwrap_err();
+        let err = e.cancel_expired(ALICE, EXPIRES_AT - 1, None, ALICE).unwrap_err();
         assert_eq!(err, EscrowError::NotExpired);
         assert_eq!(err.code(), 103);
     }
@@ -4686,7 +4881,7 @@ mod error_code_tests {
         // A bound escrow never exits through the native-SOL path: `None`
         // vs `Some` mismatches too.
         let mut e = mint_escrow();
-        assert_eq!(e.cancel(ALICE, None), Err(EscrowError::MintMismatch));
+        assert_eq!(e.cancel(ALICE, None, ALICE), Err(EscrowError::MintMismatch));
         assert_eq!(e.state(), EscrowState::Funded);
     }
 
@@ -4770,11 +4965,11 @@ mod error_code_tests {
         assert_eq!(e.released_amount(), 400_000);
 
         let mut e = mint_escrow();
-        e.cancel(ALICE, Some(MINT_A)).unwrap();
+        e.cancel(ALICE, Some(MINT_A), ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
 
         let mut e = mint_escrow();
-        e.cancel_expired(BOB, EXPIRES_AT, Some(MINT_A)).unwrap();
+        e.cancel_expired(BOB, EXPIRES_AT, Some(MINT_A), ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
 
         let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
@@ -5080,7 +5275,7 @@ mod property_tests {
             // fund → cancel.
             let mut e = mk();
             e.fund(ALICE).unwrap();
-            e.cancel(ALICE, None).unwrap();
+            e.cancel(ALICE, None, ALICE).unwrap();
             assert_eq!(e.state(), EscrowState::Cancelled);
             assert_eq!(e.amount(), amount, "case {case}: amount changed on cancel path");
 
@@ -5088,7 +5283,7 @@ mod property_tests {
             // edge (now == expires_at satisfies now >= expires_at).
             let mut e = mk();
             e.fund(ALICE).unwrap();
-            e.cancel_expired(BOB, expiry, None).unwrap();
+            e.cancel_expired(BOB, expiry, None, ALICE).unwrap();
             assert_eq!(e.state(), EscrowState::Cancelled);
             assert_eq!(
                 e.amount(),
@@ -5131,7 +5326,7 @@ mod property_tests {
             let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, expiry).unwrap();
             e.fund(ALICE).unwrap();
             let expected = now >= expiry;
-            match e.cancel_expired(ALICE, now, None) {
+            match e.cancel_expired(ALICE, now, None, ALICE) {
                 Ok(()) => {
                     assert!(
                         expected,
@@ -5360,6 +5555,19 @@ mod account_space_tests {
                 out.extend_from_slice(&h);
             }
         }
+        // AV-23: refund address whitelist, always reserved like `quorum`:
+        // the `None` discriminant followed by a zeroed address, so
+        // `with_refund_address` writes in place without reallocating.
+        match e.refund_to {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; 32]);
+            }
+            Some(addr) => {
+                out.push(1);
+                out.extend_from_slice(&addr);
+            }
+        }
         out
     }
 
@@ -5378,10 +5586,10 @@ mod account_space_tests {
         // + 8 (AV-15 skipped counter) + (1 + 32) (AV-16 mint binding)
         // + 2 (AV-17 protocol fee rate) + 8 (AV-17 cumulative fee counter)
         // + 8 (AV-21 expiry grace period) + (1 + 32) (AV-22 dispute
-        // evidence hash)
-        assert_eq!(ESCROW_BODY_LEN, 573, "escrow payload bytes");
+        // evidence hash) + (1 + 32) (AV-23 refund address whitelist)
+        assert_eq!(ESCROW_BODY_LEN, 606, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 581, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 614, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -5393,13 +5601,15 @@ mod account_space_tests {
         // 8-byte cumulative fee counter (AV-17, zeroed when no fee
         // charged) + 8-byte expiry grace period (AV-21, zeroed when no
         // grace period configured) + (1 + 32)-byte dispute evidence hash
-        // (AV-22, zeroed when no evidence attached).
+        // (AV-22, zeroed when no evidence attached) + (1 + 32)-byte
+        // refund address whitelist (AV-23, zeroed when no whitelist
+        // configured).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 170);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 203);
     }
 
     #[test]
@@ -5511,6 +5721,11 @@ mod account_space_tests {
         // offset above is unchanged.
         assert_eq!(bytes[540], 0, "evidence_hash: None discriminant");
         assert_eq!(&bytes[541..573], &[0u8; 32], "evidence_hash: zeroed");
+        // AV-23: refund whitelist discriminant + zeroed address (no
+        // whitelist configured here); appended last, so every earlier
+        // offset above is unchanged.
+        assert_eq!(bytes[573], 0, "refund_to: None discriminant");
+        assert_eq!(&bytes[574..606], &[0u8; 32], "refund_to: zeroed");
 
         // With quorum: same total length (space is always reserved), Some
         // discriminant, attestor bytes and approval bitmask in place.
@@ -5724,16 +5939,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 581) * 3480 * 2 = 709 * 6960 = 4_934_640 lamports.
-        assert_eq!(full, 4_934_640);
+        // (128 + 614) * 3480 * 2 = 742 * 6960 = 5_164_320 lamports.
+        assert_eq!(full, 5_164_320);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 170) * 3480 * 2 = 298 * 6960 = 2_074_080 lamports.
-        assert_eq!(no_quorum, 2_074_080);
+        // (128 + 203) * 3480 * 2 = 331 * 6960 = 2_303_760 lamports.
+        assert_eq!(no_quorum, 2_303_760);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -5776,12 +5991,12 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(4_934_640, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(5_164_320, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(4_704_959, params.0, params.1),
             Err(RentShortfall {
-                required: 4_934_640,
+                required: 5_164_320,
                 provided: 4_704_959,
             })
         );
@@ -5794,7 +6009,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 4_934_640,
+                required: 5_164_320,
                 provided: 0,
             })
         );
@@ -5958,7 +6173,7 @@ mod partial_release_tests {
     fn cancel_after_partial_release_refunds_remainder_and_preserves_released() {
         let mut e = funded_escrow();
         e.release(ALICE, 400_000, None).unwrap();
-        e.cancel(ALICE, None).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         // Released funds stay released; the refund is the remainder.
         assert_eq!(e.released_amount(), 400_000, "released preserved for audit");
@@ -6131,7 +6346,7 @@ mod dual_sig_tests {
         e.release(ALICE, 400_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!((e.released_amount(), e.remaining_amount()), (400_000, 600_000));
-        e.cancel(ALICE, None).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
     }
 
@@ -6355,7 +6570,7 @@ mod vesting_tests {
     #[test]
     fn claim_on_terminal_states_is_invalid_transition() {
         let mut e = funded_vesting_escrow();
-        e.cancel(ALICE, None).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(e.claim(BOB, END, None), Err(EscrowError::InvalidStateTransition));
     }
 
@@ -6395,7 +6610,7 @@ mod vesting_tests {
     fn cancel_after_claims_refunds_remainder_and_preserves_released() {
         let mut e = funded_vesting_escrow();
         e.claim(BOB, START + (END - START) / 2, None).unwrap();
-        e.cancel(ALICE, None).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         assert_eq!(e.released_amount(), 500_000, "claims preserved for audit");
         assert_eq!(e.remaining_amount(), 500_000, "refundable remainder");
@@ -6469,7 +6684,7 @@ mod vesting_tests {
         let mut e = funded_vesting_escrow();
         e.claim(BOB, START + (END - START) / 2, None).unwrap(); // 500_000
         e.release(ALICE, 200_000, None).unwrap();
-        e.cancel(ALICE, None).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(e.released_amount(), 700_000);
         assert_eq!(e.remaining_amount(), 300_000);
         assert_eq!(
@@ -6611,9 +6826,9 @@ mod arbitration_tests {
             e.release(ALICE, 100_000, None),
             Err(EscrowError::InvalidStateTransition)
         );
-        assert_eq!(e.cancel(ALICE, None), Err(EscrowError::InvalidStateTransition));
+        assert_eq!(e.cancel(ALICE, None, ALICE), Err(EscrowError::InvalidStateTransition));
         assert_eq!(
-            e.cancel_expired(ALICE, EXPIRES_AT + 1, None),
+            e.cancel_expired(ALICE, EXPIRES_AT + 1, None, ALICE),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.claim(BOB, EXPIRES_AT + 1, None), Err(EscrowError::InvalidStateTransition));
@@ -6630,7 +6845,7 @@ mod arbitration_tests {
         // outcome once escalated.
         let mut e = disputed_escrow();
         assert_eq!(
-            e.cancel_expired(BOB, EXPIRES_AT + 1_000_000, None),
+            e.cancel_expired(BOB, EXPIRES_AT + 1_000_000, None, ALICE),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.state(), EscrowState::Disputed);
@@ -7112,7 +7327,7 @@ mod milestone_tests {
         );
         // Cancel refunds the remainder (including the skipped tranche);
         // both counters are preserved for audit.
-        e.cancel(ALICE, None).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         assert_eq!(e.released_amount(), 600_000);
         assert_eq!(e.skipped_amount(), 400_000);
@@ -7335,11 +7550,11 @@ mod protocol_fee_tests {
     fn refunds_and_skips_never_carry_a_fee() {
         // cancel.
         let mut e = funded_fee_escrow(10_000);
-        e.cancel(ALICE, None).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(e.fees_paid(), 0);
         // cancel_expired.
         let mut e = funded_fee_escrow(10_000);
-        e.cancel_expired(BOB, EXPIRES_AT, None).unwrap();
+        e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
         assert_eq!(e.fees_paid(), 0);
     }
 
@@ -7595,27 +7810,28 @@ mod combination_matrix_tests {
             let mut e = build_with_expiry(flags, 0);
             fund_fully(&mut e, flags);
             // The mint binding is checked before expiry (check order:
-            // authority -> state -> mint -> expiry): a wrong mint fails
-            // even on an expired escrow, in both mismatch directions.
+            // authority -> state -> mint -> refund -> expiry): a wrong
+            // mint fails even on an expired escrow, in both mismatch
+            // directions.
             let wrong_mint = if flags & F_MINT != 0 {
                 Some(OTHER_MINT)
             } else {
                 Some(MINT)
             };
             assert_eq!(
-                e.cancel_expired(ALICE, NOW, wrong_mint),
+                e.cancel_expired(ALICE, NOW, wrong_mint, ALICE),
                 Err(EscrowError::MintMismatch)
             );
             // Early call: not expired yet.
             let mut early = build_with_expiry(flags, NOW + 1);
             fund_fully(&mut early, flags);
             assert_eq!(
-                early.cancel_expired(BOB, NOW, mint_arg(flags)),
+                early.cancel_expired(BOB, NOW, mint_arg(flags), ALICE),
                 Err(EscrowError::NotExpired)
             );
             // Either party may cancel an expired escrow; the refund is
             // the full remainder and no fee is ever charged on it.
-            e.cancel_expired(BOB, NOW, mint_arg(flags)).unwrap();
+            e.cancel_expired(BOB, NOW, mint_arg(flags), ALICE).unwrap();
             assert_eq!(e.state(), EscrowState::Cancelled);
             assert_eq!(e.released_amount(), 0);
             assert_eq!(e.remaining_amount(), AMOUNT);
@@ -7834,13 +8050,13 @@ mod combination_matrix_tests {
     fn matrix_check_order_cancel_expired() {
         let mut e = build_with_expiry(ALL, 0);
         fund_fully(&mut e, ALL);
-        // Check order: authority -> state -> mint -> expiry.
+        // Check order: authority -> state -> mint -> refund -> expiry.
         assert_eq!(
-            e.cancel_expired(MALLORY, NOW, Some(MINT)),
+            e.cancel_expired(MALLORY, NOW, Some(MINT), ALICE),
             Err(EscrowError::Unauthorized)
         );
         assert_eq!(
-            e.cancel_expired(ALICE, NOW, Some(OTHER_MINT)),
+            e.cancel_expired(ALICE, NOW, Some(OTHER_MINT), ALICE),
             Err(EscrowError::MintMismatch)
         );
         // Expiry is the last check: an early call fails NotExpired even
@@ -7848,12 +8064,12 @@ mod combination_matrix_tests {
         let mut early = build_with_expiry(ALL, NOW + 1);
         fund_fully(&mut early, ALL);
         assert_eq!(
-            early.cancel_expired(ALICE, NOW, Some(MINT)),
+            early.cancel_expired(ALICE, NOW, Some(MINT), ALICE),
             Err(EscrowError::NotExpired)
         );
         // Executable: either party cancels, the refund is the remainder,
         // and refunds never carry a fee.
-        e.cancel_expired(BOB, NOW, Some(MINT)).unwrap();
+        e.cancel_expired(BOB, NOW, Some(MINT), ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         assert_eq!(e.fees_paid(), 0);
         assert_conservation(0, 0, AMOUNT);
@@ -7915,7 +8131,7 @@ mod grace_tests {
         assert!(e.is_expiry_eligible(EXPIRES_AT));
         assert!(!e.is_expiry_eligible(EXPIRES_AT - 1));
         let mut e = funded_no_grace();
-        e.cancel_expired(ALICE, EXPIRES_AT, None).unwrap();
+        e.cancel_expired(ALICE, EXPIRES_AT, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
     }
 
@@ -7926,17 +8142,17 @@ mod grace_tests {
         // At expires_at itself: still NotExpired — the whole point of the
         // grace period (the keeper's clock may be ahead of the chain's).
         assert_eq!(
-            e.cancel_expired(ALICE, EXPIRES_AT, None),
+            e.cancel_expired(ALICE, EXPIRES_AT, None, ALICE),
             Err(EscrowError::NotExpired)
         );
         // One second before the gate: still NotExpired.
         assert_eq!(
-            e.cancel_expired(ALICE, EXPIRES_AT + GRACE - 1, None),
+            e.cancel_expired(ALICE, EXPIRES_AT + GRACE - 1, None, ALICE),
             Err(EscrowError::NotExpired)
         );
         assert_eq!(e.state(), EscrowState::Funded, "failed cancels change nothing");
         // At expires_at + grace: the gate passes.
-        e.cancel_expired(ALICE, EXPIRES_AT + GRACE, None).unwrap();
+        e.cancel_expired(ALICE, EXPIRES_AT + GRACE, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
     }
 
@@ -7945,7 +8161,7 @@ mod grace_tests {
         // Either party may cancel an expired escrow — the grace period
         // does not change who may call, only when.
         let mut e = funded_with_grace();
-        e.cancel_expired(BOB, EXPIRES_AT + GRACE, None).unwrap();
+        e.cancel_expired(BOB, EXPIRES_AT + GRACE, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
     }
 
@@ -7956,7 +8172,7 @@ mod grace_tests {
         // the grace period did not reorder the checks.
         let mut e = funded_with_grace();
         assert_eq!(
-            e.cancel_expired(MALLORY, EXPIRES_AT + 1, None),
+            e.cancel_expired(MALLORY, EXPIRES_AT + 1, None, ALICE),
             Err(EscrowError::Unauthorized)
         );
         assert_eq!(e.state(), EscrowState::Funded);
@@ -7978,7 +8194,7 @@ mod grace_tests {
         ] {
             let eligible = funded_with_grace().is_expiry_eligible(now);
             let mut e = funded_with_grace();
-            let res = e.cancel_expired(ALICE, now, None);
+            let res = e.cancel_expired(ALICE, now, None, ALICE);
             assert_eq!(
                 res.is_ok(),
                 eligible,
@@ -8000,10 +8216,10 @@ mod grace_tests {
         let mut e = funded_with_grace();
         e.release(ALICE, 400_000, None).unwrap();
         assert_eq!(
-            e.cancel_expired(ALICE, EXPIRES_AT + GRACE - 1, None),
+            e.cancel_expired(ALICE, EXPIRES_AT + GRACE - 1, None, ALICE),
             Err(EscrowError::NotExpired)
         );
-        e.cancel_expired(ALICE, EXPIRES_AT + GRACE, None).unwrap();
+        e.cancel_expired(ALICE, EXPIRES_AT + GRACE, None, ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         assert_eq!(e.released_amount(), 400_000);
         assert_eq!(e.remaining_amount(), AMOUNT - 400_000);
@@ -8114,5 +8330,173 @@ mod evidence_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         assert_eq!(bytes[540], 1, "evidence_hash: Some discriminant");
         assert_eq!(&bytes[541..573], &EVIDENCE, "evidence_hash bytes");
+    }
+}
+
+// ---------- AV-23: refund address whitelist ----------
+//
+// The unilateral refund paths (`cancel` / `cancel_expired`) take the
+// refund destination explicitly and pin it against the escrow's refund
+// policy — the whitelisted address when one is configured via
+// `with_refund_address`, otherwise the initializer. A phishing frontend
+// that swaps the destination account gets `RefundAddressMismatch`
+// instead of a redirected refund.
+#[cfg(test)]
+mod refund_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const CAROL: [u8; 32] = [0xC4; 32]; // whitelisted refund address
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger / phishing destination
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn funded(amount: u64, expires_at: u64) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, amount, expires_at).unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    fn funded_whitelisted() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_refund_address(CAROL)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    #[test]
+    fn refund_to_defaults_to_none_initializer_is_recipient() {
+        // Backward compatible: no whitelist means the initializer is the
+        // only valid refund destination.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.refund_to(), None);
+        assert_eq!(e.refund_recipient(), ALICE);
+        let mut e = funded(1_000_000, EXPIRES_AT);
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        // Any other destination is a policy mismatch.
+        let mut e = funded(1_000_000, EXPIRES_AT);
+        assert_eq!(
+            e.cancel(ALICE, None, MALLORY),
+            Err(EscrowError::RefundAddressMismatch)
+        );
+        assert_eq!(e.state(), EscrowState::Funded, "failed cancel changes nothing");
+    }
+
+    #[test]
+    fn with_refund_address_only_before_funding() {
+        // The policy is fixed before funds move, like the other
+        // builders: re-configuring a live escrow is rejected.
+        let e = funded(1_000_000, EXPIRES_AT);
+        assert_eq!(
+            e.with_refund_address(CAROL),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_refund_address(CAROL)
+            .unwrap();
+        assert_eq!(e.refund_to(), Some(CAROL));
+        assert_eq!(e.refund_recipient(), CAROL);
+    }
+
+    #[test]
+    fn with_refund_address_rejects_zero_address() {
+        // A zero address can never be the legitimate refund destination:
+        // binding it is a policy mismatch by construction.
+        let err = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_refund_address([0u8; 32])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RefundAddressMismatch);
+    }
+
+    #[test]
+    fn cancel_requires_whitelisted_destination() {
+        // With a whitelist, only the declared address is accepted — the
+        // initializer's own key is rejected too, so a phishing frontend
+        // cannot even fall back to a "plausible" destination.
+        let mut e = funded_whitelisted();
+        e.cancel(ALICE, None, CAROL).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+
+        for bad in [ALICE, BOB, MALLORY, [0u8; 32]] {
+            let mut e = funded_whitelisted();
+            assert_eq!(
+                e.cancel(ALICE, None, bad),
+                Err(EscrowError::RefundAddressMismatch),
+                "destination {bad:02x?} should be rejected"
+            );
+            assert_eq!(e.state(), EscrowState::Funded);
+        }
+    }
+
+    #[test]
+    fn cancel_expired_refunds_to_whitelist_even_for_taker() {
+        // The caller authorizes the cancel; the whitelist authorizes the
+        // destination. A taker-initiated cancel_expired still refunds to
+        // the declared address — never to the caller.
+        let mut e = funded_whitelisted();
+        e.cancel_expired(BOB, EXPIRES_AT, None, CAROL).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+
+        let mut e = funded_whitelisted();
+        assert_eq!(
+            e.cancel_expired(BOB, EXPIRES_AT, None, BOB),
+            Err(EscrowError::RefundAddressMismatch),
+            "taker must not redirect the refund to themselves"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn refund_check_order_mint_then_refund_then_expiry() {
+        // Authority -> state -> mint -> refund -> expiry: each gate fires
+        // in order, so a caller learns nothing beyond the first failure.
+        let mut e = funded_whitelisted();
+        // Stranger first: Unauthorized before any policy check.
+        assert_eq!(
+            e.cancel_expired(MALLORY, EXPIRES_AT, None, MALLORY),
+            Err(EscrowError::Unauthorized)
+        );
+        // Mint binding before the refund pin.
+        assert_eq!(
+            e.cancel_expired(ALICE, EXPIRES_AT, Some([0xD0; 32]), MALLORY),
+            Err(EscrowError::MintMismatch)
+        );
+        // Refund pin before the expiry gate: a wrong destination fails
+        // even on an unexpired escrow.
+        let mut early = {
+            let mut x = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT + 10_000)
+                .unwrap()
+                .with_refund_address(CAROL)
+                .unwrap();
+            x.fund(ALICE).unwrap();
+            x
+        };
+        assert_eq!(
+            early.cancel_expired(ALICE, EXPIRES_AT, None, MALLORY),
+            Err(EscrowError::RefundAddressMismatch)
+        );
+        // And the expiry gate still fires with a correct destination.
+        assert_eq!(
+            early.cancel_expired(ALICE, EXPIRES_AT, None, CAROL),
+            Err(EscrowError::NotExpired)
+        );
+        assert_eq!(early.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn refund_to_persists_in_serialized_layout() {
+        // The whitelist occupies the appended tail of the vault account
+        // (discriminant + 32 bytes), so `with_refund_address` writes it
+        // in place.
+        let e = funded_whitelisted();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes[573], 1, "refund_to: Some discriminant");
+        assert_eq!(&bytes[574..606], &CAROL, "refund_to bytes");
     }
 }

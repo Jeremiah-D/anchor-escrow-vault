@@ -142,6 +142,11 @@ pub mod escrow_vault {
     /// AV-16: the vault token account's mint must equal the bound
     /// `vault.mint` (`MintMismatch` otherwise); `None` on the native-SOL
     /// path (no mint bound).
+    /// AV-23: the refund goes to `accounts.refund_to`, pinned by the
+    /// state machine against the escrow's refund policy (the whitelisted
+    /// address, or the initializer with no whitelist;
+    /// `RefundAddressMismatch` otherwise) — a phishing frontend cannot
+    /// redirect the refund by swapping the destination account.
     pub fn cancel(ctx: Context<Cancel>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let from = escrow.state() as u8;
@@ -149,6 +154,7 @@ pub mod escrow_vault {
             .cancel(
                 ctx.accounts.initializer.key().to_bytes(),
                 vault_token_mint(&ctx.accounts.vault_token_account),
+                ctx.accounts.refund_to.key().to_bytes(),
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
@@ -176,6 +182,10 @@ pub mod escrow_vault {
     /// AV-16: the vault token account's mint must equal the bound
     /// `vault.mint` (`MintMismatch` otherwise); `None` on the native-SOL
     /// path (no mint bound).
+    /// AV-23: the refund goes to `accounts.refund_to`, pinned by the
+    /// state machine against the escrow's refund policy — even when the
+    /// taker is the caller, the refund goes to the declared address,
+    /// never to the caller (`RefundAddressMismatch` otherwise).
     pub fn cancel_expired(ctx: Context<CancelExpired>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
@@ -185,6 +195,7 @@ pub mod escrow_vault {
                 ctx.accounts.authority.key().to_bytes(),
                 now,
                 vault_token_mint(&ctx.accounts.vault_token_account),
+                ctx.accounts.refund_to.key().to_bytes(),
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
@@ -669,6 +680,27 @@ pub mod escrow_vault {
         // in the real build.
         Ok(())
     }
+
+    /// Declare the refund address whitelist (AV-23; mirrors
+    /// `Escrow::with_refund_address`): after this, `cancel` /
+    /// `cancel_expired` only refund to `refund_to`
+    /// (`RefundAddressMismatch` otherwise) — a phishing frontend cannot
+    /// redirect the refund. `Uninitialized` only; the zero address is
+    /// rejected.
+    pub fn initialize_refund_address(
+        ctx: Context<InitializeRefundAddress>,
+        refund_to: Pubkey,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_refund_address(refund_to.to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.refund_to` is always present (33 bytes, zeroed by
+        // default), so the address is written in place — no realloc
+        // needed in the real build.
+        Ok(())
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -767,6 +799,15 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `grace_period`).
     pub evidence_hash: Option<[u8; 32]>,
+    /// AV-23: opt-in refund address whitelist; mirrors
+    /// `escrow_state`'s `refund_to`. `None` for an escrow with no
+    /// whitelist (refunds go to the initializer). The account always
+    /// reserves the full 33-byte region (1-byte discriminant + 32-byte
+    /// address, zeroed when `None`) so `initialize_refund_address`
+    /// writes the address in place without reallocating. Layout position
+    /// matches `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `evidence_hash`).
+    pub refund_to: Option<Pubkey>,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -944,6 +985,13 @@ pub struct Cancel<'info> {
     /// build reads its `mint` for the state machine's `MintMismatch`
     /// check; unused on the native-SOL path.
     pub vault_token_account: AccountInfo<'info>,
+    /// CHECK: the refund destination account. AV-23: the state machine
+    /// pins it against the escrow's refund policy (the whitelisted
+    /// address, or the initializer with no whitelist) — a phishing
+    /// frontend cannot redirect the refund by swapping this account.
+    /// The real build transfers the refund to this account after the
+    /// state machine's `RefundAddressMismatch` check passes.
+    pub refund_to: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -960,6 +1008,12 @@ pub struct CancelExpired<'info> {
     /// build reads its `mint` for the state machine's `MintMismatch`
     /// check; unused on the native-SOL path.
     pub vault_token_account: AccountInfo<'info>,
+    /// CHECK: the refund destination account. AV-23: the state machine
+    /// pins it against the escrow's refund policy — even when the taker
+    /// is the caller, the refund goes to the declared address, never to
+    /// the caller. The real build transfers the refund to this account
+    /// after the state machine's `RefundAddressMismatch` check passes.
+    pub refund_to: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -1104,6 +1158,16 @@ pub struct ReleaseMilestone<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitializeRefundAddress<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer declares the refund whitelist; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct SkipMilestone<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
@@ -1213,7 +1277,7 @@ fn read_event_seq(_vault: &Account<Vault>) -> u64 {
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {
     // One program error per EscrowError variant, so on-chain failures
-    // surface the exact `escrow_state` reason (code 100–115) to clients.
+    // surface the exact `escrow_state` reason (code 100–116) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
         escrow_state::EscrowError::InvalidStateTransition => {
@@ -1239,6 +1303,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {
         escrow_state::EscrowError::MintMismatch => error!(ErrorCode::MintMismatch),
         escrow_state::EscrowError::InvalidProtocolFee => error!(ErrorCode::InvalidProtocolFee),
         escrow_state::EscrowError::InvalidGracePeriod => error!(ErrorCode::InvalidGracePeriod),
+        escrow_state::EscrowError::RefundAddressMismatch => {
+            error!(ErrorCode::RefundAddressMismatch)
+        },
     }
 }
 
@@ -1276,4 +1343,6 @@ pub enum ErrorCode {
     InvalidProtocolFee,
     #[msg("Invalid grace period: expires_at + grace_period overflows u64 (no grace on a no-timeout escrow)")]
     InvalidGracePeriod,
+    #[msg("Refund destination does not match the escrow's refund policy (whitelisted address, or the initializer with no whitelist)")]
+    RefundAddressMismatch,
 }

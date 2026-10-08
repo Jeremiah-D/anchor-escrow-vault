@@ -81,8 +81,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured) |
 | `fund(authority)`                           | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer            |
 | `release(authority, amount)`                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured); cumulative releases ≤ locked amount |
-| `cancel(authority)`                         | `Funded`       | `Cancelled` | initializer          |
-| `cancel_expired(authority, now)`            | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default) |
+| `cancel(authority, refund_to)`               | `Funded`       | `Cancelled` | initializer; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise |
+| `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); the refund still goes to the whitelisted address even when the taker calls |
 
 Rules: the initializer drives `fund`/`release`/`cancel`; any other caller
 gets `Unauthorized` (checked before state validity). An escrow that has
@@ -99,6 +99,20 @@ twice, releasing before funding) gets `InvalidStateTransition`; zero
 amounts get `AmountMismatch`; `release`/`cancel`/`cancel_expired` preserve
 `amount` exactly (refund
 accounting).
+
+**Refund address whitelist (anti-phishing).** An escrow can declare a
+refund address (`with_refund_address`, opt-in on `Uninitialized`; the zero
+address is rejected). After that, `cancel` / `cancel_expired` take the
+refund destination explicitly and the state machine pins it against the
+whitelist (`RefundAddressMismatch`, code 116, otherwise) — the refund can
+only ever go to the declared address, so a phishing frontend cannot
+redirect it by swapping the destination account in the cancel instruction.
+With no whitelist the policy is "refund to the initializer" (backward
+compatible), and even a taker-initiated `cancel_expired` refunds to the
+declared address, never to the caller: the caller authorizes the cancel,
+the whitelist authorizes the destination. The whitelist covers the
+unilateral refund paths only; the arbiter's `resolve` split keeps its
+existing semantics by design.
 
 **Partial release (staged payouts).** `release(authority, amount)` releases
 in tranches: each call adds to a cumulative `released` counter and leaves
@@ -308,6 +322,7 @@ program error per variant):
 | `MintMismatch` | 113 | exit-path token mint ≠ the escrow's bound mint (`None` vs `Some` mismatches too) |
 | `InvalidProtocolFee` | 114 | `with_protocol_fee` with `fee_bps` > 10_000 (not a valid basis-point rate) |
 | `InvalidGracePeriod` | 115 | `with_grace_period` where `expires_at + grace_period` would overflow `u64` (grace on a no-timeout escrow) |
+| `RefundAddressMismatch` | 116 | `cancel`/`cancel_expired` with a refund destination ≠ the whitelisted address (or ≠ the initializer with no whitelist), or `with_refund_address` with the zero address |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -601,15 +616,17 @@ returns a `KeeperReport` of immediately executable calls:
 
 | action | listed when | caller | `amount` |
 |--------|-------------|--------|----------|
-| `cancel_expired(authority, now, mint)` | `Funded`, `now >= expires_at + grace_period` (grace-aware: the keeper never lists a call the chain would reject as `NotExpired`), remainder > 0 | initializer (canonical; the taker may also call) | refundable remainder (never fee'd) |
+| `cancel_expired(authority, now, mint, refund_to)` | `Funded`, `now >= expires_at + grace_period` (grace-aware: the keeper never lists a call the chain would reject as `NotExpired`), remainder > 0 | initializer (canonical; the taker may also call) | refundable remainder (never fee'd) |
 | `claim(taker, now, mint)` | `Funded`, vesting attached, no milestone plan, vested − released > 0, quorum satisfied if configured | taker | gross vested-but-unreleased (`payout + fee == amount`) |
 
 Only *executable* calls are listed: a vesting claim behind an unsatisfied
 quorum is withheld (the call would fail), and a milestone-plan escrow
 never lists `claim` (the plan owns the release schedule). Each action
 carries the exact instruction arguments — `caller`, `mint` (the bound SPL
-mint, or `null` on the native-SOL path) — so the keeper can build the
-`cancel_expired` / `claim` instruction directly. The scan is a pure read
+mint, or `null` on the native-SOL path), and `refund_to` (the refund
+destination for `cancel_expired` — the whitelisted address when
+configured, else the initializer; `null` for `claim`) — so the keeper can
+build the `cancel_expired` / `claim` instruction directly. The scan is a pure read
 over `&Escrow` snapshots: dry-run by construction, zero side effects,
 deterministic output in input order. `KeeperReport::to_json()` emits
 hand-serialized JSON (the crate stays dependency-free; keys are 64-char
@@ -618,7 +635,7 @@ lowercase hex).
 ```json
 {"at":1750000000,"scanned":1,"actions":[
   {"escrow_id":"...","action":"claim","caller":"...","caller_role":"taker",
-   "mint":null,"amount":500000,"reason":"vesting_unlocked"}
+   "mint":null,"refund_to":null,"amount":500000,"reason":"vesting_unlocked"}
 ]}
 ```
 
@@ -650,7 +667,8 @@ two-way consistency check against the IDL parameter table:
 | fees_paid     | u64               | 8     |
 | grace_period  | u64               | 8     |
 | evidence_hash | Option<[u8; 32]>  | 33    |
-| **total**     |                   | **581** |
+| refund_to     | Option<Pubkey>    | 33    |
+| **total**     |                   | **614** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -673,11 +691,12 @@ was charged) follow the same always-present, appended-last treatment, as
 does the 8-byte expiry grace period `grace_period` (AV-21, zeroed when no
 grace period is configured) — and the 33-byte dispute evidence hash region
 (AV-22: 1-byte discriminant + 32-byte commitment, zeroed when no evidence
-is attached).
-`escrow-state` exposes `VAULT_SPACE` (581) and
-`VAULT_SPACE_NO_QUORUM` (170) for the Anchor `space =` constraint, plus a
+is attached) — and the 33-byte refund whitelist region (AV-23: 1-byte
+discriminant + 32-byte address, zeroed when no whitelist is configured).
+`escrow-state` exposes `VAULT_SPACE` (614) and
+`VAULT_SPACE_NO_QUORUM` (203) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **4,934,640 lamports** to be
+mainnet rent parameters the full vault needs **5,164,320 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ## Run the tests

@@ -21,10 +21,12 @@
 //!
 //! Every listed action carries the exact arguments the keeper needs to
 //! build the instruction: `caller` (the signing key), `mint` (the bound
-//! SPL mint, or `null` on the native-SOL path), and `amount` (the refund
-//! the `cancel_expired` call would return to the initializer, or the
-//! gross vested-but-unreleased amount a `claim` would move — the protocol
-//! fee slices it, `payout + fee == amount`).
+//! SPL mint, or `null` on the native-SOL path), `refund_to` (the refund
+//! destination for `cancel_expired` — the escrow's whitelisted address
+//! when configured, else the initializer; `null` for `claim`), and
+//! `amount` (the refund the `cancel_expired` call would return to the
+//! initializer, or the gross vested-but-unreleased amount a `claim` would
+//! move — the protocol fee slices it, `payout + fee == amount`).
 //!
 //! `Disputed` escrows list no action — their unilateral exits are locked
 //! — but the scan never drops their state: the dispute evidence hash
@@ -103,6 +105,14 @@ pub struct KeeperAction {
     /// The `mint` argument to pass: the escrow's bound mint, or `None`
     /// on the native-SOL path.
     pub mint: Option<[u8; 32]>,
+    /// `cancel_expired`: the refund destination to pass — the escrow's
+    /// whitelisted refund address when one is configured via
+    /// [`Escrow::with_refund_address`], otherwise the initializer
+    /// (AV-23: the state machine rejects any other destination with
+    /// `RefundAddressMismatch`, so the keeper must build the
+    /// instruction with exactly this address). `None` for `claim`
+    /// actions, which pay the taker rather than refunding.
+    pub refund_to: Option<[u8; 32]>,
     /// `cancel_expired`: the refundable remainder the call would return
     /// to the initializer. `claim`: the gross vested-but-unreleased
     /// amount (the protocol fee slices it; `payout + fee == amount`).
@@ -136,7 +146,8 @@ impl KeeperReport {
     /// ```json
     /// {"at":1000000,"scanned":1,"actions":[
     ///   {"escrow_id":"...","action":"cancel_expired","caller":"...",
-    ///    "caller_role":"initializer","mint":null,"amount":1000000,
+    ///    "caller_role":"initializer","mint":null,
+    ///    "refund_to":"...","amount":1000000,
     ///    "reason":"expired"}
     /// ]}
     /// ```
@@ -164,6 +175,17 @@ impl KeeperReport {
                 Some(m) => {
                     s.push('"');
                     s.push_str(&hex32(&m));
+                    s.push('"');
+                }
+                None => s.push_str("null"),
+            }
+            // AV-23: the refund destination the cancel_expired
+            // instruction must name (`null` for claim actions).
+            s.push_str(",\"refund_to\":");
+            match a.refund_to {
+                Some(r) => {
+                    s.push('"');
+                    s.push_str(&hex32(&r));
                     s.push('"');
                 }
                 None => s.push_str("null"),
@@ -213,6 +235,11 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 caller: e.initializer(),
                 caller_role: "initializer",
                 mint: e.mint(),
+                // AV-23: the instruction must name the refund
+                // destination explicitly, and the state machine pins it
+                // to the escrow's refund policy — the report carries the
+                // effective recipient so the keeper builds a valid call.
+                refund_to: Some(e.refund_recipient()),
                 amount: e.remaining_amount(),
                 reason: "expired",
             });
@@ -232,6 +259,9 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 caller: e.taker(),
                 caller_role: "taker",
                 mint: e.mint(),
+                // Claims pay the taker, not a refund: no refund
+                // destination applies.
+                refund_to: None,
                 amount: e.claimable_amount(now),
                 reason: "vesting_unlocked",
             });
@@ -305,7 +335,7 @@ mod keeper_tests {
         let mut released = funded(AMOUNT, NEVER);
         released.release(ALICE, AMOUNT, None).unwrap();
         let mut cancelled = funded(AMOUNT, NEVER);
-        cancelled.cancel(ALICE, None).unwrap();
+        cancelled.cancel(ALICE, None, ALICE).unwrap();
         let watched = [watch(ID1, uninit), watch(ID2, released), watch(ID3, cancelled)];
         let report = scan_keeper_actions(&watched, MID);
         assert!(report.is_empty());
@@ -374,7 +404,7 @@ mod keeper_tests {
         for now in [MID - 1, MID, MID + 1, MID + GRACE - 1, MID + GRACE, MID + GRACE + 1] {
             let listed = !scan_keeper_actions(&watched, now).is_empty();
             let mut probe = e;
-            let executable = probe.cancel_expired(ALICE, now, None).is_ok();
+            let executable = probe.cancel_expired(ALICE, now, None, ALICE).is_ok();
             assert_eq!(listed, executable, "keeper/chain disagree at now={now}");
         }
     }
@@ -551,6 +581,9 @@ mod keeper_tests {
                 caller: ALICE,
                 caller_role: "initializer",
                 mint: None,
+                // No whitelist configured: the refund goes to the
+                // initializer (AV-23 default policy).
+                refund_to: Some(ALICE),
                 amount: AMOUNT,
                 reason: "expired",
             }
@@ -564,8 +597,9 @@ mod keeper_tests {
         let watched = [watch(ID1, funded(AMOUNT, 0))];
         let report = scan_keeper_actions(&watched, 1_000_000);
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"amount\":1000000,\"reason\":\"expired\"}}]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"reason\":\"expired\"}}]}}",
             hex_of(0x01),
+            hex_of(0xAA),
             hex_of(0xAA),
         );
         assert_eq!(report.to_json(), expected);
@@ -583,12 +617,43 @@ mod keeper_tests {
         let watched = [watch(ID2, e)];
         let report = scan_keeper_actions(&watched, MID);
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"amount\":500000,\"reason\":\"vesting_unlocked\"}}]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"reason\":\"vesting_unlocked\"}}]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),
         );
         assert_eq!(report.to_json(), expected);
+    }
+
+    #[test]
+    fn cancel_expired_action_carries_whitelisted_refund_to() {
+        // AV-23: the keeper builds the cancel_expired instruction, so
+        // the action must name the refund destination the state machine
+        // will pin — the whitelisted address, not the caller.
+        const WHITELIST: [u8; 32] = [0xC4; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, 0)
+            .unwrap()
+            .with_refund_address(WHITELIST)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let watched = [watch(ID1, e)];
+        let report = scan_keeper_actions(&watched, 1_000_000);
+        assert_eq!(report.actions.len(), 1);
+        let action = &report.actions[0];
+        assert_eq!(action.kind, KeeperActionKind::CancelExpired);
+        assert_eq!(action.caller, ALICE, "initializer is the canonical caller");
+        assert_eq!(
+            action.refund_to,
+            Some(WHITELIST),
+            "the instruction must name the whitelisted destination"
+        );
+        assert!(
+            report.to_json().contains(&format!(
+                "\"refund_to\":\"{}\"",
+                hex_of(0xC4)
+            )),
+            "refund_to must be serialized for the operator"
+        );
     }
 
     #[test]

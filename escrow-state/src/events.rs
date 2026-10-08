@@ -415,15 +415,17 @@ impl IndexedEscrow {
 
     /// Cancel the escrow and return funds (mirrors [`Escrow::cancel`]).
     /// Emits `Cancelled` with the refunded remainder in
-    /// `amounts.refund`.
+    /// `amounts.refund`. `refund_to` is the refund destination, pinned
+    /// against the escrow's refund policy (AV-23).
     pub fn cancel(
         &mut self,
         authority: [u8; 32],
         mint: Option<[u8; 32]>,
+        refund_to: [u8; 32],
         at: u64,
     ) -> Result<(), EscrowError> {
         let from = self.inner.state();
-        self.inner.cancel(authority, mint)?;
+        self.inner.cancel(authority, mint, refund_to)?;
         let to = self.inner.state();
         let refund = self.inner.remaining_amount();
         self.push_event(
@@ -439,14 +441,18 @@ impl IndexedEscrow {
 
     /// Cancel an expired escrow (mirrors [`Escrow::cancel_expired`]).
     /// Emits `ExpiredCancelled`; `now` doubles as the event's `at`.
+    /// `refund_to` is the refund destination, pinned against the
+    /// escrow's refund policy (AV-23).
     pub fn cancel_expired(
         &mut self,
         authority: [u8; 32],
         now: u64,
         mint: Option<[u8; 32]>,
+        refund_to: [u8; 32],
     ) -> Result<(), EscrowError> {
         let from = self.inner.state();
-        self.inner.cancel_expired(authority, now, mint)?;
+        self.inner
+            .cancel_expired(authority, now, mint, refund_to)?;
         let to = self.inner.state();
         let refund = self.inner.remaining_amount();
         self.push_event(
@@ -867,7 +873,7 @@ mod event_tests {
     fn cancel_emits_refund_of_remainder() {
         let mut e = funded(1_000_000);
         e.release(ALICE, 300_000, None, T0 + 2).unwrap();
-        e.cancel(ALICE, None, T0 + 3).unwrap();
+        e.cancel(ALICE, None, ALICE, T0 + 3).unwrap();
         assert_event(
             &last(&e),
             EscrowEventKind::Cancelled,
@@ -884,7 +890,7 @@ mod event_tests {
     #[test]
     fn cancel_expired_emits_with_now_as_at() {
         let mut e = funded(1_000_000);
-        e.cancel_expired(BOB, EXPIRES_AT, None).unwrap();
+        e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
         assert_event(
             &last(&e),
             EscrowEventKind::ExpiredCancelled,
@@ -907,13 +913,13 @@ mod event_tests {
         e.fund(ALICE, T0).unwrap();
         let before = e.drain_events().len();
         assert_eq!(
-            e.cancel_expired(BOB, EXPIRES_AT, None),
+            e.cancel_expired(BOB, EXPIRES_AT, None, ALICE),
             Err(EscrowError::NotExpired)
         );
         assert!(e.drain_events().is_empty(), "failed cancel emitted an event");
         assert_eq!(before, 2, "Initialized + Funded before the failed call");
         // After the grace period the same call succeeds and emits.
-        e.cancel_expired(BOB, EXPIRES_AT + 300, None).unwrap();
+        e.cancel_expired(BOB, EXPIRES_AT + 300, None, ALICE).unwrap();
         assert_event(
             &last(&e),
             EscrowEventKind::ExpiredCancelled,
@@ -1107,7 +1113,7 @@ mod event_tests {
         // Over-release.
         assert!(e.release(ALICE, 1_000_001, None, T0 + 9).is_err());
         // Cancel by a stranger.
-        assert!(e.cancel(MALLORY, None, T0 + 9).is_err());
+        assert!(e.cancel(MALLORY, None, ALICE, T0 + 9).is_err());
         // Attest with no quorum configured.
         assert!(e.attest(ATTESTOR_1, T0 + 9).is_err());
         // Escalate with no arbiter configured.
