@@ -117,7 +117,8 @@
       "discriminator": [246, 150, 236, 206, 108, 63, 58, 10],
       "accounts": [],
       "args": [
-        {"name": "taker_amount", "type": "u64"}
+        {"name": "taker_amount", "type": "u64"},
+        {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}}
       ]
     },
     {
@@ -242,7 +243,8 @@
           {"name": "refund_to", "type": {"option": "publicKey"}, "offset": 581},
           {"name": "penalty_bps", "type": "u16", "offset": 614},
           {"name": "timelock", "type": "u64", "offset": 616},
-          {"name": "decimals", "type": "u8", "offset": 624}
+          {"name": "decimals", "type": "u8", "offset": 624},
+          {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 625}
         ]
       }
     }

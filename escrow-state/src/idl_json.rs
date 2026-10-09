@@ -812,8 +812,10 @@ fn idl_field_offsets_pin_borsh_encoder() {
 #[test]
 fn idl_field_offsets_pin_dispute_path() {
     // The dispute path exercises the tail fields the funded path leaves
-    // zeroed: evidence_hash persisted on escalate, Disputed/Settled
-    // discriminants through resolve.
+    // zeroed: evidence_hash persisted on escalate, rationale_hash
+    // persisted on resolve, Disputed/Settled discriminants through
+    // resolve.
+    const RATIONALE: [u8; 32] = [0xA1; 32];
     let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
     e = e.with_arbiter(ARB).unwrap();
     e.fund(ALICE).unwrap();
@@ -826,12 +828,23 @@ fn idl_field_offsets_pin_dispute_path() {
     assert_eq!(ev[0], 1, "evidence discriminant");
     assert_eq!(&ev[1..33], &EVIDENCE);
 
-    let (payout, fee, refund) = e.resolve(ARB, 300_000, None).unwrap();
+    let (payout, fee, refund) = e.resolve(ARB, 300_000, None, Some(RATIONALE)).unwrap();
     assert_eq!((payout, fee, refund), (300_000, 0, 700_000));
     let enc = encode_escrow(&e);
     assert_eq!(body_field(&enc, &offsets, "state"), &[6u8]); // Settled
     // Evidence survives settlement: the audit trail is never cleared.
     let ev = body_field(&enc, &offsets, "evidence_hash");
     assert_eq!(&ev[1..33], &EVIDENCE);
+    // AV-38: the rationale hash lands on the IDL-computed tail offset —
+    // the last field of the account — and earlier offsets are stable.
+    let rh = body_field(&enc, &offsets, "rationale_hash");
+    assert_eq!(rh[0], 1, "rationale discriminant");
+    assert_eq!(&rh[1..33], &RATIONALE);
+    let (_, rh_offset, rh_len) = offsets
+        .iter()
+        .find(|(n, _, _)| *n == "rationale_hash")
+        .copied()
+        .expect("rationale_hash in IDL offsets");
+    assert_eq!((rh_offset, rh_len), (625, 33));
     assert_eq!(u64_at(body_field(&enc, &offsets, "released")), 300_000);
 }

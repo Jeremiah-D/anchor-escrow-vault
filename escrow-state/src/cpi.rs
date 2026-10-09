@@ -812,7 +812,7 @@ mod cpi_tests {
             .unwrap();
         e.fund(init).unwrap();
         e.escalate(taker, 0, None).unwrap();
-        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None).unwrap();
+        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None).unwrap();
         assert_eq!(fee, 0);
         assert_eq!(taker_payout + refund, 1_000_000);
         let addrs = ResolveAddrs {
@@ -849,7 +849,7 @@ mod cpi_tests {
             .unwrap();
         e.fund(init).unwrap();
         e.escalate(taker, 0, None).unwrap();
-        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None).unwrap();
+        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None).unwrap();
         assert!(fee > 0);
         let addrs = ResolveAddrs {
             source: key(10),

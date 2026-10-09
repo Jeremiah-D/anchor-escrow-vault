@@ -318,6 +318,16 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     let penalty_bps = c.u16_le()?;
     let timelock = c.u64_le()?;
     let decimals = c.u8()?;
+    // AV-38: arbiter's rationale-document hash, always reserved like
+    // `evidence_hash`: the `None` discriminant followed by a zeroed
+    // 32-byte commitment, appended last so every earlier offset above
+    // is unchanged.
+    let rationale_hash = if c.option_present("rationale_hash")? {
+        Some(c.pubkey()?)
+    } else {
+        c.skip(32)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -347,6 +357,7 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         penalty_bps,
         timelock,
         decimals,
+        rationale_hash,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

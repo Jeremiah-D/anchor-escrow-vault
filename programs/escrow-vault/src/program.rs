@@ -84,6 +84,7 @@ pub mod escrow_vault {
             None,
             None,
             None,
+            None,
         );
         Ok(())
     }
@@ -107,6 +108,7 @@ pub mod escrow_vault {
             0,
             0,
             Clock::get()?.unix_timestamp as u64,
+            None,
             None,
             None,
             None,
@@ -159,6 +161,7 @@ pub mod escrow_vault {
             fee,
             0,
             Clock::get()?.unix_timestamp as u64,
+            None,
             None,
             None,
             None,
@@ -233,6 +236,7 @@ pub mod escrow_vault {
             0,
             Clock::get()?.unix_timestamp as u64,
             None,
+            None,
             Some(receipt.cpi_target),
             Some(receipt.accounts_hash),
         );
@@ -274,6 +278,7 @@ pub mod escrow_vault {
             0,
             escrow.remaining_amount(),
             Clock::get()?.unix_timestamp as u64,
+            None,
             None,
             None,
             None,
@@ -336,6 +341,7 @@ pub mod escrow_vault {
             None,
             None,
             None,
+            None,
         );
         Ok(())
     }
@@ -394,6 +400,7 @@ pub mod escrow_vault {
                 None,
                 None,
                 None,
+                None,
             );
         }
         Ok(())
@@ -434,6 +441,7 @@ pub mod escrow_vault {
                 0,
                 0,
                 Clock::get()?.unix_timestamp as u64,
+                None,
                 None,
                 None,
                 None,
@@ -482,6 +490,7 @@ pub mod escrow_vault {
                 0,
                 0,
                 Clock::get()?.unix_timestamp as u64,
+                None,
                 None,
                 None,
                 None,
@@ -545,6 +554,7 @@ pub mod escrow_vault {
             None,
             None,
             None,
+            None,
         );
         Ok((payout, fee))
     }
@@ -600,6 +610,9 @@ pub mod escrow_vault {
             0,
             now,
             evidence_hash,
+            None,
+            None,
+            None,
         );
         Ok(())
     }
@@ -615,7 +628,19 @@ pub mod escrow_vault {
     /// AV-16: the vault token account's mint must equal the bound
     /// `vault.mint` (`MintMismatch` otherwise); `None` on the
     /// native-SOL path (no mint bound).
-    pub fn resolve(ctx: Context<Resolve>, taker_amount: u64) -> Result<(u64, u64, u64)> {
+    /// AV-38: `rationale_hash` is the arbiter's optional 32-byte
+    /// commitment to the off-chain rationale document behind the ruling
+    /// (e.g. the SHA-256 of the written arbitration report), persisted
+    /// on the vault (`vault.rationale_hash`) and carried by the
+    /// `Resolved` event; `None` attaches no rationale (backward
+    /// compatible). Never cleared — `Settled` keeps it as the audit
+    /// trail of the arbitration, following the AV-22 `evidence_hash`
+    /// convention.
+    pub fn resolve(
+        ctx: Context<Resolve>,
+        taker_amount: u64,
+        rationale_hash: Option<[u8; 32]>,
+    ) -> Result<(u64, u64, u64)> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let from = escrow.state() as u8;
         let (payout, fee, refund) = escrow
@@ -623,6 +648,7 @@ pub mod escrow_vault {
                 ctx.accounts.arbiter.key().to_bytes(),
                 taker_amount,
                 vault_token_mint(&ctx.accounts.vault_token_account),
+                rationale_hash,
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
@@ -636,6 +662,9 @@ pub mod escrow_vault {
         // AV-22: the Resolved event carries the dispute evidence hash
         // the escrow still holds — the settlement references the
         // evidence the arbiter reviewed.
+        // AV-38: the Resolved event carries the rationale-document
+        // commitment the arbiter attached — the settlement references
+        // the ruling it wrote.
         emit_transition(
             &ctx.accounts.vault,
             escrow_state::EscrowEventKind::Resolved,
@@ -646,6 +675,7 @@ pub mod escrow_vault {
             refund,
             Clock::get()?.unix_timestamp as u64,
             escrow.evidence_hash(),
+            rationale_hash,
             None,
             None,
         );
@@ -705,6 +735,7 @@ pub mod escrow_vault {
                 None,
                 None,
                 None,
+                None,
             );
         }
         Ok(())
@@ -750,6 +781,7 @@ pub mod escrow_vault {
             None,
             None,
             None,
+            None,
         );
         Ok((payout, fee))
     }
@@ -788,6 +820,7 @@ pub mod escrow_vault {
                 0,
                 tranche,
                 Clock::get()?.unix_timestamp as u64,
+                None,
                 None,
                 None,
                 None,
@@ -998,6 +1031,7 @@ pub mod escrow_vault {
             None,
             None,
             None,
+            None,
         );
         Ok(())
     }
@@ -1131,6 +1165,18 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after `timelock`).
     /// Display-only: it never gates a transition and never moves funds.
     pub decimals: u8,
+    /// AV-38: 32-byte commitment to the arbiter's off-chain rationale
+    /// document (e.g. the SHA-256 of the written ruling), attached at
+    /// `resolve`; mirrors `escrow_state`'s `rationale_hash`. `None`
+    /// when the arbiter supplied no rationale. The account always
+    /// reserves the full 33-byte region (1-byte discriminant + 32-byte
+    /// commitment, zeroed when `None`) so `resolve` writes the hash in
+    /// place without reallocating; never cleared — it stays on the
+    /// vault in `Settled` as the audit trail of the arbitration,
+    /// following the AV-22 `evidence_hash` convention. Layout position
+    /// matches `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `decimals`).
+    pub rationale_hash: Option<[u8; 32]>,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -1207,6 +1253,12 @@ pub struct EscrowVaultEvent {
     /// indexer learns the evidence reference from the event stream
     /// without a second account read.
     pub evidence_hash: Option<[u8; 32]>,
+    /// AV-38: the arbiter's rationale-document commitment carried by
+    /// the `Resolved` event (`None` for every other kind); mirrors
+    /// `escrow_state::EscrowEvent::rationale_hash`, so an off-chain
+    /// indexer learns the ruling reference from the event stream
+    /// without a second account read.
+    pub rationale_hash: Option<[u8; 32]>,
     /// AV-35: the third-party program a CPI-routed release invoked
     /// (`release_via_cpi`); `None` on every other kind. Mirrors
     /// `escrow_state::EscrowEvent::cpi.target`.
@@ -1680,6 +1732,9 @@ fn write_escrow(_vault: &mut Account<Vault>, _escrow: &escrow_state::Escrow) {
 /// `evidence_hash` (AV-22) is the dispute-evidence commitment carried by
 /// the `Escalated` and `Resolved` events (`None` for every other kind),
 /// mirroring `escrow_state::EscrowEvent::evidence_hash`.
+/// `rationale_hash` (AV-38) is the arbiter's rationale-document
+/// commitment carried by the `Resolved` event (`None` for every other
+/// kind), mirroring `escrow_state::EscrowEvent::rationale_hash`.
 /// `cpi_target` / `cpi_accounts_hash` (AV-35) carry the CPI-routing
 /// audit on a `Released` event whose payout flowed through a
 /// third-party program (`None` on every other kind), mirroring
@@ -1694,6 +1749,7 @@ fn emit_transition(
     refund: u64,
     at: u64,
     evidence_hash: Option<[u8; 32]>,
+    rationale_hash: Option<[u8; 32]>,
     cpi_target: Option<Pubkey>,
     cpi_accounts_hash: Option<[u8; 32]>,
 ) {
@@ -1708,6 +1764,7 @@ fn emit_transition(
         refund,
         at,
         evidence_hash,
+        rationale_hash,
         cpi_target,
         cpi_accounts_hash,
     });

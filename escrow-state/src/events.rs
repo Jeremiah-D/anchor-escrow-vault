@@ -266,6 +266,11 @@ pub struct CpiRouteAudit {
 /// arbiter's settlement references the evidence it reviewed). It is
 /// `None` on every other kind — the event log never invents evidence.
 ///
+/// `rationale_hash` (AV-38) carries the arbiter's rationale-document
+/// commitment on `Resolved`: the hash the arbiter attached at settlement,
+/// so the settlement references the ruling it wrote. It is `None` on
+/// every other kind — the event log never invents a rationale.
+///
 /// `cpi` (AV-35) carries the CPI-routing audit on a `Released` event
 /// whose payout flowed through a third-party program
 /// ([`IndexedEscrow::release_via_cpi`]). It is `None` on every other
@@ -285,6 +290,11 @@ pub struct EscrowEvent {
     pub amounts: EventAmounts,
     pub at: u64,
     pub evidence_hash: Option<[u8; 32]>,
+    /// AV-38: the arbiter's rationale-document commitment, carried by
+    /// the `Resolved` event (`None` on every other kind); mirrors
+    /// [`Escrow::rationale_hash`], so the settlement references the
+    /// ruling the arbiter wrote.
+    pub rationale_hash: Option<[u8; 32]>,
     pub cpi: Option<CpiRouteAudit>,
 }
 
@@ -342,6 +352,8 @@ impl IndexedEscrow {
             at,
             None,
             None,
+
+        None,
         );
         Ok(indexed)
     }
@@ -355,6 +367,7 @@ impl IndexedEscrow {
         amounts: EventAmounts,
         at: u64,
         evidence_hash: Option<[u8; 32]>,
+        rationale_hash: Option<[u8; 32]>,
         cpi: Option<CpiRouteAudit>,
     ) {
         let event = EscrowEvent {
@@ -366,6 +379,7 @@ impl IndexedEscrow {
             amounts,
             at,
             evidence_hash,
+            rationale_hash,
             cpi,
         };
         self.next_seq += 1;
@@ -398,6 +412,8 @@ impl IndexedEscrow {
                     at,
                     None,
                     None,
+
+                None,
                 );
                 Err(EscrowError::ReentrantCall)
             }
@@ -517,7 +533,7 @@ impl IndexedEscrow {
         self.inner.activate(authority)?;
         let to = self.inner.state();
         if to != from {
-            self.push_event(EscrowEventKind::Activated, from, to, EventAmounts::none(), at, None, None);
+            self.push_event(EscrowEventKind::Activated, from, to, EventAmounts::none(), at, None, None, None);
         }
         Ok(())
     }
@@ -540,6 +556,8 @@ impl IndexedEscrow {
             at,
             None,
             None,
+
+        None,
         );
         Ok(())
     }
@@ -574,6 +592,8 @@ impl IndexedEscrow {
             at,
             None,
             None,
+
+        None,
         );
         Ok((payout, fee))
     }
@@ -620,6 +640,7 @@ impl IndexedEscrow {
             EventAmounts::payout(amount, fee),
             at,
             None,
+            None,
             Some(CpiRouteAudit {
                 target: receipt.cpi_target,
                 accounts_hash: receipt.accounts_hash,
@@ -654,6 +675,8 @@ impl IndexedEscrow {
             at,
             None,
             None,
+
+        None,
         );
         Ok(())
     }
@@ -686,6 +709,8 @@ impl IndexedEscrow {
             now,
             None,
             None,
+
+        None,
         );
         Ok((refund, penalty))
     }
@@ -713,7 +738,7 @@ impl IndexedEscrow {
         // on the error path.
         if after > before {
             let state = self.inner.state();
-            self.push_event(EscrowEventKind::Attested, state, state, EventAmounts::none(), at, None, None);
+            self.push_event(EscrowEventKind::Attested, state, state, EventAmounts::none(), at, None, None, None);
         }
         Ok(())
     }
@@ -748,6 +773,8 @@ impl IndexedEscrow {
                 at,
                 None,
                 None,
+
+            None,
             );
         }
         Ok(())
@@ -778,6 +805,8 @@ impl IndexedEscrow {
             now,
             None,
             None,
+
+        None,
         );
         Ok((payout, fee))
     }
@@ -801,6 +830,8 @@ impl IndexedEscrow {
             now,
             evidence_hash,
             None,
+
+        None,
         );
         Ok(())
     }
@@ -810,19 +841,22 @@ impl IndexedEscrow {
     /// `amounts.payout`, the protocol fee in `amounts.fee`, and the
     /// initializer's share in `amounts.refund` — and the dispute
     /// evidence hash the escrow still holds, so the settlement
-    /// references the evidence the arbiter reviewed. Returns
+    /// references the evidence the arbiter reviewed — and the arbiter's
+    /// rationale-document commitment (AV-38), so the settlement
+    /// references the ruling the arbiter wrote. Returns
     /// `(taker_payout, fee, initializer_refund)` like the inner method.
     pub fn resolve(
         &mut self,
         authority: [u8; 32],
         taker_amount: u64,
         mint: Option<[u8; 32]>,
+        rationale_hash: Option<[u8; 32]>,
         at: u64,
     ) -> Result<(u64, u64, u64), EscrowError> {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
-        let result = self.inner.resolve(authority, taker_amount, mint);
+        let result = self.inner.resolve(authority, taker_amount, mint, rationale_hash);
         let (payout, fee, refund) = self.map_reentrant(result, at)?;
         // `taker_amount` is the gross taker share by construction
         // (`payout + fee == taker_amount`).
@@ -837,6 +871,10 @@ impl IndexedEscrow {
         // the settlement event carries the same commitment the
         // `Escalated` event carried.
         let evidence_hash = self.inner.evidence_hash();
+        // AV-38: the rationale hash the arbiter attached at settlement
+        // rides the `Resolved` event, so the settlement references the
+        // ruling it wrote.
+        let rationale_hash = self.inner.rationale_hash();
         self.push_event(
             EscrowEventKind::Resolved,
             from,
@@ -844,6 +882,7 @@ impl IndexedEscrow {
             amounts,
             at,
             evidence_hash,
+            rationale_hash,
             None,
         );
         Ok((payout, fee, refund))
@@ -873,6 +912,8 @@ impl IndexedEscrow {
                 at,
                 None,
                 None,
+
+            None,
             );
         }
         Ok(())
@@ -908,6 +949,8 @@ impl IndexedEscrow {
             at,
             None,
             None,
+
+        None,
         );
         Ok((payout, fee))
     }
@@ -945,6 +988,8 @@ impl IndexedEscrow {
                 at,
                 None,
                 None,
+
+            None,
             );
         }
         Ok(())
@@ -977,6 +1022,8 @@ impl IndexedEscrow {
             at,
             None,
             None,
+
+        None,
         );
         Ok(rent)
     }
@@ -1329,7 +1376,7 @@ mod event_tests {
             0,
             EXPIRES_AT - 1,
         );
-        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, T0 + 3).unwrap();
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, T0 + 3).unwrap();
         assert_eq!((payout, fee, refund), (600_000, 0, 400_000));
         assert_event(
             &last(&e),
@@ -1374,7 +1421,7 @@ mod event_tests {
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
         e.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE)).unwrap();
-        e.resolve(ARBITER, 600_000, None, T0 + 3).unwrap();
+        e.resolve(ARBITER, 600_000, None, None, T0 + 3).unwrap();
         let event = last(&e);
         assert_eq!(event.kind, EscrowEventKind::Resolved);
         assert_eq!(event.from, EscrowState::Disputed);
@@ -1389,6 +1436,43 @@ mod event_tests {
                 EscrowEventKind::Escalated | EscrowEventKind::Resolved
             ))
             .all(|ev| ev.evidence_hash.is_none()));
+    }
+
+    #[test]
+    fn resolved_event_carries_the_rationale_hash() {
+        // AV-38: the arbiter attaches the rationale-document commitment
+        // at settlement, and the Resolved event carries it — alongside
+        // the evidence hash — so the settlement references the ruling
+        // it wrote. Without a rationale the event carries None: the log
+        // never invents one.
+        const RATIONALE: [u8; 32] = [0xA1; 32];
+        const EVIDENCE: [u8; 32] = [0xE1; 32];
+        let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE)).unwrap();
+        e.resolve(ARBITER, 600_000, None, Some(RATIONALE), T0 + 3)
+            .unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::Resolved);
+        assert_eq!(event.rationale_hash, Some(RATIONALE));
+        assert_eq!(
+            event.evidence_hash,
+            Some(EVIDENCE),
+            "rationale must not displace the evidence commitment"
+        );
+
+        let mut e2 = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
+        e2.fund(ALICE, T0 + 1).unwrap();
+        e2.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e2.resolve(ARBITER, 600_000, None, None, T0 + 3).unwrap();
+        assert_eq!(last(&e2).rationale_hash, None);
+        // Non-resolve events never carry a rationale hash.
+        assert!(e
+            .events()
+            .iter()
+            .chain(e2.events().iter())
+            .filter(|ev| !matches!(ev.kind, EscrowEventKind::Resolved))
+            .all(|ev| ev.rationale_hash.is_none()));
     }
 
     #[test]
@@ -1461,7 +1545,7 @@ mod event_tests {
         // Escalate with no arbiter configured.
         assert!(e.escalate(ALICE, T0 + 9, None).is_err());
         // Resolve outside a dispute.
-        assert!(e.resolve(ARBITER, 1, None, T0 + 9).is_err());
+        assert!(e.resolve(ARBITER, 1, None, None, T0 + 9).is_err());
         // Milestone ops with no plan attached.
         assert!(e.confirm_milestone(ALICE, 0, T0 + 9).is_err());
         assert!(e.release_milestone(ALICE, 0, None, T0 + 9).is_err());
@@ -1591,7 +1675,7 @@ mod event_tests {
             .unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
         e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
-        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, T0 + 3).unwrap();
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, T0 + 3).unwrap();
         // 1000 bps of 600_000 = 60_000; the refund is never fee'd.
         assert_eq!((payout, fee, refund), (540_000, 60_000, 400_000));
         assert_event(
@@ -1683,7 +1767,7 @@ mod event_tests {
                     .unwrap();
                 d.fund(ALICE, T0 + 1).unwrap();
                 d.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
-                d.resolve(ARBITER, 0, None, T0 + 3).unwrap();
+                d.resolve(ARBITER, 0, None, None, T0 + 3).unwrap();
                 return d;
             }
             _ => panic!("not a terminal state"),

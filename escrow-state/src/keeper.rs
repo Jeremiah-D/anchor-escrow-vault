@@ -1,5 +1,5 @@
 //! Off-chain keeper report (AV-20): scan a batch of escrows and emit the
-//! executable `cancel_expired` / `claim` call list as JSON.
+//! executable `cancel_expired` / `claim` / `resolve` call list as JSON.
 //!
 //! A keeper bot watches many vaults and needs to know, at a given `now`,
 //! which ones have an *immediately executable* keeper action:
@@ -20,21 +20,32 @@
 //!   (AV-27) is unlocked — otherwise the call would fail with
 //!   `QuorumNotReached` / `TimelockNotReached` and would not be
 //!   executable.
+//! - `resolve` (AV-38): the escrow is `Disputed` with a configured
+//!   arbiter and a positive remaining balance. Only the arbiter may
+//!   call it; the report names the arbiter as the caller so an
+//!   arbiter-operated keeper bot learns which disputes await its ruling.
+//!   The taker/initializer split is the arbiter's judgment and the
+//!   rationale-document commitment (AV-38) comes from the arbiter's
+//!   off-chain deliberation, so neither is on the action — the keeper
+//!   flags the escrow as awaiting resolution with the splittable pool
+//!   (`amount`) and the bound mint; the arbiter supplies the split and
+//!   the rationale hash at call time.
 //!
 //! Every listed action carries the exact arguments the keeper needs to
 //! build the instruction: `caller` (the signing key), `mint` (the bound
 //! SPL mint, or `null` on the native-SOL path), `refund_to` (the refund
 //! destination for `cancel_expired` — the escrow's whitelisted address
-//! when configured, else the initializer; `null` for `claim`), and
-//! `amount` (the refund the `cancel_expired` call would return to the
-//! initializer, or the gross vested-but-unreleased amount a `claim` would
-//! move — the protocol fee slices it, `payout + fee == amount`).
+//! when configured, else the initializer; `null` for `claim` and
+//! `resolve`), and `amount` (the refund the `cancel_expired` call would
+//! return to the initializer, the gross vested-but-unreleased amount a
+//! `claim` would move — the protocol fee slices it, `payout + fee ==
+//! amount` — or the remaining locked amount a `resolve` would split).
 //!
-//! `Disputed` escrows list no action — their unilateral exits are locked
-//! — but the scan never drops their state: the dispute evidence hash
-//! attached at `escalate` (AV-22) stays readable on the watched snapshot
-//! ([`Escrow::evidence_hash`]) so operator tooling can fetch the
-//! off-chain evidence for the arbiter.
+//! `Disputed` escrows list exactly the `resolve` action above — their
+//! unilateral exits stay locked — and the scan never drops their state:
+//! the dispute evidence hash attached at `escalate` (AV-22) stays
+//! readable on the watched snapshot ([`Escrow::evidence_hash`]) so
+//! operator tooling can fetch the off-chain evidence for the arbiter.
 //!
 //! # Dry-run by construction
 //!
@@ -81,6 +92,13 @@ pub enum KeeperActionKind {
     CancelExpired,
     /// `claim(taker, now, mint)`.
     Claim,
+    /// `resolve(arbiter, taker_amount, mint, rationale_hash)` (AV-38):
+    /// the arbiter's settlement of a `Disputed` escrow. Listed so an
+    /// arbiter-operated keeper bot learns which disputes await its
+    /// ruling; the taker/initializer split and the rationale-document
+    /// commitment are the arbiter's call-time judgment, not keeper
+    /// inputs.
+    Resolve,
 }
 
 impl KeeperActionKind {
@@ -90,6 +108,7 @@ impl KeeperActionKind {
         match self {
             KeeperActionKind::CancelExpired => "cancel_expired",
             KeeperActionKind::Claim => "claim",
+            KeeperActionKind::Resolve => "resolve",
         }
     }
 }
@@ -104,7 +123,8 @@ pub struct KeeperAction {
     pub kind: KeeperActionKind,
     /// The key that must sign the call.
     pub caller: [u8; 32],
-    /// Which role `caller` plays: `"initializer"` or `"taker"`.
+    /// Which role `caller` plays: `"initializer"`, `"taker"`, or
+    /// `"arbiter"` (AV-38, `resolve` actions).
     pub caller_role: &'static str,
     /// The `mint` argument to pass: the escrow's bound mint, or `None`
     /// on the native-SOL path.
@@ -115,11 +135,16 @@ pub struct KeeperAction {
     /// (AV-23: the state machine rejects any other destination with
     /// `RefundAddressMismatch`, so the keeper must build the
     /// instruction with exactly this address). `None` for `claim`
-    /// actions, which pay the taker rather than refunding.
+    /// actions, which pay the taker rather than refunding — and `None`
+    /// for `resolve` actions, which split the remainder between the
+    /// taker and the initializer rather than refunding to one address.
     pub refund_to: Option<[u8; 32]>,
     /// `cancel_expired`: the refundable remainder the call would return
     /// to the initializer. `claim`: the gross vested-but-unreleased
     /// amount (the protocol fee slices it; `payout + fee == amount`).
+    /// `resolve` (AV-38): the remaining locked amount the arbiter's
+    /// split divides between the taker and the initializer — the split
+    /// itself is the arbiter's judgment at call time.
     /// Always `> 0` — zero-value actions are never listed.
     pub amount: u64,
     /// The escrow's token decimal metadata (AV-28): the SPL mint's
@@ -127,7 +152,8 @@ pub struct KeeperAction {
     /// `display_amount` rendering only — the instruction itself always
     /// moves the raw `amount`.
     pub decimals: u8,
-    /// Machine-readable reason: `"expired"` or `"vesting_unlocked"`.
+    /// Machine-readable reason: `"expired"`, `"vesting_unlocked"`, or
+    /// `"disputed"` (AV-38, `resolve` actions).
     pub reason: &'static str,
 }
 
@@ -236,10 +262,43 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
     let mut actions = Vec::new();
     for w in watched {
         let e = &w.escrow;
+        // AV-38: a disputed escrow has exactly one keeper-executable
+        // call — the arbiter's `resolve`. The unilateral exits stay
+        // locked, so nothing else is listed; the taker/initializer split
+        // and the rationale-document commitment are the arbiter's
+        // judgment at call time, so the action carries the splittable
+        // pool rather than a decided split. An arbiter-less dispute
+        // (unreachable through the state machine, which requires an
+        // arbiter to escalate) lists nothing — no key could sign the
+        // call.
+        if e.state() == EscrowState::Disputed {
+            if let Some(arbiter) = e.arbiter() {
+                let remaining = e.remaining_amount();
+                if remaining > 0 {
+                    actions.push(KeeperAction {
+                        escrow_id: w.escrow_id,
+                        kind: KeeperActionKind::Resolve,
+                        caller: arbiter,
+                        caller_role: "arbiter",
+                        mint: e.mint(),
+                        // `resolve` splits the remainder between the
+                        // taker and the initializer — no single refund
+                        // destination applies.
+                        refund_to: None,
+                        amount: remaining,
+                        // AV-28: the report renders the amount in human
+                        // units alongside the raw value.
+                        decimals: e.decimals(),
+                        reason: "disputed",
+                    });
+                }
+            }
+            continue;
+        }
         // Only a live, funded escrow has keeper-executable exits:
         // Uninitialized / Activated escrows are not funded yet, and the
-        // terminal states (Released, Cancelled, Settled) — plus Disputed,
-        // whose unilateral exits are locked — have none.
+        // terminal states (Released, Cancelled, Settled, Closed) have
+        // none.
         if e.state() != EscrowState::Funded {
             continue;
         }
@@ -552,28 +611,45 @@ mod keeper_tests {
     }
 
     #[test]
-    fn disputed_escrow_has_no_keeper_action() {
+    fn disputed_escrow_lists_resolve_for_arbiter() {
+        // AV-38: a disputed escrow lists exactly one keeper action —
+        // the arbiter's `resolve` — so an arbiter-operated keeper bot
+        // learns which disputes await its ruling. The unilateral exits
+        // stay locked, so nothing else is listed.
+        const ARBITER: [u8; 32] = [0xA8; 32];
         let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
             .unwrap()
-            .with_arbiter([0xA8; 32])
+            .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE).unwrap();
         e.escalate(ALICE, MID, None).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
-        assert!(
-            report.is_empty(),
-            "unilateral exits are locked while disputed"
-        );
+        assert_eq!(report.actions.len(), 1);
+        let a = report.actions[0];
+        assert_eq!(a.kind, KeeperActionKind::Resolve);
+        assert_eq!(a.escrow_id, ID1);
+        assert_eq!(a.caller, ARBITER);
+        assert_eq!(a.caller_role, "arbiter");
+        assert_eq!(a.mint, None);
+        assert_eq!(a.refund_to, None, "resolve splits, it does not refund");
+        assert_eq!(a.amount, AMOUNT, "the splittable pool");
+        assert_eq!(a.reason, "disputed");
+        // JSON shape: the action name renders as "resolve".
+        let json = report.to_json();
+        assert!(json.contains("\"action\":\"resolve\""));
+        assert!(json.contains("\"caller_role\":\"arbiter\""));
+        assert!(json.contains("\"reason\":\"disputed\""));
     }
 
     #[test]
     fn disputed_evidence_hash_survives_keeper_scan() {
-        // AV-22 passthrough: the keeper lists no action for a disputed
-        // escrow, but the scan pipeline must not drop the dispute
-        // evidence hash — operator tooling reads it from the watched
-        // snapshot to fetch the off-chain evidence for the arbiter.
+        // AV-22 passthrough: the keeper lists only the arbiter's
+        // `resolve` for a disputed escrow (AV-38), but the scan pipeline
+        // must not drop the dispute evidence hash — operator tooling
+        // reads it from the watched snapshot to fetch the off-chain
+        // evidence for the arbiter.
         const EVIDENCE: [u8; 32] = [0xE1; 32];
         let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
             .unwrap()
@@ -583,7 +659,8 @@ mod keeper_tests {
         e.escalate(BOB, MID, Some(EVIDENCE)).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
-        assert!(report.is_empty());
+        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions[0].kind, KeeperActionKind::Resolve);
         assert_eq!(
             watched[0].escrow.evidence_hash(),
             Some(EVIDENCE),

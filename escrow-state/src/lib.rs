@@ -385,6 +385,18 @@ pub struct Escrow {
     /// most 9 decimals; 18 is the hard ceiling
     /// ([`EscrowError::InvalidDecimals`]).
     decimals: u8,
+    /// AV-38: 32-byte commitment to the arbiter's off-chain rationale
+    /// document (e.g. the SHA-256 of the written ruling) attached at
+    /// [`Escrow::resolve`]. `None` means the arbiter supplied no
+    /// rationale (backward compatible): the field is only `Some` on a
+    /// `Settled` escrow whose arbiter attached one. Persisted (33 bytes
+    /// in the vault account) so the parties and indexers can verify what
+    /// the ruling referenced without trusting the arbiter to re-supply
+    /// it. Never cleared — it stays on the escrow in `Settled` as the
+    /// audit trail of the arbitration, following the AV-22
+    /// `evidence_hash` convention. Appended last so every earlier field
+    /// offset stays stable.
+    rationale_hash: Option<[u8; 32]>,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -1010,6 +1022,10 @@ impl Escrow {
             // bare integers (backward compatible). Opt in via
             // `with_decimals` before funding.
             decimals: 0,
+            // AV-38: no rationale attached by default — the field is only
+            // `Some` once `resolve` stores the arbiter's rationale hash
+            // (backward compatible).
+            rationale_hash: None,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -1939,6 +1955,16 @@ impl Escrow {
         self.evidence_hash
     }
 
+    /// The 32-byte commitment to the arbiter's off-chain rationale
+    /// document attached at [`Escrow::resolve`], or `None` when the
+    /// arbiter supplied no rationale (backward compatible). Only
+    /// meaningful on a `Settled` escrow — it is never cleared, so the
+    /// settlement keeps the audit trail of what the ruling referenced,
+    /// following the AV-22 `evidence_hash` convention.
+    pub fn rationale_hash(&self) -> Option<[u8; 32]> {
+        self.rationale_hash
+    }
+
     /// Opt in to a refund address whitelist (AV-23 — Solana security /
     /// payment fintech): declare the address every refund on the
     /// unilateral exit paths ([`Escrow::cancel`],
@@ -2199,6 +2225,17 @@ impl Escrow {
     /// the `Resolved` indexer event carries it (see
     /// [`crate::EscrowEvent::evidence_hash`]).
     ///
+    /// AV-38: `rationale_hash` is the arbiter's optional 32-byte
+    /// commitment to the off-chain rationale document behind the ruling
+    /// (e.g. the SHA-256 of the written arbitration report) — persisted
+    /// on the escrow ([`Escrow::rationale_hash`]) so the parties and
+    /// indexers can verify what the ruling referenced, and carried by
+    /// the `Resolved` indexer event (see
+    /// [`crate::EscrowEvent::rationale_hash`]); `None` attaches no
+    /// rationale (backward compatible). Like the AV-22 evidence hash,
+    /// it is never cleared — `Settled` keeps it as the audit trail of
+    /// the arbitration.
+    ///
     /// Check order is deliberate: arbiter configuration, then state,
     /// then authority, then the mint binding (AV-16), then the amount.
     /// The arbiter's identity is the authority being verified, so the
@@ -2210,6 +2247,7 @@ impl Escrow {
         authority: [u8; 32],
         taker_amount: u64,
         mint: Option<[u8; 32]>,
+        rationale_hash: Option<[u8; 32]>,
     ) -> Result<(u64, u64, u64), EscrowError> {
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
         self.require_not_reentrant()?;
@@ -2236,6 +2274,10 @@ impl Escrow {
         // initializer's refund is never fee'd.
         let fee = self.charge_protocol_fee(taker_amount)?;
         self.released += taker_amount;
+        // AV-38: persist the arbiter's rationale commitment alongside
+        // the settlement — never cleared, following the AV-22
+        // evidence_hash audit-trail convention.
+        self.rationale_hash = rationale_hash;
         self.state = EscrowState::Settled;
         Ok((taker_amount - fee, fee, remaining - taker_amount))
     }
@@ -2817,6 +2859,12 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // configured). Appended last so every earlier field offset stays
     // stable.
     ("decimals", "u8", 1),
+    // AV-38: arbiter's rationale-document hash (see `Escrow::resolve`):
+    // one discriminant byte, then the 32-byte commitment. The region is
+    // always reserved (zeroed when `None`) so `resolve` writes in
+    // place — same treatment as `arbiter` / `mint` / `evidence_hash`.
+    // Appended last so every earlier field offset stays stable.
+    ("rationale_hash", "Option<[u8; 32]>", 1 + 32),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -2865,9 +2913,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// always present too: 8-byte `timelock` (zeroed when no timelock is
 /// configured). The token decimal metadata (AV-28) is always present
 /// too: 1-byte `decimals` (zeroed when no decimal metadata is
-/// configured).
+/// configured). The arbiter's rationale-document hash (AV-38) is
+/// likewise always present: 1-byte discriminant + 32-byte commitment
+/// (zeroed when the arbiter attached no rationale).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -3241,7 +3291,7 @@ mod tests {
             .unwrap();
         settled.fund(ALICE).unwrap();
         settled.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
-        settled.resolve(ARBITER, 0, None).unwrap();
+        settled.resolve(ARBITER, 0, None, None).unwrap();
         [
             (EscrowState::Cancelled, cancelled),
             (EscrowState::Released, released),
@@ -3257,7 +3307,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 5_240_880, "from {state:?}");
+            assert_eq!(rent, 5_470_560, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -3352,8 +3402,9 @@ mod tests {
         // carries discriminant 7. The AV-10 pins hold unchanged —
         // re-asserted here so this feature cannot silently grow the
         // account (every byte of VAULT_SPACE is rent the initializer
-        // paid for).
-        assert_eq!(VAULT_SPACE, 625, "full Vault account space");
+        // paid for). AV-38 grew the account by 33 bytes (rationale
+        // hash), so the pin tracks the new total deliberately.
+        assert_eq!(VAULT_SPACE, 658, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -3436,7 +3487,7 @@ mod permission_tests {
                 e = e.with_arbiter(ARBITER).unwrap();
                 e.fund(ALICE).unwrap();
                 e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
-                e.resolve(ARBITER, 600_000, None).unwrap();
+                e.resolve(ARBITER, 600_000, None, None).unwrap();
             }
             EscrowState::Closed => {
                 // AV-34: the initializer reclaimed the rent after the
@@ -4471,16 +4522,30 @@ pub(crate) mod anchor_idl_tests {
         },
         InstructionSpec {
             name: "resolve",
-            params: &[(
-                "taker_amount",
-                "u64",
-                "instruction param; taker's share of the remaining funds",
-            )],
+            params: &[
+                (
+                    "taker_amount",
+                    "u64",
+                    "instruction param; taker's share of the remaining funds",
+                ),
+                (
+                    "rationale_hash",
+                    "Option<[u8; 32]>",
+                    "instruction param; 32-byte commitment to the arbiter's \
+                     off-chain rationale document (e.g. SHA-256 of the \
+                     written ruling), None = no rationale attached",
+                ),
+            ],
             method: "Escrow::resolve",
             input_mapping: "authority <- accounts.arbiter (signer; must \
                             equal the configured arbiter); taker_amount <- \
                             param, capped at the remaining locked amount \
-                            (ReleaseExceedsLocked); Disputed -> Settled; \
+                            (ReleaseExceedsLocked); rationale_hash <- \
+                            param, persisted on the escrow in Settled so \
+                            the parties and indexers can verify what the \
+                            ruling referenced (never cleared, following \
+                            the AV-22 evidence_hash audit-trail \
+                            convention); Disputed -> Settled; \
                             returns (taker_payout, fee, initializer_refund) \
                             so the program can size all three transfers \
                             (AV-17: the fee slices the taker's share, the \
@@ -5361,8 +5426,10 @@ pub(crate) mod anchor_idl_tests {
 
     #[test]
     fn resolve_maps_arbiter_signer_and_taker_amount_param() {
-        // IDL: resolve(taker_amount: u64) — authority <-
-        // accounts.arbiter (signer); taker_amount <- instruction param.
+        // IDL: resolve(taker_amount: u64, rationale_hash: Option<[u8; 32]>) —
+        // authority <- accounts.arbiter (signer); taker_amount <-
+        // instruction param; rationale_hash <- instruction param,
+        // persisted in Settled (AV-38).
         // Returns (taker_payout, initializer_refund) so the program can
         // size both transfers.
         const ARBITER: [u8; 32] = [0xA8; 32];
@@ -5372,7 +5439,7 @@ pub(crate) mod anchor_idl_tests {
             .unwrap();
         e.fund(ALICE).unwrap();
         e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
-        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None).unwrap();
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None).unwrap();
         assert_eq!((payout, fee, refund), (600_000, 0, 400_000));
         assert_eq!(e.state(), EscrowState::Settled);
         // Taker's share in `released`, initializer's refund in
@@ -5386,7 +5453,7 @@ pub(crate) mod anchor_idl_tests {
         e.fund(ALICE).unwrap();
         e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
         assert_eq!(
-            e.resolve(ALICE, 600_000, None),
+            e.resolve(ALICE, 600_000, None, None),
             Err(EscrowError::Unauthorized)
         );
         assert_eq!(e.state(), EscrowState::Disputed);
@@ -5652,7 +5719,7 @@ pub(crate) mod anchor_idl_tests {
                         .unwrap();
                     d.fund(ALICE).unwrap();
                     d.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
-                    d.resolve(ARBITER, 0, None).unwrap();
+                    d.resolve(ARBITER, 0, None, None).unwrap();
                     assert_eq!(d.state(), EscrowState::Settled);
                     return d;
                 }
@@ -5739,6 +5806,10 @@ pub(crate) mod anchor_idl_tests {
         // remaining funds; the taker's share accumulates in `released`,
         // like `release`'s amount param.
         ("resolve", "taker_amount", "released"),
+        // AV-38: the arbiter's rationale-document commitment param
+        // populates `rationale_hash`; the `Option` discriminant is
+        // implied (an attached hash is `Some`).
+        ("resolve", "rationale_hash", "rationale_hash"),
         // AV-15: the tranche list populates the plan's amounts; the count
         // is derived (see FIELD_SOURCES). The plan region is zeroed by
         // `initialize`.
@@ -6237,7 +6308,7 @@ mod error_code_tests {
         // the state is not Disputed.
         let mut e = escrow();
         e.fund(ALICE).unwrap();
-        let err = e.resolve([0xA8; 32], 100, None).unwrap_err();
+        let err = e.resolve([0xA8; 32], 100, None, None).unwrap_err();
         assert_eq!(err, EscrowError::InvalidArbiter);
         assert_eq!(err.code(), 108);
     }
@@ -6721,7 +6792,7 @@ mod reentrancy_fuzz_tests {
                 4 => nested.claim(if wrong_caller { ALICE } else { BOB }, NOW, mint).map(|_| ()),
                 5 => nested.cancel(authority, mint, ALICE).map(|_| ()),
                 6 => nested.cancel_expired(authority, NOW, mint, ALICE).map(|_| ()),
-                7 => nested.resolve(authority, 1, mint).map(|_| ()),
+                7 => nested.resolve(authority, 1, mint, None).map(|_| ()),
                 _ => nested.close_vault(authority).map(|_| ()),
             };
             assert_eq!(
@@ -7392,6 +7463,20 @@ mod account_space_tests {
         // decimal metadata is configured); appended last so every
         // earlier offset above is unchanged.
         out.push(e.decimals);
+        // AV-38: arbiter's rationale-document hash, always reserved like
+        // `quorum`: the `None` discriminant followed by a zeroed 32-byte
+        // commitment, so `resolve` writes in place without reallocating;
+        // appended last so every earlier offset above is unchanged.
+        match e.rationale_hash {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; 32]);
+            }
+            Some(h) => {
+                out.push(1);
+                out.extend_from_slice(&h);
+            }
+        }
         out
     }
 
@@ -7412,10 +7497,11 @@ mod account_space_tests {
         // + 8 (AV-21 expiry grace period) + (1 + 32) (AV-22 dispute
         // evidence hash) + (1 + 32) (AV-23 refund address whitelist)
         // + 2 (AV-24 anti-griefing penalty rate) + 8 (AV-27 timelock)
-        // + 1 (AV-28 token decimal metadata).
-        assert_eq!(ESCROW_BODY_LEN, 617, "escrow payload bytes");
+        // + 1 (AV-28 token decimal metadata) + (1 + 32) (AV-38 arbiter's
+        // rationale-document hash).
+        assert_eq!(ESCROW_BODY_LEN, 650, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 625, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 658, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -7433,13 +7519,14 @@ mod account_space_tests {
         // when no penalty configured) + 8-byte timelock unlock timestamp
         // (AV-27, zeroed when no timelock configured) + 1-byte token
         // decimal metadata (AV-28, zeroed when no decimal metadata is
-        // configured).
+        // configured) + (1 + 32)-byte arbiter's rationale-document hash
+        // (AV-38, zeroed when the arbiter attached no rationale).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 214);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 247);
     }
 
     #[test]
@@ -7793,16 +7880,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 625) * 3480 * 2 = 753 * 6960 = 5_240_880 lamports.
-        assert_eq!(full, 5_240_880);
+        // (128 + 658) * 3480 * 2 = 786 * 6960 = 5_470_560 lamports.
+        assert_eq!(full, 5_470_560);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 214) * 3480 * 2 = 342 * 6960 = 2_380_320 lamports.
-        assert_eq!(no_quorum, 2_380_320);
+        // (128 + 247) * 3480 * 2 = 375 * 6960 = 2_610_000 lamports.
+        assert_eq!(no_quorum, 2_610_000);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -7846,13 +7933,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(5_240_880, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(5_470_560, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(5_240_879, params.0, params.1),
+            check_vault_rent_exempt(5_470_559, params.0, params.1),
             Err(RentShortfall {
-                required: 5_240_880,
-                provided: 5_240_879,
+                required: 5_470_560,
+                provided: 5_470_559,
             })
         );
         // Generous funding: exempt.
@@ -7864,7 +7951,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 5_240_880,
+                required: 5_470_560,
                 provided: 0,
             })
         );
@@ -8711,7 +8798,7 @@ mod arbitration_tests {
     #[test]
     fn resolve_splits_the_remainder_atomically() {
         let mut e = disputed_escrow();
-        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None).unwrap();
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None).unwrap();
         assert_eq!((payout, fee, refund), (600_000, 0, 400_000));
         assert_eq!(e.state(), EscrowState::Settled);
         // The taker's share joins the released counter (shared audit
@@ -8726,11 +8813,11 @@ mod arbitration_tests {
     fn resolve_honors_boundary_splits() {
         // Full payout to the taker.
         let mut e = disputed_escrow();
-        assert_eq!(e.resolve(ARBITER, 1_000_000, None).unwrap(), (1_000_000, 0, 0));
+        assert_eq!(e.resolve(ARBITER, 1_000_000, None, None).unwrap(), (1_000_000, 0, 0));
         assert_eq!(e.state(), EscrowState::Settled);
         // Full refund to the initializer.
         let mut e = disputed_escrow();
-        assert_eq!(e.resolve(ARBITER, 0, None).unwrap(), (0, 0, 1_000_000));
+        assert_eq!(e.resolve(ARBITER, 0, None, None).unwrap(), (0, 0, 1_000_000));
         assert_eq!(e.state(), EscrowState::Settled);
     }
 
@@ -8738,7 +8825,7 @@ mod arbitration_tests {
     fn resolve_rejects_over_split() {
         let mut e = disputed_escrow();
         assert_eq!(
-            e.resolve(ARBITER, 1_000_001, None),
+            e.resolve(ARBITER, 1_000_001, None, None),
             Err(EscrowError::ReleaseExceedsLocked)
         );
         assert_eq!(e.state(), EscrowState::Disputed);
@@ -8751,7 +8838,7 @@ mod arbitration_tests {
         let mut e = disputed_escrow();
         for authority in [ALICE, BOB, MALLORY] {
             assert_eq!(
-                e.resolve(authority, 100_000, None),
+                e.resolve(authority, 100_000, None, None),
                 Err(EscrowError::Unauthorized)
             );
             assert_eq!(e.state(), EscrowState::Disputed);
@@ -8759,14 +8846,14 @@ mod arbitration_tests {
         // Not disputed yet: state rejects before authority is consulted.
         let mut e = funded_arbitrated_escrow();
         assert_eq!(
-            e.resolve(ARBITER, 100_000, None),
+            e.resolve(ARBITER, 100_000, None, None),
             Err(EscrowError::InvalidStateTransition)
         );
         // Settled is terminal: no second settlement.
         let mut e = disputed_escrow();
-        e.resolve(ARBITER, 600_000, None).unwrap();
+        e.resolve(ARBITER, 600_000, None, None).unwrap();
         assert_eq!(
-            e.resolve(ARBITER, 100_000, None),
+            e.resolve(ARBITER, 100_000, None, None),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.released_amount(), 600_000, "second resolve moved nothing");
@@ -8779,7 +8866,7 @@ mod arbitration_tests {
         let mut e = funded_arbitrated_escrow();
         e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
         e.escalate(BOB, EXPIRES_AT - 1, None).unwrap();
-        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None).unwrap();
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None).unwrap();
         assert_eq!((payout, fee, refund), (600_000, 0, 0));
         assert_eq!(e.released_amount(), 1_000_000);
         assert_eq!(e.remaining_amount(), 0);
@@ -8802,7 +8889,7 @@ mod arbitration_tests {
             .unwrap();
         e.fund(ALICE).unwrap();
         e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
-        assert_eq!(e.resolve(ARBITER, 500_000, None).unwrap(), (500_000, 0, 500_000));
+        assert_eq!(e.resolve(ARBITER, 500_000, None, None).unwrap(), (500_000, 0, 500_000));
         assert_eq!(e.state(), EscrowState::Settled);
     }
 
@@ -8824,7 +8911,7 @@ mod arbitration_tests {
             e.claim(BOB, 1_750_000_000, None),
             Err(EscrowError::InvalidStateTransition)
         );
-        assert_eq!(e.resolve(ARBITER, 200_000, None).unwrap(), (200_000, 0, 800_000));
+        assert_eq!(e.resolve(ARBITER, 200_000, None, None).unwrap(), (200_000, 0, 800_000));
     }
 
     #[test]
@@ -9207,7 +9294,7 @@ mod milestone_tests {
         confirm_both(&mut e, 0);
         e.release_milestone(ALICE, 1_750_000_000, 0, None).unwrap(); // 400_000 to the taker
         e.escalate(BOB, EXPIRES_AT - 1, None).unwrap();
-        let (payout, fee, refund) = e.resolve(ARBITER, 300_000, None).unwrap();
+        let (payout, fee, refund) = e.resolve(ARBITER, 300_000, None, None).unwrap();
         assert_eq!((payout, fee, refund), (300_000, 0, 300_000));
         assert_eq!(e.released_amount(), 700_000, "taker share in released");
         assert_eq!(e.remaining_amount(), 300_000, "initializer refund");
@@ -9392,7 +9479,7 @@ mod protocol_fee_tests {
             .unwrap();
         e.fund(ALICE).unwrap();
         e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
-        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None).unwrap();
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None).unwrap();
         assert_eq!((payout, fee, refund), (540_000, 60_000, 400_000));
         assert_eq!(payout + fee, 600_000, "fee slices the taker's share");
         assert_eq!(e.fees_paid(), 60_000);
@@ -10168,7 +10255,7 @@ mod evidence_tests {
         // persists through the settlement, never cleared.
         let mut e = funded_arbitrated_escrow();
         e.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE)).unwrap();
-        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None).unwrap();
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None).unwrap();
         assert_eq!(e.state(), EscrowState::Settled);
         assert_eq!(e.evidence_hash(), Some(EVIDENCE));
         // payout is net of the fee; the three legs sum to the lockup.
@@ -10185,6 +10272,172 @@ mod evidence_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         assert_eq!(bytes[540], 1, "evidence_hash: Some discriminant");
         assert_eq!(&bytes[541..573], &EVIDENCE, "evidence_hash bytes");
+    }
+}
+
+// ---------- AV-38: arbiter's rationale-document hash ----------
+//
+// `resolve` takes an optional 32-byte commitment to the arbiter's
+// off-chain rationale document (e.g. the SHA-256 of the written ruling),
+// persisted on the escrow in `Settled` — never cleared, following the
+// AV-22 `evidence_hash` audit-trail convention. The `Resolved` indexer
+// event carries it (see events.rs), the keeper lists a `resolve` action
+// for disputed escrows (see keeper.rs), and the AV-26 snapshot exports
+// it (see snapshot.rs).
+#[cfg(test)]
+mod rationale_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const RATIONALE_HASH: [u8; 32] = [0xA1; 32]; // stand-in rationale commitment
+
+    fn disputed_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        e
+    }
+
+    #[test]
+    fn resolve_persists_rationale_hash() {
+        // The arbiter attaches the rationale-document commitment at
+        // settlement; it lands on the escrow alongside `Settled`.
+        let mut e = disputed_escrow();
+        assert_eq!(e.rationale_hash(), None, "nothing attached before resolve");
+        let (payout, fee, refund) =
+            e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH)).unwrap();
+        assert_eq!(e.state(), EscrowState::Settled);
+        assert_eq!(e.rationale_hash(), Some(RATIONALE_HASH));
+        // The split itself is untouched by the new parameter.
+        assert_eq!((payout, fee, refund), (600_000, 0, 400_000));
+    }
+
+    #[test]
+    fn resolve_without_rationale_hash_is_backward_compatible() {
+        // `None` keeps the historical behavior exactly: the settlement
+        // works, and the field reads back as `None`.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.rationale_hash(), None);
+        let mut e = disputed_escrow();
+        e.resolve(ARBITER, 600_000, None, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Settled);
+        assert_eq!(e.rationale_hash(), None);
+    }
+
+    #[test]
+    fn failed_resolve_stores_nothing() {
+        // A rejected settlement must not leave a half-written hash: the
+        // store happens only after every gate passes.
+        let mut e = disputed_escrow();
+        assert_eq!(
+            e.resolve(MALLORY, 600_000, None, Some(RATIONALE_HASH)),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.rationale_hash(), None);
+        assert_eq!(e.state(), EscrowState::Disputed);
+        // Wrong state: resolve from Funded stores nothing either.
+        let mut funded = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        funded.fund(ALICE).unwrap();
+        assert_eq!(
+            funded.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH)),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(funded.rationale_hash(), None);
+    }
+
+    #[test]
+    fn rationale_hash_is_never_cleared() {
+        // The hash is the audit trail of the arbitration: it survives
+        // every later transition — including `close_vault` into
+        // `Closed` — and a decode roundtrip of the account bytes.
+        let mut e = disputed_escrow();
+        e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH)).unwrap();
+        e.close_vault(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Closed);
+        assert_eq!(e.rationale_hash(), Some(RATIONALE_HASH));
+
+        let mut e = disputed_escrow();
+        e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH)).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        let decoded =
+            crate::discriminator::decode_vault_account(&with_discriminator(&bytes)).unwrap();
+        assert_eq!(decoded.rationale_hash(), Some(RATIONALE_HASH));
+    }
+
+    #[test]
+    fn rationale_hash_persists_in_serialized_layout() {
+        // The hash occupies the appended tail of the vault account
+        // (discriminant + 32 bytes) — body offset 617, right after the
+        // AV-28 `decimals` byte — so `resolve` writes it in place and
+        // every earlier field offset stays stable.
+        let mut e = disputed_escrow();
+        e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH)).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes.len(), 650, "body grew by exactly 33 bytes");
+        assert_eq!(bytes[616], 0, "decimals offset unchanged");
+        assert_eq!(bytes[617], 1, "rationale_hash: Some discriminant");
+        assert_eq!(&bytes[618..650], &RATIONALE_HASH, "rationale_hash bytes");
+        // The AV-22 evidence region is untouched by the append.
+        assert_eq!(bytes[540], 0, "evidence_hash: None discriminant");
+        assert_eq!(&bytes[541..573], &[0u8; 32], "evidence_hash: zeroed");
+    }
+
+    #[test]
+    fn rationale_hash_defaults_to_zeroed_tail_on_the_wire() {
+        // Backward compatibility on the wire: an escrow settled without
+        // a rationale serializes the tail as a zeroed region, exactly
+        // like every other `None` tail field.
+        let mut e = disputed_escrow();
+        e.resolve(ARBITER, 600_000, None, None).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), 650);
+        assert_eq!(bytes[617], 0, "rationale_hash: None discriminant");
+        assert_eq!(&bytes[618..650], &[0u8; 32], "rationale_hash: zeroed");
+    }
+
+    #[test]
+    fn rationale_hash_rent_recomputed_from_mainnet_formula() {
+        // AV-38 grows the account by 33 bytes; the rent-exempt minimums
+        // are recomputed from the mainnet formula, not copied from the
+        // AV-28 numbers.
+        let full = rent_exempt_minimum_lamports(
+            VAULT_SPACE,
+            MAINNET_LAMPORTS_PER_BYTE_YEAR,
+            MAINNET_EXEMPTION_THRESHOLD_YEARS,
+        );
+        // (128 + 658) * 3480 * 2 = 786 * 6960 = 5_470_560 lamports.
+        assert_eq!(VAULT_SPACE, 658);
+        assert_eq!(full, 5_470_560);
+        assert_eq!(full, vault_close_rent_reclaimed());
+        let no_quorum = rent_exempt_minimum_lamports(
+            VAULT_SPACE_NO_QUORUM,
+            MAINNET_LAMPORTS_PER_BYTE_YEAR,
+            MAINNET_EXEMPTION_THRESHOLD_YEARS,
+        );
+        // (128 + 247) * 3480 * 2 = 375 * 6960 = 2_610_000 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 247);
+        assert_eq!(no_quorum, 2_610_000);
+    }
+
+    /// Prepend the 8-byte Anchor discriminator: the exact input
+    /// `decode_vault_account` expects.
+    fn with_discriminator(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ANCHOR_DISCRIMINATOR_LEN + body.len());
+        out.extend_from_slice(&crate::discriminator::vault_account_discriminator());
+        out.extend_from_slice(body);
+        out
     }
 }
 
@@ -10686,7 +10939,7 @@ mod timelock_tests {
             .unwrap();
         e.fund(ALICE).unwrap();
         e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
-        let (payout, _fee, _refund) = e.resolve(ARBITER, 600_000, None).unwrap();
+        let (payout, _fee, _refund) = e.resolve(ARBITER, 600_000, None, None).unwrap();
         assert_eq!(payout, 600_000);
         assert_eq!(e.state(), EscrowState::Settled);
     }
@@ -10872,7 +11125,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 617, "one byte appended by AV-28");
+        assert_eq!(ESCROW_BODY_LEN, 650, "33 bytes appended by AV-38");
         assert_eq!(bytes[616], 9, "decimals tail offset");
         // The timelock offset is unchanged by the append.
         assert_eq!(
@@ -10890,29 +11143,29 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 625) * 3480 * 2 = 753 * 6960 = 5_240_880 lamports.
+        // (128 + 658) * 3480 * 2 = 786 * 6960 = 5_470_560 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            5_240_880
+            5_470_560
         );
-        // (128 + 214) * 3480 * 2 = 342 * 6960 = 2_380_320 lamports.
+        // (128 + 247) * 3480 * 2 = 375 * 6960 = 2_610_000 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            2_380_320
+            2_610_000
         );
-        // Exactly one byte's rent above the AV-27 numbers.
-        assert_eq!(VAULT_SPACE, 625);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 214);
-        assert!(check_vault_rent_exempt(5_240_880, 3_480, 2.0).is_ok());
-        assert!(check_vault_rent_exempt(5_240_879, 3_480, 2.0).is_err());
+        // 33 bytes' rent above the AV-28 numbers (AV-38 rationale hash).
+        assert_eq!(VAULT_SPACE, 658);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 247);
+        assert!(check_vault_rent_exempt(5_470_560, 3_480, 2.0).is_ok());
+        assert!(check_vault_rent_exempt(5_470_559, 3_480, 2.0).is_err());
     }
 
     #[test]

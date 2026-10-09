@@ -66,7 +66,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize(initializer, taker, amount, expires_at)` | — | `Uninitialized` | anyone (amount > 0) |
 | `initialize_arbiter(arbiter)`               | `Uninitialized`| `Uninitialized` | initializer (once, before funding; zero key rejected) |
 | `escalate(authority, now, evidence_hash)`   | `Funded`       | `Disputed` | initializer **or** taker, only when `now < expires_at` (locks `release`/`cancel`/`cancel_expired`/`claim`); `evidence_hash` is the optional 32-byte off-chain-evidence commitment, persisted |
-| `resolve(authority, taker_amount)`           | `Disputed`     | `Settled` | arbiter only; atomic split of the remainder (taker payout / initializer refund) |
+| `resolve(authority, taker_amount, rationale_hash)` | `Disputed`     | `Settled` | arbiter only; atomic split of the remainder (taker payout / initializer refund); `rationale_hash` is the optional 32-byte commitment to the arbiter's off-chain rationale document, persisted in `Settled` (never cleared) |
 | `initialize_milestones(milestones)`          | `Uninitialized`| `Uninitialized` | initializer (once, before funding; tranche amounts must sum to the locked amount) |
 | `confirm_milestone(authority, index)`        | `Funded`       | — (no state change) | initializer **or** taker (in order; a milestone is confirmed once *both* parties confirmed) |
 | `release_milestone(authority, now, index)`        | `Funded`       | `Funded` (partial) / `Released` (final tranche) | initializer; milestone dual-confirmed (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise) |
@@ -256,7 +256,13 @@ arbiter and indexers can read it without trusting the escalator to
 re-supply it; `None` attaches no evidence (backward compatible). The hash
 is never cleared: it survives `resolve` into `Settled` as the audit trail
 of what the arbiter reviewed, and both the `Escalated` and `Resolved`
-indexer events carry it.
+indexer events carry it. The arbiter may attach a 32-byte **rationale
+hash** (`resolve(…, rationale_hash)`) — a commitment to the off-chain
+rationale document behind the ruling (e.g. the SHA-256 of the written
+arbitration report) — persisted on the escrow in `Settled` so the parties
+and indexers can verify what the ruling referenced; `None` attaches no
+rationale (backward compatible). Like the evidence hash, it is never
+cleared, and the `Resolved` indexer event carries it.
 
 **Milestone tranche release (staged settlement).** An escrow can declare a
 milestone plan at creation (`MilestonePlan::new(amounts)`, opt-in on
@@ -696,16 +702,20 @@ returns a `KeeperReport` of immediately executable calls:
 |--------|-------------|--------|----------|
 | `cancel_expired(authority, now, mint, refund_to)` | `Funded`, `now >= expires_at + grace_period` (grace-aware: the keeper never lists a call the chain would reject as `NotExpired`), remainder > 0 | initializer (canonical; the taker may also call) | refundable remainder (never fee'd) |
 | `claim(taker, now, mint)` | `Funded`, vesting attached, no milestone plan, vested − released > 0, quorum satisfied if configured, timelock unlocked (`now >= unlock_at`) | taker | gross vested-but-unreleased (`payout + fee == amount`) |
+| `resolve(arbiter, taker_amount, mint, rationale_hash)` (AV-38) | `Disputed`, arbiter configured, remainder > 0 | arbiter | remaining locked amount the arbiter's split divides (the split itself and the rationale-document commitment are the arbiter's call-time judgment) |
 
 Only *executable* calls are listed: a vesting claim behind an unsatisfied
 quorum is withheld (the call would fail), a claim behind a locked timelock
 is withheld (`TimelockNotReached`), and a milestone-plan escrow
-never lists `claim` (the plan owns the release schedule). Each action
+never lists `claim` (the plan owns the release schedule). A `Disputed`
+escrow lists exactly the `resolve` action — its unilateral exits stay
+locked, so nothing else is listed — letting an arbiter-operated keeper bot
+learn which disputes await its ruling. Each action
 carries the exact instruction arguments — `caller`, `mint` (the bound SPL
 mint, or `null` on the native-SOL path), and `refund_to` (the refund
 destination for `cancel_expired` — the whitelisted address when
-configured, else the initializer; `null` for `claim`) — so the keeper can
-build the `cancel_expired` / `claim` instruction directly. The scan is a pure read
+configured, else the initializer; `null` for `claim` and `resolve`) — so the keeper can
+build the `cancel_expired` / `claim` / `resolve` instruction directly. The scan is a pure read
 over `&Escrow` snapshots: dry-run by construction, zero side effects,
 deterministic output in input order. `KeeperReport::to_json()` emits
 hand-serialized JSON (the crate stays dependency-free; keys are 64-char
@@ -740,7 +750,8 @@ Raw fields: `initializer`, `taker`, `state` (`uninitialized` / `activated` /
 (`required` / `initializer_activated` / `taker_activated`), `fee_bps`,
 `fees_paid`, `skipped`, `penalty_bps`, `unlock_at` (AV-27; `0` = no
 timelock), plus the optional `quorum`,
-`vesting`, `arbiter`, `mint`, `evidence_hash`, `refund_to` (hex or `null`)
+`vesting`, `arbiter`, `mint`, `evidence_hash`, `rationale_hash` (AV-38;
+hex or `null`), `refund_to` (hex or `null`)
 and the effective `refund_recipient` (whitelist when configured, else the
 initializer).
 
@@ -775,7 +786,7 @@ diffing numbers while operators read whole tokens.
  "claimable":0,"display_claimable":"0.000000",
  "arbiter":null,"mint":null,"fee_bps":0,"fees_paid":0,"display_fees_paid":"0.000000",
  "milestones":null,"skipped":0,"display_skipped":"0.000000",
- "evidence_hash":null,"refund_to":null,"refund_recipient":"...",
+ "evidence_hash":null,"rationale_hash":null,"refund_to":null,"refund_recipient":"...",
  "penalty_bps":0,"unlock_at":0,"unlock_eligible":true}
 ```
 
@@ -811,7 +822,8 @@ two-way consistency check against the IDL parameter table:
 | penalty_bps   | u16               | 2     |
 | timelock      | u64               | 8     |
 | decimals      | u8                | 1     |
-| **total**     |                   | **625** |
+| rationale_hash | Option<[u8; 32]> | 33    |
+| **total**     |                   | **658** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -840,11 +852,13 @@ discriminant + 32-byte address, zeroed when no whitelist is configured)
 when no penalty is configured) — and the 8-byte timelock unlock timestamp
 `timelock` (AV-27, zeroed when no timelock is configured) — and the 1-byte
 token decimal metadata `decimals` (AV-28, zeroed when no decimal metadata
-is declared).
-`escrow-state` exposes `VAULT_SPACE` (625) and
-`VAULT_SPACE_NO_QUORUM` (214) for the Anchor `space =` constraint, plus a
+is declared) — and the 33-byte arbiter's rationale-document hash region
+(AV-38: 1-byte discriminant + 32-byte commitment, zeroed when the arbiter
+attached no rationale).
+`escrow-state` exposes `VAULT_SPACE` (658) and
+`VAULT_SPACE_NO_QUORUM` (247) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **5,240,880 lamports** to be
+mainnet rent parameters the full vault needs **5,470,560 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -864,10 +878,12 @@ the deposit:
   7, appended after `Settled` so discriminants 0–6 stay stable for
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
-  No vault field is added or moved (`VAULT_SPACE` stays 625); the state
+  No vault field is added or moved by the close itself (`VAULT_SPACE`
+  stays 658 — the AV-38 rationale-hash growth is accounted in the
+  layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**5,240,880
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**5,470,560
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the
@@ -899,7 +915,7 @@ discriminators against FIPS-pinned SHA-256 vectors, and — the point of
 the item — every account field's IDL name/type/offset against the real
 bytes of the hand-written Borsh encoder (`encode_escrow`) for a
 fully-configured escrow, including the dispute path's `evidence_hash`
-region. The `"offset"` on each field is a pipeline extension (byte
+and `rationale_hash` regions. The `"offset"` on each field is a pipeline extension (byte
 offset into the account data *including* the 8-byte Anchor
 discriminator); Anchor tooling ignores unknown JSON fields. When the
 Anchor toolchain is available, `anchor build` output should replace

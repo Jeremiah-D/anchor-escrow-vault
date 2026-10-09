@@ -194,6 +194,11 @@ pub struct EscrowSnapshot {
     /// Dispute evidence commitment attached at `escalate`, or `None`
     /// when no evidence was supplied (AV-22).
     pub evidence_hash: Option<[u8; 32]>,
+    /// The arbiter's rationale-document commitment attached at
+    /// `resolve`, or `None` when the arbiter supplied no rationale
+    /// (AV-38). Only `Some` on a `Settled` escrow — never cleared, so
+    /// the snapshot keeps the audit trail of the arbitration.
+    pub rationale_hash: Option<[u8; 32]>,
     /// Whitelisted refund destination, or `None` when no whitelist is
     /// configured (AV-23).
     pub refund_to: Option<[u8; 32]>,
@@ -285,6 +290,7 @@ impl Escrow {
             milestones,
             skipped: self.skipped_amount(),
             evidence_hash: self.evidence_hash(),
+            rationale_hash: self.rationale_hash(),
             refund_to: self.refund_to(),
             refund_recipient: self.refund_recipient(),
             penalty_bps: self.penalty_bps(),
@@ -453,6 +459,10 @@ impl EscrowSnapshot {
         s.push_str(&format_amount(self.skipped, self.decimals));
         s.push_str("\",\"evidence_hash\":");
         write_opt_hex(&mut s, self.evidence_hash);
+        // AV-38: the arbiter's rationale-document commitment — `null`
+        // until the arbiter attaches one at `resolve`.
+        s.push_str(",\"rationale_hash\":");
+        write_opt_hex(&mut s, self.rationale_hash);
         s.push_str(",\"refund_to\":");
         write_opt_hex(&mut s, self.refund_to);
         s.push_str(",\"refund_recipient\":\"");
@@ -516,7 +526,7 @@ mod snapshot_tests {
              \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\
              \"milestones\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
-             \"evidence_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
+             \"evidence_hash\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
              \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true\
              }}",
             init = hex_of(0xAA),
@@ -681,6 +691,28 @@ mod snapshot_tests {
         let json = snap.to_json();
         assert!(json.contains(&format!("\"arbiter\":\"{}\"", hex_of(0xA8))));
         assert!(json.contains(&format!("\"evidence_hash\":\"{}\"", hex_of(0xE1))));
+    }
+
+    #[test]
+    fn settled_snapshot_carries_rationale_hash() {
+        // AV-38: once the arbiter attaches the rationale-document
+        // commitment at `resolve`, the snapshot export carries it —
+        // field and JSON — so keeper/indexer tooling can verify what
+        // the ruling referenced without a second account read.
+        const RATIONALE: [u8; 32] = [0xA1; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(BOB, MID, None).unwrap();
+        assert_eq!(e.snapshot(MID).rationale_hash, None);
+        e.resolve(ARBITER, 400_000, None, Some(RATIONALE)).unwrap();
+        let snap = e.snapshot(MID);
+        assert_eq!(snap.state, "settled");
+        assert_eq!(snap.rationale_hash, Some(RATIONALE));
+        let json = snap.to_json();
+        assert!(json.contains(&format!("\"rationale_hash\":\"{}\"", hex_of(0xA1))));
     }
 
     #[test]
