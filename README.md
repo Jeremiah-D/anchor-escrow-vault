@@ -1064,6 +1064,42 @@ multisig/CLI-ready instruction list as JSON.
   instructions keep scan order, batch ids are positional — the same
   report always yields byte-identical JSON.
 
+## Batch lifecycle scan (AV-37)
+
+`escrow-state/src/batch.rs` is the proactive half of the keeper story:
+where the keeper report (AV-20) covers the *reactive* exits
+(`cancel_expired` / `claim`) and the execution plan (AV-33) batches
+them, `scan_batch_lifecycle` covers the *proactive* lifecycle — one
+scan emitting the executable `initialize → fund → release` call list
+for a whole fleet of escrows.
+
+- **Input**: a watch list where each item is either a not-yet-created
+  vault (with its `initialize` parameters) or a live escrow snapshot.
+  Each item gets exactly one outcome: an executable action
+  (`initialize` / `fund` / full `release` of the remainder, with exact
+  arguments and logical accounts), `Blocked { reason }`
+  (`invalid_amount`, `awaiting_activation`, `quorum_not_satisfied`,
+  `timelock_not_reached`, `milestone_plan_attached`,
+  `nothing_to_release`, `disputed`), or `Done` for terminal states.
+  A `release` action carries the gross `amount` plus the `payout`/`fee`
+  split (`protocol_fee_for`); `initialize` carries `taker`/`expires_at`.
+- **Partial-failure isolation**: the scan is pure reads — one item's
+  outcome can never affect another's. A blocked item is reported inline
+  with its machine-readable reason while every executable item still
+  gets its action; the operator runs the executable calls, fixes the
+  blocked items, and re-scans. No abort, no shared state.
+- **ALT support**: the report builds `alt_table` — the deduped set of
+  every non-signer account referenced by any action, in first-seen
+  order, capped at 256 (the on-chain Address Lookup Table limit).
+  Signers are excluded by construction (they can never live in a
+  lookup table). Each account carries `alt_index` into the table (or
+  `None`), so the operator creates/extends the ALT once and references
+  accounts by index in every transaction — the standard fleet pattern
+  for batch `initialize` runs where dozens of vault PDAs would
+  otherwise bloat every transaction.
+- **Dry-run**: like the keeper report — no events, no clock, no
+  mutation. Amounts are as of the scan; execute, then re-scan.
+
 ## Run the tests
 
 ```bash

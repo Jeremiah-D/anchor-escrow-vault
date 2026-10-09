@@ -18,6 +18,10 @@ mod cpi_call;
 mod discriminator;
 // AV-33: batch settlement execution plan over the keeper report.
 mod execution_plan;
+// AV-37: batch lifecycle scan — one report with the executable
+// `initialize -> fund -> release` call list for many escrows, ALT
+// support, and per-item failure isolation (fleet bring-up / sweep).
+mod batch;
 #[cfg(test)]
 mod idl_json;
 #[cfg(test)]
@@ -158,6 +162,15 @@ pub use discriminator::{
 // JSON. Purely additive and read-only.
 pub use execution_plan::{
     plan_execution, ExecutionBatch, ExecutionPlan, PlannedAccount, PlannedInstruction,
+};
+
+// AV-37: batch lifecycle scan — one report with the executable
+// `initialize -> fund -> release` call list for many escrows, with
+// Address Lookup Table support and per-item failure isolation.
+// Purely additive and read-only (dry-run by construction).
+pub use batch::{
+    scan_batch_lifecycle, BatchAccount, BatchActionKind, BatchInitializeParams, BatchItem,
+    BatchItemOutcome, BatchLifecycleAction, BatchReport, BatchWatchItem,
 };
 
 /// Lifecycle states of an escrow vault.
