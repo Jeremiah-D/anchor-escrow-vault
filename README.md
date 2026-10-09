@@ -948,6 +948,29 @@ vault accounts without trusting them:
   `pub(crate)` primitive so this module, the AV-33 planner, and the
   test-only IDL pipeline (AV-29) all use one implementation.
 
+## Batch settlement execution plan (AV-33)
+
+`escrow-state/src/execution_plan.rs` turns the keeper report (AV-20)
+into executable work: `plan_execution` groups the report's actions into
+**atomicity batches** keyed by `(mint, caller)` and serializes the
+multisig/CLI-ready instruction list as JSON.
+
+- **Batching**: one signing key authorizes the whole batch (single
+  multisig proposal / CLI run), and the token path is uniform inside a
+  batch (all native-SOL or all the same SPL mint). Across batches, vault
+  account sets are disjoint by construction — a failing batch is retried
+  alone and never invalidates another.
+- **Instructions**: each carries the real Anchor instruction
+  discriminator (`sha256("global:<name>")[..8]`, same constructor the
+  IDL pipeline pins) and logical accounts as `(pubkey, role, signer,
+  writable)` triples (`vault` / `authority` / `refund_to` / `mint`).
+  Roles are logical on purpose — the submitter maps them to concrete
+  accounts (system program, token program, ATAs); the crate never
+  invents addresses it cannot derive.
+- **Determinism**: batches sort by `(mint, caller)` (native-SOL first),
+  instructions keep scan order, batch ids are positional — the same
+  report always yields byte-identical JSON.
+
 ## Run the tests
 
 ```bash

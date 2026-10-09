@@ -84,7 +84,9 @@ pub enum KeeperActionKind {
 }
 
 impl KeeperActionKind {
-    fn as_str(&self) -> &'static str {
+    /// `pub(crate)` so the execution-plan builder (AV-33) can stamp the
+    /// instruction name on planned instructions.
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             KeeperActionKind::CancelExpired => "cancel_expired",
             KeeperActionKind::Claim => "claim",
