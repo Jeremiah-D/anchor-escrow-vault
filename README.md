@@ -733,6 +733,7 @@ returns a `KeeperReport` of immediately executable calls:
 | `cancel_expired(authority, now, mint, refund_to)` | `Funded`, `now >= expires_at + grace_period` (grace-aware: the keeper never lists a call the chain would reject as `NotExpired`), remainder > 0 | initializer (canonical; the taker may also call) | refundable remainder (never fee'd) |
 | `claim(taker, now, mint)` | `Funded`, vesting attached, no milestone plan, vested − released > 0, quorum satisfied if configured, timelock unlocked (`now >= unlock_at`) | taker | gross vested-but-unreleased (`payout + fee == amount`) |
 | `resolve(arbiter, taker_amount, mint, rationale_hash)` (AV-38) | `Disputed`, arbiter configured, remainder > 0 | arbiter | remaining locked amount the arbiter's split divides (the split itself and the rationale-document commitment are the arbiter's call-time judgment) |
+| `close_vault(authority)` (AV-40) | `Cancelled` / `Released` / `Settled` — the terminal states AV-34's `close_vault` accepts. `Disputed` is never listed (the arbitration is still live; the vault account is the arbiter's audit surface) and `Closed` is never listed (the rent is already reclaimed) — the scan lists only calls the chain would accept | initializer (the only key `close_vault` accepts — AV-34 checks authority before state) | `rent_reclaimed`: the mainnet rent-exempt minimum for the current `VAULT_SPACE` (via `vault_close_rent_reclaimed()`, never a hardcoded figure) |
 
 Only *executable* calls are listed: a vesting claim behind an unsatisfied
 quorum is withheld (the call would fail), a claim behind a locked timelock
@@ -759,6 +760,41 @@ same `amount` rendered in human units (`500000` at 6 decimals →
   {"escrow_id":"...","action":"claim","caller":"...","caller_role":"taker",
    "mint":null,"refund_to":null,"amount":500000,"decimals":6,
    "display_amount":"0.500000","reason":"vesting_unlocked"}
+]}
+```
+
+## Close sweep (AV-40)
+
+Terminal-state vaults (`Cancelled` / `Released` / `Settled`) have
+served their purpose, but their rent-exempt deposits stay locked until
+the vault account is closed — stranding them forever if nobody sweeps.
+`scan_closeable(watched)` is the second keeper scan: it walks the same
+watch list and emits the executable `close_vault` call list for
+terminal-state vaults, grouped per initializer signer into
+`CloseBatch`es with a per-batch `total_reclaimed` lamports summary.
+Like the AV-20 scan it lists only *executable* calls — `Disputed`
+(the arbitration is still live, and the vault account is the arbiter's
+audit surface) and already-`Closed` vaults are skipped, never listed,
+as are the pre-terminal states (`Uninitialized` / `Funded` /
+`Activated`). Each action names the initializer as the canonical
+caller (AV-34 restricts `close_vault` to the initializer, checked
+before state validity — the only key the chain accepts) and carries
+`rent_reclaimed`: the mainnet rent-exempt minimum for the *current*
+`VAULT_SPACE`, computed via `vault_close_rent_reclaimed()` rather
+than a hardcoded figure, so the estimate tracks the account layout as
+it grows. The scan carries no `now` (closing has no time gate) and is
+dry-run by construction: a pure read over `&Escrow` snapshots, zero
+side effects. `CloseReport::to_json()` emits hand-serialized JSON in
+the same deterministic style (64-char lowercase hex keys, fixed field
+order; batches in first-seen caller order, actions in input order):
+
+```json
+{"scanned":2,"batches":[
+  {"caller":"...","total_reclaimed":10941120,"actions":[
+    {"escrow_id":"...","action":"close_vault","caller":"...",
+     "caller_role":"initializer","rent_reclaimed":5470560,
+     "reason":"released"}
+  ]}
 ]}
 ```
 

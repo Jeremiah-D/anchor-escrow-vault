@@ -137,6 +137,13 @@ pub use keeper::{
     scan_keeper_actions, KeeperAction, KeeperActionKind, KeeperReport, WatchedEscrow,
 };
 
+// AV-40: terminal-vault close sweep — scan a batch of escrows for
+// closeable (`Cancelled` / `Released` / `Settled`) vaults, group the
+// executable `close_vault` calls per initializer into batches with a
+// reclaimed-rent total, and serialize the sweep as JSON. Purely
+// additive and read-only (dry-run by construction).
+pub use keeper::{scan_closeable, CloseAction, CloseBatch, CloseReport};
+
 // AV-26: off-chain state snapshot — a point-in-time, read-only view of
 // an `Escrow` as canonical JSON (all fields + derived remaining /
 // vested-claimable / quorum progress), for keeper bots and indexers

@@ -59,8 +59,31 @@
 //! dependency-free): deterministic field order, keys as 64-char lowercase
 //! hex, `mint` as a hex string or `null`. Actions keep the input order so
 //! a keeper feeding a stable watch list gets a stable call list.
+//!
+//! # Rent-reclaim sweep (AV-40)
+//!
+//! A terminal-state vault (`Cancelled` / `Released` / `Settled`) has
+//! served its purpose, but its rent-exempt deposit stays locked until
+//! the account is closed — leaving it there would strand the deposit
+//! forever. [`scan_closeable`] is the second scan: it walks the same
+//! watch list and emits the executable `close_vault` call list for
+//! terminal-state vaults, grouped per initializer signer into
+//! [`CloseBatch`]es with a per-batch reclaimed-lamports total, and
+//! serializable via [`CloseReport::to_json`] (same hand-rolled
+//! deterministic style as the keeper report).
+//!
+//! Only *executable* calls are listed, exactly like the AV-20 scan: the
+//! chain rejects `close_vault` from `Disputed` (AV-34: the arbitration
+//! is still live and the vault account is the audit surface the arbiter
+//! works from) and from `Closed` (the rent is already reclaimed), so
+//! those two states are skipped — never listed — as are the
+//! pre-terminal states (`Uninitialized` / `Funded` / `Activated`),
+//! whose vault accounts have not served their purpose yet. The
+//! canonical caller is the initializer: AV-34 restricts `close_vault`
+//! to the initializer, checked before state validity, so it is the
+//! only key the chain will accept.
 
-use crate::{format_amount, Escrow, EscrowState};
+use crate::{format_amount, vault_close_rent_reclaimed, Escrow, EscrowState};
 
 /// Render 32 bytes as 64 lowercase hex characters.
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -361,6 +384,183 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         at: now,
         scanned: watched.len(),
         actions,
+    }
+}
+
+/// One executable `close_vault` call: everything needed to build the
+/// instruction, nothing more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloseAction {
+    /// Which escrow's vault this call closes: the caller-supplied
+    /// identity (the Anchor layer keys the vault PDA off it — the
+    /// same convention as [`WatchedEscrow::escrow_id`]).
+    pub escrow_id: [u8; 32],
+    /// The key that must sign the `close_vault` call — always the
+    /// escrow's initializer. AV-34 restricts `close_vault` to the
+    /// initializer and checks the authority *before* state validity,
+    /// so this is the canonical caller and the only key the chain
+    /// will accept. It doubles as the instruction's `authority`
+    /// argument: `close_vault(authority)` takes no other arguments —
+    /// the vault account is the target, the initializer is the signer.
+    pub caller: [u8; 32],
+    /// Always `"initializer"` — the canonical (and only accepted)
+    /// close caller.
+    pub caller_role: &'static str,
+    /// Estimated rent-exempt lamports the call returns to the
+    /// initializer. Computed from [`crate::vault_close_rent_reclaimed`]
+    /// — the mainnet rent-exempt minimum for the *current*
+    /// [`crate::VAULT_SPACE`] — never a hardcoded figure: the account
+    /// layout has grown since earlier constants, and the estimate
+    /// tracks the layout automatically.
+    pub rent_reclaimed: u64,
+    /// Machine-readable reason: the terminal state the vault sits in —
+    /// `"cancelled"`, `"released"`, or `"settled"`.
+    pub reason: &'static str,
+}
+
+/// One per-caller close batch: every close action that a single
+/// initializer signer must issue. Batching per caller matters for the
+/// operator: one signer, one sweep, one rent-reclaim total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseBatch {
+    /// The initializer all of this batch's actions sign for.
+    pub caller: [u8; 32],
+    /// This caller's close actions, in input order.
+    pub actions: Vec<CloseAction>,
+    /// Sum of `rent_reclaimed` across the batch's actions.
+    pub total_reclaimed: u64,
+}
+
+/// The close-sweep result: terminal-state vaults grouped into
+/// per-caller close batches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseReport {
+    /// How many escrows were scanned.
+    pub scanned: usize,
+    /// Per-caller batches, in first-seen caller order, so a keeper
+    /// feeding a stable watch list gets a stable sweep list.
+    pub batches: Vec<CloseBatch>,
+}
+
+impl CloseReport {
+    /// True when no closeable vault was found.
+    pub fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+
+    /// Hand-serialized JSON (the crate is dependency-free). Deterministic
+    /// field order; keys are 64-char lowercase hex. Batches keep their
+    /// first-seen caller order, actions keep the input order.
+    ///
+    /// ```json
+    /// {"scanned":2,"batches":[
+    ///   {"caller":"...","total_reclaimed":5470560,"actions":[
+    ///     {"escrow_id":"...","action":"close_vault","caller":"...",
+    ///      "caller_role":"initializer","rent_reclaimed":5470560,
+    ///      "reason":"released"}
+    ///   ]}
+    /// ]}
+    /// ```
+    pub fn to_json(&self) -> String {
+        let mut s = String::with_capacity(64 + self.batches.len() * 360);
+        s.push_str("{\"scanned\":");
+        s.push_str(&self.scanned.to_string());
+        s.push_str(",\"batches\":[");
+        for (bi, b) in self.batches.iter().enumerate() {
+            if bi > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"caller\":\"");
+            s.push_str(&hex32(&b.caller));
+            s.push_str("\",\"total_reclaimed\":");
+            s.push_str(&b.total_reclaimed.to_string());
+            s.push_str(",\"actions\":[");
+            for (i, a) in b.actions.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str("{\"escrow_id\":\"");
+                s.push_str(&hex32(&a.escrow_id));
+                s.push_str("\",\"action\":\"close_vault\",\"caller\":\"");
+                s.push_str(&hex32(&a.caller));
+                s.push_str("\",\"caller_role\":\"");
+                s.push_str(a.caller_role);
+                s.push_str("\",\"rent_reclaimed\":");
+                s.push_str(&a.rent_reclaimed.to_string());
+                s.push_str(",\"reason\":\"");
+                s.push_str(a.reason);
+                s.push_str("\"}");
+            }
+            s.push_str("]}");
+        }
+        s.push_str("]}");
+        s
+    }
+}
+
+/// Scan `watched` and return every immediately executable `close_vault`
+/// call, grouped into per-caller batches. Pure read over the
+/// snapshots: zero side effects, deterministic output in input order.
+///
+/// The scan lists exactly the vaults AV-34's `close_vault` accepts —
+/// `Cancelled`, `Released`, `Settled` — and nothing else:
+///
+/// - `Disputed` is skipped: the chain rejects the close (the
+///   arbitration is still live, and the vault account is the audit
+///   surface the arbiter works from), so listing it would not be an
+///   *executable* call.
+/// - `Closed` is skipped: the rent deposit is already reclaimed and a
+///   second `close_vault` fails with `InvalidStateTransition`.
+/// - `Uninitialized` / `Funded` / `Activated` are skipped: their vault
+///   accounts have not served their purpose yet, and the close would
+///   fail the terminal-state gate.
+///
+/// The scan carries no `now`: closing has no time gate, so the list is
+/// valid until the vaults are closed and re-scanned.
+pub fn scan_closeable(watched: &[WatchedEscrow]) -> CloseReport {
+    // AV-40: `rent_reclaimed` is computed from the current
+    // `VAULT_SPACE` formula (via `vault_close_rent_reclaimed`), never
+    // hardcoded — the same figure `close_vault` returns on success.
+    let rent = vault_close_rent_reclaimed();
+    let mut batches: Vec<CloseBatch> = Vec::new();
+    for w in watched {
+        let e = &w.escrow;
+        // Mirror AV-34's terminal-state gate exactly: only the three
+        // states `close_vault` accepts contribute an action.
+        let reason = match e.state() {
+            EscrowState::Cancelled => "cancelled",
+            EscrowState::Released => "released",
+            EscrowState::Settled => "settled",
+            _ => continue,
+        };
+        let caller = e.initializer();
+        let action = CloseAction {
+            escrow_id: w.escrow_id,
+            // AV-34 restricts `close_vault` to the initializer —
+            // authority is checked before state validity — so the
+            // initializer is the canonical caller *and* the only key
+            // the chain accepts.
+            caller,
+            caller_role: "initializer",
+            rent_reclaimed: rent,
+            reason,
+        };
+        // Group per caller, batches in first-seen caller order.
+        match batches.iter_mut().find(|b| b.caller == caller) {
+            Some(batch) => {
+                batch.actions.push(action);
+                batch.total_reclaimed += rent;
+            }
+            None => batches.push(CloseBatch {
+                caller,
+                actions: vec![action],
+                total_reclaimed: rent,
+            }),
+        }
+    }
+    CloseReport {
+        scanned: watched.len(),
+        batches,
     }
 }
 
@@ -825,5 +1025,335 @@ mod keeper_tests {
             json.contains("\"amount\":500000,\"decimals\":6,\"display_amount\":\"0.500000\""),
             "claim display amount must serialize, got: {json}"
         );
+    }
+}
+
+#[cfg(test)]
+mod close_keeper_tests {
+    use super::*;
+    use crate::{
+        rent_exempt_minimum_lamports, MAINNET_EXEMPTION_THRESHOLD_YEARS,
+        MAINNET_LAMPORTS_PER_BYTE_YEAR, VAULT_SPACE,
+    };
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const CAROL: [u8; 32] = [0xCC; 32]; // second initializer (batch grouping)
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const ID1: [u8; 32] = [0x01; 32];
+    const ID2: [u8; 32] = [0x02; 32];
+    const ID3: [u8; 32] = [0x03; 32];
+    const ID4: [u8; 32] = [0x04; 32];
+    const AMOUNT: u64 = 1_000_000;
+    const MID: u64 = 1_750_000_000;
+    const NEVER: u64 = u64::MAX; // no timeout
+
+    fn watch(id: [u8; 32], escrow: Escrow) -> WatchedEscrow {
+        WatchedEscrow {
+            escrow_id: id,
+            escrow,
+        }
+    }
+
+    fn funded(initializer: [u8; 32]) -> Escrow {
+        let mut e = Escrow::initialize(initializer, BOB, AMOUNT, NEVER).unwrap();
+        e.fund(initializer).unwrap();
+        e
+    }
+
+    fn cancelled() -> Escrow {
+        let mut e = funded(ALICE);
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        e
+    }
+
+    fn released() -> Escrow {
+        let mut e = funded(ALICE);
+        e.release(ALICE, MID, AMOUNT, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        e
+    }
+
+    fn settled() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, MID, None).unwrap();
+        e.resolve(ARBITER, 400_000, None, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Settled);
+        e
+    }
+
+    fn closed() -> Escrow {
+        let mut e = released();
+        e.close_vault(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Closed);
+        e
+    }
+
+    fn disputed() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, MID, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        e
+    }
+
+    fn hex_of(byte: u8) -> String {
+        format!("{:02x}", byte).repeat(32)
+    }
+
+    #[test]
+    fn terminal_states_cancelled_released_settled_are_all_listed() {
+        // AV-34's terminal states are exactly the ones `close_vault`
+        // accepts — each contributes one closeable action.
+        let watched = [
+            watch(ID1, cancelled()),
+            watch(ID2, released()),
+            watch(ID3, settled()),
+        ];
+        let report = scan_closeable(&watched);
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.batches.len(), 1, "one caller: one batch");
+        let batch = &report.batches[0];
+        assert_eq!(batch.actions.len(), 3);
+        // Input order preserved.
+        assert_eq!(batch.actions[0].escrow_id, ID1);
+        assert_eq!(batch.actions[0].reason, "cancelled");
+        assert_eq!(batch.actions[1].escrow_id, ID2);
+        assert_eq!(batch.actions[1].reason, "released");
+        assert_eq!(batch.actions[2].escrow_id, ID3);
+        assert_eq!(batch.actions[2].reason, "settled");
+    }
+
+    #[test]
+    fn disputed_and_closed_are_skipped() {
+        // `Disputed`: the arbitration is still live and the vault
+        // account is the arbiter's audit surface — the chain rejects
+        // the close, so the keeper never lists it. `Closed`: the rent
+        // is already reclaimed and a second close would fail — the
+        // scan never lists a call the chain would reject.
+        let watched = [watch(ID1, disputed()), watch(ID2, closed())];
+        let report = scan_closeable(&watched);
+        assert!(report.is_empty(), "neither state is closeable");
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.to_json(), r#"{"scanned":2,"batches":[]}"#);
+    }
+
+    #[test]
+    fn non_terminal_states_are_skipped() {
+        // Uninitialized / Funded / Activated: the vault account has
+        // not served its purpose yet, and `close_vault` would fail the
+        // terminal-state gate — not executable, not listed.
+        let uninit = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER).unwrap();
+        // AV-12: a dual-signature escrow reaches `Activated` once both
+        // parties record their activation signatures.
+        let mut activated = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        let watched = [
+            watch(ID1, uninit),
+            watch(ID2, funded(ALICE)),
+            watch(ID3, activated),
+        ];
+        let report = scan_closeable(&watched);
+        assert!(report.is_empty());
+        assert_eq!(report.scanned, 3);
+    }
+
+    #[test]
+    fn initializer_is_the_canonical_caller() {
+        // AV-34 restricts `close_vault` to the initializer, checked
+        // before state validity — the report names the one key the
+        // chain will accept. Each escrow's own initializer signs for
+        // its vault.
+        let mut e = funded(CAROL);
+        e.cancel(CAROL, None, CAROL).unwrap();
+        let carol_escrow = e;
+        let watched = [watch(ID1, cancelled()), watch(ID2, carol_escrow)];
+        let report = scan_closeable(&watched);
+        assert_eq!(report.batches.len(), 2);
+        for batch in &report.batches {
+            for a in &batch.actions {
+                assert_eq!(a.caller, batch.caller);
+                assert_eq!(a.caller_role, "initializer");
+            }
+        }
+        assert_eq!(report.batches[0].caller, ALICE);
+        assert_eq!(report.batches[0].actions[0].caller, ALICE);
+        assert_eq!(report.batches[1].caller, CAROL);
+        assert_eq!(report.batches[1].actions[0].caller, CAROL);
+    }
+
+    #[test]
+    fn rent_reclaimed_matches_current_vault_space_formula() {
+        // AV-40: the estimate is computed from the CURRENT
+        // `VAULT_SPACE` formula — never a hardcoded figure. The layout
+        // has grown since earlier constants, so the test recomputes
+        // the rent-exempt minimum from the live `VAULT_SPACE` instead
+        // of pinning a stale number.
+        let expected = rent_exempt_minimum_lamports(
+            VAULT_SPACE,
+            MAINNET_LAMPORTS_PER_BYTE_YEAR,
+            MAINNET_EXEMPTION_THRESHOLD_YEARS,
+        );
+        assert_eq!(
+            vault_close_rent_reclaimed(),
+            expected,
+            "rent reclaimed must track the current VAULT_SPACE"
+        );
+        let watched = [watch(ID1, cancelled()), watch(ID2, settled())];
+        let report = scan_closeable(&watched);
+        for batch in &report.batches {
+            for a in &batch.actions {
+                assert_eq!(
+                    a.rent_reclaimed, expected,
+                    "listed reclaim must equal the VAULT_SPACE formula"
+                );
+            }
+            assert_eq!(
+                batch.total_reclaimed,
+                expected * batch.actions.len() as u64,
+                "batch total must equal the per-action sum"
+            );
+        }
+    }
+
+    #[test]
+    fn listed_rent_matches_close_vault_return() {
+        // Keeper/chain agreement: the scan's estimate equals what a
+        // real `close_vault` returns — the keeper never quotes a
+        // figure the chain would not actually transfer.
+        let escrows = [cancelled(), released(), settled()];
+        let watched = [
+            watch(ID1, escrows[0]),
+            watch(ID2, escrows[1]),
+            watch(ID3, escrows[2]),
+        ];
+        let report = scan_closeable(&watched);
+        let actions: Vec<&CloseAction> =
+            report.batches.iter().flat_map(|b| b.actions.iter()).collect();
+        assert_eq!(actions.len(), 3);
+        for (i, w) in watched.iter().enumerate() {
+            let mut probe = w.escrow;
+            let rent = probe.close_vault(w.escrow.initializer()).unwrap();
+            assert_eq!(
+                actions[i].rent_reclaimed, rent,
+                "keeper estimate disagrees with close_vault at index {i}"
+            );
+            assert_eq!(actions[i].caller, w.escrow.initializer());
+        }
+    }
+
+    #[test]
+    fn actions_grouped_per_caller_with_totals() {
+        // Two initializers share the watch list: the sweep groups per
+        // caller with a per-batch reclaimed total.
+        let rent = vault_close_rent_reclaimed();
+        let mut carol_cancelled = funded(CAROL);
+        carol_cancelled.cancel(CAROL, None, CAROL).unwrap();
+        let watched = [
+            watch(ID1, cancelled()),      // ALICE
+            watch(ID2, carol_cancelled),  // CAROL
+            watch(ID3, released()),       // ALICE
+            watch(ID4, funded(ALICE)),    // ALICE, but live: skipped
+        ];
+        let report = scan_closeable(&watched);
+        assert_eq!(report.scanned, 4);
+        assert_eq!(report.batches.len(), 2);
+        let (alice_batch, carol_batch) = (&report.batches[0], &report.batches[1]);
+        // Batches in first-seen caller order.
+        assert_eq!(alice_batch.caller, ALICE);
+        assert_eq!(carol_batch.caller, CAROL);
+        // Actions in input order within each batch.
+        assert_eq!(alice_batch.actions.len(), 2);
+        assert_eq!(alice_batch.actions[0].escrow_id, ID1);
+        assert_eq!(alice_batch.actions[1].escrow_id, ID3);
+        assert_eq!(carol_batch.actions.len(), 1);
+        assert_eq!(carol_batch.actions[0].escrow_id, ID2);
+        // Per-batch totals.
+        assert_eq!(alice_batch.total_reclaimed, 2 * rent);
+        assert_eq!(carol_batch.total_reclaimed, rent);
+        // Total invariant: the batch total is the sum of its actions.
+        for batch in &report.batches {
+            let sum: u64 = batch.actions.iter().map(|a| a.rent_reclaimed).sum();
+            assert_eq!(batch.total_reclaimed, sum);
+        }
+    }
+
+    #[test]
+    fn batch_order_follows_first_seen_caller() {
+        // Deterministic output: batch order is the callers' first
+        // appearance in the input, so a stable watch list gives a
+        // stable sweep list.
+        let mut carol_cancelled = funded(CAROL);
+        carol_cancelled.cancel(CAROL, None, CAROL).unwrap();
+        let watched = [watch(ID1, carol_cancelled), watch(ID2, cancelled())];
+        let report = scan_closeable(&watched);
+        assert_eq!(report.batches.len(), 2);
+        assert_eq!(report.batches[0].caller, CAROL);
+        assert_eq!(report.batches[1].caller, ALICE);
+    }
+
+    #[test]
+    fn scan_is_dry_run() {
+        // Zero side effects: the snapshots are bit-identical after
+        // the scan (WatchedEscrow is Copy + PartialEq, so exact).
+        let before = [
+            watch(ID1, cancelled()),
+            watch(ID2, disputed()),
+            watch(ID3, released()),
+            watch(ID4, settled()),
+        ];
+        let _report = scan_closeable(&before);
+        assert_eq!(
+            before,
+            [
+                watch(ID1, cancelled()),
+                watch(ID2, disputed()),
+                watch(ID3, released()),
+                watch(ID4, settled())
+            ]
+        );
+    }
+
+    #[test]
+    fn json_shape_is_pinned() {
+        // Deterministic serialization: fixed field order, 64-hex
+        // lowercase keys, batches in first-seen caller order, actions
+        // in input order.
+        let rent = vault_close_rent_reclaimed();
+        let watched = [watch(ID1, cancelled()), watch(ID2, released())];
+        let report = scan_closeable(&watched);
+        let expected = format!(
+            "{{\"scanned\":2,\"batches\":[{{\"caller\":\"{}\",\"total_reclaimed\":{},\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"close_vault\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"rent_reclaimed\":{},\"reason\":\"cancelled\"}},{{\"escrow_id\":\"{}\",\"action\":\"close_vault\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"rent_reclaimed\":{},\"reason\":\"released\"}}]}}]}}",
+            hex_of(0xAA),
+            2 * rent,
+            hex_of(0x01),
+            hex_of(0xAA),
+            rent,
+            hex_of(0x02),
+            hex_of(0xAA),
+            rent,
+        );
+        assert_eq!(report.to_json(), expected);
+    }
+
+    #[test]
+    fn empty_input_scans_to_empty_report() {
+        let report = scan_closeable(&[]);
+        assert!(report.is_empty());
+        assert_eq!(report.scanned, 0);
+        assert_eq!(report.to_json(), r#"{"scanned":0,"batches":[]}"#);
     }
 }
