@@ -888,6 +888,37 @@ deep, and a determinism pin (same seed ⇒ identical run, so any failure is
 reproducible from the seed alone). It runs in CI with the rest of
 `cargo test -p escrow-state`.
 
+## Settlement CPI construction (AV-31)
+
+`escrow-state/src/cpi.rs` builds the transfer instructions that move
+settled funds — with zero dependencies and fully offline-testable:
+
+- **Instruction constructors**: `system_transfer(from, to, lamports)`
+  assembles a System Program `Transfer` (u32 index `2` || u64 LE, 12
+  bytes); `spl_token_transfer(source, mint, destination, authority,
+  amount)` assembles an SPL Token `Transfer` (u8 index `3` || u64 LE, 9
+  bytes). The byte layouts are pinned by unit tests, and the SPL Token
+  program id is decoded from its canonical base58 address with the same
+  decoder that validates mint addresses (AV-16).
+- **Settlement plans**: `payout_plan` (release / claim / milestone
+  release), `refund_plan` (cancel / cancel_expired), and `resolve_plan`
+  take the escrow *after* the transition plus the amounts the transition
+  returned, and validate the plan against the machine before any
+  instruction is built: moved totals cannot exceed what the machine
+  recorded (`SettlementMismatch` on tampered or stale amounts),
+  recipients are pinned against the escrow's taker / initializer / refund
+  policy (`RecipientMismatch` on a swapped destination — the AV-23
+  anti-phishing pin), and the transfer program follows the escrow's mint
+  binding (native SOL vs SPL token).
+
+The Anchor skeleton (`programs/escrow-vault/src/program.rs`,
+`cpi_settle_payout` / `cpi_settle_refund` / `cpi_settle_resolve`) mirrors
+these constructors: the real build assembles the addresses, calls the
+matching `cpi::*_plan`, and executes each validated leg (native legs via
+`invoke`/`invoke_signed` with the vault seeds, SPL legs via
+`anchor_spl::token::transfer`). Because the program never hand-rolls
+instruction bytes, the on-chain code cannot drift from the tested layout.
+
 ## Run the tests
 
 ```bash

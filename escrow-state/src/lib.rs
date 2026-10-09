@@ -8,10 +8,21 @@
 mod events;
 mod keeper;
 mod snapshot;
+mod cpi;
 #[cfg(test)]
 mod idl_json;
 #[cfg(test)]
 mod sim;
+
+// AV-31: off-chain CPI transfer instruction construction — byte-exact
+// System Program / SPL Token transfer builders plus settlement plans
+// that validate amounts and recipients against the state machine's
+// transition results before anything is submitted on-chain.
+pub use cpi::{
+    payout_plan, refund_plan, resolve_plan, spl_token_program_id, spl_token_transfer,
+    system_program_id, system_transfer, AccountMeta, CpiError, PayoutAddrs, PayoutKind,
+    Pubkey, RefundAddrs, RefundKind, ResolveAddrs, SettlementPlan, TransferInstruction,
+};
 
 // AV-18: typed indexer events — an event-logging adapter over `Escrow`
 // plus the `EscrowEvent` / `EscrowEventKind` / `EventAmounts` record

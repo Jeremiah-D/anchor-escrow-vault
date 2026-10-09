@@ -123,9 +123,11 @@ pub mod escrow_vault {
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
-        // Transfer of `payout` lamports/tokens to `ctx.accounts.taker`
-        // and `fee` to the protocol fee account goes here once real
-        // token accounts are wired up.
+        // AV-31: settle via `cpi_settle_payout` (`PayoutKind::Release`) —
+        // the transfer instruction bytes are built and validated by
+        // `escrow_state::cpi::payout_plan` (amounts/recipients pinned
+        // against the state machine); the real build executes the
+        // validated plan once the token accounts are wired up.
         // AV-18: `payout + fee` is the gross amount (== the `amount`
         // param); partial releases carry from == to == Funded, the
         // closing one to == Released.
@@ -163,6 +165,11 @@ pub mod escrow_vault {
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-31: settle via `cpi_settle_refund` (`RefundKind::Cancel`) —
+        // `escrow_state::cpi::refund_plan` builds and validates the
+        // refund transfer bytes against the AV-23-pinned `refund_to`;
+        // the real build executes the validated plan once the token
+        // accounts are wired up.
         // AV-18: the refund is the remainder after any partial releases.
         emit_transition(
             &ctx.accounts.vault,
@@ -209,11 +216,12 @@ pub mod escrow_vault {
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
-        // Refund of lamports/tokens to the initializer goes here
-        // once real token accounts are wired up. AV-24: `refund` goes to
-        // `accounts.refund_to`; `penalty` (non-zero only on a
-        // taker-initiated cancel) is a second transfer to the
-        // initializer — the griefing compensation.
+        // AV-31: settle via `cpi_settle_refund` (`RefundKind::CancelExpired`) —
+        // `escrow_state::cpi::refund_plan` builds and validates the
+        // transfer bytes: `refund` to the AV-23-pinned `refund_to`,
+        // `penalty` (non-zero only on a taker-initiated cancel, AV-24)
+        // to the initializer. The real build executes the validated
+        // plan once the token accounts are wired up.
         // AV-18: `now` doubles as the event's `at`, mirroring
         // `IndexedEscrow::cancel_expired`. The real build's
         // `EscrowVaultEvent` gains a `penalty` amounts field mirroring
@@ -416,9 +424,9 @@ pub mod escrow_vault {
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
-        // Transfer of `payout` lamports/tokens to `ctx.accounts.taker`
-        // and `fee` to the protocol fee account goes here once real
-        // token accounts are wired up.
+        // AV-31: settle via `cpi_settle_payout` (`PayoutKind::Claim`) —
+        // see `release`: `escrow_state::cpi::payout_plan` builds and
+        // validates the transfer bytes, the real build executes them.
         // AV-18: `payout + fee` is the gross claimable; `now` doubles as
         // the event's `at`, mirroring `IndexedEscrow::claim`.
         emit_transition(
@@ -512,10 +520,11 @@ pub mod escrow_vault {
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
-        // Transfer of `payout` to `ctx.accounts.taker`, `fee` to the
-        // protocol fee account, and `refund` to
-        // `ctx.accounts.initializer` goes here once real token accounts
-        // are wired up.
+        // AV-31: settle via `cpi_settle_resolve` —
+        // `escrow_state::cpi::resolve_plan` builds and validates the
+        // three-leg transfer bytes (taker payout / protocol fee /
+        // initializer refund); the real build executes the validated
+        // plan once the token accounts are wired up.
         // AV-18: `taker_amount` is the gross taker share
         // (`payout + fee`); the refund is never fee'd.
         // AV-22: the Resolved event carries the dispute evidence hash
@@ -615,9 +624,8 @@ pub mod escrow_vault {
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
-        // Transfer of `payout` lamports/tokens to `ctx.accounts.taker`
-        // and `fee` to the protocol fee account goes here once real
-        // token accounts are wired up.
+        // AV-31: settle via `cpi_settle_payout`
+        // (`PayoutKind::MilestoneRelease`) — see `release`.
         // AV-18: `payout + fee` is the gross tranche; the final tranche
         // carries to == Released.
         emit_transition(
@@ -1471,8 +1479,87 @@ fn read_event_seq(_vault: &Account<Vault>) -> u64 {
     unimplemented!("read the vault's persisted event_seq in the real build")
 }
 
-fn escrow_error(e: escrow_state::EscrowError) -> Error {
-    // One program error per EscrowError variant, so on-chain failures
+/// AV-31: settlement CPI wiring (reference — not compiled by CI).
+///
+/// The fund-moving instructions (`release`, `claim`, `release_milestone`,
+/// `cancel`, `cancel_expired`, `resolve`) compute amounts through the
+/// pure-logic state machine and then move lamports/tokens with CPI calls.
+/// The transfer *instruction bytes* are constructed and validated off-chain
+/// by `escrow_state::cpi` (zero dependencies, fully unit-tested):
+///
+/// - `cpi::system_transfer` / `cpi::spl_token_transfer` assemble the exact
+///   account metas and data bytes (System `Transfer` = u32 index 2 ||
+///   u64 LE; SPL Token `Transfer` = u8 index 3 || u64 LE);
+/// - `cpi::payout_plan` / `cpi::refund_plan` / `cpi::resolve_plan` take the
+///   escrow *after* the transition plus the amounts the transition
+///   returned, and reject tampered amounts (`SettlementMismatch`) and
+///   swapped recipients (`RecipientMismatch`) before any instruction is
+///   built.
+///
+/// The real build only *executes* a validated plan:
+/// 1. assemble the `*Addrs` from the instruction's accounts (vault PDA /
+///    vault token account as `source`, vault PDA as `vault_authority`,
+///    taker/initializer/refund/fee accounts as the legs);
+/// 2. call the matching `cpi::*_plan` — a `CpiError` maps to the program
+///    error below and aborts before any lamport moves;
+/// 3. execute each `TransferInstruction`: native-SOL legs via
+///    `solana_program::program::invoke` against the System Program (the
+///    vault PDA signs through `invoke_signed` with the vault seeds), SPL
+///    legs via `anchor_spl::token::transfer` CPI.
+///
+/// Because the program never hand-rolls instruction bytes, the on-chain
+/// code cannot drift from the byte layout pinned by the `escrow-state`
+/// unit tests; the IDL mapping tests pin which instruction maps to which
+/// plan kind.
+fn cpi_settle_payout(
+    _vault: &Account<Vault>,
+    _escrow: &escrow_state::Escrow,
+    _kind: escrow_state::PayoutKind,
+    _payout: u64,
+    _fee: u64,
+) {
+    unimplemented!(
+        "real build: escrow_state::cpi::payout_plan, then one CPI per leg \
+         (invoke/invoke_signed for native SOL, anchor_spl::token::transfer for SPL)"
+    )
+}
+
+/// AV-31: reference wiring for `cancel` / `cancel_expired` settlements.
+/// See [`cpi_settle_payout`] for the build-then-execute flow; the plan
+/// kind is `cpi::RefundKind::Cancel` / `CancelExpired`, the refund leg
+/// targets the AV-23-pinned `refund_to`, and the penalty leg (taker-
+/// initiated expiry cancels only, AV-24) targets the initializer.
+fn cpi_settle_refund(
+    _vault: &Account<Vault>,
+    _escrow: &escrow_state::Escrow,
+    _kind: escrow_state::RefundKind,
+    _refund: u64,
+    _penalty: u64,
+) {
+    unimplemented!(
+        "real build: escrow_state::cpi::refund_plan, then one CPI per leg \
+         (invoke/invoke_signed for native SOL, anchor_spl::token::transfer for SPL)"
+    )
+}
+
+/// AV-31: reference wiring for the `resolve` three-way split. The plan
+/// kind is implicit (resolve is the only three-leg settlement): taker
+/// payout leg, protocol-fee leg, initializer-refund leg — see
+/// [`cpi_settle_payout`] for the build-then-execute flow.
+fn cpi_settle_resolve(
+    _vault: &Account<Vault>,
+    _escrow: &escrow_state::Escrow,
+    _taker_payout: u64,
+    _fee: u64,
+    _refund: u64,
+) {
+    unimplemented!(
+        "real build: escrow_state::cpi::resolve_plan, then one CPI per leg \
+         (invoke/invoke_signed for native SOL, anchor_spl::token::transfer for SPL)"
+    )
+}
+
+fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error per EscrowError variant, so on-chain failures
     // surface the exact `escrow_state` reason (code 100–118) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
