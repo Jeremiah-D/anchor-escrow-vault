@@ -64,6 +64,14 @@
       ]
     },
     {
+      "name": "update_attestors",
+      "discriminator": [39, 65, 233, 198, 170, 184, 251, 35],
+      "accounts": [],
+      "args": [
+        {"name": "attestors", "type": {"vec": "publicKey"}}
+      ]
+    },
+    {
       "name": "initialize_dual_sig",
       "discriminator": [35, 138, 15, 52, 181, 161, 70, 198],
       "accounts": [],

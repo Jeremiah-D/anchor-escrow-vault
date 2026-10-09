@@ -77,6 +77,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
 | `update_quorum(initializer, taker, threshold)` | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance); `0` or `> registered` is `InvalidQuorum` |
+| `update_attestors(initializer, taker, attestors)` | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance; no party can unilaterally reshape the electorate); empty set / `> 8` / duplicates / new set smaller than the unchanged threshold is `InvalidQuorum`; approval bits remap by pubkey (retained votes survive, removed voters' bits cleared); emits `AttestorsUpdated` on a real set change, nothing on a no-op |
 | `activate(authority)`                       | `Uninitialized`| `Uninitialized` (one party) / `Activated` (both parties) | initializer **or** taker (dual-sig escrows only) |
 | `initialize_vesting(start, end)`            | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `start < end`) |
 | `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise) |
@@ -193,6 +194,29 @@ at or below the current approval count, `release` becomes legal
 immediately — that is the intended unlock. `0`, above the registered
 count, or no quorum configured is `InvalidQuorum`; the change emits a
 `QuorumUpdated` indexer event (no-op re-affirmations emit nothing).
+
+**Attestor set governance (dual-signed).** The quorum's *electorate*
+moves by the same dual-signed mechanism: `update_attestors(initializer,
+taker, attestors)` replaces the registered attestor set on an
+`Uninitialized` or `Funded` escrow, when both parties agree. A
+registered attestor can go rogue (a compromised oracle key) or dark —
+without this, its vote or veto would outlive its trustworthiness
+forever. One party alone gets `Unauthorized`: swapping the electorate
+for sockpuppets would be a unilateral weakening of the release gate,
+so the set can only be reshaped by mutual agreement, exactly like the
+AV-25 threshold move. The attestor array is a fixed 8-slot reservation,
+so add/remove compacts into the slots in place — the account layout
+never changes, rent is untouched. Recorded votes follow their pubkeys,
+not their slots: approval bits remap to the new indices, so a retained
+attestor keeps its vote and a removed attestor's bit is cleared (a
+stale bit would otherwise be misattributed to whatever key lands in the
+compacted slot, crediting the wrong voter). The threshold is unchanged
+by a set swap — if the old threshold no longer fits the new set size
+that is `InvalidQuorum`, so shrink the threshold first (AV-25) and then
+the set. Empty sets, more than 8 keys, and duplicates are `InvalidQuorum`
+too. Passing the identical set succeeds as a no-op; a real set change
+emits an `AttestorsUpdated` indexer event (no-op updates emit nothing,
+mirroring `update_quorum`).
 
 **Dual-signature activation (multisig escrow).** An escrow can require
 *two* signatures to activate (`with_dual_sig`, opt-in on `Uninitialized`,
@@ -637,7 +661,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `Attested`, `QuorumUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `VaultClosed` |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `VaultClosed` |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -659,6 +683,12 @@ successful calls that change nothing observable:
   event is the ordering signal that the release gate moved, the new
   threshold is read from the vault; a no-op re-affirmation emits
   nothing.
+- `update_attestors` emits `AttestorsUpdated` when the attestor set
+  actually changes (`from == to ==` the current state, all amounts
+  zero) — the ordering signal that the release gate's electorate
+  changed, the new set is read from the vault (approval bits are
+  remapped by pubkey: retained votes survive, removed voters' bits are
+  cleared); a no-op same-set update emits nothing.
 - `confirm_milestone` emits when the milestone becomes fully confirmed
   (the completing vote); the first party's confirmation alone emits
   nothing, paralleling `activate`.

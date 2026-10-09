@@ -43,6 +43,14 @@
 //!   the vault (paralleling `Attested`, which likewise does not carry
 //!   the vote itself). A no-op update (same threshold) emits nothing,
 //!   paralleling `attest`'s idempotent duplicates.
+//! - `update_attestors` emits [`EscrowEventKind::AttestorsUpdated`] when
+//!   the attestor set actually changes (AV-39) — `from == to ==` the
+//!   current state, all amounts zero: the event is the ordering signal
+//!   that the release gate's electorate changed, and the indexer reads
+//!   the new set from the vault (approval bits are remapped by pubkey,
+//!   so a retained attestor's vote survives; a removed attestor's bit
+//!   is cleared). A no-op update (the identical set, same order) emits
+//!   nothing, paralleling `update_quorum`'s no-op rule.
 //! - Partial `release` / `claim` calls emit [`EscrowEventKind::Released`]
 //!   / [`EscrowEventKind::Claimed`] with `from == to == Funded`: the
 //!   `EscrowState` variant does not change, but funds moved and the
@@ -87,7 +95,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, ReentryRejected (AV-36) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, ReentryRejected (AV-36) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
@@ -131,6 +139,12 @@ pub enum EscrowEventKind {
     /// current state; the new threshold is read from the vault, the
     /// event is the ordering signal.
     QuorumUpdated,
+    /// AV-39: the quorum's attestor set changed by dual-signed
+    /// governance ([`Escrow::update_attestors`]). `from == to ==` the
+    /// current state; the new set is read from the vault, the event is
+    /// the ordering signal. A no-op same-set update emits nothing
+    /// (paralleling [`EscrowEventKind::QuorumUpdated`]'s no-op rule).
+    AttestorsUpdated,
     /// AV-34: the vault account was closed by the initializer and its
     /// rent-exempt deposit reclaimed ([`Escrow::close_vault`]).
     /// `from` is the terminal state the escrow was in (`Cancelled`,
@@ -780,6 +794,55 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Replace the quorum's attestor set by dual-signed governance
+    /// (mirrors [`Escrow::update_attestors`]). Emits `AttestorsUpdated`
+    /// when the set actually changes; a no-op update (the identical
+    /// set, same order) emits nothing — paralleling `update_quorum`'s
+    /// no-op rule. `from == to ==` the current state: the electorate,
+    /// not the lifecycle state, is what changed. `at` is the
+    /// caller-supplied timestamp (on-chain: the clock sysvar).
+    pub fn update_attestors(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_attestors: &[[u8; 32]],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before: Vec<[u8; 32]> = self
+            .inner
+            .quorum()
+            .map(|q| q.attestors().to_vec())
+            .unwrap_or_default();
+        self.inner
+            .update_attestors(initializer, taker, new_attestors)?;
+        let after: Vec<[u8; 32]> = self
+            .inner
+            .quorum()
+            .map(|q| q.attestors().to_vec())
+            .unwrap_or_default();
+        // The inner call succeeds with a configured quorum or fails (no
+        // quorum / bad set / wrong authority / bad state), so a changed
+        // set here always means real governance. Order matters to the
+        // bitmask (votes remap by pubkey), so a pure reorder of the same
+        // keys still counts as a change: the canonical slot order is
+        // part of the configuration.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::AttestorsUpdated,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+
+            None,
+            );
+        }
+        Ok(())
+    }
+
     /// Claim the vested-but-unreleased portion (mirrors [`Escrow::claim`]).
     /// Emits `Claimed`; `now` doubles as the event's `at`. Partial
     /// claims carry `from == to == Funded`, the closing one
@@ -1039,6 +1102,7 @@ mod event_tests {
     const MALLORY: [u8; 32] = [0xCC; 32];
     const ATTESTOR_1: [u8; 32] = [0xA1; 32];
     const ATTESTOR_2: [u8; 32] = [0xA2; 32];
+    const ATTESTOR_3: [u8; 32] = [0xA3; 32];
     const ARBITER: [u8; 32] = [0xA8; 32];
     const ESCROW_ID: [u8; 32] = [0x1D; 32];
     const EXPIRES_AT: u64 = 1_800_000_000;
@@ -1614,6 +1678,65 @@ mod event_tests {
         e.fund(ALICE, T0 + 1).unwrap();
         assert_eq!(
             e.update_quorum(ALICE, MALLORY, 1, T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert!(e.drain_events().len() == 2, "failed update emitted an event");
+    }
+
+    #[test]
+    fn update_attestors_emits_governance_event() {
+        // AV-39: a real set change emits AttestorsUpdated with
+        // from == to == the current state and zero amounts — the event
+        // is the ordering signal, the new set is read from the vault.
+        // ATTESTOR_1's vote is dropped with ATTESTOR_1; ATTESTOR_2's
+        // vote remaps to its new slot.
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 1).unwrap();
+        let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
+        e.attest(ATTESTOR_1, T0 + 1).unwrap();
+        e.fund(ALICE, T0 + 2).unwrap();
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_2, ATTESTOR_3], T0 + 3)
+            .unwrap();
+        assert_event(
+            &last(&e),
+            EscrowEventKind::AttestorsUpdated,
+            3,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            0,
+            0,
+            0,
+            T0 + 3,
+        );
+        // The removed voter's bit is gone at the wrapper level too:
+        // quorum progress recomputed from the retained (voteless)
+        // set, so the 1-of-2 is no longer satisfied.
+        assert!(!e.inner().quorum().unwrap().is_satisfied());
+    }
+
+    #[test]
+    fn update_attestors_noop_emits_nothing() {
+        // The identical set in the identical order: the state machine
+        // succeeds but nothing observable changed, so no event —
+        // paralleling `update_quorum`'s no-op rule.
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        assert_eq!(e.event_count(), 2);
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_2], T0 + 2)
+            .unwrap();
+        assert_eq!(e.event_count(), 2);
+        assert_eq!(e.next_seq(), 2);
+    }
+
+    #[test]
+    fn failed_update_attestors_emits_nothing() {
+        // One party alone is Unauthorized: the failed governance call
+        // emits no event and the set is untouched.
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        assert_eq!(
+            e.update_attestors(ALICE, MALLORY, &[ATTESTOR_1], T0 + 2),
             Err(EscrowError::Unauthorized)
         );
         assert!(e.drain_events().len() == 2, "failed update emitted an event");

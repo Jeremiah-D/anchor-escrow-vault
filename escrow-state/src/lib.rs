@@ -744,6 +744,13 @@ impl QuorumPolicy {
     pub fn registered_count(&self) -> u8 {
         self.registered
     }
+
+    /// The registered attestor keys, in slot order. The fixed 8-slot
+    /// array stays internal; this exposes only the populated prefix, in
+    /// the order votes map onto the approval bitmask.
+    pub fn attestors(&self) -> &[[u8; 32]] {
+        &self.attestors[..self.registered as usize]
+    }
 }
 
 /// Linear vesting schedule (AV-13): the locked [`Escrow::amount`] unlocks
@@ -1591,6 +1598,75 @@ impl Escrow {
             return Err(EscrowError::InvalidQuorum);
         }
         policy.threshold = new_threshold;
+        Ok(())
+    }
+
+    /// Replace the quorum's attestor set by mutual agreement (AV-39 —
+    /// Solana quorum governance): both the initializer and the taker
+    /// must authorize the change (dual-signature governance, reusing
+    /// the AV-12 / AV-25 concept), on an escrow that is `Uninitialized`
+    /// or `Funded`.
+    ///
+    /// Why: the attestor set is fixed before funding
+    /// ([`Escrow::with_quorum`]), but a registered attestor can go rogue
+    /// or dark — a compromised oracle key still holding a vote would
+    /// otherwise keep its veto over the release gate forever. One party
+    /// alone cannot reshape the electorate: swapping the set for
+    /// sockpuppets would be a unilateral weakening of the gate, so the
+    /// change needs both parties, exactly like AV-25's threshold move.
+    ///
+    /// The attestor array is a fixed 8-slot reservation (AV-04), so
+    /// add/remove compacts into the slots with no layout change (the
+    /// account needs no realloc, rent is untouched). Recorded votes
+    /// follow their pubkeys, not their slots: approval bits are remapped
+    /// to the new indices, so a retained attestor keeps its vote and a
+    /// removed attestor's bit is cleared (dropping it would misattribute
+    /// a stale vote to a different attestor after compaction). The
+    /// threshold is unchanged — if the old threshold no longer fits the
+    /// new set size, that is `InvalidQuorum` (shrink the set and the
+    /// threshold together with AV-25 first). Passing the identical set
+    /// succeeds as a no-op.
+    ///
+    /// Check order is deliberate: authority (both parties) first, then
+    /// state, then quorum configuration, then set validity — mirroring
+    /// [`Escrow::update_quorum`], so a stranger learns nothing about the
+    /// quorum from the error alone.
+    pub fn update_attestors(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_attestors: &[[u8; 32]],
+    ) -> Result<(), EscrowError> {
+        // Both parties must sign: either key alone (or a stranger) is
+        // Unauthorized. Independent `==` checks (not `||`): the
+        // degenerate initializer == taker self-escrow authorizes with
+        // one key passed twice, like AV-12's activation.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let old = self.quorum.as_ref().ok_or(EscrowError::InvalidQuorum)?;
+        // Validate through `QuorumPolicy::new` so the set rules stay in
+        // one place: empty, longer than `MAX_ATTESTORS`, duplicate
+        // attestor, or a threshold that no longer fits the new set size
+        // are all `InvalidQuorum` (the threshold here is the *old* one —
+        // this call never moves it).
+        let mut new_policy = QuorumPolicy::new(new_attestors, old.threshold)?;
+        // Remap approval bits by pubkey: retained attestors keep their
+        // votes at the new indices, removed ones lose theirs. Without
+        // this the bits would still point at the old slots and a
+        // compacted set would misattribute a stale vote.
+        for (new_i, attestor) in new_attestors.iter().enumerate() {
+            if let Some(old_i) = old.index_of(*attestor) {
+                if old.approvals & (1u64 << old_i) != 0 {
+                    new_policy.approvals |= 1u64 << new_i;
+                }
+            }
+        }
+        self.quorum = Some(new_policy);
         Ok(())
     }
 
@@ -4293,6 +4369,7 @@ pub(crate) mod anchor_idl_tests {
     const MALLORY: [u8; 32] = [0xCC; 32];
     const ATTESTOR_1: [u8; 32] = [0xA1; 32];
     const ATTESTOR_2: [u8; 32] = [0xA2; 32];
+    const ATTESTOR_3: [u8; 32] = [0xA3; 32];
     const EXPIRES_AT: u64 = 1_800_000_000;
 
     /// One IDL instruction and how it maps onto the state machine.
@@ -4434,6 +4511,32 @@ pub(crate) mod anchor_idl_tests {
                             moves, in place, so the account needs no \
                             realloc; lowering an unreachable threshold \
                             restores liveness when attestors go dark",
+        },
+        InstructionSpec {
+            // AV-39: dual-signed attestor set governance.
+            name: "update_attestors",
+            params: &[(
+                "attestors",
+                "Vec<Pubkey>",
+                "instruction param; the new attestor set (1-8 keys, no duplicates)",
+            )],
+            method: "Escrow::update_attestors",
+            input_mapping: "authority <- accounts.initializer AND \
+                            accounts.taker (BOTH signers — dual-signature \
+                            governance; one party alone is Unauthorized, \
+                            so no party can unilaterally reshape the \
+                            electorate); attestors <- param (Pubkey -> \
+                            [u8; 32] conversion); Uninitialized or Funded \
+                            only; no quorum configured, an empty set, > 8 \
+                            keys, a duplicate, or a new set smaller than \
+                            the unchanged threshold is InvalidQuorum; the \
+                            set compacts into the reserved 8 slots in \
+                            place (no layout change, no realloc); approval \
+                            bits remap by pubkey — retained attestors \
+                            keep their votes, removed ones lose theirs; a \
+                            no-op same-set update succeeds silently \
+                            (AttestorsUpdated indexer event only fires on \
+                            a real set change)",
         },
         InstructionSpec {
             // AV-12: dual-signature activation.
@@ -4811,6 +4914,16 @@ pub(crate) mod anchor_idl_tests {
         e
     }
 
+    fn quorum_3_of_3_funded_escrow() -> Escrow {
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], 3).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
     // ----- the consistency check -----
 
     #[test]
@@ -4827,6 +4940,7 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::cancel_expired",
             "QuorumPolicy::new + Escrow::with_quorum",
             "Escrow::update_quorum",
+            "Escrow::update_attestors",
             "Escrow::with_dual_sig",
             "Escrow::activate",
             "VestingSchedule::new + Escrow::with_vesting",
@@ -4870,7 +4984,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_twenty_instructions_take_params() {
+    fn only_twenty_one_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -4886,6 +5000,7 @@ pub(crate) mod anchor_idl_tests {
                 &"release_via_cpi",
                 &"initialize_quorum",
                 &"update_quorum",
+                &"update_attestors",
                 &"initialize_vesting",
                 &"initialize_arbiter",
                 &"escalate",
@@ -5229,6 +5344,249 @@ pub(crate) mod anchor_idl_tests {
             e.update_quorum(ALICE, BOB, 1),
             Err(EscrowError::InvalidStateTransition)
         );
+    }
+
+    #[test]
+    fn update_attestors_maps_dual_signers_and_attestor_set_param() {
+        // IDL: update_attestors(attestors: Vec<Pubkey>). The program
+        // passes accounts.initializer and accounts.taker (BOTH signers)
+        // plus the param (Pubkey -> [u8; 32]), then
+        // Escrow::update_attestors.
+        let mut e = quorum_funded_escrow();
+        // Both parties sign: the set compacts into the reserved slots
+        // (remove ATTESTOR_2, add ATTESTOR_3 — no layout change).
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_3])
+            .unwrap();
+        assert_eq!(
+            e.quorum().unwrap().attestors(),
+            &[ATTESTOR_1, ATTESTOR_3]
+        );
+        assert_eq!(e.quorum().unwrap().registered_count(), 2);
+        // The threshold is untouched by a set swap.
+        assert_eq!(e.quorum().unwrap().threshold(), 2);
+        // One party alone is Unauthorized — the electorate cannot be
+        // reshaped unilaterally. A stranger learns nothing either.
+        assert_eq!(
+            e.update_attestors(ALICE, MALLORY, &[ATTESTOR_1]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.update_attestors(MALLORY, BOB, &[ATTESTOR_1]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.quorum().unwrap().attestors(),
+            &[ATTESTOR_1, ATTESTOR_3],
+            "failed update keeps the set"
+        );
+    }
+
+    #[test]
+    fn update_attestors_authorizes_degenerate_self_escrow() {
+        // initializer == taker: one key passed twice authorizes, like
+        // AV-12's activation and AV-25's threshold move. The independent
+        // `==` checks (not `||`) make the degenerate case work without
+        // letting a stranger in.
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 1).unwrap();
+        let mut e = Escrow::initialize(ALICE, ALICE, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.update_attestors(ALICE, ALICE, &[ATTESTOR_1]).unwrap();
+        assert_eq!(e.quorum().unwrap().attestors(), &[ATTESTOR_1]);
+    }
+
+    #[test]
+    fn update_attestors_state_gating() {
+        // Uninitialized and Funded are the only legal states.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 1).unwrap())
+            .unwrap();
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_1]).unwrap();
+        assert_eq!(e.quorum().unwrap().registered_count(), 1);
+
+        // Released is terminal: locked out.
+        let mut e = quorum_funded_escrow();
+        e.attest(ATTESTOR_1).unwrap();
+        e.attest(ATTESTOR_2).unwrap();
+        e.release(ALICE, EXPIRES_AT - 1, 1_000_000, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.update_attestors(ALICE, BOB, &[ATTESTOR_1]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+
+        // Cancelled is terminal: locked out.
+        let mut e = quorum_funded_escrow();
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(
+            e.update_attestors(ALICE, BOB, &[ATTESTOR_1]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+
+        // Disputed is locked out: the electorate is frozen while the
+        // arbiter decides, so neither party can reshape the gate
+        // mid-arbitration.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap())
+            .unwrap()
+            .with_arbiter([0xA9; 32])
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, 1, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(
+            e.update_attestors(ALICE, BOB, &[ATTESTOR_1]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+
+        // Closed is terminal: locked out.
+        let mut e = quorum_funded_escrow();
+        e.cancel(ALICE, None, ALICE).unwrap();
+        e.close_vault(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Closed);
+        assert_eq!(
+            e.update_attestors(ALICE, BOB, &[ATTESTOR_1]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn update_attestors_config_validation() {
+        let mut e = quorum_funded_escrow();
+        // No quorum configured.
+        let mut plain = funded_escrow();
+        assert_eq!(
+            plain.update_attestors(ALICE, BOB, &[ATTESTOR_1]),
+            Err(EscrowError::InvalidQuorum)
+        );
+        // Empty set.
+        assert_eq!(
+            e.update_attestors(ALICE, BOB, &[]),
+            Err(EscrowError::InvalidQuorum)
+        );
+        // Duplicates.
+        assert_eq!(
+            e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_1]),
+            Err(EscrowError::InvalidQuorum)
+        );
+        // More than MAX_ATTESTORS.
+        let nine: [[u8; 32]; 9] = std::array::from_fn(|i| [i as u8; 32]);
+        assert_eq!(
+            e.update_attestors(ALICE, BOB, &nine),
+            Err(EscrowError::InvalidQuorum)
+        );
+        // Exactly MAX_ATTESTORS is fine.
+        let eight: [[u8; 32]; 8] = std::array::from_fn(|i| [0xB0 + i as u8; 32]);
+        e.update_attestors(ALICE, BOB, &eight).unwrap();
+        assert_eq!(e.quorum().unwrap().registered_count(), 8);
+        // New set smaller than the unchanged threshold.
+        let mut e = quorum_funded_escrow(); // 2-of-2
+        assert_eq!(
+            e.update_attestors(ALICE, BOB, &[ATTESTOR_1]),
+            Err(EscrowError::InvalidQuorum)
+        );
+        // Shrink the threshold first (AV-25), then the set fits.
+        e.update_quorum(ALICE, BOB, 1).unwrap();
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_1]).unwrap();
+        assert_eq!(e.quorum().unwrap().attestors(), &[ATTESTOR_1]);
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+        // Failed updates leave the set untouched.
+        assert_eq!(
+            e.quorum().unwrap().registered_count(),
+            1,
+            "failed updates must not disturb the set"
+        );
+    }
+
+    #[test]
+    fn update_attestors_remaps_approval_bits_by_pubkey() {
+        // 3-of-3, two votes recorded (ATTESTOR_2 at slot 1,
+        // ATTESTOR_3 at slot 2) — quorum not yet satisfied. Replace
+        // the set: drop ATTESTOR_1 and ATTESTOR_2, add two fresh keys.
+        // Votes follow pubkeys, not slots.
+        let mut e = quorum_3_of_3_funded_escrow();
+        e.attest(ATTESTOR_2).unwrap();
+        e.attest(ATTESTOR_3).unwrap();
+        assert_eq!(e.quorum().unwrap().approval_count(), 2);
+        assert!(!e.quorum().unwrap().is_satisfied());
+        let fresh_1: [u8; 32] = [0xF1; 32];
+        let fresh_2: [u8; 32] = [0xF2; 32];
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_3, fresh_1, fresh_2])
+            .unwrap();
+        let q = e.quorum().unwrap();
+        assert_eq!(q.attestors(), &[ATTESTOR_3, fresh_1, fresh_2]);
+        // ATTESTOR_3's vote remapped from old slot 2 to new slot 0;
+        // ATTESTOR_2's vote is gone with ATTESTOR_2. Threshold
+        // unchanged at 3, so quorum progress recomputes from the one
+        // retained vote: still not satisfied.
+        assert_eq!(q.approval_count(), 1);
+        assert!(!q.is_satisfied());
+        assert_eq!(q.threshold(), 3);
+        // The surviving vote is ATTESTOR_3's at its new index: a
+        // re-attest is idempotent (count does not move), which proves
+        // the remapped bit sits where `attest` looks.
+        e.attest(ATTESTOR_3).unwrap();
+        assert_eq!(e.quorum().unwrap().approval_count(), 1);
+        // The two fresh keys can still vote (their bits were clear);
+        // once both vote, the retained vote plus the two new ones
+        // satisfy the 3-of-3 again — quorum progress recomputed from
+        // retained attestors, not from stale bits.
+        e.attest(fresh_1).unwrap();
+        e.attest(fresh_2).unwrap();
+        let q = e.quorum().unwrap();
+        assert_eq!(q.approval_count(), 3);
+        assert!(q.is_satisfied());
+        // The remapped vote is real: release is now legal.
+        e.release(ALICE, EXPIRES_AT - 1, 1_000_000, None).unwrap();
+    }
+
+    #[test]
+    fn update_attestors_clears_removed_voter_bit() {
+        // Removing a voted attestor clears its approval bit — keeping
+        // the bit would misattribute the stale vote to whatever key
+        // lands in the compacted slot.
+        let mut e = quorum_funded_escrow(); // 2-of-2
+        e.attest(ATTESTOR_1).unwrap();
+        assert_eq!(e.quorum().unwrap().approval_count(), 1);
+        e.update_quorum(ALICE, BOB, 1).unwrap(); // shrink threshold to fit
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_2]).unwrap();
+        let q = e.quorum().unwrap();
+        assert_eq!(q.attestors(), &[ATTESTOR_2]);
+        assert_eq!(q.approval_count(), 0);
+        assert!(!q.is_satisfied());
+    }
+
+    #[test]
+    fn update_attestors_noop_same_set_succeeds() {
+        // The identical set in the identical order: success, set and
+        // votes byte-identical afterwards.
+        let mut e = quorum_funded_escrow();
+        e.attest(ATTESTOR_1).unwrap();
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_2])
+            .unwrap();
+        let q = e.quorum().unwrap();
+        assert_eq!(q.attestors(), &[ATTESTOR_1, ATTESTOR_2]);
+        assert_eq!(q.approval_count(), 1);
+        assert_eq!(q.threshold(), 2);
+        assert_eq!(q.registered_count(), 2);
+    }
+
+    #[test]
+    fn update_attestors_add_compacts_into_reserved_slots() {
+        // Growing the set compacts into the fixed 8-slot reservation:
+        // no new layout, no realloc (the rent/layout pin tests pin
+        // VAULT_FIELDS byte-identical).
+        let mut e = quorum_funded_escrow(); // 2-of-2
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3])
+            .unwrap();
+        let q = e.quorum().unwrap();
+        assert_eq!(q.attestors(), &[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3]);
+        assert_eq!(q.registered_count(), 3);
+        assert_eq!(q.approval_count(), 0);
+        assert_eq!(q.threshold(), 2, "threshold unchanged by growth");
     }
 
     #[test]
@@ -5799,6 +6157,10 @@ pub(crate) mod anchor_idl_tests {
         // AV-25: the dual-signed governance update writes the same
         // field (a second param source is allowed — see `released`).
         ("update_quorum", "threshold", "quorum.threshold"),
+        // AV-39: the dual-signed attestor-set update writes the
+        // quorum's attestor array; the approval bitmask is remapped by
+        // the state machine, not written by the param.
+        ("update_attestors", "attestors", "quorum.attestors"),
         ("initialize_vesting", "start", "vesting.start"),
         ("initialize_vesting", "end", "vesting.end"),
         ("initialize_arbiter", "arbiter", "arbiter"),

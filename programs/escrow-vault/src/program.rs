@@ -450,6 +450,64 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Replace the quorum's attestor set by dual-signed governance
+    /// (AV-39; mirrors `Escrow::update_attestors`). Both the
+    /// initializer and the taker must sign — one party alone cannot
+    /// reshape the electorate into sockpuppets (a unilateral weakening
+    /// of the release gate). Allowed on `Uninitialized` or `Funded`
+    /// escrows; no quorum configured, an empty set, more than 8 keys,
+    /// a duplicate key, or a new set smaller than the unchanged
+    /// threshold is `InvalidQuorum`. The set compacts into the
+    /// already-reserved 8 slots in place, so the account needs no
+    /// realloc. Approval bits remap by pubkey: retained attestors keep
+    /// their votes, removed attestors lose theirs. Emits
+    /// `AttestorsUpdated` when the set actually changes (a no-op
+    /// same-set update emits nothing), mirroring
+    /// `IndexedEscrow::update_attestors`.
+    pub fn update_attestors(ctx: Context<UpdateAttestors>, attestors: Vec<Pubkey>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let set_before: Vec<[u8; 32]> = escrow
+            .quorum()
+            .map(|q| q.attestors().to_vec())
+            .unwrap_or_default();
+        escrow
+            .update_attestors(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &attestors
+                    .iter()
+                    .map(|a| a.to_bytes())
+                    .collect::<Vec<[u8; 32]>>(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrite `vault.quorum.attestors` in the real build (in place —
+        // the quorum region is always reserved), with the approval
+        // bitmask remapped by pubkey exactly as the state machine does.
+        let set_after: Vec<[u8; 32]> = escrow
+            .quorum()
+            .map(|q| q.attestors().to_vec())
+            .unwrap_or_default();
+        if set_after != set_before {
+            let state = escrow.state() as u8;
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::AttestorsUpdated,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Opt in to dual-signature activation (AV-12; mirrors
     /// `Escrow::with_dual_sig`). `Uninitialized` only, like
     /// `initialize_quorum`. After this, `fund` requires the escrow to be
@@ -1289,6 +1347,18 @@ pub enum EscrowVaultEventKind {
     MilestoneConfirmed,
     MilestoneReleased,
     MilestoneSkipped,
+    /// AV-25: the quorum's attestation threshold changed by dual-signed
+    /// governance (`Escrow::update_quorum`). Mirrors
+    /// `escrow_state::EscrowEventKind::QuorumUpdated`.
+    QuorumUpdated,
+    /// AV-39: the quorum's attestor set changed by dual-signed
+    /// governance (`Escrow::update_attestors`). Mirrors
+    /// `escrow_state::EscrowEventKind::AttestorsUpdated`.
+    AttestorsUpdated,
+    /// AV-36: a fund-moving transition was rejected as a reentrant call
+    /// (`EscrowError::ReentrantCall`). Mirrors
+    /// `escrow_state::EscrowEventKind::ReentryRejected`.
+    ReentryRejected,
     /// AV-34: the vault account was closed by the initializer and its
     /// rent-exempt deposit reclaimed (`Cancelled | Released | Settled ->
     /// Closed`).
@@ -1319,6 +1389,13 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::MilestoneSkipped => {
             EscrowVaultEventKind::MilestoneSkipped
+        }
+        escrow_state::EscrowEventKind::QuorumUpdated => EscrowVaultEventKind::QuorumUpdated,
+        escrow_state::EscrowEventKind::AttestorsUpdated => {
+            EscrowVaultEventKind::AttestorsUpdated
+        }
+        escrow_state::EscrowEventKind::ReentryRejected => {
+            EscrowVaultEventKind::ReentryRejected
         }
         escrow_state::EscrowEventKind::VaultClosed => EscrowVaultEventKind::VaultClosed,
     }
@@ -1467,6 +1544,18 @@ pub struct UpdateQuorum<'info> {
     pub vault: Account<'info, Vault>,
     /// First governance signer: must equal the escrow's initializer.
     /// Both parties must sign — one alone is `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker.
+    pub taker: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateAttestors<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone is `Unauthorized`, so no
+    /// party can unilaterally reshape the attestor electorate.
     pub initializer: Signer<'info>,
     /// Second governance signer: must equal the escrow's taker.
     pub taker: Signer<'info>,
