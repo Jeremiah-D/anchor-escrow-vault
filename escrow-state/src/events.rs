@@ -95,7 +95,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, ReentryRejected (AV-36) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
@@ -145,6 +145,14 @@ pub enum EscrowEventKind {
     /// the ordering signal. A no-op same-set update emits nothing
     /// (paralleling [`EscrowEventKind::QuorumUpdated`]'s no-op rule).
     AttestorsUpdated,
+    /// AV-41: the AV-27 timelock was cleared early by dual-signed
+    /// emergency governance ([`Escrow::emergency_unlock`]). `from == to
+    /// ==` the current state (a config change, not a lifecycle move —
+    /// like [`EscrowEventKind::QuorumUpdated`]); the cleared timelock is
+    /// read from the vault, the event is the ordering signal. Always
+    /// emitted on success: the call fails unless an active timelock was
+    /// cleared, so there is no no-op case.
+    EmergencyUnlock,
     /// AV-34: the vault account was closed by the initializer and its
     /// rent-exempt deposit reclaimed ([`Escrow::close_vault`]).
     /// `from` is the terminal state the escrow was in (`Cancelled`,
@@ -536,6 +544,20 @@ impl IndexedEscrow {
         Ok(self)
     }
 
+    /// Opt in to a timelock (mirrors [`Escrow::with_timelock`]).
+    /// Configuration: emits no event.
+    pub fn with_timelock(mut self, unlock_at: u64) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_timelock(unlock_at)?;
+        Ok(self)
+    }
+
+    /// Opt in to emergency timelock-unlock governance (mirrors
+    /// [`Escrow::with_emergency_unlock`]). Configuration: emits no event.
+    pub fn with_emergency_unlock(mut self) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_emergency_unlock()?;
+        Ok(self)
+    }
+
     // ----- transitions: exactly one event per successful transition -----
 
     /// Record one party's activation signature (mirrors
@@ -840,6 +862,35 @@ impl IndexedEscrow {
             None,
             );
         }
+        Ok(())
+    }
+
+    /// Clear the AV-27 timelock by dual-signed emergency governance
+    /// (mirrors [`Escrow::emergency_unlock`]). Emits `EmergencyUnlock`
+    /// with `from == to ==` the current state — a config change, not a
+    /// lifecycle move (like `QuorumUpdated`). `at` is the caller-supplied
+    /// timestamp (on-chain: the clock sysvar). The inner call fails
+    /// unless an active timelock was actually cleared, so a successful
+    /// call always emits — there is no no-op case.
+    pub fn emergency_unlock(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        self.inner.emergency_unlock(initializer, taker)?;
+        let state = self.inner.state();
+        self.push_event(
+            EscrowEventKind::EmergencyUnlock,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+
+            None,
+        );
         Ok(())
     }
 

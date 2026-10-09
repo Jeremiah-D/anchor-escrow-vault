@@ -328,6 +328,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(32)?;
         None
     };
+    // AV-41: emergency timelock-unlock governance opt-in, always
+    // present (zeroed when the feature is off); appended last so every
+    // earlier offset above is unchanged.
+    let emergency_unlock = c.u8()? != 0;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -358,6 +362,7 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         timelock,
         decimals,
         rationale_hash,
+        emergency_unlock,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

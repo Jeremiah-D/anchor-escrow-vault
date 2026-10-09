@@ -1038,6 +1038,56 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to emergency timelock-unlock governance (AV-41; mirrors
+    /// `Escrow::with_emergency_unlock`). `Uninitialized` only, like
+    /// `initialize_quorum`. After this, `emergency_unlock` may clear the
+    /// AV-27 timelock by mutual agreement.
+    pub fn initialize_emergency_unlock(ctx: Context<InitializeEmergencyUnlock>) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow.with_emergency_unlock().map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Sets the opt-in byte in `vault.emergency_unlock` in the real
+        // build (always present, 1 byte, zeroed by default — no realloc).
+        Ok(())
+    }
+
+    /// Clear the AV-27 timelock by dual-signed emergency governance
+    /// (AV-41; mirrors `Escrow::emergency_unlock`). Both the initializer
+    /// and the taker must sign — one party alone is `Unauthorized`.
+    /// `Funded` only, and only when the governance was opted in and an
+    /// active timelock exists (`InvalidStateTransition` otherwise). The
+    /// timelock clears to 0 immediately; state and amounts are
+    /// untouched. Emits `EmergencyUnlock` (from == to == the current
+    /// state), mirroring `IndexedEscrow::emergency_unlock`.
+    pub fn emergency_unlock(ctx: Context<EmergencyUnlock>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        escrow
+            .emergency_unlock(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Clears `vault.timelock` to 0 in the real build (in place — the
+        // 8-byte region is always reserved).
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::EmergencyUnlock,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// Close the vault account and reclaim the rent-exempt deposit
     /// (`Cancelled | Released | Settled -> Closed`; mirrors
     /// `Escrow::close_vault`). Only the initializer may call this —
@@ -1235,6 +1285,14 @@ pub struct Vault {
     /// matches `escrow_state::VAULT_FIELDS` (appended last, after
     /// `decimals`).
     pub rationale_hash: Option<[u8; 32]>,
+    /// AV-41: emergency timelock-unlock governance opt-in; mirrors
+    /// `escrow_state`'s `emergency_unlock`. `false` for an escrow without
+    /// the governance capability. Always present (1 byte, zeroed by
+    /// default) so `initialize_emergency_unlock` writes the flag in
+    /// place without reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `rationale_hash`).
+    pub emergency_unlock: bool,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -1724,6 +1782,27 @@ pub struct InitializeDecimals<'info> {
     /// state machine rejects re-configuration once the escrow leaves
     /// `Uninitialized`.
     pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeEmergencyUnlock<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer opts into emergency timelock-unlock
+    /// governance; the state machine rejects re-configuration once the
+    /// escrow leaves `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct EmergencyUnlock<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone is `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker.
+    pub taker: Signer<'info>,
 }
 
 #[derive(Accounts)]

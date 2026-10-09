@@ -84,6 +84,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `fund(authority)`                           | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer            |
 | `release(authority, now, amount)`                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise); cumulative releases ≤ locked amount |
 | `initialize_timelock(unlock_at)`            | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `unlock_at` is the Unix timestamp before which no taker payout may leave; `0` = no lock) |
+| `initialize_emergency_unlock()`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opts into dual-signed emergency timelock-unlock governance) |
+| `emergency_unlock(initializer, taker)`       | `Funded`       | `Funded` (no state change) | **both** parties must sign (dual-signature governance; one party alone is `Unauthorized`); requires the opt-in and an active timelock (`InvalidStateTransition` otherwise); clears `timelock` to `0` so payouts become immediately eligible — state and amounts untouched; emits `EmergencyUnlock` |
 | `initialize_decimals(decimals)`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `decimals` is the SPL mint's decimal places — SPL mints declare at most 9, `> 18` is rejected; `0` = no decimal metadata; display-only, never gates a transition or moves funds) |
 | `cancel(authority, refund_to)`               | `Funded`       | `Cancelled` | initializer; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise |
 | `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); the refund still goes to the whitelisted address even when the taker calls; returns `(refund, penalty)` — a taker-initiated cancel with `penalty_bps > 0` slices an anti-griefing penalty for the initializer (see below) |
@@ -148,6 +150,21 @@ a misconfigured or abandoned timelock can never trap funds forever — after
 dispute still settles via arbitration. The keeper report lists a `claim`
 action only once the timelock is unlocked, and the state snapshot exposes
 `unlock_at` / `unlock_eligible` for indexers.
+
+**Emergency timelock unlock.** An escrow can additionally opt into
+dual-signed emergency governance (`with_emergency_unlock()`, once, before
+funding). When both parties agree the lock has outlived its purpose — a
+renegotiated deal, a wrong `unlock_at`, counterparties who both want out
+early — `emergency_unlock(initializer, taker)` clears the timelock
+immediately: both the initializer and the taker must sign (one party alone
+is `Unauthorized`), the escrow must be `Funded`, the governance must be
+opted in, and an active timelock must exist (`InvalidStateTransition`
+otherwise). The timelock clears to `0`, so `release` / `claim` /
+`release_milestone` become immediately eligible — state and amounts are
+untouched, and the `EmergencyUnlock` event (from == to == the current
+state) records the governance decision for indexers. Check order is
+authority → state → governance config, so a stranger learns nothing about
+the escrow's configuration from the error alone.
 
 **Token decimals.** An escrow can declare its SPL mint's decimal places
 (`with_decimals(decimals)`, once, before funding; SPL mints declare at most
@@ -643,6 +660,32 @@ initializer            escrow                 state
    |---------------------------------->|  Funded→Released     |
 ```
 
+**K. Emergency timelock unlock — dual-signed early clearing.** The
+governance is opted in before funding; both parties must sign, and the
+call clears the timelock without moving state or funds:
+
+```
+initializer    taker            escrow                 state
+   |  initialize_emergency_unlock()  |  |             |
+   |---------------------------------->|  (governance   |
+   |                                   |   fixed, still |
+   |                                   |   Uninitialized)|
+   |  fund(alice)  |                     |              |
+   |---------------------------------->| Uninitialized→Funded |
+   |  emergency_unlock(alice)  // only the initializer → Err(Unauthorized),
+   |                          // timelock intact, state unchanged
+   |               emergency_unlock(alice, bob)  |       |
+   |               ---------------------------->|  (timelock  |
+   |                                           |   cleared → |
+   |                                           |   0; stays  |
+   |                                           |   Funded;   |
+   |                                           |   Emergency |
+   |                                           |   Unlock    |
+   |                                           |   emitted)  |
+   |  release(alice, amount, early)  |                       |
+   |---------------------------------->| Funded→Released       |
+```
+
 Note that `attest` never changes `EscrowState` itself (it only grows the
 quorum's approval bitmask), and the failed-call invariant holds on every
 path above: any `Err(...)` return leaves the state — and `amount` and the
@@ -661,7 +704,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `VaultClosed` |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `EmergencyUnlock`, `VaultClosed` |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -790,9 +833,9 @@ order; batches in first-seen caller order, actions in input order):
 
 ```json
 {"scanned":2,"batches":[
-  {"caller":"...","total_reclaimed":10941120,"actions":[
+  {"caller":"...","total_reclaimed":10955040,"actions":[
     {"escrow_id":"...","action":"close_vault","caller":"...",
-     "caller_role":"initializer","rent_reclaimed":5470560,
+     "caller_role":"initializer","rent_reclaimed":5477520,
      "reason":"released"}
   ]}
 ]}
@@ -889,7 +932,8 @@ two-way consistency check against the IDL parameter table:
 | timelock      | u64               | 8     |
 | decimals      | u8                | 1     |
 | rationale_hash | Option<[u8; 32]> | 33    |
-| **total**     |                   | **658** |
+| emergency_unlock | bool           | 1     |
+| **total**     |                   | **659** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -920,11 +964,13 @@ when no penalty is configured) — and the 8-byte timelock unlock timestamp
 token decimal metadata `decimals` (AV-28, zeroed when no decimal metadata
 is declared) — and the 33-byte arbiter's rationale-document hash region
 (AV-38: 1-byte discriminant + 32-byte commitment, zeroed when the arbiter
-attached no rationale).
-`escrow-state` exposes `VAULT_SPACE` (658) and
-`VAULT_SPACE_NO_QUORUM` (247) for the Anchor `space =` constraint, plus a
+attached no rationale) — and the 1-byte emergency timelock-unlock
+governance opt-in `emergency_unlock` (AV-41, zeroed when the feature is
+off).
+`escrow-state` exposes `VAULT_SPACE` (659) and
+`VAULT_SPACE_NO_QUORUM` (248) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **5,470,560 lamports** to be
+mainnet rent parameters the full vault needs **5,477,520 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)

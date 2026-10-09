@@ -218,6 +218,18 @@
       ]
     },
     {
+      "name": "initialize_emergency_unlock",
+      "discriminator": [153, 121, 160, 71, 132, 213, 75, 93],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "emergency_unlock",
+      "discriminator": [17, 106, 80, 63, 244, 220, 225, 70],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "close_vault",
       "discriminator": [141, 103, 17, 126, 72, 75, 29, 29],
       "accounts": [],
@@ -252,7 +264,8 @@
           {"name": "penalty_bps", "type": "u16", "offset": 614},
           {"name": "timelock", "type": "u64", "offset": 616},
           {"name": "decimals", "type": "u8", "offset": 624},
-          {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 625}
+          {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 625},
+          {"name": "emergency_unlock", "type": "bool", "offset": 658}
         ]
       }
     }

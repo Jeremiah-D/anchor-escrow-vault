@@ -404,6 +404,15 @@ pub struct Escrow {
     /// `evidence_hash` convention. Appended last so every earlier field
     /// offset stays stable.
     rationale_hash: Option<[u8; 32]>,
+    /// AV-41: emergency timelock-unlock governance opt-in. `false` (the
+    /// default) means the feature is off — backward compatible. Set once
+    /// via [`Escrow::with_emergency_unlock`] on an `Uninitialized`
+    /// escrow; once both parties authorize
+    /// ([`Escrow::emergency_unlock`]), the AV-27 timelock is cleared and
+    /// taker payouts become immediately eligible. Persisted (1 byte in
+    /// the vault account) so the on-chain program enforces the opt-in.
+    /// Appended last so every earlier field offset stays stable.
+    emergency_unlock: bool,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -1040,6 +1049,9 @@ impl Escrow {
             // `Some` once `resolve` stores the arbiter's rationale hash
             // (backward compatible).
             rationale_hash: None,
+            // AV-41: emergency timelock-unlock governance is opt-in —
+            // off by default (backward compatible).
+            emergency_unlock: false,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -2212,6 +2224,84 @@ impl Escrow {
         now >= self.timelock
     }
 
+    /// Opt in to emergency timelock-unlock governance (AV-41).
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// governance capability is fixed before any funds move — mirroring
+    /// [`Escrow::with_dual_sig`] and the other `with_*` builders. After
+    /// this, [`Escrow::emergency_unlock`] may clear the AV-27 timelock by
+    /// mutual agreement, without waiting for `unlock_at`.
+    pub fn with_emergency_unlock(mut self) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        self.emergency_unlock = true;
+        Ok(self)
+    }
+
+    /// True when emergency timelock-unlock governance was opted in via
+    /// [`Escrow::with_emergency_unlock`].
+    pub fn emergency_unlock_enabled(&self) -> bool {
+        self.emergency_unlock
+    }
+
+    /// Clear the AV-27 timelock by mutual agreement, effective
+    /// immediately (AV-41 — Solana multisig governance for time-locked
+    /// escrows). Both the initializer and the taker must authorize —
+    /// one party alone (or a stranger) is [`EscrowError::Unauthorized`].
+    ///
+    /// Why: a timelock that outlives its purpose (a deal renegotiated,
+    /// an oracle feeding a wrong `unlock_at`, counterparties who both
+    /// want out early) would otherwise force everyone to wait for the
+    /// clock. The unilateral exits stay ungated by design, but the
+    /// *payout* paths do not — dual-signed governance lets the two
+    /// parties lift the payout gate early without any single party
+    /// being able to unlock unilaterally.
+    ///
+    /// Effect: `timelock` is set to `0`, so every taker payout path
+    /// ([`Escrow::release`], [`Escrow::claim`],
+    /// [`Escrow::release_milestone`]) becomes immediately eligible —
+    /// the state and all amounts are untouched. Clearing (rather than
+    /// flagging) keeps one source of truth: [`Escrow::is_unlock_eligible`]
+    /// and the keeper report read the same field the payout gates do.
+    ///
+    /// Check order is deliberate: authority (both parties) first, then
+    /// state, then the dual-signature governance configuration — a
+    /// stranger learns nothing about the escrow's configuration from the
+    /// error alone.
+    ///
+    /// [`EscrowError::InvalidStateTransition`] when the escrow is not
+    /// `Funded` (the timelock only binds locked funds), when emergency
+    /// governance was never opted in, or when there is no active
+    /// timelock to clear (`timelock == 0` — never configured, or
+    /// already cleared by a previous unlock).
+    pub fn emergency_unlock(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // Both parties must sign: either key alone (or a stranger) is
+        // Unauthorized. Independent `==` checks (not `||`): the
+        // degenerate initializer == taker self-escrow authorizes with
+        // one key passed twice, like AV-12's activation and AV-25's
+        // governance updates.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if !self.emergency_unlock {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        if self.timelock == 0 {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        self.timelock = 0;
+        Ok(())
+    }
+
     /// Opt in to token decimal metadata (AV-28). Builder-style: only
     /// valid on an `Uninitialized` escrow, so the precision is fixed
     /// before any funds move — mirroring [`Escrow::with_timelock`] and
@@ -2948,6 +3038,11 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // place — same treatment as `arbiter` / `mint` / `evidence_hash`.
     // Appended last so every earlier field offset stays stable.
     ("rationale_hash", "Option<[u8; 32]>", 1 + 32),
+    // AV-41: emergency timelock-unlock governance opt-in (see
+    // `Escrow::with_emergency_unlock`): one bool byte, always present
+    // (zeroed when the feature is off). Appended last so every earlier
+    // field offset stays stable.
+    ("emergency_unlock", "bool", 1),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -2998,9 +3093,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// too: 1-byte `decimals` (zeroed when no decimal metadata is
 /// configured). The arbiter's rationale-document hash (AV-38) is
 /// likewise always present: 1-byte discriminant + 32-byte commitment
-/// (zeroed when the arbiter attached no rationale).
+/// (zeroed when the arbiter attached no rationale). The emergency
+/// timelock-unlock governance opt-in (AV-41) is always present too:
+/// 1 byte, zeroed when the feature is off.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -3390,7 +3487,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 5_470_560, "from {state:?}");
+            assert_eq!(rent, 5_477_520, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -3487,7 +3584,7 @@ mod tests {
         // account (every byte of VAULT_SPACE is rent the initializer
         // paid for). AV-38 grew the account by 33 bytes (rationale
         // hash), so the pin tracks the new total deliberately.
-        assert_eq!(VAULT_SPACE, 658, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 659, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -4881,6 +4978,38 @@ pub(crate) mod anchor_idl_tests {
                             and the AV-26 snapshot export",
         },
         InstructionSpec {
+            // AV-41: emergency timelock-unlock governance opt-in.
+            name: "initialize_emergency_unlock",
+            params: &[],
+            method: "Escrow::with_emergency_unlock",
+            input_mapping: "no params; authority <- accounts.initializer \\
+                            (signer), enforced by the Anchor account \\
+                            constraint, not the state machine; \\
+                            Uninitialized only, like initialize_quorum; \\
+                            sets the emergency_unlock opt-in byte in the \\
+                            vault (persisted, 1 byte appended last), \\
+                            enabling the emergency_unlock instruction",
+        },
+        InstructionSpec {
+            // AV-41: dual-signed emergency timelock unlock.
+            name: "emergency_unlock",
+            params: &[],
+            method: "Escrow::emergency_unlock",
+            input_mapping: "no params; authority <- accounts.initializer \\
+                            AND accounts.taker (BOTH signers — \\
+                            dual-signature governance; one party alone is \\
+                            Unauthorized); Funded only; emergency_unlock \\
+                            must be opted in (InvalidStateTransition \\
+                            otherwise); an active timelock must exist \\
+                            (timelock == 0 is InvalidStateTransition — \\
+                            never configured or already cleared); clears \\
+                            timelock to 0 so release / claim / \\
+                            release_milestone become immediately eligible \\
+                            — state and amounts untouched; emits the \\
+                            EmergencyUnlock indexer event (from == to == \\
+                            the current state)",
+        },
+        InstructionSpec {
             // AV-34: terminal-state vault close with rent reclamation.
             name: "close_vault",
             params: &[],
@@ -4967,6 +5096,8 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::with_penalty_bps",
             "Escrow::with_timelock",
             "Escrow::with_decimals",
+            "Escrow::with_emergency_unlock",
+            "Escrow::emergency_unlock",
             "Escrow::close_vault",
         ];
         assert_eq!(
@@ -6270,6 +6401,15 @@ pub(crate) mod anchor_idl_tests {
             "fees_paid",
             "accumulated by release / claim / release_milestone / resolve \
              (the taker's share); zeroed by initialize",
+        ),
+        // AV-41: no instruction param writes this field (like
+        // `activation`'s required bit): `initialize_emergency_unlock`
+        // is a param-less instruction, so it is a field source, not a
+        // param mapping.
+        (
+            "emergency_unlock",
+            "zeroed by initialize; set by initialize_emergency_unlock \
+             (Uninitialized only)",
         ),
     ];
 
@@ -7846,6 +7986,10 @@ mod account_space_tests {
                 out.extend_from_slice(&h);
             }
         }
+        // AV-41: emergency timelock-unlock governance opt-in, always
+        // present (zeroed when the feature is off); appended last so
+        // every earlier offset above is unchanged.
+        out.push(e.emergency_unlock as u8);
         out
     }
 
@@ -7868,9 +8012,9 @@ mod account_space_tests {
         // + 2 (AV-24 anti-griefing penalty rate) + 8 (AV-27 timelock)
         // + 1 (AV-28 token decimal metadata) + (1 + 32) (AV-38 arbiter's
         // rationale-document hash).
-        assert_eq!(ESCROW_BODY_LEN, 650, "escrow payload bytes");
+        assert_eq!(ESCROW_BODY_LEN, 651, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 658, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 659, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -7889,13 +8033,15 @@ mod account_space_tests {
         // (AV-27, zeroed when no timelock configured) + 1-byte token
         // decimal metadata (AV-28, zeroed when no decimal metadata is
         // configured) + (1 + 32)-byte arbiter's rationale-document hash
-        // (AV-38, zeroed when the arbiter attached no rationale).
+        // (AV-38, zeroed when the arbiter attached no rationale) +
+        // 1-byte emergency timelock-unlock governance opt-in (AV-41,
+        // zeroed when the feature is off).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 247);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 248);
     }
 
     #[test]
@@ -8249,16 +8395,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 658) * 3480 * 2 = 786 * 6960 = 5_470_560 lamports.
-        assert_eq!(full, 5_470_560);
+        // (128 + 659) * 3480 * 2 = 787 * 6960 = 5_477_520 lamports.
+        assert_eq!(full, 5_477_520);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 247) * 3480 * 2 = 375 * 6960 = 2_610_000 lamports.
-        assert_eq!(no_quorum, 2_610_000);
+        // (128 + 248) * 3480 * 2 = 376 * 6960 = 2_616_960 lamports.
+        assert_eq!(no_quorum, 2_616_960);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -8302,12 +8448,12 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(5_470_560, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(5_477_520, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(5_470_559, params.0, params.1),
             Err(RentShortfall {
-                required: 5_470_560,
+                required: 5_477_520,
                 provided: 5_470_559,
             })
         );
@@ -8320,7 +8466,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 5_470_560,
+                required: 5_477_520,
                 provided: 0,
             })
         );
@@ -10754,7 +10900,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH)).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 650, "body grew by exactly 33 bytes");
+        assert_eq!(bytes.len(), 651, "body grew by 33 (AV-38) + 1 (AV-41) bytes");
         assert_eq!(bytes[616], 0, "decimals offset unchanged");
         assert_eq!(bytes[617], 1, "rationale_hash: Some discriminant");
         assert_eq!(&bytes[618..650], &RATIONALE_HASH, "rationale_hash bytes");
@@ -10771,7 +10917,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 650);
+        assert_eq!(bytes.len(), 651);
         assert_eq!(bytes[617], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[618..650], &[0u8; 32], "rationale_hash: zeroed");
     }
@@ -10786,18 +10932,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 658) * 3480 * 2 = 786 * 6960 = 5_470_560 lamports.
-        assert_eq!(VAULT_SPACE, 658);
-        assert_eq!(full, 5_470_560);
+        // (128 + 659) * 3480 * 2 = 787 * 6960 = 5_477_520 lamports.
+        assert_eq!(VAULT_SPACE, 659);
+        assert_eq!(full, 5_477_520);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 247) * 3480 * 2 = 375 * 6960 = 2_610_000 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 247);
-        assert_eq!(no_quorum, 2_610_000);
+        // (128 + 248) * 3480 * 2 = 376 * 6960 = 2_616_960 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 248);
+        assert_eq!(no_quorum, 2_616_960);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -11364,6 +11510,236 @@ mod timelock_tests {
     }
 }
 
+// ---------- AV-41: emergency timelock-unlock governance ----------
+
+#[cfg(test)]
+mod emergency_unlock_tests {
+    use super::*;
+    use crate::events::{EscrowEventKind, IndexedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const UNLOCK_AT: u64 = 1_900_000_000;
+    const ESCROW_ID: [u8; 32] = [0xE5; 32];
+
+    fn funded_with_timelock_and_governance() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap()
+            .with_emergency_unlock()
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    #[test]
+    fn dual_signed_unlock_clears_timelock_and_release_works_immediately() {
+        let mut e = funded_with_timelock_and_governance();
+        // Before the unlock timestamp the payout gate is shut.
+        assert_eq!(
+            e.release(ALICE, UNLOCK_AT - 1, 1_000_000, None),
+            Err(EscrowError::TimelockNotReached)
+        );
+        e.emergency_unlock(ALICE, BOB).unwrap();
+        assert_eq!(e.unlock_at(), 0, "timelock cleared");
+        assert!(e.is_unlock_eligible(UNLOCK_AT - 1));
+        assert_eq!(e.state(), EscrowState::Funded, "state untouched");
+        assert_eq!(
+            (e.released_amount(), e.remaining_amount()),
+            (0, 1_000_000),
+            "amounts untouched"
+        );
+        // The payout gate is open immediately — no waiting for the clock.
+        e.release(ALICE, UNLOCK_AT - 1, 1_000_000, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn single_party_is_unauthorized() {
+        let mut e = funded_with_timelock_and_governance();
+        // One party alone — either side, or a stranger entirely — is
+        // Unauthorized, and the failed call moves nothing.
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.emergency_unlock(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(e.unlock_at(), UNLOCK_AT, "rejected calls change nothing");
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn check_order_is_authority_then_state_then_governance_config() {
+        // Authority first: a stranger on an Uninitialized escrow learns
+        // nothing about its configuration.
+        let mut unfunded = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap()
+            .with_emergency_unlock()
+            .unwrap();
+        assert_eq!(
+            unfunded.emergency_unlock(MALLORY, MALLORY),
+            Err(EscrowError::Unauthorized)
+        );
+        // State before config: the right parties on an Uninitialized
+        // escrow report the state gate, not the governance config.
+        assert_eq!(
+            unfunded.emergency_unlock(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Config last: Funded but never opted in.
+        let mut no_opt_in = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap();
+        no_opt_in.fund(ALICE).unwrap();
+        assert_eq!(
+            no_opt_in.emergency_unlock(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(!no_opt_in.emergency_unlock_enabled());
+    }
+
+    #[test]
+    fn no_active_timelock_is_invalid() {
+        // Opted in but no timelock configured: nothing to clear.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_emergency_unlock()
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.emergency_unlock(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // A second unlock after a successful one: the timelock is already
+        // clear, so there is nothing to clear again.
+        let mut e2 = funded_with_timelock_and_governance();
+        e2.emergency_unlock(ALICE, BOB).unwrap();
+        assert_eq!(
+            e2.emergency_unlock(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn with_emergency_unlock_is_uninitialized_only() {
+        let e = funded_with_timelock_and_governance();
+        assert_eq!(
+            e.with_emergency_unlock(),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(e.emergency_unlock_enabled(), "rejected reconfig changes nothing");
+    }
+
+    #[test]
+    fn unlock_rejected_in_terminal_states() {
+        // Released: the timelock no longer binds anything.
+        let mut e = funded_with_timelock_and_governance();
+        e.emergency_unlock(ALICE, BOB).unwrap();
+        e.release(ALICE, 0, 1_000_000, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.emergency_unlock(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Cancelled: same gate.
+        let mut e2 = funded_with_timelock_and_governance();
+        e2.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(e2.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e2.emergency_unlock(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn degenerate_self_escrow_unlocks_with_one_key_twice() {
+        // initializer == taker: one key passed twice authorizes, like
+        // AV-12's activation and AV-25's governance updates.
+        let mut e = Escrow::initialize(ALICE, ALICE, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap()
+            .with_emergency_unlock()
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.emergency_unlock(ALICE, ALICE).unwrap();
+        assert_eq!(e.unlock_at(), 0);
+    }
+
+    #[test]
+    fn emergency_unlock_opt_in_persists_in_serialized_layout_tail() {
+        // The opt-in byte is the appended tail: offset 650, right after
+        // the AV-38 rationale_hash region — every earlier offset stays
+        // stable (the AV-27 timelock still sits at 608..616).
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&plain);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes[650], 0, "emergency_unlock: off by default");
+        let opted = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap()
+            .with_emergency_unlock()
+            .unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&opted);
+        assert_eq!(bytes.len(), 651);
+        assert_eq!(bytes[650], 1, "emergency_unlock: opt-in byte set");
+        assert_eq!(
+            u64::from_le_bytes(bytes[608..616].try_into().unwrap()),
+            UNLOCK_AT,
+            "timelock offset unchanged by the append"
+        );
+    }
+
+    #[test]
+    fn indexed_escrow_emits_emergency_unlock_event() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, 0)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap()
+            .with_emergency_unlock()
+            .unwrap();
+        e.fund(ALICE, 0).unwrap();
+        // Drain the Funded event so the unlock is the last one.
+        let _ = e.drain_events();
+        e.emergency_unlock(ALICE, BOB, 42).unwrap();
+        let events = e.drain_events();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, EscrowEventKind::EmergencyUnlock);
+        assert_eq!(ev.from, EscrowState::Funded);
+        assert_eq!(ev.to, EscrowState::Funded);
+        assert_eq!(ev.at, 42);
+        // A failed unlock emits nothing.
+        let mut e2 = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, 0)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap()
+            .with_emergency_unlock()
+            .unwrap();
+        e2.fund(ALICE, 0).unwrap();
+        let _ = e2.drain_events();
+        assert_eq!(
+            e2.emergency_unlock(MALLORY, BOB, 42),
+            Err(EscrowError::Unauthorized)
+        );
+        assert!(e2.drain_events().is_empty());
+    }
+}
+
 // ---------- AV-28: token decimal metadata ----------
 //
 // The SPL mint's decimal places, declared once before funding via
@@ -11494,7 +11870,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 650, "33 bytes appended by AV-38");
+        assert_eq!(ESCROW_BODY_LEN, 651, "33 bytes appended by AV-38, 1 by AV-41");
         assert_eq!(bytes[616], 9, "decimals tail offset");
         // The timelock offset is unchanged by the append.
         assert_eq!(
@@ -11512,29 +11888,30 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 658) * 3480 * 2 = 786 * 6960 = 5_470_560 lamports.
+        // (128 + 659) * 3480 * 2 = 787 * 6960 = 5_477_520 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            5_470_560
+            5_477_520
         );
-        // (128 + 247) * 3480 * 2 = 375 * 6960 = 2_610_000 lamports.
+        // (128 + 248) * 3480 * 2 = 376 * 6960 = 2_616_960 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            2_610_000
+            2_616_960
         );
-        // 33 bytes' rent above the AV-28 numbers (AV-38 rationale hash).
-        assert_eq!(VAULT_SPACE, 658);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 247);
-        assert!(check_vault_rent_exempt(5_470_560, 3_480, 2.0).is_ok());
-        assert!(check_vault_rent_exempt(5_470_559, 3_480, 2.0).is_err());
+        // 34 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
+        // AV-41 emergency-unlock opt-in byte).
+        assert_eq!(VAULT_SPACE, 659);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 248);
+        assert!(check_vault_rent_exempt(5_477_520, 3_480, 2.0).is_ok());
+        assert!(check_vault_rent_exempt(5_477_519, 3_480, 2.0).is_err());
     }
 
     #[test]
