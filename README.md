@@ -919,6 +919,35 @@ matching `cpi::*_plan`, and executes each validated leg (native legs via
 `anchor_spl::token::transfer`). Because the program never hand-rolls
 instruction bytes, the on-chain code cannot drift from the tested layout.
 
+## Account discriminators & panic-free decoding (AV-32)
+
+`escrow-state/src/discriminator.rs` is the defensive half of reading
+on-chain bytes — for indexers, keeper tooling, and anyone else parsing
+vault accounts without trusting them:
+
+- **Discriminator registry**: `PROGRAM_ACCOUNT_NAMES` is the single
+  source of truth for the program side's `#[account]` types (today just
+  `Vault`). Tests pin it against
+  `programs/escrow-vault/src/program.rs` via `include_str!` (a new
+  account type fails the build until registered) and assert global
+  uniqueness: no account discriminator
+  (`sha256("account:<Name>")[..8]`) collides with another account's or
+  with any instruction's (`sha256("global:<name>")[..8]`) — a collision
+  would let one account's bytes masquerade as another's.
+- **Panic-free decoding**: `decode_vault_account` turns raw account data
+  back into an `Escrow` with every read bounds-checked
+  (`checked_add` + `get`), so fuzzed / mutated / truncated / overlong
+  byte streams can only return `Ok` / `Err` — never trap. Check order:
+  exact `VAULT_SPACE` length first (truncated and overlong both rejected,
+  matching Anchor's `try_from_slice`), then the discriminator, then the
+  structural field decode (bad `state` / `Option` discriminants are
+  `Err`, not UB). The decode is structural like Anchor's
+  `try_deserialize` — it reports what's on chain rather than
+  re-litigating domain invariants.
+- The crate's hand-rolled SHA-256 moved to the crate root as a shared
+  `pub(crate)` primitive so this module, the AV-33 planner, and the
+  test-only IDL pipeline (AV-29) all use one implementation.
+
 ## Run the tests
 
 ```bash
