@@ -38,6 +38,15 @@
 //! `close` constraint) and recover the lamports it has carried since
 //! `initialize` — the escrow moves to `Closed`, the deepest terminal.
 //!
+//! Reentrancy (AV-36): every fund-moving instruction runs under the
+//! state machine's reentrancy guard — `Escrow::release_via_cpi` arms a
+//! runtime lock around the injected executor (here: the real
+//! `cpi_invoke_target` below), and every fund-moving transition
+//! rejects a nested entry with `ReentrantCall` before its authority
+//! check. A hostile CPI target that invokes the escrow program again
+//! mid-instruction therefore fails closed, and the rejection is
+//! visible to indexers as a `ReentryRejected` event.
+//!
 //! To compile for real: `anchor build` with the Solana toolchain installed.
 
 use anchor_lang::prelude::*;
@@ -198,7 +207,14 @@ pub mod escrow_vault {
                 // program here via `cpi_invoke_target` below. A failed
                 // invoke aborts the transaction, so no state change
                 // persists — the state machine's rollback models exactly
-                // this.
+                // this. AV-36: the state machine arms its reentrancy
+                // lock around this closure (see
+                // `escrow_state::Escrow::release_via_cpi`), so a hostile
+                // target that CPIs back into this program mid-invoke is
+                // rejected with `ReentrantCall` (`ErrorCode::ReentrantCall`)
+                // before its authority check — the outer release is
+                // unaffected and the rejection emits a `ReentryRejected`
+                // indexer event.
                 |inv| cpi_invoke_target(&ctx, inv),
             )
             .map_err(|e| escrow_error(e))?;
@@ -1326,6 +1342,13 @@ pub struct ReleaseViaCpi<'info> {
     // order. Anchor validates nothing about them — the state machine
     // validates the invocation shape (`InvalidCpiTarget`) and the
     // `Released` event's CPI audit pins the exact authorized bytes.
+    // AV-36: the real invoke below runs with the state machine's
+    // reentrancy lock armed (see `escrow_state::Escrow::release_via_cpi`):
+    // if the target program CPIs back into any fund-moving instruction
+    // of this program mid-invoke, the nested entry is rejected with
+    // `ErrorCode::ReentrantCall` and the outer release completes
+    // normally. The lock is process-memory only — it is not part of
+    // the vault account layout (`VAULT_FIELDS` unchanged).
 }
 
 #[derive(Accounts)]
@@ -1878,6 +1901,7 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidDecimals => error!(ErrorCode::InvalidDecimals),
         escrow_state::EscrowError::InvalidCpiTarget => error!(ErrorCode::InvalidCpiTarget),
         escrow_state::EscrowError::CpiExecutionFailed => error!(ErrorCode::CpiExecutionFailed),
+        escrow_state::EscrowError::ReentrantCall => error!(ErrorCode::ReentrantCall),
     }
 }
 
@@ -1927,4 +1951,6 @@ pub enum ErrorCode {
     InvalidCpiTarget,
     #[msg("CPI execution failed: the third-party invoke failed after the release gates passed; the whole release was rolled back")]
     CpiExecutionFailed,
+    #[msg("Reentrant call rejected: a fund-moving transition was entered while the AV-36 reentrancy lock was held (nested entry from inside release_via_cpi's executor window)")]
+    ReentrantCall,
 }

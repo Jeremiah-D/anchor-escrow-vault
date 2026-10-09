@@ -303,7 +303,8 @@
     {"code": 118, "name": "TimelockNotReached"},
     {"code": 119, "name": "InvalidDecimals"},
     {"code": 120, "name": "InvalidCpiTarget"},
-    {"code": 121, "name": "CpiExecutionFailed"}
+    {"code": 121, "name": "CpiExecutionFailed"},
+    {"code": 122, "name": "ReentrantCall"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

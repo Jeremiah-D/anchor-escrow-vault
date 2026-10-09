@@ -347,6 +347,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         penalty_bps,
         timelock,
         decimals,
+        // AV-36: the reentrancy lock is runtime-only — decoded escrows
+        // always start unlocked; the lock can only be armed inside
+        // `release_via_cpi`'s executor window on a live `&mut Escrow`.
+        reentrancy_lock: false,
     })
 }
 

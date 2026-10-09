@@ -372,6 +372,27 @@ pub struct Escrow {
     /// most 9 decimals; 18 is the hard ceiling
     /// ([`EscrowError::InvalidDecimals`]).
     decimals: u8,
+    /// AV-36: in-process reentrancy lock. Runtime-only — it is
+    /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
+    /// the hand-written Borsh layout tests, `decode_vault_account`,
+    /// and the AV-26 snapshot export, which all enumerate only the
+    /// persisted fields. The lock guards the injected executor window
+    /// of [`Escrow::release_via_cpi`] — the one point where untrusted
+    /// code runs while a transition is mid-flight — against reentrant
+    /// fund-moving calls from a hostile callback (the pure-logic model
+    /// of a CPI target program invoking the escrow program again
+    /// mid-instruction). Every fund-moving transition
+    /// ([`Escrow::fund`], [`Escrow::release`],
+    /// [`Escrow::release_via_cpi`], [`Escrow::release_milestone`],
+    /// [`Escrow::claim`], [`Escrow::cancel`],
+    /// [`Escrow::cancel_expired`], [`Escrow::resolve`],
+    /// [`Escrow::close_vault`]) calls
+    /// [`Escrow::require_not_reentrant`] first — before the authority
+    /// check, like a Solidity `nonReentrant` modifier — and a nested
+    /// entry fails with [`EscrowError::ReentrantCall`] regardless of
+    /// its arguments. `false` outside an executor window; never
+    /// persisted, never part of the account layout.
+    reentrancy_lock: bool,
 }
 
 /// Bit 0 of [`Escrow::activation`]: the initializer has recorded their
@@ -527,6 +548,19 @@ pub enum EscrowError {
     /// pure-logic model mirrors that atomicity. Nothing observable
     /// changes on this error: no event fires, no counter moves.
     CpiExecutionFailed,
+    /// Reentrant call rejected (AV-36): a fund-moving transition was
+    /// entered while the reentrancy lock was already held — a nested
+    /// entry from inside [`Escrow::release_via_cpi`]'s injected
+    /// executor window (the pure-logic model of a CPI target program
+    /// invoking the escrow program again mid-instruction). Checked
+    /// before the authority check, so a reentrant call fails
+    /// regardless of its arguments; the outer transition is
+    /// unaffected and completes normally. The
+    /// [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits a
+    /// `ReentryRejected` event on this rejection — the deliberate
+    /// exception to the "failed calls emit nothing" rule, because a
+    /// blocked reentry is a security signal the indexer must see.
+    ReentrantCall,
 }
 
 impl EscrowError {
@@ -561,6 +595,7 @@ impl EscrowError {
             EscrowError::InvalidDecimals => 119,
             EscrowError::InvalidCpiTarget => 120,
             EscrowError::CpiExecutionFailed => 121,
+            EscrowError::ReentrantCall => 122,
         }
     }
 
@@ -589,6 +624,7 @@ impl EscrowError {
             EscrowError::InvalidDecimals,
             EscrowError::InvalidCpiTarget,
             EscrowError::CpiExecutionFailed,
+            EscrowError::ReentrantCall,
         ]
     }
 }
@@ -961,6 +997,10 @@ impl Escrow {
             // bare integers (backward compatible). Opt in via
             // `with_decimals` before funding.
             decimals: 0,
+            // AV-36: the reentrancy lock starts clear — it is runtime
+            // state, armed only around the injected executor window of
+            // `release_via_cpi`, never persisted.
+            reentrancy_lock: false,
         })
     }
 
@@ -985,11 +1025,35 @@ impl Escrow {
         Ok(())
     }
 
+    /// AV-36: reject a nested entry while the reentrancy lock is held.
+    /// Called first by every fund-moving transition — before the
+    /// authority check, like a Solidity `nonReentrant` modifier — so a
+    /// reentrant call fails regardless of its arguments. A stranger
+    /// learns nothing new from this error (the lock is only ever held
+    /// inside [`Escrow::release_via_cpi`]'s executor window), and the
+    /// outer transition is unaffected.
+    fn require_not_reentrant(&self) -> Result<(), EscrowError> {
+        if self.reentrancy_lock {
+            return Err(EscrowError::ReentrantCall);
+        }
+        Ok(())
+    }
+
+    /// AV-36: whether the reentrancy lock is currently held. Intended
+    /// for tests and for the Anchor layer's CPI-context constraint —
+    /// it is `true` only inside [`Escrow::release_via_cpi`]'s executor
+    /// window. Never serialized (see the field docs).
+    pub fn is_reentrancy_locked(&self) -> bool {
+        self.reentrancy_lock
+    }
+
     /// Lock funds into the vault. `Uninitialized -> Funded` for a plain
     /// escrow, `Activated -> Funded` for a dual-signature escrow
     /// (AV-12): a single signature can create the escrow, but only the
     /// initializer *after both parties activated* may fund it.
     pub fn fund(&mut self, authority: [u8; 32]) -> Result<(), EscrowError> {
+        // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        self.require_not_reentrant()?;
         self.require_initializer(authority)?;
         match self.state {
             EscrowState::Uninitialized if !self.dual_sig_required() => {
@@ -1125,6 +1189,8 @@ impl Escrow {
         amount: u64,
         mint: Option<[u8; 32]>,
     ) -> Result<(u64, u64), EscrowError> {
+        // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        self.require_not_reentrant()?;
         self.require_initializer(authority)?;
         match self.state {
             EscrowState::Funded => {}
@@ -1230,6 +1296,10 @@ impl Escrow {
     where
         F: FnOnce(&CpiInvocation) -> Result<(), CpiError>,
     {
+        // AV-36: reentrancy guard first (see `require_not_reentrant`) —
+        // the executor window below is the one place untrusted code
+        // runs mid-transition.
+        self.require_not_reentrant()?;
         // Snapshot the three fields `release` mutates, so a failure
         // below restores them exactly. `release` itself is atomic — its
         // gates run before any mutation — so a gate failure needs no
@@ -1254,7 +1324,18 @@ impl Escrow {
             rollback(self);
             return Err(e);
         }
-        match execute_cpi(cpi) {
+        // AV-36: arm the reentrancy lock for the executor window — the
+        // only point where untrusted code runs while a transition is
+        // mid-flight. A callback that re-enters any fund-moving
+        // transition hits `require_not_reentrant` and fails with
+        // `ReentrantCall`; the lock is cleared on both outcomes so a
+        // failed executor never wedges the escrow (the rollback below
+        // restores `released` / `fees_paid` / `state`; the lock is not
+        // part of the persisted state and needs no rollback).
+        self.reentrancy_lock = true;
+        let outcome = execute_cpi(cpi);
+        self.reentrancy_lock = false;
+        match outcome {
             Ok(()) => Ok((payout, fee, cpi_call::cpi_receipt(cpi, payout, fee))),
             Err(_) => {
                 rollback(self);
@@ -1290,6 +1371,8 @@ impl Escrow {
         mint: Option<[u8; 32]>,
         refund_to: [u8; 32],
     ) -> Result<(), EscrowError> {
+        // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        self.require_not_reentrant()?;
         self.require_initializer(authority)?;
         match self.state {
             EscrowState::Funded => {
@@ -1361,6 +1444,8 @@ impl Escrow {
         mint: Option<[u8; 32]>,
         refund_to: [u8; 32],
     ) -> Result<(u64, u64), EscrowError> {
+        // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        self.require_not_reentrant()?;
         if authority != self.initializer && authority != self.taker {
             return Err(EscrowError::Unauthorized);
         }
@@ -1528,6 +1613,8 @@ impl Escrow {
         now: u64,
         mint: Option<[u8; 32]>,
     ) -> Result<(u64, u64), EscrowError> {
+        // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        self.require_not_reentrant()?;
         if authority != self.taker {
             return Err(EscrowError::Unauthorized);
         }
@@ -2111,6 +2198,8 @@ impl Escrow {
         taker_amount: u64,
         mint: Option<[u8; 32]>,
     ) -> Result<(u64, u64, u64), EscrowError> {
+        // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        self.require_not_reentrant()?;
         let arbiter = self.arbiter.ok_or(EscrowError::InvalidArbiter)?;
         match self.state {
             EscrowState::Disputed => {}
@@ -2170,6 +2259,8 @@ impl Escrow {
     /// `close` constraint and the runtime transfers the account's
     /// lamports to the initializer.
     pub fn close_vault(&mut self, authority: [u8; 32]) -> Result<u64, EscrowError> {
+        // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        self.require_not_reentrant()?;
         self.require_initializer(authority)?;
         match self.state {
             EscrowState::Cancelled | EscrowState::Released | EscrowState::Settled => {}
@@ -2299,6 +2390,8 @@ impl Escrow {
         index: u8,
         mint: Option<[u8; 32]>,
     ) -> Result<(u64, u64), EscrowError> {
+        // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        self.require_not_reentrant()?;
         self.require_initializer(authority)?;
         match self.state {
             EscrowState::Funded => {}
@@ -5953,6 +6046,11 @@ mod error_code_tests {
             121,
             "release_via_cpi whose injected CPI executor reported failure after the gates passed (whole release rolled back)",
         ),
+        (
+            EscrowError::ReentrantCall,
+            122,
+            "a fund-moving transition entered while the AV-36 reentrancy lock was held (nested entry from inside release_via_cpi's executor window)",
+        ),
     ];
 
     #[test]
@@ -6450,6 +6548,234 @@ mod error_code_tests {
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.penalty_bps(), 250, "failed reconfigure keeps the rate");
+    }
+
+    #[test]
+    fn reentrant_call_triggered_by_callback_inside_executor_window() {
+        // AV-36: the trigger is a hostile CPI target "calling back"
+        // into the escrow program mid-instruction. The pure-logic
+        // model smuggles a raw pointer to the live escrow into the
+        // injected executor (`addr_of_mut!` creates no borrow, so the
+        // outer `&mut` borrow for `release_via_cpi` is undisturbed) —
+        // safe Rust cannot express this reentry at all (the borrow
+        // checker rejects it), which is exactly why the runtime lock
+        // exists.
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        let inv = CpiInvocation {
+            program_id: [0xD1; 32],
+            accounts: vec![AccountMeta {
+                pubkey: [0x01; 32],
+                is_signer: false,
+                is_writable: true,
+            }],
+            data: vec![9],
+        };
+        let raw: *mut Escrow = std::ptr::addr_of_mut!(e);
+        let result = e.release_via_cpi(ALICE, 1_750_000_000, 1_000_000, None, &inv, |_| {
+            // Every fund-moving transition rejects the nested entry —
+            // before its authority check, so even the correctly-signed
+            // reentrant calls fail.
+            let nested = unsafe { &mut *raw };
+            assert_eq!(
+                nested.release(ALICE, 1_750_000_000, 100, None),
+                Err(EscrowError::ReentrantCall)
+            );
+            assert_eq!(
+                nested.cancel(ALICE, None, ALICE),
+                Err(EscrowError::ReentrantCall)
+            );
+            assert_eq!(
+                nested.fund(ALICE),
+                Err(EscrowError::ReentrantCall)
+            );
+            Ok(())
+        });
+        assert!(result.is_ok(), "the outer release must complete normally");
+        // The nested attempts changed nothing: one clean full release.
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert!(!e.is_reentrancy_locked(), "the lock is cleared on success");
+        // A failed executor also clears the lock — the escrow is never
+        // wedged.
+        let mut e2 = escrow();
+        e2.fund(ALICE).unwrap();
+        let err = e2.release_via_cpi(ALICE, 1_750_000_000, 1_000_000, None, &inv, |_| {
+            Err(CpiError::ZeroAddress)
+        });
+        assert_eq!(err, Err(EscrowError::CpiExecutionFailed));
+        assert!(!e2.is_reentrancy_locked());
+        assert_eq!(e2.state(), EscrowState::Funded);
+    }
+}
+
+// ---------- AV-36: reentrancy callback fuzz ----------
+//
+// Deterministic seeded fuzz over the hostile-callback scenario: the
+// injected CPI executor "calls back" into the escrow mid-release (a
+// smuggled raw pointer, the pure-logic model of a CPI target program
+// invoking the escrow program again mid-instruction — safe Rust cannot
+// express this, the borrow checker rejects it, which is why the
+// runtime lock exists). Every seed drives a different escrow
+// configuration through a partial plain release plus a CPI-routed
+// release whose executor fires a random burst of reentrant fund-moving
+// calls; each burst must be fully rejected with `ReentrantCall`, the
+// outer release must complete exactly as a benign control run, and the
+// lock must be clear afterwards. A second pass has the hostile
+// executor fail *after* its reentrant burst: the outer call must roll
+// back completely (`CpiExecutionFailed`) with the lock cleared.
+#[cfg(test)]
+mod reentrancy_fuzz_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const NOW: u64 = 1_750_000_000;
+    const SEEDS: u64 = 32;
+
+    /// xorshift64*: deterministic, dependency-free (same generator
+    /// family as the AV-03 / AV-08 / AV-30 harnesses).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            // Never zero: xorshift with a zero state never advances.
+            if x == 0 {
+                x = 0x9E3779B97F4A7C15;
+            }
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn dex_invocation() -> CpiInvocation {
+        CpiInvocation {
+            program_id: [0xD1; 32],
+            accounts: vec![AccountMeta {
+                pubkey: [0x01; 32],
+                is_signer: false,
+                is_writable: true,
+            }],
+            data: vec![9],
+        }
+    }
+
+    fn configured_escrow(rng: &mut Rng) -> (Escrow, Option<[u8; 32]>) {
+        let amount = 1 + rng.below(1_000_000_000);
+        let fee_bps = [0u16, 100, 10_000][rng.below(3) as usize];
+        let mint = if rng.below(2) == 0 {
+            None
+        } else {
+            Some([0xD0; 32])
+        };
+        let mut e = Escrow::initialize(ALICE, BOB, amount, u64::MAX).unwrap();
+        if fee_bps > 0 {
+            e = e.with_protocol_fee(fee_bps).unwrap();
+        }
+        if let Some(m) = mint {
+            e = e.with_mint(m).unwrap();
+        }
+        e.fund(ALICE).unwrap();
+        (e, mint)
+    }
+
+    /// Fire a burst of reentrant fund-moving calls at `nested` and
+    /// assert every one is rejected with `ReentrantCall` — including
+    /// wrongly-signed calls (the guard runs before the authority
+    /// check) and calls that would otherwise fail on config gates
+    /// (the guard runs before those too).
+    fn reentrant_burst(nested: &mut Escrow, mint: Option<[u8; 32]>, inv: &CpiInvocation, seed: u64) {
+        let mut r = Rng(seed);
+        for _ in 0..(1 + r.below(8)) {
+            let wrong_caller = r.below(4) == 0;
+            let authority = if wrong_caller { MALLORY } else { ALICE };
+            let err = match r.below(9) {
+                0 => nested.fund(authority).map(|_| ()),
+                1 => nested.release(authority, NOW, 1, mint).map(|_| ()),
+                2 => nested
+                    .release_via_cpi(authority, NOW, 1, mint, inv, |_| Ok(()))
+                    .map(|_| ()),
+                3 => nested.release_milestone(authority, NOW, 0, mint).map(|_| ()),
+                // BOB is the claim authority; ALICE/MALLORY are both
+                // "wrong" here — still ReentrantCall, guard first.
+                4 => nested.claim(if wrong_caller { ALICE } else { BOB }, NOW, mint).map(|_| ()),
+                5 => nested.cancel(authority, mint, ALICE).map(|_| ()),
+                6 => nested.cancel_expired(authority, NOW, mint, ALICE).map(|_| ()),
+                7 => nested.resolve(authority, 1, mint).map(|_| ()),
+                _ => nested.close_vault(authority).map(|_| ()),
+            };
+            assert_eq!(
+                err,
+                Err(EscrowError::ReentrantCall),
+                "reentrant burst call was not rejected as ReentrantCall"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_callback_bursts_are_rejected_and_change_nothing() {
+        for s in 0..SEEDS {
+            let mut rng = Rng(0xC0FFEE00 ^ (s.wrapping_mul(0x9E3779B97F4A7C15)));
+            let (mut e, mint) = configured_escrow(&mut rng);
+            let amount = e.amount();
+            // A partial plain release first: the CPI-routed release
+            // under attack is mid-lifecycle, not just the trivial
+            // full-release path.
+            let partial = amount / 3;
+            e.release(ALICE, NOW, partial, mint).unwrap();
+            let inv = dex_invocation();
+            let burst_seed = rng.next();
+            let raw: *mut Escrow = std::ptr::addr_of_mut!(e);
+            let result = e.release_via_cpi(ALICE, NOW, amount - partial, mint, &inv, |_| {
+                let nested = unsafe { &mut *raw };
+                reentrant_burst(nested, mint, &inv, burst_seed);
+                Ok(())
+            });
+            assert!(result.is_ok(), "seed {s}: outer release must complete");
+            // Bit-identical to a benign control run: the hostile
+            // bursts changed nothing observable.
+            let (mut control, _) = {
+                let mut rng2 = Rng(0xC0FFEE00 ^ (s.wrapping_mul(0x9E3779B97F4A7C15)));
+                configured_escrow(&mut rng2)
+            };
+            control.release(ALICE, NOW, partial, mint).unwrap();
+            let inv2 = dex_invocation();
+            control
+                .release_via_cpi(ALICE, NOW, amount - partial, mint, &inv2, |_| Ok(()))
+                .unwrap();
+            assert_eq!(e, control, "seed {s}: hostile run diverged from control");
+            assert!(!e.is_reentrancy_locked(), "seed {s}: lock not cleared");
+            assert_eq!(e.state(), EscrowState::Released);
+        }
+    }
+
+    #[test]
+    fn hostile_callback_then_executor_failure_rolls_back_cleanly() {
+        for s in 0..SEEDS {
+            let mut rng = Rng(0xBAD_C0DE ^ (s.wrapping_mul(0x9E3779B97F4A7C15)));
+            let (mut e, mint) = configured_escrow(&mut rng);
+            let before = e; // Escrow is Copy: exact pre-call snapshot.
+            let inv = dex_invocation();
+            let burst_seed = rng.next();
+            let raw: *mut Escrow = std::ptr::addr_of_mut!(e);
+            let err = e.release_via_cpi(ALICE, NOW, e.amount(), mint, &inv, |_| {
+                let nested = unsafe { &mut *raw };
+                reentrant_burst(nested, mint, &inv, burst_seed);
+                Err(CpiError::ZeroAddress)
+            });
+            assert_eq!(err, Err(EscrowError::CpiExecutionFailed), "seed {s}");
+            // Full rollback: the reentrant bursts *and* the settled
+            // release left no trace.
+            assert_eq!(e, before, "seed {s}: rollback incomplete");
+            assert!(!e.is_reentrancy_locked(), "seed {s}: lock not cleared");
+        }
     }
 }
 

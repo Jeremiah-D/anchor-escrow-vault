@@ -53,6 +53,12 @@
 //!   `Released` or `Settled`) and `to == Closed`:
 //!   `amounts.rent_reclaimed` carries the rent-exempt lamports the
 //!   initializer reclaimed, every other amount is zero.
+//! - A rejected reentrant entry (AV-36) emits
+//!   [`EscrowEventKind::ReentryRejected`] — the deliberate exception to
+//!   the "failed calls emit nothing" rule. A blocked reentry is a
+//!   security signal (a hostile CPI target attempting to re-enter the
+//!   program mid-instruction), and the indexer must see it in `seq`
+//!   order: `from == to ==` the current state, all amounts zero.
 //! - The `with_*` builders (`with_quorum`, `with_mint`, …) are
 //!   configuration, not transitions, and emit nothing.
 //!
@@ -81,7 +87,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, ReentryRejected (AV-36) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
@@ -132,6 +138,15 @@ pub enum EscrowEventKind {
     /// [`EventAmounts::rent_reclaimed`] carries the reclaimed lamports
     /// ([`crate::vault_close_rent_reclaimed`]).
     VaultClosed,
+    /// AV-36: a fund-moving transition was rejected as a reentrant
+    /// call ([`EscrowError::ReentrantCall`]) — a nested entry from
+    /// inside [`Escrow::release_via_cpi`]'s injected executor window.
+    /// `from == to ==` the current state, all amounts zero: nothing
+    /// moved. This is the deliberate exception to the "failed calls
+    /// emit nothing" rule — a blocked reentry is a security signal
+    /// (a hostile CPI target attempting to re-enter the program
+    /// mid-instruction), and the indexer must see it in `seq` order.
+    ReentryRejected,
 }
 
 /// Fund movements carried by an [`EscrowEvent`].
@@ -357,6 +372,39 @@ impl IndexedEscrow {
         self.events.push(event);
     }
 
+    /// AV-36: map a fund-moving transition's result, emitting
+    /// [`EscrowEventKind::ReentryRejected`] when the inner call was
+    /// rejected as a reentrant call ([`EscrowError::ReentrantCall`]).
+    /// This is the deliberate exception to the "failed calls emit
+    /// nothing" rule: a blocked reentry is a security signal — a
+    /// hostile CPI target attempting to re-enter the program
+    /// mid-instruction — and the indexer must see it in `seq` order.
+    /// Every other outcome passes through untouched; in particular a
+    /// rejection changes no state, so `from == to ==` the current
+    /// state and all amounts are zero.
+    fn map_reentrant<T>(
+        &mut self,
+        result: Result<T, EscrowError>,
+        at: u64,
+    ) -> Result<T, EscrowError> {
+        match result {
+            Err(EscrowError::ReentrantCall) => {
+                let state = self.inner.state();
+                self.push_event(
+                    EscrowEventKind::ReentryRejected,
+                    state,
+                    state,
+                    EventAmounts::none(),
+                    at,
+                    None,
+                    None,
+                );
+                Err(EscrowError::ReentrantCall)
+            }
+            other => other,
+        }
+    }
+
     /// The inner state machine (read-only: transitions go through this
     /// wrapper so the event log cannot drift from the state).
     pub fn inner(&self) -> &Escrow {
@@ -478,7 +526,12 @@ impl IndexedEscrow {
     /// `Funded`.
     pub fn fund(&mut self, authority: [u8; 32], at: u64) -> Result<(), EscrowError> {
         let from = self.inner.state();
-        self.inner.fund(authority)?;
+        // AV-36: a rejected reentrant entry emits `ReentryRejected`
+        // (the deliberate exception to the no-events-on-failure rule).
+        // (The inner result is bound first so its `&mut` borrow ends
+        // before `map_reentrant` reborrows `self`.)
+        let result = self.inner.fund(authority);
+        self.map_reentrant(result, at)?;
         self.push_event(
             EscrowEventKind::Funded,
             from,
@@ -507,7 +560,10 @@ impl IndexedEscrow {
         at: u64,
     ) -> Result<(u64, u64), EscrowError> {
         let from = self.inner.state();
-        let (payout, fee) = self.inner.release(authority, at, amount, mint)?;
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.release(authority, at, amount, mint);
+        let (payout, fee) = self.map_reentrant(result, at)?;
         // `amount` is the gross payout by construction
         // (`payout + fee == amount`); it cannot overflow u64 addition.
         self.push_event(
@@ -549,9 +605,12 @@ impl IndexedEscrow {
         F: FnOnce(&CpiInvocation) -> Result<(), CpiError>,
     {
         let from = self.inner.state();
-        let (payout, fee, receipt) =
-            self.inner
-                .release_via_cpi(authority, at, amount, mint, cpi, execute_cpi)?;
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self
+            .inner
+            .release_via_cpi(authority, at, amount, mint, cpi, execute_cpi);
+        let (payout, fee, receipt) = self.map_reentrant(result, at)?;
         // `amount` is the gross payout by construction
         // (`payout + fee == amount`); it cannot overflow u64 addition.
         self.push_event(
@@ -581,7 +640,10 @@ impl IndexedEscrow {
         at: u64,
     ) -> Result<(), EscrowError> {
         let from = self.inner.state();
-        self.inner.cancel(authority, mint, refund_to)?;
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.cancel(authority, mint, refund_to);
+        self.map_reentrant(result, at)?;
         let to = self.inner.state();
         let refund = self.inner.remaining_amount();
         self.push_event(
@@ -609,9 +671,12 @@ impl IndexedEscrow {
         refund_to: [u8; 32],
     ) -> Result<(u64, u64), EscrowError> {
         let from = self.inner.state();
-        let (refund, penalty) = self
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected` (`now` doubles as the event's `at`).
+        let result = self
             .inner
-            .cancel_expired(authority, now, mint, refund_to)?;
+            .cancel_expired(authority, now, mint, refund_to);
+        let (refund, penalty) = self.map_reentrant(result, now)?;
         let to = self.inner.state();
         self.push_event(
             EscrowEventKind::ExpiredCancelled,
@@ -699,7 +764,10 @@ impl IndexedEscrow {
         mint: Option<[u8; 32]>,
     ) -> Result<(u64, u64), EscrowError> {
         let from = self.inner.state();
-        let (payout, fee) = self.inner.claim(authority, now, mint)?;
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected` (`now` doubles as the event's `at`).
+        let result = self.inner.claim(authority, now, mint);
+        let (payout, fee) = self.map_reentrant(result, now)?;
         // `payout + fee` is the gross claimable (`<= amount`); no
         // overflow possible.
         self.push_event(
@@ -752,7 +820,10 @@ impl IndexedEscrow {
         at: u64,
     ) -> Result<(u64, u64, u64), EscrowError> {
         let from = self.inner.state();
-        let (payout, fee, refund) = self.inner.resolve(authority, taker_amount, mint)?;
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.resolve(authority, taker_amount, mint);
+        let (payout, fee, refund) = self.map_reentrant(result, at)?;
         // `taker_amount` is the gross taker share by construction
         // (`payout + fee == taker_amount`).
         let amounts = EventAmounts {
@@ -821,7 +892,12 @@ impl IndexedEscrow {
         at: u64,
     ) -> Result<(u64, u64), EscrowError> {
         let from = self.inner.state();
-        let (payout, fee) = self.inner.release_milestone(authority, at, index, mint)?;
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self
+            .inner
+            .release_milestone(authority, at, index, mint);
+        let (payout, fee) = self.map_reentrant(result, at)?;
         // `payout + fee` is the gross tranche (`<= amount`); no overflow
         // possible.
         self.push_event(
@@ -889,7 +965,10 @@ impl IndexedEscrow {
     /// amount like the inner method.
     pub fn close_vault(&mut self, authority: [u8; 32], at: u64) -> Result<u64, EscrowError> {
         let from = self.inner.state();
-        let rent = self.inner.close_vault(authority)?;
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.close_vault(authority);
+        let rent = self.map_reentrant(result, at)?;
         self.push_event(
             EscrowEventKind::VaultClosed,
             from,
@@ -1750,5 +1829,82 @@ mod event_tests {
         assert_eq!(event.cpi, None);
         // And no other event kind ever carries one either.
         assert!(e.events().iter().all(|ev| ev.cpi.is_none() || ev.kind == EscrowEventKind::Released));
+    }
+
+    // ----- AV-36: reentrancy rejection events -----
+
+    fn cpi_invocation() -> CpiInvocation {
+        CpiInvocation {
+            program_id: [0xD1; 32],
+            accounts: vec![AccountMeta {
+                pubkey: [0x01; 32],
+                is_signer: false,
+                is_writable: true,
+            }],
+            data: vec![9],
+        }
+    }
+
+    #[test]
+    fn reentry_rejected_event_fires_on_nested_entry() {
+        // A hostile executor "calls back" into the escrow mid-release
+        // (raw pointer past the &mut borrow — the pure-logic model of
+        // a CPI target re-entering the program). The reentrant call
+        // goes through the `IndexedEscrow` wrapper, so the rejection
+        // is rejected *and* recorded as a security signal.
+        let mut e = funded(1_000_000);
+        let events_before = e.event_count();
+        let inv = cpi_invocation();
+        let raw: *mut IndexedEscrow = std::ptr::addr_of_mut!(e);
+        e.release_via_cpi(ALICE, 1_000_000, None, T0 + 2, &inv, |_| {
+            let nested = unsafe { &mut *raw };
+            assert_eq!(
+                nested.release(ALICE, 100, None, T0 + 2),
+                Err(EscrowError::ReentrantCall)
+            );
+            Ok(())
+        })
+        .unwrap();
+        // The rejection emitted exactly one event: from == to == the
+        // state at executor time (the full release already settled, so
+        // `Released`), zero amounts, then the outer release's own
+        // event in seq order.
+        assert_eq!(e.event_count(), events_before + 2);
+        let rejected = e.events()[events_before];
+        assert_eq!(rejected.kind, EscrowEventKind::ReentryRejected);
+        assert_eq!(rejected.from, EscrowState::Released);
+        assert_eq!(rejected.to, EscrowState::Released);
+        assert_eq!(
+            rejected.amounts,
+            EventAmounts {
+                payout: 0,
+                fee: 0,
+                refund: 0,
+                penalty: 0,
+                rent_reclaimed: 0,
+            }
+        );
+        assert_eq!(rejected.seq + 1, last(&e).seq);
+        assert_eq!(last(&e).kind, EscrowEventKind::Released);
+        // The nested attempt changed nothing.
+        assert_eq!(e.inner().released_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn non_reentrant_failures_still_emit_nothing() {
+        // The ReentryRejected exception is narrow: ordinary failures
+        // keep the "failed calls emit nothing" rule.
+        let mut e = funded(1_000_000);
+        let events_before = e.event_count();
+        assert_eq!(
+            e.release(MALLORY, 100, None, T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), events_before);
+        assert_eq!(
+            e.cancel(ALICE, None, MALLORY, T0 + 2),
+            Err(EscrowError::RefundAddressMismatch)
+        );
+        assert_eq!(e.event_count(), events_before);
     }
 }

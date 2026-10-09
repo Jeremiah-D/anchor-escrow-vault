@@ -387,6 +387,7 @@ program error per variant):
 | `InvalidDecimals` | 119 | `with_decimals` with `decimals` > 18 (not a valid token precision) |
 | `InvalidCpiTarget` | 120 | `release_via_cpi` with a zero program id, an empty account list, or a zero account key (malformed third-party invocation) |
 | `CpiExecutionFailed` | 121 | `release_via_cpi` whose injected CPI executor reported failure after the gates passed (whole release rolled back) |
+| `ReentrantCall` | 122 | a fund-moving transition entered while the AV-36 reentrancy lock was held (nested entry from inside `release_via_cpi`'s executor window) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -979,6 +980,27 @@ becomes a leg of a larger composed transaction:
   transaction and no state change persists; the pure-logic model
   mirrors that atomicity. Nothing observable changes on failure: no
   event fires, no counter moves.
+- **Reentrancy guard (AV-36)**: the state machine arms a runtime
+  reentrancy lock around the injected executor — the one point where
+  untrusted code runs while a transition is mid-flight. Every
+  fund-moving transition (`fund`, `release`, `release_via_cpi`,
+  `release_milestone`, `claim`, `cancel`, `cancel_expired`, `resolve`,
+  `close_vault`) checks the lock first, before its authority check
+  (Solidity `nonReentrant`-style), and a nested entry fails with
+  `ReentrantCall` (code 122) regardless of its arguments. The lock is
+  cleared on both executor outcomes, so a failed executor never wedges
+  the escrow; it is process-memory only — not serialized, not part of
+  the vault account layout (`VAULT_FIELDS` unchanged). A blocked
+  reentry emits a `ReentryRejected` indexer event (`from == to ==` the
+  current state, zero amounts) — the deliberate exception to the
+  "failed calls emit nothing" rule, because a hostile CPI target
+  attempting to re-enter the program mid-instruction is a security
+  signal the indexer must see. The Anchor skeleton documents the same
+  constraint on its `ReleaseViaCpi` context: the real `invoke` runs
+  under the armed lock. Covered by a deterministic seeded fuzz (32
+  seeds × random escrow configs × hostile executor bursts asserting
+  every reentrant call is rejected and the outer release is
+  bit-identical to a benign control run).
 - **Audit**: success returns `CpiReceipt { cpi_target, accounts_hash,
   payout, fee }`, where `accounts_hash` is the SHA-256 over the
   canonical invocation encoding (program id + accounts with
