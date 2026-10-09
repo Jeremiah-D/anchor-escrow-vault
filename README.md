@@ -839,6 +839,38 @@ pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
 mainnet rent parameters the full vault needs **5,240,880 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
+## IDL pipeline (AV-29)
+
+`programs/escrow-vault/idl/escrow_vault.json` is a checked-in Anchor IDL
+for the program: every instruction (name, `sha256("global:<name>")[..8]`
+discriminator, args), the `Vault` account with per-field Borsh byte
+offsets, the `QuorumPolicy`/`VestingSchedule`/`MilestonePlan` subtypes,
+and the error code table.
+
+The Anchor/Solana BPF toolchain is unavailable in this environment, so
+the file is *generated*, not hand-written: `escrow-state/src/idl_json.rs`
+(a test-only pipeline) renders it deterministically from the single
+sources of truth — `VAULT_FIELDS` for the account layout, the
+`INSTRUCTIONS` spec table for instruction name/args, `EscrowError` for
+error codes. Regenerate with:
+
+```bash
+UPDATE_IDL=1 cargo test -p escrow-state idl_json
+```
+
+Without the variable, CI fails on any byte-level drift between the
+generator and the checked-in file. The pipeline tests pin the IDL in
+both directions: instruction name/args against the spec table,
+discriminators against FIPS-pinned SHA-256 vectors, and — the point of
+the item — every account field's IDL name/type/offset against the real
+bytes of the hand-written Borsh encoder (`encode_escrow`) for a
+fully-configured escrow, including the dispute path's `evidence_hash`
+region. The `"offset"` on each field is a pipeline extension (byte
+offset into the account data *including* the 8-byte Anchor
+discriminator); Anchor tooling ignores unknown JSON fields. When the
+Anchor toolchain is available, `anchor build` output should replace
+this file — the pinning tests then guard the real artifact instead.
+
 ## Run the tests
 
 ```bash

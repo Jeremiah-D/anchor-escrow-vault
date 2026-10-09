@@ -8,6 +8,8 @@
 mod events;
 mod keeper;
 mod snapshot;
+#[cfg(test)]
+mod idl_json;
 
 // AV-18: typed indexer events — an event-logging adapter over `Escrow`
 // plus the `EscrowEvent` / `EscrowEventKind` / `EventAmounts` record
@@ -3670,7 +3672,7 @@ mod quorum_tests {
 //   is the program layer's job. The spec marks this explicitly instead
 //   of hiding the seam.
 #[cfg(test)]
-mod anchor_idl_tests {
+pub(crate) mod anchor_idl_tests {
     use super::*;
     use std::collections::HashSet;
 
@@ -3682,19 +3684,21 @@ mod anchor_idl_tests {
     const EXPIRES_AT: u64 = 1_800_000_000;
 
     /// One IDL instruction and how it maps onto the state machine.
-    struct InstructionSpec {
+    /// `pub(crate)` so the AV-29 IDL pipeline (`idl_json`) can pin the
+    /// generated `escrow_vault.json` against this table in both directions.
+    pub(crate) struct InstructionSpec {
         /// Instruction name as it appears in the IDL.
-        name: &'static str,
+        pub(crate) name: &'static str,
         /// (param name, IDL type, value source). Empty when the
         /// instruction's inputs come entirely from accounts / sysvars.
-        params: &'static [(&'static str, &'static str, &'static str)],
+        pub(crate) params: &'static [(&'static str, &'static str, &'static str)],
         /// State-machine method this instruction must call.
-        method: &'static str,
+        pub(crate) method: &'static str,
         /// Which account / sysvar feeds which method argument.
-        input_mapping: &'static str,
+        pub(crate) input_mapping: &'static str,
     }
 
-    const INSTRUCTIONS: &[InstructionSpec] = &[
+    pub(crate) const INSTRUCTIONS: &[InstructionSpec] = &[
         InstructionSpec {
             name: "initialize",
             params: &[
@@ -6269,8 +6273,10 @@ mod account_space_tests {
     /// followed by zeroed quorum bytes, so `initialize_quorum` can write
     /// the policy in place without reallocating.
     /// Shared with the AV-22 evidence tests below, which pin the
-    /// `Some` encoding of the appended tail fields.
-    pub(super) fn encode_escrow(e: &Escrow) -> Vec<u8> {
+    /// `Some` encoding of the appended tail fields, and with the AV-29
+    /// IDL pipeline (`idl_json`), which pins the IDL field offsets
+    /// against these bytes.
+    pub(crate) fn encode_escrow(e: &Escrow) -> Vec<u8> {
         let mut out = Vec::with_capacity(ESCROW_BODY_LEN + 8);
         out.extend_from_slice(&e.initializer);
         out.extend_from_slice(&e.taker);
