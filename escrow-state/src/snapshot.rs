@@ -61,6 +61,7 @@ fn state_name(state: EscrowState) -> &'static str {
         EscrowState::Activated => "activated",
         EscrowState::Disputed => "disputed",
         EscrowState::Settled => "settled",
+        EscrowState::Closed => "closed",
     }
 }
 

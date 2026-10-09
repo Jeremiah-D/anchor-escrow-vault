@@ -198,6 +198,12 @@
       "args": [
         {"name": "decimals", "type": "u8"}
       ]
+    },
+    {
+      "name": "close_vault",
+      "discriminator": [141, 103, 17, 126, 72, 75, 29, 29],
+      "accounts": [],
+      "args": []
     }
   ],
   "accounts": [

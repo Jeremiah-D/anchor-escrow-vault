@@ -186,6 +186,7 @@ fn state_from_discriminant(d: u8) -> Result<EscrowState, AccountDecodeError> {
         4 => Ok(EscrowState::Activated),
         5 => Ok(EscrowState::Disputed),
         6 => Ok(EscrowState::Settled),
+        7 => Ok(EscrowState::Closed),
         other => Err(AccountDecodeError::InvalidStateDiscriminant(other)),
     }
 }
@@ -391,6 +392,9 @@ mod discriminator_tests {
         assert_eq!(EscrowState::Activated as u8, 4);
         assert_eq!(EscrowState::Disputed as u8, 5);
         assert_eq!(EscrowState::Settled as u8, 6);
+        // AV-34: appended after Settled so discriminants 0–6 stay
+        // stable for already-serialized vaults.
+        assert_eq!(EscrowState::Closed as u8, 7);
     }
 
     #[test]
@@ -573,7 +577,9 @@ mod discriminator_tests {
         let base = account_bytes(&funded(1_000_000, EXPIRES_AT));
         // `state` sits at offset 8 + 32 + 32 + 8 + 8 + 8 = 96.
         let state_off = ANCHOR_DISCRIMINATOR_LEN + 32 + 32 + 8 + 8 + 8;
-        for bad in [7u8, 42, 255] {
+        // AV-34: discriminant 7 is now valid (`Closed`); the first
+        // invalid byte is 8.
+        for bad in [8u8, 42, 255] {
             let mut b = base.clone();
             b[state_off] = bad;
             assert_eq!(
@@ -582,6 +588,13 @@ mod discriminator_tests {
                 "state byte {bad}"
             );
         }
+        // AV-34: discriminant 7 decodes to the new terminal state.
+        let mut closed = base.clone();
+        closed[state_off] = 7;
+        assert_eq!(
+            decode_vault_account(&closed).unwrap().state(),
+            EscrowState::Closed
+        );
         // `quorum` Option discriminant follows `state`: offset 97.
         let quorum_disc_off = state_off + 1;
         for bad in [2u8, 3, 255] {

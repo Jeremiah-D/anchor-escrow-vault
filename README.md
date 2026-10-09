@@ -86,6 +86,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_decimals(decimals)`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `decimals` is the SPL mint's decimal places — SPL mints declare at most 9, `> 18` is rejected; `0` = no decimal metadata; display-only, never gates a transition or moves funds) |
 | `cancel(authority, refund_to)`               | `Funded`       | `Cancelled` | initializer; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise |
 | `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); the refund still goes to the whitelisted address even when the taker calls; returns `(refund, penalty)` — a taker-initiated cancel with `penalty_bps > 0` slices an anti-griefing penalty for the initializer (see below) |
+| `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it) |
 
 Rules: the initializer drives `fund`/`release`/`cancel`; any other caller
 gets `Unauthorized` (checked before state validity). An escrow that has
@@ -627,11 +628,11 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `Attested`, `QuorumUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped` |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `Attested`, `QuorumUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `VaultClosed` |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
-| `amounts` | one struct for every kind: `payout` (gross taker amount before the fee split), `fee` (AV-17 protocol fee), `refund` (initializer's refund), `penalty` (AV-24 anti-griefing penalty on a taker-initiated `cancel_expired`); zeroed when the kind moves no such value |
+| `amounts` | one struct for every kind: `payout` (gross taker amount before the fee split), `fee` (AV-17 protocol fee), `refund` (initializer's refund), `penalty` (AV-24 anti-griefing penalty on a taker-initiated `cancel_expired`), `rent_reclaimed` (AV-34 rent-exempt deposit reclaimed on `VaultClosed`); zeroed when the kind moves no such value |
 | `at` | caller-supplied Unix-seconds timestamp (`cancel_expired` / `escalate` / `claim` reuse their `now`) |
 
 **Emission rule.** Exactly one event per *successful* call that changes
@@ -661,6 +662,10 @@ successful calls that change nothing observable:
   `(refund, penalty)` split in `amounts` (AV-24): a taker-initiated
   cancel carries the penalty earmarked for the initializer, an
   initializer-initiated cancel carries `penalty == 0`.
+- `close_vault` emits `VaultClosed` with `from` the terminal state the
+  escrow was in (`Cancelled` / `Released` / `Settled`) and `to ==
+  Closed`; `amounts.rent_reclaimed` carries the reclaimed rent-exempt
+  deposit (AV-34), every other amount is zero.
 - `drain_events()` takes the recorded events and clears the log; the
   sequence counter keeps running, so a resuming indexer never sees
   duplicates.
@@ -838,6 +843,32 @@ is declared).
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
 mainnet rent parameters the full vault needs **5,240,880 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
+
+### Terminal-state rent reclamation (AV-34)
+
+A vault account must carry the rent-exempt minimum for as long as the
+escrow lives — but once the escrow reaches a terminal state, the account
+serves no purpose and the lamports would stay locked forever if the
+account were never closed. `close_vault` lets the initializer reclaim
+the deposit:
+
+- **Gate:** only the initializer may close (`Unauthorized` otherwise,
+  checked before state validity); only `Cancelled`, `Released` and
+  `Settled` may be closed. `Disputed` is deliberately *not* closable —
+  the arbitration is still live and the vault is the arbiter's audit
+  surface.
+- **Effect:** the escrow moves to the new `Closed` state (discriminant
+  7, appended after `Settled` so discriminants 0–6 stay stable for
+  already-serialized vaults) — the deepest terminal: every transition,
+  and a second `close_vault`, is `InvalidStateTransition` from there.
+  No vault field is added or moved (`VAULT_SPACE` stays 625); the state
+  byte simply carries the new discriminant.
+- **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**5,240,880
+  lamports**, the same figure `initialize` demanded), carried in the
+  `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
+  real build closes the account with Anchor's `close` constraint and the
+  runtime transfers the account's lamports to the initializer.
 
 ## IDL pipeline (AV-29)
 

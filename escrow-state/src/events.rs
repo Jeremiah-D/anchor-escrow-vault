@@ -48,6 +48,11 @@
 //!   `EscrowState` variant does not change, but funds moved and the
 //!   payout stream must be complete for the indexer. A closing payout
 //!   has `to == Released`.
+//! - `close_vault` (AV-34) emits [`EscrowEventKind::VaultClosed`] with
+//!   `from` the terminal state the escrow was in (`Cancelled`,
+//!   `Released` or `Settled`) and `to == Closed`:
+//!   `amounts.rent_reclaimed` carries the rent-exempt lamports the
+//!   initializer reclaimed, every other amount is zero.
 //! - The `with_*` builders (`with_quorum`, `with_mint`, …) are
 //!   configuration, not transitions, and emit nothing.
 //!
@@ -82,6 +87,7 @@
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
 //! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
 //! | MilestoneSkipped | 0 | 0 | skipped tranche (the initializer's refund) | 0 |
+//! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //!
 //! # Backward compatibility
 //!
@@ -117,6 +123,13 @@ pub enum EscrowEventKind {
     /// current state; the new threshold is read from the vault, the
     /// event is the ordering signal.
     QuorumUpdated,
+    /// AV-34: the vault account was closed by the initializer and its
+    /// rent-exempt deposit reclaimed ([`Escrow::close_vault`]).
+    /// `from` is the terminal state the escrow was in (`Cancelled`,
+    /// `Released` or `Settled`), `to == Closed`, and
+    /// [`EventAmounts::rent_reclaimed`] carries the reclaimed lamports
+    /// ([`crate::vault_close_rent_reclaimed`]).
+    VaultClosed,
 }
 
 /// Fund movements carried by an [`EscrowEvent`].
@@ -125,16 +138,20 @@ pub enum EscrowEventKind {
 /// table): `payout` is the gross amount moved to the taker *before* the
 /// protocol-fee split (`payout - fee` is the taker's net), `fee` is the
 /// AV-17 protocol fee sliced from `payout`, `refund` is the amount
-/// returned to the initializer, and `penalty` is the AV-24 anti-griefing
+/// returned to the initializer, `penalty` is the AV-24 anti-griefing
 /// penalty sliced from the remainder on a taker-initiated
-/// `cancel_expired` (routed to the initializer as griefing compensation).
-/// All four are zero when the kind moves no such value.
+/// `cancel_expired` (routed to the initializer as griefing
+/// compensation), and `rent_reclaimed` is the AV-34 rent-exempt deposit
+/// returned to the initializer when the vault account is closed
+/// (non-zero only on `VaultClosed`). All fields are zero when the kind
+/// moves no such value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventAmounts {
     pub payout: u64,
     pub fee: u64,
     pub refund: u64,
     pub penalty: u64,
+    pub rent_reclaimed: u64,
 }
 
 impl EventAmounts {
@@ -145,6 +162,7 @@ impl EventAmounts {
             fee: 0,
             refund: 0,
             penalty: 0,
+            rent_reclaimed: 0,
         }
     }
 
@@ -155,6 +173,7 @@ impl EventAmounts {
             fee,
             refund: 0,
             penalty: 0,
+            rent_reclaimed: 0,
         }
     }
 
@@ -165,6 +184,7 @@ impl EventAmounts {
             fee: 0,
             refund,
             penalty: 0,
+            rent_reclaimed: 0,
         }
     }
 
@@ -177,6 +197,20 @@ impl EventAmounts {
             fee: 0,
             refund,
             penalty,
+            rent_reclaimed: 0,
+        }
+    }
+
+    /// A vault close (AV-34): the initializer reclaims the rent-exempt
+    /// deposit `rent`; every other field is zero — no payout, fee,
+    /// refund or penalty moves on close.
+    fn close(rent: u64) -> Self {
+        Self {
+            payout: 0,
+            fee: 0,
+            refund: 0,
+            penalty: 0,
+            rent_reclaimed: rent,
         }
     }
 }
@@ -217,7 +251,7 @@ pub struct EscrowEvent {
 /// constructor, then `activate`, `fund`, `attest`, `update_quorum`,
 /// `release`, `cancel`, `cancel_expired`, `claim`, `escalate`,
 /// `resolve`, `confirm_milestone`, `release_milestone`,
-/// `skip_milestone`) plus the `with_*` configuration builders,
+/// `skip_milestone`, `close_vault`) plus the `with_*` configuration builders,
 /// delegating every call to the inner state machine. Exactly one
 /// [`EscrowEvent`] is recorded per successful transition (see the module
 /// docs for the emission rule); failed calls record nothing.
@@ -641,6 +675,7 @@ impl IndexedEscrow {
             fee,
             refund,
             penalty: 0,
+            rent_reclaimed: 0,
         };
         // AV-22: the evidence hash survives `resolve` on the escrow, so
         // the settlement event carries the same commitment the
@@ -749,6 +784,33 @@ impl IndexedEscrow {
         }
         Ok(())
     }
+
+    /// Close the vault account and reclaim the rent-exempt deposit
+    /// (mirrors [`Escrow::close_vault`]). Only the initializer may call
+    /// this (`Unauthorized` otherwise, checked before state validity —
+    /// a stranger learns nothing about state); only the terminal
+    /// states `Cancelled`, `Released` and `Settled` may be closed
+    /// (`InvalidStateTransition` otherwise — `Disputed` is not a
+    /// terminal state, and `Closed` is the deepest terminal).
+    ///
+    /// Emits `VaultClosed` with `from` the terminal state the escrow
+    /// was in and `to == Closed`; `amounts.rent_reclaimed` carries the
+    /// reclaimed rent-exempt lamports
+    /// ([`crate::vault_close_rent_reclaimed`]). Returns the reclaimed
+    /// amount like the inner method.
+    pub fn close_vault(&mut self, authority: [u8; 32], at: u64) -> Result<u64, EscrowError> {
+        let from = self.inner.state();
+        let rent = self.inner.close_vault(authority)?;
+        self.push_event(
+            EscrowEventKind::VaultClosed,
+            from,
+            self.inner.state(),
+            EventAmounts::close(rent),
+            at,
+            None,
+        );
+        Ok(rent)
+    }
 }
 
 #[cfg(test)]
@@ -814,6 +876,7 @@ mod event_tests {
                 fee,
                 refund,
                 penalty: 0,
+                rent_reclaimed: 0,
             },
             "amounts"
         );
@@ -1433,5 +1496,99 @@ mod event_tests {
             EscrowEventKind::Cancelled,
             EscrowEventKind::ExpiredCancelled
         );
+    }
+
+    // ----- AV-34: terminal-state vault close with rent reclamation -----
+
+    fn terminal_indexed(state: EscrowState) -> IndexedEscrow {
+        let mut e = funded(1_000_000);
+        match state {
+            EscrowState::Cancelled => e.cancel(ALICE, None, ALICE, T0 + 2).unwrap(),
+            EscrowState::Released => {
+                e.release(ALICE, 1_000_000, None, T0 + 2).unwrap();
+            }
+            EscrowState::Settled => {
+                let mut d = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+                    .unwrap()
+                    .with_arbiter(ARBITER)
+                    .unwrap();
+                d.fund(ALICE, T0 + 1).unwrap();
+                d.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+                d.resolve(ARBITER, 0, None, T0 + 3).unwrap();
+                return d;
+            }
+            _ => panic!("not a terminal state"),
+        }
+        assert_eq!(e.inner().state(), state);
+        e
+    }
+
+    #[test]
+    fn close_vault_emits_vault_closed_with_reclaimed_rent() {
+        for state in [
+            EscrowState::Cancelled,
+            EscrowState::Released,
+            EscrowState::Settled,
+        ] {
+            let mut e = terminal_indexed(state);
+            let seq_before = e.next_seq();
+            let rent = e.close_vault(ALICE, T0 + 10).unwrap();
+            assert_eq!(
+                rent,
+                crate::vault_close_rent_reclaimed(),
+                "from {state:?}"
+            );
+            assert_eq!(e.inner().state(), EscrowState::Closed);
+            let event = last(&e);
+            assert_eq!(event.kind, EscrowEventKind::VaultClosed, "from {state:?}");
+            assert_eq!(event.seq, seq_before, "from {state:?}");
+            assert_eq!(event.from, state, "from {state:?}");
+            assert_eq!(event.to, EscrowState::Closed, "from {state:?}");
+            assert_eq!(event.escrow_id, ESCROW_ID, "from {state:?}");
+            assert_eq!(event.at, T0 + 10, "from {state:?}");
+            assert_eq!(event.evidence_hash, None, "from {state:?}");
+            assert_eq!(
+                event.amounts,
+                EventAmounts {
+                    payout: 0,
+                    fee: 0,
+                    refund: 0,
+                    penalty: 0,
+                    rent_reclaimed: crate::vault_close_rent_reclaimed(),
+                },
+                "from {state:?}: only rent_reclaimed carries value"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_close_vault_emits_nothing() {
+        // Stranger on a terminal vault: Unauthorized, checked before
+        // state validity.
+        let mut e = terminal_indexed(EscrowState::Cancelled);
+        let events_before = e.event_count();
+        assert_eq!(e.close_vault(MALLORY, T0 + 10), Err(EscrowError::Unauthorized));
+        assert_eq!(e.event_count(), events_before);
+        // Live escrow: InvalidStateTransition.
+        let mut funded = funded(1_000_000);
+        let events_before = funded.event_count();
+        assert_eq!(
+            funded.close_vault(ALICE, T0 + 10),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(funded.event_count(), events_before);
+        // Disputed is not terminal: the arbitration is still live.
+        let mut d = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        d.fund(ALICE, T0 + 1).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        let events_before = d.event_count();
+        assert_eq!(
+            d.close_vault(ALICE, T0 + 10),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(d.event_count(), events_before);
     }
 }

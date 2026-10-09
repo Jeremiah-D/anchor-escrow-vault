@@ -32,6 +32,12 @@
 //! `seq` so an off-chain indexer can subscribe to state changes in
 //! order instead of polling account data.
 //!
+//! The terminal-state vault close (`close_vault`) reclaims the
+//! rent-exempt deposit: once the escrow is `Cancelled`, `Released` or
+//! `Settled`, the initializer may close the vault account (Anchor
+//! `close` constraint) and recover the lamports it has carried since
+//! `initialize` — the escrow moves to `Closed`, the deepest terminal.
+//!
 //! To compile for real: `anchor build` with the Solana toolchain installed.
 
 use anchor_lang::prelude::*;
@@ -832,6 +838,59 @@ pub mod escrow_vault {
         // needed in the real build.
         Ok(())
     }
+
+    /// Close the vault account and reclaim the rent-exempt deposit
+    /// (`Cancelled | Released | Settled -> Closed`; mirrors
+    /// `Escrow::close_vault`). Only the initializer may call this —
+    /// the state machine checks authority before state validity
+    /// (`Unauthorized` otherwise, so strangers learn nothing about
+    /// state); only a terminal vault may be closed
+    /// (`InvalidStateTransition` otherwise — `Disputed` is not a
+    /// terminal state, and `Closed` is the deepest terminal, so a
+    /// second close fails too).
+    ///
+    /// Solana rent economics: the vault account has carried the
+    /// rent-exempt minimum for `escrow_state::VAULT_SPACE` since
+    /// `initialize` (see `escrow_state::check_vault_rent_exempt`); once
+    /// the escrow reached a terminal state the account serves no
+    /// purpose, but the lamports stay locked until the account closes.
+    /// The state machine returns the reclaimed amount
+    /// (`escrow_state::vault_close_rent_reclaimed`); in the real build
+    /// the account itself closes through Anchor's `close` constraint on
+    /// `CloseVault` — the runtime transfers the account's lamports
+    /// (including the rent-exempt deposit) to the initializer and zeroes
+    /// the account, so no explicit system-program CPI is needed.
+    /// AV-18: emits `VaultClosed` with `from` the terminal state and
+    /// `to == Closed`. The real build's `EscrowVaultEvent` gains a
+    /// `rent_reclaimed` amounts field mirroring
+    /// `escrow_state::EventAmounts::rent_reclaimed` (carrying the
+    /// returned amount); the skeleton's `emit_transition` keeps its
+    /// current shape until the real build wires the event struct.
+    pub fn close_vault(ctx: Context<CloseVault>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        // The reclaimed rent-exempt lamports
+        // (`escrow_state::vault_close_rent_reclaimed`): the real build's
+        // account-close transfers the account's lamports to
+        // `accounts.initializer` via the `close` constraint on
+        // `CloseVault` — the state machine moves no funds itself.
+        let _rent = escrow
+            .close_vault(ctx.accounts.initializer.key().to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::VaultClosed,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+        );
+        Ok(())
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -1058,6 +1117,10 @@ pub enum EscrowVaultEventKind {
     MilestoneConfirmed,
     MilestoneReleased,
     MilestoneSkipped,
+    /// AV-34: the vault account was closed by the initializer and its
+    /// rent-exempt deposit reclaimed (`Cancelled | Released | Settled ->
+    /// Closed`).
+    VaultClosed,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -1085,6 +1148,7 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         escrow_state::EscrowEventKind::MilestoneSkipped => {
             EscrowVaultEventKind::MilestoneSkipped
         }
+        escrow_state::EscrowEventKind::VaultClosed => EscrowVaultEventKind::VaultClosed,
     }
 }
 
@@ -1409,6 +1473,26 @@ pub struct InitializeGracePeriod<'info> {
     /// Only the initializer configures the grace period; the state
     /// machine rejects re-configuration once the escrow leaves
     /// `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CloseVault<'info> {
+    /// The vault closes through Anchor's `close` constraint: the runtime
+    /// transfers the account's lamports — including the rent-exempt
+    /// deposit (`escrow_state::vault_close_rent_reclaimed`, the same
+    /// figure `initialize` demanded via
+    /// `escrow_state::check_vault_rent_exempt`) — to `initializer` and
+    /// zeroes the account. `close` implies `mut`. In the real build this
+    /// is the account-close CPI: no explicit system-program instruction
+    /// is needed beyond the constraint.
+    #[account(mut, close = initializer)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer closes the vault; the state machine
+    /// additionally checks authority before state validity
+    /// (`Unauthorized` otherwise). A constraint in the real build
+    /// asserts `initializer.key() == vault.initializer`.
+    #[account(mut)]
     pub initializer: Signer<'info>,
 }
 

@@ -174,9 +174,21 @@ pub enum EscrowState {
     Disputed,
     /// AV-14: the arbiter settled the dispute (via [`Escrow::resolve`])
     /// with a single atomic split of the remaining locked funds between
-    /// taker (payout) and initializer (refund). Terminal: no transition
-    /// leaves `Settled`.
+    /// taker (payout) and initializer (refund). Terminal for fund
+    /// movements: no fund-moving transition leaves `Settled` — only
+    /// [`Escrow::close_vault`] (AV-34) retires the vault account itself
+    /// into [`EscrowState::Closed`] to reclaim the rent-exempt deposit.
     Settled,
+    /// AV-34: the vault account was closed and its rent-exempt deposit
+    /// reclaimed by the initializer (via [`Escrow::close_vault`).
+    /// Reachable only from the terminal states (`Cancelled`,
+    /// `Released`, `Settled`) — never from `Disputed`, where the
+    /// arbitration is still live. The deepest terminal: no transition
+    /// leaves `Closed`, and every existing transition's state match
+    /// rejects it with `InvalidStateTransition`. Appended last, so the
+    /// existing Borsh discriminants (0–6) stay stable for
+    /// already-serialized vaults.
+    Closed,
 }
 
 /// An escrow vault. Public keys are `[u8; 32]` so this crate stays
@@ -2011,6 +2023,47 @@ impl Escrow {
         Ok((taker_amount - fee, fee, remaining - taker_amount))
     }
 
+    /// Close the vault account and reclaim the rent-exempt deposit:
+    /// `Cancelled | Released | Settled -> Closed` (AV-34). Only the
+    /// initializer may call this — [`EscrowError::Unauthorized`]
+    /// otherwise, checked before state validity (so strangers learn
+    /// nothing about state, mirroring every other transition), then the
+    /// terminal-state gate ([`EscrowError::InvalidStateTransition`]).
+    ///
+    /// Solana rent economics: a vault account must carry the
+    /// rent-exempt minimum for [`VAULT_SPACE`] (see
+    /// [`check_vault_rent_exempt`]) for as long as the escrow lives.
+    /// Once the escrow reaches a terminal state the account has served
+    /// its purpose, but the lamports stay locked until the account is
+    /// closed — leaving them there would strand the deposit forever.
+    /// Closing from `Disputed` is deliberately rejected: the
+    /// arbitration is still live, and the vault account is the audit
+    /// surface the arbiter works from.
+    ///
+    /// `Closed` is the deepest terminal: no transition leaves it —
+    /// every existing transition's state match rejects it with
+    /// `InvalidStateTransition`, and a second `close_vault` fails the
+    /// same way. The account layout is untouched (`VAULT_FIELDS` /
+    /// `VAULT_SPACE` unchanged — the state byte simply carries the new
+    /// discriminant 7).
+    ///
+    /// Returns the rent-exempt lamports the initializer reclaims
+    /// ([`vault_close_rent_reclaimed`]): the mainnet rent-exempt
+    /// minimum for `VAULT_SPACE`, the same figure funded at
+    /// `initialize` time. The state machine moves no funds itself —
+    /// on-chain, the real build closes the account with Anchor's
+    /// `close` constraint and the runtime transfers the account's
+    /// lamports to the initializer.
+    pub fn close_vault(&mut self, authority: [u8; 32]) -> Result<u64, EscrowError> {
+        self.require_initializer(authority)?;
+        match self.state {
+            EscrowState::Cancelled | EscrowState::Released | EscrowState::Settled => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        self.state = EscrowState::Closed;
+        Ok(vault_close_rent_reclaimed())
+    }
+
     /// Attach a milestone tranche plan (AV-15). Builder-style: only valid
     /// on an `Uninitialized` escrow, so the release schedule is fixed
     /// before any funds move — mirroring [`Escrow::with_quorum`],
@@ -2654,6 +2707,25 @@ pub fn check_vault_rent_exempt(
     }
 }
 
+/// Rent-exempt lamports reclaimed by [`Escrow::close_vault`] (AV-34):
+/// the mainnet rent-exempt minimum for [`VAULT_SPACE`] — exactly the
+/// figure [`check_vault_rent_exempt`] required the vault to carry at
+/// `initialize` time, so closing the account returns the deposit in
+/// full. Off-chain mirror of the account-close transfer: the real
+/// build closes the vault account (Anchor `close` constraint) and the
+/// runtime transfers the account's actual lamports to the initializer;
+/// the program reads the rent parameters from the rent sysvar, while
+/// this function uses the mainnet defaults above for off-chain
+/// estimation (see the
+/// [`rent_exempt_minimum_lamports`] docs).
+pub fn vault_close_rent_reclaimed() -> u64 {
+    rent_exempt_minimum_lamports(
+        VAULT_SPACE,
+        MAINNET_LAMPORTS_PER_BYTE_YEAR,
+        MAINNET_EXEMPTION_THRESHOLD_YEARS,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2929,6 +3001,143 @@ mod tests {
         assert_eq!(e.release(BOB, 1_750_000_000, 1_000_000, None), Err(EscrowError::Unauthorized));
         assert_eq!(e.state(), EscrowState::Funded);
     }
+
+    // ---------- AV-34: terminal-state vault close with rent reclamation ----------
+
+    /// A terminal escrow in each of the three closeable states.
+    fn terminal_escrows() -> [(EscrowState, Escrow); 3] {
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Cancelled: unilateral refund path.
+        let mut cancelled = funded_escrow();
+        cancelled.cancel(ALICE, None, ALICE).unwrap();
+        // Released: full payout path.
+        let mut released = funded_escrow();
+        released.release(ALICE, EXPIRES_AT, 1_000_000, None).unwrap();
+        // Settled: arbiter split path (the whole remainder refunded).
+        let mut settled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        settled.fund(ALICE).unwrap();
+        settled.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        settled.resolve(ARBITER, 0, None).unwrap();
+        [
+            (EscrowState::Cancelled, cancelled),
+            (EscrowState::Released, released),
+            (EscrowState::Settled, settled),
+        ]
+    }
+
+    #[test]
+    fn close_vault_moves_every_terminal_state_to_closed_and_returns_rent() {
+        for (state, mut e) in terminal_escrows() {
+            assert_eq!(e.state(), state);
+            let rent = e.close_vault(ALICE).unwrap();
+            // The reclaimed rent is the mainnet rent-exempt minimum for
+            // VAULT_SPACE — hand-computed in
+            // rent_formula_matches_hand_computed_mainnet_numbers.
+            assert_eq!(rent, 5_240_880, "from {state:?}");
+            assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
+            assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
+        }
+    }
+
+    #[test]
+    fn close_vault_rejects_non_initializer_before_state() {
+        // Authority is checked before state validity: a stranger on a
+        // live escrow gets Unauthorized, not a state error.
+        for (_, mut e) in terminal_escrows() {
+            assert_eq!(e.close_vault(MALLORY), Err(EscrowError::Unauthorized));
+            assert_eq!(e.close_vault(BOB), Err(EscrowError::Unauthorized));
+        }
+        let mut funded = funded_escrow();
+        assert_eq!(
+            funded.close_vault(MALLORY),
+            Err(EscrowError::Unauthorized),
+            "authority first, even on a live escrow"
+        );
+    }
+
+    #[test]
+    fn close_vault_rejects_non_terminal_states() {
+        // A live escrow cannot be closed — the account still serves its
+        // purpose.
+        let mut funded = funded_escrow();
+        assert_eq!(
+            funded.close_vault(ALICE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(funded.state(), EscrowState::Funded);
+        let mut fresh = escrow();
+        assert_eq!(
+            fresh.close_vault(ALICE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed is deliberately NOT a terminal state: the arbitration
+        // is still live and the vault is the arbiter's audit surface.
+        const DISPUTE_ARBITER: [u8; 32] = [0xA8; 32];
+        let mut disputed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(DISPUTE_ARBITER)
+            .unwrap();
+        disputed.fund(ALICE).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        assert_eq!(disputed.state(), EscrowState::Disputed);
+        assert_eq!(
+            disputed.close_vault(ALICE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(disputed.state(), EscrowState::Disputed);
+    }
+
+    #[test]
+    fn closed_escrow_rejects_every_operation() {
+        for (state, mut e) in terminal_escrows() {
+            e.close_vault(ALICE).unwrap();
+            assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
+            // A second close fails like everything else.
+            assert_eq!(
+                e.close_vault(ALICE),
+                Err(EscrowError::InvalidStateTransition),
+                "from {state:?}: double close"
+            );
+            // Representative fund-moving and admin transitions all fail.
+            assert_eq!(
+                e.release(ALICE, EXPIRES_AT, 1, None),
+                Err(EscrowError::InvalidStateTransition),
+                "from {state:?}: release"
+            );
+            assert_eq!(
+                e.cancel(ALICE, None, ALICE),
+                Err(EscrowError::InvalidStateTransition),
+                "from {state:?}: cancel"
+            );
+            assert_eq!(
+                e.fund(ALICE),
+                Err(EscrowError::InvalidStateTransition),
+                "from {state:?}: fund"
+            );
+            assert_eq!(
+                e.activate(ALICE),
+                Err(EscrowError::InvalidStateTransition),
+                "from {state:?}: activate"
+            );
+        }
+    }
+
+    #[test]
+    fn close_vault_adds_no_fields_and_keeps_space() {
+        // AV-34 touches no persisted field: the state byte simply
+        // carries discriminant 7. The AV-10 pins hold unchanged —
+        // re-asserted here so this feature cannot silently grow the
+        // account (every byte of VAULT_SPACE is rent the initializer
+        // paid for).
+        assert_eq!(VAULT_SPACE, 625, "full Vault account space");
+        assert_eq!(
+            EscrowState::Closed as u8, 7,
+            "Closed appended last, discriminants 0-6 stable"
+        );
+    }
 }
 
 // ---------- AV-02: permission model, full negative coverage ----------
@@ -2957,7 +3166,7 @@ mod permission_tests {
     const ZERO_KEY: [u8; 32] = [0x00; 32];
     const EXPIRES_AT: u64 = 1_800_000_000;
 
-    const ALL_STATES: [EscrowState; 7] = [
+    const ALL_STATES: [EscrowState; 8] = [
         EscrowState::Uninitialized,
         EscrowState::Activated,
         EscrowState::Funded,
@@ -2965,12 +3174,15 @@ mod permission_tests {
         EscrowState::Cancelled,
         EscrowState::Disputed,
         EscrowState::Settled,
+        // AV-34: the closed vault is the deepest terminal — every
+        // transition must fail from here.
+        EscrowState::Closed,
     ];
 
     /// Arbiter key used to build the disputed / settled states.
     const ARBITER: [u8; 32] = [0xA8; 32];
 
-    /// Build an escrow in each of the seven lifecycle states.
+    /// Build an escrow in each of the eight lifecycle states.
     fn in_state(state: EscrowState) -> Escrow {
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         match state {
@@ -3004,6 +3216,13 @@ mod permission_tests {
                 e.fund(ALICE).unwrap();
                 e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
                 e.resolve(ARBITER, 600_000, None).unwrap();
+            }
+            EscrowState::Closed => {
+                // AV-34: the initializer reclaimed the rent after the
+                // escrow reached its terminal state.
+                e.fund(ALICE).unwrap();
+                e.cancel(ALICE, None, ALICE).unwrap();
+                e.close_vault(ALICE).unwrap();
             }
         }
         assert_eq!(e.state(), state);
@@ -3150,6 +3369,7 @@ mod permission_tests {
             assert_eq!(e.state(), state, "state must be unchanged");
         }
     }
+
 }
 
 // ---------- AV-03: model-based fuzz of amount conservation ----------
@@ -3750,6 +3970,7 @@ mod quorum_tests {
         e.release(ALICE, 1_750_000_000, 1_000_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
+
 }
 
 // ---------- AV-05: Anchor IDL <-> state machine input mapping ----------
@@ -4239,6 +4460,29 @@ pub(crate) mod anchor_idl_tests {
                             human-readable amounts in the keeper report \\
                             and the AV-26 snapshot export",
         },
+        InstructionSpec {
+            // AV-34: terminal-state vault close with rent reclamation.
+            name: "close_vault",
+            params: &[],
+            method: "Escrow::close_vault",
+            input_mapping: "authority <- accounts.initializer (signer); \\
+                            Cancelled | Released | Settled -> Closed — the \\
+                            state machine checks authority first \\
+                            (Unauthorized otherwise, before state \\
+                            validity), then the terminal-state gate \\
+                            (InvalidStateTransition otherwise; Disputed \\
+                            is not a terminal state and cannot be \\
+                            closed); Closed is the deepest terminal — no \\
+                            transition leaves it; returns the reclaimed \\
+                            rent-exempt lamports \\
+                            (escrow_state::vault_close_rent_reclaimed: \\
+                            the mainnet rent-exempt minimum for \\
+                            VAULT_SPACE), which the real build's account-\\
+                            close CPI (Anchor `close` constraint) \\
+                            transfers to the initializer; the vault \\
+                            account layout is untouched — no new fields, \\
+                            VAULT_SPACE unchanged",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -4291,6 +4535,7 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::with_penalty_bps",
             "Escrow::with_timelock",
             "Escrow::with_decimals",
+            "Escrow::close_vault",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -5085,6 +5330,66 @@ pub(crate) mod anchor_idl_tests {
             Err(EscrowError::Unauthorized)
         );
         assert_eq!(e.released_amount(), 500_000);
+    }
+
+    #[test]
+    fn close_vault_maps_initializer_signer_to_terminal_close() {
+        // IDL: close_vault() — no params; authority <-
+        // accounts.initializer (signer). Only the initializer may close
+        // a terminal vault (Unauthorized otherwise, checked before state
+        // validity); only Cancelled / Released / Settled may be closed
+        // (InvalidStateTransition otherwise). Returns the reclaimed
+        // rent-exempt lamports (escrow_state::vault_close_rent_reclaimed)
+        // so the program can size the account-close transfer.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        fn terminal(state: EscrowState) -> Escrow {
+            let mut e = funded_escrow();
+            match state {
+                EscrowState::Cancelled => {
+                    e.cancel(ALICE, None, ALICE).unwrap();
+                }
+                EscrowState::Released => {
+                    e.release(ALICE, EXPIRES_AT, 1_000_000, None).unwrap();
+                }
+                EscrowState::Settled => {
+                    let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                        .unwrap()
+                        .with_arbiter(ARBITER)
+                        .unwrap();
+                    d.fund(ALICE).unwrap();
+                    d.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+                    d.resolve(ARBITER, 0, None).unwrap();
+                    assert_eq!(d.state(), EscrowState::Settled);
+                    return d;
+                }
+                _ => panic!("not a terminal state"),
+            }
+            assert_eq!(e.state(), state);
+            e
+        }
+        for state in [
+            EscrowState::Cancelled,
+            EscrowState::Released,
+            EscrowState::Settled,
+        ] {
+            let mut e = terminal(state);
+            let rent = e.close_vault(ALICE).unwrap();
+            assert_eq!(rent, vault_close_rent_reclaimed());
+            assert_eq!(e.state(), EscrowState::Closed);
+        }
+        // Documented failure modes.
+        let mut funded = funded_escrow();
+        assert_eq!(
+            funded.close_vault(ALICE),
+            Err(EscrowError::InvalidStateTransition),
+            "a live escrow cannot be closed"
+        );
+        let mut funded = funded_escrow();
+        assert_eq!(
+            funded.close_vault(MALLORY),
+            Err(EscrowError::Unauthorized),
+            "a stranger learns nothing about state"
+        );
     }
 
     // ----- AV-10, second half: two-way vault-field <-> IDL consistency -----
@@ -6602,6 +6907,9 @@ mod account_space_tests {
         // stable for already-serialized vaults.
         assert_eq!(EscrowState::Disputed as u8, 5);
         assert_eq!(EscrowState::Settled as u8, 6);
+        // AV-34: appended after Settled so discriminants 0–6 stay
+        // stable for already-serialized vaults.
+        assert_eq!(EscrowState::Closed as u8, 7);
     }
 
     #[test]
@@ -6970,6 +7278,7 @@ mod account_space_tests {
             (128 + 100) * 1_000
         );
     }
+
 
     #[test]
     fn check_vault_rent_exempt_boundary() {
