@@ -10,6 +10,8 @@ mod keeper;
 mod snapshot;
 #[cfg(test)]
 mod idl_json;
+#[cfg(test)]
+mod sim;
 
 // AV-18: typed indexer events — an event-logging adapter over `Escrow`
 // plus the `EscrowEvent` / `EscrowEventKind` / `EventAmounts` record

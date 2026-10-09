@@ -871,6 +871,23 @@ discriminator); Anchor tooling ignores unknown JSON fields. When the
 Anchor toolchain is available, `anchor build` output should replace
 this file — the pinning tests then guard the real artifact instead.
 
+## Concurrent simulation runner (AV-30)
+
+`escrow-state/src/sim.rs` (test-only) is a deterministic off-chain
+simulation runner: each run interleaves random operations across several
+randomly-configured escrows (dual-sig, quorum, vesting, milestones, mint,
+fees, grace, penalties, timelock, decimals, arbiter — seeded, so every
+configuration is reproducible), advancing a shared clock so expiries and
+vesting curves are crossed mid-run. Every step asserts amount conservation
+(`deposited == paid_out + refunded + locked`), the protocol-fee bound
+(`fees_paid <= released`), and — via deliberately-invalid probes — the
+exact error for each illegal operation, pinning the documented check order
+(authority → state → config → amount) under interleaving. Three tests run
+it: 16 seeds × 500 steps × 6 escrows, a single escrow driven 2000 steps
+deep, and a determinism pin (same seed ⇒ identical run, so any failure is
+reproducible from the seed alone). It runs in CI with the rest of
+`cargo test -p escrow-state`.
+
 ## Run the tests
 
 ```bash
