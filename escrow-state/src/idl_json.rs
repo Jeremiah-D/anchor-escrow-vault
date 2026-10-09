@@ -170,6 +170,7 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         "String" => IdlType::Str,
         "Vec<Pubkey>" => IdlType::Vec(Box::new(IdlType::PublicKey)),
         "Vec<u64>" => IdlType::Vec(Box::new(IdlType::U64)),
+        "Vec<u8>" => IdlType::Vec(Box::new(IdlType::U8)),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         other => panic!("idl_json: unmapped instruction arg type string: {other}"),
     }
@@ -618,10 +619,10 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 20, "error variant count drift");
+    assert_eq!(errors.len(), 22, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
-    assert_eq!(EscrowError::InvalidDecimals.code(), 119);
+    assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
 }
 
 #[test]

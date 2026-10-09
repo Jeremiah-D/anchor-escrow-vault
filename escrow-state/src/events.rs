@@ -96,6 +96,8 @@
 //! dependency-free.
 
 use crate::{Escrow, EscrowError, EscrowState, MilestonePlan, QuorumPolicy, VestingSchedule};
+use crate::cpi::CpiError;
+use crate::cpi_call::{CpiInvocation, CpiReceipt};
 
 /// What kind of state change an [`EscrowEvent`] records.
 ///
@@ -215,6 +217,24 @@ impl EventAmounts {
     }
 }
 
+/// CPI-routing audit for a [`EscrowEvent`]: which third-party program a
+/// CPI-routed release invoked, and the SHA-256 commitment over the exact
+/// instruction the release authorized (AV-35).
+///
+/// An indexer re-derives [`cpi_accounts_hash`](super::cpi_accounts_hash)
+/// from the proposed instruction and compares it against
+/// `accounts_hash` — a swapped account, flag, or data byte changes the
+/// hash, so the audit trail pins the authorized instruction byte-exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpiRouteAudit {
+    /// The invoked third-party program (e.g. a DEX or lending program).
+    pub target: [u8; 32],
+    /// SHA-256 over the canonical encoding of the authorized
+    /// [`CpiInvocation`](super::CpiInvocation): program id, accounts
+    /// (key + signer/writable flags, in order), and data.
+    pub accounts_hash: [u8; 32],
+}
+
 /// One typed record of a state change, in per-escrow [`seq`](Self::seq)
 /// order.
 ///
@@ -230,6 +250,13 @@ impl EventAmounts {
 /// escalation, `Resolved` carries the hash the escrow still holds (the
 /// arbiter's settlement references the evidence it reviewed). It is
 /// `None` on every other kind — the event log never invents evidence.
+///
+/// `cpi` (AV-35) carries the CPI-routing audit on a `Released` event
+/// whose payout flowed through a third-party program
+/// ([`IndexedEscrow::release_via_cpi`]). It is `None` on every other
+/// kind — plain releases authorize no third-party instruction.
+///
+/// [`IndexedEscrow::release_via_cpi`]: IndexedEscrow::release_via_cpi
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EscrowEvent {
     pub kind: EscrowEventKind,
@@ -243,6 +270,7 @@ pub struct EscrowEvent {
     pub amounts: EventAmounts,
     pub at: u64,
     pub evidence_hash: Option<[u8; 32]>,
+    pub cpi: Option<CpiRouteAudit>,
 }
 
 /// An event-logging adapter over [`Escrow`] (AV-18).
@@ -298,6 +326,7 @@ impl IndexedEscrow {
             EventAmounts::none(),
             at,
             None,
+            None,
         );
         Ok(indexed)
     }
@@ -311,6 +340,7 @@ impl IndexedEscrow {
         amounts: EventAmounts,
         at: u64,
         evidence_hash: Option<[u8; 32]>,
+        cpi: Option<CpiRouteAudit>,
     ) {
         let event = EscrowEvent {
             kind,
@@ -321,6 +351,7 @@ impl IndexedEscrow {
             amounts,
             at,
             evidence_hash,
+            cpi,
         };
         self.next_seq += 1;
         self.events.push(event);
@@ -438,7 +469,7 @@ impl IndexedEscrow {
         self.inner.activate(authority)?;
         let to = self.inner.state();
         if to != from {
-            self.push_event(EscrowEventKind::Activated, from, to, EventAmounts::none(), at, None);
+            self.push_event(EscrowEventKind::Activated, from, to, EventAmounts::none(), at, None, None);
         }
         Ok(())
     }
@@ -454,6 +485,7 @@ impl IndexedEscrow {
             self.inner.state(),
             EventAmounts::none(),
             at,
+            None,
             None,
         );
         Ok(())
@@ -485,8 +517,56 @@ impl IndexedEscrow {
             EventAmounts::payout(amount, fee),
             at,
             None,
+            None,
         );
         Ok((payout, fee))
+    }
+
+    /// Release `amount` routed through a third-party program via CPI
+    /// (mirrors [`Escrow::release_via_cpi`]). Emits `Released` exactly
+    /// like [`IndexedEscrow::release`] — partial releases carry
+    /// `from == to == Funded`, the closing one `to == Released` — so
+    /// the payout stream stays complete in `seq` order, with the CPI
+    /// audit attached (`cpi.target` / `cpi.accounts_hash`): the
+    /// indexer's audit trail pins the exact instruction the release
+    /// authorized. On executor failure the state machine rolls back
+    /// and nothing is emitted, like every other failed transition.
+    /// Returns `(taker_payout, fee, receipt)` like the inner method.
+    /// `at` is both the event timestamp and the state machine's `now`.
+    ///
+    /// [`Escrow::release_via_cpi`]: super::Escrow::release_via_cpi
+    /// [`IndexedEscrow::release`]: IndexedEscrow::release
+    pub fn release_via_cpi<F>(
+        &mut self,
+        authority: [u8; 32],
+        amount: u64,
+        mint: Option<[u8; 32]>,
+        at: u64,
+        cpi: &CpiInvocation,
+        execute_cpi: F,
+    ) -> Result<(u64, u64, CpiReceipt), EscrowError>
+    where
+        F: FnOnce(&CpiInvocation) -> Result<(), CpiError>,
+    {
+        let from = self.inner.state();
+        let (payout, fee, receipt) =
+            self.inner
+                .release_via_cpi(authority, at, amount, mint, cpi, execute_cpi)?;
+        // `amount` is the gross payout by construction
+        // (`payout + fee == amount`); it cannot overflow u64 addition.
+        self.push_event(
+            EscrowEventKind::Released,
+            from,
+            self.inner.state(),
+            EventAmounts::payout(amount, fee),
+            at,
+            None,
+            Some(CpiRouteAudit {
+                target: receipt.cpi_target,
+                accounts_hash: receipt.accounts_hash,
+            }),
+        );
+        Ok((payout, fee, receipt))
     }
 
     /// Cancel the escrow and return funds (mirrors [`Escrow::cancel`]).
@@ -510,6 +590,7 @@ impl IndexedEscrow {
             to,
             EventAmounts::refund(refund),
             at,
+            None,
             None,
         );
         Ok(())
@@ -539,6 +620,7 @@ impl IndexedEscrow {
             EventAmounts::expired_cancel(refund, penalty),
             now,
             None,
+            None,
         );
         Ok((refund, penalty))
     }
@@ -566,7 +648,7 @@ impl IndexedEscrow {
         // on the error path.
         if after > before {
             let state = self.inner.state();
-            self.push_event(EscrowEventKind::Attested, state, state, EventAmounts::none(), at, None);
+            self.push_event(EscrowEventKind::Attested, state, state, EventAmounts::none(), at, None, None);
         }
         Ok(())
     }
@@ -600,6 +682,7 @@ impl IndexedEscrow {
                 EventAmounts::none(),
                 at,
                 None,
+                None,
             );
         }
         Ok(())
@@ -626,6 +709,7 @@ impl IndexedEscrow {
             EventAmounts::payout(payout + fee, fee),
             now,
             None,
+            None,
         );
         Ok((payout, fee))
     }
@@ -648,6 +732,7 @@ impl IndexedEscrow {
             EventAmounts::none(),
             now,
             evidence_hash,
+            None,
         );
         Ok(())
     }
@@ -688,6 +773,7 @@ impl IndexedEscrow {
             amounts,
             at,
             evidence_hash,
+            None,
         );
         Ok((payout, fee, refund))
     }
@@ -714,6 +800,7 @@ impl IndexedEscrow {
                 state,
                 EventAmounts::none(),
                 at,
+                None,
                 None,
             );
         }
@@ -743,6 +830,7 @@ impl IndexedEscrow {
             self.inner.state(),
             EventAmounts::payout(payout + fee, fee),
             at,
+            None,
             None,
         );
         Ok((payout, fee))
@@ -780,6 +868,7 @@ impl IndexedEscrow {
                 EventAmounts::refund(tranche),
                 at,
                 None,
+                None,
             );
         }
         Ok(())
@@ -808,6 +897,7 @@ impl IndexedEscrow {
             EventAmounts::close(rent),
             at,
             None,
+            None,
         );
         Ok(rent)
     }
@@ -816,7 +906,7 @@ impl IndexedEscrow {
 #[cfg(test)]
 mod event_tests {
     use super::*;
-    use crate::{EscrowState, MilestonePlan, QuorumPolicy, VestingSchedule};
+    use crate::{cpi_accounts_hash, AccountMeta, EscrowState, MilestonePlan, QuorumPolicy, VestingSchedule};
 
     const ALICE: [u8; 32] = [0xAA; 32];
     const BOB: [u8; 32] = [0xBB; 32];
@@ -1590,5 +1680,75 @@ mod event_tests {
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(d.event_count(), events_before);
+    }
+
+    // ----- AV-35: CPI-routed release events -----
+
+    fn dex_invocation() -> CpiInvocation {
+        CpiInvocation {
+            program_id: [0xD1; 32],
+            accounts: vec![
+                AccountMeta { pubkey: [1u8; 32], is_signer: true, is_writable: true },
+                AccountMeta { pubkey: [2u8; 32], is_signer: false, is_writable: true },
+            ],
+            data: vec![7, 7, 7],
+        }
+    }
+
+    #[test]
+    fn cpi_routed_release_emits_released_with_cpi_audit() {
+        let mut e = funded(1_000_000);
+        let inv = dex_invocation();
+        let (payout, fee, receipt) = e
+            .release_via_cpi(ALICE, 1_000_000, None, T0 + 2, &inv, |_| Ok(()))
+            .unwrap();
+        assert_eq!((payout, fee), (1_000_000, 0));
+        let event = last(&e);
+        assert_event(
+            &event,
+            EscrowEventKind::Released,
+            2,
+            EscrowState::Funded,
+            EscrowState::Released,
+            1_000_000,
+            0,
+            0,
+            T0 + 2,
+        );
+        // The audit trail pins the exact authorized instruction.
+        let audit = event.cpi.expect("CPI-routed release must carry the CPI audit");
+        assert_eq!(audit.target, [0xD1; 32]);
+        assert_eq!(audit.accounts_hash, receipt.accounts_hash);
+        assert_eq!(audit.accounts_hash, cpi_accounts_hash(&inv));
+    }
+
+    #[test]
+    fn failed_cpi_release_emits_nothing() {
+        let mut e = funded(1_000_000);
+        let inv = dex_invocation();
+        let events_before = e.event_count();
+        assert_eq!(
+            e.release_via_cpi(ALICE, 1_000_000, None, T0 + 2, &inv, |_| {
+                Err(CpiError::ZeroAddress)
+            }),
+            Err(EscrowError::CpiExecutionFailed)
+        );
+        assert_eq!(e.event_count(), events_before);
+        // The next successful release still gets the next seq — the
+        // failed one left no gap in the event log.
+        e.release_via_cpi(ALICE, 1_000_000, None, T0 + 3, &inv, |_| Ok(()))
+            .unwrap();
+        assert_eq!(last(&e).seq, events_before as u64);
+    }
+
+    #[test]
+    fn plain_release_carries_no_cpi_audit() {
+        let mut e = funded(1_000_000);
+        e.release(ALICE, 1_000_000, None, T0 + 2).unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::Released);
+        assert_eq!(event.cpi, None);
+        // And no other event kind ever carries one either.
+        assert!(e.events().iter().all(|ev| ev.cpi.is_none() || ev.kind == EscrowEventKind::Released));
     }
 }

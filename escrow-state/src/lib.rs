@@ -9,6 +9,10 @@ mod events;
 mod keeper;
 mod snapshot;
 mod cpi;
+// AV-35: CPI-routed release — third-party program invocation modeled as
+// data, validated before settlement, with an injected executor seam and
+// rollback on executor failure (mirrors on-chain CPI atomicity).
+mod cpi_call;
 // AV-32: Anchor account discriminators + panic-free vault account decoding
 // (production code: indexers and keeper tooling verify on-chain bytes).
 mod discriminator;
@@ -112,10 +116,15 @@ pub use cpi::{
     Pubkey, RefundAddrs, RefundKind, ResolveAddrs, SettlementPlan, TransferInstruction,
 };
 
+// AV-35: CPI-routed release — the third-party invocation as data, its
+// SHA-256 accounts-hash audit commitment, and the success receipt.
+// Purely additive: no existing signature changed.
+pub use cpi_call::{cpi_accounts_hash, CpiInvocation, CpiReceipt};
+
 // AV-18: typed indexer events — an event-logging adapter over `Escrow`
 // plus the `EscrowEvent` / `EscrowEventKind` / `EventAmounts` record
 // types. Purely additive: no existing signature changed.
-pub use events::{EscrowEvent, EscrowEventKind, EventAmounts, IndexedEscrow};
+pub use events::{CpiRouteAudit, EscrowEvent, EscrowEventKind, EventAmounts, IndexedEscrow};
 
 // AV-20: off-chain keeper report — scan a batch of escrows for executable
 // `cancel_expired` / `claim` calls and serialize the call list as JSON.
@@ -501,6 +510,23 @@ pub enum EscrowError {
     /// [`EscrowError::InvalidArbiter`], [`EscrowError::InvalidMint`] and
     /// [`EscrowError::InvalidProtocolFee`] (config error).
     InvalidDecimals,
+    /// CPI-routed release misconfiguration (AV-35):
+    /// [`Escrow::release_via_cpi`] with a zero program id, an empty
+    /// account list, or a zero account key — the invocation the vault
+    /// would authorize is malformed. Checked after the release gates
+    /// (mirroring `cancel`'s authority → state → mint → refund-input
+    /// order); the release is rolled back, so nothing observable
+    /// changes. Parallels [`EscrowError::InvalidMint`] (input-shape
+    /// error).
+    InvalidCpiTarget,
+    /// CPI execution failure (AV-35): the injected executor reported
+    /// failure after [`Escrow::release_via_cpi`]'s gates passed, so the
+    /// whole release was rolled back (`released`, `fees_paid` and
+    /// `state` restored to their pre-call values). On-chain a failed
+    /// CPI aborts the transaction and no state change persists — the
+    /// pure-logic model mirrors that atomicity. Nothing observable
+    /// changes on this error: no event fires, no counter moves.
+    CpiExecutionFailed,
 }
 
 impl EscrowError {
@@ -533,6 +559,8 @@ impl EscrowError {
             EscrowError::InvalidPenalty => 117,
             EscrowError::TimelockNotReached => 118,
             EscrowError::InvalidDecimals => 119,
+            EscrowError::InvalidCpiTarget => 120,
+            EscrowError::CpiExecutionFailed => 121,
         }
     }
 
@@ -559,6 +587,8 @@ impl EscrowError {
             EscrowError::InvalidPenalty,
             EscrowError::TimelockNotReached,
             EscrowError::InvalidDecimals,
+            EscrowError::InvalidCpiTarget,
+            EscrowError::CpiExecutionFailed,
         ]
     }
 }
@@ -1146,6 +1176,91 @@ impl Escrow {
             self.state = EscrowState::Released;
         }
         Ok((amount - fee, fee))
+    }
+
+    /// Release `amount` routed through a third-party program via CPI
+    /// (AV-35): the taker's payout flows into the target program's
+    /// instruction — a DEX swap, a lending-protocol deposit, a
+    /// streaming-payment splitter — instead of moving straight to the
+    /// taker wallet, so one release becomes a leg of a larger composed
+    /// transaction. The protocol fee still settles to the fee account
+    /// through the normal payout path (see [`cpi::payout_plan`]); fee
+    /// accounting is identical whether or not a release is CPI-routed.
+    ///
+    /// `cpi` is the invocation the vault authorizes: target program id,
+    /// the instruction's accounts, and its opaque data
+    /// ([`CpiInvocation`]). `execute_cpi` is the execution seam — the
+    /// Anchor layer plugs the real `invoke` here; off-chain callers and
+    /// tests inject a stub or a simulator. The executor sees the same
+    /// invocation the receipt commits to.
+    ///
+    /// Atomicity: the exact [`Escrow::release`] gates run first, so a
+    /// CPI-routed release is a release, not a bypass; then the
+    /// invocation shape is validated
+    /// ([`EscrowError::InvalidCpiTarget`] — zero program id, empty
+    /// account list, or zero account key; checked after the gates,
+    /// mirroring `cancel`'s authority → state → mint → refund-input
+    /// order). Only then does the state machine settle and hand the
+    /// invocation to the executor. If the executor reports failure the
+    /// whole release rolls back — `released`, `fees_paid` and `state`
+    /// are restored to their pre-call values — and the error is
+    /// [`EscrowError::CpiExecutionFailed`]. On-chain a failed CPI
+    /// aborts the transaction and no state change persists; the
+    /// pure-logic model mirrors that atomicity. Nothing observable
+    /// changes on failure: no event fires (see
+    /// [`IndexedEscrow::release_via_cpi`]), no counter moves.
+    ///
+    /// Returns `(taker_payout, fee, receipt)` like `release`, plus the
+    /// [`CpiReceipt`] audit record: `cpi_target` and the SHA-256
+    /// `accounts_hash` over the canonical invocation encoding, so an
+    /// indexer re-derives the hash and confirms the release authorized
+    /// exactly this instruction.
+    ///
+    /// [`cpi::payout_plan`]: crate::cpi::payout_plan
+    /// [`IndexedEscrow::release_via_cpi`]: crate::events::IndexedEscrow::release_via_cpi
+    pub fn release_via_cpi<F>(
+        &mut self,
+        authority: [u8; 32],
+        now: u64,
+        amount: u64,
+        mint: Option<[u8; 32]>,
+        cpi: &CpiInvocation,
+        execute_cpi: F,
+    ) -> Result<(u64, u64, CpiReceipt), EscrowError>
+    where
+        F: FnOnce(&CpiInvocation) -> Result<(), CpiError>,
+    {
+        // Snapshot the three fields `release` mutates, so a failure
+        // below restores them exactly. `release` itself is atomic — its
+        // gates run before any mutation — so a gate failure needs no
+        // rollback; the snapshot only serves the CPI validation and
+        // executor paths.
+        let snapshot = (self.released, self.fees_paid, self.state);
+        let rollback = |this: &mut Self| {
+            let (released, fees_paid, state) = snapshot;
+            this.released = released;
+            this.fees_paid = fees_paid;
+            this.state = state;
+        };
+        // Identical gates and fee math to `release`.
+        let (payout, fee) = match self.release(authority, now, amount, mint) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+        // Invocation-shape check after the gates (see the cancel-input
+        // ordering note above): a malformed invocation rolls the just-
+        // settled release back.
+        if let Err(e) = cpi_call::validate_cpi_invocation(cpi) {
+            rollback(self);
+            return Err(e);
+        }
+        match execute_cpi(cpi) {
+            Ok(()) => Ok((payout, fee, cpi_call::cpi_receipt(cpi, payout, fee))),
+            Err(_) => {
+                rollback(self);
+                Err(EscrowError::CpiExecutionFailed)
+            }
+        }
     }
 
     /// Cancel the escrow and return funds. `Funded -> Cancelled`.
@@ -4081,6 +4196,30 @@ pub(crate) mod anchor_idl_tests {
                             (TimelockNotReached while now < unlock_at)",
         },
         InstructionSpec {
+            name: "release_via_cpi",
+            params: &[
+                ("amount", "u64", "instruction param"),
+                ("cpi_data", "Vec<u8>", "instruction param: opaque target-instruction data"),
+            ],
+            method: "Escrow::release_via_cpi",
+            input_mapping: "authority <- accounts.initializer (signer); \
+                            amount, cpi_data <- params; now <- clock sysvar (NOT an \
+                            instruction param — see module docs); the third-party \
+                            invocation is built from accounts.remaining_accounts: \
+                            [0] is the target program id, [1..] are the target \
+                            instruction's accounts in its expected order \
+                            (cpi_invocation_from_remaining_accounts); the state \
+                            machine runs the exact `release` gates, validates the \
+                            invocation shape (InvalidCpiTarget — zero program id, \
+                            empty account list, or zero account key), and rolls \
+                            the whole release back when the injected executor \
+                            reports failure (CpiExecutionFailed — on-chain the \
+                            failed CPI aborts the transaction); returns \
+                            (taker_payout, fee) plus the CpiReceipt audit \
+                            (cpi_target + accounts_hash), which the `Released` \
+                            event carries for the indexer",
+        },
+        InstructionSpec {
             name: "cancel",
             params: &[],
             method: "Escrow::cancel",
@@ -4512,6 +4651,7 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::initialize",
             "Escrow::fund",
             "Escrow::release",
+            "Escrow::release_via_cpi",
             "Escrow::cancel",
             "Escrow::cancel_expired",
             "QuorumPolicy::new + Escrow::with_quorum",
@@ -4559,7 +4699,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_nineteen_instructions_take_params() {
+    fn only_twenty_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -4572,6 +4712,7 @@ pub(crate) mod anchor_idl_tests {
             vec![
                 &"initialize",
                 &"release",
+                &"release_via_cpi",
                 &"initialize_quorum",
                 &"update_quorum",
                 &"initialize_vesting",
@@ -4949,6 +5090,53 @@ pub(crate) mod anchor_idl_tests {
         e.attest(ATTESTOR_1).unwrap();
         assert_eq!(e.release(ALICE, 1_750_000_000, 1_000_000, None), Err(EscrowError::QuorumNotReached));
         assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn release_via_cpi_maps_params_and_remaining_accounts() {
+        // IDL: release_via_cpi(amount: u64, cpi_data: Vec<u8>) —
+        // authority <- accounts.initializer; amount, cpi_data <- params;
+        // now <- clock sysvar; the third-party invocation is built from
+        // accounts.remaining_accounts ([0] = target program, [1..] its
+        // instruction accounts). Executed against the real machine with
+        // a succeeding executor.
+        let inv = CpiInvocation {
+            program_id: [0xD1; 32],
+            accounts: vec![AccountMeta {
+                pubkey: [0xA1; 32],
+                is_signer: false,
+                is_writable: true,
+            }],
+            data: vec![9],
+        };
+        let mut e = funded_escrow();
+        let (payout, fee, receipt) = e
+            .release_via_cpi(ALICE, 1_750_000_000, 1_000_000, None, &inv, |_| Ok(()))
+            .unwrap();
+        assert_eq!((payout, fee), (1_000_000, 0));
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(receipt.cpi_target, [0xD1; 32]);
+        assert_eq!(receipt.accounts_hash, cpi_accounts_hash(&inv));
+        // Documented failure mode: the executor fails — the whole
+        // release rolls back (on-chain the CPI aborts the transaction).
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.release_via_cpi(ALICE, 1_750_000_000, 1_000_000, None, &inv, |_| {
+                Err(CpiError::ZeroAddress)
+            }),
+            Err(EscrowError::CpiExecutionFailed)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+        // Documented failure mode: malformed invocation (zero program
+        // id) — InvalidCpiTarget, nothing changes.
+        let mut e = funded_escrow();
+        let bad = CpiInvocation { program_id: [0u8; 32], ..inv.clone() };
+        assert_eq!(
+            e.release_via_cpi(ALICE, 1_750_000_000, 100, None, &bad, |_| Ok(())),
+            Err(EscrowError::InvalidCpiTarget)
+        );
+        assert_eq!(e.released_amount(), 0);
     }
 
     #[test]
@@ -5397,6 +5585,9 @@ pub(crate) mod anchor_idl_tests {
     // Direction 1 (IDL -> account): every instruction param must populate
     // exactly one vault field — a param that writes nothing (or writes an
     // undocumented field) is a spec lie the program would compile anyway.
+    // The documented exception is `TRANSIENT_PARAMS` below: params that
+    // are consumed at call time and never persisted (persistence is the
+    // default, transience the justified exception).
     // Direction 2 (account -> IDL): every vault field must have a
     // documented source — a field no instruction or account constraint
     // ever writes is dead space the `space =` rent pays for. A field may
@@ -5412,10 +5603,24 @@ pub(crate) mod anchor_idl_tests {
     // breaks one side until the other is updated.
 
     /// (instruction name, IDL param name) -> vault field path it populates.
+    ///
+    /// Transient params (see `TRANSIENT_PARAMS`) are exempt: they are
+    /// consumed at call time and never persisted, so they map to no
+    /// vault field.
+    const TRANSIENT_PARAMS: &[(&str, &str)] = &[
+        // AV-35: the target program's opaque instruction data rides the
+        // transaction and authorizes nothing persistent — the `Released`
+        // event's CPI audit (not the vault) is where it is recorded.
+        ("release_via_cpi", "cpi_data"),
+    ];
     const PARAM_FIELD_MAP: &[(&str, &str, &str)] = &[
         ("initialize", "amount", "amount"),
         ("initialize", "expires_at", "expires_at"),
         ("release", "amount", "released"),
+        // AV-35: the CPI-routed release accumulates into the same
+        // `released` counter — a second param source for the field (see
+        // the direction-2 note above).
+        ("release_via_cpi", "amount", "released"),
         ("initialize_quorum", "attestors", "quorum.attestors"),
         ("initialize_quorum", "threshold", "quorum.threshold"),
         // AV-25: the dual-signed governance update writes the same
@@ -5552,6 +5757,11 @@ pub(crate) mod anchor_idl_tests {
         let vault_fields = vault_field_paths();
         for spec in INSTRUCTIONS {
             for (param, _, _) in spec.params {
+                // Transient params are consumed at call time and never
+                // persisted — exempt by documented design, not by drift.
+                if TRANSIENT_PARAMS.contains(&(spec.name, *param)) {
+                    continue;
+                }
                 let targets: Vec<&&str> = PARAM_FIELD_MAP
                     .iter()
                     .filter(|(ix, p, _)| *ix == spec.name && *p == *param)
@@ -5732,6 +5942,16 @@ mod error_code_tests {
             EscrowError::InvalidDecimals,
             119,
             "with_decimals with decimals > 18 (not a valid token precision)",
+        ),
+        (
+            EscrowError::InvalidCpiTarget,
+            120,
+            "release_via_cpi with a zero program id, an empty account list, or a zero account key (malformed third-party invocation)",
+        ),
+        (
+            EscrowError::CpiExecutionFailed,
+            121,
+            "release_via_cpi whose injected CPI executor reported failure after the gates passed (whole release rolled back)",
         ),
     ];
 
@@ -10517,5 +10737,241 @@ mod quorum_governance_tests {
             Err(EscrowError::InvalidQuorum),
             "no quorum configured: InvalidQuorum, not a threshold complaint"
         );
+    }
+}
+
+// `release_via_cpi` (AV-35): the taker's payout flows into a third-party
+// program's instruction instead of moving straight to the taker wallet.
+// Same gates as `release`; the invocation shape is validated after the
+// gates; the injected executor's failure rolls the whole release back
+// (mirroring on-chain CPI atomicity); success returns the `CpiReceipt`
+// audit record (`cpi_target` + `accounts_hash`).
+#[cfg(test)]
+mod cpi_release_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ATTESTOR_1: [u8; 32] = [0xA1; 32];
+    const ATTESTOR_2: [u8; 32] = [0xA2; 32];
+    const DEX: [u8; 32] = [0xD1; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn key(n: u8) -> Pubkey {
+        [n; 32]
+    }
+
+    fn funded() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn dex_invocation() -> CpiInvocation {
+        CpiInvocation {
+            program_id: DEX,
+            accounts: vec![
+                AccountMeta { pubkey: key(1), is_signer: true, is_writable: true },
+                AccountMeta { pubkey: key(2), is_signer: false, is_writable: true },
+            ],
+            data: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn happy_path_full_cpi_release() {
+        let mut e = funded();
+        let inv = dex_invocation();
+        let (payout, fee, receipt) = e
+            .release_via_cpi(ALICE, NOW, 1_000_000, None, &inv, |_| Ok(()))
+            .unwrap();
+        assert_eq!((payout, fee), (1_000_000, 0));
+        assert_eq!(receipt.cpi_target, DEX);
+        assert_eq!(receipt.accounts_hash, cpi_accounts_hash(&inv));
+        assert_eq!((receipt.payout, receipt.fee), (1_000_000, 0));
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.released_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn partial_cpi_releases_accumulate_like_plain_release() {
+        let mut e = funded();
+        let inv = dex_invocation();
+        let (payout, fee, _) = e
+            .release_via_cpi(ALICE, NOW, 400_000, None, &inv, |_| Ok(()))
+            .unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 400_000);
+        e.release_via_cpi(ALICE, NOW, 600_000, None, &inv, |_| Ok(()))
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.released_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn gates_match_plain_release() {
+        let inv = dex_invocation();
+        // Unauthorized: a stranger's CPI-routed release is rejected like
+        // a plain one.
+        let mut e = funded();
+        assert_eq!(
+            e.release_via_cpi(MALLORY, NOW, 100, None, &inv, |_| Ok(())),
+            Err(EscrowError::Unauthorized)
+        );
+        // State: release before fund.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            e.release_via_cpi(ALICE, NOW, 100, None, &inv, |_| Ok(())),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Amount: zero is AmountMismatch, not a CPI error.
+        let mut e = funded();
+        assert_eq!(
+            e.release_via_cpi(ALICE, NOW, 0, None, &inv, |_| Ok(())),
+            Err(EscrowError::AmountMismatch)
+        );
+        // Quorum: unattested quorum blocks CPI-routed releases too.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e = e
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.release_via_cpi(ALICE, NOW, 100, None, &inv, |_| Ok(())),
+            Err(EscrowError::QuorumNotReached)
+        );
+        // Timelock: now < unlock_at blocks the CPI path as well.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e = e.with_timelock(NOW + 1_000).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.release_via_cpi(ALICE, NOW, 100, None, &inv, |_| Ok(())),
+            Err(EscrowError::TimelockNotReached)
+        );
+        // Mint: the gate runs before any CPI validation.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e = e
+            .with_mint(
+                crate::parse_mint_address("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap(),
+            )
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let mut bad_inv = dex_invocation();
+        bad_inv.program_id = [0u8; 32];
+        assert_eq!(
+            e.release_via_cpi(ALICE, NOW, 100, None, &bad_inv, |_| Ok(())),
+            Err(EscrowError::MintMismatch),
+            "gates run before CPI-shape validation"
+        );
+    }
+
+    #[test]
+    fn malformed_invocation_is_invalid_cpi_target_and_changes_nothing() {
+        let cases: Vec<CpiInvocation> = vec![
+            CpiInvocation { program_id: [0u8; 32], accounts: dex_invocation().accounts, data: vec![] },
+            CpiInvocation { program_id: DEX, accounts: vec![], data: vec![] },
+            CpiInvocation {
+                program_id: DEX,
+                accounts: vec![AccountMeta { pubkey: [0u8; 32], is_signer: false, is_writable: true }],
+                data: vec![],
+            },
+        ];
+        for inv in &cases {
+            let mut e = funded();
+            assert_eq!(
+                e.release_via_cpi(ALICE, NOW, 100, None, inv, |_| Ok(())),
+                Err(EscrowError::InvalidCpiTarget)
+            );
+            // Rolled back: the release never happened.
+            assert_eq!(e.state(), EscrowState::Funded);
+            assert_eq!(e.released_amount(), 0);
+            assert_eq!(e.fees_paid(), 0);
+        }
+    }
+
+    #[test]
+    fn executor_failure_rolls_back_the_whole_release() {
+        let mut e = funded();
+        let inv = dex_invocation();
+        let err = e.release_via_cpi(ALICE, NOW, 1_000_000, None, &inv, |_| {
+            Err(CpiError::ZeroAddress)
+        });
+        assert_eq!(err, Err(EscrowError::CpiExecutionFailed));
+        // Nothing observable changed: the chain would have aborted the
+        // transaction, and the model restores the pre-call snapshot.
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.fees_paid(), 0);
+    }
+
+    #[test]
+    fn executor_failure_after_partial_release_restores_the_partial() {
+        let mut e = funded();
+        let inv = dex_invocation();
+        e.release_via_cpi(ALICE, NOW, 400_000, None, &inv, |_| Ok(()))
+            .unwrap();
+        assert_eq!(e.released_amount(), 400_000);
+        let err = e.release_via_cpi(ALICE, NOW, 600_000, None, &inv, |_| {
+            Err(CpiError::ZeroAddress)
+        });
+        assert_eq!(err, Err(EscrowError::CpiExecutionFailed));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 400_000);
+        // And the escrow still works: a retry with a healthy executor
+        // completes the release.
+        e.release_via_cpi(ALICE, NOW, 600_000, None, &inv, |_| Ok(()))
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn protocol_fee_still_settles_through_the_normal_path() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e = e.with_protocol_fee(250).unwrap();
+        e.fund(ALICE).unwrap();
+        let inv = dex_invocation();
+        let (payout, fee, receipt) = e
+            .release_via_cpi(ALICE, NOW, 1_000_000, None, &inv, |_| Ok(()))
+            .unwrap();
+        // 250 bps of 1_000_000.
+        assert_eq!((payout, fee), (975_000, 25_000));
+        assert_eq!((receipt.payout, receipt.fee), (975_000, 25_000));
+        assert_eq!(e.fees_paid(), 25_000);
+        // The gross still accumulates in `released`: the conservation
+        // invariant is untouched by CPI routing.
+        assert_eq!(e.released_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn executor_receives_the_exact_authorized_invocation() {
+        let mut e = funded();
+        let inv = dex_invocation();
+        let expected = inv.clone();
+        e.release_via_cpi(ALICE, NOW, 100, None, &inv, |seen| {
+            assert_eq!(seen.program_id, expected.program_id);
+            assert_eq!(seen.accounts, expected.accounts);
+            assert_eq!(seen.data, expected.data);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn receipt_hash_pins_the_exact_invocation_bytes() {
+        let mut e = funded();
+        let inv = dex_invocation();
+        let (_, _, receipt) = e
+            .release_via_cpi(ALICE, NOW, 100, None, &inv, |_| Ok(()))
+            .unwrap();
+        assert_eq!(receipt.accounts_hash, cpi_accounts_hash(&inv));
+        // A tampered invocation (same program, one flag flipped) hashes
+        // differently — the audit trail would catch the swap.
+        let mut tampered = inv.clone();
+        tampered.accounts[1].is_signer = true;
+        assert_ne!(cpi_accounts_hash(&tampered), receipt.accounts_hash);
     }
 }

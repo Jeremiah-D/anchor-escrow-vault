@@ -385,6 +385,8 @@ program error per variant):
 | `InvalidPenalty` | 117 | `with_penalty_bps` with `penalty_bps` > 10_000 (not a valid basis-point rate) |
 | `TimelockNotReached` | 118 | `release`/`claim`/`release_milestone` while `now < unlock_at` (AV-27 timelock); `cancel`/`cancel_expired`/`resolve` are never gated |
 | `InvalidDecimals` | 119 | `with_decimals` with `decimals` > 18 (not a valid token precision) |
+| `InvalidCpiTarget` | 120 | `release_via_cpi` with a zero program id, an empty account list, or a zero account key (malformed third-party invocation) |
+| `CpiExecutionFailed` | 121 | `release_via_cpi` whose injected CPI executor reported failure after the gates passed (whole release rolled back) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -949,6 +951,44 @@ matching `cpi::*_plan`, and executes each validated leg (native legs via
 `invoke`/`invoke_signed` with the vault seeds, SPL legs via
 `anchor_spl::token::transfer`). Because the program never hand-rolls
 instruction bytes, the on-chain code cannot drift from the tested layout.
+
+## CPI-routed release (AV-35)
+
+`escrow-state/src/cpi_call.rs` models the release path where the taker's
+payout flows *through* a third-party program — a DEX swap, a lending
+deposit — instead of moving straight to the taker wallet, so one release
+becomes a leg of a larger composed transaction:
+
+- **Invocation as data**: `CpiInvocation { program_id, accounts,
+  data }` is the inner instruction the vault authorizes. The Anchor
+  skeleton's `release_via_cpi(amount, cpi_data)` instruction builds it
+  from `remaining_accounts` (`[0]` = target program, `[1..]` its
+  instruction accounts) via `cpi_invocation_from_remaining_accounts`;
+  `cpi_invoke_target` is the stub where the real build performs the
+  `invoke_signed` with the vault PDA as signer.
+- **Same gates, then validation**: `Escrow::release_via_cpi` runs the
+  exact `release` gates (authority, state, mint, milestone plan,
+  quorum, timelock, amount — a CPI-routed release is a release, not a
+  bypass), then validates the invocation shape (`InvalidCpiTarget`,
+  code 120: zero program id, empty account list, or zero account key).
+- **Atomicity**: the state machine hands the validated invocation to an
+  injected executor (the seam where the Anchor layer plugs the real
+  `invoke`). If the executor reports failure, the whole release rolls
+  back — `released`, `fees_paid` and `state` restored — and the error
+  is `CpiExecutionFailed` (code 121). On-chain a failed CPI aborts the
+  transaction and no state change persists; the pure-logic model
+  mirrors that atomicity. Nothing observable changes on failure: no
+  event fires, no counter moves.
+- **Audit**: success returns `CpiReceipt { cpi_target, accounts_hash,
+  payout, fee }`, where `accounts_hash` is the SHA-256 over the
+  canonical invocation encoding (program id + accounts with
+  signer/writable flags + data). The `Released` indexer event carries
+  the same audit (`EscrowEvent.cpi`, mirrored on-chain as
+  `EscrowVaultEvent.cpi_target` / `cpi_accounts_hash`), so an indexer
+  re-derives the hash and confirms the release authorized exactly this
+  instruction. The protocol fee still settles to the fee account through
+  the normal payout path, so fee accounting is identical with or
+  without CPI routing.
 
 ## Account discriminators & panic-free decoding (AV-32)
 

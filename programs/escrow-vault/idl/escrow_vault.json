@@ -26,6 +26,15 @@
       ]
     },
     {
+      "name": "release_via_cpi",
+      "discriminator": [25, 119, 163, 178, 107, 93, 139, 68],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"},
+        {"name": "cpi_data", "type": {"vec": "u8"}}
+      ]
+    },
+    {
       "name": "cancel",
       "discriminator": [232, 219, 223, 41, 219, 236, 220, 190],
       "accounts": [],
@@ -292,7 +301,9 @@
     {"code": 116, "name": "RefundAddressMismatch"},
     {"code": 117, "name": "InvalidPenalty"},
     {"code": 118, "name": "TimelockNotReached"},
-    {"code": 119, "name": "InvalidDecimals"}
+    {"code": 119, "name": "InvalidDecimals"},
+    {"code": 120, "name": "InvalidCpiTarget"},
+    {"code": 121, "name": "CpiExecutionFailed"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

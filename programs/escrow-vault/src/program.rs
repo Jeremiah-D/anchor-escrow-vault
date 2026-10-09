@@ -73,6 +73,8 @@ pub mod escrow_vault {
             0,
             Clock::get()?.unix_timestamp as u64,
             None,
+            None,
+            None,
         );
         Ok(())
     }
@@ -96,6 +98,8 @@ pub mod escrow_vault {
             0,
             0,
             Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
             None,
         );
         Ok(())
@@ -147,6 +151,74 @@ pub mod escrow_vault {
             0,
             Clock::get()?.unix_timestamp as u64,
             None,
+            None,
+            None,
+        );
+        Ok((payout, fee))
+    }
+
+    /// Release `amount` routed through a third-party program via CPI
+    /// (AV-35): the taker's payout flows into the target program's
+    /// instruction — a DEX swap, a lending-protocol deposit — instead of
+    /// moving straight to the taker wallet. The target program is
+    /// `ctx.remaining_accounts[0]`; `ctx.remaining_accounts[1..]` are
+    /// the target instruction's accounts in its expected order;
+    /// `cpi_data` is the target instruction's opaque data. The state
+    /// machine (`escrow_state::Escrow::release_via_cpi`) runs the exact
+    /// `release` gates, validates the invocation shape, and — on
+    /// executor failure — rolls the whole release back, mirroring the
+    /// chain's CPI atomicity. The protocol fee still settles to the fee
+    /// account through the normal payout path. Returns
+    /// `(taker_payout, fee)`; the CPI audit (`cpi_target` +
+    /// `cpi_accounts_hash`) rides on the `Released` event.
+    pub fn release_via_cpi(
+        ctx: Context<ReleaseViaCpi>,
+        amount: u64,
+        cpi_data: Vec<u8>,
+    ) -> Result<(u64, u64)> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        // AV-27: the timelock gate reads the Solana clock sysvar — never
+        // an instruction param.
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        // Build the third-party invocation from the remaining accounts:
+        // [0] is the target program, [1..] its instruction accounts.
+        let invocation = cpi_invocation_from_remaining_accounts(
+            ctx.remaining_accounts,
+            cpi_data,
+        )?;
+        let (payout, fee, receipt) = escrow
+            .release_via_cpi(
+                ctx.accounts.initializer.key().to_bytes(),
+                now,
+                amount,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+                &invocation,
+                // The execution seam: the real build invokes the target
+                // program here via `cpi_invoke_target` below. A failed
+                // invoke aborts the transaction, so no state change
+                // persists — the state machine's rollback models exactly
+                // this.
+                |inv| cpi_invoke_target(&ctx, inv),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `payout + fee` is the gross amount (== the `amount`
+        // param); partial releases carry from == to == Funded, the
+        // closing one to == Released. AV-35: the Released event carries
+        // the CPI audit so the indexer pins the authorized instruction.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Released,
+            from,
+            escrow.state() as u8,
+            payout + fee,
+            fee,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            Some(receipt.cpi_target),
+            Some(receipt.accounts_hash),
         );
         Ok((payout, fee))
     }
@@ -186,6 +258,8 @@ pub mod escrow_vault {
             0,
             escrow.remaining_amount(),
             Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
             None,
         );
         Ok(())
@@ -244,6 +318,8 @@ pub mod escrow_vault {
             refund,
             now,
             None,
+            None,
+            None,
         );
         Ok(())
     }
@@ -300,6 +376,8 @@ pub mod escrow_vault {
                 0,
                 Clock::get()?.unix_timestamp as u64,
                 None,
+                None,
+                None,
             );
         }
         Ok(())
@@ -340,6 +418,8 @@ pub mod escrow_vault {
                 0,
                 0,
                 Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
                 None,
             );
         }
@@ -386,6 +466,8 @@ pub mod escrow_vault {
                 0,
                 0,
                 Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
                 None,
             );
         }
@@ -444,6 +526,8 @@ pub mod escrow_vault {
             fee,
             0,
             now,
+            None,
+            None,
             None,
         );
         Ok((payout, fee))
@@ -546,6 +630,8 @@ pub mod escrow_vault {
             refund,
             Clock::get()?.unix_timestamp as u64,
             escrow.evidence_hash(),
+            None,
+            None,
         );
         Ok((payout, fee, refund))
     }
@@ -601,6 +687,8 @@ pub mod escrow_vault {
                 0,
                 Clock::get()?.unix_timestamp as u64,
                 None,
+                None,
+                None,
             );
         }
         Ok(())
@@ -644,6 +732,8 @@ pub mod escrow_vault {
             0,
             Clock::get()?.unix_timestamp as u64,
             None,
+            None,
+            None,
         );
         Ok((payout, fee))
     }
@@ -682,6 +772,8 @@ pub mod escrow_vault {
                 0,
                 tranche,
                 Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
                 None,
             );
         }
@@ -887,6 +979,8 @@ pub mod escrow_vault {
             0,
             0,
             Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
             None,
         );
         Ok(())
@@ -1097,6 +1191,16 @@ pub struct EscrowVaultEvent {
     /// indexer learns the evidence reference from the event stream
     /// without a second account read.
     pub evidence_hash: Option<[u8; 32]>,
+    /// AV-35: the third-party program a CPI-routed release invoked
+    /// (`release_via_cpi`); `None` on every other kind. Mirrors
+    /// `escrow_state::EscrowEvent::cpi.target`.
+    pub cpi_target: Option<Pubkey>,
+    /// AV-35: SHA-256 over the canonical encoding of the exact
+    /// instruction the CPI-routed release authorized (program id +
+    /// accounts + data; see `escrow_state::cpi_accounts_hash`); `None`
+    /// on every other kind. Mirrors
+    /// `escrow_state::EscrowEvent::cpi.accounts_hash`.
+    pub cpi_accounts_hash: Option<[u8; 32]>,
 }
 
 /// AV-18: on-chain mirror of `escrow_state::EscrowEventKind`, mapped by
@@ -1199,6 +1303,29 @@ pub struct Release<'info> {
     /// bound `vault.mint` (`MintMismatch` otherwise). Unused on the
     /// native-SOL path — the state machine then requires `None`.
     pub vault_token_account: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ReleaseViaCpi<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    pub initializer: Signer<'info>,
+    /// CHECK: beneficiary of the release on the plain path; on the
+    /// CPI-routed path the payout flows into the target program's
+    /// instruction instead. Kept as a named account so the IDL stays
+    /// explicit about who the release is for.
+    pub taker: AccountInfo<'info>,
+    /// CHECK: Solana clock sysvar, read for the AV-27 timelock gate
+    /// (never an instruction param).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`).
+    pub vault_token_account: AccountInfo<'info>,
+    // The target program and its instruction accounts travel as
+    // `remaining_accounts`: `[0]` is the third-party program id,
+    // `[1..]` are the target instruction's accounts in its expected
+    // order. Anchor validates nothing about them — the state machine
+    // validates the invocation shape (`InvalidCpiTarget`) and the
+    // `Released` event's CPI audit pins the exact authorized bytes.
 }
 
 #[derive(Accounts)]
@@ -1530,6 +1657,10 @@ fn write_escrow(_vault: &mut Account<Vault>, _escrow: &escrow_state::Escrow) {
 /// `evidence_hash` (AV-22) is the dispute-evidence commitment carried by
 /// the `Escalated` and `Resolved` events (`None` for every other kind),
 /// mirroring `escrow_state::EscrowEvent::evidence_hash`.
+/// `cpi_target` / `cpi_accounts_hash` (AV-35) carry the CPI-routing
+/// audit on a `Released` event whose payout flowed through a
+/// third-party program (`None` on every other kind), mirroring
+/// `escrow_state::EscrowEvent::cpi`.
 fn emit_transition(
     vault: &Account<Vault>,
     kind: escrow_state::EscrowEventKind,
@@ -1540,6 +1671,8 @@ fn emit_transition(
     refund: u64,
     at: u64,
     evidence_hash: Option<[u8; 32]>,
+    cpi_target: Option<Pubkey>,
+    cpi_accounts_hash: Option<[u8; 32]>,
 ) {
     emit!(EscrowVaultEvent {
         kind: escrow_event_kind(kind),
@@ -1552,6 +1685,8 @@ fn emit_transition(
         refund,
         at,
         evidence_hash,
+        cpi_target,
+        cpi_accounts_hash,
     });
 }
 
@@ -1561,6 +1696,71 @@ fn emit_transition(
 /// every emission, so `seq` stays monotonic across transactions.
 fn read_event_seq(_vault: &Account<Vault>) -> u64 {
     unimplemented!("read the vault's persisted event_seq in the real build")
+}
+
+/// AV-31: settlement CPI wiring (reference — not compiled by CI).
+///
+/// AV-35: third-party CPI invocation for `release_via_cpi` (reference —
+/// not compiled by CI).
+///
+/// The target program id is `remaining_accounts[0]`; the rest are the
+/// target instruction's accounts in its expected order. The state
+/// machine validates the invocation shape (`InvalidCpiTarget`) before
+/// settling; the real build then invokes the target program with the
+/// vault PDA as signer:
+///
+/// ```ignore
+/// let ix = anchor_lang::solana_program::instruction::Instruction {
+///     program_id: invocation.program_id,
+///     accounts: invocation.accounts.iter().map(|m| AccountMeta {
+///         pubkey: m.pubkey,
+///         is_signer: m.is_signer,
+///         is_writable: m.is_writable,
+///     }).collect(),
+///     data: invocation.data.clone(),
+/// };
+/// // The vault PDA signs through `invoke_signed` with the vault seeds,
+/// // exactly like the AV-31 settlement CPIs.
+/// anchor_lang::solana_program::program::invoke_signed(
+///     &ix,
+///     &ctx.remaining_accounts,
+///     &[&vault_seeds],
+/// )?;
+/// ```
+///
+/// A failed invoke aborts the transaction: no state change persists.
+/// That is the on-chain atomicity the state machine's rollback
+/// (`CpiExecutionFailed`) models in pure logic.
+fn cpi_invocation_from_remaining_accounts(
+    remaining: &[AccountInfo],
+    data: Vec<u8>,
+) -> Result<escrow_state::CpiInvocation> {
+    let (program, accounts) = remaining.split_first().ok_or(error!(ErrorCode::InvalidCpiTarget))?;
+    Ok(escrow_state::CpiInvocation {
+        program_id: program.key().to_bytes(),
+        accounts: accounts
+            .iter()
+            .map(|a| escrow_state::AccountMeta {
+                pubkey: a.key().to_bytes(),
+                is_signer: a.is_signer,
+                is_writable: a.is_writable,
+            })
+            .collect(),
+        data,
+    })
+}
+
+/// AV-35: invoke the third-party program (reference — not compiled by
+/// CI). The real build performs the `invoke_signed` sketched above,
+/// with the vault PDA signing through the vault seeds. Any invoke
+/// failure surfaces here and — via the state machine's executor seam —
+/// rolls the whole release back (`CpiExecutionFailed`); the caller
+/// observes the chain abort the transaction instead.
+fn cpi_invoke_target(
+    _ctx: &Context<ReleaseViaCpi>,
+    _invocation: &escrow_state::CpiInvocation,
+) -> std::result::Result<(), escrow_state::CpiError> {
+    unimplemented!("invoke the target program via CPI with the vault PDA as signer in the real build")
 }
 
 /// AV-31: settlement CPI wiring (reference — not compiled by CI).
@@ -1676,6 +1876,8 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidPenalty => error!(ErrorCode::InvalidPenalty),
         escrow_state::EscrowError::TimelockNotReached => error!(ErrorCode::TimelockNotReached),
         escrow_state::EscrowError::InvalidDecimals => error!(ErrorCode::InvalidDecimals),
+        escrow_state::EscrowError::InvalidCpiTarget => error!(ErrorCode::InvalidCpiTarget),
+        escrow_state::EscrowError::CpiExecutionFailed => error!(ErrorCode::CpiExecutionFailed),
     }
 }
 
@@ -1721,4 +1923,8 @@ pub enum ErrorCode {
     TimelockNotReached,
     #[msg("Invalid token decimals: with_decimals decimals must be 0-18")]
     InvalidDecimals,
+    #[msg("Invalid CPI target: release_via_cpi with a zero program id, an empty account list, or a zero account key")]
+    InvalidCpiTarget,
+    #[msg("CPI execution failed: the third-party invoke failed after the release gates passed; the whole release was rolled back")]
+    CpiExecutionFailed,
 }
