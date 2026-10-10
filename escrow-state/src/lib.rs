@@ -2243,6 +2243,65 @@ impl Escrow {
         Ok(())
     }
 
+    /// Rotate the emergency-pause authority (AV-47 — Solana governance):
+    /// the escrow authority (initializer) hands the pause switch to a new
+    /// key; the old key stops working immediately.
+    ///
+    /// Why: the pause key is typically a hot operational key while the
+    /// escrow authority is the durable owner key. If the pause key is lost
+    /// or suspected compromised, the escrow could be stuck paused forever
+    /// — or never pausable again. Rotation is the governance escape hatch:
+    /// the owner designates a fresh pause key without moving funds,
+    /// changing state, or touching any other configuration.
+    ///
+    /// Check order is authority → state → config, matching
+    /// [`Escrow::update_quorum`] / [`Escrow::update_attestors`]:
+    /// 1. the caller must be the escrow authority — a stranger (or the
+    ///    taker) is [`EscrowError::Unauthorized`]. Note this is the
+    ///    *escrow* authority, not the current pause key: rotation is an
+    ///    owner-governance power, so a lost pause key cannot block it;
+    /// 2. the escrow must have left `Uninitialized` — on a fresh escrow
+    ///    use the [`Escrow::with_pause_authority`] builder instead
+    ///    ([`EscrowError::InvalidStateTransition`]);
+    /// 3. a pause authority must actually be opted in — there is nothing
+    ///    to rotate on a switch-less escrow
+    ///    ([`EscrowError::InvalidStateTransition`], paralleling
+    ///    [`Escrow::pause`] / [`Escrow::unpause`]);
+    /// 4. the zero address is [`EscrowError::InvalidPauseAuthority`] —
+    ///    a zero address can never hold the switch.
+    ///
+    /// Deliberately *not* gated by the pause itself: the escape hatch must
+    /// work while the escrow is paused — a lost pause key plus an engaged
+    /// pause is exactly the situation rotation exists for (rotate, then
+    /// `unpause` with the fresh key). Rotating to the already-bound key is
+    /// a no-op success (idempotent); the `PauseAuthorityRotated` indexer
+    /// event fires only on an actual change, paralleling `update_quorum`'s
+    /// no-op rule. No layout change: the 33-byte `pause_authority` region
+    /// is rewritten in place.
+    pub fn rotate_pause_authority(
+        &mut self,
+        authority: [u8; 32],
+        new_authority: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        self.require_initializer(authority)?;
+        match self.state {
+            EscrowState::Uninitialized => return Err(EscrowError::InvalidStateTransition),
+            _ => {}
+        }
+        let old = match self.pause_authority {
+            Some(a) => a,
+            None => return Err(EscrowError::InvalidStateTransition),
+        };
+        if new_authority == [0u8; 32] {
+            return Err(EscrowError::InvalidPauseAuthority);
+        }
+        if new_authority == old {
+            return Ok(());
+        }
+        self.pause_authority = Some(new_authority);
+        Ok(())
+    }
+
     /// Opt in to an expiry grace period (AV-21 — Solana operations /
     /// backend engineering): [`Escrow::cancel_expired`] then requires
     /// `now >= expires_at + grace_period` (see
@@ -5688,6 +5747,38 @@ pub(crate) mod anchor_idl_tests {
                             the Unpaused indexer event (from == to == the \\
                             current state)",
         },
+        InstructionSpec {
+            // AV-47: rotate the emergency-pause authority by owner
+            // governance.
+            name: "rotate_pause_authority",
+            params: &[(
+                "new_authority",
+                "Pubkey",
+                "instruction param; the replacement pause authority - \\
+                 the old key stops working immediately",
+            )],
+            method: "Escrow::rotate_pause_authority",
+            input_mapping: "authority <- accounts.initializer (signer) - \\
+                            the *escrow* authority, not the pause key, so \\
+                            a lost pause key cannot block rotation; \\
+                            new_authority <- param (Pubkey -> [u8; 32] \\
+                            conversion); Uninitialized -> \\
+                            InvalidStateTransition (use \\
+                            initialize_pause_authority on a fresh \\
+                            escrow); no opted-in authority -> \\
+                            InvalidStateTransition; a stranger (or the \\
+                            taker) is Unauthorized; the zero address is \\
+                            InvalidPauseAuthority; deliberately NOT gated \\
+                            by the pause itself - rotation is the key-loss \\
+                            escape hatch and must work while paused \\
+                            (rotate, then unpause with the fresh key); \\
+                            rotating to the bound key is an idempotent \\
+                            no-op; emits the PauseAuthorityRotated \\
+                            indexer event only on an actual change (from \\
+                            == to == the current state); the 33-byte \\
+                            pause_authority region is rewritten in place - \\
+                            no layout / rent change",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -5759,6 +5850,7 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::with_pause_authority",
             "Escrow::pause",
             "Escrow::unpause",
+            "Escrow::rotate_pause_authority",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -5782,7 +5874,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_twenty_three_instructions_take_params() {
+    fn only_twenty_four_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -5816,6 +5908,7 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_decimals",
                 &"initialize_fee_recipient",
                 &"initialize_pause_authority",
+                &"rotate_pause_authority",
             ]
         );
     }
@@ -6554,6 +6647,36 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn rotate_pause_authority_maps_param_to_pause_authority_field() {
+        // IDL: rotate_pause_authority(new_authority: Pubkey) —
+        // new_authority <- param; authority <- accounts.initializer
+        // (signer, enforced by the Anchor account constraint, not the
+        // state machine). The param rewrites the same vault field the
+        // initialize_pause_authority param populates (see
+        // PARAM_FIELD_MAP) — no layout change.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const PAUSER2: [u8; 32] = [0xE1; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.rotate_pause_authority(ALICE, PAUSER2).unwrap();
+        assert_eq!(e.pause_authority(), Some(PAUSER2));
+        // Documented failure modes: a stranger is Unauthorized even on a
+        // live escrow, and the zero address can never hold the switch.
+        assert_eq!(
+            e.rotate_pause_authority(MALLORY, PAUSER),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.rotate_pause_authority(ALICE, [0u8; 32]),
+            Err(EscrowError::InvalidPauseAuthority)
+        );
+        assert_eq!(e.pause_authority(), Some(PAUSER2));
+    }
+
+    #[test]
     fn escalate_maps_authority_and_clock_sysvar() {
         // IDL: escalate() — no params. authority <- accounts.authority
         // (signer: initializer OR taker); now <- clock sysvar, deliberately
@@ -7025,6 +7148,10 @@ pub(crate) mod anchor_idl_tests {
         // the `Option` discriminant is implied (a bound authority is
         // `Some`), mirroring `initialize_fee_recipient`.
         ("initialize_pause_authority", "pause_authority", "pause_authority"),
+        // AV-47: the rotation param rewrites the same field in place —
+        // a second param source for `pause_authority`, like
+        // `update_quorum`'s threshold (see the direction-2 note above).
+        ("rotate_pause_authority", "new_authority", "pause_authority"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -13711,3 +13838,231 @@ mod pause_tests {
         assert!(!decoded.is_paused());
     }
 }
+
+// ----- AV-47: pause-authority rotation matrix (Solana governance) -----
+#[cfg(test)]
+mod pause_rotation_tests {
+    use super::*;
+    use crate::events::{EscrowEventKind, IndexedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const PAUSER2: [u8; 32] = [0xE1; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ESCROW_ID: [u8; 32] = [0x1D; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+    const T0: u64 = 1_700_000_000;
+
+    fn pausable() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+    }
+
+    fn funded_pausable() -> Escrow {
+        let mut e = pausable();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    #[test]
+    fn rotation_hands_the_switch_to_the_new_key() {
+        let mut e = funded_pausable();
+        e.rotate_pause_authority(ALICE, PAUSER2).unwrap();
+        assert_eq!(e.pause_authority(), Some(PAUSER2));
+        // The old key is dead immediately: it can neither pause nor
+        // unpause anymore.
+        assert_eq!(e.pause(MALLORY), Err(EscrowError::Unauthorized));
+        assert_eq!(e.pause(PAUSER), Err(EscrowError::Unauthorized));
+        // The new key owns the switch.
+        e.pause(PAUSER2).unwrap();
+        assert!(e.is_paused());
+        assert_eq!(e.unpause(PAUSER), Err(EscrowError::Unauthorized));
+        e.unpause(PAUSER2).unwrap();
+        assert!(!e.is_paused());
+    }
+
+    #[test]
+    fn stranger_and_taker_cannot_rotate() {
+        let mut e = funded_pausable();
+        assert_eq!(
+            e.rotate_pause_authority(MALLORY, PAUSER2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.rotate_pause_authority(BOB, PAUSER2),
+            Err(EscrowError::Unauthorized)
+        );
+        // Failed rotation changes nothing.
+        assert_eq!(e.pause_authority(), Some(PAUSER));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn rotation_check_order_is_authority_before_state() {
+        // A stranger on an Uninitialized escrow is Unauthorized — the
+        // authority gate runs before the state gate.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            e.rotate_pause_authority(MALLORY, PAUSER2),
+            Err(EscrowError::Unauthorized)
+        );
+        // ... and before the config gates too: a stranger with a zero
+        // key is still Unauthorized, not InvalidPauseAuthority.
+        assert_eq!(
+            e.rotate_pause_authority(MALLORY, [0u8; 32]),
+            Err(EscrowError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn rotation_on_uninitialized_is_rejected() {
+        // On a fresh escrow the builder is the way — rotation is an
+        // operational-governance call, not a setup call.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            e.rotate_pause_authority(ALICE, PAUSER2),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.pause_authority(), None);
+    }
+
+    #[test]
+    fn rotation_without_opted_in_authority_is_rejected() {
+        // No switch configured: nothing to rotate, even on a live escrow.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.rotate_pause_authority(ALICE, PAUSER2),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.pause_authority(), None);
+    }
+
+    #[test]
+    fn rotation_rejects_the_zero_address() {
+        let mut e = funded_pausable();
+        assert_eq!(
+            e.rotate_pause_authority(ALICE, [0u8; 32]),
+            Err(EscrowError::InvalidPauseAuthority)
+        );
+        assert_eq!(e.pause_authority(), Some(PAUSER));
+    }
+
+    #[test]
+    fn rotation_to_the_bound_key_is_an_idempotent_noop() {
+        let mut e = funded_pausable();
+        e.rotate_pause_authority(ALICE, PAUSER).unwrap();
+        assert_eq!(e.pause_authority(), Some(PAUSER));
+        // The old (same) key still owns the switch.
+        e.pause(PAUSER).unwrap();
+        e.unpause(PAUSER).unwrap();
+    }
+
+    #[test]
+    fn rotation_works_while_paused_key_loss_escape_hatch() {
+        // The scenario rotation exists for: the escrow is paused and the
+        // pause key is lost. The owner rotates to a fresh key *while
+        // paused* — the one governance call the pause gate does not
+        // block — then unpauses with the fresh key.
+        let mut e = funded_pausable();
+        e.pause(PAUSER).unwrap();
+        assert!(e.is_paused());
+        // While paused, ordinary transitions fail fast...
+        assert_eq!(
+            e.release(ALICE, NOW, 1_000_000, None).map(|_| ()),
+            Err(EscrowError::Paused)
+        );
+        // ...but rotation goes through.
+        e.rotate_pause_authority(ALICE, PAUSER2).unwrap();
+        assert_eq!(e.pause_authority(), Some(PAUSER2));
+        assert!(e.is_paused(), "rotation never flips the pause flag");
+        // The lost key cannot unpause; the fresh key can.
+        assert_eq!(e.unpause(PAUSER), Err(EscrowError::Unauthorized));
+        e.unpause(PAUSER2).unwrap();
+        assert!(!e.is_paused());
+        // Life goes on: the escrow releases normally afterwards.
+        let (payout, _fee) = e.release(ALICE, NOW, 1_000_000, None).unwrap();
+        assert_eq!(payout, 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn rotation_in_activated_state() {
+        // Rotation is available in every post-Uninitialized state, not
+        // just Funded.
+        let mut e = pausable().with_dual_sig().unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Activated);
+        e.rotate_pause_authority(ALICE, PAUSER2).unwrap();
+        assert_eq!(e.pause_authority(), Some(PAUSER2));
+    }
+
+    #[test]
+    fn rotation_leaves_state_amounts_and_layout_untouched() {
+        let mut e = funded_pausable();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.rotate_pause_authority(ALICE, PAUSER2).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert!(!e.is_paused());
+        // Same account space: only the 33-byte authority region changed
+        // (Some discriminant + address at the AV-46 pinned offsets).
+        let after = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(before.len(), after.len());
+        assert_eq!(after[755], 1, "pause_authority: Some discriminant");
+        assert_eq!(&after[756..788], &PAUSER2, "authority address offset");
+        assert_eq!(&after[..755], &before[..755]);
+        assert_eq!(&after[788..], &before[788..]);
+    }
+
+    #[test]
+    fn rotation_emits_pause_authority_rotated_only_on_change() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let base = e.events().len();
+        e.rotate_pause_authority(ALICE, PAUSER2, T0 + 2).unwrap();
+        let ev = *e.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::PauseAuthorityRotated);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(e.events().len(), base + 1);
+        // A same-key rotation is a silent no-op.
+        e.rotate_pause_authority(ALICE, PAUSER2, T0 + 3).unwrap();
+        assert_eq!(e.events().len(), base + 1);
+        // Failures emit nothing.
+        assert_eq!(
+            e.rotate_pause_authority(MALLORY, PAUSER, T0 + 4),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.events().len(), base + 1);
+    }
+
+    #[test]
+    fn rotation_then_full_lifecycle_with_new_pause_key() {
+        // Rotate once live, then run the whole lifecycle with the new
+        // key able to pause mid-flight.
+        let mut e = pausable();
+        e.fund(ALICE).unwrap();
+        e.rotate_pause_authority(ALICE, PAUSER2).unwrap();
+        e.pause(PAUSER2).unwrap();
+        assert_eq!(
+            e.release(ALICE, NOW, 500_000, None).map(|_| ()),
+            Err(EscrowError::Paused)
+        );
+        e.unpause(PAUSER2).unwrap();
+        let (payout, _fee) = e.release(ALICE, NOW, 500_000, None).unwrap();
+        assert_eq!(payout, 500_000);
+        let (payout, _fee) = e.release(ALICE, NOW, 500_000, None).unwrap();
+        assert_eq!(payout, 500_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+}
+

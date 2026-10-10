@@ -95,7 +95,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
@@ -179,6 +179,15 @@ pub enum EscrowEventKind {
     /// `from == to ==` the current state; mirrors
     /// [`EscrowEventKind::Paused`].
     Unpaused,
+    /// AV-47: the emergency-pause authority was rotated by owner
+    /// governance ([`Escrow::rotate_pause_authority`]). `from == to ==`
+    /// the current state (a config change, not a lifecycle move — like
+    /// [`EscrowEventKind::QuorumUpdated`]); the new authority is read
+    /// from the vault, the event is the ordering signal. Emitted only on
+    /// an actual change: rotating to the already-bound key is an
+    /// idempotent no-op that emits nothing (paralleling
+    /// [`EscrowEventKind::QuorumUpdated`]'s no-op rule).
+    PauseAuthorityRotated,
 }
 
 /// Fund movements carried by an [`EscrowEvent`].
@@ -961,6 +970,39 @@ impl IndexedEscrow {
 
             None,
         );
+        Ok(())
+    }
+
+    /// Rotate the emergency-pause authority (mirrors
+    /// [`Escrow::rotate_pause_authority`]). Emits `PauseAuthorityRotated`
+    /// only when the authority actually changes; `from == to ==` the
+    /// current state. `at` is the caller-supplied event timestamp.
+    pub fn rotate_pause_authority(
+        &mut self,
+        authority: [u8; 32],
+        new_authority: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.pause_authority();
+        self.inner.rotate_pause_authority(authority, new_authority)?;
+        let after = self.inner.pause_authority();
+        // The inner call rejects an unconfigured switch, a zero key, a
+        // stranger, and Uninitialized, so a changed authority here always
+        // means real governance — and a same-key no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::PauseAuthorityRotated,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+
+                None,
+            );
+        }
         Ok(())
     }
 

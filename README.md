@@ -77,6 +77,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_pause_authority(pause_authority)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding; binds the key allowed to engage/release the emergency pause; zero address is `InvalidPauseAuthority`) |
 | `pause()`                                     | any            | — (no state change; sets the pause flag) | the bound pause authority only (`Unauthorized` otherwise; `InvalidStateTransition` with no authority bound or when already paused); emits `Paused` |
 | `unpause()`                                   | any            | — (no state change; clears the pause flag) | the bound pause authority only (same rules as `pause`; `InvalidStateTransition` when not paused); emits `Unpaused` |
+| `rotate_pause_authority(new_authority)`       | any (post-`Uninitialized`) | — (no state change; rewrites the bound pause authority) | the escrow authority (initializer) only — a stranger/taker is `Unauthorized`; `InvalidStateTransition` on `Uninitialized` or with no authority bound; zero address is `InvalidPauseAuthority`; works while paused (key-loss escape hatch); emits `PauseAuthorityRotated` only on an actual change |
 | `initialize_quorum(attestors, weights, threshold)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
@@ -462,6 +463,20 @@ state-changing path faster than upgrading the program. The authority is
 typically a multisig or a governance program, so no single key can grief
 the escrow by pausing it forever.
 
+**Pause-authority rotation (AV-47).** The escrow authority (initializer) may
+hand the pause switch to a new key at any time after initialization
+(`rotate_pause_authority(new_authority)`); the old key stops working
+immediately. Check order is authority → state → config: a stranger (or the
+taker) is `Unauthorized`, rotation on an `Uninitialized` escrow or with no
+authority bound is `InvalidStateTransition`, and the zero address is
+`InvalidPauseAuthority`. Rotation is deliberately *not* gated by the pause
+itself — it is the key-loss escape hatch, so it must work while paused
+(rotate, then `unpause` with the fresh key); rotating to the already-bound
+key is an idempotent no-op. An actual change emits the
+`PauseAuthorityRotated` indexer event (`from == to ==` the current state).
+The 33-byte authority region is rewritten in place — no layout or rent
+change.
+
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
 
@@ -492,7 +507,7 @@ program error per variant):
 | `ReentrantCall` | 122 | a fund-moving transition entered while the AV-36 reentrancy lock was held (nested entry from inside `release_via_cpi`'s executor window) |
 | `InvalidFeeRecipient` | 123 | `with_fee_recipient` with the zero address (a zero address can never be the legitimate protocol-fee destination) |
 | `Paused` | 124 | any state-changing transition while the AV-46 emergency pause is engaged (`fund`/`release`/`claim`/`attest`/`resolve`/`cancel`/milestone/governance paths) |
-| `InvalidPauseAuthority` | 125 | `with_pause_authority` with the zero address (a zero address can never hold the emergency switch) |
+| `InvalidPauseAuthority` | 125 | `with_pause_authority` / `rotate_pause_authority` with the zero address (a zero address can never hold the emergency switch) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert

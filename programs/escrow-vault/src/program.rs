@@ -1176,6 +1176,50 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Rotate the emergency-pause authority by owner governance (AV-47;
+    /// mirrors `Escrow::rotate_pause_authority`). Only the initializer
+    /// signs — the *escrow* authority, not the pause key, so a lost pause
+    /// key cannot block rotation. Deliberately NOT gated by the pause
+    /// itself: rotation is the key-loss escape hatch and must work while
+    /// paused (rotate, then `unpause` with the fresh key). The old key
+    /// stops working immediately; rotating to the bound key is an
+    /// idempotent no-op. Emits `PauseAuthorityRotated` only on an actual
+    /// change (from == to == the current state).
+    pub fn rotate_pause_authority(
+        ctx: Context<RotatePauseAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.pause_authority();
+        escrow
+            .rotate_pause_authority(
+                ctx.accounts.initializer.key().to_bytes(),
+                new_authority.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.pause_authority` in place in the real build
+        // (33 bytes, always present, zeroed when None) — no realloc.
+        if escrow.pause_authority() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::PauseAuthorityRotated,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Clear the AV-27 timelock by dual-signed emergency governance
     /// (AV-41; mirrors `Escrow::emergency_unlock`). Both the initializer
     /// and the taker must sign — one party alone is `Unauthorized`.
@@ -1587,6 +1631,10 @@ pub enum EscrowVaultEventKind {
     /// AV-46: the emergency pause was released (`Escrow::unpause`).
     /// Mirrors `escrow_state::EscrowEventKind::Unpaused`.
     Unpaused,
+    /// AV-47: the emergency-pause authority was rotated by owner
+    /// governance (`Escrow::rotate_pause_authority`). Mirrors
+    /// `escrow_state::EscrowEventKind::PauseAuthorityRotated`.
+    PauseAuthorityRotated,
     /// AV-34: the vault account was closed by the initializer and its
     /// rent-exempt deposit reclaimed (`Cancelled | Released | Settled ->
     /// Closed`).
@@ -1627,6 +1675,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::Paused => EscrowVaultEventKind::Paused,
         escrow_state::EscrowEventKind::Unpaused => EscrowVaultEventKind::Unpaused,
+        escrow_state::EscrowEventKind::PauseAuthorityRotated => {
+            EscrowVaultEventKind::PauseAuthorityRotated
+        }
         escrow_state::EscrowEventKind::VaultClosed => EscrowVaultEventKind::VaultClosed,
     }
 }
@@ -2005,6 +2056,16 @@ pub struct Unpause<'info> {
     pub vault: Account<'info, Vault>,
     /// The bound pause authority (same rules as `Pause`).
     pub pause_authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct RotatePauseAuthority<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The escrow authority (initializer) — rotation is an
+    /// owner-governance power, so the *escrow* authority signs, not the
+    /// pause key. A stranger (or the taker) is `Unauthorized`.
+    pub initializer: Signer<'info>,
 }
 
 #[derive(Accounts)]

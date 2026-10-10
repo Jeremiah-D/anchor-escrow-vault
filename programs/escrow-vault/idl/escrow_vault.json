@@ -264,6 +264,14 @@
       "discriminator": [169, 144, 4, 38, 10, 141, 188, 255],
       "accounts": [],
       "args": []
+    },
+    {
+      "name": "rotate_pause_authority",
+      "discriminator": [30, 65, 235, 29, 171, 205, 28, 136],
+      "accounts": [],
+      "args": [
+        {"name": "new_authority", "type": "publicKey"}
+      ]
     }
   ],
   "accounts": [
