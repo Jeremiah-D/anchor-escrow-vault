@@ -2022,3 +2022,558 @@ mod keeper_milestone_tests {
         );
     }
 }
+
+// ============================================================================
+// Vault rent-health keeper scan (AV-43)
+// ============================================================================
+//
+// `scan_keeper_actions` (AV-20) answers "which vault needs a keeper call
+// *right now*", `scan_closeable` (AV-40) sweeps terminal vaults, and
+// `scan_milestones` (AV-42) walks tranche gates. None of them watches the
+// vault *account's* lamports balance — but a vault account must carry the
+// rent-exempt minimum for [`VAULT_SPACE`](crate::VAULT_SPACE) for as long
+// as the escrow lives. A vault whose balance has eroded below that minimum
+// is rent-bleeding: on-chain the runtime eats lamports each epoch, and at
+// close the account only transfers what it actually holds — the
+// initializer's expected `vault_close_rent_reclaimed()` reclaim (see
+// [`Escrow::close_vault`]) silently shrinks. An underfunded vault can
+// therefore make `close_vault` *economically* fail: the close succeeds on
+// the state machine but returns less rent than the operator funded.
+//
+// [`scan_rent_health`] is the fourth keeper scan: it walks watched vaults
+// together with their measured on-chain lamports balances
+// ([`WatchedEscrowWithBalance`]) and lists every vault whose balance has
+// fallen into the critical threshold — a configurable percentage of the
+// canonical rent-exempt minimum — with the exact top-up lamports needed
+// to restore full rent exemption (`required - balance`). The operator
+// transfers exactly that amount into the vault account; the next scan
+// shows the vault healthy again.
+//
+// The canonical figure is the main formula: [`vault_close_rent_reclaimed`]
+// (`rent_exempt_minimum_lamports(VAULT_SPACE, MAINNET...)`) — the same
+// number `initialize` funds, `check_vault_rent_exempt` enforces, and
+// `close_vault` promises. Never a hardcoded figure: the account layout
+// has grown since earlier constants, and the scan tracks the layout
+// automatically.
+//
+// Like the other scans this is a dry-run over `&` snapshots: no mutation,
+// no events. `Closed` vaults are skipped — the account no longer exists,
+// so there is no balance to measure. Every other state is scanned: a
+// live `Funded` vault bleeds rent while it waits, a terminal vault bleeds
+// while it waits to be closed, and an `Uninitialized` entry with a zero
+// balance simply reports the full `required` — exactly what `initialize`
+// will demand. Actions keep the input order so a keeper feeding a stable
+// watch list gets a stable top-up list.
+//
+// Output is the same hand-rolled deterministic JSON as the other scans:
+// fixed field order, 64-char lowercase hex keys, lamports as plain
+// integers (the exact unit the top-up transfer moves).
+
+/// One watched vault with its measured on-chain lamports balance: the
+/// caller-supplied identity, the read-only state snapshot, and the vault
+/// account's *actual* lamports as observed off-chain (e.g. via
+/// `getAccountInfo`). The scan never mutates the snapshot (dry-run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchedEscrowWithBalance {
+    /// Caller-supplied 32-byte escrow identity — the same convention as
+    /// [`WatchedEscrow::escrow_id`].
+    pub escrow_id: [u8; 32],
+    /// Read-only snapshot of the escrow's state.
+    pub escrow: Escrow,
+    /// The vault account's measured lamports balance.
+    pub vault_lamports: u64,
+}
+
+/// One executable `top_up` action: everything needed to fund the vault
+/// back to rent exemption, nothing more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopUpAction {
+    /// Which escrow's vault this action tops up.
+    pub escrow_id: [u8; 32],
+    /// The escrow's state at scan time, for operator context:
+    /// `"funded"`, `"cancelled"`, `"released"`, `"settled"`,
+    /// `"disputed"`, `"activated"`, or `"uninitialized"`.
+    pub state: &'static str,
+    /// The vault's measured lamports balance at scan time.
+    pub vault_lamports: u64,
+    /// The canonical rent-exempt minimum from
+    /// [`vault_close_rent_reclaimed`] — the figure the scan compared
+    /// against.
+    pub required_lamports: u64,
+    /// The exact lamports to transfer into the vault account to restore
+    /// rent exemption: `required_lamports - vault_lamports`. Always
+    /// `> 0` — only under-threshold vaults are listed.
+    pub top_up_lamports: u64,
+    /// The key that should fund the top-up — the escrow's initializer,
+    /// the canonical funder of the vault account (it funded the rent
+    /// deposit at `initialize` time).
+    pub caller: [u8; 32],
+    /// Always `"initializer"` — the canonical vault funder.
+    pub caller_role: &'static str,
+    /// Machine-readable reason: always `"underfunded"` today — the
+    /// vault's balance has fallen below the critical threshold of the
+    /// rent-exempt minimum.
+    pub reason: &'static str,
+}
+
+/// The rent-health scan result: every vault needing a top-up at
+/// [`RentHealthReport::at`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RentHealthReport {
+    /// The `now` (Unix seconds) the scan ran at. The scan has no time
+    /// gate — rent health is a balance fact, not a deadline — but the
+    /// timestamp pins when the balances were measured.
+    pub at: u64,
+    /// How many vaults were scanned.
+    pub scanned: usize,
+    /// The canonical rent-exempt minimum the scan used, from
+    /// [`vault_close_rent_reclaimed`].
+    pub required_lamports: u64,
+    /// The effective critical-threshold percentage (the caller's value,
+    /// clamped to `0..=100`).
+    pub critical_threshold_pct: u8,
+    /// Top-up actions, in the input's order.
+    pub top_ups: Vec<TopUpAction>,
+}
+
+impl RentHealthReport {
+    /// True when every scanned vault is above its critical threshold.
+    pub fn is_empty(&self) -> bool {
+        self.top_ups.is_empty()
+    }
+
+    /// Hand-serialized JSON (the crate is dependency-free). Deterministic
+    /// field order; keys are 64-char lowercase hex; lamports are plain
+    /// integers — the exact unit the top-up transfer moves.
+    ///
+    /// ```json
+    /// {"at":1000000,"scanned":1,"required_lamports":5477520,
+    ///  "critical_threshold_pct":90,"top_ups":[
+    ///   {"escrow_id":"...","state":"funded","vault_lamports":4000000,
+    ///    "required_lamports":5477520,"top_up_lamports":1477520,
+    ///    "caller":"...","caller_role":"initializer",
+    ///    "reason":"underfunded"}
+    /// ]}
+    /// ```
+    pub fn to_json(&self) -> String {
+        let mut s = String::with_capacity(128 + self.top_ups.len() * 380);
+        s.push_str("{\"at\":");
+        s.push_str(&self.at.to_string());
+        s.push_str(",\"scanned\":");
+        s.push_str(&self.scanned.to_string());
+        s.push_str(",\"required_lamports\":");
+        s.push_str(&self.required_lamports.to_string());
+        s.push_str(",\"critical_threshold_pct\":");
+        s.push_str(&self.critical_threshold_pct.to_string());
+        s.push_str(",\"top_ups\":[");
+        for (i, t) in self.top_ups.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"escrow_id\":\"");
+            s.push_str(&hex32(&t.escrow_id));
+            s.push_str("\",\"state\":\"");
+            s.push_str(t.state);
+            s.push_str("\",\"vault_lamports\":");
+            s.push_str(&t.vault_lamports.to_string());
+            s.push_str(",\"required_lamports\":");
+            s.push_str(&t.required_lamports.to_string());
+            s.push_str(",\"top_up_lamports\":");
+            s.push_str(&t.top_up_lamports.to_string());
+            s.push_str(",\"caller\":\"");
+            s.push_str(&hex32(&t.caller));
+            s.push_str("\",\"caller_role\":\"");
+            s.push_str(t.caller_role);
+            s.push_str("\",\"reason\":\"");
+            s.push_str(t.reason);
+            s.push_str("\"}");
+        }
+        s.push_str("]}");
+        s
+    }
+}
+
+/// Lowercase state name for the rent-health report's operator context.
+fn rent_health_state_name(state: EscrowState) -> &'static str {
+    match state {
+        EscrowState::Uninitialized => "uninitialized",
+        EscrowState::Funded => "funded",
+        EscrowState::Released => "released",
+        EscrowState::Cancelled => "cancelled",
+        EscrowState::Activated => "activated",
+        EscrowState::Disputed => "disputed",
+        EscrowState::Settled => "settled",
+        EscrowState::Closed => "closed",
+    }
+}
+
+/// Scan `watched` at `now` and return every vault whose measured balance
+/// has fallen into the critical threshold of the canonical rent-exempt
+/// minimum, with the exact top-up lamports to restore it. Pure read over
+/// the snapshots: zero side effects, deterministic output in input order.
+///
+/// A vault is listed when `vault_lamports < floor(required *
+/// critical_threshold_pct / 100)` — the boundary is exclusive: a vault
+/// sitting *exactly* on the threshold is not critical. The threshold
+/// percentage is clamped to `0..=100` (`0` lists nothing; `100` lists
+/// every strictly-underfunded vault).
+///
+/// The listed `top_up_lamports` is `required - vault_lamports`: funding
+/// exactly that amount restores the full rent-exempt minimum, so the
+/// next scan shows the vault healthy. Only the initializer is named as
+/// the funder — it funded the rent deposit at `initialize` time.
+///
+/// `Closed` vaults are skipped: the account no longer exists, so there is
+/// no balance to measure and no top-up to perform.
+pub fn scan_rent_health(
+    watched: &[WatchedEscrowWithBalance],
+    now: u64,
+    critical_threshold_pct: u8,
+) -> RentHealthReport {
+    // AV-43: the canonical figure is the main formula — the same number
+    // `initialize` funds and `close_vault` promises. Computed in u128:
+    // `required * pct` cannot wrap (u128 is far larger than u64 * 100).
+    let required = vault_close_rent_reclaimed();
+    let pct = critical_threshold_pct.min(100);
+    let critical_min = ((required as u128 * pct as u128) / 100) as u64;
+    let mut top_ups = Vec::new();
+    for w in watched {
+        let e = &w.escrow;
+        // A closed vault's account no longer exists — nothing to
+        // measure, nothing to top up.
+        if e.state() == EscrowState::Closed {
+            continue;
+        }
+        // Exclusive boundary: exactly-at-threshold is not critical.
+        // `critical_min <= required`, so a listed vault is always
+        // strictly underfunded and `required - balance` never wraps.
+        if w.vault_lamports < critical_min {
+            top_ups.push(TopUpAction {
+                escrow_id: w.escrow_id,
+                state: rent_health_state_name(e.state()),
+                vault_lamports: w.vault_lamports,
+                required_lamports: required,
+                top_up_lamports: required - w.vault_lamports,
+                // The initializer is the canonical vault funder.
+                caller: e.initializer(),
+                caller_role: "initializer",
+                reason: "underfunded",
+            });
+        }
+    }
+    RentHealthReport {
+        at: now,
+        scanned: watched.len(),
+        required_lamports: required,
+        critical_threshold_pct: pct,
+        top_ups,
+    }
+}
+
+#[cfg(test)]
+mod rent_health_tests {
+    use super::*;
+    use crate::{
+        check_vault_rent_exempt, vault_close_rent_reclaimed, RentShortfall,
+        MAINNET_EXEMPTION_THRESHOLD_YEARS, MAINNET_LAMPORTS_PER_BYTE_YEAR,
+    };
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const ID1: [u8; 32] = [0x01; 32];
+    const ID2: [u8; 32] = [0x02; 32];
+    const ID3: [u8; 32] = [0x03; 32];
+    const AMOUNT: u64 = 1_000_000;
+    const NOW: u64 = 1_750_000_000;
+    const NEVER: u64 = u64::MAX; // no timeout
+    const PCT: u8 = 90;
+
+    fn watch(id: [u8; 32], escrow: Escrow, vault_lamports: u64) -> WatchedEscrowWithBalance {
+        WatchedEscrowWithBalance {
+            escrow_id: id,
+            escrow,
+            vault_lamports,
+        }
+    }
+
+    fn funded() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER).unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    fn released() -> Escrow {
+        let mut e = funded();
+        e.release(ALICE, NOW, AMOUNT, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        e
+    }
+
+    fn closed() -> Escrow {
+        let mut e = released();
+        e.close_vault(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Closed);
+        e
+    }
+
+    fn required() -> u64 {
+        vault_close_rent_reclaimed()
+    }
+
+    fn critical_min(pct: u8) -> u64 {
+        ((required() as u128 * pct as u128) / 100) as u64
+    }
+
+    fn hex_of(byte: u8) -> String {
+        format!("{:02x}", byte).repeat(32)
+    }
+
+    #[test]
+    fn empty_input_scans_to_empty_report() {
+        let report = scan_rent_health(&[], NOW, PCT);
+        assert!(report.is_empty());
+        assert_eq!(report.scanned, 0);
+        assert_eq!(report.required_lamports, required());
+        assert_eq!(report.critical_threshold_pct, PCT);
+        let expected = format!(
+            "{{\"at\":1750000000,\"scanned\":0,\"required_lamports\":{},\"critical_threshold_pct\":90,\"top_ups\":[]}}",
+            required()
+        );
+        assert_eq!(report.to_json(), expected);
+    }
+
+    #[test]
+    fn healthy_vault_at_or_above_required_is_not_listed() {
+        // A vault carrying the full rent-exempt minimum (or more) is
+        // healthy — the keeper lists nothing.
+        let watched = [
+            watch(ID1, funded(), required()),
+            watch(ID2, funded(), required() + 1),
+            watch(ID3, released(), u64::MAX),
+        ];
+        let report = scan_rent_health(&watched, NOW, PCT);
+        assert!(report.is_empty(), "no top-up needed: {report:?}");
+        assert_eq!(report.scanned, 3);
+    }
+
+    #[test]
+    fn exact_at_threshold_vault_is_not_listed() {
+        // The critical boundary is exclusive: a vault sitting exactly on
+        // `floor(required * pct / 100)` is not critical.
+        let balance = critical_min(PCT);
+        assert!(balance < required(), "sanity: 90% < 100%");
+        let watched = [watch(ID1, funded(), balance)];
+        let report = scan_rent_health(&watched, NOW, PCT);
+        assert!(
+            report.is_empty(),
+            "exact-at-threshold is not critical: {report:?}"
+        );
+    }
+
+    #[test]
+    fn just_below_threshold_lists_exact_top_up() {
+        // One lamport below the threshold: listed, with the exact amount
+        // to restore the full rent-exempt minimum.
+        let balance = critical_min(PCT) - 1;
+        let watched = [watch(ID1, funded(), balance)];
+        let report = scan_rent_health(&watched, NOW, PCT);
+        assert_eq!(report.top_ups.len(), 1);
+        let t = report.top_ups[0];
+        assert_eq!(t.escrow_id, ID1);
+        assert_eq!(t.state, "funded");
+        assert_eq!(t.vault_lamports, balance);
+        assert_eq!(t.required_lamports, required());
+        assert_eq!(
+            t.top_up_lamports,
+            required() - balance,
+            "exact lamports to restore rent exemption"
+        );
+        assert_eq!(t.caller, ALICE);
+        assert_eq!(t.caller_role, "initializer");
+        assert_eq!(t.reason, "underfunded");
+        // Funding the exact top-up restores health: the next scan is
+        // clean at every threshold percentage.
+        let restored = [watch(ID1, funded(), balance + t.top_up_lamports)];
+        assert_eq!(restored[0].vault_lamports, required());
+        for pct in [0u8, 50, 90, 100] {
+            assert!(
+                scan_rent_health(&restored, NOW, pct).is_empty(),
+                "restored vault must be healthy at pct={pct}"
+            );
+        }
+    }
+
+    #[test]
+    fn underfunded_vault_makes_close_economically_fail() {
+        // The close boundary: `close_vault` promises `required` lamports
+        // back to the initializer, but an eroded vault account only holds
+        // `balance` — on-chain the `close` constraint transfers what the
+        // account actually holds, so the close *economically* fails to
+        // return the full rent. The keeper's top-up is exactly the
+        // reclaim shortfall. At 100% threshold every strictly-underfunded
+        // vault is listed — below `required` is critical by definition.
+        let shortfall: u64 = 100_000;
+        let balance = required() - shortfall;
+        // Probe a copy for the close promise; the watched escrow stays
+        // `Released` — the scan skips `Closed` vaults (their account no
+        // longer exists).
+        let mut probe = released();
+        let promised = probe.close_vault(ALICE).unwrap();
+        assert_eq!(promised, required(), "close_vault promises full rent");
+        // The same balance fails the rent-exemption check `initialize`
+        // runs — the scan measures against the main formula, exactly.
+        assert_eq!(
+            check_vault_rent_exempt(
+                balance,
+                MAINNET_LAMPORTS_PER_BYTE_YEAR,
+                MAINNET_EXEMPTION_THRESHOLD_YEARS
+            ),
+            Err(RentShortfall {
+                required: required(),
+                provided: balance,
+            })
+        );
+        let watched = [watch(ID1, released(), balance)];
+        let report = scan_rent_health(&watched, NOW, 100);
+        assert_eq!(report.top_ups.len(), 1);
+        let t = report.top_ups[0];
+        assert_eq!(t.state, "released");
+        assert_eq!(
+            t.top_up_lamports, shortfall,
+            "top-up must equal the reclaim shortfall the initializer would suffer on close"
+        );
+        assert_eq!(t.vault_lamports + t.top_up_lamports, promised);
+    }
+
+    #[test]
+    fn terminal_states_all_scanned_for_rent_health() {
+        // A terminal vault still holds the rent deposit until it is
+        // closed — rent erosion there matters just as much as on a live
+        // vault.
+        let mut cancelled = funded();
+        cancelled.cancel(ALICE, None, ALICE).unwrap();
+        let watched = [
+            watch(ID1, cancelled, 0),
+            watch(ID2, released(), 0),
+        ];
+        let report = scan_rent_health(&watched, NOW, PCT);
+        assert_eq!(report.top_ups.len(), 2);
+        assert_eq!(report.top_ups[0].state, "cancelled");
+        assert_eq!(report.top_ups[1].state, "released");
+        // A never-created vault account (balance 0) reports the full
+        // `required` — exactly what `initialize` will demand.
+        for t in &report.top_ups {
+            assert_eq!(t.top_up_lamports, required());
+        }
+    }
+
+    #[test]
+    fn closed_vaults_are_skipped() {
+        // The account no longer exists after close: no balance to
+        // measure, no top-up to perform — even at zero lamports.
+        let watched = [watch(ID1, closed(), 0)];
+        let report = scan_rent_health(&watched, NOW, PCT);
+        assert!(report.is_empty(), "closed vaults have no account: {report:?}");
+        assert_eq!(report.scanned, 1);
+    }
+
+    #[test]
+    fn threshold_pct_is_clamped_to_100() {
+        // A percentage above 100 is meaningless: it behaves as 100 —
+        // every strictly-underfunded vault is listed, nothing more.
+        let watched = [
+            watch(ID1, funded(), required() - 1),
+            watch(ID2, funded(), required()),
+        ];
+        let report = scan_rent_health(&watched, NOW, 250);
+        assert_eq!(report.critical_threshold_pct, 100);
+        assert_eq!(report.top_ups.len(), 1);
+        assert_eq!(report.top_ups[0].escrow_id, ID1);
+        assert_eq!(report.top_ups[0].top_up_lamports, 1);
+    }
+
+    #[test]
+    fn pct_zero_lists_nothing() {
+        // A 0% threshold disables the scan: no balance can fall below 0.
+        let watched = [watch(ID1, funded(), 0)];
+        let report = scan_rent_health(&watched, NOW, 0);
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn json_is_deterministic_and_pinned() {
+        let balance = critical_min(PCT) - 7;
+        let top_up = required() - balance;
+        let watched = [watch(ID1, funded(), balance), watch(ID2, funded(), required())];
+        let a = scan_rent_health(&watched, NOW, PCT).to_json();
+        let b = scan_rent_health(&watched, NOW, PCT).to_json();
+        assert_eq!(a, b, "equal input must serialize byte-identically");
+        // Input order preserved: only ID1 is listed.
+        let expected = format!(
+            "{{\"at\":1750000000,\"scanned\":2,\"required_lamports\":{req},\"critical_threshold_pct\":90,\"top_ups\":[{{\"escrow_id\":\"{id}\",\"state\":\"funded\",\"vault_lamports\":{bal},\"required_lamports\":{req},\"top_up_lamports\":{top},\"caller\":\"{alice}\",\"caller_role\":\"initializer\",\"reason\":\"underfunded\"}}]}}",
+            req = required(),
+            id = hex_of(0x01),
+            bal = balance,
+            top = top_up,
+            alice = hex_of(0xAA),
+        );
+        assert_eq!(a, expected, "pinned JSON shape");
+    }
+
+    #[test]
+    fn scan_is_dry_run_and_preserves_input_order() {
+        let before = [
+            watch(ID1, funded(), critical_min(PCT) - 1),
+            watch(ID2, funded(), required()),
+            watch(ID3, released(), 0),
+        ];
+        let report = scan_rent_health(&before, NOW, PCT);
+        // Zero side effects: the snapshots are bit-identical afterwards
+        // (WatchedEscrowWithBalance is Copy + PartialEq, so this is
+        // exact).
+        assert_eq!(
+            before,
+            [
+                watch(ID1, funded(), critical_min(PCT) - 1),
+                watch(ID2, funded(), required()),
+                watch(ID3, released(), 0),
+            ]
+        );
+        assert_eq!(report.scanned, 3);
+        // Input order preserved: ID1's top-up first, ID3's second.
+        assert_eq!(report.top_ups.len(), 2);
+        assert_eq!(report.top_ups[0].escrow_id, ID1);
+        assert_eq!(report.top_ups[1].escrow_id, ID3);
+    }
+
+    #[test]
+    fn listed_balance_always_fails_the_main_rent_formula() {
+        // Cross-check: every listed vault fails `check_vault_rent_exempt`
+        // with the mainnet parameters — the scan's notion of
+        // "underfunded" is exactly the chain's notion of "not
+        // rent-exempt".
+        let balances = [
+            0,
+            1,
+            critical_min(PCT) - 1,
+            required() - 1,
+        ];
+        for (i, balance) in balances.iter().enumerate() {
+            let watched = [watch([i as u8; 32], funded(), *balance)];
+            let report = scan_rent_health(&watched, NOW, 100);
+            assert_eq!(report.top_ups.len(), 1, "balance={balance}");
+            assert_eq!(
+                check_vault_rent_exempt(
+                    *balance,
+                    MAINNET_LAMPORTS_PER_BYTE_YEAR,
+                    MAINNET_EXEMPTION_THRESHOLD_YEARS
+                ),
+                Err(RentShortfall {
+                    required: required(),
+                    provided: *balance,
+                }),
+                "listed balance must fail the main rent formula: {balance}"
+            );
+        }
+    }
+}

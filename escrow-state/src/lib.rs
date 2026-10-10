@@ -144,6 +144,14 @@ pub use keeper::{
 // additive and read-only (dry-run by construction).
 pub use keeper::{scan_closeable, CloseAction, CloseBatch, CloseReport};
 
+// AV-43: vault rent-health keeper scan — walk watched vaults with their
+// measured on-chain lamports balances, list every vault whose balance
+// has fallen into the configurable critical threshold of the canonical
+// rent-exempt minimum (`vault_close_rent_reclaimed()`), with the exact
+// top-up lamports to restore rent exemption, and serialize the top-up
+// list as JSON. Purely additive and read-only (dry-run by construction).
+pub use keeper::{scan_rent_health, RentHealthReport, TopUpAction, WatchedEscrowWithBalance};
+
 // AV-26: off-chain state snapshot — a point-in-time, read-only view of
 // an `Escrow` as canonical JSON (all fields + derived remaining /
 // vested-claimable / quorum progress), for keeper bots and indexers
