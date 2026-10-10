@@ -1668,6 +1668,57 @@ impl Escrow {
         if authority != self.initializer && authority != self.taker {
             return Err(EscrowError::Unauthorized);
         }
+        self.expire_cancel_locked(now, mint, refund_to, authority == self.taker)
+    }
+
+    /// Permissionless expiry crank (AV-48 — Solana crank pattern):
+    /// *anyone* may execute the expiry cancel on a `Funded` escrow once
+    /// the expiry gate passes (`Funded -> Cancelled`), so a keeper bot
+    /// that is party to nothing can still sweep timed-out escrows and
+    /// return the funds — no counterparty signature required.
+    ///
+    /// Anti-MEV by construction: the caller authorizes nothing about
+    /// the funds. The refund is pinned to the escrow's refund policy
+    /// ([`Escrow::refund_recipient`] — the AV-23 whitelist address when
+    /// configured, otherwise the initializer), exactly as
+    /// [`Escrow::cancel_expired`] enforces it; the caller receives zero.
+    /// A taker who cranks still pays the AV-24 anti-griefing penalty —
+    /// the penalty keys off *who* initiated, not which entry point they
+    /// used, so the taker cannot dodge it via the crank.
+    ///
+    /// Gate order mirrors `cancel_expired` minus the party-membership
+    /// check: pause (AV-46) first, then reentrancy (AV-36), then state,
+    /// mint, the pinned refund destination, and the expiry gate
+    /// (expiry + grace period via [`Escrow::is_expiry_eligible`]).
+    pub fn crank_expired(
+        &mut self,
+        caller: [u8; 32],
+        now: u64,
+        mint: Option<[u8; 32]>,
+    ) -> Result<(u64, u64), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast, before
+        // the reentrancy guard. There is deliberately no authority
+        // check: the crank is permissionless.
+        self.require_not_paused()?;
+        self.require_not_reentrant()?;
+        let refund_to = self.refund_recipient();
+        self.expire_cancel_locked(now, mint, refund_to, caller == self.taker)
+    }
+
+    /// Shared expiry-cancel core for [`Escrow::cancel_expired`] (party
+    /// path) and [`Escrow::crank_expired`] (permissionless path, AV-48).
+    /// The caller has already passed the pause / reentrancy / authority
+    /// gates; `charge_penalty` marks a taker-initiated cancel (AV-24).
+    /// `refund_to` must already satisfy the refund policy — the crank
+    /// passes [`Escrow::refund_recipient`] directly, so the pin holds by
+    /// construction and the check below is a pure invariant assertion.
+    fn expire_cancel_locked(
+        &mut self,
+        now: u64,
+        mint: Option<[u8; 32]>,
+        refund_to: [u8; 32],
+        charge_penalty: bool,
+    ) -> Result<(u64, u64), EscrowError> {
         match self.state {
             EscrowState::Funded => {}
             _ => return Err(EscrowError::InvalidStateTransition),
@@ -1689,7 +1740,7 @@ impl Escrow {
         // `expiry_cancel_penalty` (floor of `remaining * bps / 10000`,
         // `bps <= 10000`), so the subtraction cannot underflow.
         let remaining = self.remaining_amount();
-        let penalty = if authority == self.taker {
+        let penalty = if charge_penalty {
             self.expiry_cancel_penalty(remaining)
         } else {
             0
@@ -3721,6 +3772,160 @@ mod tests {
 
     // ---------- cancel_expired ----------
 
+    // ---------- crank_expired (AV-48) ----------
+
+    #[test]
+    fn crank_expired_by_stranger_after_expiry_ok() {
+        // Permissionless: a stranger (neither party) can crank an
+        // expired escrow — the keeper bot needs no counterparty key.
+        let mut e = funded_escrow();
+        let (refund, penalty) = e.crank_expired(MALLORY, EXPIRES_AT + 1, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!((refund, penalty), (1_000_000, 0));
+    }
+
+    #[test]
+    fn crank_expired_before_expiry_fails() {
+        // 未到期拒: the crank reuses the exact expiry gate
+        // (expiry + grace period) — a premature crank is NotExpired.
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.crank_expired(MALLORY, EXPIRES_AT - 1, None),
+            Err(EscrowError::NotExpired)
+        );
+        assert_eq!(e.state(), EscrowState::Funded, "failed crank moves nothing");
+    }
+
+    #[test]
+    fn crank_expired_respects_grace_period() {
+        // The crank honors the opt-in grace period exactly like the
+        // party path — keeper/cluster clock drift cannot trigger a
+        // premature crank.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_grace_period(300)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.crank_expired(MALLORY, EXPIRES_AT + 299, None),
+            Err(EscrowError::NotExpired)
+        );
+        let (refund, _) = e.crank_expired(MALLORY, EXPIRES_AT + 300, None).unwrap();
+        assert_eq!(refund, 1_000_000);
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn crank_expired_refund_goes_to_pinned_destination_not_caller() {
+        // 资金流向: the refund follows the escrow's refund policy — the
+        // AV-23 whitelist address when configured, otherwise the
+        // initializer. The cranker receives zero (anti-MEV): the return
+        // value is the full remainder, and no leg names the caller.
+        const WHITELIST: [u8; 32] = [0xC4; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_refund_address(WHITELIST)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let (refund, penalty) = e.crank_expired(MALLORY, EXPIRES_AT + 1, None).unwrap();
+        assert_eq!((refund, penalty), (1_000_000, 0));
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(e.refund_recipient(), WHITELIST);
+    }
+
+    #[test]
+    fn crank_expired_by_taker_charges_penalty() {
+        // The AV-24 anti-griefing penalty keys off *who* initiated, not
+        // which entry point — a taker cranker cannot dodge it.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_penalty_bps(500)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        // floor(1_000_000 * 500 / 10000) = 50_000 to the initializer.
+        let (refund, penalty) = e.crank_expired(BOB, EXPIRES_AT + 1, None).unwrap();
+        assert_eq!((refund, penalty), (950_000, 50_000));
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn crank_expired_by_initializer_charges_no_penalty() {
+        // The initializer reclaiming their own funds pays no penalty,
+        // whichever entry point they use.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_penalty_bps(500)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let (refund, penalty) = e.crank_expired(ALICE, EXPIRES_AT + 1, None).unwrap();
+        assert_eq!((refund, penalty), (1_000_000, 0));
+    }
+
+    #[test]
+    fn crank_expired_on_non_funded_states_is_invalid() {
+        for state in [
+            EscrowState::Uninitialized,
+            EscrowState::Released,
+            EscrowState::Cancelled,
+        ] {
+            let mut e = funded_escrow();
+            e.state = state;
+            assert_eq!(
+                e.crank_expired(MALLORY, EXPIRES_AT + 1, None),
+                Err(EscrowError::InvalidStateTransition),
+                "crank from {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn crank_expired_rejects_mint_mismatch() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint([0xD0; 32])
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.crank_expired(MALLORY, EXPIRES_AT + 1, Some([0xD1; 32])),
+            Err(EscrowError::MintMismatch)
+        );
+        // The bound mint cranks fine.
+        let (refund, _) = e
+            .crank_expired(MALLORY, EXPIRES_AT + 1, Some([0xD0; 32]))
+            .unwrap();
+        assert_eq!(refund, 1_000_000);
+    }
+
+    #[test]
+    fn crank_expired_while_paused_is_rejected() {
+        // 暂停中拒: `require_not_paused` runs first — a paused escrow
+        // fails fast regardless of the permissionless caller.
+        const PAUSE_AUTH: [u8; 32] = [0x9A; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSE_AUTH)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.pause(PAUSE_AUTH).unwrap();
+        assert_eq!(
+            e.crank_expired(MALLORY, EXPIRES_AT + 1, None),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(e.state(), EscrowState::Funded, "failed crank moves nothing");
+    }
+
+    #[test]
+    fn crank_expired_after_partial_release_refunds_remainder() {
+        // The crank refunds the remainder after partial releases —
+        // `released` is preserved for audit, like the party path.
+        let mut e = funded_escrow();
+        e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
+        let (refund, penalty) = e.crank_expired(MALLORY, EXPIRES_AT + 1, None).unwrap();
+        assert_eq!((refund, penalty), (600_000, 0));
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(e.released_amount(), 400_000);
+    }
+
     #[test]
     fn cancel_expired_by_initializer_after_expiry_ok() {
         let mut e = funded_escrow();
@@ -5203,6 +5408,26 @@ pub(crate) mod anchor_idl_tests {
                             return (remaining, 0)",
         },
         InstructionSpec {
+            // AV-48: permissionless expiry crank (Solana crank pattern).
+            name: "crank_expired",
+            params: &[],
+            method: "Escrow::crank_expired",
+            input_mapping: "caller <- accounts.cranker (signer: ANY key — \
+                            no party-membership check, the crank is \
+                            permissionless); now <- clock sysvar (NOT an \
+                            instruction param — see module docs); refund \
+                            destination <- accounts.refund_to, asserted by \
+                            the skeleton against the vault's pinned refund \
+                            policy (whitelisted address, or the \
+                            initializer with no whitelist — the state \
+                            machine pins it internally too, so a swapped \
+                            account fails closed); the cranker receives \
+                            nothing (anti-MEV); returns (refund, penalty) \
+                            — AV-24: a taker cranker still pays the \
+                            penalty, routed to the initializer; every \
+                            other caller returns (remaining, 0)",
+        },
+        InstructionSpec {
             name: "initialize_quorum",
             params: &[
                 ("attestors", "Vec<Pubkey>", "instruction param"),
@@ -5821,6 +6046,7 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::release_via_cpi",
             "Escrow::cancel",
             "Escrow::cancel_expired",
+            "Escrow::crank_expired",
             "QuorumPolicy::new + Escrow::with_quorum",
             "Escrow::update_quorum",
             "Escrow::update_attestors",

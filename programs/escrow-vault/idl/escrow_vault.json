@@ -47,6 +47,12 @@
       "args": []
     },
     {
+      "name": "crank_expired",
+      "discriminator": [242, 214, 197, 141, 189, 175, 150, 24],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "initialize_quorum",
       "discriminator": [78, 18, 53, 161, 28, 58, 249, 102],
       "accounts": [],

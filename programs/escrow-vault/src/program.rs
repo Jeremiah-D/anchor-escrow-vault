@@ -86,6 +86,7 @@ pub mod escrow_vault {
             None,
             None,
             None,
+            None,
         );
         Ok(())
     }
@@ -109,6 +110,7 @@ pub mod escrow_vault {
             0,
             0,
             Clock::get()?.unix_timestamp as u64,
+            None,
             None,
             None,
             None,
@@ -162,6 +164,7 @@ pub mod escrow_vault {
             fee,
             0,
             Clock::get()?.unix_timestamp as u64,
+            None,
             None,
             None,
             None,
@@ -240,6 +243,7 @@ pub mod escrow_vault {
             None,
             Some(receipt.cpi_target),
             Some(receipt.accounts_hash),
+            None,
         );
         Ok((payout, fee))
     }
@@ -279,6 +283,7 @@ pub mod escrow_vault {
             0,
             escrow.remaining_amount(),
             Clock::get()?.unix_timestamp as u64,
+            None,
             None,
             None,
             None,
@@ -343,11 +348,77 @@ pub mod escrow_vault {
             None,
             None,
             None,
+            None,
         );
         Ok(())
     }
 
-    /// Attach a weighted attestor quorum to the release path
+    /// Permissionless expiry crank (AV-48 — Solana crank pattern;
+    /// mirrors `Escrow::crank_expired`). ANY signer may execute the
+    /// expiry cancel on a `Funded` escrow once the clock (Solana clock
+    /// sysvar) has passed `expires_at` plus the opt-in grace period —
+    /// no counterparty signature required, so a keeper bot that is
+    /// party to nothing can sweep timed-out vaults.
+    ///
+    /// Anti-MEV by construction: the caller authorizes nothing about
+    /// the funds. `accounts.refund_to` is asserted here against the
+    /// vault's pinned refund policy (the AV-23 whitelist address when
+    /// configured, otherwise the initializer — the state machine pins
+    /// it internally too), and the cranker receives nothing. AV-24: a
+    /// taker cranker still pays the anti-griefing penalty to the
+    /// initializer; every other caller returns `(remaining, 0)`.
+    /// A paused escrow rejects with `Paused` (AV-46).
+    pub fn crank_expired(ctx: Context<CrankExpired>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        // The state machine pins the refund destination internally
+        // (AV-48); the skeleton additionally asserts the transfer
+        // target account matches the pinned policy, so a swapped
+        // account fails closed before any state changes.
+        let expected_refund_to = match ctx.accounts.vault.refund_to {
+            Some(addr) => addr,
+            None => ctx.accounts.vault.initializer,
+        };
+        require!(
+            ctx.accounts.refund_to.key() == expected_refund_to,
+            ErrorCode::RefundAddressMismatch
+        );
+        let from = escrow.state() as u8;
+        let (refund, _penalty) = escrow
+            .crank_expired(
+                ctx.accounts.cranker.key().to_bytes(),
+                now,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-31: settle via `cpi_settle_refund` (`RefundKind::CancelExpired`) —
+        // `escrow_state::cpi::refund_plan` builds and validates the
+        // transfer bytes: `refund` to the pinned `refund_to`, `penalty`
+        // (non-zero only when the cranker is the taker, AV-24) to the
+        // initializer. The real build executes the validated plan once
+        // the token accounts are wired up.
+        // AV-18: `now` doubles as the event's `at`, mirroring
+        // `IndexedEscrow::crank_expired`; the `caller` field carries the
+        // crank signer's key so the indexer sees who cranked without a
+        // second account read.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::ExpiredCranked,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            refund,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.cranker.key()),
+        );
+        Ok(())
+    }
     /// (`Uninitialized` only; mirrors `Escrow::with_quorum`). After
     /// this, `release` additionally requires the accumulated weight of
     /// distinct attestations to reach `threshold`; the refund paths
@@ -392,19 +463,20 @@ pub mod escrow_vault {
         if approvals_after > approvals_before {
             let state = escrow.state() as u8;
             emit_transition(
-                &ctx.accounts.vault,
-                escrow_state::EscrowEventKind::Attested,
-                state,
-                state,
-                0,
-                0,
-                0,
-                Clock::get()?.unix_timestamp as u64,
-                None,
-                None,
-                None,
-                None,
-            );
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Attested,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         }
         Ok(())
     }
@@ -437,19 +509,20 @@ pub mod escrow_vault {
         if threshold_after != threshold_before {
             let state = escrow.state() as u8;
             emit_transition(
-                &ctx.accounts.vault,
-                escrow_state::EscrowEventKind::QuorumUpdated,
-                state,
-                state,
-                0,
-                0,
-                0,
-                Clock::get()?.unix_timestamp as u64,
-                None,
-                None,
-                None,
-                None,
-            );
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::QuorumUpdated,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         }
         Ok(())
     }
@@ -513,19 +586,20 @@ pub mod escrow_vault {
         if set_after != set_before {
             let state = escrow.state() as u8;
             emit_transition(
-                &ctx.accounts.vault,
-                escrow_state::EscrowEventKind::AttestorsUpdated,
-                state,
-                state,
-                0,
-                0,
-                0,
-                Clock::get()?.unix_timestamp as u64,
-                None,
-                None,
-                None,
-                None,
-            );
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::AttestorsUpdated,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         }
         Ok(())
     }
@@ -562,19 +636,20 @@ pub mod escrow_vault {
         let to = escrow.state() as u8;
         if to != from {
             emit_transition(
-                &ctx.accounts.vault,
-                escrow_state::EscrowEventKind::Activated,
-                from,
-                to,
-                0,
-                0,
-                0,
-                Clock::get()?.unix_timestamp as u64,
-                None,
-                None,
-                None,
-                None,
-            );
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Activated,
+            from,
+            to,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         }
         Ok(())
     }
@@ -635,6 +710,7 @@ pub mod escrow_vault {
             None,
             None,
             None,
+            None,
         );
         Ok((payout, fee))
     }
@@ -690,6 +766,7 @@ pub mod escrow_vault {
             0,
             now,
             evidence_hash,
+            None,
             None,
             None,
             None,
@@ -758,6 +835,7 @@ pub mod escrow_vault {
             rationale_hash,
             None,
             None,
+            None,
         );
         Ok((payout, fee, refund))
     }
@@ -804,19 +882,20 @@ pub mod escrow_vault {
         if !confirmed_before && escrow.milestone_confirmed(index as usize) {
             let state = escrow.state() as u8;
             emit_transition(
-                &ctx.accounts.vault,
-                escrow_state::EscrowEventKind::MilestoneConfirmed,
-                state,
-                state,
-                0,
-                0,
-                0,
-                Clock::get()?.unix_timestamp as u64,
-                None,
-                None,
-                None,
-                None,
-            );
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::MilestoneConfirmed,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         }
         Ok(())
     }
@@ -862,6 +941,7 @@ pub mod escrow_vault {
             None,
             None,
             None,
+            None,
         );
         Ok((payout, fee))
     }
@@ -892,19 +972,20 @@ pub mod escrow_vault {
         if !settled_before && escrow.milestone_settled(index as usize) {
             let state = escrow.state() as u8;
             emit_transition(
-                &ctx.accounts.vault,
-                escrow_state::EscrowEventKind::MilestoneSkipped,
-                state,
-                state,
-                0,
-                0,
-                tranche,
-                Clock::get()?.unix_timestamp as u64,
-                None,
-                None,
-                None,
-                None,
-            );
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::MilestoneSkipped,
+            state,
+            state,
+            0,
+            0,
+            tranche,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         }
         Ok(())
     }
@@ -1142,6 +1223,7 @@ pub mod escrow_vault {
             None,
             None,
             None,
+            None,
         );
         Ok(())
     }
@@ -1168,6 +1250,7 @@ pub mod escrow_vault {
             0,
             0,
             Clock::get()?.unix_timestamp as u64,
+            None,
             None,
             None,
             None,
@@ -1203,19 +1286,20 @@ pub mod escrow_vault {
         // (33 bytes, always present, zeroed when None) — no realloc.
         if escrow.pause_authority() != before {
             emit_transition(
-                &ctx.accounts.vault,
-                escrow_state::EscrowEventKind::PauseAuthorityRotated,
-                state,
-                state,
-                0,
-                0,
-                0,
-                Clock::get()?.unix_timestamp as u64,
-                None,
-                None,
-                None,
-                None,
-            );
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::PauseAuthorityRotated,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         }
         Ok(())
     }
@@ -1249,6 +1333,7 @@ pub mod escrow_vault {
             0,
             0,
             Clock::get()?.unix_timestamp as u64,
+            None,
             None,
             None,
             None,
@@ -1305,6 +1390,7 @@ pub mod escrow_vault {
             0,
             0,
             Clock::get()?.unix_timestamp as u64,
+            None,
             None,
             None,
             None,
@@ -1593,6 +1679,12 @@ pub struct EscrowVaultEvent {
     /// on every other kind. Mirrors
     /// `escrow_state::EscrowEvent::cpi.accounts_hash`.
     pub cpi_accounts_hash: Option<[u8; 32]>,
+    /// AV-48: the permissionless crank caller's key, carried by the
+    /// `ExpiredCranked` event (`None` on every other kind). Mirrors
+    /// `escrow_state::EscrowEvent::caller`, so an off-chain indexer
+    /// learns who cranked the escrow from the event stream without a
+    /// second account read.
+    pub caller: Option<Pubkey>,
 }
 
 /// AV-18: on-chain mirror of `escrow_state::EscrowEventKind`, mapped by
@@ -1606,6 +1698,11 @@ pub enum EscrowVaultEventKind {
     Released,
     Cancelled,
     ExpiredCancelled,
+    /// AV-48: an expired escrow was cancelled through the permissionless
+    /// crank (`Escrow::crank_expired`). Mirrors
+    /// `escrow_state::EscrowEventKind::ExpiredCranked`; the event's
+    /// `caller` field carries the crank caller's key.
+    ExpiredCranked,
     Attested,
     Claimed,
     Escalated,
@@ -1653,6 +1750,7 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         escrow_state::EscrowEventKind::ExpiredCancelled => {
             EscrowVaultEventKind::ExpiredCancelled
         }
+        escrow_state::EscrowEventKind::ExpiredCranked => EscrowVaultEventKind::ExpiredCranked,
         escrow_state::EscrowEventKind::Attested => EscrowVaultEventKind::Attested,
         escrow_state::EscrowEventKind::Claimed => EscrowVaultEventKind::Claimed,
         escrow_state::EscrowEventKind::Escalated => EscrowVaultEventKind::Escalated,
@@ -1801,6 +1899,29 @@ pub struct CancelExpired<'info> {
     /// is the caller, the refund goes to the declared address, never to
     /// the caller. The real build transfers the refund to this account
     /// after the state machine's `RefundAddressMismatch` check passes.
+    pub refund_to: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CrankExpired<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// AV-48: ANY key may sign — no party-membership check. The state
+    /// machine enforces the permissionless crank; the cranker receives
+    /// nothing (anti-MEV).
+    pub cranker: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the expiry comparison.
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build reads its `mint` for the state machine's `MintMismatch`
+    /// check; unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
+    /// CHECK: the refund destination account. AV-48: the handler
+    /// asserts this equals the vault's pinned refund policy (the AV-23
+    /// whitelist address when configured, otherwise the initializer) —
+    /// the state machine pins it internally too, so a swapped account
+    /// fails closed. The real build transfers the refund to this
+    /// account.
     pub refund_to: AccountInfo<'info>,
 }
 
@@ -2194,6 +2315,7 @@ fn emit_transition(
     rationale_hash: Option<[u8; 32]>,
     cpi_target: Option<Pubkey>,
     cpi_accounts_hash: Option<[u8; 32]>,
+    caller: Option<Pubkey>,
 ) {
     emit!(EscrowVaultEvent {
         kind: escrow_event_kind(kind),
@@ -2209,6 +2331,7 @@ fn emit_transition(
         rationale_hash,
         cpi_target,
         cpi_accounts_hash,
+        caller,
     });
 }
 

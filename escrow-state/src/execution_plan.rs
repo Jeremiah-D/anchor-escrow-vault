@@ -158,9 +158,11 @@ fn plan_instruction(a: &KeeperAction) -> PlannedInstruction {
             writable: false,
         },
     ];
-    if a.kind == KeeperActionKind::CancelExpired {
-        // The scan always sets `refund_to` for `cancel_expired` — the
-        // refund recipient the state machine pins (AV-23 anti-phishing).
+    if a.kind == KeeperActionKind::CancelExpired || a.kind == KeeperActionKind::CrankExpired {
+        // The scan always sets `refund_to` for `cancel_expired` /
+        // `crank_expired` — the refund recipient the state machine pins
+        // (AV-23 anti-phishing; the AV-48 crank refunds to the same
+        // pinned destination, the cranker receives nothing).
         // Guarded anyway: a plan must never name a wrong destination,
         // and must never panic on a hand-built report either.
         if let Some(r) = a.refund_to {
@@ -493,7 +495,9 @@ mod execution_plan_tests {
     #[test]
     fn scan_then_plan_end_to_end() {
         // Real scan output feeds the planner: an expired escrow becomes
-        // one batch with one cancel_expired instruction.
+        // two batches — the permissionless crank (zero-key caller sorts
+        // first) and the party-signed cancel_expired — each carrying the
+        // pinned refund_to account.
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, 0).unwrap();
         e.fund(ALICE).unwrap();
         let watched = [WatchedEscrow {
@@ -502,9 +506,13 @@ mod execution_plan_tests {
         }];
         let plan = plan_execution(&scan_keeper_actions(&watched, MID));
         assert_eq!(plan.scanned, 1);
-        assert_eq!(plan.actions, 1);
-        assert_eq!(plan.batches.len(), 1);
-        let ix = &plan.batches[0].instructions[0];
+        assert_eq!(plan.actions, 2);
+        assert_eq!(plan.batches.len(), 2);
+        let crank = &plan.batches[0].instructions[0];
+        assert_eq!(crank.kind, KeeperActionKind::CrankExpired);
+        assert_eq!(crank.caller_role, "anyone");
+        assert_eq!(crank.amount, 1_000_000);
+        let ix = &plan.batches[1].instructions[0];
         assert_eq!(ix.kind, KeeperActionKind::CancelExpired);
         assert_eq!(ix.caller_role, "initializer");
         assert_eq!(ix.amount, 1_000_000);
@@ -512,6 +520,7 @@ mod execution_plan_tests {
         // accounts with signer/writable flags, amount.
         let json = plan.to_json();
         assert!(json.contains("\"instruction\":\"cancel_expired\""));
+        assert!(json.contains("\"instruction\":\"crank_expired\""));
         assert!(json.contains("\"role\":\"refund_to\""));
         assert!(json.contains("\"signer\":true"));
     }

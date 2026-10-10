@@ -113,6 +113,14 @@ pub struct WatchedEscrow {
 pub enum KeeperActionKind {
     /// `cancel_expired(authority, now, mint)`.
     CancelExpired,
+    /// `crank_expired(caller, now, mint)` (AV-48): the permissionless
+    /// expiry crank. Listed alongside `CancelExpired` for expired
+    /// escrows so a keeper bot that is party to nothing can sweep
+    /// timed-out vaults — the caller is `"anyone"` (see
+    /// [`KeeperAction::caller`]), never the escrow's parties. The
+    /// refund destination is the same pinned address as the party
+    /// path's; the cranker receives nothing.
+    CrankExpired,
     /// `claim(taker, now, mint)`.
     Claim,
     /// `resolve(arbiter, taker_amount, mint, rationale_hash)` (AV-38):
@@ -130,6 +138,7 @@ impl KeeperActionKind {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             KeeperActionKind::CancelExpired => "cancel_expired",
+            KeeperActionKind::CrankExpired => "crank_expired",
             KeeperActionKind::Claim => "claim",
             KeeperActionKind::Resolve => "resolve",
         }
@@ -144,10 +153,14 @@ pub struct KeeperAction {
     pub escrow_id: [u8; 32],
     /// Which transition to invoke.
     pub kind: KeeperActionKind,
-    /// The key that must sign the call.
+    /// The key that must sign the call. AV-48: for `CrankExpired` actions
+    /// this is the zero key — the crank is permissionless, so *no*
+    /// specific key must sign; the keeper substitutes its own key when
+    /// building the instruction. `caller_role` is `"anyone"` then.
     pub caller: [u8; 32],
-    /// Which role `caller` plays: `"initializer"`, `"taker"`, or
-    /// `"arbiter"` (AV-38, `resolve` actions).
+    /// Which role `caller` plays: `"initializer"`, `"taker"`,
+    /// `"arbiter"` (AV-38, `resolve` actions), or `"anyone"` (AV-48,
+    /// `crank_expired` actions — the permissionless crank).
     pub caller_role: &'static str,
     /// The `mint` argument to pass: the escrow's bound mint, or `None`
     /// on the native-SOL path.
@@ -278,9 +291,13 @@ impl KeeperReport {
 /// output in input order.
 ///
 /// An escrow contributes at most one action per kind. An expired escrow
-/// with claimable vesting lists *both*: both calls are executable at the
-/// scan time (amounts are as of the scan; the keeper re-scans after
-/// executing).
+/// with claimable vesting lists *both* `cancel_expired` and `claim`:
+/// both calls are executable at the scan time (amounts are as of the
+/// scan; the keeper re-scans after executing). AV-48: an expired escrow
+/// additionally lists a `crank_expired` action (permissionless crank,
+/// caller `"anyone"`) alongside the party-signed `cancel_expired` — a
+/// third-party keeper sweeps with the crank, the initializer's own
+/// keeper with the party path.
 pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport {
     let mut actions = Vec::new();
     for w in watched {
@@ -351,6 +368,33 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 decimals: e.decimals(),
                 reason: "expired",
             });
+            // AV-48: the permissionless crank — the same expiry exit,
+            // callable by anyone. A keeper bot that is party to nothing
+            // sweeps timed-out vaults with `crank_expired`; the party
+            // path above stays for the initializer's own keeper. The
+            // crank fails on a paused escrow (`require_not_paused`), so
+            // it is only listed when the escrow is not paused — a listed
+            // crank is always executable, never a `Paused` rejection.
+            // (The pre-existing `CancelExpired` listing above predates
+            // the pause feature and does not filter on it; left
+            // untouched.)
+            if !e.is_paused() {
+                actions.push(KeeperAction {
+                    escrow_id: w.escrow_id,
+                    kind: KeeperActionKind::CrankExpired,
+                    // Permissionless: no specific key must sign — the
+                    // keeper substitutes its own key; see `caller` docs.
+                    caller: [0u8; 32],
+                    caller_role: "anyone",
+                    mint: e.mint(),
+                    // The crank refunds to the same pinned destination
+                    // as the party path; the cranker receives nothing.
+                    refund_to: Some(e.refund_recipient()),
+                    amount: e.remaining_amount(),
+                    decimals: e.decimals(),
+                    reason: "expired",
+                });
+            }
         }
         // The taker's pull path: vesting attached, no milestone plan (the
         // plan owns the release schedule and disables `claim`), something
@@ -643,7 +687,8 @@ mod keeper_tests {
     fn expired_escrow_lists_cancel_expired_for_initializer() {
         let watched = [watch(ID1, funded(AMOUNT, 0))];
         let report = scan_keeper_actions(&watched, MID);
-        assert_eq!(report.actions.len(), 1);
+        // AV-48: the party-signed path plus the permissionless crank.
+        assert_eq!(report.actions.len(), 2);
         let a = report.actions[0];
         assert_eq!(a.kind, KeeperActionKind::CancelExpired);
         assert_eq!(a.escrow_id, ID1);
@@ -652,6 +697,52 @@ mod keeper_tests {
         assert_eq!(a.mint, None);
         assert_eq!(a.amount, AMOUNT);
         assert_eq!(a.reason, "expired");
+        let c = report.actions[1];
+        assert_eq!(c.kind, KeeperActionKind::CrankExpired);
+        assert_eq!(c.escrow_id, ID1);
+        assert_eq!(c.caller, [0u8; 32], "the crank is permissionless");
+        assert_eq!(c.caller_role, "anyone");
+        assert_eq!(c.mint, None);
+        assert_eq!(c.refund_to, Some(ALICE), "same pinned destination");
+        assert_eq!(c.amount, AMOUNT);
+        assert_eq!(c.reason, "expired");
+    }
+
+    #[test]
+    fn paused_escrow_lists_no_crank_action() {
+        // AV-48: the crank fails on a paused escrow (`require_not_paused`
+        // runs first), so the keeper must not list it — a listed crank
+        // is always executable. The pre-existing party-signed
+        // `cancel_expired` listing is untouched by AV-48.
+        const PAUSE_AUTH: [u8; 32] = [0x9A; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, 0)
+            .unwrap()
+            .with_pause_authority(PAUSE_AUTH)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.pause(PAUSE_AUTH).unwrap();
+        assert!(e.is_paused());
+        let watched = [watch(ID1, e)];
+        let report = scan_keeper_actions(&watched, MID);
+        assert!(
+            report
+                .actions
+                .iter()
+                .all(|a| a.kind != KeeperActionKind::CrankExpired),
+            "a paused escrow must not list the crank: {report:?}"
+        );
+    }
+
+    #[test]
+    fn crank_action_json_names_crank_expired_and_anyone_caller() {
+        // AV-48: the crank action serializes with the new action name
+        // and the `"anyone"` caller role so operator tooling can
+        // distinguish it from the party-signed path.
+        let watched = [watch(ID1, funded(AMOUNT, 0))];
+        let report = scan_keeper_actions(&watched, MID);
+        let json = report.to_json();
+        assert!(json.contains("\"action\":\"crank_expired\""));
+        assert!(json.contains("\"caller_role\":\"anyone\""));
     }
 
     #[test]
@@ -659,8 +750,9 @@ mod keeper_tests {
         // `now == expires_at` is expiry-eligible (`now >= expires_at`).
         let watched = [watch(ID1, funded(AMOUNT, MID))];
         let report = scan_keeper_actions(&watched, MID);
-        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions.len(), 2);
         assert_eq!(report.actions[0].kind, KeeperActionKind::CancelExpired);
+        assert_eq!(report.actions[1].kind, KeeperActionKind::CrankExpired);
         // One second earlier: not eligible.
         let report = scan_keeper_actions(&watched, MID - 1);
         assert!(report.is_empty());
@@ -686,8 +778,9 @@ mod keeper_tests {
         assert!(report.is_empty());
         // At expires_at + grace: executable, listed.
         let report = scan_keeper_actions(&watched, MID + GRACE);
-        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions.len(), 2);
         assert_eq!(report.actions[0].kind, KeeperActionKind::CancelExpired);
+        assert_eq!(report.actions[1].kind, KeeperActionKind::CrankExpired);
         assert_eq!(report.actions[0].reason, "expired");
         // Cross-check against the real transition at every boundary: the
         // keeper's predicate and the chain's gate never disagree.
@@ -712,8 +805,10 @@ mod keeper_tests {
         e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
-        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions.len(), 2);
         assert_eq!(report.actions[0].amount, 600_000);
+        assert_eq!(report.actions[1].kind, KeeperActionKind::CrankExpired);
+        assert_eq!(report.actions[1].amount, 600_000);
     }
 
     #[test]
@@ -725,8 +820,10 @@ mod keeper_tests {
         e.fund(ALICE).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
-        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions.len(), 2);
         assert_eq!(report.actions[0].mint, Some(MINT));
+        assert_eq!(report.actions[1].kind, KeeperActionKind::CrankExpired);
+        assert_eq!(report.actions[1].mint, Some(MINT));
         let json = report.to_json();
         assert!(
             json.contains(&format!("\"mint\":\"{}\"", hex_of(0xD0))),
@@ -806,8 +903,9 @@ mod keeper_tests {
         let report = scan_keeper_actions(&watched, MID);
         // The plan owns the release schedule (`claim` would fail with
         // InvalidMilestones), but the expiry exit still refunds.
-        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions.len(), 2);
         assert_eq!(report.actions[0].kind, KeeperActionKind::CancelExpired);
+        assert_eq!(report.actions[1].kind, KeeperActionKind::CrankExpired);
     }
 
     #[test]
@@ -879,8 +977,9 @@ mod keeper_tests {
         // (WatchedEscrow is Copy + PartialEq, so this is exact).
         assert_eq!(before, [watch(ID1, e1), watch(ID2, e2), watch(ID3, e3)]);
         assert_eq!(report.scanned, 3);
-        assert_eq!(report.actions.len(), 2);
-        // Input order preserved: ID1's cancel first, ID2's claim second.
+        assert_eq!(report.actions.len(), 3);
+        // Input order preserved: ID1's cancel first, ID1's crank second,
+        // ID2's claim third.
         assert_eq!(
             report.actions[0],
             KeeperAction {
@@ -898,18 +997,38 @@ mod keeper_tests {
                 reason: "expired",
             }
         );
-        assert_eq!(report.actions[1].escrow_id, ID2);
-        assert_eq!(report.actions[1].kind, KeeperActionKind::Claim);
+        assert_eq!(
+            report.actions[1],
+            KeeperAction {
+                escrow_id: ID1,
+                kind: KeeperActionKind::CrankExpired,
+                // Permissionless: the zero key marks "anyone".
+                caller: [0u8; 32],
+                caller_role: "anyone",
+                mint: None,
+                refund_to: Some(ALICE),
+                amount: AMOUNT,
+                decimals: 0,
+                reason: "expired",
+            }
+        );
+        assert_eq!(report.actions[2].escrow_id, ID2);
+        assert_eq!(report.actions[2].kind, KeeperActionKind::Claim);
     }
 
     #[test]
     fn json_shape_is_pinned() {
         let watched = [watch(ID1, funded(AMOUNT, 0))];
         let report = scan_keeper_actions(&watched, 1_000_000);
+        // AV-48: the expired escrow lists both the party-signed
+        // `cancel_expired` and the permissionless `crank_expired`.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\"}}]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\"}},{{\"escrow_id\":\"{}\",\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\"}}]}}",
             hex_of(0x01),
             hex_of(0xAA),
+            hex_of(0xAA),
+            hex_of(0x01),
+            hex_of(0x00),
             hex_of(0xAA),
         );
         assert_eq!(report.to_json(), expected);
@@ -948,7 +1067,7 @@ mod keeper_tests {
         e.fund(ALICE).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, 1_000_000);
-        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions.len(), 2);
         let action = &report.actions[0];
         assert_eq!(action.kind, KeeperActionKind::CancelExpired);
         assert_eq!(action.caller, ALICE, "initializer is the canonical caller");
@@ -956,6 +1075,16 @@ mod keeper_tests {
             action.refund_to,
             Some(WHITELIST),
             "the instruction must name the whitelisted destination"
+        );
+        // AV-48: the crank carries the same pinned destination — the
+        // cranker receives nothing.
+        let crank = &report.actions[1];
+        assert_eq!(crank.kind, KeeperActionKind::CrankExpired);
+        assert_eq!(crank.caller_role, "anyone");
+        assert_eq!(
+            crank.refund_to,
+            Some(WHITELIST),
+            "the crank refunds to the pinned destination too"
         );
         assert!(
             report.to_json().contains(&format!(
@@ -969,14 +1098,17 @@ mod keeper_tests {
     #[test]
     fn expired_vesting_escrow_lists_both_calls() {
         // Both calls are executable at the scan time; the keeper executes
-        // one and re-scans. Amounts are as of the scan.
+        // one and re-scans. Amounts are as of the scan. AV-48: the
+        // permissionless crank is listed too.
         let watched = [watch(ID1, funded_vesting(0))];
         let report = scan_keeper_actions(&watched, MID);
-        assert_eq!(report.actions.len(), 2);
+        assert_eq!(report.actions.len(), 3);
         assert_eq!(report.actions[0].kind, KeeperActionKind::CancelExpired);
         assert_eq!(report.actions[0].amount, AMOUNT);
-        assert_eq!(report.actions[1].kind, KeeperActionKind::Claim);
-        assert_eq!(report.actions[1].amount, 500_000);
+        assert_eq!(report.actions[1].kind, KeeperActionKind::CrankExpired);
+        assert_eq!(report.actions[1].amount, AMOUNT);
+        assert_eq!(report.actions[2].kind, KeeperActionKind::Claim);
+        assert_eq!(report.actions[2].amount, 500_000);
     }
 
     #[test]
@@ -990,11 +1122,16 @@ mod keeper_tests {
         e.fund(ALICE).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, 1_000_000);
-        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions.len(), 2);
         let a = report.actions[0];
         assert_eq!(a.kind, KeeperActionKind::CancelExpired);
         assert_eq!(a.amount, AMOUNT, "the instruction moves raw units");
         assert_eq!(a.decimals, 6);
+        assert_eq!(
+            report.actions[1].kind,
+            KeeperActionKind::CrankExpired,
+            "AV-48: the crank is listed too"
+        );
         let json = report.to_json();
         assert!(
             json.contains("\"amount\":1000000,\"decimals\":6,\"display_amount\":\"1.000000\""),

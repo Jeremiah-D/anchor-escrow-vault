@@ -99,6 +99,7 @@
 //! | Released, Claimed, MilestoneReleased | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
+//! | ExpiredCranked (AV-48) | 0 | 0 | remainder minus penalty, to the whitelisted destination (the cranker receives nothing) | anti-griefing penalty to the initializer (AV-24; 0 unless the cranker is the taker) |
 //! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
 //! | MilestoneSkipped | 0 | 0 | skipped tranche (the initializer's refund) | 0 |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
@@ -188,6 +189,15 @@ pub enum EscrowEventKind {
     /// idempotent no-op that emits nothing (paralleling
     /// [`EscrowEventKind::QuorumUpdated`]'s no-op rule).
     PauseAuthorityRotated,
+    /// AV-48: an expired escrow was cancelled through the permissionless
+    /// crank ([`Escrow::crank_expired`]) instead of the party-signed
+    /// [`EscrowEventKind::ExpiredCancelled`] path. `from == Funded`, `to
+    /// == Cancelled`; amounts follow the [`EventAmounts::expired_cancel`]
+    /// shape (refund to the pinned destination, penalty only when the
+    /// cranker is the taker). The [`EscrowEvent::caller`] field carries
+    /// the crank caller's key — the one kind where the caller is neither
+    /// party, so the indexer cannot infer it from the escrow's parties.
+    ExpiredCranked,
 }
 
 /// Fund movements carried by an [`EscrowEvent`].
@@ -317,6 +327,12 @@ pub struct CpiRouteAudit {
 /// ([`IndexedEscrow::release_via_cpi`]). It is `None` on every other
 /// kind — plain releases authorize no third-party instruction.
 ///
+/// `caller` (AV-48) carries the crank caller's key on the
+/// `ExpiredCranked` event — the one kind where the caller is neither
+/// party, so the indexer cannot infer it from the escrow's parties.
+/// It is `None` on every other kind — the event log never invents a
+/// caller.
+///
 /// [`IndexedEscrow::release_via_cpi`]: IndexedEscrow::release_via_cpi
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EscrowEvent {
@@ -337,6 +353,9 @@ pub struct EscrowEvent {
     /// ruling the arbiter wrote.
     pub rationale_hash: Option<[u8; 32]>,
     pub cpi: Option<CpiRouteAudit>,
+    /// AV-48: the permissionless crank caller's key, carried by the
+    /// `ExpiredCranked` event (`None` on every other kind).
+    pub caller: Option<[u8; 32]>,
 }
 
 /// An event-logging adapter over [`Escrow`] (AV-18).
@@ -393,13 +412,16 @@ impl IndexedEscrow {
             at,
             None,
             None,
-
-        None,
+            None,
+            None,
         );
         Ok(indexed)
     }
 
     /// Record one event, assigning the next per-escrow sequence number.
+    /// `caller` (AV-48) is `Some` only for the permissionless crank
+    /// ([`EscrowEventKind::ExpiredCranked`]) — every other kind passes
+    /// `None`, since the event log never invents a caller.
     fn push_event(
         &mut self,
         kind: EscrowEventKind,
@@ -410,6 +432,7 @@ impl IndexedEscrow {
         evidence_hash: Option<[u8; 32]>,
         rationale_hash: Option<[u8; 32]>,
         cpi: Option<CpiRouteAudit>,
+        caller: Option<[u8; 32]>,
     ) {
         let event = EscrowEvent {
             kind,
@@ -422,6 +445,7 @@ impl IndexedEscrow {
             evidence_hash,
             rationale_hash,
             cpi,
+            caller,
         };
         self.next_seq += 1;
         self.events.push(event);
@@ -446,16 +470,16 @@ impl IndexedEscrow {
             Err(EscrowError::ReentrantCall) => {
                 let state = self.inner.state();
                 self.push_event(
-                    EscrowEventKind::ReentryRejected,
-                    state,
-                    state,
-                    EventAmounts::none(),
-                    at,
-                    None,
-                    None,
-
-                None,
-                );
+            EscrowEventKind::ReentryRejected,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+        );
                 Err(EscrowError::ReentrantCall)
             }
             other => other,
@@ -595,7 +619,17 @@ impl IndexedEscrow {
         self.inner.activate(authority)?;
         let to = self.inner.state();
         if to != from {
-            self.push_event(EscrowEventKind::Activated, from, to, EventAmounts::none(), at, None, None, None);
+            self.push_event(
+            EscrowEventKind::Activated,
+            from,
+            to,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+        );
         }
         Ok(())
     }
@@ -618,8 +652,8 @@ impl IndexedEscrow {
             at,
             None,
             None,
-
-        None,
+            None,
+            None,
         );
         Ok(())
     }
@@ -654,8 +688,8 @@ impl IndexedEscrow {
             at,
             None,
             None,
-
-        None,
+            None,
+            None,
         );
         Ok((payout, fee))
     }
@@ -707,6 +741,7 @@ impl IndexedEscrow {
                 target: receipt.cpi_target,
                 accounts_hash: receipt.accounts_hash,
             }),
+            None,
         );
         Ok((payout, fee, receipt))
     }
@@ -737,8 +772,8 @@ impl IndexedEscrow {
             at,
             None,
             None,
-
-        None,
+            None,
+            None,
         );
         Ok(())
     }
@@ -771,8 +806,40 @@ impl IndexedEscrow {
             now,
             None,
             None,
+            None,
+            None,
+        );
+        Ok((refund, penalty))
+    }
 
-        None,
+    /// Permissionless expiry crank (mirrors [`Escrow::crank_expired`],
+    /// AV-48). Emits `ExpiredCranked` (carrying the crank `caller` —
+    /// the one event kind where the caller is neither party) with the
+    /// same [`EventAmounts::expired_cancel`] shape as the party-signed
+    /// path; `now` doubles as the event's `at`. Returns the `(refund,
+    /// penalty)` split: only a taker cranker pays the AV-24 penalty.
+    pub fn crank_expired(
+        &mut self,
+        caller: [u8; 32],
+        now: u64,
+        mint: Option<[u8; 32]>,
+    ) -> Result<(u64, u64), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected` (`now` doubles as the event's `at`).
+        let result = self.inner.crank_expired(caller, now, mint);
+        let (refund, penalty) = self.map_reentrant(result, now)?;
+        let to = self.inner.state();
+        self.push_event(
+            EscrowEventKind::ExpiredCranked,
+            from,
+            to,
+            EventAmounts::expired_cancel(refund, penalty),
+            now,
+            None,
+            None,
+            None,
+            Some(caller),
         );
         Ok((refund, penalty))
     }
@@ -800,7 +867,17 @@ impl IndexedEscrow {
         // on the error path.
         if after > before {
             let state = self.inner.state();
-            self.push_event(EscrowEventKind::Attested, state, state, EventAmounts::none(), at, None, None, None);
+            self.push_event(
+            EscrowEventKind::Attested,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+        );
         }
         Ok(())
     }
@@ -828,16 +905,16 @@ impl IndexedEscrow {
         if after != before {
             let state = self.inner.state();
             self.push_event(
-                EscrowEventKind::QuorumUpdated,
-                state,
-                state,
-                EventAmounts::none(),
-                at,
-                None,
-                None,
-
+            EscrowEventKind::QuorumUpdated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
             None,
-            );
+            None,
+            None,
+            None,
+        );
         }
         Ok(())
     }
@@ -890,16 +967,16 @@ impl IndexedEscrow {
         if after != before {
             let state = self.inner.state();
             self.push_event(
-                EscrowEventKind::AttestorsUpdated,
-                state,
-                state,
-                EventAmounts::none(),
-                at,
-                None,
-                None,
-
+            EscrowEventKind::AttestorsUpdated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
             None,
-            );
+            None,
+            None,
+            None,
+        );
         }
         Ok(())
     }
@@ -927,7 +1004,7 @@ impl IndexedEscrow {
             at,
             None,
             None,
-
+            None,
             None,
         );
         Ok(())
@@ -948,7 +1025,7 @@ impl IndexedEscrow {
             at,
             None,
             None,
-
+            None,
             None,
         );
         Ok(())
@@ -967,7 +1044,7 @@ impl IndexedEscrow {
             at,
             None,
             None,
-
+            None,
             None,
         );
         Ok(())
@@ -992,16 +1069,16 @@ impl IndexedEscrow {
         if after != before {
             let state = self.inner.state();
             self.push_event(
-                EscrowEventKind::PauseAuthorityRotated,
-                state,
-                state,
-                EventAmounts::none(),
-                at,
-                None,
-                None,
-
-                None,
-            );
+            EscrowEventKind::PauseAuthorityRotated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+        );
         }
         Ok(())
     }
@@ -1031,8 +1108,8 @@ impl IndexedEscrow {
             now,
             None,
             None,
-
-        None,
+            None,
+            None,
         );
         Ok((payout, fee))
     }
@@ -1056,8 +1133,8 @@ impl IndexedEscrow {
             now,
             evidence_hash,
             None,
-
-        None,
+            None,
+            None,
         );
         Ok(())
     }
@@ -1110,6 +1187,7 @@ impl IndexedEscrow {
             evidence_hash,
             rationale_hash,
             None,
+            None,
         );
         Ok((payout, fee, refund))
     }
@@ -1131,16 +1209,16 @@ impl IndexedEscrow {
         if !confirmed_before && self.inner.milestone_confirmed(i) {
             let state = self.inner.state();
             self.push_event(
-                EscrowEventKind::MilestoneConfirmed,
-                state,
-                state,
-                EventAmounts::none(),
-                at,
-                None,
-                None,
-
+            EscrowEventKind::MilestoneConfirmed,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
             None,
-            );
+            None,
+            None,
+            None,
+        );
         }
         Ok(())
     }
@@ -1175,8 +1253,8 @@ impl IndexedEscrow {
             at,
             None,
             None,
-
-        None,
+            None,
+            None,
         );
         Ok((payout, fee))
     }
@@ -1207,16 +1285,16 @@ impl IndexedEscrow {
         if !settled_before && self.inner.milestone_settled(i) {
             let state = self.inner.state();
             self.push_event(
-                EscrowEventKind::MilestoneSkipped,
-                state,
-                state,
-                EventAmounts::refund(tranche),
-                at,
-                None,
-                None,
-
+            EscrowEventKind::MilestoneSkipped,
+            state,
+            state,
+            EventAmounts::refund(tranche),
+            at,
             None,
-            );
+            None,
+            None,
+            None,
+        );
         }
         Ok(())
     }
@@ -1248,8 +1326,8 @@ impl IndexedEscrow {
             at,
             None,
             None,
-
-        None,
+            None,
+            None,
         );
         Ok(rent)
     }
@@ -1518,6 +1596,59 @@ mod event_tests {
         assert_eq!(event.kind, EscrowEventKind::ExpiredCancelled);
         assert_eq!(event.amounts.refund, 1_000_000);
         assert_eq!(event.amounts.penalty, 0);
+    }
+
+    #[test]
+    fn crank_expired_emits_expired_cranked_with_caller() {
+        // AV-48: the permissionless crank emits `ExpiredCranked`
+        // (not `ExpiredCancelled`) carrying the crank caller's key —
+        // the one event kind where the caller is neither party.
+        let mut e = funded(1_000_000);
+        let (refund, penalty) = e.crank_expired(MALLORY, EXPIRES_AT, None).unwrap();
+        assert_eq!((refund, penalty), (1_000_000, 0));
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::ExpiredCranked);
+        assert_eq!(event.from, EscrowState::Funded);
+        assert_eq!(event.to, EscrowState::Cancelled);
+        assert_eq!(event.amounts.refund, 1_000_000);
+        assert_eq!(event.amounts.penalty, 0);
+        assert_eq!(event.caller, Some(MALLORY), "the crank caller is recorded");
+        assert_eq!(event.at, EXPIRES_AT, "now doubles as at");
+    }
+
+    #[test]
+    fn party_cancel_emits_no_caller() {
+        // The `caller` field is `None` on every other kind — the event
+        // log never invents a caller.
+        let mut e = funded(1_000_000);
+        e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::ExpiredCancelled);
+        assert_eq!(event.caller, None);
+    }
+
+    #[test]
+    fn taker_crank_emits_penalty_split() {
+        // AV-48: a taker cranker pays the AV-24 penalty — the event
+        // carries the exact (refund, penalty) split.
+        let mut e = indexed(1_000_000).with_penalty_bps(250).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let (refund, penalty) = e.crank_expired(BOB, EXPIRES_AT, None).unwrap();
+        assert_eq!((refund, penalty), (975_000, 25_000));
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::ExpiredCranked);
+        assert_eq!(event.amounts.refund, 975_000);
+        assert_eq!(event.amounts.penalty, 25_000);
+        assert_eq!(event.caller, Some(BOB));
+    }
+
+    #[test]
+    fn failed_crank_emits_nothing() {
+        // A premature crank emits nothing — the "failed calls emit
+        // nothing" rule holds for the permissionless path too.
+        let mut e = funded(1_000_000);
+        assert!(e.crank_expired(MALLORY, EXPIRES_AT - 1, None).is_err());
+        assert_eq!(e.drain_events().len(), 2, "only Initialized + Funded");
     }
 
     #[test]
