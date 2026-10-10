@@ -841,6 +841,30 @@ order; batches in first-seen caller order, actions in input order):
 ]}
 ```
 
+`scan_milestones(watched, now)` (AV-42) is the third keeper scan: it
+walks the same watch list and, per escrow carrying an AV-15 milestone
+plan in `Funded` state, emits the milestone tranche's executable call
+list. Each party's missing `confirm_milestone` approval and each
+party's missing `skip_milestone` approval is listed as its own action
+— skipping is dual-signed on-chain (each party records their approval
+in a separate call, executing only when both are present), so the
+scan never invents a combined call the chain has no instruction for.
+Once every gate passes, the initializer's `release_milestone` becomes
+executable. Every action carries the exact arguments the keeper needs:
+`escrow_id`, `index`, `caller` (+ `caller_role`), `mint`, and the
+tranche amount split (`tranche`, `fee`, `taker_payout` — the AV-17
+protocol-fee preview, `0` on confirm/skip actions which move no
+funds). Tranches that are not yet executable go into `blocked` with a
+machine-readable reason: `"unconfirmed"`, `"quorum_not_satisfied"`,
+`"timelock_not_reached"`, or `"prerequisite"` (an earlier tranche is
+still unsettled — settlement is strictly in-order). Like the other
+scans it is a dry-run over `&Escrow` snapshots — no mutation, no
+events, no clock; escrows without a milestone plan, not in `Funded`,
+or fully settled contribute nothing — and `MilestoneReport::to_json()`
+emits hand-serialized JSON in the same deterministic style (AV-33
+conventions: fixed field order, 64-char lowercase hex keys, `mint` as
+hex or `null`).
+
 ## State snapshot (AV-26)
 
 Keeper bots and indexers need one more primitive than the call list: *"what
