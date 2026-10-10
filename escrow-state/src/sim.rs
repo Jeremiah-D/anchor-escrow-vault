@@ -113,7 +113,10 @@ impl SimEscrow {
             let n = 1 + rng.below(3) as usize;
             let threshold = 1 + rng.below(n as u64) as u8;
             e = e
-                .with_quorum(QuorumPolicy::new(&ATTESTOR_POOL[..n], threshold).unwrap())
+                .with_quorum(
+                    QuorumPolicy::new(&ATTESTOR_POOL[..n], &vec![1u64; n], u64::from(threshold))
+                        .unwrap(),
+                )
                 .unwrap();
             ATTESTOR_POOL[..n].to_vec()
         } else {
@@ -280,7 +283,7 @@ enum ValidOp {
     Attest(usize),
     Release(u64),
     Claim,
-    UpdateQuorum(u8),
+    UpdateQuorum(u64),
     Cancel,
     CancelExpired([u8; 32]),
     Escalate([u8; 32], Option<[u8; 32]>),
@@ -413,8 +416,11 @@ impl Runner {
                         cands.push(ValidOp::Escalate(if rng.coin() { ALICE } else { BOB }, evidence));
                     }
                     if s.escrow.quorum().is_some() && rng.below(10) == 0 {
-                        let registered = s.escrow.quorum().unwrap().registered_count();
-                        cands.push(ValidOp::UpdateQuorum(1 + rng.below(registered as u64) as u8));
+                        // AV-45: the governance threshold is a weight sum;
+                        // the sim registers unit weights, so total weight
+                        // == registered count here.
+                        let total = s.escrow.quorum().unwrap().total_weight();
+                        cands.push(ValidOp::UpdateQuorum(1 + rng.below(total)));
                     }
                     let pick = rng.below(cands.len() as u64) as usize;
                     cands.into_iter().nth(pick)

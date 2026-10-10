@@ -236,16 +236,21 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         for a in attestors.iter_mut() {
             *a = c.pubkey()?;
         }
+        let mut weights = [0u64; MAX_ATTESTORS];
+        for w in weights.iter_mut() {
+            *w = c.u64_le()?;
+        }
         let registered = c.u8()?;
-        let threshold = c.u8()?;
+        let threshold = c.u64_le()?;
         let approvals = c.u64_le()?;
         debug_assert_eq!(
-            8 * PUBKEY_LEN + 1 + 1 + 8,
+            8 * PUBKEY_LEN + 8 * 8 + 1 + 8 + 8,
             QUORUM_POLICY_LEN,
             "quorum region drift vs QUORUM_POLICY_LEN"
         );
         Some(QuorumPolicy {
             attestors,
+            weights,
             registered,
             threshold,
             approvals,
@@ -497,7 +502,7 @@ mod discriminator_tests {
         // field table must decode, not just the prefix.
         let mut e = Escrow::initialize(ALICE, BOB, 5_000_000, EXPIRES_AT)
             .unwrap()
-            .with_quorum(QuorumPolicy::new(&[A1, A2], 2).unwrap())
+            .with_quorum(QuorumPolicy::new(&[A1, A2], &[1, 1], 2).unwrap())
             .unwrap()
             .with_vesting(VestingSchedule::new(1_700_000_000, 1_900_000_000).unwrap())
             .unwrap()

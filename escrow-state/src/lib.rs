@@ -247,7 +247,7 @@ pub struct Escrow {
     released: u64,
     expires_at: u64,
     state: EscrowState,
-    /// Optional N-of-M attestor quorum gating `release`. `None` means a
+    /// Optional weighted attestor quorum gating `release`. `None` means a
     /// plain two-party escrow (backward compatible).
     quorum: Option<QuorumPolicy>,
     /// AV-12: dual-signature activation bitmask (see
@@ -709,48 +709,80 @@ impl EscrowError {
 /// crate stays heap-free and `Copy`.
 pub const MAX_ATTESTORS: usize = 8;
 
-/// N-of-M release policy: `threshold` distinct attestations from the
-/// registered `attestors` must be recorded before [`Escrow::release`]
-/// succeeds. Models arbitrated / oracle-gated escrows (e.g. 2-of-3 with
-/// an arbiter, or M-of-N oracle attestation of delivery), the same
-/// pattern as multi-sig escrow release conditions.
+/// Weighted release policy (AV-45): each registered attestor carries a
+/// `weight: u64`, and [`Escrow::release`] succeeds once the accumulated
+/// weight of distinct attestations reaches `threshold` (a weight sum,
+/// not a headcount). Models stake-weighted oracle / arbiter panels —
+/// the same pattern as weighted multi-sig release conditions — where
+/// some voters speak for more than others (e.g. a 2-of-3 panel where
+/// the arbiter's vote alone meets the threshold).
 ///
 /// Attestations are a bitmask over the registered attestors, so the
-/// policy is `Copy` and needs no allocation. Deliberately, the quorum
-/// gates *release only*: the `cancel` / `cancel_expired` refund paths
-/// stay initializer-driven so attestors cannot grief funds into a lockup
-/// by withholding approval.
+/// policy is `Copy` and needs no allocation; the accumulated weight is
+/// derived from the bitmask and the per-attestor weights on demand, so
+/// it can never drift from the recorded votes. `attest` stays
+/// idempotent: repeat attestations by the same attestor count once.
+/// Deliberately, the quorum gates *release only*: the `cancel` /
+/// `cancel_expired` refund paths stay initializer-driven so attestors
+/// cannot grief funds into a lockup by withholding approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuorumPolicy {
     attestors: [[u8; 32]; MAX_ATTESTORS],
+    /// Per-attestor vote weight, in slot order (parallel to `attestors`).
+    weights: [u64; MAX_ATTESTORS],
     registered: u8,
-    threshold: u8,
+    /// Weight-sum threshold: release is legal once the accumulated
+    /// weight of distinct attestations reaches this value.
+    threshold: u64,
     approvals: u64,
 }
 
 impl QuorumPolicy {
-    /// Register `attestors` with an N-of-M `threshold`.
+    /// Register `attestors` with per-attestor `weights` and a weight-sum
+    /// `threshold`.
     ///
     /// Rejects with [`EscrowError::InvalidQuorum`] when the list is
-    /// empty, longer than [`MAX_ATTESTORS`], contains a duplicate, or the
-    /// threshold is 0 / larger than the number of attestors.
-    pub fn new(attestors: &[[u8; 32]], threshold: u8) -> Result<Self, EscrowError> {
+    /// empty, longer than [`MAX_ATTESTORS`], contains a duplicate, the
+    /// weights slice length mismatches the attestor list, any weight is
+    /// zero, the weights' u128 accumulation overflows the u64 weight
+    /// domain, or the threshold is 0 / larger than the total weight.
+    pub fn new(
+        attestors: &[[u8; 32]],
+        weights: &[u64],
+        threshold: u64,
+    ) -> Result<Self, EscrowError> {
         if attestors.is_empty() || attestors.len() > MAX_ATTESTORS {
             return Err(EscrowError::InvalidQuorum);
         }
+        if weights.len() != attestors.len() {
+            return Err(EscrowError::InvalidQuorum);
+        }
         let mut table = [[0u8; 32]; MAX_ATTESTORS];
-        for (i, attestor) in attestors.iter().enumerate() {
+        let mut weight_table = [0u64; MAX_ATTESTORS];
+        // Accumulate in u128 (checked): the total weight must fit the
+        // u64 weight domain, so a configuration whose combined voting
+        // power is unrepresentable is rejected up front rather than
+        // wrapping mid-tally.
+        let mut total: u128 = 0;
+        for (i, (attestor, weight)) in attestors.iter().zip(weights.iter()).enumerate() {
             if table[..i].contains(attestor) {
                 return Err(EscrowError::InvalidQuorum);
             }
+            if *weight == 0 {
+                return Err(EscrowError::InvalidQuorum);
+            }
+            total = total.checked_add(*weight as u128).ok_or(EscrowError::InvalidQuorum)?;
             table[i] = *attestor;
+            weight_table[i] = *weight;
         }
+        let total_weight = u64::try_from(total).map_err(|_| EscrowError::InvalidQuorum)?;
         let registered = attestors.len() as u8;
-        if threshold == 0 || threshold > registered {
+        if threshold == 0 || threshold > total_weight {
             return Err(EscrowError::InvalidQuorum);
         }
         Ok(Self {
             attestors: table,
+            weights: weight_table,
             registered,
             threshold,
             approvals: 0,
@@ -776,9 +808,10 @@ impl QuorumPolicy {
         }
     }
 
-    /// True once at least `threshold` distinct attestors have attested.
+    /// True once the accumulated weight of distinct attestations reaches
+    /// the weight-sum `threshold`.
     pub fn is_satisfied(&self) -> bool {
-        self.approval_count() >= self.threshold
+        self.approved_weight() >= self.threshold
     }
 
     /// Number of distinct attestors that have attested so far.
@@ -786,12 +819,40 @@ impl QuorumPolicy {
         self.approvals.count_ones() as u8
     }
 
-    /// The N in N-of-M.
-    pub fn threshold(&self) -> u8 {
+    /// Accumulated weight of the distinct attestors that have attested
+    /// so far. Derived from the approval bitmask and the per-attestor
+    /// weights, so it is always consistent with the recorded votes;
+    /// bounded by [`QuorumPolicy::total_weight`], hence by `u64::MAX`.
+    pub fn approved_weight(&self) -> u64 {
+        let mut sum: u128 = 0;
+        for i in 0..self.registered as usize {
+            if self.approvals & (1u64 << i) != 0 {
+                sum += self.weights[i] as u128;
+            }
+        }
+        // `total_weight` fit `u64` at construction and the approved set
+        // is a subset of the registered set, so this cannot truncate.
+        debug_assert!(sum <= u64::MAX as u128);
+        sum as u64
+    }
+
+    /// Total voting weight across all registered attestors.
+    pub fn total_weight(&self) -> u64 {
+        let mut sum: u128 = 0;
+        for i in 0..self.registered as usize {
+            sum += self.weights[i] as u128;
+        }
+        debug_assert!(sum <= u64::MAX as u128);
+        sum as u64
+    }
+
+    /// The weight-sum threshold a release must reach.
+    pub fn threshold(&self) -> u64 {
         self.threshold
     }
 
-    /// The M in N-of-M.
+    /// Number of registered attestors (the headcount; voting power is
+    /// per-attestor weight — see [`QuorumPolicy::total_weight`]).
     pub fn registered_count(&self) -> u8 {
         self.registered
     }
@@ -801,6 +862,12 @@ impl QuorumPolicy {
     /// the order votes map onto the approval bitmask.
     pub fn attestors(&self) -> &[[u8; 32]] {
         &self.attestors[..self.registered as usize]
+    }
+
+    /// The registered attestor weights, in slot order (parallel to
+    /// [`QuorumPolicy::attestors`]).
+    pub fn weights(&self) -> &[u64] {
+        &self.weights[..self.registered as usize]
     }
 }
 
@@ -1574,7 +1641,7 @@ impl Escrow {
         Ok((remaining - penalty, penalty))
     }
 
-    /// Attach an N-of-M attestor quorum to the release path.
+    /// Attach a weighted attestor quorum to the release path.
     /// Builder-style: only valid on an `Uninitialized` escrow, so the
     /// release condition is fixed before any funds move. Re-configuring
     /// a live escrow is rejected with `InvalidStateTransition`.
@@ -1606,11 +1673,11 @@ impl Escrow {
         }
     }
 
-    /// Adjust the quorum's attestation threshold by mutual agreement
-    /// (AV-25 — Solana quorum governance): both the initializer and the
-    /// taker must authorize the change (dual-signature governance,
-    /// reusing the AV-12 concept), on an escrow that is `Uninitialized`
-    /// or `Funded`.
+    /// Adjust the quorum's weight-sum threshold by mutual agreement
+    /// (AV-25 — Solana quorum governance, AV-45 weighted): both the
+    /// initializer and the taker must authorize the change
+    /// (dual-signature governance, reusing the AV-12 concept), on an
+    /// escrow that is `Uninitialized` or `Funded`.
     ///
     /// Why: the quorum is fixed before funding ([`Escrow::with_quorum`]),
     /// but attestors can go dark — a lost key or an unresponsive oracle
@@ -1621,17 +1688,17 @@ impl Escrow {
     /// mutual agreement when they want a stricter gate), without any
     /// single party being able to weaken the gate unilaterally.
     ///
-    /// The attestor set and existing attestations are untouched: only
-    /// the threshold moves, in place within the already-reserved quorum
-    /// region (no layout change, no realloc). If the new threshold is at
-    /// or below the current approval count, `release` becomes legal
-    /// immediately — that is the intended unlock. Setting the same
-    /// threshold again succeeds as a no-op.
+    /// The attestor set, their weights, and existing attestations are
+    /// untouched: only the threshold moves, in place within the
+    /// already-reserved quorum region (no layout change, no realloc). If
+    /// the new threshold is at or below the current approved weight,
+    /// `release` becomes legal immediately — that is the intended
+    /// unlock. Setting the same threshold again succeeds as a no-op.
     ///
     /// Check order is deliberate: authority (both parties) first, then
     /// state, then quorum configuration, then threshold validity — a
     /// stranger learns nothing about the quorum from the error alone.
-    /// A `0` threshold or one above the registered attestor count is
+    /// A `0` threshold or one above the total registered weight is
     /// [`EscrowError::InvalidQuorum`], reusing the quorum configuration
     /// error; calling on an escrow with no quorum configured is
     /// `InvalidQuorum` too.
@@ -1639,7 +1706,7 @@ impl Escrow {
         &mut self,
         initializer: [u8; 32],
         taker: [u8; 32],
-        new_threshold: u8,
+        new_threshold: u64,
     ) -> Result<(), EscrowError> {
         // Both parties must sign: either key alone (or a stranger) is
         // Unauthorized. Independent `==` checks (not `||`): the
@@ -1653,7 +1720,7 @@ impl Escrow {
             _ => return Err(EscrowError::InvalidStateTransition),
         }
         let policy = self.quorum.as_mut().ok_or(EscrowError::InvalidQuorum)?;
-        if new_threshold == 0 || new_threshold > policy.registered_count() {
+        if new_threshold == 0 || new_threshold > policy.total_weight() {
             return Err(EscrowError::InvalidQuorum);
         }
         policy.threshold = new_threshold;
@@ -1661,10 +1728,10 @@ impl Escrow {
     }
 
     /// Replace the quorum's attestor set by mutual agreement (AV-39 —
-    /// Solana quorum governance): both the initializer and the taker
-    /// must authorize the change (dual-signature governance, reusing
-    /// the AV-12 / AV-25 concept), on an escrow that is `Uninitialized`
-    /// or `Funded`.
+    /// Solana quorum governance, AV-45 weighted): both the initializer
+    /// and the taker must authorize the change (dual-signature
+    /// governance, reusing the AV-12 / AV-25 concept), on an escrow that
+    /// is `Uninitialized` or `Funded`.
     ///
     /// Why: the attestor set is fixed before funding
     /// ([`Escrow::with_quorum`]), but a registered attestor can go rogue
@@ -1674,16 +1741,20 @@ impl Escrow {
     /// sockpuppets would be a unilateral weakening of the gate, so the
     /// change needs both parties, exactly like AV-25's threshold move.
     ///
-    /// The attestor array is a fixed 8-slot reservation (AV-04), so
-    /// add/remove compacts into the slots with no layout change (the
-    /// account needs no realloc, rent is untouched). Recorded votes
-    /// follow their pubkeys, not their slots: approval bits are remapped
-    /// to the new indices, so a retained attestor keeps its vote and a
-    /// removed attestor's bit is cleared (dropping it would misattribute
-    /// a stale vote to a different attestor after compaction). The
-    /// threshold is unchanged — if the old threshold no longer fits the
-    /// new set size, that is `InvalidQuorum` (shrink the set and the
-    /// threshold together with AV-25 first). Passing the identical set
+    /// `new_weights` rides with the set: every replacement attestor
+    /// carries its vote weight (parallel to `new_attestors`; a zero
+    /// weight or a length mismatch is `InvalidQuorum` — weights cannot
+    /// be invented by omission). The attestor array is a fixed 8-slot
+    /// reservation (AV-04), so add/remove compacts into the slots with
+    /// no layout change (the account needs no realloc, rent is
+    /// untouched). Recorded votes follow their pubkeys, not their
+    /// slots: approval bits are remapped to the new indices, so a
+    /// retained attestor keeps its vote and a removed attestor's bit is
+    /// cleared (dropping it would misattribute a stale vote to a
+    /// different attestor after compaction). The weight-sum threshold is
+    /// unchanged — if it no longer fits the new total weight, that is
+    /// `InvalidQuorum` (move the threshold with AV-25 first, then swap
+    /// the set). Passing the identical set with identical weights
     /// succeeds as a no-op.
     ///
     /// Check order is deliberate: authority (both parties) first, then
@@ -1695,6 +1766,7 @@ impl Escrow {
         initializer: [u8; 32],
         taker: [u8; 32],
         new_attestors: &[[u8; 32]],
+        new_weights: &[u64],
     ) -> Result<(), EscrowError> {
         // Both parties must sign: either key alone (or a stranger) is
         // Unauthorized. Independent `==` checks (not `||`): the
@@ -1710,10 +1782,11 @@ impl Escrow {
         let old = self.quorum.as_ref().ok_or(EscrowError::InvalidQuorum)?;
         // Validate through `QuorumPolicy::new` so the set rules stay in
         // one place: empty, longer than `MAX_ATTESTORS`, duplicate
-        // attestor, or a threshold that no longer fits the new set size
-        // are all `InvalidQuorum` (the threshold here is the *old* one —
-        // this call never moves it).
-        let mut new_policy = QuorumPolicy::new(new_attestors, old.threshold)?;
+        // attestor, weight/length mismatch, zero weight, weight-domain
+        // overflow, or a weight-sum threshold that no longer fits the
+        // new total weight are all `InvalidQuorum` (the threshold here
+        // is the *old* one — this call never moves it).
+        let mut new_policy = QuorumPolicy::new(new_attestors, new_weights, old.threshold)?;
         // Remap approval bits by pubkey: retained attestors keep their
         // votes at the new indices, removed ones lose theirs. Without
         // this the bits would still point at the old slots and a
@@ -3007,11 +3080,13 @@ pub const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
 /// Serialized length of a Solana `Pubkey` under Borsh/Anchor: 32 bytes.
 pub const PUBKEY_LEN: usize = 32;
 
-/// Serialized length of `QuorumPolicy` under Borsh/Anchor: 8 registered
-/// attestor pubkeys, the registered count, the threshold, and the approval
-/// bitmask. Fixed-size by design (`MAX_ATTESTORS`), so account space is
-/// known at `initialize` time and never needs a realloc.
-pub const QUORUM_POLICY_LEN: usize = 8 * PUBKEY_LEN + 1 + 1 + 8;
+/// Serialized length of `QuorumPolicy` under Borsh/Anchor (AV-45
+/// weighted): 8 registered attestor pubkeys each followed by its u64
+/// vote weight, the registered count, the u64 weight-sum threshold,
+/// and the approval bitmask. Fixed-size by design (`MAX_ATTESTORS`), so
+/// account space is known at `initialize` time and never needs a
+/// realloc.
+pub const QUORUM_POLICY_LEN: usize = 8 * PUBKEY_LEN + 8 * 8 + 1 + 8 + 8;
 
 /// Serialized length of [`MilestonePlan`] under Borsh/Anchor (AV-15):
 /// `MAX_MILESTONES` tranche-amount u64s plus the tranche count byte.
@@ -3074,6 +3149,8 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // `Option<QuorumPolicy>`: one discriminant byte, then the policy when
     // `Some`. The space is always reserved (even for plain two-party
     // escrows) so `initialize_quorum` never needs to grow the account.
+    // AV-45: each attestor slot is pubkey + u64 weight, and the
+    // threshold is a u64 weight sum (see `QUORUM_POLICY_LEN`).
     ("quorum", "Option<QuorumPolicy>", 1 + QUORUM_POLICY_LEN),
     // AV-12: dual-signature activation bitmask (bit 0 initializer, bit 1
     // taker, bit 2 dual-sig required). One byte; activation progress must
@@ -3620,7 +3697,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 5_707_200, "from {state:?}");
+            assert_eq!(rent, 6_201_360, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -3718,7 +3795,7 @@ mod tests {
         // paid for). AV-38 grew the account by 33 bytes (rationale
         // hash) and AV-44 by 33 more (fee recipient), so the pin tracks
         // the new total deliberately.
-        assert_eq!(VAULT_SPACE, 692, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 763, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -4315,7 +4392,7 @@ mod fuzz_tests {
 }
 
 
-// ---------- AV-04: attestor quorum, N-of-M release gate ----------
+// ---------- AV-04: attestor quorum, weighted release gate (AV-45) ----------
 //
 // | case                                   | fund | release            | cancel/cancel_expired |
 // |----------------------------------------|------|--------------------|-----------------------|
@@ -4339,7 +4416,7 @@ mod quorum_tests {
     const EXPIRES_AT: u64 = 1_800_000_000;
 
     fn quorum_2_of_3() -> QuorumPolicy {
-        QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], 2).unwrap()
+        QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 2).unwrap()
     }
 
     fn escrow_with_quorum() -> Escrow {
@@ -4356,7 +4433,7 @@ mod quorum_tests {
     #[test]
     fn policy_rejects_empty_attestor_list() {
         assert_eq!(
-            QuorumPolicy::new(&[], 1),
+            QuorumPolicy::new(&[], &[], 1),
             Err(EscrowError::InvalidQuorum)
         );
     }
@@ -4364,7 +4441,7 @@ mod quorum_tests {
     #[test]
     fn policy_rejects_zero_threshold() {
         assert_eq!(
-            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 0),
+            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 0),
             Err(EscrowError::InvalidQuorum)
         );
     }
@@ -4372,7 +4449,7 @@ mod quorum_tests {
     #[test]
     fn policy_rejects_threshold_above_attestor_count() {
         assert_eq!(
-            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 3),
+            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 3),
             Err(EscrowError::InvalidQuorum)
         );
     }
@@ -4380,7 +4457,7 @@ mod quorum_tests {
     #[test]
     fn policy_rejects_duplicate_attestor() {
         assert_eq!(
-            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_1], 1),
+            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_1], &[1, 1], 1),
             Err(EscrowError::InvalidQuorum)
         );
     }
@@ -4389,7 +4466,7 @@ mod quorum_tests {
     fn policy_rejects_more_than_max_attestors() {
         let many: Vec<[u8; 32]> = (0..=MAX_ATTESTORS as u8).map(|i| [i; 32]).collect();
         assert_eq!(
-            QuorumPolicy::new(&many, 1),
+            QuorumPolicy::new(&many, &vec![1u64; many.len()], 1),
             Err(EscrowError::InvalidQuorum)
         );
     }
@@ -4397,10 +4474,160 @@ mod quorum_tests {
     #[test]
     fn policy_accepts_boundary_configs() {
         // 1-of-1 and M-of-M are the boundary policies.
-        let one = QuorumPolicy::new(&[ATTESTOR_1], 1).unwrap();
-        assert_eq!((one.registered_count(), one.threshold()), (1, 1));
-        let all = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], 3).unwrap();
+        let one = QuorumPolicy::new(&[ATTESTOR_1], &[1], 1).unwrap();
+        assert_eq!((one.registered_count(), one.threshold()), (1u8, 1u64));
+        let all = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 3).unwrap();
         assert!(!all.is_satisfied());
+    }
+
+    // ---------- AV-45: weighted quorum ----------
+
+    #[test]
+    fn weighted_policy_rejects_zero_weight() {
+        assert_eq!(
+            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 0], 1),
+            Err(EscrowError::InvalidQuorum)
+        );
+    }
+
+    #[test]
+    fn weighted_policy_rejects_weight_length_mismatch() {
+        assert_eq!(
+            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1], 1),
+            Err(EscrowError::InvalidQuorum)
+        );
+        assert_eq!(
+            QuorumPolicy::new(&[ATTESTOR_1], &[1, 2], 1),
+            Err(EscrowError::InvalidQuorum)
+        );
+    }
+
+    #[test]
+    fn weighted_policy_rejects_threshold_above_total_weight() {
+        // Total weight is 5; a threshold of 6 can never be reached.
+        assert_eq!(
+            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[2, 3], 6),
+            Err(EscrowError::InvalidQuorum)
+        );
+        // Exactly the total weight is the strictest legal policy.
+        let p = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[2, 3], 5).unwrap();
+        assert_eq!(p.total_weight(), 5);
+    }
+
+    #[test]
+    fn weighted_policy_rejects_weight_domain_overflow() {
+        // The weights accumulate in u128 but must fit the u64 weight
+        // domain: a combined voting power no threshold could name is
+        // rejected up front instead of wrapping mid-tally.
+        assert_eq!(
+            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[u64::MAX, u64::MAX], 1),
+            Err(EscrowError::InvalidQuorum)
+        );
+        // A single max weight is fine — it fits the domain exactly.
+        let p = QuorumPolicy::new(&[ATTESTOR_1], &[u64::MAX], u64::MAX).unwrap();
+        assert_eq!(p.total_weight(), u64::MAX);
+    }
+
+    #[test]
+    fn weighted_attestations_accumulate_by_voter_weight() {
+        // Weights [2, 3, 5], threshold 7: conservation — every vote adds
+        // exactly its voter's weight, repeats add nothing, and the
+        // approved weight plus the outstanding weight always equals the
+        // total.
+        let mut p = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[2, 3, 5], 7).unwrap();
+        assert_eq!(p.total_weight(), 10);
+        assert_eq!(p.approved_weight(), 0);
+        assert!(!p.is_satisfied());
+
+        p.attest(ATTESTOR_1).unwrap();
+        assert_eq!((p.approval_count(), p.approved_weight()), (1, 2));
+        assert!(!p.is_satisfied());
+        // Idempotent: a repeat attestation adds no weight.
+        p.attest(ATTESTOR_1).unwrap();
+        assert_eq!((p.approval_count(), p.approved_weight()), (1, 2));
+
+        p.attest(ATTESTOR_2).unwrap();
+        assert_eq!((p.approval_count(), p.approved_weight()), (2, 5));
+        assert!(!p.is_satisfied(), "weight 5 < threshold 7");
+
+        p.attest(ATTESTOR_3).unwrap();
+        assert_eq!((p.approval_count(), p.approved_weight()), (3, 10));
+        assert!(p.is_satisfied(), "weight 10 >= threshold 7");
+        // Conservation: approved + outstanding == total.
+        assert_eq!(p.approved_weight() + (p.total_weight() - p.approved_weight()), p.total_weight());
+
+        assert_eq!(p.attest(MALLORY), Err(EscrowError::Unauthorized));
+    }
+
+    #[test]
+    fn weighted_release_gate_uses_weight_threshold() {
+        // A heavy voter alone can meet the threshold while two light
+        // voters cannot — the gate counts weight, not heads.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(
+                QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[2, 3, 5], 7).unwrap(),
+            )
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.attest(ATTESTOR_1).unwrap();
+        e.attest(ATTESTOR_2).unwrap();
+        assert_eq!(
+            e.release(ALICE, EXPIRES_AT - 1, 1_000_000, None),
+            Err(EscrowError::QuorumNotReached),
+            "weight 5 of 7 is not enough"
+        );
+        e.attest(ATTESTOR_3).unwrap();
+        e.release(ALICE, EXPIRES_AT - 1, 1_000_000, None).unwrap();
+    }
+
+    #[test]
+    fn update_quorum_moves_weight_threshold_under_dual_sig() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        // Lowering to 1 restores liveness; the new threshold is a weight.
+        e.update_quorum(ALICE, BOB, 1).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+        // A zero threshold or one above the total weight is rejected.
+        assert_eq!(e.update_quorum(ALICE, BOB, 0), Err(EscrowError::InvalidQuorum));
+        assert_eq!(e.update_quorum(ALICE, BOB, 3), Err(EscrowError::InvalidQuorum));
+        assert_eq!(
+            e.quorum().unwrap().threshold(),
+            1,
+            "failed update keeps the threshold"
+        );
+        // One party alone cannot move the gate.
+        assert_eq!(
+            e.update_quorum(ALICE, MALLORY, 2),
+            Err(EscrowError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn update_attestors_replaces_weights_and_remaps_votes_by_weight() {
+        // Weights [2, 3], threshold 4. ATTESTOR_1 votes (weight 2).
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[2, 3], 4).unwrap())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.attest(ATTESTOR_1).unwrap();
+        assert!(!e.quorum().unwrap().is_satisfied());
+        // Swap the set with new weights: the retained vote follows its
+        // pubkey and now counts its NEW weight (5 >= threshold 4).
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_3], &[5, 1])
+            .unwrap();
+        let q = e.quorum().unwrap();
+        assert_eq!(q.weights(), &[5, 1]);
+        assert_eq!(q.total_weight(), 6);
+        assert_eq!(q.approved_weight(), 5, "retained vote at its new weight");
+        assert!(q.is_satisfied());
+        // Conservation across the swap: the new total is exactly the new
+        // weights' sum — no weight is created or destroyed by the remap.
+        assert_eq!(q.total_weight(), 5 + 1);
     }
 
     // ---------- attestation recording ----------
@@ -4545,7 +4772,7 @@ mod quorum_tests {
     #[test]
     fn initializer_or_taker_as_attestor_is_allowed() {
         // Parties may double as attestors (e.g. 2-of-3 maker/taker/arbiter).
-        let policy = QuorumPolicy::new(&[ALICE, ATTESTOR_1], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ALICE, ATTESTOR_1], &[1, 1], 2).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
@@ -4725,56 +4952,80 @@ pub(crate) mod anchor_idl_tests {
             name: "initialize_quorum",
             params: &[
                 ("attestors", "Vec<Pubkey>", "instruction param"),
-                ("threshold", "u8", "instruction param"),
+                (
+                    "weights",
+                    "Vec<u64>",
+                    "instruction param; per-attestor vote weight, parallel to attestors",
+                ),
+                (
+                    "threshold",
+                    "u64",
+                    "instruction param; the weight-sum threshold",
+                ),
             ],
             method: "QuorumPolicy::new + Escrow::with_quorum",
-            input_mapping: "attestors/threshold <- params (Pubkey -> \
+            input_mapping: "attestors/weights/threshold <- params (Pubkey -> \
                             [u8; 32] conversion); authority <- \
                             accounts.initializer (signer), enforced by the \
                             Anchor account constraint, not the state machine",
         },
         InstructionSpec {
-            // AV-25: dual-signed quorum threshold governance.
+            // AV-25: dual-signed quorum threshold governance (AV-45: the
+            // threshold is a weight sum).
             name: "update_quorum",
-            params: &[("threshold", "u8", "instruction param; the new N in N-of-M")],
+            params: &[(
+                "threshold",
+                "u64",
+                "instruction param; the new weight-sum threshold",
+            )],
             method: "Escrow::update_quorum",
             input_mapping: "authority <- accounts.initializer AND \
                             accounts.taker (BOTH signers — dual-signature \
                             governance; one party alone is Unauthorized); \
                             threshold <- param; Uninitialized or Funded \
-                            only; 0 or > registered attestor count is \
+                            only; 0 or > total registered weight is \
                             InvalidQuorum, and no quorum configured is \
-                            InvalidQuorum; the attestor set and existing \
-                            attestations are untouched — only the threshold \
-                            moves, in place, so the account needs no \
-                            realloc; lowering an unreachable threshold \
-                            restores liveness when attestors go dark",
+                            InvalidQuorum; the attestor set, their weights \
+                            and existing attestations are untouched — only \
+                            the threshold moves, in place, so the account \
+                            needs no realloc; lowering an unreachable \
+                            threshold restores liveness when attestors go \
+                            dark",
         },
         InstructionSpec {
-            // AV-39: dual-signed attestor set governance.
+            // AV-39: dual-signed attestor set governance (AV-45: the set
+            // carries per-attestor weights).
             name: "update_attestors",
-            params: &[(
-                "attestors",
-                "Vec<Pubkey>",
-                "instruction param; the new attestor set (1-8 keys, no duplicates)",
-            )],
+            params: &[
+                (
+                    "attestors",
+                    "Vec<Pubkey>",
+                    "instruction param; the new attestor set (1-8 keys, no duplicates)",
+                ),
+                (
+                    "weights",
+                    "Vec<u64>",
+                    "instruction param; per-attestor vote weight, parallel to attestors",
+                ),
+            ],
             method: "Escrow::update_attestors",
             input_mapping: "authority <- accounts.initializer AND \
                             accounts.taker (BOTH signers — dual-signature \
                             governance; one party alone is Unauthorized, \
                             so no party can unilaterally reshape the \
-                            electorate); attestors <- param (Pubkey -> \
-                            [u8; 32] conversion); Uninitialized or Funded \
-                            only; no quorum configured, an empty set, > 8 \
-                            keys, a duplicate, or a new set smaller than \
-                            the unchanged threshold is InvalidQuorum; the \
-                            set compacts into the reserved 8 slots in \
-                            place (no layout change, no realloc); approval \
-                            bits remap by pubkey — retained attestors \
-                            keep their votes, removed ones lose theirs; a \
-                            no-op same-set update succeeds silently \
-                            (AttestorsUpdated indexer event only fires on \
-                            a real set change)",
+                            electorate); attestors/weights <- params \
+                            (Pubkey -> [u8; 32] conversion); Uninitialized \
+                            or Funded only; no quorum configured, an empty \
+                            set, > 8 keys, a duplicate, a weight/length \
+                            mismatch, a zero weight, or a weight-sum \
+                            threshold that no longer fits the new total \
+                            weight is InvalidQuorum; the set compacts into \
+                            the reserved 8 slots in place (no layout \
+                            change, no realloc); approval bits remap by \
+                            pubkey — retained attestors keep their votes, \
+                            removed ones lose theirs; a no-op same-set \
+                            update succeeds silently (AttestorsUpdated \
+                            indexer event only fires on a real set change)",
         },
         InstructionSpec {
             // AV-12: dual-signature activation.
@@ -5198,7 +5449,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     fn quorum_funded_escrow() -> Escrow {
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
@@ -5208,7 +5459,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     fn quorum_3_of_3_funded_escrow() -> Escrow {
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], 3).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 3).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
@@ -5589,10 +5840,10 @@ pub(crate) mod anchor_idl_tests {
 
     #[test]
     fn update_quorum_maps_dual_signers_and_threshold_param() {
-        // IDL: update_quorum(threshold: u8). The program passes
+        // IDL: update_quorum(threshold: u64). The program passes
         // accounts.initializer and accounts.taker (BOTH signers) plus
         // the param, then Escrow::update_quorum.
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
@@ -5630,7 +5881,7 @@ pub(crate) mod anchor_idl_tests {
         );
         assert_eq!(e.quorum().unwrap().threshold(), 1);
         // Terminal states are locked out.
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
@@ -5645,14 +5896,14 @@ pub(crate) mod anchor_idl_tests {
 
     #[test]
     fn update_attestors_maps_dual_signers_and_attestor_set_param() {
-        // IDL: update_attestors(attestors: Vec<Pubkey>). The program
-        // passes accounts.initializer and accounts.taker (BOTH signers)
-        // plus the param (Pubkey -> [u8; 32]), then
+        // IDL: update_attestors(attestors: Vec<Pubkey>, weights: Vec<u64>).
+        // The program passes accounts.initializer and accounts.taker
+        // (BOTH signers) plus the params (Pubkey -> [u8; 32]), then
         // Escrow::update_attestors.
         let mut e = quorum_funded_escrow();
         // Both parties sign: the set compacts into the reserved slots
         // (remove ATTESTOR_2, add ATTESTOR_3 — no layout change).
-        e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_3])
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_3], &[1, 1])
             .unwrap();
         assert_eq!(
             e.quorum().unwrap().attestors(),
@@ -5664,11 +5915,11 @@ pub(crate) mod anchor_idl_tests {
         // One party alone is Unauthorized — the electorate cannot be
         // reshaped unilaterally. A stranger learns nothing either.
         assert_eq!(
-            e.update_attestors(ALICE, MALLORY, &[ATTESTOR_1]),
+            e.update_attestors(ALICE, MALLORY, &[ATTESTOR_1], &[1]),
             Err(EscrowError::Unauthorized)
         );
         assert_eq!(
-            e.update_attestors(MALLORY, BOB, &[ATTESTOR_1]),
+            e.update_attestors(MALLORY, BOB, &[ATTESTOR_1], &[1]),
             Err(EscrowError::Unauthorized)
         );
         assert_eq!(
@@ -5684,12 +5935,12 @@ pub(crate) mod anchor_idl_tests {
         // AV-12's activation and AV-25's threshold move. The independent
         // `==` checks (not `||`) make the degenerate case work without
         // letting a stranger in.
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 1).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 1).unwrap();
         let mut e = Escrow::initialize(ALICE, ALICE, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
             .unwrap();
-        e.update_attestors(ALICE, ALICE, &[ATTESTOR_1]).unwrap();
+        e.update_attestors(ALICE, ALICE, &[ATTESTOR_1], &[1]).unwrap();
         assert_eq!(e.quorum().unwrap().attestors(), &[ATTESTOR_1]);
     }
 
@@ -5698,9 +5949,9 @@ pub(crate) mod anchor_idl_tests {
         // Uninitialized and Funded are the only legal states.
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
-            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 1).unwrap())
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 1).unwrap())
             .unwrap();
-        e.update_attestors(ALICE, BOB, &[ATTESTOR_1]).unwrap();
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_1], &[1]).unwrap();
         assert_eq!(e.quorum().unwrap().registered_count(), 1);
 
         // Released is terminal: locked out.
@@ -5710,7 +5961,7 @@ pub(crate) mod anchor_idl_tests {
         e.release(ALICE, EXPIRES_AT - 1, 1_000_000, None).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(
-            e.update_attestors(ALICE, BOB, &[ATTESTOR_1]),
+            e.update_attestors(ALICE, BOB, &[ATTESTOR_1], &[1]),
             Err(EscrowError::InvalidStateTransition)
         );
 
@@ -5718,7 +5969,7 @@ pub(crate) mod anchor_idl_tests {
         let mut e = quorum_funded_escrow();
         e.cancel(ALICE, None, ALICE).unwrap();
         assert_eq!(
-            e.update_attestors(ALICE, BOB, &[ATTESTOR_1]),
+            e.update_attestors(ALICE, BOB, &[ATTESTOR_1], &[1]),
             Err(EscrowError::InvalidStateTransition)
         );
 
@@ -5727,7 +5978,7 @@ pub(crate) mod anchor_idl_tests {
         // mid-arbitration.
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
-            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap())
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap())
             .unwrap()
             .with_arbiter([0xA9; 32])
             .unwrap();
@@ -5735,7 +5986,7 @@ pub(crate) mod anchor_idl_tests {
         e.escalate(ALICE, 1, None).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         assert_eq!(
-            e.update_attestors(ALICE, BOB, &[ATTESTOR_1]),
+            e.update_attestors(ALICE, BOB, &[ATTESTOR_1], &[1]),
             Err(EscrowError::InvalidStateTransition)
         );
 
@@ -5745,7 +5996,7 @@ pub(crate) mod anchor_idl_tests {
         e.close_vault(ALICE).unwrap();
         assert_eq!(e.state(), EscrowState::Closed);
         assert_eq!(
-            e.update_attestors(ALICE, BOB, &[ATTESTOR_1]),
+            e.update_attestors(ALICE, BOB, &[ATTESTOR_1], &[1]),
             Err(EscrowError::InvalidStateTransition)
         );
     }
@@ -5756,38 +6007,38 @@ pub(crate) mod anchor_idl_tests {
         // No quorum configured.
         let mut plain = funded_escrow();
         assert_eq!(
-            plain.update_attestors(ALICE, BOB, &[ATTESTOR_1]),
+            plain.update_attestors(ALICE, BOB, &[ATTESTOR_1], &[1]),
             Err(EscrowError::InvalidQuorum)
         );
         // Empty set.
         assert_eq!(
-            e.update_attestors(ALICE, BOB, &[]),
+            e.update_attestors(ALICE, BOB, &[], &[]),
             Err(EscrowError::InvalidQuorum)
         );
         // Duplicates.
         assert_eq!(
-            e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_1]),
+            e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_1], &[1, 1]),
             Err(EscrowError::InvalidQuorum)
         );
         // More than MAX_ATTESTORS.
         let nine: [[u8; 32]; 9] = std::array::from_fn(|i| [i as u8; 32]);
         assert_eq!(
-            e.update_attestors(ALICE, BOB, &nine),
+            e.update_attestors(ALICE, BOB, &nine, &[1u64; 9]),
             Err(EscrowError::InvalidQuorum)
         );
         // Exactly MAX_ATTESTORS is fine.
         let eight: [[u8; 32]; 8] = std::array::from_fn(|i| [0xB0 + i as u8; 32]);
-        e.update_attestors(ALICE, BOB, &eight).unwrap();
+        e.update_attestors(ALICE, BOB, &eight, &[1u64; 8]).unwrap();
         assert_eq!(e.quorum().unwrap().registered_count(), 8);
         // New set smaller than the unchanged threshold.
         let mut e = quorum_funded_escrow(); // 2-of-2
         assert_eq!(
-            e.update_attestors(ALICE, BOB, &[ATTESTOR_1]),
+            e.update_attestors(ALICE, BOB, &[ATTESTOR_1], &[1]),
             Err(EscrowError::InvalidQuorum)
         );
         // Shrink the threshold first (AV-25), then the set fits.
         e.update_quorum(ALICE, BOB, 1).unwrap();
-        e.update_attestors(ALICE, BOB, &[ATTESTOR_1]).unwrap();
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_1], &[1]).unwrap();
         assert_eq!(e.quorum().unwrap().attestors(), &[ATTESTOR_1]);
         assert_eq!(e.quorum().unwrap().threshold(), 1);
         // Failed updates leave the set untouched.
@@ -5811,7 +6062,7 @@ pub(crate) mod anchor_idl_tests {
         assert!(!e.quorum().unwrap().is_satisfied());
         let fresh_1: [u8; 32] = [0xF1; 32];
         let fresh_2: [u8; 32] = [0xF2; 32];
-        e.update_attestors(ALICE, BOB, &[ATTESTOR_3, fresh_1, fresh_2])
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_3, fresh_1, fresh_2], &[1, 1, 1])
             .unwrap();
         let q = e.quorum().unwrap();
         assert_eq!(q.attestors(), &[ATTESTOR_3, fresh_1, fresh_2]);
@@ -5849,7 +6100,7 @@ pub(crate) mod anchor_idl_tests {
         e.attest(ATTESTOR_1).unwrap();
         assert_eq!(e.quorum().unwrap().approval_count(), 1);
         e.update_quorum(ALICE, BOB, 1).unwrap(); // shrink threshold to fit
-        e.update_attestors(ALICE, BOB, &[ATTESTOR_2]).unwrap();
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_2], &[1]).unwrap();
         let q = e.quorum().unwrap();
         assert_eq!(q.attestors(), &[ATTESTOR_2]);
         assert_eq!(q.approval_count(), 0);
@@ -5862,7 +6113,7 @@ pub(crate) mod anchor_idl_tests {
         // votes byte-identical afterwards.
         let mut e = quorum_funded_escrow();
         e.attest(ATTESTOR_1).unwrap();
-        e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_2])
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_2], &[1, 1])
             .unwrap();
         let q = e.quorum().unwrap();
         assert_eq!(q.attestors(), &[ATTESTOR_1, ATTESTOR_2]);
@@ -5877,7 +6128,7 @@ pub(crate) mod anchor_idl_tests {
         // no new layout, no realloc (the rent/layout pin tests pin
         // VAULT_FIELDS byte-identical).
         let mut e = quorum_funded_escrow(); // 2-of-2
-        e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3])
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1])
             .unwrap();
         let q = e.quorum().unwrap();
         assert_eq!(q.attestors(), &[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3]);
@@ -5997,12 +6248,13 @@ pub(crate) mod anchor_idl_tests {
 
     #[test]
     fn initialize_quorum_maps_attestor_list_and_threshold() {
-        // IDL: initialize_quorum(attestors: Vec<Pubkey>, threshold: u8).
+        // IDL: initialize_quorum(attestors: Vec<Pubkey>, weights: Vec<u64>,
+        // threshold: u64).
         // The program converts each Pubkey to [u8; 32], runs
         // QuorumPolicy::new, then Escrow::with_quorum. Authority <-
         // accounts.initializer, enforced by the Anchor account constraint
         // (see module docs), not by the state machine.
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
@@ -6013,7 +6265,7 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(e.release(ALICE, 1_750_000_000, 1_000_000, None), Err(EscrowError::QuorumNotReached));
         // Documented failure mode: bad policy rejected before touching the escrow.
         assert_eq!(
-            QuorumPolicy::new(&[ATTESTOR_1], 0),
+            QuorumPolicy::new(&[ATTESTOR_1], &[1], 0),
             Err(EscrowError::InvalidQuorum)
         );
     }
@@ -6450,14 +6702,17 @@ pub(crate) mod anchor_idl_tests {
         // the direction-2 note above).
         ("release_via_cpi", "amount", "released"),
         ("initialize_quorum", "attestors", "quorum.attestors"),
+        ("initialize_quorum", "weights", "quorum.weights"),
         ("initialize_quorum", "threshold", "quorum.threshold"),
         // AV-25: the dual-signed governance update writes the same
         // field (a second param source is allowed — see `released`).
         ("update_quorum", "threshold", "quorum.threshold"),
         // AV-39: the dual-signed attestor-set update writes the
-        // quorum's attestor array; the approval bitmask is remapped by
-        // the state machine, not written by the param.
+        // quorum's attestor array and their weights; the approval
+        // bitmask is remapped by the state machine, not written by the
+        // param.
         ("update_attestors", "attestors", "quorum.attestors"),
+        ("update_attestors", "weights", "quorum.weights"),
         ("initialize_vesting", "start", "vesting.start"),
         ("initialize_vesting", "end", "vesting.end"),
         ("initialize_arbiter", "arbiter", "arbiter"),
@@ -6586,6 +6841,7 @@ pub(crate) mod anchor_idl_tests {
             if *name == "quorum" {
                 paths.extend([
                     "quorum.attestors",
+                    "quorum.weights",
                     "quorum.registered",
                     "quorum.threshold",
                     "quorum.approvals",
@@ -6894,14 +7150,14 @@ mod error_code_tests {
 
     #[test]
     fn invalid_quorum_triggered_by_zero_threshold_policy() {
-        let err = QuorumPolicy::new(&[ATTESTOR_1], 0).unwrap_err();
+        let err = QuorumPolicy::new(&[ATTESTOR_1], &[1], 0).unwrap_err();
         assert_eq!(err, EscrowError::InvalidQuorum);
         assert_eq!(err.code(), 104);
     }
 
     #[test]
     fn quorum_not_reached_triggered_by_premature_release() {
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
         let mut e = escrow().with_quorum(policy).unwrap();
         e.fund(ALICE).unwrap();
         e.attest(ATTESTOR_1).unwrap(); // 1 of 2: not enough
@@ -7846,7 +8102,7 @@ mod property_tests {
             );
 
             // quorum fund → attest → release.
-            let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], 2).unwrap();
+            let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], &[1, 1], 2).unwrap();
             let mut e = mk().with_quorum(policy).unwrap();
             e.fund(ALICE).unwrap();
             e.attest([0xA1; 32]).unwrap();
@@ -7924,7 +8180,9 @@ mod property_tests {
                 // (0xAA/0xCC) so the outsider check is sound.
                 attestors[i as usize] = [(i + 1) as u8; 32];
             }
-            let mut policy = QuorumPolicy::new(&attestors[..m as usize], threshold).unwrap();
+            let mut policy =
+                QuorumPolicy::new(&attestors[..m as usize], &vec![1u64; m as usize], u64::from(threshold))
+                    .unwrap();
 
             // 2m attestations: duplicates plus outsider noise.
             let mut distinct = [false; MAX_ATTESTORS];
@@ -7961,7 +8219,10 @@ mod property_tests {
                 "case {case}: satisfaction mismatch \
                  (distinct={distinct_count}, threshold={threshold})"
             );
-            assert_eq!((policy.registered_count(), policy.threshold()), (m, threshold));
+            assert_eq!(
+                (policy.registered_count(), policy.threshold()),
+                (m, u64::from(threshold))
+            );
         });
     }
 }
@@ -8022,11 +8283,17 @@ mod account_space_tests {
             }
             Some(q) => {
                 out.push(1);
-                for attestor in q.attestors {
-                    out.extend_from_slice(&attestor);
+                // AV-45: the 8 attestor keys, then the 8 per-attestor
+                // u64 weights in slot order (Borsh order matches
+                // `QUORUM_POLICY_LEN`).
+                for attestor in q.attestors.iter() {
+                    out.extend_from_slice(attestor);
+                }
+                for weight in q.weights.iter() {
+                    out.extend_from_slice(&weight.to_le_bytes());
                 }
                 out.push(q.registered);
-                out.push(q.threshold);
+                out.extend_from_slice(&q.threshold.to_le_bytes());
                 out.extend_from_slice(&q.approvals.to_le_bytes());
             }
         }
@@ -8181,11 +8448,17 @@ mod account_space_tests {
         // Hardcoded on purpose: if the layout ever changes, these numbers
         // must be updated deliberately — and the Anchor program's
         // `space =` expression with them.
-        assert_eq!(QUORUM_POLICY_LEN, 8 * 32 + 1 + 1 + 8, "quorum policy bytes");
-        assert_eq!(QUORUM_POLICY_LEN, 266);
+        // AV-45: 8 attestor keys + 8 u64 weights + registered count +
+        // u64 weight-sum threshold + approval bitmask.
+        assert_eq!(
+            QUORUM_POLICY_LEN,
+            8 * 32 + 8 * 8 + 1 + 8 + 8,
+            "quorum policy bytes"
+        );
+        assert_eq!(QUORUM_POLICY_LEN, 337);
         assert_eq!(MILESTONE_PLAN_LEN, 8 * 8 + 1, "milestone plan bytes");
         assert_eq!(MILESTONE_PLAN_LEN, 65);
-        // 32 + 32 + 8 + 8 + 8 + 1 + (1 + 266) + 1 (AV-12 activation bitmask)
+        // 32 + 32 + 8 + 8 + 8 + 1 + (1 + 337) (AV-45 weighted quorum) + 1 (AV-12 activation bitmask)
         // + (1 + 16) (AV-13 vesting schedule) + (1 + 32) (AV-14 arbiter)
         // + (1 + 65) (AV-15 milestone plan) + 8 (AV-15 confirmation bitmap)
         // + 8 (AV-15 skipped counter) + (1 + 32) (AV-16 mint binding)
@@ -8196,9 +8469,9 @@ mod account_space_tests {
         // + 1 (AV-28 token decimal metadata) + (1 + 32) (AV-38 arbiter's
         // rationale-document hash) + 1 (AV-41 emergency timelock-unlock
         // governance opt-in) + (1 + 32) (AV-44 protocol-fee recipient pin).
-        assert_eq!(ESCROW_BODY_LEN, 684, "escrow payload bytes");
+        assert_eq!(ESCROW_BODY_LEN, 755, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 692, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 763, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -8268,7 +8541,7 @@ mod account_space_tests {
 
         // Field offsets: 0..32 initializer, 32..64 taker, 64..72 amount,
         // 72..80 released, 80..88 expires_at, 88 state, 89 quorum
-        // discriminant (None), 356 activation bitmask (AV-12).
+        // discriminant (None), 427 activation bitmask (AV-12).
         assert_eq!(&bytes[0..32], &ALICE);
         assert_eq!(&bytes[32..64], &BOB);
         assert_eq!(u64::from_le_bytes(bytes[64..72].try_into().unwrap()), 1_000_000);
@@ -8284,73 +8557,73 @@ mod account_space_tests {
         assert_eq!(bytes[88], EscrowState::Funded as u8);
         assert_eq!(bytes[89], 0, "quorum: None discriminant");
         assert_eq!(
-            &bytes[90..356],
+            &bytes[90..427],
             &[0u8; QUORUM_POLICY_LEN],
             "None quorum reserves zeroed quorum bytes in the account layout"
         );
         // AV-12: activation bitmask trails the quorum region; zero for a
         // plain escrow.
-        assert_eq!(bytes[356], 0, "activation bitmask offset, plain escrow");
+        assert_eq!(bytes[427], 0, "activation bitmask offset, plain escrow");
         // AV-13: vesting discriminant + zeroed schedule (no vesting here).
-        assert_eq!(bytes[357], 0, "vesting: None discriminant");
-        assert_eq!(&bytes[358..374], &[0u8; 16], "vesting: zeroed schedule");
+        assert_eq!(bytes[428], 0, "vesting: None discriminant");
+        assert_eq!(&bytes[429..445], &[0u8; 16], "vesting: zeroed schedule");
         // AV-14: arbiter discriminant + zeroed key (no arbiter here).
-        assert_eq!(bytes[374], 0, "arbiter: None discriminant");
-        assert_eq!(&bytes[375..407], &[0u8; 32], "arbiter: zeroed key");
+        assert_eq!(bytes[445], 0, "arbiter: None discriminant");
+        assert_eq!(&bytes[446..478], &[0u8; 32], "arbiter: zeroed key");
         // AV-15: milestones discriminant + zeroed plan (no plan here),
         // zeroed confirmation bitmap, zero skipped.
-        assert_eq!(bytes[407], 0, "milestones: None discriminant");
+        assert_eq!(bytes[478], 0, "milestones: None discriminant");
         assert_eq!(
-            &bytes[408..473],
+            &bytes[479..544],
             &[0u8; MILESTONE_PLAN_LEN],
             "milestones: zeroed plan"
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[473..481].try_into().unwrap()),
+            u64::from_le_bytes(bytes[544..552].try_into().unwrap()),
             0,
             "milestone_flags: zeroed"
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[481..489].try_into().unwrap()),
+            u64::from_le_bytes(bytes[552..560].try_into().unwrap()),
             0,
             "skipped: zero"
         );
         // AV-16: mint discriminant + zeroed address (no mint bound here).
-        assert_eq!(bytes[489], 0, "mint: None discriminant");
-        assert_eq!(&bytes[490..522], &[0u8; 32], "mint: zeroed address");
+        assert_eq!(bytes[560], 0, "mint: None discriminant");
+        assert_eq!(&bytes[561..593], &[0u8; 32], "mint: zeroed address");
         // AV-17: fee rate u16 + cumulative fee u64 (no fee configured,
         // none charged).
         assert_eq!(
-            u16::from_le_bytes(bytes[522..524].try_into().unwrap()),
+            u16::from_le_bytes(bytes[593..595].try_into().unwrap()),
             0,
             "fee_bps: zeroed"
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[524..532].try_into().unwrap()),
+            u64::from_le_bytes(bytes[595..603].try_into().unwrap()),
             0,
             "fees_paid: zero"
         );
         // AV-21: expiry grace period u64, zeroed for a plain escrow.
         assert_eq!(
-            u64::from_le_bytes(bytes[532..540].try_into().unwrap()),
+            u64::from_le_bytes(bytes[603..611].try_into().unwrap()),
             0,
             "grace_period: zeroed"
         );
         // AV-22: dispute evidence hash discriminant + zeroed commitment
         // (no evidence attached here); appended last, so every earlier
         // offset above is unchanged.
-        assert_eq!(bytes[540], 0, "evidence_hash: None discriminant");
-        assert_eq!(&bytes[541..573], &[0u8; 32], "evidence_hash: zeroed");
+        assert_eq!(bytes[611], 0, "evidence_hash: None discriminant");
+        assert_eq!(&bytes[612..644], &[0u8; 32], "evidence_hash: zeroed");
         // AV-23: refund whitelist discriminant + zeroed address (no
         // whitelist configured here); appended last, so every earlier
         // offset above is unchanged.
-        assert_eq!(bytes[573], 0, "refund_to: None discriminant");
-        assert_eq!(&bytes[574..606], &[0u8; 32], "refund_to: zeroed");
+        assert_eq!(bytes[644], 0, "refund_to: None discriminant");
+        assert_eq!(&bytes[645..677], &[0u8; 32], "refund_to: zeroed");
         // AV-24: anti-griefing penalty rate u16, zeroed for a plain
         // escrow; appended last, so every earlier offset above is
         // unchanged.
         assert_eq!(
-            u16::from_le_bytes(bytes[606..608].try_into().unwrap()),
+            u16::from_le_bytes(bytes[677..679].try_into().unwrap()),
             0,
             "penalty_bps: zeroed"
         );
@@ -8358,20 +8631,20 @@ mod account_space_tests {
         // escrow; appended last, so every earlier offset above is
         // unchanged.
         assert_eq!(
-            u64::from_le_bytes(bytes[608..616].try_into().unwrap()),
+            u64::from_le_bytes(bytes[679..687].try_into().unwrap()),
             0,
             "timelock: zeroed"
         );
         // AV-28: token decimal metadata u8, zeroed for a plain escrow
         // (no decimal metadata declared); appended last, so every
         // earlier offset above is unchanged.
-        assert_eq!(bytes[616], 0, "decimals: zeroed");
+        assert_eq!(bytes[687], 0, "decimals: zeroed");
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "tail byte is the last byte");
 
         // With quorum: same total length (space is always reserved), Some
         // discriminant, attestor bytes and approval bitmask in place.
         let policy =
-            QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], 2).unwrap();
+            QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], &[1, 1], 2).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
@@ -8386,50 +8659,66 @@ mod account_space_tests {
             0,
             "released field offset, nothing released yet"
         );
-        // attestors: 90..346 (8 x 32), registered at 346, threshold at 347,
-        // approvals u64 LE at 348..356.
+        // attestors: 90..346 (8 x 32), weights: 346..410 (8 x u64 LE),
+        // registered at 410, threshold u64 LE at 411..419,
+        // approvals u64 LE at 419..427.
         assert_eq!(&bytes[90..122], &[0xA1; 32]);
         assert_eq!(&bytes[122..154], &[0xA2; 32]);
         assert_eq!(&bytes[154..346], &[0u8; 192], "unused attestor slots are zero");
-        assert_eq!(bytes[346], 2, "registered count");
-        assert_eq!(bytes[347], 2, "threshold");
         assert_eq!(
-            u64::from_le_bytes(bytes[348..356].try_into().unwrap()),
+            u64::from_le_bytes(bytes[346..354].try_into().unwrap()),
+            1,
+            "weight of attestor slot 0"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[354..362].try_into().unwrap()),
+            1,
+            "weight of attestor slot 1"
+        );
+        assert_eq!(&bytes[362..410], &[0u8; 48], "unused weight slots are zero");
+        assert_eq!(bytes[410], 2, "registered count");
+        assert_eq!(
+            u64::from_le_bytes(bytes[411..419].try_into().unwrap()),
+            2,
+            "weight-sum threshold"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[419..427].try_into().unwrap()),
             0b01,
             "approval bitmask after one attestation"
         );
         // AV-12: activation bitmask trails the quorum region; zero here
         // (this escrow did not opt into dual-signature activation).
-        assert_eq!(bytes[356], 0, "activation bitmask offset, no dual-sig");
+        assert_eq!(bytes[427], 0, "activation bitmask offset, no dual-sig");
         // AV-13: vesting discriminant + zeroed schedule (no vesting here).
-        assert_eq!(bytes[357], 0, "vesting: None discriminant");
-        assert_eq!(&bytes[358..374], &[0u8; 16], "vesting: zeroed schedule");
+        assert_eq!(bytes[428], 0, "vesting: None discriminant");
+        assert_eq!(&bytes[429..445], &[0u8; 16], "vesting: zeroed schedule");
         // AV-14: arbiter discriminant + zeroed key (no arbiter here).
-        assert_eq!(bytes[374], 0, "arbiter: None discriminant");
-        assert_eq!(&bytes[375..407], &[0u8; 32], "arbiter: zeroed key");
+        assert_eq!(bytes[445], 0, "arbiter: None discriminant");
+        assert_eq!(&bytes[446..478], &[0u8; 32], "arbiter: zeroed key");
         // AV-15: the tail is untouched by the quorum region: milestones
         // discriminant + zeroed plan, zeroed confirmation bitmap, zero
         // skipped.
-        assert_eq!(bytes[407], 0, "milestones: None discriminant");
+        assert_eq!(bytes[478], 0, "milestones: None discriminant");
         assert_eq!(
-            &bytes[408..473],
+            &bytes[479..544],
             &[0u8; MILESTONE_PLAN_LEN],
             "milestones: zeroed plan"
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[473..481].try_into().unwrap()),
+            u64::from_le_bytes(bytes[544..552].try_into().unwrap()),
             0,
             "milestone_flags: zeroed"
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[481..489].try_into().unwrap()),
+            u64::from_le_bytes(bytes[552..560].try_into().unwrap()),
             0,
             "skipped: zero"
         );
         // AV-16: the mint region trails the skipped counter, untouched by
         // the quorum region: None discriminant + zeroed address.
-        assert_eq!(bytes[489], 0, "mint: None discriminant");
-        assert_eq!(&bytes[490..522], &[0u8; 32], "mint: zeroed address");
+        assert_eq!(bytes[560], 0, "mint: None discriminant");
+        assert_eq!(&bytes[561..593], &[0u8; 32], "mint: zeroed address");
     }
 
     #[test]
@@ -8446,9 +8735,9 @@ mod account_space_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         // Everything before the arbiter region is untouched.
         assert_eq!(bytes[88], EscrowState::Funded as u8);
-        assert_eq!(&bytes[358..374], &[0u8; 16], "vesting: zeroed schedule");
-        assert_eq!(bytes[374], 1, "arbiter: Some discriminant");
-        assert_eq!(&bytes[375..407], &ARBITER, "arbiter key offset");
+        assert_eq!(&bytes[429..445], &[0u8; 16], "vesting: zeroed schedule");
+        assert_eq!(bytes[445], 1, "arbiter: Some discriminant");
+        assert_eq!(&bytes[446..478], &ARBITER, "arbiter key offset");
     }
 
     #[test]
@@ -8463,14 +8752,14 @@ mod account_space_tests {
         e.fund(ALICE).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes[357], 1, "vesting: Some discriminant");
+        assert_eq!(bytes[428], 1, "vesting: Some discriminant");
         assert_eq!(
-            u64::from_le_bytes(bytes[358..366].try_into().unwrap()),
+            u64::from_le_bytes(bytes[429..437].try_into().unwrap()),
             1_700_000_000,
             "vesting.start offset"
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[366..374].try_into().unwrap()),
+            u64::from_le_bytes(bytes[437..445].try_into().unwrap()),
             1_800_000_000,
             "vesting.end offset"
         );
@@ -8478,9 +8767,9 @@ mod account_space_tests {
         // never the curve).
         e.claim(BOB, 1_750_000_000, None).unwrap();
         let bytes = encode_escrow(&e);
-        assert_eq!(bytes[357], 1, "vesting discriminant unchanged by claim");
+        assert_eq!(bytes[428], 1, "vesting discriminant unchanged by claim");
         assert_eq!(
-            u64::from_le_bytes(bytes[358..366].try_into().unwrap()),
+            u64::from_le_bytes(bytes[429..437].try_into().unwrap()),
             1_700_000_000
         );
     }
@@ -8509,30 +8798,30 @@ mod account_space_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         // The head of the layout is untouched.
         assert_eq!(bytes[88], EscrowState::Funded as u8);
-        assert_eq!(&bytes[375..407], &[0u8; 32], "arbiter: zeroed key");
+        assert_eq!(&bytes[446..478], &[0u8; 32], "arbiter: zeroed key");
         // Milestone plan: discriminant 1, amounts, count.
-        assert_eq!(bytes[407], 1, "milestones: Some discriminant");
+        assert_eq!(bytes[478], 1, "milestones: Some discriminant");
         assert_eq!(
-            u64::from_le_bytes(bytes[408..416].try_into().unwrap()),
+            u64::from_le_bytes(bytes[479..487].try_into().unwrap()),
             400_000,
             "milestones.amounts[0] offset"
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[416..424].try_into().unwrap()),
+            u64::from_le_bytes(bytes[487..495].try_into().unwrap()),
             600_000,
             "milestones.amounts[1] offset"
         );
-        assert_eq!(&bytes[424..472], &[0u8; 48], "unused tranche slots are zero");
-        assert_eq!(bytes[472], 2, "milestones.count offset");
+        assert_eq!(&bytes[495..543], &[0u8; 48], "unused tranche slots are zero");
+        assert_eq!(bytes[543], 2, "milestones.count offset");
         // Confirmation bitmap: milestone 0 has both confirmations + the
         // released bit (bits 0,1,2); milestone 1 has both skip approvals +
         // the skipped bit (bits 6*1+3, 6*1+4, 6*1+5 = 9,10,11).
-        let flags = u64::from_le_bytes(bytes[473..481].try_into().unwrap());
+        let flags = u64::from_le_bytes(bytes[544..552].try_into().unwrap());
         assert_eq!(flags, 0b111 | (0b111 << 9), "milestone_flags offsets");
         assert_eq!(flags, 3_591);
         // Skipped counter: the refunded tranche.
         assert_eq!(
-            u64::from_le_bytes(bytes[481..489].try_into().unwrap()),
+            u64::from_le_bytes(bytes[552..560].try_into().unwrap()),
             600_000,
             "skipped offset"
         );
@@ -8558,17 +8847,17 @@ mod account_space_tests {
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         assert_eq!(bytes[88], EscrowState::Funded as u8);
-        assert_eq!(&bytes[481..489], &[0u8; 8], "skipped: zero");
-        assert_eq!(bytes[489], 1, "mint: Some discriminant");
-        assert_eq!(&bytes[490..522], &MINT, "mint address offset");
+        assert_eq!(&bytes[552..560], &[0u8; 8], "skipped: zero");
+        assert_eq!(bytes[560], 1, "mint: Some discriminant");
+        assert_eq!(&bytes[561..593], &MINT, "mint address offset");
         // The state-machine view agrees with the bytes.
         assert_eq!(e.mint(), Some(MINT));
         // A bound mint survives a state transition (release moves money,
         // never the binding).
         e.release(ALICE, 1_750_000_000, 1_000_000, Some(MINT)).unwrap();
         let bytes = encode_escrow(&e);
-        assert_eq!(bytes[489], 1, "mint discriminant unchanged by release");
-        assert_eq!(&bytes[490..522], &MINT);
+        assert_eq!(bytes[560], 1, "mint discriminant unchanged by release");
+        assert_eq!(&bytes[561..593], &MINT);
         assert_eq!(e.state(), EscrowState::Released);
     }
 
@@ -8580,8 +8869,8 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 692) * 3480 * 2 = 820 * 6960 = 5_707_200 lamports.
-        assert_eq!(full, 5_707_200);
+        // (128 + 763) * 3480 * 2 = 891 * 6960 = 6_201_360 lamports.
+        assert_eq!(full, 6_201_360);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
@@ -8633,12 +8922,12 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(5_707_200, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(6_201_360, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(5_707_199, params.0, params.1),
             Err(RentShortfall {
-                required: 5_707_200,
+                required: 6_201_360,
                 provided: 5_707_199,
             })
         );
@@ -8651,7 +8940,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 5_707_200,
+                required: 6_201_360,
                 provided: 0,
             })
         );
@@ -8773,7 +9062,7 @@ mod partial_release_tests {
 
     #[test]
     fn quorum_still_gates_partial_release() {
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
@@ -8789,7 +9078,7 @@ mod partial_release_tests {
 
     #[test]
     fn attestations_allowed_between_partial_releases() {
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
@@ -8996,7 +9285,7 @@ mod dual_sig_tests {
     fn dual_sig_combines_with_quorum() {
         // Independent builders compose: activation gates fund, quorum
         // gates release.
-        let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], 2).unwrap();
+        let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], &[1, 1], 2).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_dual_sig()
@@ -9015,7 +9304,7 @@ mod dual_sig_tests {
 
     #[test]
     fn attest_allowed_between_activation_and_funding() {
-        let policy = QuorumPolicy::new(&[[0xA1; 32]], 1).unwrap();
+        let policy = QuorumPolicy::new(&[[0xA1; 32]], &[1], 1).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_dual_sig()
@@ -9261,7 +9550,7 @@ mod vesting_tests {
     #[test]
     fn quorum_gates_claim_like_release() {
         // Otherwise the taker could bypass attestation via claim.
-        let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], 2).unwrap();
+        let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], &[1, 1], 2).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_vesting(VestingSchedule::new(START, END).unwrap())
@@ -9580,7 +9869,7 @@ mod arbitration_tests {
         // A 2-of-2 quorum gates release, but the arbiter settles without
         // attestations: requiring them would let attestors veto the
         // settlement.
-        let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], 2).unwrap();
+        let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], &[1, 1], 2).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
@@ -9842,7 +10131,7 @@ mod milestone_tests {
     fn quorum_gates_release_milestone_like_release() {
         // Otherwise the initializer could bypass attestation by routing
         // the payout through a milestone.
-        let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], 2).unwrap();
+        let policy = QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], &[1, 1], 2).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
@@ -10293,7 +10582,7 @@ mod combination_matrix_tests {
     const AXES: [u8; 6] = [F_DUAL_SIG, F_QUORUM, F_VESTING, F_MILESTONES, F_MINT, F_FEE];
 
     fn quorum_policy() -> QuorumPolicy {
-        QuorumPolicy::new(&[A1, A2, A3], 2).unwrap()
+        QuorumPolicy::new(&[A1, A2, A3], &[1, 1, 1], 2).unwrap()
     }
 
     fn build_with_expiry(flags: u8, expires_at: u64) -> Escrow {
@@ -10970,8 +11259,8 @@ mod evidence_tests {
         e.escalate(BOB, EXPIRES_AT - 1, Some(EVIDENCE)).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes[540], 1, "evidence_hash: Some discriminant");
-        assert_eq!(&bytes[541..573], &EVIDENCE, "evidence_hash bytes");
+        assert_eq!(bytes[611], 1, "evidence_hash: Some discriminant");
+        assert_eq!(&bytes[612..644], &EVIDENCE, "evidence_hash bytes");
     }
 }
 
@@ -11085,17 +11374,17 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH)).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 684, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) bytes");
-        assert_eq!(bytes[616], 0, "decimals offset unchanged");
-        assert_eq!(bytes[617], 1, "rationale_hash: Some discriminant");
-        assert_eq!(&bytes[618..650], &RATIONALE_HASH, "rationale_hash bytes");
+        assert_eq!(bytes.len(), 755, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) bytes");
+        assert_eq!(bytes[687], 0, "decimals offset unchanged");
+        assert_eq!(bytes[688], 1, "rationale_hash: Some discriminant");
+        assert_eq!(&bytes[689..721], &RATIONALE_HASH, "rationale_hash bytes");
         // The AV-22 evidence region is untouched by the append.
-        assert_eq!(bytes[540], 0, "evidence_hash: None discriminant");
-        assert_eq!(&bytes[541..573], &[0u8; 32], "evidence_hash: zeroed");
+        assert_eq!(bytes[611], 0, "evidence_hash: None discriminant");
+        assert_eq!(&bytes[612..644], &[0u8; 32], "evidence_hash: zeroed");
         // AV-44: the new tail region — fee_recipient unset serializes
         // zeroed.
-        assert_eq!(bytes[651], 0, "fee_recipient: None discriminant");
-        assert_eq!(&bytes[652..684], &[0u8; 32], "fee_recipient: zeroed");
+        assert_eq!(bytes[722], 0, "fee_recipient: None discriminant");
+        assert_eq!(&bytes[723..755], &[0u8; 32], "fee_recipient: zeroed");
     }
 
     #[test]
@@ -11106,11 +11395,11 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 684);
-        assert_eq!(bytes[617], 0, "rationale_hash: None discriminant");
-        assert_eq!(&bytes[618..650], &[0u8; 32], "rationale_hash: zeroed");
-        assert_eq!(bytes[651], 0, "fee_recipient: None discriminant");
-        assert_eq!(&bytes[652..684], &[0u8; 32], "fee_recipient: zeroed");
+        assert_eq!(bytes.len(), 755);
+        assert_eq!(bytes[688], 0, "rationale_hash: None discriminant");
+        assert_eq!(&bytes[689..721], &[0u8; 32], "rationale_hash: zeroed");
+        assert_eq!(bytes[722], 0, "fee_recipient: None discriminant");
+        assert_eq!(&bytes[723..755], &[0u8; 32], "fee_recipient: zeroed");
     }
 
     #[test]
@@ -11123,9 +11412,9 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 692) * 3480 * 2 = 820 * 6960 = 5_707_200 lamports.
-        assert_eq!(VAULT_SPACE, 692);
-        assert_eq!(full, 5_707_200);
+        // (128 + 763) * 3480 * 2 = 891 * 6960 = 6_201_360 lamports.
+        assert_eq!(VAULT_SPACE, 763);
+        assert_eq!(full, 6_201_360);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
@@ -11310,8 +11599,8 @@ mod refund_tests {
         let e = funded_whitelisted();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes[573], 1, "refund_to: Some discriminant");
-        assert_eq!(&bytes[574..606], &CAROL, "refund_to bytes");
+        assert_eq!(bytes[644], 1, "refund_to: Some discriminant");
+        assert_eq!(&bytes[645..677], &CAROL, "refund_to bytes");
     }
 }
 
@@ -11473,7 +11762,7 @@ mod penalty_tests {
     #[test]
     fn penalty_rate_persists_in_layout_tail() {
         // The rate survives serialization at the appended tail offset
-        // (bytes[606..608]); earlier offsets are unchanged.
+        // (bytes[677..679]); earlier offsets are unchanged.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_penalty_bps(250)
@@ -11481,7 +11770,7 @@ mod penalty_tests {
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         assert_eq!(
-            u16::from_le_bytes(bytes[606..608].try_into().unwrap()),
+            u16::from_le_bytes(bytes[677..679].try_into().unwrap()),
             250,
             "penalty_bps tail offset"
         );
@@ -11694,7 +11983,7 @@ mod timelock_tests {
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         assert_eq!(
-            u64::from_le_bytes(bytes[608..616].try_into().unwrap()),
+            u64::from_le_bytes(bytes[679..687].try_into().unwrap()),
             UNLOCK_AT,
             "timelock tail offset"
         );
@@ -11879,7 +12168,7 @@ mod emergency_unlock_tests {
         let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes[650], 0, "emergency_unlock: off by default");
+        assert_eq!(bytes[721], 0, "emergency_unlock: off by default");
         let opted = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_timelock(UNLOCK_AT)
@@ -11887,10 +12176,10 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 684);
-        assert_eq!(bytes[650], 1, "emergency_unlock: opt-in byte set");
+        assert_eq!(bytes.len(), 755);
+        assert_eq!(bytes[721], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
-            u64::from_le_bytes(bytes[608..616].try_into().unwrap()),
+            u64::from_le_bytes(bytes[679..687].try_into().unwrap()),
             UNLOCK_AT,
             "timelock offset unchanged by the append"
         );
@@ -12062,11 +12351,11 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 684, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44");
-        assert_eq!(bytes[616], 9, "decimals tail offset");
+        assert_eq!(ESCROW_BODY_LEN, 755, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45");
+        assert_eq!(bytes[687], 9, "decimals tail offset");
         // The timelock offset is unchanged by the append.
         assert_eq!(
-            u64::from_le_bytes(bytes[608..616].try_into().unwrap()),
+            u64::from_le_bytes(bytes[679..687].try_into().unwrap()),
             0,
             "timelock offset stable"
         );
@@ -12074,20 +12363,20 @@ mod decimals_tests {
         let mut plain = initialized();
         plain.fund(ALICE).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&plain);
-        assert_eq!(bytes[616], 0, "decimals zeroed without the builder");
+        assert_eq!(bytes[687], 0, "decimals zeroed without the builder");
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
     }
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 692) * 3480 * 2 = 820 * 6960 = 5_707_200 lamports.
+        // (128 + 763) * 3480 * 2 = 891 * 6960 = 6_201_360 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            5_707_200
+            6_201_360
         );
         // (128 + 281) * 3480 * 2 = 409 * 6960 = 2_846_640 lamports.
         assert_eq!(
@@ -12100,9 +12389,9 @@ mod decimals_tests {
         );
         // 67 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin).
-        assert_eq!(VAULT_SPACE, 692);
+        assert_eq!(VAULT_SPACE, 763);
         assert_eq!(VAULT_SPACE_NO_QUORUM, 281);
-        assert!(check_vault_rent_exempt(5_707_200, 3_480, 2.0).is_ok());
+        assert!(check_vault_rent_exempt(6_201_360, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(5_707_199, 3_480, 2.0).is_err());
     }
 
@@ -12137,8 +12426,8 @@ mod quorum_governance_tests {
     const ATTESTOR_2: [u8; 32] = [0xA2; 32];
     const EXPIRES_AT: u64 = 1_800_000_000;
 
-    fn funded_quorum(threshold: u8) -> Escrow {
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], threshold).unwrap();
+    fn funded_quorum(threshold: u64) -> Escrow {
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], threshold).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
@@ -12188,7 +12477,7 @@ mod quorum_governance_tests {
     fn governance_works_before_funding() {
         // The threshold can be adjusted on an `Uninitialized` escrow —
         // e.g. the parties renegotiate the gate before locking funds.
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
@@ -12228,7 +12517,7 @@ mod quorum_governance_tests {
         // Degenerate initializer == taker escrow: one key passed for both
         // slots authorizes, paralleling AV-12's activation.
         const SELF: [u8; 32] = [0x5E; 32];
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
         let mut e = Escrow::initialize(SELF, SELF, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_quorum(policy)
@@ -12367,7 +12656,7 @@ mod cpi_release_tests {
         // Quorum: unattested quorum blocks CPI-routed releases too.
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e = e
-            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap())
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap())
             .unwrap();
         e.fund(ALICE).unwrap();
         assert_eq!(
@@ -12587,11 +12876,11 @@ mod fee_recipient_tests {
         let e = fee_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes[651], 1, "fee_recipient: Some discriminant");
-        assert_eq!(&bytes[652..684], &RECIPIENT, "fee_recipient bytes");
+        assert_eq!(bytes[722], 1, "fee_recipient: Some discriminant");
+        assert_eq!(&bytes[723..755], &RECIPIENT, "fee_recipient bytes");
         // Every earlier offset is unchanged by the append.
-        assert_eq!(bytes[650], 0, "emergency_unlock offset unchanged");
-        assert_eq!(bytes[616], 0, "decimals offset unchanged");
+        assert_eq!(bytes[721], 0, "emergency_unlock offset unchanged");
+        assert_eq!(bytes[687], 0, "decimals offset unchanged");
     }
 
     #[test]

@@ -185,12 +185,14 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
 /// the byte-level offset test below nail any drift.
 fn named_type_fields(name: &str) -> &'static [(&'static str, IdlType)] {
     match name {
-        // QuorumPolicy { attestors: [[u8; 32]; 8], registered: u8,
-        //                threshold: u8, approvals: u64 }.
+        // QuorumPolicy { attestors: [[u8; 32]; 8], weights: [u64; 8],
+        //                registered: u8, threshold: u64, approvals: u64 }
+        // (AV-45 weighted).
         "QuorumPolicy" => &[
             ("attestors", IdlType::Array(ArrayElem::PublicKey, 8)),
+            ("weights", IdlType::Array(ArrayElem::U64, 8)),
             ("registered", IdlType::U8),
-            ("threshold", IdlType::U8),
+            ("threshold", IdlType::U64),
             ("approvals", IdlType::U64),
         ],
         // VestingSchedule { start: u64, end: u64 }.
@@ -691,7 +693,7 @@ fn max_config_funded_escrow() -> Escrow {
     let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
     e = e.with_dual_sig().unwrap();
     e = e
-        .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap())
+        .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap())
         .unwrap();
     e = e
         .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
@@ -740,15 +742,19 @@ fn idl_field_offsets_pin_borsh_encoder() {
     assert_eq!(u64_at(body_field(&enc, &offsets, "expires_at")), EXPIRES_AT);
     assert_eq!(body_field(&enc, &offsets, "state"), &[1u8]); // Funded
 
-    // quorum: Some { attestors[8], registered, threshold, approvals }.
+    // quorum: Some { attestors[8], weights[8], registered, threshold,
+    // approvals } (AV-45 weighted).
     let q = body_field(&enc, &offsets, "quorum");
     assert_eq!(q[0], 1, "quorum discriminant");
     assert_eq!(&q[1..33], &ATTESTOR_1);
     assert_eq!(&q[33..65], &ATTESTOR_2);
     assert_eq!(&q[65..257], &[0u8; 192], "unused attestor slots zeroed");
-    assert_eq!(q[257], 2, "registered");
-    assert_eq!(q[258], 2, "threshold");
-    assert_eq!(u64_at(&q[259..267]), 0b11, "approvals bitmask");
+    assert_eq!(u64_at(&q[257..265]), 1, "weight of attestor slot 0");
+    assert_eq!(u64_at(&q[265..273]), 1, "weight of attestor slot 1");
+    assert_eq!(&q[273..321], &[0u8; 48], "unused weight slots zeroed");
+    assert_eq!(q[321], 2, "registered");
+    assert_eq!(u64_at(&q[322..330]), 2, "weight-sum threshold");
+    assert_eq!(u64_at(&q[330..338]), 0b11, "approvals bitmask");
 
     // activation: bit 0 initializer, bit 1 taker, bit 2 dual-sig required
     // (set by with_dual_sig) => 0b111.
@@ -850,6 +856,6 @@ fn idl_field_offsets_pin_dispute_path() {
         .find(|(n, _, _)| *n == "rationale_hash")
         .copied()
         .expect("rationale_hash in IDL offsets");
-    assert_eq!((rh_offset, rh_len), (625, 33));
+    assert_eq!((rh_offset, rh_len), (696, 33));
     assert_eq!(u64_at(body_field(&enc, &offsets, "released")), 300_000);
 }

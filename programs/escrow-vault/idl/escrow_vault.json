@@ -52,7 +52,8 @@
       "accounts": [],
       "args": [
         {"name": "attestors", "type": {"vec": "publicKey"}},
-        {"name": "threshold", "type": "u8"}
+        {"name": "weights", "type": {"vec": "u64"}},
+        {"name": "threshold", "type": "u64"}
       ]
     },
     {
@@ -60,7 +61,7 @@
       "discriminator": [74, 161, 172, 92, 0, 64, 134, 242],
       "accounts": [],
       "args": [
-        {"name": "threshold", "type": "u8"}
+        {"name": "threshold", "type": "u64"}
       ]
     },
     {
@@ -68,7 +69,8 @@
       "discriminator": [39, 65, 233, 198, 170, 184, 251, 35],
       "accounts": [],
       "args": [
-        {"name": "attestors", "type": {"vec": "publicKey"}}
+        {"name": "attestors", "type": {"vec": "publicKey"}},
+        {"name": "weights", "type": {"vec": "u64"}}
       ]
     },
     {
@@ -257,24 +259,24 @@
           {"name": "expires_at", "type": "u64", "offset": 88},
           {"name": "state", "type": "u8", "offset": 96},
           {"name": "quorum", "type": {"option": {"defined": "QuorumPolicy"}}, "offset": 97},
-          {"name": "activation", "type": "u8", "offset": 364},
-          {"name": "vesting", "type": {"option": {"defined": "VestingSchedule"}}, "offset": 365},
-          {"name": "arbiter", "type": {"option": "publicKey"}, "offset": 382},
-          {"name": "milestones", "type": {"option": {"defined": "MilestonePlan"}}, "offset": 415},
-          {"name": "milestone_flags", "type": "u64", "offset": 481},
-          {"name": "skipped", "type": "u64", "offset": 489},
-          {"name": "mint", "type": {"option": "publicKey"}, "offset": 497},
-          {"name": "fee_bps", "type": "u16", "offset": 530},
-          {"name": "fees_paid", "type": "u64", "offset": 532},
-          {"name": "grace_period", "type": "u64", "offset": 540},
-          {"name": "evidence_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 548},
-          {"name": "refund_to", "type": {"option": "publicKey"}, "offset": 581},
-          {"name": "penalty_bps", "type": "u16", "offset": 614},
-          {"name": "timelock", "type": "u64", "offset": 616},
-          {"name": "decimals", "type": "u8", "offset": 624},
-          {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 625},
-          {"name": "emergency_unlock", "type": "bool", "offset": 658},
-          {"name": "fee_recipient", "type": {"option": "publicKey"}, "offset": 659}
+          {"name": "activation", "type": "u8", "offset": 435},
+          {"name": "vesting", "type": {"option": {"defined": "VestingSchedule"}}, "offset": 436},
+          {"name": "arbiter", "type": {"option": "publicKey"}, "offset": 453},
+          {"name": "milestones", "type": {"option": {"defined": "MilestonePlan"}}, "offset": 486},
+          {"name": "milestone_flags", "type": "u64", "offset": 552},
+          {"name": "skipped", "type": "u64", "offset": 560},
+          {"name": "mint", "type": {"option": "publicKey"}, "offset": 568},
+          {"name": "fee_bps", "type": "u16", "offset": 601},
+          {"name": "fees_paid", "type": "u64", "offset": 603},
+          {"name": "grace_period", "type": "u64", "offset": 611},
+          {"name": "evidence_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 619},
+          {"name": "refund_to", "type": {"option": "publicKey"}, "offset": 652},
+          {"name": "penalty_bps", "type": "u16", "offset": 685},
+          {"name": "timelock", "type": "u64", "offset": 687},
+          {"name": "decimals", "type": "u8", "offset": 695},
+          {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 696},
+          {"name": "emergency_unlock", "type": "bool", "offset": 729},
+          {"name": "fee_recipient", "type": {"option": "publicKey"}, "offset": 730}
         ]
       }
     }
@@ -286,9 +288,10 @@
         "kind": "struct",
         "fields": [
           {"name": "attestors", "type": {"array": ["publicKey", 8]}, "offset": 0},
-          {"name": "registered", "type": "u8", "offset": 256},
-          {"name": "threshold", "type": "u8", "offset": 257},
-          {"name": "approvals", "type": "u64", "offset": 258}
+          {"name": "weights", "type": {"array": ["u64", 8]}, "offset": 256},
+          {"name": "registered", "type": "u8", "offset": 320},
+          {"name": "threshold", "type": "u64", "offset": 321},
+          {"name": "approvals", "type": "u64", "offset": 329}
         ]
       }
     },

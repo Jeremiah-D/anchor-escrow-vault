@@ -454,9 +454,9 @@ impl CloseReport {
     ///
     /// ```json
     /// {"scanned":2,"batches":[
-    ///   {"caller":"...","total_reclaimed":5707200,"actions":[
+    ///   {"caller":"...","total_reclaimed":6201360,"actions":[
     ///     {"escrow_id":"...","action":"close_vault","caller":"...",
-    ///      "caller_role":"initializer","rent_reclaimed":5707200,
+    ///      "caller_role":"initializer","rent_reclaimed":6201360,
     ///      "reason":"released"}
     ///   ]}
     /// ]}
@@ -774,7 +774,7 @@ mod keeper_tests {
             .unwrap()
             .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
             .unwrap()
-            .with_quorum(QuorumPolicy::new(&[A1, A2, A3], 2).unwrap())
+            .with_quorum(QuorumPolicy::new(&[A1, A2, A3], &[1, 1, 1], 2).unwrap())
             .unwrap();
         e.fund(ALICE).unwrap();
         e.attest(A1).unwrap(); // 1 of 2: the claim call would fail
@@ -1875,7 +1875,7 @@ mod keeper_milestone_tests {
     #[test]
     fn release_blocked_by_quorum_reports_reason() {
         let mut e = milestone_escrow_with(&[300_000, 700_000], |e| {
-            e.with_quorum(QuorumPolicy::new(&[A1, A2, A3], 2).unwrap())
+            e.with_quorum(QuorumPolicy::new(&[A1, A2, A3], &[1, 1, 1], 2).unwrap())
         });
         e.confirm_milestone(ALICE, 0).unwrap();
         e.confirm_milestone(BOB, 0).unwrap();
@@ -2147,10 +2147,10 @@ impl RentHealthReport {
     /// integers — the exact unit the top-up transfer moves.
     ///
     /// ```json
-    /// {"at":1000000,"scanned":1,"required_lamports":5707200,
+    /// {"at":1000000,"scanned":1,"required_lamports":6201360,
     ///  "critical_threshold_pct":90,"top_ups":[
     ///   {"escrow_id":"...","state":"funded","vault_lamports":4000000,
-    ///    "required_lamports":5707200,"top_up_lamports":1707200,
+    ///    "required_lamports":6201360,"top_up_lamports":2201360,
     ///    "caller":"...","caller_role":"initializer",
     ///    "reason":"underfunded"}
     /// ]}

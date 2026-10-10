@@ -10,9 +10,10 @@
 //! the on-chain account into `escrow_state::Escrow`, runs the transition,
 //! and writes it back. State and authority rules live in one place —
 //! the `escrow-state` crate — so the on-chain program cannot drift from
-//! the tested logic. The optional N-of-M attestor quorum (`initialize_quorum`
-//! / `attest`) gates `release` exactly as the state machine does; the
-//! optional linear vesting schedule (`initialize_vesting` / `claim`) lets
+//! the tested logic. The optional weighted attestor quorum
+//! (`initialize_quorum` / `attest`) gates `release` exactly as the state
+//! machine does; the optional linear vesting schedule
+//! (`initialize_vesting` / `claim`) lets
 //! the taker pull the vested stream exactly as `Escrow::claim` defines;
 //! the optional dispute arbiter (`initialize_arbiter` / `escalate` /
 //! `resolve`) settles contested escrows with one atomic split exactly as
@@ -346,18 +347,20 @@ pub mod escrow_vault {
         Ok(())
     }
 
-    /// Attach an N-of-M attestor quorum to the release path (`Uninitialized`
-    /// only; mirrors `Escrow::with_quorum`). After this, `release`
-    /// additionally requires `threshold` distinct attestations; the refund
-    /// paths (`cancel` / `cancel_expired`) stay quorum-free by design.
+    /// Attach a weighted attestor quorum to the release path
+    /// (`Uninitialized` only; mirrors `Escrow::with_quorum`). After
+    /// this, `release` additionally requires the accumulated weight of
+    /// distinct attestations to reach `threshold`; the refund paths
+    /// (`cancel` / `cancel_expired`) stay quorum-free by design.
     pub fn initialize_quorum(
         ctx: Context<InitializeQuorum>,
         attestors: Vec<Pubkey>,
-        threshold: u8,
+        weights: Vec<u64>,
+        threshold: u64,
     ) -> Result<()> {
         let keys: Vec<[u8; 32]> = attestors.iter().map(|k| k.to_bytes()).collect();
         let policy =
-            escrow_state::QuorumPolicy::new(&keys, threshold).map_err(|e| escrow_error(e))?;
+            escrow_state::QuorumPolicy::new(&keys, &weights, threshold).map_err(|e| escrow_error(e))?;
         let escrow = read_escrow(&ctx.accounts.vault);
         let escrow = escrow.with_quorum(policy).map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
@@ -406,17 +409,18 @@ pub mod escrow_vault {
         Ok(())
     }
 
-    /// Adjust the quorum's attestation threshold by dual-signed
+    /// Adjust the quorum's weight-sum threshold by dual-signed
     /// governance (AV-25; mirrors `Escrow::update_quorum`). Both the
     /// initializer and the taker must sign — one party alone cannot
     /// weaken the gate. Allowed on `Uninitialized` or `Funded` escrows;
-    /// `0` or above the registered attestor count is `InvalidQuorum`, as
-    /// is calling with no quorum configured. The attestor set and
-    /// existing attestations are untouched — only the threshold moves,
-    /// in place, so the account needs no realloc. Emits `QuorumUpdated`
-    /// when the threshold actually changes (a no-op re-affirmation
-    /// emits nothing), mirroring `IndexedEscrow::update_quorum`.
-    pub fn update_quorum(ctx: Context<UpdateQuorum>, threshold: u8) -> Result<()> {
+    /// `0` or above the total registered weight is `InvalidQuorum`, as
+    /// is calling with no quorum configured. The attestor set, their
+    /// weights, and existing attestations are untouched — only the
+    /// threshold moves, in place, so the account needs no realloc.
+    /// Emits `QuorumUpdated` when the threshold actually changes (a
+    /// no-op re-affirmation emits nothing), mirroring
+    /// `IndexedEscrow::update_quorum`.
+    pub fn update_quorum(ctx: Context<UpdateQuorum>, threshold: u64) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let threshold_before = escrow.quorum().map(|q| q.threshold()).unwrap_or(0);
         escrow
@@ -456,19 +460,29 @@ pub mod escrow_vault {
     /// reshape the electorate into sockpuppets (a unilateral weakening
     /// of the release gate). Allowed on `Uninitialized` or `Funded`
     /// escrows; no quorum configured, an empty set, more than 8 keys,
-    /// a duplicate key, or a new set smaller than the unchanged
-    /// threshold is `InvalidQuorum`. The set compacts into the
-    /// already-reserved 8 slots in place, so the account needs no
-    /// realloc. Approval bits remap by pubkey: retained attestors keep
-    /// their votes, removed attestors lose theirs. Emits
-    /// `AttestorsUpdated` when the set actually changes (a no-op
-    /// same-set update emits nothing), mirroring
-    /// `IndexedEscrow::update_attestors`.
-    pub fn update_attestors(ctx: Context<UpdateAttestors>, attestors: Vec<Pubkey>) -> Result<()> {
+    /// a duplicate key, a weight/length mismatch, a zero weight, or a
+    /// weight-sum threshold that no longer fits the new total weight is
+    /// `InvalidQuorum`. The set compacts into the already-reserved 8
+    /// slots in place, so the account needs no realloc. Approval bits
+    /// remap by pubkey: retained attestors keep their votes (at the new
+    /// weights), removed attestors lose theirs. Emits `AttestorsUpdated`
+    /// when the set actually changes (a no-op same-set update emits
+    /// nothing), mirroring `IndexedEscrow::update_attestors`.
+    pub fn update_attestors(
+        ctx: Context<UpdateAttestors>,
+        attestors: Vec<Pubkey>,
+        weights: Vec<u64>,
+    ) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
-        let set_before: Vec<[u8; 32]> = escrow
+        let set_before: Vec<([u8; 32], u64)> = escrow
             .quorum()
-            .map(|q| q.attestors().to_vec())
+            .map(|q| {
+                q.attestors()
+                    .iter()
+                    .zip(q.weights().iter())
+                    .map(|(a, w)| (*a, *w))
+                    .collect()
+            })
             .unwrap_or_default();
         escrow
             .update_attestors(
@@ -478,15 +492,23 @@ pub mod escrow_vault {
                     .iter()
                     .map(|a| a.to_bytes())
                     .collect::<Vec<[u8; 32]>>(),
+                &weights,
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
-        // Rewrite `vault.quorum.attestors` in the real build (in place —
-        // the quorum region is always reserved), with the approval
-        // bitmask remapped by pubkey exactly as the state machine does.
-        let set_after: Vec<[u8; 32]> = escrow
+        // Rewrite `vault.quorum.attestors` / `vault.quorum.weights` in the
+        // real build (in place — the quorum region is always reserved),
+        // with the approval bitmask remapped by pubkey exactly as the
+        // state machine does.
+        let set_after: Vec<([u8; 32], u64)> = escrow
             .quorum()
-            .map(|q| q.attestors().to_vec())
+            .map(|q| {
+                q.attestors()
+                    .iter()
+                    .zip(q.weights().iter())
+                    .map(|(a, w)| (*a, *w))
+                    .collect()
+            })
             .unwrap_or_default();
         if set_after != set_before {
             let state = escrow.state() as u8;
@@ -1342,11 +1364,24 @@ pub struct Vesting {
 /// See the state machine docs for the release-gating semantics.
 /// Serialized size is pinned by `escrow_state::QUORUM_POLICY_LEN`
 /// (266 bytes); the AV-10 tests assert it against a manual encoding.
+/// Skeleton mirror of `escrow_state::QuorumPolicy`: up to
+/// `escrow_state::MAX_ATTESTORS` attestor keys in slot order, the
+/// parallel per-attestor vote weights (AV-45), the registered count,
+/// the u64 weight-sum release threshold, and the approval bitmask.
+/// See the state machine docs for the weighted attestation /
+/// release-gate semantics. Serialized size is pinned by
+/// `escrow_state::QUORUM_POLICY_LEN`; the AV-04/AV-45 tests assert it
+/// against a manual encoding.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
 pub struct Quorum {
     pub attestors: [Pubkey; 8],
+    /// Per-attestor vote weight, in slot order (parallel to
+    /// `attestors`); mirrors `escrow_state::QuorumPolicy` (AV-45).
+    pub weights: [u64; 8],
     pub registered: u8,
-    pub threshold: u8,
+    /// Weight-sum release threshold; mirrors
+    /// `escrow_state::QuorumPolicy::threshold` (AV-45).
+    pub threshold: u64,
     pub approvals: u64,
 }
 
@@ -1493,7 +1528,7 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    // Full vault space: 8-byte discriminator + 617-byte payload = 625
+    // Full vault space: 8-byte discriminator + 755-byte payload = 763
     // bytes (see `escrow_state::VAULT_SPACE`; AV-12 added the 1-byte
     // activation bitmask, AV-13 the 17-byte vesting region, AV-14 the
     // 33-byte arbiter region, AV-15 the 66-byte milestone plan + the
@@ -1502,11 +1537,14 @@ pub struct Initialize<'info> {
     // cumulative fee counter, AV-21 the 8-byte grace period, AV-22 the
     // 33-byte evidence hash region, AV-23 the 33-byte refund whitelist
     // region, AV-24 the 2-byte penalty rate, AV-27 the 8-byte timelock,
-    // AV-28 the 1-byte decimals metadata).
+    // AV-28 the 1-byte decimals metadata, AV-38 the 33-byte rationale
+    // hash region, AV-41 the 1-byte emergency-unlock flag, AV-44 the
+    // 33-byte fee-recipient region, AV-45 the 64-byte quorum weight
+    // array + the 7-byte wider weight-sum threshold).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 5_240_880 lamports.
+    // rent parameters the minimum is 6_201_360 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,

@@ -12,8 +12,9 @@
 //! - `vested` / `claimable`: the streaming-payments position at the
 //!   snapshot time (`vested` is the schedule's unlock, `claimable` is
 //!   vested-minus-already-released, i.e. what `claim` would move);
-//! - quorum progress: `approvals` of `threshold` (of `registered`), and
-//!   whether the quorum is already satisfied for a `release`;
+//! - quorum progress: `approved_weight` of `threshold` weight (of
+//!   `total_weight`, across `registered` attestors), and whether the
+//!   quorum is already satisfied for a `release`;
 //! - milestone progress: per-tranche amounts with their confirmation and
 //!   settlement bits, plus the index of the next unsettled tranche;
 //! - `expiry_eligible`: whether the chain's `cancel_expired` gate passes
@@ -76,17 +77,21 @@ pub struct DualSigSnapshot {
     pub taker_activated: bool,
 }
 
-/// N-of-M quorum progress (AV-04).
+/// Weighted quorum progress (AV-04, AV-45).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuorumSnapshot {
     /// The M: registered attestors.
     pub registered: u8,
-    /// The N: distinct approvals required.
-    pub threshold: u8,
-    /// Distinct attestors that have attested so far.
+    /// The weight-sum threshold a release must reach.
+    pub threshold: u64,
+    /// Distinct attestors that have attested so far (headcount).
     pub approvals: u8,
-    /// Whether `approvals >= threshold` — a `release` would pass the
-    /// quorum gate right now.
+    /// Accumulated weight of the distinct attestations so far.
+    pub approved_weight: u64,
+    /// Total registered voting weight.
+    pub total_weight: u64,
+    /// Whether `approved_weight >= threshold` — a `release` would pass
+    /// the quorum gate right now.
     pub satisfied: bool,
 }
 
@@ -278,6 +283,8 @@ impl Escrow {
                 registered: q.registered_count(),
                 threshold: q.threshold(),
                 approvals: q.approval_count(),
+                approved_weight: q.approved_weight(),
+                total_weight: q.total_weight(),
                 satisfied: q.is_satisfied(),
             }),
             vesting: self.vesting_schedule().map(|s| VestingSnapshot {
@@ -382,6 +389,10 @@ impl EscrowSnapshot {
                 s.push_str(&q.threshold.to_string());
                 s.push_str(",\"approvals\":");
                 s.push_str(&q.approvals.to_string());
+                s.push_str(",\"approved_weight\":");
+                s.push_str(&q.approved_weight.to_string());
+                s.push_str(",\"total_weight\":");
+                s.push_str(&q.total_weight.to_string());
                 s.push_str(",\"satisfied\":");
                 s.push_str(if q.satisfied { "true" } else { "false" });
                 s.push('}');
@@ -603,7 +614,7 @@ mod snapshot_tests {
     fn quorum_progress_is_derived() {
         let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
             .unwrap()
-            .with_quorum(QuorumPolicy::new(&[A1, A2, A3], 2).unwrap())
+            .with_quorum(QuorumPolicy::new(&[A1, A2, A3], &[1, 1, 1], 2).unwrap())
             .unwrap();
         e.fund(ALICE).unwrap();
         e.attest(A1).unwrap();
@@ -612,10 +623,12 @@ mod snapshot_tests {
         assert_eq!(q.registered, 3);
         assert_eq!(q.threshold, 2);
         assert_eq!(q.approvals, 1);
+        assert_eq!(q.approved_weight, 1);
+        assert_eq!(q.total_weight, 3);
         assert!(!q.satisfied);
         let json = snap.to_json();
         assert!(
-            json.contains("\"quorum\":{\"registered\":3,\"threshold\":2,\"approvals\":1,\"satisfied\":false}"),
+            json.contains("\"quorum\":{\"registered\":3,\"threshold\":2,\"approvals\":1,\"approved_weight\":1,\"total_weight\":3,\"satisfied\":false}"),
             "quorum progress must serialize, got: {json}"
         );
         // Satisfy it: the snapshot flips without any state transition.

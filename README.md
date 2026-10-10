@@ -74,10 +74,10 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
 | `initialize_protocol_fee(fee_bps)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `fee_bps` in 0–10000 basis points; the fee slices every taker payout into net payout + protocol fee) |
 | `initialize_fee_recipient(fee_recipient)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding; pins the destination of every fee leg — the settlement builders reject a `fee_leg` that does not equal it; zero address is `InvalidFeeRecipient`; with no pin the fee goes to the program-level fee account) |
-| `initialize_quorum(attestors, threshold)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
+| `initialize_quorum(attestors, weights, threshold)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
-| `update_quorum(initializer, taker, threshold)` | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance); `0` or `> registered` is `InvalidQuorum` |
+| `update_quorum(initializer, taker, threshold)` | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance); `0` or `> total weight` is `InvalidQuorum` |
 | `update_attestors(initializer, taker, attestors)` | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance; no party can unilaterally reshape the electorate); empty set / `> 8` / duplicates / new set smaller than the unchanged threshold is `InvalidQuorum`; approval bits remap by pubkey (retained votes survive, removed voters' bits cleared); emits `AttestorsUpdated` on a real set change, nothing on a no-op |
 | `activate(authority)`                       | `Uninitialized`| `Uninitialized` (one party) / `Activated` (both parties) | initializer **or** taker (dual-sig escrows only) |
 | `initialize_vesting(start, end)`            | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `start < end`) |
@@ -186,55 +186,60 @@ locked amount (`ReleaseExceedsLocked`, code 106); a zero-amount release is
 progress, and `cancel` / `cancel_expired` after partial releases refund
 only the remainder while `released_amount()` stays preserved for audit.
 
-**Attestor quorum (N-of-M release gate).** An escrow can be created with an
-optional quorum policy (`QuorumPolicy::new(attestors, threshold)`, up to 8
-attestors, heap-free bitmask): `initialize_quorum` attaches it once, before
-funding; registered attestors record idempotent attestations via `attest`
-in `Uninitialized` or `Funded`. `release` then additionally requires
-`threshold` distinct attestations, else `QuorumNotReached`. Check order is
-authority → state → quorum, so strangers learn nothing about attestation
-progress. Deliberately, the quorum gates *release only*: `cancel` and
-`cancel_expired` stay ungated so attestors cannot grief funds into a lockup
-by withholding approval. Without a quorum the escrow behaves exactly as the
-plain two-party machine above.
+**Attestor quorum (weighted release gate, AV-45).** An escrow can be created with an
+optional quorum policy (`QuorumPolicy::new(attestors, weights, threshold)`,
+up to 8 attestors, heap-free bitmask): `initialize_quorum` attaches it once,
+before funding; registered attestors record idempotent attestations via
+`attest` in `Uninitialized` or `Funded`. Each attestor carries a vote
+weight, and `release` then additionally requires the *accumulated weight*
+of distinct attestations to reach the weight-sum `threshold`, else
+`QuorumNotReached` — a heavy voter (e.g. an arbiter) can meet the threshold
+alone while light voters must combine. Check order is authority → state →
+quorum, so strangers learn nothing about attestation progress. Deliberately,
+the quorum gates *release only*: `cancel` and `cancel_expired` stay ungated
+so attestors cannot grief funds into a lockup by withholding approval.
+Without a quorum the escrow behaves exactly as the plain two-party machine
+above. Zero weights, weight/length mismatches, weight-domain overflow, and
+a threshold of `0` or above the total weight are all `InvalidQuorum`.
 
 **Quorum threshold governance (dual-signed).** The quorum threshold is
 fixed before funding — but attestors can go dark (a lost key, an
 unresponsive oracle), which would lock the funds behind an unreachable
 threshold forever. `update_quorum(initializer, taker, threshold)` lets
-*both* parties move the threshold together, on an `Uninitialized` or
-`Funded` escrow: lower it to restore liveness, or raise it by mutual
-agreement when they want a stricter gate. One party alone gets
-`Unauthorized` — the gate can never be weakened unilaterally. The
-attestor set and recorded votes are untouched; only the threshold moves,
-in place, so the account layout never changes. If the new threshold is
-at or below the current approval count, `release` becomes legal
-immediately — that is the intended unlock. `0`, above the registered
-count, or no quorum configured is `InvalidQuorum`; the change emits a
+*both* parties move the weight-sum threshold together, on an
+`Uninitialized` or `Funded` escrow: lower it to restore liveness, or raise
+it by mutual agreement when they want a stricter gate. One party alone gets
+`Unauthorized` — the gate can never be weakened unilaterally. The attestor
+set, their weights, and recorded votes are untouched; only the threshold
+moves, in place, so the account layout never changes. If the new threshold
+is at or below the current approved weight, `release` becomes legal
+immediately — that is the intended unlock. `0`, above the total registered
+weight, or no quorum configured is `InvalidQuorum`; the change emits a
 `QuorumUpdated` indexer event (no-op re-affirmations emit nothing).
 
 **Attestor set governance (dual-signed).** The quorum's *electorate*
 moves by the same dual-signed mechanism: `update_attestors(initializer,
-taker, attestors)` replaces the registered attestor set on an
-`Uninitialized` or `Funded` escrow, when both parties agree. A
-registered attestor can go rogue (a compromised oracle key) or dark —
-without this, its vote or veto would outlive its trustworthiness
-forever. One party alone gets `Unauthorized`: swapping the electorate
-for sockpuppets would be a unilateral weakening of the release gate,
-so the set can only be reshaped by mutual agreement, exactly like the
+taker, attestors, weights)` replaces the registered attestor set — and
+their vote weights — on an `Uninitialized` or `Funded` escrow, when both
+parties agree. A registered attestor can go rogue (a compromised oracle
+key) or dark — without this, its vote or veto would outlive its
+trustworthiness forever. One party alone gets `Unauthorized`: swapping the
+electorate for sockpuppets would be a unilateral weakening of the release
+gate, so the set can only be reshaped by mutual agreement, exactly like the
 AV-25 threshold move. The attestor array is a fixed 8-slot reservation,
 so add/remove compacts into the slots in place — the account layout
 never changes, rent is untouched. Recorded votes follow their pubkeys,
 not their slots: approval bits remap to the new indices, so a retained
-attestor keeps its vote and a removed attestor's bit is cleared (a
-stale bit would otherwise be misattributed to whatever key lands in the
-compacted slot, crediting the wrong voter). The threshold is unchanged
-by a set swap — if the old threshold no longer fits the new set size
-that is `InvalidQuorum`, so shrink the threshold first (AV-25) and then
-the set. Empty sets, more than 8 keys, and duplicates are `InvalidQuorum`
-too. Passing the identical set succeeds as a no-op; a real set change
-emits an `AttestorsUpdated` indexer event (no-op updates emit nothing,
-mirroring `update_quorum`).
+attestor keeps its vote (counted at its *new* weight) and a removed
+attestor's bit is cleared (a stale bit would otherwise be misattributed to
+whatever key lands in the compacted slot, crediting the wrong voter). The
+weight-sum threshold is unchanged by a set swap — if the old threshold no
+longer fits the new total weight that is `InvalidQuorum`, so move the
+threshold first (AV-25) and then the set. Empty sets, more than 8 keys,
+duplicates, weight/length mismatches, and zero weights are `InvalidQuorum`
+too. Passing the identical set with identical weights succeeds as a no-op;
+a real set change emits an `AttestorsUpdated` indexer event (no-op updates
+emit nothing, mirroring `update_quorum`).
 
 **Dual-signature activation (multisig escrow).** An escrow can require
 *two* signatures to activate (`with_dual_sig`, opt-in on `Uninitialized`,
@@ -406,7 +411,9 @@ The rate (`fee_bps`, 2 bytes) and the cumulative counter (`fees_paid`,
 8 bytes) are persisted in the vault account (see the layout table),
 appended last so every earlier field offset stays stable; with the fee
 region the full vault is 692 bytes and needs **5,707,200 lamports** to be
-rent-exempt on mainnet.
+rent-exempt on mainnet. (AV-45 grows the quorum region by 71 bytes — 64 for
+the per-attestor weight array plus 7 for the wider u64 weight-sum threshold —
+so the full vault is now 763 bytes and needs **6,201,360 lamports**.)
 
 **Fee recipient pin (AV-44).** An escrow can additionally pin *where* the
 fee goes (`initialize_fee_recipient(fee_recipient)`, opt-in on
@@ -852,9 +859,9 @@ order; batches in first-seen caller order, actions in input order):
 
 ```json
 {"scanned":2,"batches":[
-  {"caller":"...","total_reclaimed":11414400,"actions":[
+  {"caller":"...","total_reclaimed":12402720,"actions":[
     {"escrow_id":"...","action":"close_vault","caller":"...",
-     "caller_role":"initializer","rent_reclaimed":5707200,
+     "caller_role":"initializer","rent_reclaimed":6201360,
      "reason":"released"}
   ]}
 ]}
@@ -958,7 +965,7 @@ two-way consistency check against the IDL parameter table:
 | released      | u64               | 8     |
 | expires_at    | u64               | 8     |
 | state         | u8 (discriminant) | 1     |
-| quorum        | Option<Quorum>    | 267   |
+| quorum        | Option<Quorum>    | 338   |
 | activation    | u8 (bitmask)      | 1     |
 | vesting       | Option<VestingSchedule> | 17 |
 | arbiter       | Option<Pubkey>    | 33    |
@@ -977,11 +984,15 @@ two-way consistency check against the IDL parameter table:
 | rationale_hash | Option<[u8; 32]> | 33    |
 | emergency_unlock | bool           | 1     |
 | fee_recipient | Option<Pubkey> | 33    |
-| **total**     |                   | **692** |
+| **total**     |                   | **763** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
-realloc. The 1-byte activation bitmask (AV-12) is likewise always present
+realloc. AV-45: the 338-byte quorum region is the 1-byte `Option`
+discriminant plus the 337-byte weighted policy — eight attestor keys
+(256), eight per-attestor u64 weights (64), the registered count (1),
+the u64 weight-sum threshold (8), and the approval bitmask (8). The 1-byte
+activation bitmask (AV-12) is likewise always present
 (zeroed for plain escrows), as is the 17-byte vesting region (AV-13:
 1-byte discriminant + `start`/`end` u64, zeroed when no schedule is
 attached), the 33-byte arbiter region (AV-14: 1-byte discriminant +
@@ -1012,10 +1023,10 @@ attached no rationale) — and the 1-byte emergency timelock-unlock
 governance opt-in `emergency_unlock` (AV-41, zeroed when the feature is
 off) — and the 33-byte protocol-fee recipient region (AV-44: 1-byte
 discriminant + 32-byte address, zeroed when no recipient is bound).
-`escrow-state` exposes `VAULT_SPACE` (692) and
+`escrow-state` exposes `VAULT_SPACE` (763) and
 `VAULT_SPACE_NO_QUORUM` (281) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **5,707,200 lamports** to be
+mainnet rent parameters the full vault needs **6,201,360 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1036,11 +1047,11 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 692 — the AV-38 rationale-hash and AV-44 fee-recipient growth is
-  accounted in the layout table above); the state
+  stays 763 — the AV-38 rationale-hash, AV-44 fee-recipient, and AV-45
+  weighted-quorum growth is accounted in the layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**5,707,200
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**6,201,360
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the

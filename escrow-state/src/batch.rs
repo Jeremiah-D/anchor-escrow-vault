@@ -758,7 +758,7 @@ mod batch_tests {
         // Unsatisfied quorum.
         let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES)
             .unwrap()
-            .with_quorum(QuorumPolicy::new(&[A1, A2], 2).unwrap())
+            .with_quorum(QuorumPolicy::new(&[A1, A2], &[1, 1], 2).unwrap())
             .unwrap();
         e.fund(ALICE).unwrap();
         e.attest(A1).unwrap(); // 1 of 2
@@ -815,7 +815,7 @@ mod batch_tests {
         // executable items around it — input order preserved.
         let mut blocked = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES)
             .unwrap()
-            .with_quorum(QuorumPolicy::new(&[A1, A2], 2).unwrap())
+            .with_quorum(QuorumPolicy::new(&[A1, A2], &[1, 1], 2).unwrap())
             .unwrap();
         blocked.fund(ALICE).unwrap();
         let items = [

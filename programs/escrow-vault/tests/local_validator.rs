@@ -136,9 +136,10 @@ fn quorum_attest_release_happy_path() {
         params: vec![("amount", AMOUNT), ("expires_at", EXPIRES_AT)],
         signers: vec![ALICE],
     };
-    // `initialize_quorum(attestors, threshold)` params -> QuorumPolicy::new,
-    // authority enforced by the program's account constraint (initializer).
-    let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], 2)
+    // `initialize_quorum(attestors, weights, threshold)` params ->
+    // QuorumPolicy::new, authority enforced by the program's account
+    // constraint (initializer).
+    let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 2)
         .expect("2-of-3 policy must construct");
     let mut escrow = apply_initialize(&init_call, ALICE, BOB)
         .with_quorum(policy)
@@ -204,7 +205,7 @@ fn release_before_quorum_threshold_is_rejected() {
         params: vec![("amount", AMOUNT), ("expires_at", EXPIRES_AT)],
         signers: vec![ALICE],
     };
-    let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], 2)
+    let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 2)
         .expect("2-of-3 policy must construct");
     let mut escrow = apply_initialize(&init_call, ALICE, BOB)
         .with_quorum(policy)

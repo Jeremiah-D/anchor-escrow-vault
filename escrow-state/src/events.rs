@@ -790,7 +790,7 @@ impl IndexedEscrow {
         &mut self,
         initializer: [u8; 32],
         taker: [u8; 32],
-        new_threshold: u8,
+        new_threshold: u64,
         at: u64,
     ) -> Result<(), EscrowError> {
         let before = self.inner.quorum().map(|q| q.threshold()).unwrap_or(0);
@@ -819,28 +819,41 @@ impl IndexedEscrow {
     /// Replace the quorum's attestor set by dual-signed governance
     /// (mirrors [`Escrow::update_attestors`]). Emits `AttestorsUpdated`
     /// when the set actually changes; a no-op update (the identical
-    /// set, same order) emits nothing — paralleling `update_quorum`'s
-    /// no-op rule. `from == to ==` the current state: the electorate,
-    /// not the lifecycle state, is what changed. `at` is the
-    /// caller-supplied timestamp (on-chain: the clock sysvar).
+    /// set, same order, same weights) emits nothing — paralleling
+    /// `update_quorum`'s no-op rule. `from == to ==` the current state:
+    /// the electorate, not the lifecycle state, is what changed. `at`
+    /// is the caller-supplied timestamp (on-chain: the clock sysvar).
     pub fn update_attestors(
         &mut self,
         initializer: [u8; 32],
         taker: [u8; 32],
         new_attestors: &[[u8; 32]],
+        new_weights: &[u64],
         at: u64,
     ) -> Result<(), EscrowError> {
-        let before: Vec<[u8; 32]> = self
+        let before: Vec<([u8; 32], u64)> = self
             .inner
             .quorum()
-            .map(|q| q.attestors().to_vec())
+            .map(|q| {
+                q.attestors()
+                    .iter()
+                    .zip(q.weights().iter())
+                    .map(|(a, w)| (*a, *w))
+                    .collect()
+            })
             .unwrap_or_default();
         self.inner
-            .update_attestors(initializer, taker, new_attestors)?;
-        let after: Vec<[u8; 32]> = self
+            .update_attestors(initializer, taker, new_attestors, new_weights)?;
+        let after: Vec<([u8; 32], u64)> = self
             .inner
             .quorum()
-            .map(|q| q.attestors().to_vec())
+            .map(|q| {
+                q.attestors()
+                    .iter()
+                    .zip(q.weights().iter())
+                    .map(|(a, w)| (*a, *w))
+                    .collect()
+            })
             .unwrap_or_default();
         // The inner call succeeds with a configured quorum or fails (no
         // quorum / bad set / wrong authority / bad state), so a changed
@@ -1170,7 +1183,7 @@ mod event_tests {
     }
 
     fn quorum_1_of_1() -> QuorumPolicy {
-        QuorumPolicy::new(&[ATTESTOR_1], 1).unwrap()
+        QuorumPolicy::new(&[ATTESTOR_1], &[1], 1).unwrap()
     }
 
     fn milestone_indexed() -> IndexedEscrow {
@@ -1689,7 +1702,7 @@ mod event_tests {
         // from == to == the current state and zero amounts — the event
         // is the ordering signal, the new threshold is read from the
         // vault.
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
         let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
         e.update_quorum(ALICE, BOB, 1, T0 + 2).unwrap();
@@ -1711,7 +1724,7 @@ mod event_tests {
         // Same threshold: the state machine succeeds but nothing
         // observable changed, so no event — paralleling `attest`'s
         // idempotent duplicates.
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
         let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
         assert_eq!(e.event_count(), 2);
@@ -1724,7 +1737,7 @@ mod event_tests {
     fn failed_update_quorum_emits_nothing() {
         // One party alone is Unauthorized: the failed governance call
         // emits no event and the threshold is untouched.
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
         let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
         assert_eq!(
@@ -1741,11 +1754,11 @@ mod event_tests {
         // is the ordering signal, the new set is read from the vault.
         // ATTESTOR_1's vote is dropped with ATTESTOR_1; ATTESTOR_2's
         // vote remaps to its new slot.
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 1).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 1).unwrap();
         let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
         e.attest(ATTESTOR_1, T0 + 1).unwrap();
         e.fund(ALICE, T0 + 2).unwrap();
-        e.update_attestors(ALICE, BOB, &[ATTESTOR_2, ATTESTOR_3], T0 + 3)
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_2, ATTESTOR_3], &[1, 1], T0 + 3)
             .unwrap();
         assert_event(
             &last(&e),
@@ -1769,11 +1782,11 @@ mod event_tests {
         // The identical set in the identical order: the state machine
         // succeeds but nothing observable changed, so no event —
         // paralleling `update_quorum`'s no-op rule.
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
         let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
         assert_eq!(e.event_count(), 2);
-        e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_2], T0 + 2)
+        e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_2], &[1, 1], T0 + 2)
             .unwrap();
         assert_eq!(e.event_count(), 2);
         assert_eq!(e.next_seq(), 2);
@@ -1783,11 +1796,11 @@ mod event_tests {
     fn failed_update_attestors_emits_nothing() {
         // One party alone is Unauthorized: the failed governance call
         // emits no event and the set is untouched.
-        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], 2).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
         let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
         assert_eq!(
-            e.update_attestors(ALICE, MALLORY, &[ATTESTOR_1], T0 + 2),
+            e.update_attestors(ALICE, MALLORY, &[ATTESTOR_1], &[1], T0 + 2),
             Err(EscrowError::Unauthorized)
         );
         assert!(e.drain_events().len() == 2, "failed update emitted an event");
