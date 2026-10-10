@@ -287,6 +287,14 @@
       ]
     },
     {
+      "name": "rotate_taker",
+      "discriminator": [188, 9, 114, 76, 124, 78, 249, 122],
+      "accounts": [],
+      "args": [
+        {"name": "new_taker", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "initialize_payout_allowlist",
       "discriminator": [155, 187, 116, 255, 95, 174, 219, 118],
       "accounts": [],
@@ -415,7 +423,8 @@
     {"code": 124, "name": "Paused"},
     {"code": 125, "name": "InvalidPauseAuthority"},
     {"code": 126, "name": "InvalidPayoutAllowlist"},
-    {"code": 127, "name": "PayoutNotAllowlisted"}
+    {"code": 127, "name": "PayoutNotAllowlisted"},
+    {"code": 128, "name": "InvalidTaker"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

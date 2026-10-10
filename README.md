@@ -78,6 +78,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `pause()`                                     | any            | — (no state change; sets the pause flag) | the bound pause authority only (`Unauthorized` otherwise; `InvalidStateTransition` with no authority bound or when already paused); emits `Paused` |
 | `unpause()`                                   | any            | — (no state change; clears the pause flag) | the bound pause authority only (same rules as `pause`; `InvalidStateTransition` when not paused); emits `Unpaused` |
 | `rotate_pause_authority(new_authority)`       | any (post-`Uninitialized`) | — (no state change; rewrites the bound pause authority) | the escrow authority (initializer) only — a stranger/taker is `Unauthorized`; `InvalidStateTransition` on `Uninitialized` or with no authority bound; zero address is `InvalidPauseAuthority`; works while paused (key-loss escape hatch); emits `PauseAuthorityRotated` only on an actual change |
+| `rotate_taker(new_taker)`                   | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the taker) | **both** the initializer and the *current* taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition` (no live counterparty left; arbitration in flight adjudicates the taker's identity); zero address is `InvalidTaker`; amount / released / attest records / milestone state all preserved; emits `TakerRotated` only on an actual change |
 | `initialize_quorum(attestors, weights, threshold)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
@@ -493,6 +494,28 @@ key is an idempotent no-op. An actual change emits the
 The 33-byte authority region is rewritten in place — no layout or rent
 change.
 
+**Taker rotation (AV-52).** The initializer and the *current* taker may
+jointly rotate the payout counterparty (`rotate_taker(new_taker)`) — the
+counterparty-change scenario: a lost or compromised taker key, an invoice
+reassigned to a new contractor, a payroll stream moved to a new wallet.
+Both parties must sign (one alone, or a stranger pair, is
+`Unauthorized`); the taker side is authenticated against the *current*
+taker, so the old key consents to its own replacement. Only
+`Uninitialized` / `Activated` / `Funded` — the terminal states have no
+live counterparty left to rotate, and `Disputed` is excluded because
+arbitration is in flight (the arbiter's `resolve` pays `taker_amount` to
+the taker, so rotating mid-dispute would let a party swap in a fresh key
+to dodge the ruling). Check order is authority → state → config: the
+zero address is `InvalidTaker`. Only the taker field changes — amount,
+released progress, attest records, milestone state, quorum, vesting are
+all preserved (the 32-byte region is rewritten in place: no layout or
+rent change). Unlike the pause-authority rotation, this one *is* gated by
+the pause (`Paused`) — it is a config transition, not the key-loss escape
+hatch. Rotating to the current taker is an idempotent no-op; an actual
+change emits the `TakerRotated` indexer event (`from == to ==` the
+current state). The keeper's claim listing and the snapshot export read
+the live taker field, so both follow the rotation automatically.
+
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
 
@@ -526,6 +549,7 @@ program error per variant):
 | `InvalidPauseAuthority` | 125 | `with_pause_authority` / `rotate_pause_authority` with the zero address (a zero address can never hold the emergency switch) |
 | `InvalidPayoutAllowlist` | 126 | `with_payout_allowlist` / `update_payout_allowlist` with an empty list, more than 4 addresses, or a zero address (the AV-49 allowlist must be 1-4 live payout destinations) |
 | `PayoutNotAllowlisted` | 127 | a payout transition (`release` / `claim` / `resolve` / `release_milestone` / `release_via_cpi`) naming a `payout_to` that is neither the taker nor a member of the payout allowlist |
+| `InvalidTaker` | 128 | `rotate_taker` with the zero address (a zero address can never be the legitimate payout counterparty) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -795,7 +819,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `EmergencyUnlock`, `VaultClosed` |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |

@@ -51,6 +51,12 @@
 //!   so a retained attestor's vote survives; a removed attestor's bit
 //!   is cleared). A no-op update (the identical set, same order) emits
 //!   nothing, paralleling `update_quorum`'s no-op rule.
+//! - `rotate_taker` emits [`EscrowEventKind::TakerRotated`] when the
+//!   taker actually changes (AV-52) — `from == to ==` the current
+//!   state, all amounts zero: the event is the ordering signal that the
+//!   payout counterparty moved, and the indexer reads the new taker
+//!   from the vault. A no-op rotation (same taker) emits nothing,
+//!   paralleling `update_quorum`'s no-op rule.
 //! - Partial `release` / `claim` calls emit [`EscrowEventKind::Released`]
 //!   / [`EscrowEventKind::Claimed`] with `from == to == Funded`: the
 //!   `EscrowState` variant does not change, but funds moved and the
@@ -99,7 +105,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
@@ -211,6 +217,15 @@ pub enum EscrowEventKind {
     /// emits no event — pre-fund configuration, like
     /// [`Escrow::with_pause_authority`].)
     PayoutAllowlistUpdated,
+    /// AV-52: the taker (payout counterparty) was rotated by dual-signed
+    /// governance ([`Escrow::rotate_taker`]). `from == to ==` the current
+    /// state (a config change, not a lifecycle move — like
+    /// [`EscrowEventKind::QuorumUpdated`]); the new taker is read from
+    /// the vault, the event is the ordering signal. Emitted only on an
+    /// actual change: rotating to the current taker is an idempotent
+    /// no-op that emits nothing (paralleling
+    /// [`EscrowEventKind::QuorumUpdated`]'s no-op rule).
+    TakerRotated,
 }
 
 /// Fund movements carried by an [`EscrowEvent`].
@@ -1119,6 +1134,41 @@ impl IndexedEscrow {
             let state = self.inner.state();
             self.push_event(
             EscrowEventKind::PayoutAllowlistUpdated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
+    /// Rotate the taker by dual-signed governance (mirrors
+    /// [`Escrow::rotate_taker`]). Emits `TakerRotated` only when the
+    /// taker actually changes; `from == to ==` the current state (a
+    /// config change, not a lifecycle move — like `QuorumUpdated`).
+    /// `at` is the caller-supplied event timestamp.
+    pub fn rotate_taker(
+        &mut self,
+        initializer: [u8; 32],
+        old_taker: [u8; 32],
+        new_taker: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.taker();
+        self.inner.rotate_taker(initializer, old_taker, new_taker)?;
+        let after = self.inner.taker();
+        // The inner call rejects a stranger pair, wrong states, and the
+        // zero address, so a changed taker here always means real
+        // governance — and a same-taker no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+            EscrowEventKind::TakerRotated,
             state,
             state,
             EventAmounts::none(),

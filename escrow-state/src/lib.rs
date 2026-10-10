@@ -697,6 +697,11 @@ pub enum EscrowError {
     /// payouts to the taker). A phishing frontend swapping the
     /// destination account fails here, before any state changes.
     PayoutNotAllowlisted,
+    /// Invalid taker address (AV-52): [`Escrow::rotate_taker`] with the
+    /// zero address — a zero address can never be the legitimate payout
+    /// counterparty, so binding it is a policy mismatch by construction.
+    /// Parallels [`EscrowError::InvalidFeeRecipient`] (config error).
+    InvalidTaker,
 }
 
 impl EscrowError {
@@ -737,6 +742,7 @@ impl EscrowError {
             EscrowError::InvalidPauseAuthority => 125,
             EscrowError::InvalidPayoutAllowlist => 126,
             EscrowError::PayoutNotAllowlisted => 127,
+            EscrowError::InvalidTaker => 128,
         }
     }
 
@@ -771,6 +777,7 @@ impl EscrowError {
             EscrowError::InvalidPauseAuthority,
             EscrowError::InvalidPayoutAllowlist,
             EscrowError::PayoutNotAllowlisted,
+            EscrowError::InvalidTaker,
         ]
     }
 }
@@ -2532,6 +2539,84 @@ impl Escrow {
             return Ok(());
         }
         self.pause_authority = Some(new_authority);
+        Ok(())
+    }
+
+    /// Rotate the taker (payout counterparty) by dual-signed governance
+    /// (AV-52 — Solana governance): the initializer and the *current*
+    /// taker jointly designate a new taker; the old key stops being the
+    /// payout recipient immediately.
+    ///
+    /// Why: the taker key is the payout destination for every release
+    /// path (`release`, `claim`, `resolve`, milestones). If the taker's
+    /// key is lost or compromised — or the counterparty legitimately
+    /// changes (an invoice reassigned to a new contractor, a payroll
+    /// stream moved to a new wallet) — the escrow would otherwise be
+    /// stuck paying a dead key. Rotation is the governance escape hatch:
+    /// both parties agree on the replacement without moving funds,
+    /// changing state, or touching any other configuration.
+    ///
+    /// Only the taker field changes: amount, released progress, attest
+    /// records, milestone state, quorum, vesting, and every other field
+    /// are untouched — the rotation rewrites the 32-byte `taker` region
+    /// in place (no layout change, rent untouched).
+    ///
+    /// Check order is authority → state → config, matching
+    /// [`Escrow::update_quorum`] / [`Escrow::update_attestors`]:
+    /// 1. the initializer AND the current taker must both authorize —
+    ///    one party alone (or a stranger pair) is
+    ///    [`EscrowError::Unauthorized`]. The taker side is authenticated
+    ///    against the *current* taker: the old key consents to its own
+    ///    replacement, so a stolen new key cannot self-install.
+    ///    Independent `==` checks (not `||`): the degenerate
+    ///    initializer == taker self-escrow authorizes with one key
+    ///    passed twice, like AV-12's activation;
+    /// 2. the escrow must be `Uninitialized`, `Activated` or `Funded` —
+    ///    the non-terminal pre-release states. The terminal states
+    ///    (`Released` / `Cancelled` / `Settled` / `Closed`) have no live
+    ///    counterparty left to rotate, and `Disputed` is excluded
+    ///    because arbitration is in flight: the taker's identity is part
+    ///    of what the arbiter's [`Escrow::resolve`] adjudicates (it pays
+    ///    `taker_amount` to the taker), so rotating mid-dispute would
+    ///    let a party swap in a fresh key to dodge or confuse the ruling
+    ///    — the dispute must settle first
+    ///    ([`EscrowError::InvalidStateTransition`]);
+    /// 3. the zero address is [`EscrowError::InvalidTaker`] — a zero
+    ///    address can never be the legitimate payout counterparty.
+    ///
+    /// AV-46: a paused escrow fails fast (`Paused`) — rotation is a
+    /// config transition, not the pause key-loss escape hatch (that is
+    /// [`Escrow::rotate_pause_authority`], which deliberately works
+    /// while paused).
+    ///
+    /// Rotating to the current taker is a no-op success (idempotent);
+    /// the `TakerRotated` indexer event fires only on an actual change,
+    /// paralleling `update_quorum`'s no-op rule.
+    pub fn rotate_taker(
+        &mut self,
+        initializer: [u8; 32],
+        old_taker: [u8; 32],
+        new_taker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the initializer and the
+        // *current* taker must authorize — one party alone (or a
+        // stranger pair) is Unauthorized.
+        if initializer != self.initializer || old_taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Activated | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if new_taker == [0u8; 32] {
+            return Err(EscrowError::InvalidTaker);
+        }
+        if new_taker == self.taker {
+            return Ok(());
+        }
+        self.taker = new_taker;
         Ok(())
     }
 
@@ -6632,6 +6717,34 @@ pub(crate) mod anchor_idl_tests {
                             no layout / rent change",
         },
         InstructionSpec {
+            // AV-52: rotate the taker (payout counterparty) by
+            // dual-signed governance.
+            name: "rotate_taker",
+            params: &[(
+                "new_taker",
+                "Pubkey",
+                "instruction param; the replacement taker - the old key \\
+                 stops being the payout recipient immediately",
+            )],
+            method: "Escrow::rotate_taker",
+            input_mapping: "initializer <- accounts.initializer (signer) \\
+                            AND old_taker <- accounts.old_taker (signer) - \\
+                            both parties must sign, one alone (or a \\
+                            stranger pair) is Unauthorized; new_taker <- \\
+                            param (Pubkey -> [u8; 32] conversion); only \\
+                            Uninitialized / Activated / Funded - the \\
+                            terminal states and Disputed are \\
+                            InvalidStateTransition (no live counterparty \\
+                            left to rotate, and arbitration in flight \\
+                            adjudicates the taker's identity); the zero \\
+                            address is InvalidTaker (code 128); rotating \\
+                            to the current taker is an idempotent no-op; \\
+                            emits the TakerRotated indexer event only on \\
+                            an actual change (from == to == the current \\
+                            state); the 32-byte taker region is rewritten \\
+                            in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-49: set the payout destination allowlist at
             // initialize time.
             name: "initialize_payout_allowlist",
@@ -6754,6 +6867,7 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::pause",
             "Escrow::unpause",
             "Escrow::rotate_pause_authority",
+            "Escrow::rotate_taker",
             "Escrow::with_payout_allowlist",
             "Escrow::update_payout_allowlist",
         ];
@@ -6779,7 +6893,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_twenty_six_instructions_take_params() {
+    fn only_twenty_seven_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -6814,6 +6928,7 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_fee_recipient",
                 &"initialize_pause_authority",
                 &"rotate_pause_authority",
+                &"rotate_taker",
                 &"initialize_payout_allowlist",
                 &"update_payout_allowlist",
             ]
@@ -7584,6 +7699,49 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn rotate_taker_maps_param_to_taker_field() {
+        // IDL: rotate_taker(new_taker: Pubkey) — new_taker <- param;
+        // initializer <- accounts.initializer (signer) AND old_taker <-
+        // accounts.old_taker (signer), enforced by the Anchor account
+        // constraints, not the state machine. The param rewrites the
+        // vault's taker field in place (see PARAM_FIELD_MAP) — no layout
+        // change.
+        const CAROL: [u8; 32] = [0xC4; 32];
+        const DAVE: [u8; 32] = [0xD4; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        e.rotate_taker(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.taker(), CAROL);
+        // Documented failure modes: one party alone is Unauthorized, the
+        // old taker must be the *current* taker, a stranger pair is
+        // Unauthorized, and the zero address can never be the taker.
+        assert_eq!(
+            e.rotate_taker(ALICE, BOB, DAVE),
+            Err(EscrowError::Unauthorized),
+            "BOB is no longer the taker"
+        );
+        assert_eq!(
+            e.rotate_taker(ALICE, MALLORY, DAVE),
+            Err(EscrowError::Unauthorized),
+            "initializer alone cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_taker(MALLORY, CAROL, DAVE),
+            Err(EscrowError::Unauthorized),
+            "old taker alone cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_taker(MALLORY, [0xD0; 32], DAVE),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.rotate_taker(ALICE, CAROL, [0u8; 32]),
+            Err(EscrowError::InvalidTaker)
+        );
+        assert_eq!(e.taker(), CAROL, "failed calls change nothing");
+    }
+
+    #[test]
     fn initialize_payout_allowlist_maps_param_to_payout_allowlist_field() {
         // IDL: initialize_payout_allowlist(allowlist: Vec<Pubkey>) —
         // allowlist <- param; authority <- accounts.initializer
@@ -8259,6 +8417,12 @@ pub(crate) mod anchor_idl_tests {
         // a second param source for `pause_authority`, like
         // `update_quorum`'s threshold (see the direction-2 note above).
         ("rotate_pause_authority", "new_authority", "pause_authority"),
+        // AV-52: the rotation param rewrites the taker field in place.
+        // The field's initial value comes from accounts.taker at
+        // `initialize` (a non-param account input); this entry
+        // documents the param source, like `rotate_pause_authority`'s
+        // new_authority.
+        ("rotate_taker", "new_taker", "taker"),
         // AV-49: the allowlist param populates `payout_allowlist`; the
         // `Option` discriminant is implied (a configured list is
         // `Some`), mirroring `initialize_pause_authority`.
@@ -8276,7 +8440,12 @@ pub(crate) mod anchor_idl_tests {
             "initializer",
             "accounts.initializer signer, stored by initialize",
         ),
-        ("taker", "accounts.taker, stored by initialize"),
+        // `taker` is populated by the `rotate_taker` instruction param
+        // (see PARAM_FIELD_MAP), so it is not listed here — like
+        // `arbiter`, every field gets exactly one source. The field's
+        // *initial* value comes from accounts.taker at `initialize` (a
+        // non-param account input, so it cannot appear in the param
+        // table); the entry below documents the param source.
         (
             "state",
             "transitions: fund/release/cancel/cancel_expired/activate/escalate/resolve",
@@ -8593,6 +8762,11 @@ mod error_code_tests {
             EscrowError::PayoutNotAllowlisted,
             127,
             "a payout transition naming a payout_to that is neither the taker nor a member of the AV-49 payout destination allowlist",
+        ),
+        (
+            EscrowError::InvalidTaker,
+            128,
+            "rotate_taker with the zero address (a zero address can never be the legitimate payout counterparty)",
         ),
     ];
 
@@ -15345,6 +15519,258 @@ mod pause_rotation_tests {
         let (payout, _fee) = e.release(ALICE, NOW, 500_000, None, BOB).unwrap();
         assert_eq!(payout, 500_000);
         assert_eq!(e.state(), EscrowState::Released);
+    }
+}
+
+// ---------- AV-52: dual-signed taker rotation (Solana governance) ----------
+#[cfg(test)]
+mod taker_rotation_tests {
+    use super::*;
+    use crate::events::{EscrowEventKind, IndexedEscrow};
+    use crate::keeper::{scan_keeper_actions, WatchedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const CAROL: [u8; 32] = [0xC4; 32]; // new taker
+    const DAVE: [u8; 32] = [0xD4; 32]; // stranger key
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const ESCROW_ID: [u8; 32] = [0x1D; 32];
+    const T0: u64 = 1_700_000_000;
+
+    /// A richly-configured live escrow: weighted quorum with recorded
+    /// votes, a milestone plan with tranche 0 confirmed and released —
+    /// the full state rotation must preserve bit-identically.
+    fn rich_funded() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(
+                QuorumPolicy::new(&[[0xA1; 32], [0xA2; 32]], &[1, 1], 2).unwrap(),
+            )
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.attest([0xA1; 32]).unwrap();
+        e.attest([0xA2; 32]).unwrap();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        e.release_milestone(ALICE, 1_750_000_000, 0, None, BOB).unwrap();
+        e
+    }
+
+    #[test]
+    fn rotation_preserves_everything_but_taker() {
+        let mut e = rich_funded();
+        let before = super::account_space_tests::encode_escrow(&e);
+        let quorum_before = e.quorum().unwrap();
+        e.rotate_taker(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.taker(), CAROL);
+        assert_eq!(e.initializer(), ALICE, "initializer untouched");
+        assert_eq!(e.state(), EscrowState::Funded, "state untouched");
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 400_000, "release progress kept");
+        assert_eq!(e.quorum().unwrap(), quorum_before, "attest records kept");
+        // Byte-level: only the 32-byte taker region (bytes 32..64)
+        // differs — every other field is bit-identical.
+        let after = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(before.len(), after.len());
+        assert_eq!(&after[0..32], &before[0..32], "initializer bytes");
+        assert_eq!(&after[32..64], &CAROL, "taker region rewritten");
+        assert_eq!(&after[64..], &before[64..], "all other fields bit-identical");
+    }
+
+    #[test]
+    fn rotation_authority_matrix() {
+        // Initializer alone cannot rotate.
+        let mut e = rich_funded();
+        assert_eq!(
+            e.rotate_taker(ALICE, MALLORY, CAROL),
+            Err(EscrowError::Unauthorized)
+        );
+        // Old taker alone cannot rotate.
+        assert_eq!(
+            e.rotate_taker(MALLORY, BOB, CAROL),
+            Err(EscrowError::Unauthorized)
+        );
+        // A stranger pair cannot rotate.
+        assert_eq!(
+            e.rotate_taker(MALLORY, DAVE, CAROL),
+            Err(EscrowError::Unauthorized)
+        );
+        // The old taker must be the *current* taker: after a rotation
+        // the previous key is stale.
+        e.rotate_taker(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(
+            e.rotate_taker(ALICE, BOB, DAVE),
+            Err(EscrowError::Unauthorized),
+            "stale old-taker key"
+        );
+        // Dual-sig success with the fresh key pair.
+        e.rotate_taker(ALICE, CAROL, DAVE).unwrap();
+        assert_eq!(e.taker(), DAVE);
+        assert_eq!(e.state(), EscrowState::Funded, "failed calls change nothing else");
+    }
+
+    #[test]
+    fn rotation_rejects_zero_new_taker() {
+        // Check order: authority -> state -> config. Valid authority on
+        // a live escrow reaches the config check: the zero address is
+        // InvalidTaker (code 128).
+        let mut e = rich_funded();
+        let err = e.rotate_taker(ALICE, BOB, [0u8; 32]).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidTaker);
+        assert_eq!(err.code(), 128);
+        assert_eq!(e.taker(), BOB, "failed call changes nothing");
+    }
+
+    #[test]
+    fn rotation_state_gates() {
+        // Allowed: the non-terminal pre-release states.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.rotate_taker(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.taker(), CAROL);
+
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Activated);
+        e.rotate_taker(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.taker(), CAROL);
+
+        let mut e = rich_funded();
+        e.rotate_taker(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.taker(), CAROL);
+
+        // Rejected: the terminal states have no live counterparty left
+        // to rotate. (A plain escrow for Released: the rich helper's
+        // milestone plan owns the release schedule, so plain `release`
+        // is InvalidMilestones there.)
+        let mut released = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        released.fund(ALICE).unwrap();
+        released.release(ALICE, EXPIRES_AT, 1_000_000, None, BOB).unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+
+        let mut cancelled = rich_funded();
+        cancelled.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(cancelled.state(), EscrowState::Cancelled);
+
+        let mut disputed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        disputed.fund(ALICE).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        assert_eq!(disputed.state(), EscrowState::Disputed);
+
+        let mut settled = disputed;
+        settled.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
+        assert_eq!(settled.state(), EscrowState::Settled);
+
+        let mut closed = released;
+        closed.close_vault(ALICE).unwrap();
+        assert_eq!(closed.state(), EscrowState::Closed);
+
+        // Rebuild the disputed case (it was moved into `settled` above).
+        let mut disputed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        disputed.fund(ALICE).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+
+        for (name, e) in [
+            ("Released", released),
+            ("Cancelled", cancelled),
+            ("Disputed", disputed),
+            ("Settled", settled),
+            ("Closed", closed),
+        ] {
+            let mut e = e;
+            assert_eq!(
+                e.rotate_taker(ALICE, BOB, CAROL),
+                Err(EscrowError::InvalidStateTransition),
+                "{name}"
+            );
+            assert_eq!(e.taker(), BOB, "{name}: taker unchanged");
+        }
+    }
+
+    #[test]
+    fn rotation_to_current_taker_is_an_idempotent_noop() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let base = e.events().len();
+        e.rotate_taker(ALICE, BOB, BOB, T0 + 2).unwrap();
+        assert_eq!(e.events().len(), base, "no-op emits nothing");
+    }
+
+    #[test]
+    fn rotation_emits_taker_rotated_only_on_change() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let base = e.events().len();
+        e.rotate_taker(ALICE, BOB, CAROL, T0 + 2).unwrap();
+        let ev = *e.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::TakerRotated);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(e.events().len(), base + 1);
+        // The inner escrow carries the new taker.
+        assert_eq!(e.inner().taker(), CAROL);
+    }
+
+    #[test]
+    fn rotation_blocked_while_paused() {
+        // AV-46: rotation is a config transition, not the pause key-loss
+        // escape hatch — a paused escrow fails fast.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.pause([0xDD; 32]).unwrap();
+        assert_eq!(
+            e.rotate_taker(ALICE, BOB, CAROL),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(e.taker(), BOB);
+    }
+
+    #[test]
+    fn keeper_and_snapshot_follow_the_new_taker() {
+        // The keeper's claim listing and the snapshot export read the
+        // live taker field, so both follow the rotation with no extra
+        // plumbing.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.rotate_taker(ALICE, BOB, CAROL).unwrap();
+        // Snapshot exports the new taker.
+        let snap = e.snapshot(1_750_000_000);
+        assert_eq!(snap.taker, CAROL);
+        // The keeper lists the claim for the new taker.
+        let watched = [WatchedEscrow {
+            escrow_id: ESCROW_ID,
+            escrow: e,
+        }];
+        let report = scan_keeper_actions(&watched, 1_750_000_000);
+        assert_eq!(report.actions.len(), 1);
+        let a = report.actions[0];
+        assert_eq!(a.caller, CAROL);
+        assert_eq!(a.caller_role, "taker");
+        // And the new taker can actually claim.
+        let mut e = watched[0].escrow;
+        let (payout, _) = e.claim(CAROL, 1_750_000_000, None, CAROL).unwrap();
+        assert_eq!(payout, 500_000);
+        assert_eq!(e.claim(BOB, 1_750_000_000, None, BOB), Err(EscrowError::Unauthorized));
     }
 }
 

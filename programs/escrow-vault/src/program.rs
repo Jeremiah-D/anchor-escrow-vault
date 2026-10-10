@@ -1400,6 +1400,54 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Rotate the taker (payout counterparty) by dual-signed governance
+    /// (AV-52; mirrors `Escrow::rotate_taker`). Both the initializer and
+    /// the *current* taker must sign — one party alone (or a stranger
+    /// pair) is `Unauthorized`. Only `Uninitialized` / `Activated` /
+    /// `Funded`: the terminal states and `Disputed` are
+    /// `InvalidStateTransition` (no live counterparty left to rotate,
+    /// and arbitration in flight adjudicates the taker's identity). The
+    /// zero address is `InvalidTaker` (code 128). A paused escrow fails
+    /// fast (`Paused`) — rotation is a config transition, not the pause
+    /// key-loss escape hatch. Only the taker field changes (amount,
+    /// released progress, attest records, milestone state all preserved);
+    /// rotating to the current taker is an idempotent no-op. Emits
+    /// `TakerRotated` only on an actual change (from == to == the
+    /// current state), mirroring `IndexedEscrow::rotate_taker`.
+    pub fn rotate_taker(ctx: Context<RotateTaker>, new_taker: Pubkey) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.taker();
+        escrow
+            .rotate_taker(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.old_taker.key().to_bytes(),
+                new_taker.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.taker` in place in the real build (32 bytes,
+        // always present) — no realloc, no rent change.
+        if escrow.taker() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::TakerRotated,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Clear the AV-27 timelock by dual-signed emergency governance
     /// (AV-41; mirrors `Escrow::emergency_unlock`). Both the initializer
     /// and the taker must sign — one party alone is `Unauthorized`.
@@ -2403,6 +2451,21 @@ pub struct RotatePauseAuthority<'info> {
     /// owner-governance power, so the *escrow* authority signs, not the
     /// pause key. A stranger (or the taker) is `Unauthorized`.
     pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct RotateTaker<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's *current*
+    /// taker. The old key consents to its own replacement, so a stolen
+    /// new key cannot self-install. A constraint in the real build
+    /// additionally asserts `old_taker.key() == vault.taker`.
+    pub old_taker: Signer<'info>,
 }
 
 #[derive(Accounts)]
