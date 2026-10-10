@@ -346,6 +346,20 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(32)?;
         None
     };
+    // AV-46: emergency-pause authority, always reserved like
+    // `fee_recipient`: the `None` discriminant followed by a zeroed
+    // 32-byte address, appended last so every earlier offset above is
+    // unchanged.
+    let pause_authority = if c.option_present("pause_authority")? {
+        Some(c.pubkey()?)
+    } else {
+        c.skip(32)?;
+        None
+    };
+    // AV-46: emergency pause flag, always present (zeroed when the
+    // escrow is not paused); appended last so every earlier offset
+    // above is unchanged.
+    let paused = c.u8()? != 0;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -378,6 +392,8 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         rationale_hash,
         emergency_unlock,
         fee_recipient,
+        pause_authority,
+        paused,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

@@ -440,6 +440,22 @@ pub struct Escrow {
     /// with `fee_bps == 0` is accepted but inert — builders stay
     /// order-independent, and a zero fee charges nothing regardless.
     fee_recipient: Option<[u8; 32]>,
+    /// AV-46: opt-in emergency-pause authority (see
+    /// [`Escrow::with_pause_authority`]). `None` means the escrow has
+    /// no pause switch (backward compatible): `pause` / `unpause` fail
+    /// with [`EscrowError::InvalidStateTransition`]. Set once via
+    /// `with_pause_authority` on an `Uninitialized` escrow, like the
+    /// other `with_*` builders. Persisted (33 bytes in the vault
+    /// account) so the authority survives serialization. Appended last
+    /// so every earlier field offset stays stable.
+    pause_authority: Option<[u8; 32]>,
+    /// AV-46: emergency pause flag (see [`Escrow::pause`] /
+    /// [`Escrow::unpause`]). While set, every state-changing transition
+    /// fails with [`EscrowError::Paused`] — the circuit breaker. Queries
+    /// (snapshots, keeper scans) are unaffected. Always present (1 byte,
+    /// zeroed by default). Appended last so every earlier field offset
+    /// stays stable.
+    paused: bool,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -635,6 +651,19 @@ pub enum EscrowError {
     /// it is a policy mismatch by construction. Parallels
     /// [`EscrowError::RefundAddressMismatch`] (config error).
     InvalidFeeRecipient,
+    /// Emergency pause engaged (AV-46): a state-changing transition
+    /// was attempted while [`Escrow::paused`] is set. The pause is a
+    /// circuit breaker — every fund-moving or config transition fails
+    /// fast with this error until the pause authority calls
+    /// [`Escrow::unpause`]. Queries (snapshots, keeper scans) are
+    /// unaffected.
+    Paused,
+    /// Invalid pause authority (AV-46):
+    /// [`Escrow::with_pause_authority`] with the zero address — a zero
+    /// address can never hold the emergency switch, so binding it is a
+    /// policy mismatch by construction. Parallels
+    /// [`EscrowError::InvalidFeeRecipient`] (config error).
+    InvalidPauseAuthority,
 }
 
 impl EscrowError {
@@ -671,6 +700,8 @@ impl EscrowError {
             EscrowError::CpiExecutionFailed => 121,
             EscrowError::ReentrantCall => 122,
             EscrowError::InvalidFeeRecipient => 123,
+            EscrowError::Paused => 124,
+            EscrowError::InvalidPauseAuthority => 125,
         }
     }
 
@@ -701,6 +732,8 @@ impl EscrowError {
             EscrowError::CpiExecutionFailed,
             EscrowError::ReentrantCall,
             EscrowError::InvalidFeeRecipient,
+            EscrowError::Paused,
+            EscrowError::InvalidPauseAuthority,
         ]
     }
 }
@@ -1159,6 +1192,13 @@ impl Escrow {
             // compatible). Opt in via `with_fee_recipient` before
             // funding.
             fee_recipient: None,
+            // AV-46: no pause authority by default — the escrow has no
+            // emergency switch (backward compatible). Opt in via
+            // `with_pause_authority` before funding.
+            pause_authority: None,
+            // AV-46: the pause flag starts clear — a fresh escrow is
+            // never born paused.
+            paused: false,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -1215,6 +1255,9 @@ impl Escrow {
     /// initializer *after both parties activated* may fund it.
     pub fn fund(&mut self, authority: [u8; 32]) -> Result<(), EscrowError> {
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        // AV-46: pause guard first — a paused escrow fails fast,
+        // before the reentrancy guard and the authority check.
+        self.require_not_paused()?;
         self.require_not_reentrant()?;
         self.require_initializer(authority)?;
         match self.state {
@@ -1264,6 +1307,8 @@ impl Escrow {
     /// dual-sig requirement — a stranger learns nothing about the
     /// escrow's configuration from the error alone.
     pub fn activate(&mut self, authority: [u8; 32]) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
         if authority != self.initializer && authority != self.taker {
             return Err(EscrowError::Unauthorized);
         }
@@ -1352,6 +1397,9 @@ impl Escrow {
         mint: Option<[u8; 32]>,
     ) -> Result<(u64, u64), EscrowError> {
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        // AV-46: pause guard first — a paused escrow fails fast,
+        // before the reentrancy guard and the authority check.
+        self.require_not_paused()?;
         self.require_not_reentrant()?;
         self.require_initializer(authority)?;
         match self.state {
@@ -1461,6 +1509,9 @@ impl Escrow {
         // AV-36: reentrancy guard first (see `require_not_reentrant`) —
         // the executor window below is the one place untrusted code
         // runs mid-transition.
+        // AV-46: pause guard first — a paused escrow fails fast,
+        // before the reentrancy guard and the authority check.
+        self.require_not_paused()?;
         self.require_not_reentrant()?;
         // Snapshot the three fields `release` mutates, so a failure
         // below restores them exactly. `release` itself is atomic — its
@@ -1534,6 +1585,9 @@ impl Escrow {
         refund_to: [u8; 32],
     ) -> Result<(), EscrowError> {
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        // AV-46: pause guard first — a paused escrow fails fast,
+        // before the reentrancy guard and the authority check.
+        self.require_not_paused()?;
         self.require_not_reentrant()?;
         self.require_initializer(authority)?;
         match self.state {
@@ -1607,6 +1661,9 @@ impl Escrow {
         refund_to: [u8; 32],
     ) -> Result<(u64, u64), EscrowError> {
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        // AV-46: pause guard first — a paused escrow fails fast,
+        // before the reentrancy guard and the authority check.
+        self.require_not_paused()?;
         self.require_not_reentrant()?;
         if authority != self.initializer && authority != self.taker {
             return Err(EscrowError::Unauthorized);
@@ -1663,6 +1720,8 @@ impl Escrow {
     /// when no quorum is configured, and `Unauthorized` for callers
     /// outside the registered attestor set.
     pub fn attest(&mut self, attestor: [u8; 32]) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
         match self.state {
             EscrowState::Uninitialized | EscrowState::Activated | EscrowState::Funded => {}
             _ => return Err(EscrowError::InvalidStateTransition),
@@ -1708,6 +1767,8 @@ impl Escrow {
         taker: [u8; 32],
         new_threshold: u64,
     ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
         // Both parties must sign: either key alone (or a stranger) is
         // Unauthorized. Independent `==` checks (not `||`): the
         // degenerate initializer == taker self-escrow authorizes with
@@ -1768,6 +1829,8 @@ impl Escrow {
         new_attestors: &[[u8; 32]],
         new_weights: &[u64],
     ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
         // Both parties must sign: either key alone (or a stranger) is
         // Unauthorized. Independent `==` checks (not `||`): the
         // degenerate initializer == taker self-escrow authorizes with
@@ -1851,6 +1914,9 @@ impl Escrow {
         mint: Option<[u8; 32]>,
     ) -> Result<(u64, u64), EscrowError> {
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        // AV-46: pause guard first — a paused escrow fails fast,
+        // before the reentrancy guard and the authority check.
+        self.require_not_paused()?;
         self.require_not_reentrant()?;
         if authority != self.taker {
             return Err(EscrowError::Unauthorized);
@@ -2082,6 +2148,101 @@ impl Escrow {
         self.fee_recipient
     }
 
+    /// Opt in to the emergency pause switch (AV-46 — Solana safety):
+    /// binds the key allowed to call [`Escrow::pause`] /
+    /// [`Escrow::unpause`]. `Uninitialized` only, like every other
+    /// `with_*` builder; the zero address is
+    /// [`EscrowError::InvalidPauseAuthority`] — a zero address can
+    /// never hold the emergency switch, paralleling the AV-44
+    /// fee-recipient policy.
+    ///
+    /// Why: when an exploit is suspected (a compromised attestor set, a
+    /// downstream bug draining through `release_via_cpi`), the operator
+    /// needs one transaction that freezes *every* state-changing path —
+    /// fund, release, claim, attest, resolve, cancel — faster than
+    /// upgrading the program. The pause is that circuit breaker; the
+    /// authority is typically a multisig or a governance program, so no
+    /// single key can grief the escrow by pausing it forever.
+    pub fn with_pause_authority(mut self, authority: [u8; 32]) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if authority == [0u8; 32] {
+            return Err(EscrowError::InvalidPauseAuthority);
+        }
+        self.pause_authority = Some(authority);
+        Ok(self)
+    }
+
+    /// The pause authority bound via [`Escrow::with_pause_authority`];
+    /// `None` when the escrow has no emergency switch (backward
+    /// compatible).
+    pub fn pause_authority(&self) -> Option<[u8; 32]> {
+        self.pause_authority
+    }
+
+    /// Whether the emergency pause is currently engaged (AV-46).
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// AV-46: reject a state-changing transition while the pause is
+    /// engaged. Called first by every state-changing method — before
+    /// the authority check, like [`Escrow::require_not_reentrant`] — so
+    /// a paused escrow fails fast regardless of the caller's arguments.
+    /// Queries (snapshots, keeper scans) never call this.
+    fn require_not_paused(&self) -> Result<(), EscrowError> {
+        if self.paused {
+            return Err(EscrowError::Paused);
+        }
+        Ok(())
+    }
+
+    /// Engage the emergency pause (AV-46): while paused, every
+    /// state-changing transition fails with [`EscrowError::Paused`].
+    /// Only the bound pause authority may call this (`Unauthorized`
+    /// otherwise); without an opted-in authority the switch does not
+    /// exist (`InvalidStateTransition`). Pausing an already-paused
+    /// escrow is `InvalidStateTransition` — the call is a strict toggle,
+    /// so every successful call flips the bit and the
+    /// [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits exactly one
+    /// `Paused` event per engagement.
+    pub fn pause(&mut self, authority: [u8; 32]) -> Result<(), EscrowError> {
+        let bound = match self.pause_authority {
+            Some(a) => a,
+            None => return Err(EscrowError::InvalidStateTransition),
+        };
+        if authority != bound {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.paused {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        self.paused = true;
+        Ok(())
+    }
+
+    /// Release the emergency pause (AV-46): state-changing transitions
+    /// work again. Same authority rules as [`Escrow::pause`]; unpausing
+    /// a non-paused escrow is `InvalidStateTransition`. Emits one
+    /// `Unpaused` event via the [`IndexedEscrow`](crate::IndexedEscrow)
+    /// wrapper.
+    pub fn unpause(&mut self, authority: [u8; 32]) -> Result<(), EscrowError> {
+        let bound = match self.pause_authority {
+            Some(a) => a,
+            None => return Err(EscrowError::InvalidStateTransition),
+        };
+        if authority != bound {
+            return Err(EscrowError::Unauthorized);
+        }
+        if !self.paused {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        self.paused = false;
+        Ok(())
+    }
+
     /// Opt in to an expiry grace period (AV-21 — Solana operations /
     /// backend engineering): [`Escrow::cancel_expired`] then requires
     /// `now >= expires_at + grace_period` (see
@@ -2181,6 +2342,8 @@ impl Escrow {
         now: u64,
         evidence_hash: Option<[u8; 32]>,
     ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
         if authority != self.initializer && authority != self.taker {
             return Err(EscrowError::Unauthorized);
         }
@@ -2438,6 +2601,8 @@ impl Escrow {
         initializer: [u8; 32],
         taker: [u8; 32],
     ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
         // Both parties must sign: either key alone (or a stranger) is
         // Unauthorized. Independent `==` checks (not `||`): the
         // degenerate initializer == taker self-escrow authorizes with
@@ -2581,6 +2746,9 @@ impl Escrow {
         rationale_hash: Option<[u8; 32]>,
     ) -> Result<(u64, u64, u64), EscrowError> {
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        // AV-46: pause guard first — a paused escrow fails fast,
+        // before the reentrancy guard and the authority check.
+        self.require_not_paused()?;
         self.require_not_reentrant()?;
         let arbiter = self.arbiter.ok_or(EscrowError::InvalidArbiter)?;
         match self.state {
@@ -2646,6 +2814,9 @@ impl Escrow {
     /// lamports to the initializer.
     pub fn close_vault(&mut self, authority: [u8; 32]) -> Result<u64, EscrowError> {
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        // AV-46: pause guard first — a paused escrow fails fast,
+        // before the reentrancy guard and the authority check.
+        self.require_not_paused()?;
         self.require_not_reentrant()?;
         self.require_initializer(authority)?;
         match self.state {
@@ -2714,6 +2885,8 @@ impl Escrow {
     /// guards every release path), so attestors keep their AV-04 role as
     /// the release gate while the two parties own milestone acceptance.
     pub fn confirm_milestone(&mut self, authority: [u8; 32], index: u8) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
         if authority != self.initializer && authority != self.taker {
             return Err(EscrowError::Unauthorized);
         }
@@ -2777,6 +2950,9 @@ impl Escrow {
         mint: Option<[u8; 32]>,
     ) -> Result<(u64, u64), EscrowError> {
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        // AV-46: pause guard first — a paused escrow fails fast,
+        // before the reentrancy guard and the authority check.
+        self.require_not_paused()?;
         self.require_not_reentrant()?;
         self.require_initializer(authority)?;
         match self.state {
@@ -2854,6 +3030,8 @@ impl Escrow {
     /// skip-approved stays unsettled until both parties align on one path:
     /// neither path completes on a single party's word.
     pub fn skip_milestone(&mut self, authority: [u8; 32], index: u8) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
         if authority != self.initializer && authority != self.taker {
             return Err(EscrowError::Unauthorized);
         }
@@ -3251,6 +3429,18 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // as `arbiter` / `mint` / `evidence_hash`. Appended last so every
     // earlier field offset stays stable.
     ("fee_recipient", "Option<Pubkey>", 1 + PUBKEY_LEN),
+    // AV-46: emergency-pause authority (see
+    // `Escrow::with_pause_authority`): one discriminant byte, then the
+    // 32-byte address. The region is always reserved (zeroed when
+    // `None`) so `with_pause_authority` writes in place — same treatment
+    // as `arbiter` / `mint` / `fee_recipient`. Appended last so every
+    // earlier field offset stays stable.
+    ("pause_authority", "Option<Pubkey>", 1 + PUBKEY_LEN),
+    // AV-46: emergency pause flag (see `Escrow::pause` /
+    // `Escrow::unpause`): one bool byte, always present (zeroed when
+    // the escrow is not paused). Appended last so every earlier field
+    // offset stays stable.
+    ("paused", "bool", 1),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -3305,9 +3495,13 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// timelock-unlock governance opt-in (AV-41) is always present too:
 /// 1 byte, zeroed when the feature is off. The protocol-fee recipient
 /// pin (AV-44) is always present as well: 1-byte discriminant +
-/// 32-byte address (zeroed when no recipient is bound).
+/// 32-byte address (zeroed when no recipient is bound). The emergency
+/// pause authority (AV-46) is always present as well: 1-byte
+/// discriminant + 32-byte address (zeroed when no authority is bound),
+/// and so is the emergency pause flag (AV-46): 1 byte, zeroed when the
+/// escrow is not paused.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -3697,7 +3891,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 6_201_360, "from {state:?}");
+            assert_eq!(rent, 6_438_000, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -3793,9 +3987,10 @@ mod tests {
         // re-asserted here so this feature cannot silently grow the
         // account (every byte of VAULT_SPACE is rent the initializer
         // paid for). AV-38 grew the account by 33 bytes (rationale
-        // hash) and AV-44 by 33 more (fee recipient), so the pin tracks
+        // hash), AV-44 by 33 more (fee recipient), and AV-46 by 34
+        // (pause authority + pause flag), so the pin tracks
         // the new total deliberately.
-        assert_eq!(VAULT_SPACE, 763, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 797, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -5440,6 +5635,59 @@ pub(crate) mod anchor_idl_tests {
                             account layout is untouched — no new fields, \\
                             VAULT_SPACE unchanged",
         },
+        InstructionSpec {
+            // AV-46: emergency-pause authority opt-in.
+            name: "initialize_pause_authority",
+            params: &[(
+                "pause_authority",
+                "Pubkey",
+                "instruction param; the key allowed to pause / unpause \\
+                 the escrow",
+            )],
+            method: "Escrow::with_pause_authority",
+            input_mapping: "pause_authority <- param (Pubkey -> [u8; 32] \\
+                            conversion); authority <- accounts.initializer \\
+                            (signer), enforced by the Anchor account \\
+                            constraint, not the state machine; \\
+                            Uninitialized only, like initialize_quorum; \\
+                            the zero address is InvalidPauseAuthority; \\
+                            without an opted-in authority pause / unpause \\
+                            fail with InvalidStateTransition (backward \\
+                            compatible); the 33-byte region is always \\
+                            reserved (zeroed when None) so the opt-in \\
+                            writes in place without reallocating",
+        },
+        InstructionSpec {
+            // AV-46: engage the emergency pause.
+            name: "pause",
+            params: &[],
+            method: "Escrow::pause",
+            input_mapping: "no params; authority <- accounts.pause_authority \\
+                            (signer); the pause authority must be opted in \\
+                            (InvalidStateTransition otherwise); a stranger \\
+                            is Unauthorized; pausing an already-paused \\
+                            escrow is InvalidStateTransition (strict \\
+                            toggle); while paused, every state-changing \\
+                            transition fails with Paused (code 124) — \\
+                            fund / release / claim / attest / resolve / \\
+                            cancel and the rest; queries (snapshots, \\
+                            keeper scans) are unaffected; emits the Paused \\
+                            indexer event (from == to == the current \\
+                            state)",
+        },
+        InstructionSpec {
+            // AV-46: release the emergency pause.
+            name: "unpause",
+            params: &[],
+            method: "Escrow::unpause",
+            input_mapping: "no params; authority <- accounts.pause_authority \\
+                            (signer); same authority rules as pause; \\
+                            unpausing a non-paused escrow is \\
+                            InvalidStateTransition (strict toggle); \\
+                            state-changing transitions work again; emits \\
+                            the Unpaused indexer event (from == to == the \\
+                            current state)",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -5508,6 +5756,9 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::with_emergency_unlock",
             "Escrow::emergency_unlock",
             "Escrow::close_vault",
+            "Escrow::with_pause_authority",
+            "Escrow::pause",
+            "Escrow::unpause",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -5531,7 +5782,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_twenty_two_instructions_take_params() {
+    fn only_twenty_three_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -5563,7 +5814,8 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_penalty",
                 &"initialize_timelock",
                 &"initialize_decimals",
-                &"initialize_fee_recipient"
+                &"initialize_fee_recipient",
+                &"initialize_pause_authority",
             ]
         );
     }
@@ -6769,6 +7021,10 @@ pub(crate) mod anchor_idl_tests {
         // `Option` discriminant is implied (a bound recipient is
         // `Some`), mirroring `initialize_mint` / `initialize_refund_address`.
         ("initialize_fee_recipient", "fee_recipient", "fee_recipient"),
+        // AV-46: the pause-authority param populates `pause_authority`;
+        // the `Option` discriminant is implied (a bound authority is
+        // `Some`), mirroring `initialize_fee_recipient`.
+        ("initialize_pause_authority", "pause_authority", "pause_authority"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -6828,6 +7084,14 @@ pub(crate) mod anchor_idl_tests {
             "emergency_unlock",
             "zeroed by initialize; set by initialize_emergency_unlock \
              (Uninitialized only)",
+        ),
+        // AV-46: no instruction param writes this field: `pause` /
+        // `unpause` are param-less instructions, so it is a field
+        // source, not a param mapping.
+        (
+            "paused",
+            "zeroed by initialize; flipped by pause / unpause (pause \\
+             authority signer only)",
         ),
     ];
 
@@ -7067,6 +7331,16 @@ mod error_code_tests {
             EscrowError::InvalidFeeRecipient,
             123,
             "with_fee_recipient with the zero address (a zero address can never be the legitimate protocol-fee destination)",
+        ),
+        (
+            EscrowError::Paused,
+            124,
+            "a state-changing transition attempted while the AV-46 emergency pause is engaged (fund / release / claim / attest / resolve / cancel and the rest)",
+        ),
+        (
+            EscrowError::InvalidPauseAuthority,
+            125,
+            "with_pause_authority with the zero address (a zero address can never hold the emergency switch)",
         ),
     ];
 
@@ -7623,6 +7897,28 @@ mod error_code_tests {
         assert_eq!(err, Err(EscrowError::CpiExecutionFailed));
         assert!(!e2.is_reentrancy_locked());
         assert_eq!(e2.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn paused_triggered_by_fund_while_pause_engaged() {
+        let mut e = escrow().with_pause_authority(MALLORY).unwrap();
+        e.pause(MALLORY).unwrap();
+        // Authorized caller, legal state — the pause alone rejects it.
+        let err = e.fund(ALICE).unwrap_err();
+        assert_eq!(err, EscrowError::Paused);
+        assert_eq!(err.code(), 124);
+        // Nothing moved: the failed transition leaves no trace.
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn invalid_pause_authority_triggered_by_zero_address() {
+        let err = escrow()
+            .with_pause_authority([0u8; 32])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidPauseAuthority);
+        assert_eq!(err.code(), 125);
     }
 }
 
@@ -8440,6 +8736,25 @@ mod account_space_tests {
                 out.extend_from_slice(&addr);
             }
         }
+        // AV-46: emergency-pause authority, always reserved like
+        // `fee_recipient`: the `None` discriminant followed by a zeroed
+        // address, so `with_pause_authority` writes in place without
+        // reallocating; appended last so every earlier offset above is
+        // unchanged.
+        match e.pause_authority {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; 32]);
+            }
+            Some(addr) => {
+                out.push(1);
+                out.extend_from_slice(&addr);
+            }
+        }
+        // AV-46: emergency pause flag, always present (zeroed when the
+        // escrow is not paused); appended last so every earlier offset
+        // above is unchanged.
+        out.push(e.paused as u8);
         out
     }
 
@@ -8468,10 +8783,12 @@ mod account_space_tests {
         // + 2 (AV-24 anti-griefing penalty rate) + 8 (AV-27 timelock)
         // + 1 (AV-28 token decimal metadata) + (1 + 32) (AV-38 arbiter's
         // rationale-document hash) + 1 (AV-41 emergency timelock-unlock
-        // governance opt-in) + (1 + 32) (AV-44 protocol-fee recipient pin).
-        assert_eq!(ESCROW_BODY_LEN, 755, "escrow payload bytes");
+        // governance opt-in) + (1 + 32) (AV-44 protocol-fee recipient pin)
+        // + (1 + 32) (AV-46 emergency-pause authority) + 1 (AV-46
+        // emergency pause flag).
+        assert_eq!(ESCROW_BODY_LEN, 789, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 763, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 797, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -8493,13 +8810,16 @@ mod account_space_tests {
         // (AV-38, zeroed when the arbiter attached no rationale) +
         // 1-byte emergency timelock-unlock governance opt-in (AV-41,
         // zeroed when the feature is off) + (1 + 32)-byte protocol-fee
-        // recipient pin (AV-44, zeroed when no recipient is bound).
+        // recipient pin (AV-44, zeroed when no recipient is bound) +
+        // (1 + 32)-byte emergency-pause authority (AV-46, zeroed when no
+        // authority is bound) + 1-byte emergency pause flag (AV-46,
+        // zeroed when the escrow is not paused).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 281);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 315);
     }
 
     #[test]
@@ -8869,16 +9189,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 763) * 3480 * 2 = 891 * 6960 = 6_201_360 lamports.
-        assert_eq!(full, 6_201_360);
+        // (128 + 797) * 3480 * 2 = 925 * 6960 = 6_438_000 lamports.
+        assert_eq!(full, 6_438_000);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 281) * 3480 * 2 = 409 * 6960 = 2_846_640 lamports.
-        assert_eq!(no_quorum, 2_846_640);
+        // (128 + 315) * 3480 * 2 = 443 * 6960 = 3_083_280 lamports.
+        assert_eq!(no_quorum, 3_083_280);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -8922,13 +9242,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(6_201_360, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(6_438_000, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(5_707_199, params.0, params.1),
+            check_vault_rent_exempt(6_437_999, params.0, params.1),
             Err(RentShortfall {
-                required: 6_201_360,
-                provided: 5_707_199,
+                required: 6_438_000,
+                provided: 6_437_999,
             })
         );
         // Generous funding: exempt.
@@ -8940,7 +9260,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 6_201_360,
+                required: 6_438_000,
                 provided: 0,
             })
         );
@@ -11374,7 +11694,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH)).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 755, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) bytes");
+        assert_eq!(bytes.len(), 789, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) bytes");
         assert_eq!(bytes[687], 0, "decimals offset unchanged");
         assert_eq!(bytes[688], 1, "rationale_hash: Some discriminant");
         assert_eq!(&bytes[689..721], &RATIONALE_HASH, "rationale_hash bytes");
@@ -11385,6 +11705,8 @@ mod rationale_tests {
         // zeroed.
         assert_eq!(bytes[722], 0, "fee_recipient: None discriminant");
         assert_eq!(&bytes[723..755], &[0u8; 32], "fee_recipient: zeroed");
+        // AV-46: the pause tail — no authority bound, flag clear.
+        assert_eq!(&bytes[755..789], &[0u8; 34], "pause tail: zeroed");
     }
 
     #[test]
@@ -11395,35 +11717,36 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 755);
+        assert_eq!(bytes.len(), 789);
         assert_eq!(bytes[688], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[689..721], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[722], 0, "fee_recipient: None discriminant");
         assert_eq!(&bytes[723..755], &[0u8; 32], "fee_recipient: zeroed");
+        assert_eq!(&bytes[755..789], &[0u8; 34], "AV-46 pause tail: zeroed");
     }
 
     #[test]
     fn rationale_hash_rent_recomputed_from_mainnet_formula() {
-        // AV-44 grows the account by 33 bytes on top of AV-38/AV-41;
+        // AV-46 grows the account by 34 bytes on top of AV-38/AV-41/AV-44/AV-45;
         // the rent-exempt minimums are recomputed from the mainnet
-        // formula, not copied from the AV-38 numbers.
+        // formula, not copied from the AV-45 numbers.
         let full = rent_exempt_minimum_lamports(
             VAULT_SPACE,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 763) * 3480 * 2 = 891 * 6960 = 6_201_360 lamports.
-        assert_eq!(VAULT_SPACE, 763);
-        assert_eq!(full, 6_201_360);
+        // (128 + 797) * 3480 * 2 = 925 * 6960 = 6_438_000 lamports.
+        assert_eq!(VAULT_SPACE, 797);
+        assert_eq!(full, 6_438_000);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 281) * 3480 * 2 = 409 * 6960 = 2_846_640 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 281);
-        assert_eq!(no_quorum, 2_846_640);
+        // (128 + 315) * 3480 * 2 = 443 * 6960 = 3_083_280 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 315);
+        assert_eq!(no_quorum, 3_083_280);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -12176,7 +12499,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 755);
+        assert_eq!(bytes.len(), 789);
         assert_eq!(bytes[721], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[679..687].try_into().unwrap()),
@@ -12351,7 +12674,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 755, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45");
+        assert_eq!(ESCROW_BODY_LEN, 789, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46");
         assert_eq!(bytes[687], 9, "decimals tail offset");
         // The timelock offset is unchanged by the append.
         assert_eq!(
@@ -12369,30 +12692,31 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 763) * 3480 * 2 = 891 * 6960 = 6_201_360 lamports.
+        // (128 + 797) * 3480 * 2 = 925 * 6960 = 6_438_000 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            6_201_360
+            6_438_000
         );
-        // (128 + 281) * 3480 * 2 = 409 * 6960 = 2_846_640 lamports.
+        // (128 + 315) * 3480 * 2 = 443 * 6960 = 3_083_280 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            2_846_640
+            3_083_280
         );
-        // 67 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
-        // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin).
-        assert_eq!(VAULT_SPACE, 763);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 281);
-        assert!(check_vault_rent_exempt(6_201_360, 3_480, 2.0).is_ok());
-        assert!(check_vault_rent_exempt(5_707_199, 3_480, 2.0).is_err());
+        // 172 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
+        // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
+        // AV-45 quorum weights + AV-46 pause switch).
+        assert_eq!(VAULT_SPACE, 797);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 315);
+        assert!(check_vault_rent_exempt(6_438_000, 3_480, 2.0).is_ok());
+        assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
     #[test]
@@ -12968,5 +13292,422 @@ mod fee_recipient_tests {
         let (payout, fee) = e.release(ALICE, 0, 5, None).unwrap();
         assert_eq!((payout, fee), (5, 0));
         assert_eq!(e.fees_paid(), 0);
+    }
+}
+
+// ---------- AV-46: emergency pause switch ----------
+//
+// Opt-in circuit breaker for the whole state machine. Matrix:
+// builder policy, authority rules, strict toggle, every state-changing
+// transition failing fast with `Paused` while engaged, queries staying
+// readable, exactly one event per successful flip, and the two new
+// fields round-tripping through the account layout.
+#[cfg(test)]
+mod pause_tests {
+    use super::*;
+    use crate::discriminator::{decode_vault_account, vault_account_discriminator};
+    use crate::events::{EscrowEventKind, IndexedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ATTESTOR: [u8; 32] = [0xA1; 32];
+    const ATTESTOR_2: [u8; 32] = [0xA2; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const ESCROW_ID: [u8; 32] = [0x1D; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+    const T0: u64 = 1_700_000_000;
+
+    fn base() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap()
+    }
+
+    fn pausable() -> Escrow {
+        base().with_pause_authority(PAUSER).unwrap()
+    }
+
+    fn paused_funded() -> Escrow {
+        let mut e = pausable();
+        e.fund(ALICE).unwrap();
+        e.pause(PAUSER).unwrap();
+        assert!(e.is_paused());
+        e
+    }
+
+    fn assert_paused<T: std::fmt::Debug>(result: Result<T, EscrowError>) {
+        assert_eq!(result.unwrap_err(), EscrowError::Paused);
+    }
+
+    // ----- builder policy -----
+
+    #[test]
+    fn with_pause_authority_pins_and_getter_reads_back() {
+        let e = pausable();
+        assert_eq!(e.pause_authority(), Some(PAUSER));
+        assert!(!e.is_paused(), "a fresh escrow is never born paused");
+    }
+
+    #[test]
+    fn pause_authority_defaults_to_none_backward_compatible() {
+        let mut e = base();
+        assert_eq!(e.pause_authority(), None);
+        assert!(!e.is_paused());
+        // No switch: pause / unpause fail as an illegal transition,
+        // not as an authorization error.
+        assert_eq!(e.pause(PAUSER), Err(EscrowError::InvalidStateTransition));
+        assert_eq!(e.unpause(PAUSER), Err(EscrowError::InvalidStateTransition));
+    }
+
+    #[test]
+    fn with_pause_authority_rejects_zero_address() {
+        let err = base().with_pause_authority([0u8; 32]).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidPauseAuthority);
+        assert_eq!(err.code(), 125);
+    }
+
+    #[test]
+    fn with_pause_authority_is_uninitialized_only() {
+        let mut e = pausable();
+        e.fund(ALICE).unwrap();
+        let err = e.with_pause_authority(MALLORY).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+        assert_eq!(e.pause_authority(), Some(PAUSER), "a failed rebind changes nothing");
+    }
+
+    #[test]
+    fn with_pause_authority_composes_with_other_builders() {
+        // Builder order-independence: the pause opt-in plays no favorites.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_protocol_fee(100)
+            .unwrap();
+        assert_eq!(e.pause_authority(), Some(PAUSER));
+        assert_eq!(e.fee_bps(), 100);
+    }
+
+    // ----- authority + toggle rules -----
+
+    #[test]
+    fn pause_rejects_stranger_with_unauthorized() {
+        let mut e = pausable();
+        assert_eq!(e.pause(MALLORY), Err(EscrowError::Unauthorized));
+        assert!(!e.is_paused());
+    }
+
+    #[test]
+    fn pause_is_a_strict_toggle() {
+        let mut e = pausable();
+        e.pause(PAUSER).unwrap();
+        assert_eq!(
+            e.pause(PAUSER),
+            Err(EscrowError::InvalidStateTransition),
+            "pausing a paused escrow is not a no-op"
+        );
+        e.unpause(PAUSER).unwrap();
+        assert!(!e.is_paused());
+        assert_eq!(
+            e.unpause(PAUSER),
+            Err(EscrowError::InvalidStateTransition),
+            "unpausing a live escrow is not a no-op"
+        );
+    }
+
+    #[test]
+    fn unpause_rejects_stranger_with_unauthorized() {
+        let mut e = pausable();
+        e.pause(PAUSER).unwrap();
+        assert_eq!(e.unpause(MALLORY), Err(EscrowError::Unauthorized));
+        assert!(e.is_paused(), "a stranger cannot lift the pause");
+    }
+
+    #[test]
+    fn pause_works_in_any_state() {
+        // The switch works even Uninitialized, so an operator can freeze
+        // an escrow before it is funded.
+        let mut e = pausable();
+        e.pause(PAUSER).unwrap();
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert!(e.is_paused());
+    }
+
+    // ----- the matrix: every state-changing transition fails fast -----
+
+    #[test]
+    fn paused_blocks_fund_and_release() {
+        let mut e = pausable();
+        e.pause(PAUSER).unwrap();
+        assert_paused(e.fund(ALICE));
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+
+        let mut e = paused_funded();
+        assert_paused(e.release(ALICE, NOW, 100, None));
+        assert_eq!(e.released_amount(), 0, "no funds moved");
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn paused_blocks_cpi_release_without_running_the_executor() {
+        let mut e = paused_funded();
+        let inv = CpiInvocation {
+            program_id: [0xD1; 32],
+            accounts: vec![AccountMeta {
+                pubkey: [0x01; 32],
+                is_signer: false,
+                is_writable: true,
+            }],
+            data: vec![9],
+        };
+        let err = e
+            .release_via_cpi(ALICE, NOW, 100, None, &inv, |_| {
+                panic!("the executor must never run on a paused escrow")
+            })
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Paused);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn paused_blocks_attest() {
+        let mut e = base()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR], &[1], 1).unwrap())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.pause(PAUSER).unwrap();
+        assert_paused(e.attest(ATTESTOR));
+    }
+
+    #[test]
+    fn paused_blocks_claim() {
+        let mut e = base()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(NOW - 100, NOW + 100).unwrap())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.pause(PAUSER).unwrap();
+        assert_paused(e.claim(BOB, NOW, None));
+    }
+
+    #[test]
+    fn paused_blocks_cancel_paths() {
+        let mut e = paused_funded();
+        assert_paused(e.cancel(ALICE, None, ALICE));
+        assert_paused(e.cancel_expired(ALICE, EXPIRES_AT, None, ALICE));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn paused_blocks_dispute_paths() {
+        let mut e = base()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.pause(PAUSER).unwrap();
+        assert_paused(e.escalate(ALICE, NOW, None));
+        // And resolve on an already-disputed escrow.
+        let mut e2 = base()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e2.fund(ALICE).unwrap();
+        e2.escalate(ALICE, NOW, None).unwrap();
+        e2.pause(PAUSER).unwrap();
+        assert_paused(e2.resolve(ARBITER, 600_000, None, None));
+        assert_eq!(e2.state(), EscrowState::Disputed);
+    }
+
+    #[test]
+    fn paused_blocks_milestone_paths() {
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = base()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.pause(PAUSER).unwrap();
+        assert_paused(e.confirm_milestone(ALICE, 0));
+        assert_paused(e.skip_milestone(ALICE, 0));
+        assert_paused(e.release_milestone(ALICE, NOW, 0, None));
+    }
+
+    #[test]
+    fn paused_blocks_quorum_governance() {
+        let mut e = base()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR], &[1], 1).unwrap())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.pause(PAUSER).unwrap();
+        assert_paused(e.update_quorum(ALICE, BOB, 1));
+        assert_paused(e.update_attestors(ALICE, BOB, &[ATTESTOR_2], &[7]));
+    }
+
+    #[test]
+    fn paused_blocks_emergency_unlock() {
+        let mut e = base()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_timelock(NOW + 10_000)
+            .unwrap()
+            .with_emergency_unlock()
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.pause(PAUSER).unwrap();
+        assert_paused(e.emergency_unlock(ALICE, BOB));
+        assert_ne!(e.unlock_at(), 0, "the timelock survives the rejected call");
+    }
+
+    #[test]
+    fn paused_blocks_activation() {
+        let mut e = base()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        e.pause(PAUSER).unwrap();
+        assert_paused(e.activate(ALICE));
+    }
+
+    #[test]
+    fn paused_blocks_close_vault() {
+        let mut e = pausable();
+        e.fund(ALICE).unwrap();
+        e.release(ALICE, NOW, 1_000_000, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        e.pause(PAUSER).unwrap();
+        assert_paused(e.close_vault(ALICE));
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn unpause_restores_every_transition() {
+        let mut e = paused_funded();
+        e.unpause(PAUSER).unwrap();
+        assert!(!e.is_paused());
+        e.release(ALICE, NOW, 1_000_000, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        // The switch survives the lifecycle: it can be re-engaged later.
+        e.pause(PAUSER).unwrap();
+        assert!(e.is_paused());
+    }
+
+    // ----- queries stay readable while paused -----
+
+    #[test]
+    fn queries_are_unaffected_by_pause() {
+        let e = paused_funded();
+        // Read-only views keep working: snapshots, balances, config.
+        let snap = e.snapshot(NOW);
+        assert_eq!(snap.state, "funded");
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.pause_authority(), Some(PAUSER));
+        assert!(e.is_paused());
+    }
+
+    // ----- events: exactly one per successful flip, none on failure -----
+
+    #[test]
+    fn pause_and_unpause_emit_exactly_one_event_each() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        let base_events = e.events().len();
+        e.pause(PAUSER, T0 + 1).unwrap();
+        let ev = *e.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::Paused);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Uninitialized, EscrowState::Uninitialized)
+        );
+        assert_eq!(e.events().len(), base_events + 1);
+
+        e.unpause(PAUSER, T0 + 2).unwrap();
+        let ev = *e.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::Unpaused);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Uninitialized, EscrowState::Uninitialized)
+        );
+        assert_eq!(e.events().len(), base_events + 2);
+    }
+
+    #[test]
+    fn failed_pause_emits_no_event() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        let base_events = e.events().len();
+        assert_eq!(e.pause(MALLORY, T0 + 1), Err(EscrowError::Unauthorized));
+        assert_eq!(e.events().len(), base_events, "a rejected pause is silent");
+        // A blocked transition is silent too — only the switch flips emit.
+        e.pause(PAUSER, T0 + 1).unwrap();
+        let after_pause = e.events().len();
+        assert_eq!(e.fund(ALICE, T0 + 2), Err(EscrowError::Paused));
+        assert_eq!(e.events().len(), after_pause);
+    }
+
+    // ----- layout: the new fields ride the account tail -----
+
+    #[test]
+    fn pause_fields_ride_the_account_layout_tail() {
+        let e = paused_funded();
+        let body = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(body.len(), ESCROW_BODY_LEN);
+        // The pre-AV-46 payload ended at 755; the pause authority rides
+        // 755..788 (1-byte discriminant + 32-byte address) and the flag
+        // is the final byte at 788.
+        assert_eq!(body[755], 1, "pause_authority: Some discriminant");
+        assert_eq!(&body[756..788], &PAUSER, "pause authority address offset");
+        assert_eq!(body[788], 1, "paused flag set");
+
+        let mut data = vault_account_discriminator().to_vec();
+        data.extend_from_slice(&body);
+        let decoded = decode_vault_account(&data).unwrap();
+        assert_eq!(decoded.pause_authority(), Some(PAUSER));
+        assert!(decoded.is_paused());
+        assert_eq!(decoded.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn unpaused_escrow_encodes_zeroed_pause_tail() {
+        // No authority bound at all: the whole 34-byte tail is zeroed.
+        let e = base();
+        let body = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(&body[755..789], &[0u8; 34], "no authority, never paused: zeroed tail");
+        let mut data = vault_account_discriminator().to_vec();
+        data.extend_from_slice(&body);
+        let decoded = decode_vault_account(&data).unwrap();
+        assert_eq!(decoded.pause_authority(), None);
+        assert!(!decoded.is_paused());
+    }
+
+    #[test]
+    fn bound_but_unpaused_escrow_encodes_authority_with_clear_flag() {
+        let e = pausable();
+        let body = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(body[755], 1, "pause_authority: Some discriminant");
+        assert_eq!(&body[756..788], &PAUSER, "pause authority address offset");
+        assert_eq!(body[788], 0, "paused flag clear");
+        let mut data = vault_account_discriminator().to_vec();
+        data.extend_from_slice(&body);
+        let decoded = decode_vault_account(&data).unwrap();
+        assert_eq!(decoded.pause_authority(), Some(PAUSER));
+        assert!(!decoded.is_paused());
     }
 }

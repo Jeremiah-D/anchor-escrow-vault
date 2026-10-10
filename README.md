@@ -74,6 +74,9 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
 | `initialize_protocol_fee(fee_bps)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `fee_bps` in 0–10000 basis points; the fee slices every taker payout into net payout + protocol fee) |
 | `initialize_fee_recipient(fee_recipient)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding; pins the destination of every fee leg — the settlement builders reject a `fee_leg` that does not equal it; zero address is `InvalidFeeRecipient`; with no pin the fee goes to the program-level fee account) |
+| `initialize_pause_authority(pause_authority)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding; binds the key allowed to engage/release the emergency pause; zero address is `InvalidPauseAuthority`) |
+| `pause()`                                     | any            | — (no state change; sets the pause flag) | the bound pause authority only (`Unauthorized` otherwise; `InvalidStateTransition` with no authority bound or when already paused); emits `Paused` |
+| `unpause()`                                   | any            | — (no state change; clears the pause flag) | the bound pause authority only (same rules as `pause`; `InvalidStateTransition` when not paused); emits `Unpaused` |
 | `initialize_quorum(attestors, weights, threshold)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
@@ -413,7 +416,9 @@ appended last so every earlier field offset stays stable; with the fee
 region the full vault is 692 bytes and needs **5,707,200 lamports** to be
 rent-exempt on mainnet. (AV-45 grows the quorum region by 71 bytes — 64 for
 the per-attestor weight array plus 7 for the wider u64 weight-sum threshold —
-so the full vault is now 763 bytes and needs **6,201,360 lamports**.)
+so the full vault is now 763 bytes and needs **6,201,360 lamports**. AV-46
+appends the 33-byte pause-authority region plus the 1-byte pause flag (34
+bytes), so the full vault is now 797 bytes and needs **6,438,000 lamports**.)
 
 **Fee recipient pin (AV-44).** An escrow can additionally pin *where* the
 fee goes (`initialize_fee_recipient(fee_recipient)`, opt-in on
@@ -431,6 +436,31 @@ no fee leg (dust payouts carry no fee, floor-rounded). The recipient is a
 persisted 33-byte region in the vault account (see the layout table),
 appended last so every earlier field offset stays stable, and is exported
 in the AV-26 snapshot JSON (`"fee_recipient"`, `null` when unpinned).
+
+**Emergency pause (AV-46).** An escrow can bind an emergency-pause
+authority (`initialize_pause_authority(pause_authority)`, opt-in on
+`Uninitialized`, like every other `with_*` builder; the zero address is
+rejected — `InvalidPauseAuthority`, code 125 — since a zero address can
+never hold the switch). The bound key may then engage the circuit breaker
+(`pause`) and release it (`unpause`); both are strict toggles (pausing a
+paused escrow, or unpausing a live one, is `InvalidStateTransition`), and
+only the bound authority may call them (`Unauthorized` otherwise; with no
+authority bound the switch does not exist). While the pause is engaged,
+*every* state-changing transition — `fund`, `release`, `claim`, `attest`,
+`resolve`, `cancel`, the milestone and governance paths — fails fast with
+`Paused` (code 124), checked before the authority and reentrancy guards so
+a paused escrow reveals nothing about its configuration. Queries are
+unaffected: snapshots and keeper scans read a paused escrow normally.
+The authority (33-byte `Option<Pubkey>` region) and the flag (1 byte,
+always present) are persisted in the vault account, appended last so every
+earlier field offset stays stable (see the layout table). The flips emit
+`Paused` / `Unpaused` indexer events (`from == to ==` the current state,
+like `EmergencyUnlock`). Why: when an exploit is suspected — a
+compromised attestor set, a downstream bug draining through
+`release_via_cpi` — the operator needs one transaction that freezes every
+state-changing path faster than upgrading the program. The authority is
+typically a multisig or a governance program, so no single key can grief
+the escrow by pausing it forever.
 
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
@@ -461,6 +491,8 @@ program error per variant):
 | `CpiExecutionFailed` | 121 | `release_via_cpi` whose injected CPI executor reported failure after the gates passed (whole release rolled back) |
 | `ReentrantCall` | 122 | a fund-moving transition entered while the AV-36 reentrancy lock was held (nested entry from inside `release_via_cpi`'s executor window) |
 | `InvalidFeeRecipient` | 123 | `with_fee_recipient` with the zero address (a zero address can never be the legitimate protocol-fee destination) |
+| `Paused` | 124 | any state-changing transition while the AV-46 emergency pause is engaged (`fund`/`release`/`claim`/`attest`/`resolve`/`cancel`/milestone/governance paths) |
+| `InvalidPauseAuthority` | 125 | `with_pause_authority` with the zero address (a zero address can never hold the emergency switch) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -859,9 +891,9 @@ order; batches in first-seen caller order, actions in input order):
 
 ```json
 {"scanned":2,"batches":[
-  {"caller":"...","total_reclaimed":12402720,"actions":[
+  {"caller":"...","total_reclaimed":12876000,"actions":[
     {"escrow_id":"...","action":"close_vault","caller":"...",
-     "caller_role":"initializer","rent_reclaimed":6201360,
+     "caller_role":"initializer","rent_reclaimed":6438000,
      "reason":"released"}
   ]}
 ]}
@@ -984,7 +1016,9 @@ two-way consistency check against the IDL parameter table:
 | rationale_hash | Option<[u8; 32]> | 33    |
 | emergency_unlock | bool           | 1     |
 | fee_recipient | Option<Pubkey> | 33    |
-| **total**     |                   | **763** |
+| pause_authority | Option<Pubkey> | 33  |
+| paused        | bool              | 1     |
+| **total**     |                   | **797** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1023,10 +1057,10 @@ attached no rationale) — and the 1-byte emergency timelock-unlock
 governance opt-in `emergency_unlock` (AV-41, zeroed when the feature is
 off) — and the 33-byte protocol-fee recipient region (AV-44: 1-byte
 discriminant + 32-byte address, zeroed when no recipient is bound).
-`escrow-state` exposes `VAULT_SPACE` (763) and
-`VAULT_SPACE_NO_QUORUM` (281) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (797) and
+`VAULT_SPACE_NO_QUORUM` (315) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **6,201,360 lamports** to be
+mainnet rent parameters the full vault needs **6,438,000 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1047,11 +1081,11 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 763 — the AV-38 rationale-hash, AV-44 fee-recipient, and AV-45
-  weighted-quorum growth is accounted in the layout table above); the state
+  stays 797 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
+  weighted-quorum, and AV-46 pause-switch growth is accounted in the layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**6,201,360
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**6,438,000
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the

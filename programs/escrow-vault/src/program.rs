@@ -1095,6 +1095,87 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Bind the emergency-pause authority (AV-46; mirrors
+    /// `Escrow::with_pause_authority`): after this, the bound key may
+    /// engage / release the circuit breaker via `pause` / `unpause`.
+    /// `Uninitialized` only; the zero address is `InvalidPauseAuthority`.
+    pub fn initialize_pause_authority(
+        ctx: Context<InitializePauseAuthority>,
+        pause_authority: Pubkey,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_pause_authority(pause_authority.to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.pause_authority` is always present (33 bytes, zeroed by
+        // default), so the address is written in place — no realloc
+        // needed in the real build.
+        Ok(())
+    }
+
+    /// Engage the emergency pause (AV-46; mirrors `Escrow::pause`).
+    /// While paused, every state-changing transition fails with `Paused`
+    /// (code 124) — the circuit breaker. Only the bound pause authority
+    /// may call this (`Unauthorized` otherwise); without an opted-in
+    /// authority the switch does not exist (`InvalidStateTransition`).
+    /// Emits `Paused` (from == to == the current state).
+    pub fn pause(ctx: Context<Pause>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        escrow
+            .pause(ctx.accounts.pause_authority.key().to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Flips `vault.paused` in place in the real build (1 byte,
+        // always present, zeroed by default).
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Paused,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
+    /// Release the emergency pause (AV-46; mirrors `Escrow::unpause`).
+    /// Same authority rules as `pause`; unpausing a non-paused escrow is
+    /// `InvalidStateTransition` (strict toggle). State-changing
+    /// transitions work again. Emits `Unpaused` (from == to == the
+    /// current state).
+    pub fn unpause(ctx: Context<Unpause>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        escrow
+            .unpause(ctx.accounts.pause_authority.key().to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Flips `vault.paused` back in place in the real build.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Unpaused,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// Clear the AV-27 timelock by dual-signed emergency governance
     /// (AV-41; mirrors `Escrow::emergency_unlock`). Both the initializer
     /// and the taker must sign — one party alone is `Unauthorized`.
@@ -1347,6 +1428,22 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `emergency_unlock`).
     pub fee_recipient: Option<Pubkey>,
+    /// AV-46: opt-in emergency-pause authority; mirrors
+    /// `escrow_state`'s `pause_authority`. `None` for an escrow with no
+    /// pause switch. The account always reserves the full 33-byte region
+    /// (1-byte discriminant + 32-byte address, zeroed when `None`) so
+    /// `initialize_pause_authority` writes the address in place without
+    /// reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `fee_recipient`).
+    pub pause_authority: Option<Pubkey>,
+    /// AV-46: emergency pause flag; mirrors `escrow_state`'s `paused`.
+    /// `false` for a live escrow. Always present (1 byte, zeroed by
+    /// default) so `pause` / `unpause` flip it in place without
+    /// reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `pause_authority`).
+    pub paused: bool,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -1484,6 +1581,12 @@ pub enum EscrowVaultEventKind {
     /// (`EscrowError::ReentrantCall`). Mirrors
     /// `escrow_state::EscrowEventKind::ReentryRejected`.
     ReentryRejected,
+    /// AV-46: the emergency pause was engaged (`Escrow::pause`).
+    /// Mirrors `escrow_state::EscrowEventKind::Paused`.
+    Paused,
+    /// AV-46: the emergency pause was released (`Escrow::unpause`).
+    /// Mirrors `escrow_state::EscrowEventKind::Unpaused`.
+    Unpaused,
     /// AV-34: the vault account was closed by the initializer and its
     /// rent-exempt deposit reclaimed (`Cancelled | Released | Settled ->
     /// Closed`).
@@ -1522,6 +1625,8 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         escrow_state::EscrowEventKind::ReentryRejected => {
             EscrowVaultEventKind::ReentryRejected
         }
+        escrow_state::EscrowEventKind::Paused => EscrowVaultEventKind::Paused,
+        escrow_state::EscrowEventKind::Unpaused => EscrowVaultEventKind::Unpaused,
         escrow_state::EscrowEventKind::VaultClosed => EscrowVaultEventKind::VaultClosed,
     }
 }
@@ -1875,6 +1980,34 @@ pub struct InitializeFeeRecipient<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitializePauseAuthority<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer binds the emergency-pause authority; the
+    /// state machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`, and rejects the zero address.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Pause<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The bound pause authority; the state machine checks it against
+    /// the opted-in address (`Unauthorized` for anyone else, and the
+    /// switch must exist).
+    pub pause_authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Unpause<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The bound pause authority (same rules as `Pause`).
+    pub pause_authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct EmergencyUnlock<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
@@ -2208,6 +2341,8 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::CpiExecutionFailed => error!(ErrorCode::CpiExecutionFailed),
         escrow_state::EscrowError::ReentrantCall => error!(ErrorCode::ReentrantCall),
         escrow_state::EscrowError::InvalidFeeRecipient => error!(ErrorCode::InvalidFeeRecipient),
+        escrow_state::EscrowError::Paused => error!(ErrorCode::Paused),
+        escrow_state::EscrowError::InvalidPauseAuthority => error!(ErrorCode::InvalidPauseAuthority),
     }
 }
 
@@ -2261,4 +2396,8 @@ pub enum ErrorCode {
     ReentrantCall,
     #[msg("Invalid protocol-fee recipient: with_fee_recipient with the zero address (a zero address can never be the legitimate fee destination)")]
     InvalidFeeRecipient,
+    #[msg("Emergency pause engaged: a state-changing transition was attempted while the AV-46 pause flag is set; only the pause authority's unpause re-enables transitions")]
+    Paused,
+    #[msg("Invalid pause authority: with_pause_authority with the zero address (a zero address can never hold the emergency switch)")]
+    InvalidPauseAuthority,
 }

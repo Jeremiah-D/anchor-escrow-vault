@@ -244,6 +244,26 @@
       "discriminator": [141, 103, 17, 126, 72, 75, 29, 29],
       "accounts": [],
       "args": []
+    },
+    {
+      "name": "initialize_pause_authority",
+      "discriminator": [138, 78, 3, 35, 190, 65, 44, 196],
+      "accounts": [],
+      "args": [
+        {"name": "pause_authority", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "pause",
+      "discriminator": [211, 22, 221, 251, 74, 121, 193, 47],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "unpause",
+      "discriminator": [169, 144, 4, 38, 10, 141, 188, 255],
+      "accounts": [],
+      "args": []
     }
   ],
   "accounts": [
@@ -276,7 +296,9 @@
           {"name": "decimals", "type": "u8", "offset": 695},
           {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 696},
           {"name": "emergency_unlock", "type": "bool", "offset": 729},
-          {"name": "fee_recipient", "type": {"option": "publicKey"}, "offset": 730}
+          {"name": "fee_recipient", "type": {"option": "publicKey"}, "offset": 730},
+          {"name": "pause_authority", "type": {"option": "publicKey"}, "offset": 763},
+          {"name": "paused", "type": "bool", "offset": 796}
         ]
       }
     }
@@ -340,7 +362,9 @@
     {"code": 120, "name": "InvalidCpiTarget"},
     {"code": 121, "name": "CpiExecutionFailed"},
     {"code": 122, "name": "ReentrantCall"},
-    {"code": 123, "name": "InvalidFeeRecipient"}
+    {"code": 123, "name": "InvalidFeeRecipient"},
+    {"code": 124, "name": "Paused"},
+    {"code": 125, "name": "InvalidPauseAuthority"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

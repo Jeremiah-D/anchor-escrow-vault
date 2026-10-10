@@ -169,6 +169,16 @@ pub enum EscrowEventKind {
     /// (a hostile CPI target attempting to re-enter the program
     /// mid-instruction), and the indexer must see it in `seq` order.
     ReentryRejected,
+    /// AV-46: the emergency pause was engaged ([`Escrow::pause`]).
+    /// `from == to ==` the current state (a config flip, not a
+    /// lifecycle move — like [`EscrowEventKind::EmergencyUnlock`]); the
+    /// pause flag is read from the vault, the event is the ordering
+    /// signal.
+    Paused,
+    /// AV-46: the emergency pause was released ([`Escrow::unpause`]).
+    /// `from == to ==` the current state; mirrors
+    /// [`EscrowEventKind::Paused`].
+    Unpaused,
 }
 
 /// Fund movements carried by an [`EscrowEvent`].
@@ -558,6 +568,13 @@ impl IndexedEscrow {
         Ok(self)
     }
 
+    /// Bind the emergency-pause authority (mirrors
+    /// [`Escrow::with_pause_authority`]). Configuration: emits no event.
+    pub fn with_pause_authority(mut self, authority: [u8; 32]) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_pause_authority(authority)?;
+        Ok(self)
+    }
+
     // ----- transitions: exactly one event per successful transition -----
 
     /// Record one party's activation signature (mirrors
@@ -895,6 +912,46 @@ impl IndexedEscrow {
         let state = self.inner.state();
         self.push_event(
             EscrowEventKind::EmergencyUnlock,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+
+            None,
+        );
+        Ok(())
+    }
+
+    /// Engage the emergency pause (mirrors [`Escrow::pause`]).
+    /// Emits `Paused`; `from == to ==` the current state (a config
+    /// flip, not a lifecycle move — like `EmergencyUnlock`). `at` is
+    /// the caller-supplied event timestamp.
+    pub fn pause(&mut self, authority: [u8; 32], at: u64) -> Result<(), EscrowError> {
+        self.inner.pause(authority)?;
+        let state = self.inner.state();
+        self.push_event(
+            EscrowEventKind::Paused,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+
+            None,
+        );
+        Ok(())
+    }
+
+    /// Release the emergency pause (mirrors [`Escrow::unpause`]).
+    /// Emits `Unpaused`; mirrors [`IndexedEscrow::pause`].
+    pub fn unpause(&mut self, authority: [u8; 32], at: u64) -> Result<(), EscrowError> {
+        self.inner.unpause(authority)?;
+        let state = self.inner.state();
+        self.push_event(
+            EscrowEventKind::Unpaused,
             state,
             state,
             EventAmounts::none(),
