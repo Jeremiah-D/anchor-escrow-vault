@@ -98,6 +98,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `crank_expired(caller, now)` (AV-48) | `Funded` | `Cancelled` | **anyone** — permissionless crank (Solana crank pattern), only when `now >= expires_at + grace_period`; no counterparty signature needed, so a keeper bot that is party to nothing can sweep timed-out vaults; the refund follows the same pinned refund policy (whitelisted address, or the initializer) — the cranker receives nothing (anti-MEV); a taker cranker still pays the anti-griefing penalty; rejected with `Paused` while the escrow is paused |
 | `initialize_payout_allowlist(allowlist)` (AV-49) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–4 live payout-destination addresses; empty / over-long / zero-address input is `InvalidPayoutAllowlist`); the payout policy gates every fund-moving transition's `payout_to` |
 | `update_payout_allowlist(initializer, taker, allowlist)` (AV-49) | `Uninitialized` / `Funded` | same (no state change) | dual-signature governance — both initializer and taker on a dual-sig escrow, initializer alone on a plain escrow (`Unauthorized` otherwise); empty clears the allowlist (back to taker-only payouts); emits `PayoutAllowlistUpdated` only on an actual change |
+| `initialize_reference(reference)` (AV-53) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the 32-byte off-chain correlation id — order id / invoice hash; any 32 bytes accepted — read-only pass-through: never read by a check gate, never cleared, never affects amount conservation) |
 | `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it) |
 | `release_and_close(authority, now, payout_to)` (AV-50) | `Funded` | `Closed` (via `Released`) | initializer; releases the **full remaining lockup** to the taker and closes the vault in the **same instruction** — one signature instead of two; the payout policy, quorum, timelock and mint gates all apply as on `release`; either leg failing aborts the whole instruction (state/counters/events roll back); emits `Released` then `VaultClosed` in that order; returns `(taker_payout, fee, rent_reclaimed)` |
 
@@ -329,6 +330,20 @@ and indexers can verify what the ruling referenced; `None` attaches no
 rationale (backward compatible). Like the evidence hash, it is never
 cleared, and the `Resolved` indexer event carries it.
 
+**Reference memo (off-chain correlation).** The initializer may bind an
+opt-in 32-byte **reference memo** (`with_reference` /
+`initialize_reference(reference)` on `Uninitialized`, e.g. an order id or
+invoice hash from the operator's off-chain system). The state machine
+treats it as read-only pass-through: no check gate reads it, no
+transition ever clears or rewrites it, and it never affects amount
+conservation — it exists so off-chain systems can reconcile. The memo is
+persisted in the vault account (appended last, 33 bytes), carried on
+*every* indexer event (read from the escrow at emit time), on every
+keeper-report action (as lowercase hex in the report JSON), and in the
+snapshot export — so an indexer or keeper bot can join each escrow back
+to the off-chain record it settles without a second account read.
+`None` attaches no memo (backward compatible).
+
 **Milestone tranche release (staged settlement).** An escrow can declare a
 milestone plan at creation (`MilestonePlan::new(amounts)`, opt-in on
 `Uninitialized` via `with_milestones`, like the quorum builder): the
@@ -436,7 +451,10 @@ appends the 33-byte pause-authority region plus the 1-byte pause flag (34
 bytes), so the full vault is now 927 bytes and needs **7,342,800 lamports**.
 AV-51 adds the 8-byte vesting `cliff_at` timestamp to the vesting region
 (the schedule goes from 17 to 25 bytes), so the full vault is now **935
-bytes** and needs **7,398,480 lamports**.)
+bytes** and needs **7,398,480 lamports**. AV-53 appends the 33-byte
+off-chain reference memo region (1-byte discriminant + 32-byte
+correlation id), so the full vault is now **968 bytes** and needs
+**7,628,160 lamports**.)
 
 **Fee recipient pin (AV-44).** An escrow can additionally pin *where* the
 fee goes (`initialize_fee_recipient(fee_recipient)`, opt-in on
@@ -1005,7 +1023,8 @@ Raw fields: `initializer`, `taker`, `state` (`uninitialized` / `activated` /
 `fees_paid`, `fee_recipient` (AV-44; hex or `null`), `skipped`, `penalty_bps`, `unlock_at` (AV-27; `0` = no
 timelock), plus the optional `quorum`,
 `vesting`, `arbiter`, `mint`, `evidence_hash`, `rationale_hash` (AV-38;
-hex or `null`), `refund_to` (hex or `null`)
+hex or `null`), `reference` (AV-53; hex or `null`), `refund_to` (hex or
+`null`)
 and the effective `refund_recipient` (whitelist when configured, else the
 initializer).
 
@@ -1041,7 +1060,7 @@ diffing numbers while operators read whole tokens.
  "arbiter":null,"mint":null,"fee_bps":0,"fees_paid":0,"display_fees_paid":"0.000000","fee_recipient":null,
  "milestones":null,"skipped":0,"display_skipped":"0.000000",
  "evidence_hash":null,"rationale_hash":null,"refund_to":null,"refund_recipient":"...",
- "penalty_bps":0,"unlock_at":0,"unlock_eligible":true}
+ "penalty_bps":0,"unlock_at":0,"unlock_eligible":true,"payout_allowlist":null,"reference":null}
 ```
 
 ## Account space & rent
@@ -1082,7 +1101,8 @@ two-way consistency check against the IDL parameter table:
 | pause_authority | Option<Pubkey> | 33  |
 | paused        | bool              | 1     |
 | payout_allowlist | Option<PayoutAllowlist> | 130 |
-| **total**     |                   | **935** |
+| reference | Option<[u8; 32]> | 33 |
+| **total**     |                   | **968** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1120,11 +1140,13 @@ is declared) — and the 33-byte arbiter's rationale-document hash region
 attached no rationale) — and the 1-byte emergency timelock-unlock
 governance opt-in `emergency_unlock` (AV-41, zeroed when the feature is
 off) — and the 33-byte protocol-fee recipient region (AV-44: 1-byte
-discriminant + 32-byte address, zeroed when no recipient is bound).
-`escrow-state` exposes `VAULT_SPACE` (935) and
-`VAULT_SPACE_NO_QUORUM` (445) for the Anchor `space =` constraint, plus a
+discriminant + 32-byte address, zeroed when no recipient is bound) — and
+the 33-byte off-chain reference memo region (AV-53: 1-byte discriminant
++ 32-byte correlation id, zeroed when no memo is attached).
+`escrow-state` exposes `VAULT_SPACE` (968) and
+`VAULT_SPACE_NO_QUORUM` (478) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **7,398,480 lamports** to be
+mainnet rent parameters the full vault needs **7,628,160 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1145,12 +1167,13 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 935 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
-  weighted-quorum, AV-46 pause-switch, AV-49 payout-allowlist, and AV-51
-  vesting-cliff growth is accounted in the layout table above); the state
+  stays 968 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
+  weighted-quorum, AV-46 pause-switch, AV-49 payout-allowlist, AV-51
+  vesting-cliff, and AV-53 reference-memo growth is accounted in the
+  layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**7,398,480
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**7,628,160
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the
@@ -1168,7 +1191,7 @@ the whole instruction aborts with zero side effects (state, counters
 and the event log all roll back). The initializer signs once instead
 of twice, and the rent-exempt deposit returns together with the
 payout. The indexer sees the fixed `Released` → `VaultClosed` event
-pair; the vault layout is untouched (`VAULT_SPACE` stays 935).
+pair; the vault layout is untouched (`VAULT_SPACE` stays 968).
 
 ## IDL pipeline (AV-29)
 

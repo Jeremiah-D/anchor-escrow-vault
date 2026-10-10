@@ -309,6 +309,14 @@
       "args": [
         {"name": "allowlist", "type": {"vec": "publicKey"}}
       ]
+    },
+    {
+      "name": "initialize_reference",
+      "discriminator": [199, 226, 9, 15, 40, 9, 131, 223],
+      "accounts": [],
+      "args": [
+        {"name": "reference", "type": "publicKey"}
+      ]
     }
   ],
   "accounts": [
@@ -344,7 +352,8 @@
           {"name": "fee_recipient", "type": {"option": "publicKey"}, "offset": 738},
           {"name": "pause_authority", "type": {"option": "publicKey"}, "offset": 771},
           {"name": "paused", "type": "bool", "offset": 804},
-          {"name": "payout_allowlist", "type": {"option": {"defined": "PayoutAllowlist"}}, "offset": 805}
+          {"name": "payout_allowlist", "type": {"option": {"defined": "PayoutAllowlist"}}, "offset": 805},
+          {"name": "reference", "type": {"option": {"array": ["u8", 32]}}, "offset": 935}
         ]
       }
     }

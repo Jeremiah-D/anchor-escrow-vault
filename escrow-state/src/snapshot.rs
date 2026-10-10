@@ -227,6 +227,11 @@ pub struct EscrowSnapshot {
     /// configured (AV-49). When `Some`, every fund-moving transition
     /// requires its `payout_to` to be a member.
     pub payout_allowlist: Option<Vec<[u8; 32]>>,
+    /// Opt-in 32-byte off-chain reference memo (e.g. order id / invoice
+    /// hash) bound at setup via [`Escrow::with_reference`], or `None`
+    /// when no reference was attached (AV-53). Read-only pass-through
+    /// for off-chain reconciliation — never read by a check gate.
+    pub reference: Option<[u8; 32]>,
 }
 
 impl Escrow {
@@ -311,6 +316,9 @@ impl Escrow {
             payout_allowlist: self
                 .payout_allowlist()
                 .map(|list| list.as_slice().to_vec()),
+            // AV-53: the off-chain reference memo rides the export for
+            // reconciliation — read-only, never a gate input.
+            reference: self.reference(),
             penalty_bps: self.penalty_bps(),
             unlock_at: self.unlock_at(),
             unlock_eligible: self.is_unlock_eligible(now),
@@ -520,6 +528,10 @@ impl EscrowSnapshot {
             }
             None => s.push_str("null"),
         }
+        // AV-53: the off-chain reference memo — 64-char lowercase hex
+        // or `null` — for off-chain reconciliation.
+        s.push_str(",\"reference\":");
+        write_opt_hex(&mut s, self.reference);
         s.push('}');
         s
     }
@@ -573,7 +585,8 @@ mod snapshot_tests {
              \"milestones\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
-             \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"payout_allowlist\":null\
+             \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"payout_allowlist\":null,\
+             \"reference\":null\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),

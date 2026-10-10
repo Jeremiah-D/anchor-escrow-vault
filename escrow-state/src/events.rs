@@ -361,6 +361,11 @@ pub struct CpiRouteAudit {
 /// It is `None` on every other kind — the event log never invents a
 /// caller.
 ///
+/// `reference` (AV-53) carries the opt-in 32-byte off-chain reference
+/// memo on *every* event kind — read from the escrow at emit time, so
+/// the log always agrees with the account. It is `None` when the
+/// escrow carries no reference — the event log never invents one.
+///
 /// [`IndexedEscrow::release_via_cpi`]: IndexedEscrow::release_via_cpi
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EscrowEvent {
@@ -384,6 +389,16 @@ pub struct EscrowEvent {
     /// AV-48: the permissionless crank caller's key, carried by the
     /// `ExpiredCranked` event (`None` on every other kind).
     pub caller: Option<[u8; 32]>,
+    /// AV-53: the opt-in 32-byte off-chain reference memo
+    /// ([`Escrow::reference`]), carried on *every* event kind the
+    /// wrapper emits — read from the escrow at emit time, so the event
+    /// log always agrees with the account. Unlike `rationale_hash`
+    /// (carried only by `Resolved`), the reference is bound before any
+    /// funds move, so every event from `Initialized` on can already
+    /// join the escrow to the operator's off-chain order/invoice
+    /// record. Read-only pass-through: the event never invents a
+    /// reference — `None` when the escrow carries none.
+    pub reference: Option<[u8; 32]>,
 }
 
 /// An event-logging adapter over [`Escrow`] (AV-18).
@@ -474,6 +489,10 @@ impl IndexedEscrow {
             rationale_hash,
             cpi,
             caller,
+            // AV-53: the off-chain reference memo rides every event —
+            // read from the escrow at emit time (never a push_event
+            // parameter), so the log always agrees with the account.
+            reference: self.inner.reference(),
         };
         self.next_seq += 1;
         self.events.push(event);
@@ -634,6 +653,15 @@ impl IndexedEscrow {
     pub fn with_pause_authority(mut self, authority: [u8; 32]) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_pause_authority(authority)?;
         Ok(self)
+    }
+
+    /// Bind the opt-in 32-byte off-chain reference memo (AV-53; mirrors
+    /// [`Escrow::with_reference`]). `Uninitialized` only, like every
+    /// other `with_*` builder; a pure setter — any 32 bytes are
+    /// accepted, and the memo rides every event the wrapper emits.
+    pub fn with_reference(mut self, reference: [u8; 32]) -> Self {
+        self.inner = self.inner.with_reference(reference);
+        self
     }
 
     // ----- transitions: exactly one event per successful transition -----

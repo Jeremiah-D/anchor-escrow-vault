@@ -1325,6 +1325,28 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Bind the opt-in 32-byte off-chain reference memo (AV-53; mirrors
+    /// `Escrow::with_reference`): an order id, invoice hash, or any
+    /// other 32-byte correlation id from the operator's off-chain
+    /// system. `Uninitialized` only; any 32 bytes are accepted — the
+    /// field is read-only pass-through (never read by a check gate,
+    /// never cleared), so there is nothing to validate and no new
+    /// error variant. Emits no event (pre-fund configuration); every
+    /// later `EscrowVaultEvent` carries the memo in its `reference`
+    /// field for off-chain reconciliation.
+    pub fn initialize_reference(
+        ctx: Context<InitializeReference>,
+        reference: Pubkey,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow.with_reference(reference.to_bytes());
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.reference` is always present (33 bytes, zeroed by
+        // default), so the memo is written in place — no realloc
+        // needed in the real build.
+        Ok(())
+    }
+
     /// Release the emergency pause (AV-46; mirrors `Escrow::unpause`).
     /// Same authority rules as `pause`; unpausing a non-paused escrow is
     /// `InvalidStateTransition` (strict toggle). State-changing
@@ -1804,6 +1826,18 @@ pub struct Vault {
     /// the list in place without reallocating. Layout position matches
     /// `escrow_state::VAULT_FIELDS` (appended last, after `paused`).
     pub payout_allowlist: Option<PayoutAllowlist>,
+    /// AV-53: opt-in 32-byte off-chain reference memo (e.g. order id /
+    /// invoice hash); mirrors `escrow_state`'s `reference`. `None` for
+    /// an escrow with no attached memo. The account always reserves the
+    /// full 33-byte region (1-byte discriminant + 32-byte correlation
+    /// id, zeroed when `None`) so `initialize_reference` writes it in
+    /// place without reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `payout_allowlist`). Read-only pass-through: no check gate
+    /// reads it, no transition clears it — it only feeds the
+    /// `EscrowVaultEvent::reference` indexer field, the keeper report
+    /// and the snapshot export for off-chain reconciliation.
+    pub reference: Option<[u8; 32]>,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -1930,6 +1964,13 @@ pub struct EscrowVaultEvent {
     /// learns who cranked the escrow from the event stream without a
     /// second account read.
     pub caller: Option<Pubkey>,
+    /// AV-53: the opt-in 32-byte off-chain reference memo, carried by
+    /// *every* event kind (`None` when the escrow carries no memo).
+    /// Mirrors `escrow_state::EscrowEvent::reference`, so an off-chain
+    /// indexer can join every event back to the operator's
+    /// order/invoice record without a second account read.
+    /// Read-only pass-through: the event never invents a reference.
+    pub reference: Option<[u8; 32]>,
 }
 
 /// AV-18: on-chain mirror of `escrow_state::EscrowEventKind`, mapped by
@@ -2491,6 +2532,17 @@ pub struct UpdatePayoutAllowlist<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitializeReference<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer binds the off-chain reference memo; the
+    /// state machine rejects binding once the escrow leaves
+    /// `Uninitialized`. Any 32 bytes are accepted — the memo is
+    /// read-only pass-through, never validated.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct EmergencyUnlock<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
@@ -2671,6 +2723,10 @@ fn emit_transition(
         cpi_target,
         cpi_accounts_hash,
         caller,
+        // AV-53: the off-chain reference memo rides every event — read
+        // from the vault's escrow at emit time, so the event stream
+        // always agrees with the account.
+        reference: read_escrow(vault).reference(),
     });
 }
 

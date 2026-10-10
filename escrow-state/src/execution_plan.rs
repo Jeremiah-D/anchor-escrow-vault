@@ -348,6 +348,8 @@ mod execution_plan_tests {
             },
             amount,
             decimals: 0,
+            // AV-53: test actions carry no reference memo.
+            reference: None,
             reason: "test",
         }
     }
@@ -503,6 +505,8 @@ mod execution_plan_tests {
         let watched = [WatchedEscrow {
             escrow_id: ID1,
             escrow: e,
+            // AV-53: no reference memo on this escrow.
+            reference: None,
         }];
         let plan = plan_execution(&scan_keeper_actions(&watched, MID));
         assert_eq!(plan.scanned, 1);

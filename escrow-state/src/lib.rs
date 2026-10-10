@@ -474,6 +474,18 @@ pub struct Escrow {
     /// policy survives serialization. Appended last so every earlier
     /// field offset stays stable.
     payout_allowlist: Option<PayoutAllowlist>,
+    /// AV-53: opt-in 32-byte off-chain reference memo (e.g. an order id
+    /// or invoice hash from the operator's off-chain system), bound at
+    /// setup via [`Escrow::with_reference`]. `None` (the default) means
+    /// no reference was attached (backward compatible). Read-only
+    /// pass-through: no check gate reads it, no transition ever clears
+    /// or rewrites it, and it never affects amount conservation — it
+    /// exists so indexer events, keeper reports and snapshot exports
+    /// can correlate the escrow with off-chain records. Persisted (33
+    /// bytes in the vault account: 1-byte discriminant + 32 bytes) so
+    /// the correlation survives serialization. Appended last so every
+    /// earlier field offset stays stable.
+    reference: Option<[u8; 32]>,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -1346,6 +1358,9 @@ impl Escrow {
             // to the taker (backward compatible). Opt in via
             // `with_payout_allowlist` before funding.
             payout_allowlist: None,
+            // AV-53: no off-chain reference memo by default (backward
+            // compatible). Opt in via `with_reference` before funding.
+            reference: None,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -2758,6 +2773,38 @@ impl Escrow {
         self.rationale_hash
     }
 
+    /// Bind the opt-in 32-byte off-chain reference memo (AV-53 —
+    /// payments fintech): an order id, invoice hash, or any other
+    /// 32-byte correlation id from the operator's off-chain system, so
+    /// indexer events, keeper reports and snapshot exports can join the
+    /// escrow back to the off-chain record it settles.
+    ///
+    /// `Uninitialized` only, like every other `with_*` builder, so the
+    /// reference is fixed before any funds move. A pure setter: any 32
+    /// bytes are accepted — there is nothing to validate, because the
+    /// field is read-only pass-through (no check gate reads it, no
+    /// transition clears or rewrites it), so no error is returned and
+    /// no new [`EscrowError`] variant is needed. The state guard is a
+    /// debug assertion: binding past setup is a programming error, not
+    /// a runtime condition.
+    pub fn with_reference(mut self, reference: [u8; 32]) -> Self {
+        debug_assert_eq!(
+            self.state,
+            EscrowState::Uninitialized,
+            "with_reference is Uninitialized-only"
+        );
+        self.reference = Some(reference);
+        self
+    }
+
+    /// The off-chain reference memo bound via
+    /// [`Escrow::with_reference`]; `None` when no reference was
+    /// attached (backward compatible). Read-only: no transition reads
+    /// or mutates it, and it never affects amount conservation.
+    pub fn reference(&self) -> Option<[u8; 32]> {
+        self.reference
+    }
+
     /// Opt in to a refund address whitelist (AV-23 — Solana security /
     /// payment fintech): declare the address every refund on the
     /// unilateral exit paths ([`Escrow::cancel`],
@@ -4040,6 +4087,13 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // place — same treatment as `arbiter` / `mint` / `refund_to`.
     // Appended last so every earlier field offset stays stable.
     ("payout_allowlist", "Option<PayoutAllowlist>", 1 + PAYOUT_ALLOWLIST_LEN),
+    // AV-53: opt-in off-chain reference memo (see
+    // `Escrow::with_reference`): one discriminant byte, then the
+    // 32-byte correlation id. The region is always reserved (zeroed
+    // when `None`) so `with_reference` writes in place — same
+    // treatment as `arbiter` / `mint` / `refund_to`. Appended last so
+    // every earlier field offset stays stable.
+    ("reference", "Option<[u8; 32]>", 1 + 32),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -4098,9 +4152,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// pause authority (AV-46) is always present as well: 1-byte
 /// discriminant + 32-byte address (zeroed when no authority is bound),
 /// and so is the emergency pause flag (AV-46): 1 byte, zeroed when the
-/// escrow is not paused.
+/// escrow is not paused. The off-chain reference memo (AV-53) is always
+/// present as well: 1-byte discriminant + 32-byte correlation id
+/// (zeroed when no reference is attached).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -4644,7 +4700,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 7_398_480, "from {state:?}");
+            assert_eq!(rent, 7_628_160, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -4742,9 +4798,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 7_398_480 by
+        // VAULT_SPACE — pinned at 7_628_160 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 7_398_480);
+        assert_eq!(rent, 7_628_160);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -4902,11 +4958,11 @@ mod tests {
     fn release_and_close_adds_no_fields_and_keeps_space() {
         // AV-50 touches no persisted field: the release leg moves the
         // `released` / `fees_paid` counters and the state byte, and
-        // then the account is closed. VAULT_SPACE stays 935 — re-asserted
+        // then the account is closed. VAULT_SPACE stays 968 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 935, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 7_398_480);
+        assert_eq!(VAULT_SPACE, 968, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 7_628_160);
     }
 
     #[test]
@@ -4917,9 +4973,10 @@ mod tests {
         // account (every byte of VAULT_SPACE is rent the initializer
         // paid for). AV-38 grew the account by 33 bytes (rationale
         // hash), AV-44 by 33 more (fee recipient), AV-46 by 34
-        // (pause authority + pause flag), and AV-51 by 8 (vesting
-        // cliff), so the pin tracks the new total deliberately.
-        assert_eq!(VAULT_SPACE, 935, "full Vault account space");
+        // (pause authority + pause flag), AV-51 by 8 (vesting
+        // cliff), and AV-53 by 33 (off-chain reference memo), so the
+        // pin tracks the new total deliberately.
+        assert_eq!(VAULT_SPACE, 968, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -6793,6 +6850,31 @@ pub(crate) mod anchor_idl_tests {
                             current state); the 130-byte region is \\
                             rewritten in place - no layout / rent change",
         },
+        InstructionSpec {
+            // AV-53: bind the opt-in 32-byte off-chain reference memo
+            // (e.g. order id / invoice hash) at initialize time.
+            name: "initialize_reference",
+            params: &[(
+                "reference",
+                "Pubkey",
+                "instruction param; the 32-byte off-chain correlation id \
+                 (order id / invoice hash) - opaque to the state machine",
+            )],
+            method: "Escrow::with_reference",
+            input_mapping: "reference <- param (Pubkey -> [u8; 32] \
+                            conversion); authority <- \
+                            accounts.initializer (signer), enforced by \
+                            the Anchor account constraint, not the state \
+                            machine; Uninitialized only, like \
+                            initialize_pause_authority; no validation - \
+                            any 32 bytes are a legitimate correlation id \
+                            (read-only pass-through, never read by a check \
+                            gate, never cleared, never affects amount \
+                            conservation); the 33-byte region is always \
+                            reserved (zeroed when None) so the opt-in \
+                            writes in place without reallocating; emits \
+                            no event (pre-fund configuration)",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -6870,6 +6952,7 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::rotate_taker",
             "Escrow::with_payout_allowlist",
             "Escrow::update_payout_allowlist",
+            "Escrow::with_reference",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -6893,7 +6976,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_twenty_seven_instructions_take_params() {
+    fn only_twenty_eight_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -6931,6 +7014,7 @@ pub(crate) mod anchor_idl_tests {
                 &"rotate_taker",
                 &"initialize_payout_allowlist",
                 &"update_payout_allowlist",
+                &"initialize_reference",
             ]
         );
     }
@@ -7773,8 +7857,32 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn update_payout_allowlist_maps_param_to_payout_allowlist_field() {
-        // IDL: update_payout_allowlist(allowlist: Vec<Pubkey>) —
+    fn initialize_reference_maps_param_to_reference_field() {
+        // IDL: initialize_reference(reference: Pubkey) — reference <-
+        // param; authority <- accounts.initializer (signer, enforced by
+        // the Anchor account constraint, not the state machine). The
+        // param populates the vault field (see PARAM_FIELD_MAP); the
+        // 33-byte region is always reserved. A pure setter: any 32
+        // bytes are accepted — there is nothing to validate, because
+        // the field is read-only pass-through (never read by a check
+        // gate, never cleared).
+        const ORDER_REF: [u8; 32] = [0x0D; 32];
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_reference(ORDER_REF);
+        assert_eq!(e.reference(), Some(ORDER_REF));
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        // The zero address is accepted: it is a correlation id, not an
+        // authority key — unlike with_pause_authority there is no key
+        // that must never hold a capability.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_reference([0u8; 32]);
+        assert_eq!(e.reference(), Some([0u8; 32]));
+    }
+
+    #[test]
+    fn update_payout_allowlist_maps_param_to_payout_allowlist_field() {        // IDL: update_payout_allowlist(allowlist: Vec<Pubkey>) —
         // allowlist <- param; authority <- accounts.initializer +
         // accounts.taker (signers) on a dual-sig escrow, initializer
         // alone on a plain escrow (enforced by the state machine). The
@@ -8431,6 +8539,10 @@ pub(crate) mod anchor_idl_tests {
         // second param source for `payout_allowlist`, like
         // `rotate_pause_authority`'s new_authority.
         ("update_payout_allowlist", "allowlist", "payout_allowlist"),
+        // AV-53: the reference param populates `reference`; the `Option`
+        // discriminant is implied (an attached memo is `Some`),
+        // mirroring `initialize_pause_authority`.
+        ("initialize_reference", "reference", "reference"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -10302,6 +10414,21 @@ mod account_space_tests {
                 out.push(list.len);
             }
         }
+        // AV-53: opt-in off-chain reference memo, always reserved like
+        // `refund_to`: the `None` discriminant followed by a zeroed
+        // 32-byte correlation id, so `with_reference` writes in place
+        // without reallocating; appended last so every earlier offset
+        // above is unchanged.
+        match e.reference {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; 32]);
+            }
+            Some(r) => {
+                out.push(1);
+                out.extend_from_slice(&r);
+            }
+        }
         out
     }
 
@@ -10333,10 +10460,10 @@ mod account_space_tests {
         // governance opt-in) + (1 + 32) (AV-44 protocol-fee recipient pin)
         // + (1 + 32) (AV-46 emergency-pause authority) + 1 (AV-46
         // emergency pause flag) + (1 + 128) (AV-49 payout destination
-        // allowlist).
-        assert_eq!(ESCROW_BODY_LEN, 927, "escrow payload bytes");
+        // allowlist) + (1 + 32) (AV-53 off-chain reference memo).
+        assert_eq!(ESCROW_BODY_LEN, 960, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 935, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 968, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -10363,13 +10490,14 @@ mod account_space_tests {
         // authority is bound) + 1-byte emergency pause flag (AV-46,
         // zeroed when the escrow is not paused) + (1 + 129)-byte payout
         // destination allowlist (AV-49, zeroed when no allowlist is
-        // configured).
+        // configured) + (1 + 32)-byte off-chain reference memo (AV-53,
+        // zeroed when no reference is attached).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 445);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 478);
     }
 
     #[test]
@@ -10761,16 +10889,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 935) * 3480 * 2 = 1063 * 6960 = 7_398_480 lamports.
-        assert_eq!(full, 7_398_480);
+        // (128 + 968) * 3480 * 2 = 1096 * 6960 = 7_628_160 lamports.
+        assert_eq!(full, 7_628_160);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 445) * 3480 * 2 = 573 * 6960 = 3_988_080 lamports.
-        assert_eq!(no_quorum, 3_988_080);
+        // (128 + 478) * 3480 * 2 = 606 * 6960 = 4_217_760 lamports.
+        assert_eq!(no_quorum, 4_217_760);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -10814,13 +10942,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(7_398_480, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(7_628_160, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(7_398_479, params.0, params.1),
+            check_vault_rent_exempt(7_628_159, params.0, params.1),
             Err(RentShortfall {
-                required: 7_398_480,
-                provided: 7_398_479,
+                required: 7_628_160,
+                provided: 7_628_159,
             })
         );
         // Generous funding: exempt.
@@ -10832,7 +10960,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 7_398_480,
+                required: 7_628_160,
                 provided: 0,
             })
         );
@@ -13268,7 +13396,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 927, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) bytes");
+        assert_eq!(bytes.len(), 960, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -13293,7 +13421,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 927);
+        assert_eq!(bytes.len(), 960);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -13304,26 +13432,26 @@ mod rationale_tests {
     #[test]
     fn rationale_hash_rent_recomputed_from_mainnet_formula() {
         // AV-46 grows the account by 34 bytes on top of AV-38/AV-41/AV-44/AV-45,
-        // and AV-51 by 8 more (vesting cliff); the rent-exempt minimums
-        // are recomputed from the mainnet formula, not copied from the
-        // AV-46 numbers.
+        // AV-51 by 8 more (vesting cliff), and AV-53 by 33 (off-chain
+        // reference memo); the rent-exempt minimums are recomputed from
+        // the mainnet formula, not copied from the AV-51 numbers.
         let full = rent_exempt_minimum_lamports(
             VAULT_SPACE,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 935) * 3480 * 2 = 1063 * 6960 = 7_398_480 lamports.
-        assert_eq!(VAULT_SPACE, 935);
-        assert_eq!(full, 7_398_480);
+        // (128 + 968) * 3480 * 2 = 1096 * 6960 = 7_628_160 lamports.
+        assert_eq!(VAULT_SPACE, 968);
+        assert_eq!(full, 7_628_160);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 445) * 3480 * 2 = 573 * 6960 = 3_988_080 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 445);
-        assert_eq!(no_quorum, 3_988_080);
+        // (128 + 478) * 3480 * 2 = 606 * 6960 = 4_217_760 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 478);
+        assert_eq!(no_quorum, 4_217_760);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -13333,6 +13461,302 @@ mod rationale_tests {
         out.extend_from_slice(&crate::discriminator::vault_account_discriminator());
         out.extend_from_slice(body);
         out
+    }
+}
+
+// ---------- AV-53: off-chain reference memo ----------
+//
+// The initializer may bind an opt-in 32-byte correlation id (order id,
+// invoice hash) at setup via `with_reference`. The state machine treats
+// it as read-only pass-through: no check gate reads it, no transition
+// clears or rewrites it, and amount conservation is untouched. It is
+// persisted in the vault account (appended last — 33 bytes), carried on
+// every indexer event, every keeper-report action, and the snapshot
+// export, so off-chain systems can reconcile escrows against their own
+// records (payments fintech).
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const ORDER_REF: [u8; 32] = [0x0D; 32]; // stand-in order id
+
+    fn referenced() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_reference(ORDER_REF)
+    }
+
+    /// Prepend the 8-byte Anchor discriminator: the exact input
+    /// `decode_vault_account` expects.
+    fn with_discriminator(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ANCHOR_DISCRIMINATOR_LEN + body.len());
+        out.extend_from_slice(&crate::discriminator::vault_account_discriminator());
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn hex_of(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn with_reference_sets_and_reads_back() {
+        let e = referenced();
+        assert_eq!(e.reference(), Some(ORDER_REF));
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+    }
+
+    #[test]
+    fn reference_defaults_to_none_backward_compatible() {
+        // No builder call: the field reads back as `None`, and the
+        // escrow behaves exactly as before AV-53.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.reference(), None);
+    }
+
+    #[test]
+    fn reference_is_never_cleared_and_never_gates() {
+        // fund -> release: the memo survives, amounts are exact.
+        let mut e = referenced();
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.reference(), Some(ORDER_REF));
+        let (payout, fee) = e.release(ALICE, 1_000_000, 400_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.reference(), Some(ORDER_REF));
+        // Conservation is untouched: released + remaining == amount.
+        assert_eq!(e.released_amount() + e.remaining_amount(), 1_000_000);
+
+        // A stranger's release is still Unauthorized — the memo opens
+        // no gate and participates in no check.
+        let mut e = referenced();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.release(MALLORY, 1_000_000, 400_000, None, BOB),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.reference(), Some(ORDER_REF));
+
+        // cancel path.
+        let mut e = referenced();
+        e.fund(ALICE).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(e.reference(), Some(ORDER_REF));
+
+        // cancel_expired path.
+        let mut e = referenced();
+        e.fund(ALICE).unwrap();
+        e.cancel_expired(ALICE, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(e.reference(), Some(ORDER_REF));
+
+        // dispute -> resolve path.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_reference(ORDER_REF)
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        assert_eq!(e.reference(), Some(ORDER_REF));
+        e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Settled);
+        assert_eq!(e.reference(), Some(ORDER_REF));
+
+        // close_vault: the memo survives into Closed.
+        e.close_vault(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Closed);
+        assert_eq!(e.reference(), Some(ORDER_REF));
+    }
+
+    #[test]
+    fn reference_does_not_change_claim_amounts() {
+        // claim path with vesting: the memo is inert — the same vested
+        // payout a memo-less escrow would produce.
+        let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
+        let mut e = referenced().with_vesting(schedule).unwrap();
+        e.fund(ALICE).unwrap();
+        let (payout, fee) = e.claim(BOB, 1_750_000_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (500_000, 0));
+        assert_eq!(e.reference(), Some(ORDER_REF));
+    }
+
+    #[test]
+    fn reference_persists_in_serialized_layout() {
+        // The memo occupies the appended tail of the vault account
+        // (discriminant + 32 bytes) — body offset 927, right after the
+        // AV-49 payout allowlist — so `with_reference` writes it in
+        // place and every earlier field offset stays stable.
+        let e = referenced();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes.len(), 960);
+        assert_eq!(bytes[927], 1, "reference: Some discriminant");
+        assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
+        // Earlier tail offsets are untouched by the append.
+        assert_eq!(bytes[696], 0, "rationale_hash offset stable");
+        assert_eq!(bytes[797], 0, "payout_allowlist offset stable");
+    }
+
+    #[test]
+    fn reference_defaults_to_zeroed_tail_on_the_wire() {
+        // Backward compatibility on the wire: an escrow without a memo
+        // serializes the tail as a zeroed region, exactly like every
+        // other `None` tail field.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), 960);
+        assert_eq!(bytes[927], 0, "reference: None discriminant");
+        assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
+    }
+
+    #[test]
+    fn reference_survives_decode_roundtrip() {
+        let e = referenced();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        let decoded =
+            crate::discriminator::decode_vault_account(&with_discriminator(&bytes)).unwrap();
+        assert_eq!(decoded.reference(), Some(ORDER_REF));
+        // The None case decodes back to None.
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&plain);
+        let decoded =
+            crate::discriminator::decode_vault_account(&with_discriminator(&bytes)).unwrap();
+        assert_eq!(decoded.reference(), None);
+    }
+
+    #[test]
+    fn reference_rent_recomputed_from_mainnet_formula() {
+        // AV-53 grows the account by 33 bytes on top of the AV-51
+        // layout; the rent-exempt minimums are recomputed from the
+        // mainnet formula, not copied from the AV-51 numbers.
+        let full = rent_exempt_minimum_lamports(
+            VAULT_SPACE,
+            MAINNET_LAMPORTS_PER_BYTE_YEAR,
+            MAINNET_EXEMPTION_THRESHOLD_YEARS,
+        );
+        // (128 + 968) * 3480 * 2 = 1096 * 6960 = 7_628_160 lamports.
+        assert_eq!(VAULT_SPACE, 968);
+        assert_eq!(full, 7_628_160);
+        assert_eq!(full, vault_close_rent_reclaimed());
+        let no_quorum = rent_exempt_minimum_lamports(
+            VAULT_SPACE_NO_QUORUM,
+            MAINNET_LAMPORTS_PER_BYTE_YEAR,
+            MAINNET_EXEMPTION_THRESHOLD_YEARS,
+        );
+        // (128 + 478) * 3480 * 2 = 606 * 6960 = 4_217_760 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 478);
+        assert_eq!(no_quorum, 4_217_760);
+    }
+
+    #[test]
+    fn events_carry_reference_on_every_kind() {
+        // The memo rides every event the wrapper emits — read from the
+        // escrow at emit time, so the log always agrees with the
+        // account.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0x1D; 32], 1_000_000)
+            .unwrap()
+            .with_reference(ORDER_REF);
+        e.fund(ALICE, 1_000_001).unwrap();
+        e.release(ALICE, 400_000, None, BOB, 1_000_002).unwrap();
+        let events = e.drain_events();
+        assert_eq!(events.len(), 3, "Initialized, Funded, Released");
+        // The `Initialized` event predates the binding (the memo is
+        // attached after construction) — it honestly carries `None`;
+        // every event emitted after the binding carries the memo.
+        assert_eq!(events[0].reference, None);
+        assert!(events[1..].iter().all(|ev| ev.reference == Some(ORDER_REF)));
+
+        // Dispute path: Escalated + Resolved carry it too.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0x1D; 32], 1_000_000)
+            .unwrap()
+            .with_reference(ORDER_REF)
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE, 1_000_001).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.resolve(ARBITER, 600_000, None, None, BOB, 1_000_002).unwrap();
+        let events = e.drain_events();
+        assert_eq!(events[0].reference, None, "Initialized predates the binding");
+        assert!(events[1..].iter().all(|ev| ev.reference == Some(ORDER_REF)));
+        assert!(events.iter().any(|ev| ev.kind == EscrowEventKind::Escalated));
+        assert!(events.iter().any(|ev| ev.kind == EscrowEventKind::Resolved));
+
+        // Cancel path.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0x1D; 32], 1_000_000)
+            .unwrap()
+            .with_reference(ORDER_REF);
+        e.fund(ALICE, 1_000_001).unwrap();
+        e.cancel(ALICE, None, ALICE, 1_000_002).unwrap();
+        let events = e.drain_events();
+        assert_eq!(events[0].reference, None, "Initialized predates the binding");
+        assert!(events[1..].iter().all(|ev| ev.reference == Some(ORDER_REF)));
+
+        // No memo attached: every event carries None — the log never
+        // invents a reference.
+        let mut e =
+            IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0x1D; 32], 1_000_000)
+                .unwrap();
+        e.fund(ALICE, 1_000_001).unwrap();
+        assert!(e.drain_events().iter().all(|ev| ev.reference.is_none()));
+    }
+
+    #[test]
+    fn keeper_report_carries_reference_as_hex() {
+        use crate::{scan_keeper_actions, WatchedEscrow};
+        // An expired funded escrow lists cancel_expired (+ the crank);
+        // every action carries the memo for off-chain correlation.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, 0)
+            .unwrap()
+            .with_reference(ORDER_REF);
+        e.fund(ALICE).unwrap();
+        let reference = e.reference();
+        let watched = [WatchedEscrow {
+            escrow_id: [0x1D; 32],
+            escrow: e,
+            reference,
+        }];
+        let report = scan_keeper_actions(&watched, 1_000_000);
+        assert!(!report.actions.is_empty());
+        assert!(report.actions.iter().all(|a| a.reference == Some(ORDER_REF)));
+        let json = report.to_json();
+        assert!(
+            json.contains(&format!("\"reference\":\"{}\"", hex_of(&ORDER_REF))),
+            "report JSON carries the reference as lowercase hex"
+        );
+
+        // No memo: the JSON carries null.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, 0).unwrap();
+        e.fund(ALICE).unwrap();
+        let watched = [WatchedEscrow {
+            escrow_id: [0x1D; 32],
+            escrow: e,
+            reference: None,
+        }];
+        let json = scan_keeper_actions(&watched, 1_000_000).to_json();
+        assert!(json.contains("\"reference\":null"));
+    }
+
+    #[test]
+    fn snapshot_carries_reference() {
+        let e = referenced();
+        let snap = e.snapshot(1_000_000);
+        assert_eq!(snap.reference, Some(ORDER_REF));
+        let json = snap.to_json();
+        assert!(
+            json.contains(&format!("\"reference\":\"{}\"", hex_of(&ORDER_REF))),
+            "snapshot JSON carries the reference as lowercase hex"
+        );
+        // No memo: field None, JSON null.
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let snap = plain.snapshot(1_000_000);
+        assert_eq!(snap.reference, None);
+        assert!(snap.to_json().contains("\"reference\":null"));
     }
 }
 
@@ -13860,6 +14284,8 @@ mod timelock_tests {
         let watched = [WatchedEscrow {
             escrow_id: [0x01; 32],
             escrow: e,
+            // AV-53: no reference memo on this escrow.
+            reference: None,
         }];
         // Before unlock: the claim call would fail, so it is not listed.
         let early = scan_keeper_actions(&watched, UNLOCK_AT - 1);
@@ -14080,7 +14506,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 927);
+        assert_eq!(bytes.len(), 960);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -14255,7 +14681,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 927, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51");
+        assert_eq!(ESCROW_BODY_LEN, 960, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -14273,30 +14699,31 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 935) * 3480 * 2 = 1063 * 6960 = 7_398_480 lamports.
+        // (128 + 968) * 3480 * 2 = 1096 * 6960 = 7_628_160 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            7_398_480
+            7_628_160
         );
-        // (128 + 445) * 3480 * 2 = 573 * 6960 = 3_988_080 lamports.
+        // (128 + 478) * 3480 * 2 = 606 * 6960 = 4_217_760 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            3_988_080
+            4_217_760
         );
-        // 180 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
+        // 213 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
-        // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff).
-        assert_eq!(VAULT_SPACE, 935);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 445);
-        assert!(check_vault_rent_exempt(7_398_480, 3_480, 2.0).is_ok());
+        // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
+        // + AV-53 off-chain reference memo).
+        assert_eq!(VAULT_SPACE, 968);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 478);
+        assert!(check_vault_rent_exempt(7_628_160, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -15760,6 +16187,8 @@ mod taker_rotation_tests {
         let watched = [WatchedEscrow {
             escrow_id: ESCROW_ID,
             escrow: e,
+            // AV-53: no reference memo on this escrow.
+            reference: None,
         }];
         let report = scan_keeper_actions(&watched, 1_750_000_000);
         assert_eq!(report.actions.len(), 1);

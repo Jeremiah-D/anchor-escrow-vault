@@ -106,6 +106,14 @@ pub struct WatchedEscrow {
     pub escrow_id: [u8; 32],
     /// Read-only snapshot of the escrow's state.
     pub escrow: Escrow,
+    /// AV-53: the opt-in 32-byte off-chain reference memo for this
+    /// watch entry — the operator copies [`Escrow::reference`] when
+    /// building the watch list. The scan carries it onto every emitted
+    /// action so the keeper report JSON can join the action back to
+    /// the operator's off-chain order/invoice record. `None` when the
+    /// escrow carries no reference. Read-only: it never affects which
+    /// actions are listed.
+    pub reference: Option<[u8; 32]>,
 }
 
 /// The keeper-callable action for one escrow.
@@ -188,6 +196,12 @@ pub struct KeeperAction {
     /// `display_amount` rendering only — the instruction itself always
     /// moves the raw `amount`.
     pub decimals: u8,
+    /// The escrow's opt-in 32-byte off-chain reference memo (AV-53),
+    /// copied from the [`WatchedEscrow`] entry at scan time — the
+    /// operator's order id / invoice hash for off-chain reconciliation.
+    /// Carried for correlation only: it is never an instruction input
+    /// and never affects which actions are listed.
+    pub reference: Option<[u8; 32]>,
     /// Machine-readable reason: `"expired"`, `"vesting_unlocked"`, or
     /// `"disputed"` (AV-38, `resolve` actions).
     pub reason: &'static str,
@@ -220,7 +234,7 @@ impl KeeperReport {
     ///    "caller_role":"initializer","mint":null,
     ///    "refund_to":"...","amount":1000000,"decimals":6,
     ///    "display_amount":"1.000000",
-    ///    "reason":"expired"}
+    ///    "reason":"expired","reference":null}
     /// ]}
     /// ```
     ///
@@ -279,7 +293,19 @@ impl KeeperReport {
             s.push_str(&format_amount(a.amount, a.decimals));
             s.push_str("\",\"reason\":\"");
             s.push_str(a.reason);
-            s.push_str("\"}");
+            // AV-53: the off-chain correlation id as 64-char lowercase
+            // hex, or `null` — correlation only, never an instruction
+            // input.
+            s.push_str("\",\"reference\":");
+            match a.reference {
+                Some(r) => {
+                    s.push('"');
+                    s.push_str(&hex32(&r));
+                    s.push('"');
+                }
+                None => s.push_str("null"),
+            }
+            s.push_str("}");
         }
         s.push_str("]}");
         s
@@ -329,6 +355,9 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         // AV-28: the report renders the amount in human
                         // units alongside the raw value.
                         decimals: e.decimals(),
+                        // AV-53: the off-chain correlation id rides the action so
+                        // the report JSON joins it to the operator's records.
+                        reference: w.reference,
                         reason: "disputed",
                     });
                 }
@@ -366,6 +395,9 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 // AV-28: the report renders the amount in human units
                 // alongside the raw value.
                 decimals: e.decimals(),
+                // AV-53: the off-chain correlation id rides the action so
+                // the report JSON joins it to the operator's records.
+                reference: w.reference,
                 reason: "expired",
             });
             // AV-48: the permissionless crank — the same expiry exit,
@@ -392,6 +424,9 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     refund_to: Some(e.refund_recipient()),
                     amount: e.remaining_amount(),
                     decimals: e.decimals(),
+                    // AV-53: the off-chain correlation id rides the action so
+                    // the report JSON joins it to the operator's records.
+                    reference: w.reference,
                     reason: "expired",
                 });
             }
@@ -420,6 +455,9 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 // AV-28: the report renders the amount in human units
                 // alongside the raw value.
                 decimals: e.decimals(),
+                // AV-53: the off-chain correlation id rides the action so
+                // the report JSON joins it to the operator's records.
+                reference: w.reference,
                 reason: "vesting_unlocked",
             });
         }
@@ -629,9 +667,14 @@ mod keeper_tests {
     const NEVER: u64 = u64::MAX; // no timeout
 
     fn watch(id: [u8; 32], escrow: Escrow) -> WatchedEscrow {
+        // AV-53: the watch entry carries the escrow's reference memo,
+        // like a keeper operator copying it when building the watch
+        // list.
+        let reference = escrow.reference();
         WatchedEscrow {
             escrow_id: id,
             escrow,
+            reference,
         }
     }
 
@@ -1020,6 +1063,8 @@ mod keeper_tests {
                 amount: AMOUNT,
                 // No decimal metadata declared: bare-integer rendering.
                 decimals: 0,
+                // No reference memo attached to the watched escrow.
+                reference: None,
                 reason: "expired",
             }
         );
@@ -1035,6 +1080,7 @@ mod keeper_tests {
                 refund_to: Some(ALICE),
                 amount: AMOUNT,
                 decimals: 0,
+                reference: None,
                 reason: "expired",
             }
         );
@@ -1049,7 +1095,7 @@ mod keeper_tests {
         // AV-48: the expired escrow lists both the party-signed
         // `cancel_expired` and the permissionless `crank_expired`.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\"}},{{\"escrow_id\":\"{}\",\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\"}}]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null}},{{\"escrow_id\":\"{}\",\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null}}]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -1072,7 +1118,7 @@ mod keeper_tests {
         let watched = [watch(ID2, e)];
         let report = scan_keeper_actions(&watched, MID);
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\"}}]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null}}]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),
@@ -1212,9 +1258,14 @@ mod close_keeper_tests {
     const NEVER: u64 = u64::MAX; // no timeout
 
     fn watch(id: [u8; 32], escrow: Escrow) -> WatchedEscrow {
+        // AV-53: the watch entry carries the escrow's reference memo,
+        // like a keeper operator copying it when building the watch
+        // list.
+        let reference = escrow.reference();
         WatchedEscrow {
             escrow_id: id,
             escrow,
+            reference,
         }
     }
 
@@ -1937,9 +1988,14 @@ mod keeper_milestone_tests {
     const NOW: u64 = 1_750_000_000;
 
     fn watch(id: [u8; 32], escrow: Escrow) -> WatchedEscrow {
+        // AV-53: the watch entry carries the escrow's reference memo,
+        // like a keeper operator copying it when building the watch
+        // list.
+        let reference = escrow.reference();
         WatchedEscrow {
             escrow_id: id,
             escrow,
+            reference,
         }
     }
 

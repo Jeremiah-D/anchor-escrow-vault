@@ -395,6 +395,16 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(PAYOUT_ALLOWLIST_LEN)?;
         None
     };
+    // AV-53: opt-in off-chain reference memo, always reserved like
+    // `refund_to`: the `None` discriminant followed by a zeroed 32-byte
+    // correlation id, appended last so every earlier offset above is
+    // unchanged.
+    let reference = if c.option_present("reference")? {
+        Some(c.pubkey()?)
+    } else {
+        c.skip(32)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -430,6 +440,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         pause_authority,
         paused,
         payout_allowlist,
+        // AV-53: the off-chain reference memo is persisted — a decoded
+        // escrow carries the same correlation id the initializer bound.
+        reference,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
