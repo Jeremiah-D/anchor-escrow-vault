@@ -98,6 +98,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_payout_allowlist(allowlist)` (AV-49) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–4 live payout-destination addresses; empty / over-long / zero-address input is `InvalidPayoutAllowlist`); the payout policy gates every fund-moving transition's `payout_to` |
 | `update_payout_allowlist(initializer, taker, allowlist)` (AV-49) | `Uninitialized` / `Funded` | same (no state change) | dual-signature governance — both initializer and taker on a dual-sig escrow, initializer alone on a plain escrow (`Unauthorized` otherwise); empty clears the allowlist (back to taker-only payouts); emits `PayoutAllowlistUpdated` only on an actual change |
 | `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it) |
+| `release_and_close(authority, now, payout_to)` (AV-50) | `Funded` | `Closed` (via `Released`) | initializer; releases the **full remaining lockup** to the taker and closes the vault in the **same instruction** — one signature instead of two; the payout policy, quorum, timelock and mint gates all apply as on `release`; either leg failing aborts the whole instruction (state/counters/events roll back); emits `Released` then `VaultClosed` in that order; returns `(taker_payout, fee, rent_reclaimed)` |
 
 Rules: the initializer drives `fund`/`release`/`cancel`; any other caller
 gets `Unauthorized` (checked before state validity). An escrow that has
@@ -827,6 +828,10 @@ successful calls that change nothing observable:
   escrow was in (`Cancelled` / `Released` / `Settled`) and `to ==
   Closed`; `amounts.rent_reclaimed` carries the reclaimed rent-exempt
   deposit (AV-34), every other amount is zero.
+- `release_and_close` (AV-50) emits `Released` (`from == Funded`,
+  `to == Released`, gross payout + fee) and then `VaultClosed`
+  (`from == Released`, `to == Closed`, `rent_reclaimed`) in that fixed
+  order — one payout-then-close pair per instruction.
 - `drain_events()` takes the recorded events and clears the log; the
   sequence counter keeps running, so a resuming indexer never sees
   duplicates.
@@ -1113,6 +1118,20 @@ the deposit:
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the
   runtime transfers the account's lamports to the initializer.
+
+### Combined release + close (AV-50)
+
+`release_and_close` merges the final payout and the account close into
+one instruction: `Funded -> Released -> Closed`. The release always
+covers the **full remaining lockup** — only a full release reaches the
+`Released` terminal state `close_vault` accepts — and every `release`
+gate (initializer authority, payout policy, quorum, timelock, mint
+binding) applies exactly as on a plain `release`. If either leg fails,
+the whole instruction aborts with zero side effects (state, counters
+and the event log all roll back). The initializer signs once instead
+of twice, and the rent-exempt deposit returns together with the
+payout. The indexer sees the fixed `Released` → `VaultClosed` event
+pair; the vault layout is untouched (`VAULT_SPACE` stays 927).
 
 ## IDL pipeline (AV-29)
 

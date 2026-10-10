@@ -252,6 +252,12 @@
       "args": []
     },
     {
+      "name": "release_and_close",
+      "discriminator": [76, 58, 136, 168, 185, 105, 132, 167],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "initialize_pause_authority",
       "discriminator": [138, 78, 3, 35, 190, 65, 44, 196],
       "accounts": [],

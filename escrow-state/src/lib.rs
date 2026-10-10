@@ -3173,6 +3173,93 @@ impl Escrow {
         Ok(vault_close_rent_reclaimed())
     }
 
+    /// Release the full remaining lockup to the taker and close the vault
+    /// account in the same atomic instruction (AV-50): `Funded ->
+    /// Released -> Closed`. One signature instead of two — the
+    /// initializer saves a signature fee — and the rent-exempt deposit
+    /// returns to the initializer together with the payout.
+    ///
+    /// The release always covers the *entire* remaining locked amount
+    /// ([`Escrow::remaining_amount`]): only a full release reaches the
+    /// `Released` terminal state that [`Escrow::close_vault`] accepts,
+    /// so a partial amount would leave the vault unclosable and the
+    /// combined call takes no amount argument — a caller-supplied
+    /// tranche would let the instruction succeed without ever closing.
+    ///
+    /// Atomicity: the exact [`Escrow::release`] gates run first
+    /// (authority, state, mint binding, payout policy, milestone plan,
+    /// quorum, timelock, amount math), then [`Escrow::close_vault`]'s
+    /// (AV-34: initializer-only, terminal-state gate). If either leg
+    /// fails, the whole call rolls back — `released`, `fees_paid` and
+    /// `state` are restored to their pre-call values — and nothing
+    /// observable changes. On-chain the whole instruction is one
+    /// transaction, so a failed leg aborts everything; the pure-logic
+    /// model mirrors that. (See
+    /// [`IndexedEscrow::release_and_close`](crate::IndexedEscrow::release_and_close)
+    /// for the `Released` + `VaultClosed` event pair, which likewise
+    /// lands only when both legs succeed.)
+    ///
+    /// In practice the close leg cannot fail once the release leg
+    /// succeeded: a full release lands exactly in `Released`, the
+    /// initializer is the same authority both legs check, and the pause
+    /// / reentrancy guards were already cleared by the first leg. The
+    /// rollback branch below is defensive — a belt-and-suspenders guard
+    /// if the legs ever diverge.
+    ///
+    /// Returns `(taker_payout, fee, rent_reclaimed)`: the taker's net
+    /// payout and the AV-17 protocol fee (as [`Escrow::release`]), plus
+    /// the rent-exempt lamports the initializer reclaims
+    /// ([`vault_close_rent_reclaimed`]). `taker_payout + fee ==` the
+    /// locked amount always; the conservation invariant is untouched —
+    /// the combined call moves no extra funds, it just settles the
+    /// whole lockup and closes the account in one step.
+    ///
+    /// No new account fields: the vault layout is untouched
+    /// (`VAULT_FIELDS` / `VAULT_SPACE` unchanged — a full release plus
+    /// a close touches only the state byte and the `released` /
+    /// `fees_paid` counters, and then the account is gone).
+    pub fn release_and_close(
+        &mut self,
+        authority: [u8; 32],
+        now: u64,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+    ) -> Result<(u64, u64, u64), EscrowError> {
+        // AV-46 / AV-36: the same guards as `release` / `close_vault`,
+        // first — the inner legs re-check them anyway, but failing
+        // fast here makes the combined call's own check order (pause,
+        // reentrancy, authority, state) explicit.
+        self.require_not_paused()?;
+        self.require_not_reentrant()?;
+        // Snapshot the three fields the legs mutate, so a failed close
+        // restores them exactly. `release` is atomic by itself (its
+        // gates run before any mutation), so a gate failure needs no
+        // rollback; the snapshot only serves the defensive close-failure
+        // path.
+        let snapshot = (self.released, self.fees_paid, self.state);
+        let rollback = |this: &mut Self| {
+            let (released, fees_paid, state) = snapshot;
+            this.released = released;
+            this.fees_paid = fees_paid;
+            this.state = state;
+        };
+        // The full remainder — the only amount that leaves the vault in
+        // a closeable terminal state.
+        let amount = self.remaining_amount();
+        let (payout, fee) = match self.release(authority, now, amount, mint, payout_to) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+        // AV-34: reclaim the rent-exempt deposit in the same call.
+        match self.close_vault(authority) {
+            Ok(rent) => Ok((payout, fee, rent)),
+            Err(e) => {
+                rollback(self);
+                Err(e)
+            }
+        }
+    }
+
     /// Attach a milestone tranche plan (AV-15). Builder-style: only valid
     /// on an `Uninitialized` escrow, so the release schedule is fixed
     /// before any funds move — mirroring [`Escrow::with_quorum`],
@@ -4491,6 +4578,182 @@ mod tests {
                 "from {state:?}: activate"
             );
         }
+    }
+
+    // ----- AV-50: release_and_close merged-path matrix -----
+
+    #[test]
+    fn release_and_close_settles_full_lockup_and_closes_in_one_call() {
+        let mut e = funded_escrow();
+        let (payout, fee, rent) = e.release_and_close(ALICE, EXPIRES_AT, None, BOB).unwrap();
+        // No fee configured: the taker takes the whole lockup.
+        assert_eq!((payout, fee), (1_000_000, 0));
+        // The rent reclaimed is the mainnet rent-exempt minimum for
+        // VAULT_SPACE — pinned at 7_342_800 by
+        // rent_formula_matches_hand_computed_mainnet_numbers.
+        assert_eq!(rent, 7_342_800);
+        assert_eq!(rent, vault_close_rent_reclaimed());
+        // Funded -> Released -> Closed in one call.
+        assert_eq!(e.state(), EscrowState::Closed);
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.remaining_amount(), 0);
+        // Amount conservation: payout + fee == the locked amount; the
+        // combined call moves no extra funds.
+        assert_eq!(payout + fee, 1_000_000);
+        assert_eq!(e.released_amount() + e.remaining_amount(), e.amount());
+        // The deepest terminal: nothing leaves Closed.
+        assert_eq!(
+            e.release_and_close(ALICE, EXPIRES_AT, None, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn release_and_close_charges_protocol_fee_and_reports_gross() {
+        // 250 bps on 1_000_000 => fee 25_000, taker payout 975_000;
+        // the gross (payout + fee) is still the full lockup.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(250)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let (payout, fee, rent) = e.release_and_close(ALICE, EXPIRES_AT, None, BOB).unwrap();
+        assert_eq!((payout, fee), (975_000, 25_000));
+        assert_eq!(e.fees_paid(), 25_000);
+        assert_eq!(rent, vault_close_rent_reclaimed());
+        assert_eq!(e.state(), EscrowState::Closed);
+        // The released counter accumulates the gross amount, so the
+        // conservation invariant (released + remaining == amount) is
+        // untouched by fees.
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.released_amount() + e.remaining_amount(), e.amount());
+    }
+
+    #[test]
+    fn release_and_close_rejects_stranger_before_state() {
+        // Authority is checked before state validity: a stranger on a
+        // live escrow gets Unauthorized — and learns nothing else —
+        // with the escrow untouched.
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.release_and_close(MALLORY, EXPIRES_AT, None, BOB),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.fees_paid(), 0);
+    }
+
+    #[test]
+    fn release_and_close_rejects_non_funded_states_with_zero_side_effects() {
+        // The release leg requires Funded: every other state fails the
+        // combined call with InvalidStateTransition, and because the
+        // release gates run before any mutation, nothing observable
+        // changes — no partial release, no close, no counter moves.
+        fn assert_rejected_unchanged(mut e: Escrow, label: &str) {
+            let before = e;
+            assert_eq!(
+                e.release_and_close(ALICE, EXPIRES_AT, None, BOB),
+                Err(EscrowError::InvalidStateTransition),
+                "{label}"
+            );
+            assert_eq!(e.state(), before.state(), "{label}: state");
+            assert_eq!(
+                e.released_amount(),
+                before.released_amount(),
+                "{label}: released"
+            );
+            assert_eq!(
+                e.remaining_amount(),
+                before.remaining_amount(),
+                "{label}: remaining"
+            );
+            assert_eq!(e.fees_paid(), before.fees_paid(), "{label}: fees_paid");
+        }
+        assert_rejected_unchanged(escrow(), "Uninitialized");
+        for (state, e) in terminal_escrows() {
+            assert_rejected_unchanged(e, &format!("terminal {state:?}"));
+        }
+        // Disputed locks every unilateral exit — the combined call is
+        // one too.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        let mut disputed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        disputed.fund(ALICE).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        assert_rejected_unchanged(disputed, "Disputed");
+        // Closed is the deepest terminal.
+        let mut closed = funded_escrow();
+        closed.release_and_close(ALICE, EXPIRES_AT, None, BOB).unwrap();
+        assert_rejected_unchanged(closed, "Closed");
+    }
+
+    #[test]
+    fn release_and_close_propagates_release_gates_without_side_effects() {
+        // Every release gate that would reject a plain `release`
+        // rejects the combined call too, with the escrow untouched —
+        // the release leg never gets to mutate, so the close leg never
+        // runs and there is nothing to roll back.
+        // AV-27 timelock: now < unlock_at.
+        let mut locked = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(EXPIRES_AT)
+            .unwrap();
+        locked.fund(ALICE).unwrap();
+        assert_eq!(
+            locked.release_and_close(ALICE, EXPIRES_AT - 1, None, BOB),
+            Err(EscrowError::TimelockNotReached)
+        );
+        assert_eq!(locked.state(), EscrowState::Funded);
+        assert_eq!(locked.released_amount(), 0);
+        // Quorum not satisfied.
+        const ATTESTOR: [u8; 32] = [0xA1; 32];
+        let mut gated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR], &[1], 1).unwrap())
+            .unwrap();
+        gated.fund(ALICE).unwrap();
+        assert_eq!(
+            gated.release_and_close(ALICE, EXPIRES_AT, None, BOB),
+            Err(EscrowError::QuorumNotReached)
+        );
+        assert_eq!(gated.state(), EscrowState::Funded);
+        assert_eq!(gated.released_amount(), 0);
+        // Milestone plan owns the release schedule: plain release —
+        // and therefore the combined call — is a config error.
+        let mut plan = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        plan.fund(ALICE).unwrap();
+        assert_eq!(
+            plan.release_and_close(ALICE, EXPIRES_AT, None, BOB),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(plan.state(), EscrowState::Funded);
+        assert_eq!(plan.released_amount(), 0);
+        // Payout policy: a stranger destination fails before any state
+        // changes (AV-49).
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.release_and_close(ALICE, EXPIRES_AT, None, MALLORY),
+            Err(EscrowError::PayoutNotAllowlisted)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn release_and_close_adds_no_fields_and_keeps_space() {
+        // AV-50 touches no persisted field: the release leg moves the
+        // `released` / `fees_paid` counters and the state byte, and
+        // then the account is closed. VAULT_SPACE stays 927 — re-asserted
+        // here so the combined instruction cannot silently grow the
+        // account (every byte is rent the initializer paid for).
+        assert_eq!(VAULT_SPACE, 927, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 7_342_800);
     }
 
     #[test]
@@ -6173,6 +6436,34 @@ pub(crate) mod anchor_idl_tests {
                             VAULT_SPACE unchanged",
         },
         InstructionSpec {
+            // AV-50: atomic release + vault close in one instruction.
+            name: "release_and_close",
+            params: &[],
+            method: "Escrow::release_and_close",
+            input_mapping: "authority <- accounts.initializer (signer); \
+                            now <- clock sysvar (NOT an instruction param — \
+                            see module docs); payout destination <- \
+                            accounts.payout_to, pinned against the payout \
+                            policy exactly like `release` (AV-49); the full \
+                            remaining lockup releases to the taker \
+                            (Funded -> Released) and the vault closes in \
+                            the same instruction (Released -> Closed) — one \
+                            signature instead of two; the initializer \
+                            reclaims the rent-exempt deposit \
+                            (escrow_state::vault_close_rent_reclaimed) via \
+                            the `close` constraint on the vault account; \
+                            either leg failing aborts the whole instruction \
+                            (state machine rolls back — no partial release, \
+                            no close); returns (taker_payout, fee, \
+                            rent_reclaimed) so the program can size the \
+                            payout, fee and account-close transfers; emits \
+                            `Released` then `VaultClosed` in that order \
+                            (AV-18); no instruction params — the release \
+                            always covers the full remainder (a \
+                            caller-supplied tranche would leave the vault \
+                            unclosable)",
+        },
+        InstructionSpec {
             // AV-46: emergency-pause authority opt-in.
             name: "initialize_pause_authority",
             params: &[(
@@ -6375,6 +6666,7 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::with_emergency_unlock",
             "Escrow::emergency_unlock",
             "Escrow::close_vault",
+            "Escrow::release_and_close",
             "Escrow::with_pause_authority",
             "Escrow::pause",
             "Escrow::unpause",
@@ -7703,6 +7995,39 @@ pub(crate) mod anchor_idl_tests {
             Err(EscrowError::Unauthorized),
             "a stranger learns nothing about state"
         );
+    }
+
+    #[test]
+    fn release_and_close_maps_combined_close_to_one_call() {
+        // IDL: release_and_close() — no params; authority <-
+        // accounts.initializer (signer), payout destination <-
+        // accounts.payout_to, now <- clock sysvar. Releases the full
+        // remaining lockup and closes the vault atomically (Funded ->
+        // Released -> Closed), returning (taker_payout, fee,
+        // rent_reclaimed) so the program can size the payout, fee and
+        // account-close transfers. Either leg failing aborts the whole
+        // instruction with no side effects.
+        let mut e = funded_escrow();
+        let (payout, fee, rent) = e.release_and_close(ALICE, EXPIRES_AT, None, BOB).unwrap();
+        assert_eq!((payout, fee), (1_000_000, 0));
+        assert_eq!(rent, vault_close_rent_reclaimed());
+        assert_eq!(e.state(), EscrowState::Closed);
+        // Documented failure modes: a stranger is Unauthorized (checked
+        // before state validity), and a non-Funded escrow is
+        // InvalidStateTransition — both with the escrow untouched.
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.release_and_close(MALLORY, EXPIRES_AT, None, BOB),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        let mut fresh = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            fresh.release_and_close(ALICE, EXPIRES_AT, None, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(fresh.state(), EscrowState::Uninitialized);
+        assert_eq!(fresh.released_amount(), 0);
     }
 
     // ----- AV-10, second half: two-way vault-field <-> IDL consistency -----

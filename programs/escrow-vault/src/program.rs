@@ -38,6 +38,9 @@
 //! `Settled`, the initializer may close the vault account (Anchor
 //! `close` constraint) and recover the lamports it has carried since
 //! `initialize` — the escrow moves to `Closed`, the deepest terminal.
+//! `release_and_close` (AV-50) merges the final payout and the close
+//! into one signature (`Funded -> Released -> Closed`), emitting the
+//! fixed `Released` then `VaultClosed` event pair.
 //!
 //! Reentrancy (AV-36): every fund-moving instruction runs under the
 //! state machine's reentrancy guard — `Escrow::release_via_cpi` arms a
@@ -1475,6 +1478,83 @@ pub mod escrow_vault {
         );
         Ok(())
     }
+
+    /// Release the full remaining lockup to the taker and close the
+    /// vault account in the same atomic instruction (AV-50; mirrors
+    /// `Escrow::release_and_close`). One signature instead of two —
+    /// the initializer saves a signature fee — and the rent-exempt
+    /// deposit returns to the initializer together with the payout.
+    ///
+    /// The state machine runs the exact `release` gates for the full
+    /// remainder (authority, state, mint binding, payout policy AV-49,
+    /// milestone plan, quorum, timelock AV-27, amount math), then
+    /// `close_vault`'s (AV-34: initializer-only, terminal-state gate);
+    /// either leg failing rolls the whole call back — on-chain the
+    /// failed instruction aborts the transaction, so no state change
+    /// persists. Returns `(taker_payout, fee, rent_reclaimed)` so the
+    /// real build can size the payout, fee and account-close transfers.
+    /// AV-16: the vault token account's mint must equal the bound
+    /// `vault.mint` (`MintMismatch` otherwise); `None` on the native-SOL
+    /// path.
+    pub fn release_and_close(ctx: Context<ReleaseAndClose>) -> Result<(u64, u64, u64)> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        // AV-27: the timelock gate reads the Solana clock sysvar — never
+        // an instruction param, so the initializer cannot fast-forward
+        // the lock they configured.
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let (payout, fee, rent) = escrow
+            .release_and_close(
+                ctx.accounts.initializer.key().to_bytes(),
+                now,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+                ctx.accounts.payout_to.key().to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-31: settle via `cpi_settle_payout` (`PayoutKind::Release`)
+        // for the (payout, fee) legs — the same validated plan `release`
+        // uses — then the `close` constraint on `ReleaseAndClose`
+        // transfers the account's remaining lamports (the rent-exempt
+        // deposit, `rent` lamports) to `accounts.initializer` and zeroes
+        // the account.
+        // AV-18: two events in fixed order — `Released` (from == Funded,
+        // to == Released, gross payout + fee) then `VaultClosed`
+        // (from == Released, to == Closed, rent_reclaimed) — mirroring
+        // `escrow_state::IndexedEscrow::release_and_close`.
+        let at = Clock::get()?.unix_timestamp as u64;
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Released,
+            from,
+            escrow_state::EscrowState::Released as u8,
+            payout + fee,
+            fee,
+            0,
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::VaultClosed,
+            escrow_state::EscrowState::Released as u8,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok((payout, fee, rent))
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -2396,6 +2476,44 @@ pub struct CloseVault<'info> {
     /// asserts `initializer.key() == vault.initializer`.
     #[account(mut)]
     pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ReleaseAndClose<'info> {
+    /// AV-50: the vault closes through Anchor's `close` constraint in
+    /// the same instruction that settles the payout — the runtime
+    /// transfers the account's lamports, including the rent-exempt
+    /// deposit (`escrow_state::vault_close_rent_reclaimed`, the same
+    /// figure `initialize` demanded via
+    /// `escrow_state::check_vault_rent_exempt`), to `initializer` and
+    /// zeroes the account. `close` implies `mut`. Combines `Release`'s
+    /// settlement accounts with `CloseVault`'s close: one signature
+    /// instead of two.
+    #[account(mut, close = initializer)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer releases and closes; the state machine
+    /// checks authority before state validity (`Unauthorized`
+    /// otherwise, so strangers learn nothing about state). A constraint
+    /// in the real build asserts `initializer.key() == vault.initializer`.
+    #[account(mut)]
+    pub initializer: Signer<'info>,
+    /// CHECK: beneficiary of the release; receives the funds.
+    pub taker: AccountInfo<'info>,
+    /// CHECK: explicit payout destination (AV-49). The state machine
+    /// requires it to satisfy the escrow's payout policy: the taker,
+    /// or a member of the payout allowlist when one is configured
+    /// (`PayoutNotAllowlisted`, code 127, otherwise). Passed as an
+    /// account (not a param) so the IDL names the destination.
+    pub payout_to: AccountInfo<'info>,
+    /// CHECK: Solana clock sysvar, read for the AV-27 timelock gate
+    /// (never an instruction param — a caller-supplied timestamp would
+    /// let the initializer fast-forward the lock).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account. The real build reads this
+    /// account's `mint` and the state machine requires it to equal the
+    /// bound `vault.mint` (`MintMismatch` otherwise). Unused on the
+    /// native-SOL path — the state machine then requires `None`.
+    pub vault_token_account: AccountInfo<'info>,
 }
 
 // --- Helpers (finalized during the real Anchor build) ---

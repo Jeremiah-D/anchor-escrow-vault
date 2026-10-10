@@ -61,6 +61,10 @@
 //!   `Released` or `Settled`) and `to == Closed`:
 //!   `amounts.rent_reclaimed` carries the rent-exempt lamports the
 //!   initializer reclaimed, every other amount is zero.
+//! - `release_and_close` (AV-50) emits `Released` and then
+//!   `VaultClosed` in that fixed order: the payout first
+//!   (`from == Funded`, `to == Released`, gross payout + fee), then the
+//!   close (`from == Released`, `to == Closed`, `rent_reclaimed`).
 //! - A rejected reentrant entry (AV-36) emits
 //!   [`EscrowEventKind::ReentryRejected`] — the deliberate exception to
 //!   the "failed calls emit nothing" rule. A blocked reentry is a
@@ -1379,6 +1383,62 @@ impl IndexedEscrow {
         );
         Ok(rent)
     }
+
+    /// Release the full remaining lockup to the taker and close the
+    /// vault account in one atomic instruction (mirrors
+    /// [`Escrow::release_and_close`], AV-50). Emits `Released`
+    /// (`from == Funded`, `to == Released`, gross payout + fee) and
+    /// then `VaultClosed` (`from == Released`, `to == Closed`,
+    /// `rent_reclaimed`) — the two events land in `seq` order, and the
+    /// order is fixed: payout first, close second, mirroring the fund
+    /// movements on-chain. Returns `(taker_payout, fee, rent_reclaimed)`
+    /// like the inner method. `at` is both the event timestamp and the
+    /// state machine's `now` (so the AV-27 timelock gate sees the same
+    /// clock the event log records).
+    ///
+    /// Atomicity is two-layered: the inner state machine restores
+    /// `released` / `fees_paid` / `state` when the close leg fails, and
+    /// this wrapper pushes no event unless both legs succeeded — a
+    /// failed call leaves the event log untouched (the AV-36
+    /// `ReentryRejected` exception aside — see `map_reentrant`).
+    pub fn release_and_close(
+        &mut self,
+        authority: [u8; 32],
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+        at: u64,
+    ) -> Result<(u64, u64, u64), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.release_and_close(authority, at, mint, payout_to);
+        let (payout, fee, rent) = self.map_reentrant(result, at)?;
+        // `payout + fee` is the gross payout by construction (== the
+        // released remainder); it cannot overflow u64 addition.
+        self.push_event(
+            EscrowEventKind::Released,
+            from,
+            EscrowState::Released,
+            EventAmounts::payout(payout + fee, fee),
+            at,
+            None,
+            None,
+            None,
+            None,
+        );
+        self.push_event(
+            EscrowEventKind::VaultClosed,
+            EscrowState::Released,
+            EscrowState::Closed,
+            EventAmounts::close(rent),
+            at,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok((payout, fee, rent))
+    }
 }
 
 #[cfg(test)]
@@ -2308,6 +2368,96 @@ mod event_tests {
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(d.event_count(), events_before);
+    }
+
+    // ----- AV-50: release_and_close dual events -----
+
+    #[test]
+    fn release_and_close_emits_released_then_vault_closed_in_fixed_order() {
+        let mut e = funded(1_000_000);
+        let seq_before = e.next_seq();
+        let (payout, fee, rent) = e.release_and_close(ALICE, None, BOB, T0 + 2).unwrap();
+        assert_eq!((payout, fee), (1_000_000, 0));
+        assert_eq!(rent, crate::vault_close_rent_reclaimed());
+        assert_eq!(e.inner().state(), EscrowState::Closed);
+        let events = e.events();
+        // Exactly two new events, in seq order: payout first, close
+        // second — the order is fixed, mirroring the fund movements.
+        assert_eq!(events.len() as u64 - seq_before, 2);
+        let released = &events[events.len() - 2];
+        assert_eq!(released.kind, EscrowEventKind::Released);
+        assert_eq!(released.seq, seq_before);
+        assert_eq!(released.from, EscrowState::Funded);
+        assert_eq!(released.to, EscrowState::Released);
+        assert_eq!(released.escrow_id, ESCROW_ID);
+        assert_eq!(released.amounts.payout, 1_000_000);
+        assert_eq!(released.amounts.fee, 0);
+        assert_eq!(released.amounts.rent_reclaimed, 0);
+        assert_eq!(released.at, T0 + 2);
+        let closed = &events[events.len() - 1];
+        assert_eq!(closed.kind, EscrowEventKind::VaultClosed);
+        assert_eq!(closed.seq, seq_before + 1);
+        assert_eq!(closed.from, EscrowState::Released);
+        assert_eq!(closed.to, EscrowState::Closed);
+        assert_eq!(closed.escrow_id, ESCROW_ID);
+        assert_eq!(
+            closed.amounts.rent_reclaimed,
+            crate::vault_close_rent_reclaimed()
+        );
+        assert_eq!(closed.amounts.payout, 0);
+        assert_eq!(closed.amounts.fee, 0);
+        assert_eq!(closed.at, T0 + 2);
+    }
+
+    #[test]
+    fn release_and_close_first_event_carries_gross_payout_and_fee() {
+        // 250 bps fee: the Released event carries gross payout (payout +
+        // fee) and the fee; the VaultClosed event carries only the rent.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_protocol_fee(250)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let (payout, fee, _) = e.release_and_close(ALICE, None, BOB, T0 + 2).unwrap();
+        assert_eq!((payout, fee), (975_000, 25_000));
+        let events = e.events();
+        let released = &events[events.len() - 2];
+        assert_eq!(released.kind, EscrowEventKind::Released);
+        assert_eq!(released.amounts.payout, 1_000_000);
+        assert_eq!(released.amounts.fee, 25_000);
+        let closed = &events[events.len() - 1];
+        assert_eq!(closed.kind, EscrowEventKind::VaultClosed);
+        assert_eq!(closed.amounts.payout, 0);
+        assert_eq!(closed.amounts.fee, 0);
+    }
+
+    #[test]
+    fn failed_release_and_close_emits_nothing() {
+        // Stranger on a live escrow: Unauthorized, no events.
+        let mut e = funded(1_000_000);
+        let events_before = e.event_count();
+        assert_eq!(
+            e.release_and_close(MALLORY, None, BOB, T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), events_before);
+        // Non-Funded state: InvalidStateTransition, no events.
+        let mut fresh = indexed(1_000_000);
+        let events_before = fresh.event_count();
+        assert_eq!(
+            fresh.release_and_close(ALICE, None, BOB, T0 + 2),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(fresh.event_count(), events_before);
+        // Already-closed: the deepest terminal rejects too, silently.
+        let mut closed = funded(1_000_000);
+        closed.release_and_close(ALICE, None, BOB, T0 + 2).unwrap();
+        let events_before = closed.event_count();
+        assert_eq!(
+            closed.release_and_close(ALICE, None, BOB, T0 + 3),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(closed.event_count(), events_before);
     }
 
     // ----- AV-35: CPI-routed release events -----
