@@ -734,7 +734,7 @@ mod batch_tests {
             .unwrap();
         e.fund(ALICE).unwrap();
         // Partial plain release first: the batch releases the remainder.
-        e.release(ALICE, NOW, 400_000, Some(MINT)).unwrap();
+        e.release(ALICE, NOW, 400_000, Some(MINT), BOB).unwrap();
         let report = scan_batch_lifecycle(&[watch(ID1, Some(e))], NOW);
         let a = action_of(&report, ID1);
         assert_eq!(a.kind, BatchActionKind::Release);
@@ -793,7 +793,7 @@ mod batch_tests {
         e.fund(ALICE).unwrap();
         e.escalate(ALICE, NOW, None).unwrap();
         let mut e2 = funded(AMOUNT);
-        e2.release(ALICE, NOW, AMOUNT, None).unwrap();
+        e2.release(ALICE, NOW, AMOUNT, None, BOB).unwrap();
         assert_eq!(e2.state(), EscrowState::Released);
         let mut e3 = funded(AMOUNT);
         e3.cancel(ALICE, None, ALICE).unwrap();
@@ -893,7 +893,7 @@ mod batch_tests {
     #[test]
     fn json_blocked_and_done_shapes() {
         let mut e = funded(AMOUNT);
-        e.release(ALICE, NOW, AMOUNT, None).unwrap();
+        e.release(ALICE, NOW, AMOUNT, None, BOB).unwrap();
         let report = scan_batch_lifecycle(
             &[watch(ID1, Some(e))],
             NOW,

@@ -667,7 +667,7 @@ mod keeper_tests {
     fn unfunded_and_terminal_escrows_yield_no_actions() {
         let uninit = Escrow::initialize(ALICE, BOB, AMOUNT, 0).unwrap();
         let mut released = funded(AMOUNT, NEVER);
-        released.release(ALICE, 1_750_000_000, AMOUNT, None).unwrap();
+        released.release(ALICE, 1_750_000_000, AMOUNT, None, BOB).unwrap();
         let mut cancelled = funded(AMOUNT, NEVER);
         cancelled.cancel(ALICE, None, ALICE).unwrap();
         let watched = [watch(ID1, uninit), watch(ID2, released), watch(ID3, cancelled)];
@@ -802,7 +802,7 @@ mod keeper_tests {
     #[test]
     fn cancel_expired_refunds_the_remainder_after_partial_release() {
         let mut e = funded(AMOUNT, 0);
-        e.release(ALICE, 1_750_000_000, 400_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 400_000, None, BOB).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
         assert_eq!(report.actions.len(), 2);
@@ -858,7 +858,7 @@ mod keeper_tests {
         // The initializer released ahead of the curve: the claimable
         // remainder is what is vested but not yet released.
         let mut e = funded_vesting(NEVER);
-        e.release(ALICE, 1_750_000_000, 200_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 200_000, None, BOB).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
         assert_eq!(report.actions.len(), 1);
@@ -1207,7 +1207,7 @@ mod close_keeper_tests {
 
     fn released() -> Escrow {
         let mut e = funded(ALICE);
-        e.release(ALICE, MID, AMOUNT, None).unwrap();
+        e.release(ALICE, MID, AMOUNT, None, BOB).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
         e
     }
@@ -1219,7 +1219,7 @@ mod close_keeper_tests {
             .unwrap();
         e.fund(ALICE).unwrap();
         e.escalate(ALICE, MID, None).unwrap();
-        e.resolve(ARBITER, 400_000, None, None).unwrap();
+        e.resolve(ARBITER, 400_000, None, None, BOB).unwrap();
         assert_eq!(e.state(), EscrowState::Settled);
         e
     }
@@ -2441,7 +2441,7 @@ mod rent_health_tests {
 
     fn released() -> Escrow {
         let mut e = funded();
-        e.release(ALICE, NOW, AMOUNT, None).unwrap();
+        e.release(ALICE, NOW, AMOUNT, None, BOB).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
         e
     }

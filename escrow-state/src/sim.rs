@@ -459,7 +459,7 @@ impl Runner {
                 Self::expect_ok(r, "confirm_milestone(taker)", ctx, idx);
             } else {
                 let (payout, fee) = Self::expect_ok(
-                    s.escrow.release_milestone(ALICE, now, s.ms_next as u8, s.mint),
+                    s.escrow.release_milestone(ALICE, now, s.ms_next as u8, s.mint, BOB),
                     "release_milestone",
                     ctx,
                     idx,
@@ -511,7 +511,7 @@ impl Runner {
             }
             ValidOp::Release(amount) => {
                 let (payout, fee) = Self::expect_ok(
-                    s.escrow.release(ALICE, now, amount, s.mint),
+                    s.escrow.release(ALICE, now, amount, s.mint, BOB),
                     "release",
                     ctx,
                     idx,
@@ -526,7 +526,7 @@ impl Runner {
             ValidOp::Claim => {
                 let expected = s.vested_now(now).saturating_sub(s.escrow.released_amount());
                 let (payout, fee) =
-                    Self::expect_ok(s.escrow.claim(BOB, now, s.mint), "claim", ctx, idx);
+                    Self::expect_ok(s.escrow.claim(BOB, now, s.mint, BOB), "claim", ctx, idx);
                 assert_eq!(
                     payout + fee,
                     expected,
@@ -558,7 +558,7 @@ impl Runner {
             }
             ValidOp::Resolve(taker_amount) => {
                 let (payout, fee, refund) = Self::expect_ok(
-                    s.escrow.resolve(ARB, taker_amount, s.mint, None),
+                    s.escrow.resolve(ARB, taker_amount, s.mint, None, BOB),
                     "resolve",
                     ctx,
                     idx,
@@ -603,7 +603,7 @@ impl Runner {
             // fails identically in every state.
             cands.push(Probe {
                 name: "stranger release",
-                run: |s, now| s.escrow.release(MALLORY, now, 1, s.mint).map(|_| ()),
+                run: |s, now| s.escrow.release(MALLORY, now, 1, s.mint, BOB).map(|_| ()),
                 expected: EscrowError::Unauthorized,
             });
             cands.push(Probe {
@@ -621,7 +621,7 @@ impl Runner {
             match state {
                 EscrowState::Uninitialized => cands.push(Probe {
                     name: "release before fund",
-                    run: |s, now| s.escrow.release(ALICE, now, 1, s.mint).map(|_| ()),
+                    run: |s, now| s.escrow.release(ALICE, now, 1, s.mint, BOB).map(|_| ()),
                     expected: EscrowError::InvalidStateTransition,
                 }),
                 // fund from Activated is the valid dual-sig funding path, so
@@ -658,18 +658,18 @@ impl Runner {
                         name: "over release",
                         run: |s, now| {
                             let over = s.escrow.remaining_amount() + 1;
-                            s.escrow.release(ALICE, now, over, s.mint).map(|_| ())
+                            s.escrow.release(ALICE, now, over, s.mint, BOB).map(|_| ())
                         },
                         expected: EscrowError::ReleaseExceedsLocked,
                     });
                     cands.push(Probe {
                         name: "zero release",
-                        run: |s, now| s.escrow.release(ALICE, now, 0, s.mint).map(|_| ()),
+                        run: |s, now| s.escrow.release(ALICE, now, 0, s.mint, BOB).map(|_| ()),
                         expected: EscrowError::AmountMismatch,
                     });
                     cands.push(Probe {
                         name: "claim without vesting",
-                        run: |s, now| s.escrow.claim(BOB, now, s.mint).map(|_| ()),
+                        run: |s, now| s.escrow.claim(BOB, now, s.mint, BOB).map(|_| ()),
                         expected: EscrowError::InvalidVesting,
                     });
                 }
@@ -684,7 +684,7 @@ impl Runner {
             if state == EscrowState::Disputed {
                 cands.push(Probe {
                     name: "stranger resolve",
-                    run: |s, _| s.escrow.resolve(MALLORY, 0, s.mint, None).map(|_| ()),
+                    run: |s, _| s.escrow.resolve(MALLORY, 0, s.mint, None, BOB).map(|_| ()),
                     expected: EscrowError::Unauthorized,
                 });
             }

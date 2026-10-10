@@ -223,6 +223,10 @@ pub struct EscrowSnapshot {
     /// `release_milestone`) pass the timelock at [`EscrowSnapshot::at`]:
     /// `at >= unlock_at`. Same predicate the keeper scan uses (AV-27).
     pub unlock_eligible: bool,
+    /// Payout destination allowlist, or `None` when no allowlist is
+    /// configured (AV-49). When `Some`, every fund-moving transition
+    /// requires its `payout_to` to be a member.
+    pub payout_allowlist: Option<Vec<[u8; 32]>>,
 }
 
 impl Escrow {
@@ -304,6 +308,9 @@ impl Escrow {
             rationale_hash: self.rationale_hash(),
             refund_to: self.refund_to(),
             refund_recipient: self.refund_recipient(),
+            payout_allowlist: self
+                .payout_allowlist()
+                .map(|list| list.as_slice().to_vec()),
             penalty_bps: self.penalty_bps(),
             unlock_at: self.unlock_at(),
             unlock_eligible: self.is_unlock_eligible(now),
@@ -495,6 +502,24 @@ impl EscrowSnapshot {
         s.push_str(&self.unlock_at.to_string());
         s.push_str(",\"unlock_eligible\":");
         s.push_str(if self.unlock_eligible { "true" } else { "false" });
+        // AV-49: payout destination allowlist — `null` when none is
+        // configured, else the allowlisted addresses as hex strings.
+        s.push_str(",\"payout_allowlist\":");
+        match &self.payout_allowlist {
+            Some(addrs) => {
+                s.push('[');
+                for (i, a) in addrs.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push('"');
+                    s.push_str(&hex32(a));
+                    s.push('"');
+                }
+                s.push(']');
+            }
+            None => s.push_str("null"),
+        }
         s.push('}');
         s
     }
@@ -548,7 +573,7 @@ mod snapshot_tests {
              \"milestones\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
-             \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true\
+             \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"payout_allowlist\":null\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),
@@ -603,7 +628,7 @@ mod snapshot_tests {
             .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
             .unwrap();
         e.fund(ALICE).unwrap();
-        e.release(ALICE, 1_750_000_000, 200_000, None).unwrap();
+        e.release(ALICE, 1_750_000_000, 200_000, None, BOB).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.released, 200_000);
         assert_eq!(snap.remaining, 800_000);
@@ -669,7 +694,7 @@ mod snapshot_tests {
         // Release tranche 0: it settles, tranche 1 becomes next. The
         // confirmation bits persist — they record that the tranche was
         // duly confirmed, even after settlement.
-        e.release_milestone(ALICE, 1_750_000_000, 0, None).unwrap();
+        e.release_milestone(ALICE, 1_750_000_000, 0, None, BOB).unwrap();
         let snap = e.snapshot(MID);
         let m = snap.milestones.as_ref().expect("plan must snapshot");
         assert_eq!(m.settled, 1);
@@ -730,7 +755,7 @@ mod snapshot_tests {
         e.fund(ALICE).unwrap();
         e.escalate(BOB, MID, None).unwrap();
         assert_eq!(e.snapshot(MID).rationale_hash, None);
-        e.resolve(ARBITER, 400_000, None, Some(RATIONALE)).unwrap();
+        e.resolve(ARBITER, 400_000, None, Some(RATIONALE), BOB).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.state, "settled");
         assert_eq!(snap.rationale_hash, Some(RATIONALE));
@@ -781,7 +806,7 @@ mod snapshot_tests {
         assert_eq!(snap.claimable, 500_000);
         assert!(!snap.expiry_eligible); // MID < expires_at + grace
         // A 1% fee'd claim: fees accumulate on the snapshot too.
-        e.claim(BOB, MID, Some(MINT)).unwrap();
+        e.claim(BOB, MID, Some(MINT), BOB).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.released, 500_000);
         assert_eq!(snap.fees_paid, 5_000); // 1% of 500_000
@@ -797,7 +822,7 @@ mod snapshot_tests {
     #[test]
     fn terminal_states_snapshot_honestly() {
         let mut e = funded(AMOUNT, NEVER);
-        e.release(ALICE, 1_750_000_000, AMOUNT, None).unwrap();
+        e.release(ALICE, 1_750_000_000, AMOUNT, None, BOB).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.state, "released");
         assert_eq!(snap.released, AMOUNT);
@@ -824,7 +849,7 @@ mod snapshot_tests {
             .with_decimals(6)
             .unwrap();
         e.fund(ALICE).unwrap();
-        e.release(ALICE, MID, 250_000, None).unwrap();
+        e.release(ALICE, MID, 250_000, None, BOB).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.decimals, 6);
         assert_eq!(snap.amount, AMOUNT);
@@ -868,7 +893,7 @@ mod snapshot_tests {
             "got: {json}"
         );
         // A 1% fee'd claim: fees_paid renders too.
-        e.claim(BOB, MID, None).unwrap();
+        e.claim(BOB, MID, None, BOB).unwrap();
         let json = e.snapshot(MID).to_json();
         assert!(
             json.contains("\"fees_paid\":5000,\"display_fees_paid\":\"0.005000\""),

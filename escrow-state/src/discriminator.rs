@@ -36,9 +36,9 @@
 //! the result.
 
 use super::{
-    sha256, Escrow, EscrowState, MilestonePlan, QuorumPolicy, VestingSchedule,
-    ANCHOR_DISCRIMINATOR_LEN, ESCROW_BODY_LEN, MAX_ATTESTORS, MAX_MILESTONES, MILESTONE_PLAN_LEN,
-    PUBKEY_LEN, QUORUM_POLICY_LEN, VAULT_SPACE,
+    sha256, Escrow, EscrowState, MilestonePlan, PayoutAllowlist, QuorumPolicy, VestingSchedule,
+    ANCHOR_DISCRIMINATOR_LEN, ESCROW_BODY_LEN, MAX_ATTESTORS, MAX_MILESTONES, MAX_PAYOUT_ALLOWLIST,
+    MILESTONE_PLAN_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, VAULT_SPACE,
 };
 
 /// Program-side `#[account]` type names, in Anchor IDL order. The single
@@ -93,6 +93,13 @@ pub enum AccountDecodeError {
     /// An `Option` discriminant byte is neither 0 nor 1. `field` names
     /// the [`VAULT_FIELDS`](crate::VAULT_FIELDS) field being decoded.
     InvalidOptionDiscriminant { field: &'static str, value: u8 },
+    /// A present payout allowlist's entry count is outside `1..=4`
+    /// ([`MAX_PAYOUT_ALLOWLIST`](crate::MAX_PAYOUT_ALLOWLIST)). The
+    /// count byte is part of the field's layout — an out-of-range count
+    /// would make [`PayoutAllowlist::as_slice`] panic, so the decoder
+    /// rejects it rather than decoding a value the accessors cannot
+    /// safely read (AV-49; AV-32 panic-free guarantee).
+    InvalidPayoutAllowlistLen(u8),
 }
 
 /// Bounds-checked cursor over the account body. Every read is
@@ -360,6 +367,32 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // escrow is not paused); appended last so every earlier offset
     // above is unchanged.
     let paused = c.u8()? != 0;
+    // AV-49: payout destination allowlist, always reserved like
+    // `refund_to`: the `None` discriminant followed by a zeroed
+    // 4-address region and count byte, appended last so every earlier
+    // offset above is unchanged. The count is validated `1..=4` — an
+    // out-of-range count would make `PayoutAllowlist::as_slice` panic,
+    // so the panic-free decoder rejects it (see
+    // `InvalidPayoutAllowlistLen`).
+    let payout_allowlist = if c.option_present("payout_allowlist")? {
+        let mut addrs = [[0u8; 32]; MAX_PAYOUT_ALLOWLIST];
+        for a in addrs.iter_mut() {
+            *a = c.pubkey()?;
+        }
+        let len = c.u8()?;
+        if len == 0 || len as usize > MAX_PAYOUT_ALLOWLIST {
+            return Err(AccountDecodeError::InvalidPayoutAllowlistLen(len));
+        }
+        debug_assert_eq!(
+            PAYOUT_ALLOWLIST_LEN,
+            4 * 32 + 1,
+            "allowlist region drift vs PAYOUT_ALLOWLIST_LEN"
+        );
+        Some(PayoutAllowlist { addrs, len })
+    } else {
+        c.skip(PAYOUT_ALLOWLIST_LEN)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -394,6 +427,7 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         fee_recipient,
         pause_authority,
         paused,
+        payout_allowlist,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
@@ -568,7 +602,7 @@ mod discriminator_tests {
     #[test]
     fn decode_round_trips_terminal_states() {
         let mut released = funded(1_000_000, EXPIRES_AT);
-        released.release(ALICE, EXPIRES_AT + 1, 1_000_000, None).unwrap();
+        released.release(ALICE, EXPIRES_AT + 1, 1_000_000, None, BOB).unwrap();
         let mut cancelled = funded(2_000_000, EXPIRES_AT);
         cancelled.cancel(ALICE, None, ALICE).unwrap();
         for e in [released, cancelled] {

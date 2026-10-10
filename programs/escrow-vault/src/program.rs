@@ -144,6 +144,7 @@ pub mod escrow_vault {
                 now,
                 amount,
                 vault_token_mint(&ctx.accounts.vault_token_account),
+                ctx.accounts.payout_to.key().to_bytes(),
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
@@ -209,6 +210,7 @@ pub mod escrow_vault {
                 now,
                 amount,
                 vault_token_mint(&ctx.accounts.vault_token_account),
+                ctx.accounts.payout_to.key().to_bytes(),
                 &invocation,
                 // The execution seam: the real build invokes the target
                 // program here via `cpi_invoke_target` below. A failed
@@ -689,6 +691,7 @@ pub mod escrow_vault {
                 ctx.accounts.taker.key().to_bytes(),
                 now,
                 vault_token_mint(&ctx.accounts.vault_token_account),
+                ctx.accounts.payout_to.key().to_bytes(),
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
@@ -806,6 +809,7 @@ pub mod escrow_vault {
                 taker_amount,
                 vault_token_mint(&ctx.accounts.vault_token_account),
                 rationale_hash,
+                ctx.accounts.payout_to.key().to_bytes(),
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
@@ -921,6 +925,7 @@ pub mod escrow_vault {
                 now,
                 index,
                 vault_token_mint(&ctx.accounts.vault_token_account),
+                ctx.accounts.payout_to.key().to_bytes(),
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
@@ -1228,13 +1233,85 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Set the payout destination allowlist (AV-49; mirrors
+    /// `Escrow::with_payout_allowlist`). Only the initializer signs, and
+    /// only while the escrow is `Uninitialized` — the allowlist is a
+    /// funding-time policy, like the quorum or vesting schedule. 1–4
+    /// live addresses; empty / over-long / zero-address input is
+    /// `InvalidPayoutAllowlist` (code 126). The 130-byte region is
+    /// always present (zeroed when `None`), so this writes in place —
+    /// no realloc in the real build. Emits no event (pre-fund
+    /// configuration, like `with_pause_authority`).
+    pub fn initialize_payout_allowlist(
+        ctx: Context<InitializePayoutAllowlist>,
+        allowlist: Vec<Pubkey>,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let addrs: Vec<[u8; 32]> = allowlist.iter().map(|k| k.to_bytes()).collect();
+        let escrow = escrow
+            .with_payout_allowlist(&addrs)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.payout_allowlist` is always present (130 bytes, zeroed
+        // by default), so the list is written in place — no realloc
+        // needed in the real build.
+        Ok(())
+    }
+
+    /// Update the payout destination allowlist (AV-49; mirrors
+    /// `Escrow::update_payout_allowlist`). Dual-signature governance:
+    /// on a dual-sig escrow both initializer and taker sign; on a plain
+    /// escrow the initializer alone. An empty list clears the allowlist
+    /// (back to taker-only payouts). `Uninitialized` / `Funded` only;
+    /// `InvalidPayoutAllowlist` (code 126) on over-long / zero-address
+    /// input. Emits `PayoutAllowlistUpdated` (from == to == the current
+    /// state).
+    pub fn update_payout_allowlist(
+        ctx: Context<UpdatePayoutAllowlist>,
+        allowlist: Vec<Pubkey>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.payout_allowlist();
+        let addrs: Vec<[u8; 32]> = allowlist.iter().map(|k| k.to_bytes()).collect();
+        escrow
+            .update_payout_allowlist(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &addrs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.payout_allowlist` in place in the real build
+        // (130 bytes, always present, zeroed when None) — no realloc.
+        // Emits only on an actual change; a same-list no-op stays
+        // silent (mirrors `rotate_pause_authority`).
+        if escrow.payout_allowlist() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::PayoutAllowlistUpdated,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Release the emergency pause (AV-46; mirrors `Escrow::unpause`).
     /// Same authority rules as `pause`; unpausing a non-paused escrow is
     /// `InvalidStateTransition` (strict toggle). State-changing
     /// transitions work again. Emits `Unpaused` (from == to == the
     /// current state).
-    pub fn unpause(ctx: Context<Unpause>) -> Result<()> {
-        let mut escrow = read_escrow(&ctx.accounts.vault);
+    pub fn unpause(ctx: Context<Unpause>) -> Result<()> {        let mut escrow = read_escrow(&ctx.accounts.vault);
         let state = escrow.state() as u8;
         escrow
             .unpause(ctx.accounts.pause_authority.key().to_bytes())
@@ -1574,6 +1651,15 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `pause_authority`).
     pub paused: bool,
+    /// AV-49: payout destination allowlist; mirrors
+    /// `escrow_state::PayoutAllowlist`. `None` for an escrow with no
+    /// allowlist (payouts go to the taker). The account always reserves
+    /// the full 130-byte region (1-byte discriminant + 4×32-byte
+    /// addresses + 1-byte count, zeroed when `None`) so
+    /// `initialize_payout_allowlist` / `update_payout_allowlist` write
+    /// the list in place without reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after `paused`).
+    pub payout_allowlist: Option<PayoutAllowlist>,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -1622,6 +1708,16 @@ pub struct Quorum {
 pub struct MilestonePlan {
     pub amounts: [u64; 8],
     pub count: u8,
+}
+
+/// AV-49: skeleton mirror of `escrow_state::PayoutAllowlist`: up to 4
+/// payout-destination pubkeys in slot order plus the live count.
+/// Serialized size is pinned by `escrow_state::PAYOUT_ALLOWLIST_LEN`
+/// (129 bytes: 4×32-byte addresses + 1-byte count).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct PayoutAllowlist {
+    pub addrs: [Pubkey; 4],
+    pub len: u8,
 }
 
 /// AV-18: on-chain indexer event, the `emit!` mirror of
@@ -1821,6 +1917,12 @@ pub struct Release<'info> {
     pub initializer: Signer<'info>,
     /// CHECK: beneficiary of the release; receives the funds.
     pub taker: AccountInfo<'info>,
+    /// CHECK: explicit payout destination (AV-49). The state machine
+    /// requires it to satisfy the escrow's payout policy: the taker,
+    /// or a member of the payout allowlist when one is configured
+    /// (`PayoutNotAllowlisted`, code 127, otherwise). Passed as an
+    /// account (not a param) so the IDL names the destination.
+    pub payout_to: AccountInfo<'info>,
     /// CHECK: Solana clock sysvar, read for the AV-27 timelock gate
     /// (never an instruction param — a caller-supplied timestamp would
     /// let the initializer fast-forward the lock).
@@ -1842,6 +1944,9 @@ pub struct ReleaseViaCpi<'info> {
     /// instruction instead. Kept as a named account so the IDL stays
     /// explicit about who the release is for.
     pub taker: AccountInfo<'info>,
+    /// CHECK: explicit payout destination (AV-49; see `Release`). The
+    /// state machine enforces the payout policy on it.
+    pub payout_to: AccountInfo<'info>,
     /// CHECK: Solana clock sysvar, read for the AV-27 timelock gate
     /// (never an instruction param).
     pub clock: AccountInfo<'info>,
@@ -2003,6 +2108,9 @@ pub struct Claim<'info> {
     /// Only the taker may pull the vested stream; the state machine
     /// rejects anyone else with `Unauthorized`.
     pub taker: Signer<'info>,
+    /// CHECK: explicit payout destination (AV-49; see `Release`). The
+    /// state machine enforces the payout policy on it.
+    pub payout_to: AccountInfo<'info>,
     /// CHECK: Solana clock sysvar, read for the vesting curve (never an
     /// instruction param).
     pub clock: AccountInfo<'info>,
@@ -2046,6 +2154,10 @@ pub struct Resolve<'info> {
     pub arbiter: Signer<'info>,
     /// CHECK: beneficiary of the taker's share of the split.
     pub taker: AccountInfo<'info>,
+    /// CHECK: explicit payout destination for the taker's share (AV-49;
+    /// see `Release`). The state machine enforces the payout policy on
+    /// it.
+    pub payout_to: AccountInfo<'info>,
     /// CHECK: beneficiary of the initializer's refund share of the split.
     pub initializer: AccountInfo<'info>,
     /// CHECK: the vault's SPL token account (see `Release`). The real
@@ -2083,6 +2195,9 @@ pub struct ReleaseMilestone<'info> {
     pub initializer: Signer<'info>,
     /// CHECK: beneficiary of the tranche; receives the funds.
     pub taker: AccountInfo<'info>,
+    /// CHECK: explicit payout destination (AV-49; see `Release`). The
+    /// state machine enforces the payout policy on it.
+    pub payout_to: AccountInfo<'info>,
     /// CHECK: Solana clock sysvar, read for the AV-27 timelock gate
     /// (never an instruction param — see `Release`).
     pub clock: AccountInfo<'info>,
@@ -2187,6 +2302,28 @@ pub struct RotatePauseAuthority<'info> {
     /// owner-governance power, so the *escrow* authority signs, not the
     /// pause key. A stranger (or the taker) is `Unauthorized`.
     pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitializePayoutAllowlist<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer sets the funding-time payout policy; the
+    /// state machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`, and rejects empty / over-long / zero-address
+    /// input (`InvalidPayoutAllowlist`, code 126).
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UpdatePayoutAllowlist<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Dual-signature governance: on a dual-sig escrow both initializer
+    /// and taker sign; on a plain escrow the initializer alone (the
+    /// state machine enforces this — a stranger is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
 }
 
 #[derive(Accounts)]
@@ -2527,6 +2664,8 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidFeeRecipient => error!(ErrorCode::InvalidFeeRecipient),
         escrow_state::EscrowError::Paused => error!(ErrorCode::Paused),
         escrow_state::EscrowError::InvalidPauseAuthority => error!(ErrorCode::InvalidPauseAuthority),
+        escrow_state::EscrowError::InvalidPayoutAllowlist => error!(ErrorCode::InvalidPayoutAllowlist),
+        escrow_state::EscrowError::PayoutNotAllowlisted => error!(ErrorCode::PayoutNotAllowlisted),
     }
 }
 
@@ -2584,4 +2723,8 @@ pub enum ErrorCode {
     Paused,
     #[msg("Invalid pause authority: with_pause_authority with the zero address (a zero address can never hold the emergency switch)")]
     InvalidPauseAuthority,
+    #[msg("Invalid payout allowlist: with_payout_allowlist with an empty list, more than 4 addresses, or a zero address (the AV-49 allowlist must be 1-4 live payout destinations)")]
+    InvalidPayoutAllowlist,
+    #[msg("Payout destination not allowlisted: a payout transition named a payout_to that is neither the taker nor a member of the AV-49 payout destination allowlist")]
+    PayoutNotAllowlisted,
 }

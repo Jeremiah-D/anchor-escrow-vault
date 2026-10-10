@@ -198,6 +198,15 @@ pub enum EscrowEventKind {
     /// the crank caller's key — the one kind where the caller is neither
     /// party, so the indexer cannot infer it from the escrow's parties.
     ExpiredCranked,
+    /// AV-49: the payout destination allowlist was updated by owner
+    /// governance ([`Escrow::update_payout_allowlist`]). `from == to ==`
+    /// the current state (a config change, not a lifecycle move — like
+    /// [`EscrowEventKind::QuorumUpdated`]); the new list is read from
+    /// the vault, the event is the ordering signal. Amounts are zero.
+    /// (The initialize-time builder [`Escrow::with_payout_allowlist`]
+    /// emits no event — pre-fund configuration, like
+    /// [`Escrow::with_pause_authority`].)
+    PayoutAllowlistUpdated,
 }
 
 /// Fund movements carried by an [`EscrowEvent`].
@@ -671,12 +680,13 @@ impl IndexedEscrow {
         authority: [u8; 32],
         amount: u64,
         mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
         at: u64,
     ) -> Result<(u64, u64), EscrowError> {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
-        let result = self.inner.release(authority, at, amount, mint);
+        let result = self.inner.release(authority, at, amount, mint, payout_to);
         let (payout, fee) = self.map_reentrant(result, at)?;
         // `amount` is the gross payout by construction
         // (`payout + fee == amount`); it cannot overflow u64 addition.
@@ -713,6 +723,7 @@ impl IndexedEscrow {
         authority: [u8; 32],
         amount: u64,
         mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
         at: u64,
         cpi: &CpiInvocation,
         execute_cpi: F,
@@ -725,7 +736,7 @@ impl IndexedEscrow {
         // `ReentryRejected`.
         let result = self
             .inner
-            .release_via_cpi(authority, at, amount, mint, cpi, execute_cpi);
+            .release_via_cpi(authority, at, amount, mint, payout_to, cpi, execute_cpi);
         let (payout, fee, receipt) = self.map_reentrant(result, at)?;
         // `amount` is the gross payout by construction
         // (`payout + fee == amount`); it cannot overflow u64 addition.
@@ -1083,6 +1094,40 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Update the payout destination allowlist (mirrors
+    /// [`Escrow::update_payout_allowlist`]). Emits `PayoutAllowlistUpdated`
+    /// only when the list actually changes; `from == to ==` the current
+    /// state. `at` is the caller-supplied event timestamp.
+    pub fn update_payout_allowlist(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        addrs: &[[u8; 32]],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.payout_allowlist();
+        self.inner.update_payout_allowlist(initializer, taker, addrs)?;
+        let after = self.inner.payout_allowlist();
+        // The inner call rejects bad input, strangers, and wrong states,
+        // so a changed list here always means real governance — and a
+        // same-list no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+            EscrowEventKind::PayoutAllowlistUpdated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Claim the vested-but-unreleased portion (mirrors [`Escrow::claim`]).
     /// Emits `Claimed`; `now` doubles as the event's `at`. Partial
     /// claims carry `from == to == Funded`, the closing one
@@ -1092,11 +1137,12 @@ impl IndexedEscrow {
         authority: [u8; 32],
         now: u64,
         mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
     ) -> Result<(u64, u64), EscrowError> {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected` (`now` doubles as the event's `at`).
-        let result = self.inner.claim(authority, now, mint);
+        let result = self.inner.claim(authority, now, mint, payout_to);
         let (payout, fee) = self.map_reentrant(result, now)?;
         // `payout + fee` is the gross claimable (`<= amount`); no
         // overflow possible.
@@ -1154,12 +1200,13 @@ impl IndexedEscrow {
         taker_amount: u64,
         mint: Option<[u8; 32]>,
         rationale_hash: Option<[u8; 32]>,
+        payout_to: [u8; 32],
         at: u64,
     ) -> Result<(u64, u64, u64), EscrowError> {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
-        let result = self.inner.resolve(authority, taker_amount, mint, rationale_hash);
+        let result = self.inner.resolve(authority, taker_amount, mint, rationale_hash, payout_to);
         let (payout, fee, refund) = self.map_reentrant(result, at)?;
         // `taker_amount` is the gross taker share by construction
         // (`payout + fee == taker_amount`).
@@ -1234,6 +1281,7 @@ impl IndexedEscrow {
         authority: [u8; 32],
         index: u8,
         mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
         at: u64,
     ) -> Result<(u64, u64), EscrowError> {
         let from = self.inner.state();
@@ -1241,7 +1289,7 @@ impl IndexedEscrow {
         // `ReentryRejected`.
         let result = self
             .inner
-            .release_milestone(authority, at, index, mint);
+            .release_milestone(authority, at, index, mint, payout_to);
         let (payout, fee) = self.map_reentrant(result, at)?;
         // `payout + fee` is the gross tranche (`<= amount`); no overflow
         // possible.
@@ -1428,7 +1476,7 @@ mod event_tests {
     fn initialize_fund_release_yields_ordered_seq() {
         let mut e = indexed(1_000_000);
         e.fund(ALICE, T0 + 1).unwrap();
-        e.release(ALICE, 1_000_000, None, T0 + 2).unwrap();
+        e.release(ALICE, 1_000_000, None, BOB, T0 + 2).unwrap();
         let events = e.events();
         assert_eq!(events.len(), 3);
         assert_event(
@@ -1473,7 +1521,7 @@ mod event_tests {
     #[test]
     fn partial_releases_emit_without_state_change() {
         let mut e = funded(1_000_000);
-        e.release(ALICE, 400_000, None, T0 + 2).unwrap();
+        e.release(ALICE, 400_000, None, BOB, T0 + 2).unwrap();
         assert_event(
             &last(&e),
             EscrowEventKind::Released,
@@ -1485,7 +1533,7 @@ mod event_tests {
             0,
             T0 + 2,
         );
-        e.release(ALICE, 600_000, None, T0 + 3).unwrap();
+        e.release(ALICE, 600_000, None, BOB, T0 + 3).unwrap();
         assert_event(
             &last(&e),
             EscrowEventKind::Released,
@@ -1536,7 +1584,7 @@ mod event_tests {
     #[test]
     fn cancel_emits_refund_of_remainder() {
         let mut e = funded(1_000_000);
-        e.release(ALICE, 300_000, None, T0 + 2).unwrap();
+        e.release(ALICE, 300_000, None, BOB, T0 + 2).unwrap();
         e.cancel(ALICE, None, ALICE, T0 + 3).unwrap();
         assert_event(
             &last(&e),
@@ -1703,7 +1751,7 @@ mod event_tests {
         let mut e = indexed(1_000_000).with_vesting(schedule).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
         // Fully vested at `end`: the claim closes the escrow.
-        let (payout, fee) = e.claim(BOB, T0 + 1_000, None).unwrap();
+        let (payout, fee) = e.claim(BOB, T0 + 1_000, None, BOB).unwrap();
         assert_eq!((payout, fee), (1_000_000, 0));
         assert_event(
             &last(&e),
@@ -1734,7 +1782,7 @@ mod event_tests {
             0,
             EXPIRES_AT - 1,
         );
-        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, T0 + 3).unwrap();
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, BOB, T0 + 3).unwrap();
         assert_eq!((payout, fee, refund), (600_000, 0, 400_000));
         assert_event(
             &last(&e),
@@ -1779,7 +1827,7 @@ mod event_tests {
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
         e.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE)).unwrap();
-        e.resolve(ARBITER, 600_000, None, None, T0 + 3).unwrap();
+        e.resolve(ARBITER, 600_000, None, None, BOB, T0 + 3).unwrap();
         let event = last(&e);
         assert_eq!(event.kind, EscrowEventKind::Resolved);
         assert_eq!(event.from, EscrowState::Disputed);
@@ -1808,7 +1856,7 @@ mod event_tests {
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
         e.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE)).unwrap();
-        e.resolve(ARBITER, 600_000, None, Some(RATIONALE), T0 + 3)
+        e.resolve(ARBITER, 600_000, None, Some(RATIONALE), BOB, T0 + 3)
             .unwrap();
         let event = last(&e);
         assert_eq!(event.kind, EscrowEventKind::Resolved);
@@ -1822,7 +1870,7 @@ mod event_tests {
         let mut e2 = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e2.fund(ALICE, T0 + 1).unwrap();
         e2.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
-        e2.resolve(ARBITER, 600_000, None, None, T0 + 3).unwrap();
+        e2.resolve(ARBITER, 600_000, None, None, BOB, T0 + 3).unwrap();
         assert_eq!(last(&e2).rationale_hash, None);
         // Non-resolve events never carry a rationale hash.
         assert!(e
@@ -1853,7 +1901,7 @@ mod event_tests {
             0,
             T0 + 3,
         );
-        e.release_milestone(ALICE, 0, None, T0 + 4).unwrap();
+        e.release_milestone(ALICE, 0, None, BOB, T0 + 4).unwrap();
         assert_event(
             &last(&e),
             EscrowEventKind::MilestoneReleased,
@@ -1893,9 +1941,9 @@ mod event_tests {
         // Double fund.
         assert!(e.fund(ALICE, T0 + 9).is_err());
         // Zero-amount release.
-        assert!(e.release(ALICE, 0, None, T0 + 9).is_err());
+        assert!(e.release(ALICE, 0, None, BOB, T0 + 9).is_err());
         // Over-release.
-        assert!(e.release(ALICE, 1_000_001, None, T0 + 9).is_err());
+        assert!(e.release(ALICE, 1_000_001, None, BOB, T0 + 9).is_err());
         // Cancel by a stranger.
         assert!(e.cancel(MALLORY, None, ALICE, T0 + 9).is_err());
         // Attest with no quorum configured.
@@ -1903,10 +1951,10 @@ mod event_tests {
         // Escalate with no arbiter configured.
         assert!(e.escalate(ALICE, T0 + 9, None).is_err());
         // Resolve outside a dispute.
-        assert!(e.resolve(ARBITER, 1, None, None, T0 + 9).is_err());
+        assert!(e.resolve(ARBITER, 1, None, None, BOB, T0 + 9).is_err());
         // Milestone ops with no plan attached.
         assert!(e.confirm_milestone(ALICE, 0, T0 + 9).is_err());
-        assert!(e.release_milestone(ALICE, 0, None, T0 + 9).is_err());
+        assert!(e.release_milestone(ALICE, 0, None, BOB, T0 + 9).is_err());
         assert!(e.skip_milestone(ALICE, 0, T0 + 9).is_err());
         // Failed constructor emits nothing either.
         assert!(IndexedEscrow::initialize(ALICE, BOB, 0, EXPIRES_AT, ESCROW_ID, T0).is_err());
@@ -2067,7 +2115,7 @@ mod event_tests {
     fn fee_escrow_splits_payout_and_fee_in_events() {
         let mut e = indexed(1_000_000).with_protocol_fee(250).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        let (payout, fee) = e.release(ALICE, 1_000_000, None, T0 + 2).unwrap();
+        let (payout, fee) = e.release(ALICE, 1_000_000, None, BOB, T0 + 2).unwrap();
         // 250 bps of 1_000_000 = 25_000.
         assert_eq!((payout, fee), (975_000, 25_000));
         assert_event(
@@ -2092,7 +2140,7 @@ mod event_tests {
             .unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
         e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
-        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, T0 + 3).unwrap();
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, BOB, T0 + 3).unwrap();
         // 1000 bps of 600_000 = 60_000; the refund is never fee'd.
         assert_eq!((payout, fee, refund), (540_000, 60_000, 400_000));
         assert_event(
@@ -2120,7 +2168,7 @@ mod event_tests {
         assert!(e.events().is_empty());
         assert_eq!(e.event_count(), 0);
         // The sequence counter keeps running across drains.
-        e.release(ALICE, 1_000_000, None, T0 + 2).unwrap();
+        e.release(ALICE, 1_000_000, None, BOB, T0 + 2).unwrap();
         assert_eq!(e.events().len(), 1);
         assert_eq!(e.events()[0].seq, 2);
         assert_eq!(e.next_seq(), 3);
@@ -2175,7 +2223,7 @@ mod event_tests {
         match state {
             EscrowState::Cancelled => e.cancel(ALICE, None, ALICE, T0 + 2).unwrap(),
             EscrowState::Released => {
-                e.release(ALICE, 1_000_000, None, T0 + 2).unwrap();
+                e.release(ALICE, 1_000_000, None, BOB, T0 + 2).unwrap();
             }
             EscrowState::Settled => {
                 let mut d = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
@@ -2184,7 +2232,7 @@ mod event_tests {
                     .unwrap();
                 d.fund(ALICE, T0 + 1).unwrap();
                 d.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
-                d.resolve(ARBITER, 0, None, None, T0 + 3).unwrap();
+                d.resolve(ARBITER, 0, None, None, BOB, T0 + 3).unwrap();
                 return d;
             }
             _ => panic!("not a terminal state"),
@@ -2280,7 +2328,7 @@ mod event_tests {
         let mut e = funded(1_000_000);
         let inv = dex_invocation();
         let (payout, fee, receipt) = e
-            .release_via_cpi(ALICE, 1_000_000, None, T0 + 2, &inv, |_| Ok(()))
+            .release_via_cpi(ALICE, 1_000_000, None, BOB, T0 + 2, &inv, |_| Ok(()))
             .unwrap();
         assert_eq!((payout, fee), (1_000_000, 0));
         let event = last(&e);
@@ -2308,7 +2356,7 @@ mod event_tests {
         let inv = dex_invocation();
         let events_before = e.event_count();
         assert_eq!(
-            e.release_via_cpi(ALICE, 1_000_000, None, T0 + 2, &inv, |_| {
+            e.release_via_cpi(ALICE, 1_000_000, None, BOB, T0 + 2, &inv, |_| {
                 Err(CpiError::ZeroAddress)
             }),
             Err(EscrowError::CpiExecutionFailed)
@@ -2316,7 +2364,7 @@ mod event_tests {
         assert_eq!(e.event_count(), events_before);
         // The next successful release still gets the next seq — the
         // failed one left no gap in the event log.
-        e.release_via_cpi(ALICE, 1_000_000, None, T0 + 3, &inv, |_| Ok(()))
+        e.release_via_cpi(ALICE, 1_000_000, None, BOB, T0 + 3, &inv, |_| Ok(()))
             .unwrap();
         assert_eq!(last(&e).seq, events_before as u64);
     }
@@ -2324,7 +2372,7 @@ mod event_tests {
     #[test]
     fn plain_release_carries_no_cpi_audit() {
         let mut e = funded(1_000_000);
-        e.release(ALICE, 1_000_000, None, T0 + 2).unwrap();
+        e.release(ALICE, 1_000_000, None, BOB, T0 + 2).unwrap();
         let event = last(&e);
         assert_eq!(event.kind, EscrowEventKind::Released);
         assert_eq!(event.cpi, None);
@@ -2357,10 +2405,10 @@ mod event_tests {
         let events_before = e.event_count();
         let inv = cpi_invocation();
         let raw: *mut IndexedEscrow = std::ptr::addr_of_mut!(e);
-        e.release_via_cpi(ALICE, 1_000_000, None, T0 + 2, &inv, |_| {
+        e.release_via_cpi(ALICE, 1_000_000, None, BOB, T0 + 2, &inv, |_| {
             let nested = unsafe { &mut *raw };
             assert_eq!(
-                nested.release(ALICE, 100, None, T0 + 2),
+                nested.release(ALICE, 100, None, BOB, T0 + 2),
                 Err(EscrowError::ReentrantCall)
             );
             Ok(())
@@ -2398,7 +2446,7 @@ mod event_tests {
         let mut e = funded(1_000_000);
         let events_before = e.event_count();
         assert_eq!(
-            e.release(MALLORY, 100, None, T0 + 2),
+            e.release(MALLORY, 100, None, BOB, T0 + 2),
             Err(EscrowError::Unauthorized)
         );
         assert_eq!(e.event_count(), events_before);

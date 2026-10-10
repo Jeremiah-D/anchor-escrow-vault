@@ -160,6 +160,7 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "Option<Pubkey>" => IdlType::Option(Box::new(IdlType::PublicKey)),
         "Option<MilestonePlan>" => IdlType::Option(Box::new(IdlType::Named("MilestonePlan"))),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
+        "Option<PayoutAllowlist>" => IdlType::Option(Box::new(IdlType::Named("PayoutAllowlist"))),
         other => panic!("idl_json: unmapped VAULT_FIELDS type string: {other}"),
     }
 }
@@ -201,6 +202,12 @@ fn named_type_fields(name: &str) -> &'static [(&'static str, IdlType)] {
         "MilestonePlan" => &[
             ("amounts", IdlType::Array(ArrayElem::U64, 8)),
             ("count", IdlType::U8),
+        ],
+        // PayoutAllowlist { addrs: [[u8; 32]; 4], len: u8 } (AV-49).
+        // The 4 payout keys serialize as 4 consecutive 32-byte pubkeys.
+        "PayoutAllowlist" => &[
+            ("addrs", IdlType::Array(ArrayElem::PublicKey, 4)),
+            ("len", IdlType::U8),
         ],
         other => panic!("idl_json: unknown named type: {other}"),
     }
@@ -407,7 +414,7 @@ fn render_idl_json() -> String {
     // ---- types ----
     w.line("\"types\": [");
     w.indent += 1;
-    for (ti, type_name) in ["QuorumPolicy", "VestingSchedule", "MilestonePlan"]
+    for (ti, type_name) in ["QuorumPolicy", "VestingSchedule", "MilestonePlan", "PayoutAllowlist"]
         .iter()
         .enumerate()
     {
@@ -558,6 +565,7 @@ fn named_type_sizes_pin_constants() {
     assert_eq!(size("QuorumPolicy"), QUORUM_POLICY_LEN);
     assert_eq!(size("VestingSchedule"), 16);
     assert_eq!(size("MilestonePlan"), MILESTONE_PLAN_LEN);
+    assert_eq!(size("PayoutAllowlist"), PAYOUT_ALLOWLIST_LEN);
 }
 
 #[test]
@@ -625,7 +633,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 26, "error variant count drift");
+    assert_eq!(errors.len(), 28, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -633,6 +641,8 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::InvalidFeeRecipient.code(), 123);
     assert_eq!(EscrowError::Paused.code(), 124);
     assert_eq!(EscrowError::InvalidPauseAuthority.code(), 125);
+    assert_eq!(EscrowError::InvalidPayoutAllowlist.code(), 126);
+    assert_eq!(EscrowError::PayoutNotAllowlisted.code(), 127);
 }
 
 #[test]
@@ -721,7 +731,7 @@ fn max_config_funded_escrow() -> Escrow {
     e.confirm_milestone(ALICE, 0).unwrap();
     e.confirm_milestone(BOB, 0).unwrap();
     let (payout, fee) = e
-        .release_milestone(ALICE, EXPIRES_AT, 0, Some(MINT))
+        .release_milestone(ALICE, EXPIRES_AT, 0, Some(MINT), BOB)
         .unwrap();
     assert_eq!((payout, fee), (390_000, 10_000));
     // Milestone 1: dual-skip => 600_000 joins the refundable remainder.
@@ -841,7 +851,7 @@ fn idl_field_offsets_pin_dispute_path() {
     assert_eq!(ev[0], 1, "evidence discriminant");
     assert_eq!(&ev[1..33], &EVIDENCE);
 
-    let (payout, fee, refund) = e.resolve(ARB, 300_000, None, Some(RATIONALE)).unwrap();
+    let (payout, fee, refund) = e.resolve(ARB, 300_000, None, Some(RATIONALE), BOB).unwrap();
     assert_eq!((payout, fee, refund), (300_000, 0, 700_000));
     let enc = encode_escrow(&e);
     assert_eq!(body_field(&enc, &offsets, "state"), &[6u8]); // Settled

@@ -366,9 +366,10 @@ pub fn payout_plan(
     }
     require_nonzero(&addrs.source)?;
     require_nonzero(&addrs.vault_authority)?;
-    if escrow.mint().is_none() && addrs.taker_leg != addrs.taker {
-        // Native path: the payout goes to the taker wallet itself. A
-        // different destination would bypass the taker pin above.
+    if escrow.mint().is_none() && !escrow.payout_recipient_allowed(addrs.taker_leg) {
+        // Native path: the payout goes to the policy-approved
+        // destination — the taker, or an AV-49 allowlist member. A
+        // different destination would bypass the payout pin above.
         return Err(CpiError::RecipientMismatch);
     }
 
@@ -491,7 +492,10 @@ pub fn resolve_plan(
     require_nonzero(&addrs.source)?;
     require_nonzero(&addrs.vault_authority)?;
     if escrow.mint().is_none() {
-        if taker_gross > 0 && addrs.taker_leg != addrs.taker {
+        // Native path: the taker leg goes to the policy-approved
+        // destination (taker or AV-49 allowlist member); the refund leg
+        // still goes to the initializer.
+        if taker_gross > 0 && !escrow.payout_recipient_allowed(addrs.taker_leg) {
             return Err(CpiError::RecipientMismatch);
         }
         if addrs.refund_leg != addrs.initializer {
@@ -617,7 +621,7 @@ mod cpi_tests {
             .unwrap();
         e.fund(init).unwrap();
         // Protocol fee: 1% → fee 5_000 on a 500_000 release.
-        let (payout, fee) = e.release(init, 0, 500_000, None).unwrap();
+        let (payout, fee) = e.release(init, 0, 500_000, None, key(2)).unwrap();
         assert_eq!((payout, fee), (495_000, 5_000));
 
         let plan = payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout, fee).unwrap();
@@ -634,7 +638,7 @@ mod cpi_tests {
     #[test]
     fn release_plan_omits_zero_fee_leg() {
         let mut e = funded_escrow(1_000_000);
-        let (payout, fee) = e.release(key(1), 0, 1_000_000, None).unwrap();
+        let (payout, fee) = e.release(key(1), 0, 1_000_000, None, key(2)).unwrap();
         assert_eq!(fee, 0);
         let plan = payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout, fee).unwrap();
         assert_eq!(plan.transfers.len(), 1);
@@ -644,7 +648,7 @@ mod cpi_tests {
     #[test]
     fn release_plan_rejects_tampered_amounts() {
         let mut e = funded_escrow(1_000_000);
-        let (payout, fee) = e.release(key(1), 0, 400_000, None).unwrap();
+        let (payout, fee) = e.release(key(1), 0, 400_000, None, key(2)).unwrap();
         // Attacker inflates the payout by 1: gross exceeds released_amount().
         assert_eq!(
             payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout + 1, fee),
@@ -661,7 +665,7 @@ mod cpi_tests {
     #[test]
     fn release_plan_rejects_swapped_recipient() {
         let mut e = funded_escrow(1_000_000);
-        let (payout, fee) = e.release(key(1), 0, 1_000_000, None).unwrap();
+        let (payout, fee) = e.release(key(1), 0, 1_000_000, None, key(2)).unwrap();
         let mut addrs = payout_addrs_native();
         addrs.taker = key(77); // not the escrow's taker
         assert_eq!(
@@ -698,7 +702,7 @@ mod cpi_tests {
             .unwrap();
         e.fund(init).unwrap();
         // Half vested at t=1500.
-        let (payout, fee) = e.claim(taker, 1500, None).unwrap();
+        let (payout, fee) = e.claim(taker, 1500, None, key(2)).unwrap();
         assert_eq!((payout, fee), (500_000, 0));
         let plan = payout_plan(PayoutKind::Claim, &e, &payout_addrs_native(), payout, fee).unwrap();
         assert_eq!(plan.transfers.len(), 1);
@@ -717,7 +721,7 @@ mod cpi_tests {
             .with_mint(mint)
             .unwrap();
         e.fund(init).unwrap();
-        let (payout, fee) = e.release(init, 0, 1_000_000, Some(mint)).unwrap();
+        let (payout, fee) = e.release(init, 0, 1_000_000, Some(mint), key(2)).unwrap();
         assert_eq!(fee, 0);
 
         let addrs = PayoutAddrs {
@@ -829,7 +833,7 @@ mod cpi_tests {
             .unwrap();
         e.fund(init).unwrap();
         e.escalate(taker, 0, None).unwrap();
-        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None).unwrap();
+        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None, key(2)).unwrap();
         assert_eq!(fee, 0);
         assert_eq!(taker_payout + refund, 1_000_000);
         let addrs = ResolveAddrs {
@@ -866,7 +870,7 @@ mod cpi_tests {
             .unwrap();
         e.fund(init).unwrap();
         e.escalate(taker, 0, None).unwrap();
-        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None).unwrap();
+        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None, key(2)).unwrap();
         assert!(fee > 0);
         let addrs = ResolveAddrs {
             source: key(10),
@@ -896,7 +900,7 @@ mod cpi_tests {
             .unwrap();
         e.fund(init).unwrap();
         // Protocol fee: 1% → fee 5_000 on a 500_000 release.
-        let (payout, fee) = e.release(init, 0, 500_000, None).unwrap();
+        let (payout, fee) = e.release(init, 0, 500_000, None, key(2)).unwrap();
         assert_eq!((payout, fee), (495_000, 5_000));
 
         // A swapped fee destination is rejected, not built.
@@ -930,7 +934,7 @@ mod cpi_tests {
             .unwrap();
         e.fund(init).unwrap();
         e.escalate(taker, 0, None).unwrap();
-        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None).unwrap();
+        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None, key(2)).unwrap();
         // 2% of 600_000 = 12_000 fee; the initializer is refunded the rest.
         assert_eq!((taker_payout, fee, refund), (588_000, 12_000, 400_000));
 
@@ -967,7 +971,7 @@ mod cpi_tests {
             .with_protocol_fee(100)
             .unwrap();
         e.fund(init).unwrap();
-        let (payout, fee) = e.release(init, 0, 500_000, None).unwrap();
+        let (payout, fee) = e.release(init, 0, 500_000, None, key(2)).unwrap();
         let plan = payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout, fee).unwrap();
         assert_eq!(plan.transfers.len(), 2);
         assert_eq!(plan.transfers[1].accounts[1].pubkey, key(9));

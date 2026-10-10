@@ -87,7 +87,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_vesting(start, end)`            | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `start < end`) |
 | `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise) |
 | `fund(authority)`                           | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer            |
-| `release(authority, now, amount)`                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise); cumulative releases ≤ locked amount |
+| `release(authority, now, amount, payout_to)` (AV-49)                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise); cumulative releases ≤ locked amount; `payout_to` must satisfy the payout policy — the taker, or a member of the payout allowlist when one is configured (`PayoutNotAllowlisted` otherwise) |
 | `initialize_timelock(unlock_at)`            | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `unlock_at` is the Unix timestamp before which no taker payout may leave; `0` = no lock) |
 | `initialize_emergency_unlock()`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opts into dual-signed emergency timelock-unlock governance) |
 | `emergency_unlock(initializer, taker)`       | `Funded`       | `Funded` (no state change) | **both** parties must sign (dual-signature governance; one party alone is `Unauthorized`); requires the opt-in and an active timelock (`InvalidStateTransition` otherwise); clears `timelock` to `0` so payouts become immediately eligible — state and amounts untouched; emits `EmergencyUnlock` |
@@ -95,6 +95,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `cancel(authority, refund_to)`               | `Funded`       | `Cancelled` | initializer; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise |
 | `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); the refund still goes to the whitelisted address even when the taker calls; returns `(refund, penalty)` — a taker-initiated cancel with `penalty_bps > 0` slices an anti-griefing penalty for the initializer (see below) |
 | `crank_expired(caller, now)` (AV-48) | `Funded` | `Cancelled` | **anyone** — permissionless crank (Solana crank pattern), only when `now >= expires_at + grace_period`; no counterparty signature needed, so a keeper bot that is party to nothing can sweep timed-out vaults; the refund follows the same pinned refund policy (whitelisted address, or the initializer) — the cranker receives nothing (anti-MEV); a taker cranker still pays the anti-griefing penalty; rejected with `Paused` while the escrow is paused |
+| `initialize_payout_allowlist(allowlist)` (AV-49) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–4 live payout-destination addresses; empty / over-long / zero-address input is `InvalidPayoutAllowlist`); the payout policy gates every fund-moving transition's `payout_to` |
+| `update_payout_allowlist(initializer, taker, allowlist)` (AV-49) | `Uninitialized` / `Funded` | same (no state change) | dual-signature governance — both initializer and taker on a dual-sig escrow, initializer alone on a plain escrow (`Unauthorized` otherwise); empty clears the allowlist (back to taker-only payouts); emits `PayoutAllowlistUpdated` only on an actual change |
 | `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it) |
 
 Rules: the initializer drives `fund`/`release`/`cancel`; any other caller
@@ -420,7 +422,7 @@ rent-exempt on mainnet. (AV-45 grows the quorum region by 71 bytes — 64 for
 the per-attestor weight array plus 7 for the wider u64 weight-sum threshold —
 so the full vault is now 763 bytes and needs **6,201,360 lamports**. AV-46
 appends the 33-byte pause-authority region plus the 1-byte pause flag (34
-bytes), so the full vault is now 797 bytes and needs **6,438,000 lamports**.)
+bytes), so the full vault is now 927 bytes and needs **7,342,800 lamports**.)
 
 **Fee recipient pin (AV-44).** An escrow can additionally pin *where* the
 fee goes (`initialize_fee_recipient(fee_recipient)`, opt-in on
@@ -509,6 +511,8 @@ program error per variant):
 | `InvalidFeeRecipient` | 123 | `with_fee_recipient` with the zero address (a zero address can never be the legitimate protocol-fee destination) |
 | `Paused` | 124 | any state-changing transition while the AV-46 emergency pause is engaged (`fund`/`release`/`claim`/`attest`/`resolve`/`cancel`/milestone/governance paths) |
 | `InvalidPauseAuthority` | 125 | `with_pause_authority` / `rotate_pause_authority` with the zero address (a zero address can never hold the emergency switch) |
+| `InvalidPayoutAllowlist` | 126 | `with_payout_allowlist` / `update_payout_allowlist` with an empty list, more than 4 addresses, or a zero address (the AV-49 allowlist must be 1-4 live payout destinations) |
+| `PayoutNotAllowlisted` | 127 | a payout transition (`release` / `claim` / `resolve` / `release_milestone` / `release_via_cpi`) naming a `payout_to` that is neither the taker nor a member of the payout allowlist |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -911,7 +915,7 @@ order; batches in first-seen caller order, actions in input order):
 {"scanned":2,"batches":[
   {"caller":"...","total_reclaimed":12876000,"actions":[
     {"escrow_id":"...","action":"close_vault","caller":"...",
-     "caller_role":"initializer","rent_reclaimed":6438000,
+     "caller_role":"initializer","rent_reclaimed":7342800,
      "reason":"released"}
   ]}
 ]}
@@ -1036,7 +1040,8 @@ two-way consistency check against the IDL parameter table:
 | fee_recipient | Option<Pubkey> | 33    |
 | pause_authority | Option<Pubkey> | 33  |
 | paused        | bool              | 1     |
-| **total**     |                   | **797** |
+| payout_allowlist | Option<PayoutAllowlist> | 130 |
+| **total**     |                   | **927** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1075,10 +1080,10 @@ attached no rationale) — and the 1-byte emergency timelock-unlock
 governance opt-in `emergency_unlock` (AV-41, zeroed when the feature is
 off) — and the 33-byte protocol-fee recipient region (AV-44: 1-byte
 discriminant + 32-byte address, zeroed when no recipient is bound).
-`escrow-state` exposes `VAULT_SPACE` (797) and
-`VAULT_SPACE_NO_QUORUM` (315) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (927) and
+`VAULT_SPACE_NO_QUORUM` (445) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **6,438,000 lamports** to be
+mainnet rent parameters the full vault needs **7,342,800 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1099,11 +1104,11 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 797 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
-  weighted-quorum, and AV-46 pause-switch growth is accounted in the layout table above); the state
+  stays 927 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
+  weighted-quorum, AV-46 pause-switch, and AV-49 payout-allowlist growth is accounted in the layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**6,438,000
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**7,342,800
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the
@@ -1336,6 +1341,24 @@ for a whole fleet of escrows.
   otherwise bloat every transaction.
 - **Dry-run**: like the keeper report — no events, no clock, no
   mutation. Amounts are as of the scan; execute, then re-scan.
+
+## Payout destination allowlist (AV-49)
+
+A taker payout is only as safe as its destination. `release`, `claim`,
+`resolve`, `release_milestone`, and `release_via_cpi` all take an explicit
+`payout_to` destination, and the state machine enforces a payout policy on
+it: without an allowlist the destination must be the taker (backward
+compatible); with one configured via `with_payout_allowlist` (1–4 live
+addresses, set at initialize time) or `update_payout_allowlist` (dual-sig
+governance once funded), the destination must be a member —
+`PayoutNotAllowlisted` (code 127) otherwise. The anti-phishing rationale:
+a compromised frontend cannot redirect a payout to an attacker address
+when the escrow pins its destinations on-chain. The settlement-plan
+builders (`cpi::payout_plan` / `resolve_plan`) enforce the same policy on
+the native-SOL leg, so an allowlisted destination does not trip
+`RecipientMismatch`. The 130-byte region is always reserved in the vault
+layout (1-byte discriminant + 4×32-byte addresses + 1-byte count), so the
+opt-in writes in place without reallocating.
 
 ## Run the tests
 
