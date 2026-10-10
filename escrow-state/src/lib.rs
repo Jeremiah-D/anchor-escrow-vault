@@ -998,27 +998,56 @@ impl QuorumPolicy {
 /// portion at any time via [`Escrow::claim`] — the streaming-payments
 /// pattern (salary streams, linear token unlocks).
 ///
+/// AV-51 adds an optional cliff: before `cliff_at` nothing unlocks, even
+/// though the linear curve would already have vested value; at and after
+/// `cliff_at` the linear curve `amount * (now - start) / (end - start)`
+/// applies unchanged — the cliff gates unlocking, it does not rebase the
+/// curve. The no-cliff schedule is `cliff_at == start` (the pre-AV-51
+/// behavior, preserved by [`VestingSchedule::new`]).
+///
 /// `Copy` and heap-free like the rest of the crate. The schedule is fixed
-/// before funding via [`Escrow::with_vesting`]; it never changes
-/// afterwards, so both parties can reason about the unlock curve
-/// off-chain.
+/// before funding via [`Escrow::with_vesting`] /
+/// [`Escrow::with_vesting_cliff`]; it never changes afterwards, so both
+/// parties can reason about the unlock curve off-chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VestingSchedule {
     start: u64,
     end: u64,
+    /// AV-51: Unix timestamp before which zero unlocks. `cliff_at ==
+    /// start` is the no-cliff schedule (backward compatible).
+    cliff_at: u64,
 }
 
 impl VestingSchedule {
     /// Build a schedule unlocking linearly from `start` (inclusive) to
     /// `end` (exclusive boundary: at `now >= end` everything is vested).
+    /// No cliff: `cliff_at == start`, the pre-AV-51 behavior.
     /// Rejects `start >= end` with [`EscrowError::InvalidVesting`] — a
     /// zero-length window would divide by zero in
     /// [`VestingSchedule::vested_amount`].
     pub fn new(start: u64, end: u64) -> Result<Self, EscrowError> {
+        Self::new_with_cliff(start, end, start)
+    }
+
+    /// Build a schedule with a cliff (AV-51): before `cliff_at` nothing
+    /// vests; at and after `cliff_at` the linear curve from `start`
+    /// applies. Rejects `start >= end` and `cliff_at > end` with
+    /// [`EscrowError::InvalidVesting`] — a cliff past the unlock window
+    /// would lock funds that can never vest. A cliff at or before
+    /// `start` is equivalent to no cliff and normalizes to `start`,
+    /// so the invariant `start <= cliff_at <= end` always holds.
+    pub fn new_with_cliff(start: u64, end: u64, cliff_at: u64) -> Result<Self, EscrowError> {
         if start >= end {
             return Err(EscrowError::InvalidVesting);
         }
-        Ok(Self { start, end })
+        if cliff_at > end {
+            return Err(EscrowError::InvalidVesting);
+        }
+        Ok(Self {
+            start,
+            end,
+            cliff_at: cliff_at.max(start),
+        })
     }
 
     /// Unix timestamp at which unlocking begins.
@@ -1031,16 +1060,35 @@ impl VestingSchedule {
         self.end
     }
 
+    /// AV-51: Unix timestamp before which zero unlocks. Equals `start`
+    /// for the no-cliff schedule built by [`VestingSchedule::new`].
+    pub fn cliff_at(&self) -> u64 {
+        self.cliff_at
+    }
+
     /// Amount vested at `now` for a locked total of `amount`: linear
     /// interpolation `amount * elapsed / duration`, clamped to
     /// `[0, amount]`. Before `start` nothing is vested; at or after `end`
     /// everything is.
+    ///
+    /// AV-51: before `cliff_at` the vested amount is zero — the cliff
+    /// gates unlocking without rebasing the curve, so at `now ==
+    /// cliff_at` the vested amount is the linear value at that point,
+    /// not a jump from zero to it.
     ///
     /// Computed in `u128`: `amount * elapsed` can reach
     /// `(u64::MAX)^2 < u128::MAX`, so the multiplication cannot overflow,
     /// and the result is `<= amount <= u64::MAX`, so the downcast is
     /// exact.
     pub fn vested_amount(&self, amount: u64, now: u64) -> u64 {
+        // AV-51: the cliff gates unlocking. `claim` derives
+        // `claimable = vested - released` and reports `AmountMismatch`
+        // when it is zero, so a pre-cliff claim fails there with no
+        // extra check — and the keeper's claim listing goes through the
+        // same `vested_amount`, so it inherits the gate too.
+        if now < self.cliff_at {
+            return 0;
+        }
         let duration = self.end - self.start; // > 0 by construction
         let elapsed = now.saturating_sub(self.start).min(duration);
         ((amount as u128 * elapsed as u128) / duration as u128) as u64
@@ -2038,6 +2086,25 @@ impl Escrow {
         }
         self.vesting = Some(schedule);
         Ok(self)
+    }
+
+    /// Attach a linear vesting schedule with a cliff (AV-51). Builder-style:
+    /// only valid on an `Uninitialized` escrow, so the unlock curve is
+    /// fixed before any funds move — mirroring [`Escrow::with_vesting`].
+    /// Before `cliff_at` nothing vests; at and after `cliff_at` the
+    /// linear curve from `start` applies (the cliff gates unlocking, it
+    /// does not rebase the curve). `cliff_at > end` is
+    /// [`EscrowError::InvalidVesting`] — a cliff past the unlock window
+    /// would lock funds that can never vest; a cliff at or before
+    /// `start` normalizes to `start` (no effective cliff).
+    pub fn with_vesting_cliff(
+        self,
+        start: u64,
+        end: u64,
+        cliff_at: u64,
+    ) -> Result<Self, EscrowError> {
+        let schedule = VestingSchedule::new_with_cliff(start, end, cliff_at)?;
+        self.with_vesting(schedule)
     }
 
     /// Claim the vested-but-unreleased portion of the locked funds
@@ -3773,10 +3840,11 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // survive serialization.
     ("activation", "u8 (bitmask)", 1),
     // AV-13: linear vesting schedule gating `claim`: one discriminant
-    // byte, then start/end u64. The region is always reserved (zeroed
-    // when `None`) so `with_vesting` never needs a realloc — same
-    // treatment as `quorum`.
-    ("vesting", "Option<VestingSchedule>", 1 + 16),
+    // byte, then start/end/cliff_at u64 (AV-51: the cliff timestamp
+    // before which zero unlocks). The region is always reserved (zeroed
+    // when `None`) so `with_vesting` / `with_vesting_cliff` never need a
+    // realloc — same treatment as `quorum`.
+    ("vesting", "Option<VestingSchedule>", 1 + 24),
     // AV-14: optional dispute arbiter (see `Escrow::with_arbiter`):
     // one discriminant byte, then the 32-byte key. The region is always
     // reserved (zeroed when `None`) so `with_arbiter` writes in place —
@@ -4491,7 +4559,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 7_342_800, "from {state:?}");
+            assert_eq!(rent, 7_398_480, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -4589,9 +4657,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 7_342_800 by
+        // VAULT_SPACE — pinned at 7_398_480 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 7_342_800);
+        assert_eq!(rent, 7_398_480);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -4749,11 +4817,11 @@ mod tests {
     fn release_and_close_adds_no_fields_and_keeps_space() {
         // AV-50 touches no persisted field: the release leg moves the
         // `released` / `fees_paid` counters and the state byte, and
-        // then the account is closed. VAULT_SPACE stays 927 — re-asserted
+        // then the account is closed. VAULT_SPACE stays 935 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 927, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 7_342_800);
+        assert_eq!(VAULT_SPACE, 935, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 7_398_480);
     }
 
     #[test]
@@ -4763,10 +4831,10 @@ mod tests {
         // re-asserted here so this feature cannot silently grow the
         // account (every byte of VAULT_SPACE is rent the initializer
         // paid for). AV-38 grew the account by 33 bytes (rationale
-        // hash), AV-44 by 33 more (fee recipient), and AV-46 by 34
-        // (pause authority + pause flag), so the pin tracks
-        // the new total deliberately.
-        assert_eq!(VAULT_SPACE, 927, "full Vault account space");
+        // hash), AV-44 by 33 more (fee recipient), AV-46 by 34
+        // (pause authority + pause flag), and AV-51 by 8 (vesting
+        // cliff), so the pin tracks the new total deliberately.
+        assert_eq!(VAULT_SPACE, 935, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -6042,18 +6110,33 @@ pub(crate) mod anchor_idl_tests {
                             Uninitialized -> Activated, unlocking fund",
         },
         InstructionSpec {
-            // AV-13: streaming release (linear vesting).
+            // AV-13: streaming release (linear vesting). AV-51: optional
+            // cliff gating the unlock curve.
             name: "initialize_vesting",
             params: &[
                 ("start", "u64", "instruction param; unlock begins"),
                 ("end", "u64", "instruction param; fully vested at now >= end"),
+                (
+                    "cliff",
+                    "u64",
+                    "instruction param; 0 = no cliff (the plain AV-13 \
+                     curve, cliff_at = start); nonzero = nothing vests \
+                     before this timestamp, the linear curve from start \
+                     applies at/after it (the cliff gates unlocking, it \
+                     does not rebase the curve); cliff > end is \
+                     InvalidVesting",
+                ),
             ],
-            method: "VestingSchedule::new + Escrow::with_vesting",
-            input_mapping: "start/end <- params; authority <- \
-                            accounts.initializer (signer), enforced by the \
-                            Anchor account constraint, not the state machine; \
-                            Uninitialized only, like initialize_quorum; \
-                            start >= end is InvalidVesting",
+            method: "VestingSchedule::new/new_with_cliff + Escrow::with_vesting/with_vesting_cliff",
+            input_mapping: "start/end/cliff <- params; cliff == 0 maps to \
+                            the no-cliff schedule (cliff_at = start); \
+                            authority <- accounts.initializer (signer), \
+                            enforced by the Anchor account constraint, not \
+                            the state machine; Uninitialized only, like \
+                            initialize_quorum; start >= end is \
+                            InvalidVesting; the instruction discriminator \
+                            is unchanged (name-derived: a new param does \
+                            not rename the instruction)",
         },
         InstructionSpec {
             name: "claim",
@@ -6645,7 +6728,7 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::update_attestors",
             "Escrow::with_dual_sig",
             "Escrow::activate",
-            "VestingSchedule::new + Escrow::with_vesting",
+            "VestingSchedule::new/new_with_cliff + Escrow::with_vesting/with_vesting_cliff",
             "Escrow::claim",
             "Escrow::attest",
             "Escrow::with_arbiter",
@@ -7888,9 +7971,11 @@ pub(crate) mod anchor_idl_tests {
 
     #[test]
     fn initialize_vesting_maps_start_end_params_to_schedule() {
-        // IDL: initialize_vesting(start: u64, end: u64). The program runs
-        // VestingSchedule::new then Escrow::with_vesting; authority <-
-        // accounts.initializer, enforced by the Anchor account constraint.
+        // IDL: initialize_vesting(start: u64, end: u64, cliff: u64). The
+        // program runs VestingSchedule::new_with_cliff (cliff == 0 maps
+        // to the no-cliff schedule, cliff_at = start) then
+        // Escrow::with_vesting; authority <- accounts.initializer,
+        // enforced by the Anchor account constraint.
         let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
@@ -7905,6 +7990,29 @@ pub(crate) mod anchor_idl_tests {
         // construction, before touching the escrow.
         assert_eq!(
             VestingSchedule::new(1_800_000_000, 1_700_000_000),
+            Err(EscrowError::InvalidVesting)
+        );
+        // AV-51: nonzero cliff pins cliff_at; the program's
+        // `cliff == 0 -> start` mapping reproduces the no-cliff schedule.
+        let cliffed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting_cliff(1_700_000_000, 1_800_000_000, 1_750_000_000)
+            .unwrap();
+        assert_eq!(
+            cliffed.vesting_schedule().map(|s| s.cliff_at()),
+            Some(1_750_000_000)
+        );
+        let no_cliff = VestingSchedule::new_with_cliff(
+            1_700_000_000,
+            1_800_000_000,
+            1_700_000_000, // program maps cliff == 0 to start
+        )
+        .unwrap();
+        assert_eq!(no_cliff, VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap());
+        // Documented failure mode: cliff past end rejected at
+        // construction.
+        assert_eq!(
+            VestingSchedule::new_with_cliff(1_700_000_000, 1_800_000_000, 1_800_000_001),
             Err(EscrowError::InvalidVesting)
         );
     }
@@ -8085,6 +8193,10 @@ pub(crate) mod anchor_idl_tests {
         ("update_attestors", "weights", "quorum.weights"),
         ("initialize_vesting", "start", "vesting.start"),
         ("initialize_vesting", "end", "vesting.end"),
+        // AV-51: the cliff param populates `vesting.cliff_at`; the
+        // `Option` discriminant is implied (an attached schedule is
+        // `Some`), mirroring `initialize_mint`.
+        ("initialize_vesting", "cliff", "vesting.cliff_at"),
         ("initialize_arbiter", "arbiter", "arbiter"),
         // The arbiter's split awards the taker `taker_amount` out of the
         // remaining funds; the taker's share accumulates in `released`,
@@ -8226,9 +8338,9 @@ pub(crate) mod anchor_idl_tests {
     ];
 
     /// Every vault field path from `VAULT_FIELDS`, with `quorum` unfolded
-    /// into its serialized subfields, `vesting` unfolded into start/end,
-    /// and `milestones` unfolded into amounts/count (order matches Borsh
-    /// layout).
+    /// into its serialized subfields, `vesting` unfolded into
+    /// start/end/cliff_at (AV-51), and `milestones` unfolded into
+    /// amounts/count (order matches Borsh layout).
     fn vault_field_paths() -> Vec<&'static str> {
         let mut paths = Vec::new();
         for (name, _, _) in VAULT_FIELDS {
@@ -8241,7 +8353,7 @@ pub(crate) mod anchor_idl_tests {
                     "quorum.approvals",
                 ]);
             } else if *name == "vesting" {
-                paths.extend(["vesting.start", "vesting.end"]);
+                paths.extend(["vesting.start", "vesting.end", "vesting.cliff_at"]);
             } else if *name == "milestones" {
                 paths.extend(["milestones.amounts", "milestones.count"]);
             } else {
@@ -8625,6 +8737,106 @@ mod error_code_tests {
         assert_eq!(err.code(), 107);
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn invalid_vesting_triggered_by_cliff_past_end() {
+        // AV-51: a cliff past the unlock window would lock funds that can
+        // never vest — rejected at construction with the existing code
+        // 107.
+        let err = VestingSchedule::new_with_cliff(1_000, 2_000, 2_001).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidVesting);
+        assert_eq!(err.code(), 107);
+        let err = escrow()
+            .with_vesting_cliff(1_700_000_000, 1_800_000_000, 1_800_000_001)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidVesting);
+    }
+
+    #[test]
+    fn vesting_cliff_boundary_matrix() {
+        // AV-51: start=1_700_000_000, end=1_800_000_000,
+        // cliff=1_750_000_000, amount=1_000_000. The cliff gates
+        // unlocking without rebasing the curve: at the cliff the vested
+        // amount is the linear value at that point (500_000), not a jump.
+        const START: u64 = 1_700_000_000;
+        const END: u64 = 1_800_000_000;
+        const CLIFF: u64 = 1_750_000_000;
+        let s = VestingSchedule::new_with_cliff(START, END, CLIFF).unwrap();
+        assert_eq!(s.cliff_at(), CLIFF);
+        assert_eq!(s.vested_amount(1_000_000, CLIFF - 1), 0, "one second before the cliff: zero");
+        assert_eq!(
+            s.vested_amount(1_000_000, CLIFF),
+            500_000,
+            "at the cliff: linear from start, no jump"
+        );
+        assert_eq!(
+            s.vested_amount(1_000_000, END),
+            1_000_000,
+            "at end: fully vested"
+        );
+        assert_eq!(
+            s.vested_amount(1_000_000, END + 1_000_000),
+            1_000_000,
+            "past end: clamped"
+        );
+        // cliff == end: the whole amount unlocks only at the last
+        // second — the streaming-payments "final settlement" shape.
+        let s = VestingSchedule::new_with_cliff(START, END, END).unwrap();
+        assert_eq!(s.vested_amount(1_000_000, END - 1), 0);
+        assert_eq!(s.vested_amount(1_000_000, END), 1_000_000);
+        // cliff == start is the no-cliff schedule: identical curve to
+        // `new` at every probe point (backward compatible).
+        let plain = VestingSchedule::new(START, END).unwrap();
+        let cliffed = VestingSchedule::new_with_cliff(START, END, START).unwrap();
+        assert_eq!(cliffed, plain);
+        for now in [START - 1, START, START + 1, CLIFF, END - 1, END, END + 1] {
+            assert_eq!(
+                cliffed.vested_amount(1_000_000, now),
+                plain.vested_amount(1_000_000, now),
+                "cliff == start ≡ no cliff at now={now}"
+            );
+        }
+        // A cliff at or before start normalizes to start (no effective
+        // cliff), keeping the invariant start <= cliff_at <= end.
+        let s = VestingSchedule::new_with_cliff(START, END, START - 1).unwrap();
+        assert_eq!(s.cliff_at(), START);
+        let s = VestingSchedule::new_with_cliff(START, END, 0).unwrap();
+        assert_eq!(s.cliff_at(), START);
+    }
+
+    #[test]
+    fn vesting_cliff_blocks_claim_before_cliff() {
+        // AV-51: a pre-cliff claim computes claimable = 0 - 0 and
+        // reports AmountMismatch (code 102) — no extra gate in `claim`,
+        // the zero falls out of `vested_amount`.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting_cliff(1_700_000_000, 1_800_000_000, 1_750_000_000)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let err = e.claim(BOB, 1_749_999_999, None, BOB).unwrap_err();
+        assert_eq!(err, EscrowError::AmountMismatch);
+        assert_eq!(err.code(), 102);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+        // At the cliff the taker pulls the linear value.
+        let (payout, fee) = e.claim(BOB, 1_750_000_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (500_000, 0));
+        assert_eq!(e.released_amount(), 500_000);
+    }
+
+    #[test]
+    fn vesting_cliff_builder_rejects_live_escrow() {
+        // Uninitialized-only, mirroring with_vesting: the curve is fixed
+        // before funds move.
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        let err = e
+            .with_vesting_cliff(1_700_000_000, 1_800_000_000, 1_750_000_000)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+        assert_eq!(err.code(), 101);
     }
 
     #[test]
@@ -9737,17 +9949,19 @@ mod account_space_tests {
         // escrows), Borsh field order after `quorum`.
         out.push(e.activation);
         // AV-13: vesting schedule, always reserved like `quorum`: the
-        // `None` discriminant followed by zeroed start/end, so
-        // `with_vesting` writes in place without reallocating.
+        // `None` discriminant followed by zeroed start/end/cliff_at (AV-51:
+        // 24 bytes), so `with_vesting` / `with_vesting_cliff` write in
+        // place without reallocating.
         match e.vesting {
             None => {
                 out.push(0);
-                out.extend_from_slice(&[0u8; 16]);
+                out.extend_from_slice(&[0u8; 24]);
             }
             Some(v) => {
                 out.push(1);
                 out.extend_from_slice(&v.start.to_le_bytes());
                 out.extend_from_slice(&v.end.to_le_bytes());
+                out.extend_from_slice(&v.cliff_at.to_le_bytes());
             }
         }
         // AV-14: dispute arbiter, always reserved like `quorum`: the
@@ -9933,7 +10147,7 @@ mod account_space_tests {
         assert_eq!(MILESTONE_PLAN_LEN, 8 * 8 + 1, "milestone plan bytes");
         assert_eq!(MILESTONE_PLAN_LEN, 65);
         // 32 + 32 + 8 + 8 + 8 + 1 + (1 + 337) (AV-45 weighted quorum) + 1 (AV-12 activation bitmask)
-        // + (1 + 16) (AV-13 vesting schedule) + (1 + 32) (AV-14 arbiter)
+        // + (1 + 24) (AV-13 vesting schedule; AV-51 adds the cliff_at u64) + (1 + 32) (AV-14 arbiter)
         // + (1 + 65) (AV-15 milestone plan) + 8 (AV-15 confirmation bitmap)
         // + 8 (AV-15 skipped counter) + (1 + 32) (AV-16 mint binding)
         // + 2 (AV-17 protocol fee rate) + 8 (AV-17 cumulative fee counter)
@@ -9946,9 +10160,9 @@ mod account_space_tests {
         // + (1 + 32) (AV-46 emergency-pause authority) + 1 (AV-46
         // emergency pause flag) + (1 + 128) (AV-49 payout destination
         // allowlist).
-        assert_eq!(ESCROW_BODY_LEN, 919, "escrow payload bytes");
+        assert_eq!(ESCROW_BODY_LEN, 927, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 927, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 935, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -10047,80 +10261,78 @@ mod account_space_tests {
         // plain escrow.
         assert_eq!(bytes[427], 0, "activation bitmask offset, plain escrow");
         // AV-13: vesting discriminant + zeroed schedule (no vesting here).
+        // AV-51: the schedule region is start/end/cliff_at (24 bytes).
         assert_eq!(bytes[428], 0, "vesting: None discriminant");
-        assert_eq!(&bytes[429..445], &[0u8; 16], "vesting: zeroed schedule");
+        assert_eq!(&bytes[429..453], &[0u8; 24], "vesting: zeroed schedule");
         // AV-14: arbiter discriminant + zeroed key (no arbiter here).
-        assert_eq!(bytes[445], 0, "arbiter: None discriminant");
-        assert_eq!(&bytes[446..478], &[0u8; 32], "arbiter: zeroed key");
+        assert_eq!(bytes[453], 0, "arbiter: None discriminant");
+        assert_eq!(&bytes[454..486], &[0u8; 32], "arbiter: zeroed key");
         // AV-15: milestones discriminant + zeroed plan (no plan here),
         // zeroed confirmation bitmap, zero skipped.
-        assert_eq!(bytes[478], 0, "milestones: None discriminant");
+        assert_eq!(bytes[486], 0, "milestones: None discriminant");
         assert_eq!(
-            &bytes[479..544],
+            &bytes[487..552],
             &[0u8; MILESTONE_PLAN_LEN],
             "milestones: zeroed plan"
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[544..552].try_into().unwrap()),
+            u64::from_le_bytes(bytes[552..560].try_into().unwrap()),
             0,
             "milestone_flags: zeroed"
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[552..560].try_into().unwrap()),
+            u64::from_le_bytes(bytes[560..568].try_into().unwrap()),
             0,
             "skipped: zero"
         );
         // AV-16: mint discriminant + zeroed address (no mint bound here).
-        assert_eq!(bytes[560], 0, "mint: None discriminant");
-        assert_eq!(&bytes[561..593], &[0u8; 32], "mint: zeroed address");
+        assert_eq!(bytes[568], 0, "mint: None discriminant");
+        assert_eq!(&bytes[569..601], &[0u8; 32], "mint: zeroed address");
         // AV-17: fee rate u16 + cumulative fee u64 (no fee configured,
         // none charged).
         assert_eq!(
-            u16::from_le_bytes(bytes[593..595].try_into().unwrap()),
+            u16::from_le_bytes(bytes[601..603].try_into().unwrap()),
             0,
             "fee_bps: zeroed"
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[595..603].try_into().unwrap()),
+            u64::from_le_bytes(bytes[603..611].try_into().unwrap()),
             0,
             "fees_paid: zero"
         );
         // AV-21: expiry grace period u64, zeroed for a plain escrow.
         assert_eq!(
-            u64::from_le_bytes(bytes[603..611].try_into().unwrap()),
+            u64::from_le_bytes(bytes[611..619].try_into().unwrap()),
             0,
             "grace_period: zeroed"
         );
         // AV-22: dispute evidence hash discriminant + zeroed commitment
-        // (no evidence attached here); appended last, so every earlier
-        // offset above is unchanged.
-        assert_eq!(bytes[611], 0, "evidence_hash: None discriminant");
-        assert_eq!(&bytes[612..644], &[0u8; 32], "evidence_hash: zeroed");
+        // (no evidence attached here). All offsets from here on sit 8
+        // bytes past the pre-AV-51 layout: the vesting schedule grew by
+        // the cliff_at u64.
+        assert_eq!(bytes[619], 0, "evidence_hash: None discriminant");
+        assert_eq!(&bytes[620..652], &[0u8; 32], "evidence_hash: zeroed");
         // AV-23: refund whitelist discriminant + zeroed address (no
-        // whitelist configured here); appended last, so every earlier
-        // offset above is unchanged.
-        assert_eq!(bytes[644], 0, "refund_to: None discriminant");
-        assert_eq!(&bytes[645..677], &[0u8; 32], "refund_to: zeroed");
+        // whitelist configured here).
+        assert_eq!(bytes[652], 0, "refund_to: None discriminant");
+        assert_eq!(&bytes[653..685], &[0u8; 32], "refund_to: zeroed");
         // AV-24: anti-griefing penalty rate u16, zeroed for a plain
-        // escrow; appended last, so every earlier offset above is
-        // unchanged.
+        // escrow.
         assert_eq!(
-            u16::from_le_bytes(bytes[677..679].try_into().unwrap()),
+            u16::from_le_bytes(bytes[685..687].try_into().unwrap()),
             0,
             "penalty_bps: zeroed"
         );
         // AV-27: timelock unlock timestamp u64, zeroed for a plain
-        // escrow; appended last, so every earlier offset above is
-        // unchanged.
+        // escrow.
         assert_eq!(
-            u64::from_le_bytes(bytes[679..687].try_into().unwrap()),
+            u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
             0,
             "timelock: zeroed"
         );
         // AV-28: token decimal metadata u8, zeroed for a plain escrow
-        // (no decimal metadata declared); appended last, so every
-        // earlier offset above is unchanged.
-        assert_eq!(bytes[687], 0, "decimals: zeroed");
+        // (no decimal metadata declared).
+        assert_eq!(bytes[695], 0, "decimals: zeroed");
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "tail byte is the last byte");
 
         // With quorum: same total length (space is always reserved), Some
@@ -10172,41 +10384,43 @@ mod account_space_tests {
         // AV-12: activation bitmask trails the quorum region; zero here
         // (this escrow did not opt into dual-signature activation).
         assert_eq!(bytes[427], 0, "activation bitmask offset, no dual-sig");
-        // AV-13: vesting discriminant + zeroed schedule (no vesting here).
+        // AV-13: vesting discriminant + zeroed schedule (no vesting
+        // here); AV-51: the region is start/end/cliff_at (24 bytes).
         assert_eq!(bytes[428], 0, "vesting: None discriminant");
-        assert_eq!(&bytes[429..445], &[0u8; 16], "vesting: zeroed schedule");
+        assert_eq!(&bytes[429..453], &[0u8; 24], "vesting: zeroed schedule");
         // AV-14: arbiter discriminant + zeroed key (no arbiter here).
-        assert_eq!(bytes[445], 0, "arbiter: None discriminant");
-        assert_eq!(&bytes[446..478], &[0u8; 32], "arbiter: zeroed key");
+        assert_eq!(bytes[453], 0, "arbiter: None discriminant");
+        assert_eq!(&bytes[454..486], &[0u8; 32], "arbiter: zeroed key");
         // AV-15: the tail is untouched by the quorum region: milestones
         // discriminant + zeroed plan, zeroed confirmation bitmap, zero
         // skipped.
-        assert_eq!(bytes[478], 0, "milestones: None discriminant");
+        assert_eq!(bytes[486], 0, "milestones: None discriminant");
         assert_eq!(
-            &bytes[479..544],
+            &bytes[487..552],
             &[0u8; MILESTONE_PLAN_LEN],
             "milestones: zeroed plan"
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[544..552].try_into().unwrap()),
+            u64::from_le_bytes(bytes[552..560].try_into().unwrap()),
             0,
             "milestone_flags: zeroed"
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[552..560].try_into().unwrap()),
+            u64::from_le_bytes(bytes[560..568].try_into().unwrap()),
             0,
             "skipped: zero"
         );
         // AV-16: the mint region trails the skipped counter, untouched by
         // the quorum region: None discriminant + zeroed address.
-        assert_eq!(bytes[560], 0, "mint: None discriminant");
-        assert_eq!(&bytes[561..593], &[0u8; 32], "mint: zeroed address");
+        assert_eq!(bytes[568], 0, "mint: None discriminant");
+        assert_eq!(&bytes[569..601], &[0u8; 32], "mint: zeroed address");
     }
 
     #[test]
     fn manual_borsh_encoding_places_arbiter_key() {
         // AV-14: an escrow with an arbiter serializes the key after the
-        // vesting region: discriminant 1, then the 32-byte key.
+        // vesting region: discriminant 1, then the 32-byte key. AV-51:
+        // the vesting region is start/end/cliff_at (24 bytes).
         const ARBITER: [u8; 32] = [0xA8; 32];
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
@@ -10217,15 +10431,17 @@ mod account_space_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         // Everything before the arbiter region is untouched.
         assert_eq!(bytes[88], EscrowState::Funded as u8);
-        assert_eq!(&bytes[429..445], &[0u8; 16], "vesting: zeroed schedule");
-        assert_eq!(bytes[445], 1, "arbiter: Some discriminant");
-        assert_eq!(&bytes[446..478], &ARBITER, "arbiter key offset");
+        assert_eq!(&bytes[429..453], &[0u8; 24], "vesting: zeroed schedule");
+        assert_eq!(bytes[453], 1, "arbiter: Some discriminant");
+        assert_eq!(&bytes[454..486], &ARBITER, "arbiter key offset");
     }
 
     #[test]
     fn manual_borsh_encoding_places_vesting_schedule() {
         // AV-13: a vesting escrow serializes the schedule after the
         // activation byte: discriminant 1, then start/end u64 LE.
+        // AV-51: cliff_at u64 LE trails end; a no-cliff schedule stores
+        // cliff_at == start.
         let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
@@ -10245,6 +10461,11 @@ mod account_space_tests {
             1_800_000_000,
             "vesting.end offset"
         );
+        assert_eq!(
+            u64::from_le_bytes(bytes[445..453].try_into().unwrap()),
+            1_700_000_000,
+            "vesting.cliff_at offset (no cliff: == start)"
+        );
         // The schedule survives a state transition (claim moves money,
         // never the curve).
         e.claim(BOB, 1_750_000_000, None, BOB).unwrap();
@@ -10253,6 +10474,18 @@ mod account_space_tests {
         assert_eq!(
             u64::from_le_bytes(bytes[429..437].try_into().unwrap()),
             1_700_000_000
+        );
+        // AV-51: a cliffed schedule serializes cliff_at in place.
+        let cliffed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting_cliff(1_700_000_000, 1_800_000_000, 1_750_000_000)
+            .unwrap();
+        let bytes = encode_escrow(&cliffed);
+        assert_eq!(bytes[428], 1, "vesting: Some discriminant");
+        assert_eq!(
+            u64::from_le_bytes(bytes[445..453].try_into().unwrap()),
+            1_750_000_000,
+            "vesting.cliff_at offset (cliffed schedule)"
         );
     }
 
@@ -10278,32 +10511,33 @@ mod account_space_tests {
 
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        // The head of the layout is untouched.
+        // The head of the layout is untouched. AV-51 shifts post-vesting
+        // offsets +8 (vesting schedule grew by the cliff_at u64).
         assert_eq!(bytes[88], EscrowState::Funded as u8);
-        assert_eq!(&bytes[446..478], &[0u8; 32], "arbiter: zeroed key");
+        assert_eq!(&bytes[454..486], &[0u8; 32], "arbiter: zeroed key");
         // Milestone plan: discriminant 1, amounts, count.
-        assert_eq!(bytes[478], 1, "milestones: Some discriminant");
+        assert_eq!(bytes[486], 1, "milestones: Some discriminant");
         assert_eq!(
-            u64::from_le_bytes(bytes[479..487].try_into().unwrap()),
+            u64::from_le_bytes(bytes[487..495].try_into().unwrap()),
             400_000,
             "milestones.amounts[0] offset"
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[487..495].try_into().unwrap()),
+            u64::from_le_bytes(bytes[495..503].try_into().unwrap()),
             600_000,
             "milestones.amounts[1] offset"
         );
-        assert_eq!(&bytes[495..543], &[0u8; 48], "unused tranche slots are zero");
-        assert_eq!(bytes[543], 2, "milestones.count offset");
+        assert_eq!(&bytes[503..551], &[0u8; 48], "unused tranche slots are zero");
+        assert_eq!(bytes[551], 2, "milestones.count offset");
         // Confirmation bitmap: milestone 0 has both confirmations + the
         // released bit (bits 0,1,2); milestone 1 has both skip approvals +
         // the skipped bit (bits 6*1+3, 6*1+4, 6*1+5 = 9,10,11).
-        let flags = u64::from_le_bytes(bytes[544..552].try_into().unwrap());
+        let flags = u64::from_le_bytes(bytes[552..560].try_into().unwrap());
         assert_eq!(flags, 0b111 | (0b111 << 9), "milestone_flags offsets");
         assert_eq!(flags, 3_591);
         // Skipped counter: the refunded tranche.
         assert_eq!(
-            u64::from_le_bytes(bytes[552..560].try_into().unwrap()),
+            u64::from_le_bytes(bytes[560..568].try_into().unwrap()),
             600_000,
             "skipped offset"
         );
@@ -10329,17 +10563,19 @@ mod account_space_tests {
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         assert_eq!(bytes[88], EscrowState::Funded as u8);
-        assert_eq!(&bytes[552..560], &[0u8; 8], "skipped: zero");
-        assert_eq!(bytes[560], 1, "mint: Some discriminant");
-        assert_eq!(&bytes[561..593], &MINT, "mint address offset");
+        // AV-51 shifts post-vesting offsets +8 (vesting schedule grew by
+        // the cliff_at u64).
+        assert_eq!(&bytes[560..568], &[0u8; 8], "skipped: zero");
+        assert_eq!(bytes[568], 1, "mint: Some discriminant");
+        assert_eq!(&bytes[569..601], &MINT, "mint address offset");
         // The state-machine view agrees with the bytes.
         assert_eq!(e.mint(), Some(MINT));
         // A bound mint survives a state transition (release moves money,
         // never the binding).
         e.release(ALICE, 1_750_000_000, 1_000_000, Some(MINT), BOB).unwrap();
         let bytes = encode_escrow(&e);
-        assert_eq!(bytes[560], 1, "mint discriminant unchanged by release");
-        assert_eq!(&bytes[561..593], &MINT);
+        assert_eq!(bytes[568], 1, "mint discriminant unchanged by release");
+        assert_eq!(&bytes[569..601], &MINT);
         assert_eq!(e.state(), EscrowState::Released);
     }
 
@@ -10351,8 +10587,8 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 927) * 3480 * 2 = 1055 * 6960 = 7_342_800 lamports.
-        assert_eq!(full, 7_342_800);
+        // (128 + 935) * 3480 * 2 = 1063 * 6960 = 7_398_480 lamports.
+        assert_eq!(full, 7_398_480);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
@@ -10404,13 +10640,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(7_342_800, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(7_398_480, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(6_437_999, params.0, params.1),
+            check_vault_rent_exempt(7_398_479, params.0, params.1),
             Err(RentShortfall {
-                required: 7_342_800,
-                provided: 6_437_999,
+                required: 7_398_480,
+                provided: 7_398_479,
             })
         );
         // Generous funding: exempt.
@@ -10422,7 +10658,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 7_342_800,
+                required: 7_398_480,
                 provided: 0,
             })
         );
@@ -12737,12 +12973,14 @@ mod evidence_tests {
     fn evidence_hash_persists_in_serialized_layout() {
         // The hash occupies the appended tail of the vault account
         // (discriminant + 32 bytes), so `escalate` writes it in place.
+        // AV-51 shifts the post-vesting offsets +8 (vesting schedule
+        // grew by the cliff_at u64).
         let mut e = funded_arbitrated_escrow();
         e.escalate(BOB, EXPIRES_AT - 1, Some(EVIDENCE)).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes[611], 1, "evidence_hash: Some discriminant");
-        assert_eq!(&bytes[612..644], &EVIDENCE, "evidence_hash bytes");
+        assert_eq!(bytes[619], 1, "evidence_hash: Some discriminant");
+        assert_eq!(&bytes[620..652], &EVIDENCE, "evidence_hash bytes");
     }
 }
 
@@ -12856,19 +13094,21 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 919, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) bytes");
-        assert_eq!(bytes[687], 0, "decimals offset unchanged");
-        assert_eq!(bytes[688], 1, "rationale_hash: Some discriminant");
-        assert_eq!(&bytes[689..721], &RATIONALE_HASH, "rationale_hash bytes");
-        // The AV-22 evidence region is untouched by the append.
-        assert_eq!(bytes[611], 0, "evidence_hash: None discriminant");
-        assert_eq!(&bytes[612..644], &[0u8; 32], "evidence_hash: zeroed");
+        assert_eq!(bytes.len(), 927, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) bytes");
+        // All offsets from decimals on sit 8 bytes past the pre-AV-51
+        // layout: the vesting schedule grew by the cliff_at u64.
+        assert_eq!(bytes[695], 0, "decimals offset");
+        assert_eq!(bytes[696], 1, "rationale_hash: Some discriminant");
+        assert_eq!(&bytes[697..729], &RATIONALE_HASH, "rationale_hash bytes");
+        // The AV-22 evidence region sits 8 past its pre-AV-51 offset.
+        assert_eq!(bytes[619], 0, "evidence_hash: None discriminant");
+        assert_eq!(&bytes[620..652], &[0u8; 32], "evidence_hash: zeroed");
         // AV-44: the new tail region — fee_recipient unset serializes
         // zeroed.
-        assert_eq!(bytes[722], 0, "fee_recipient: None discriminant");
-        assert_eq!(&bytes[723..755], &[0u8; 32], "fee_recipient: zeroed");
+        assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
+        assert_eq!(&bytes[731..763], &[0u8; 32], "fee_recipient: zeroed");
         // AV-46: the pause tail — no authority bound, flag clear.
-        assert_eq!(&bytes[755..789], &[0u8; 34], "pause tail: zeroed");
+        assert_eq!(&bytes[763..797], &[0u8; 34], "pause tail: zeroed");
     }
 
     #[test]
@@ -12879,27 +13119,28 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 919);
-        assert_eq!(bytes[688], 0, "rationale_hash: None discriminant");
-        assert_eq!(&bytes[689..721], &[0u8; 32], "rationale_hash: zeroed");
-        assert_eq!(bytes[722], 0, "fee_recipient: None discriminant");
-        assert_eq!(&bytes[723..755], &[0u8; 32], "fee_recipient: zeroed");
-        assert_eq!(&bytes[755..789], &[0u8; 34], "AV-46 pause tail: zeroed");
+        assert_eq!(bytes.len(), 927);
+        assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
+        assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
+        assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
+        assert_eq!(&bytes[731..763], &[0u8; 32], "fee_recipient: zeroed");
+        assert_eq!(&bytes[763..797], &[0u8; 34], "AV-46 pause tail: zeroed");
     }
 
     #[test]
     fn rationale_hash_rent_recomputed_from_mainnet_formula() {
-        // AV-46 grows the account by 34 bytes on top of AV-38/AV-41/AV-44/AV-45;
-        // the rent-exempt minimums are recomputed from the mainnet
-        // formula, not copied from the AV-45 numbers.
+        // AV-46 grows the account by 34 bytes on top of AV-38/AV-41/AV-44/AV-45,
+        // and AV-51 by 8 more (vesting cliff); the rent-exempt minimums
+        // are recomputed from the mainnet formula, not copied from the
+        // AV-46 numbers.
         let full = rent_exempt_minimum_lamports(
             VAULT_SPACE,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 927) * 3480 * 2 = 1055 * 6960 = 7_342_800 lamports.
-        assert_eq!(VAULT_SPACE, 927);
-        assert_eq!(full, 7_342_800);
+        // (128 + 935) * 3480 * 2 = 1063 * 6960 = 7_398_480 lamports.
+        assert_eq!(VAULT_SPACE, 935);
+        assert_eq!(full, 7_398_480);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
@@ -13080,12 +13321,12 @@ mod refund_tests {
     fn refund_to_persists_in_serialized_layout() {
         // The whitelist occupies the appended tail of the vault account
         // (discriminant + 32 bytes), so `with_refund_address` writes it
-        // in place.
+        // in place. AV-51 shifts the post-vesting offsets +8.
         let e = funded_whitelisted();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes[644], 1, "refund_to: Some discriminant");
-        assert_eq!(&bytes[645..677], &CAROL, "refund_to bytes");
+        assert_eq!(bytes[652], 1, "refund_to: Some discriminant");
+        assert_eq!(&bytes[653..685], &CAROL, "refund_to bytes");
     }
 }
 
@@ -13246,8 +13487,9 @@ mod penalty_tests {
 
     #[test]
     fn penalty_rate_persists_in_layout_tail() {
-        // The rate survives serialization at the appended tail offset
-        // (bytes[677..679]); earlier offsets are unchanged.
+        // The rate survives serialization at the tail offset; AV-51
+        // shifts the post-vesting offsets +8 (vesting schedule grew by
+        // the cliff_at u64).
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_penalty_bps(250)
@@ -13255,7 +13497,7 @@ mod penalty_tests {
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         assert_eq!(
-            u16::from_le_bytes(bytes[677..679].try_into().unwrap()),
+            u16::from_le_bytes(bytes[685..687].try_into().unwrap()),
             250,
             "penalty_bps tail offset"
         );
@@ -13461,6 +13703,8 @@ mod timelock_tests {
 
     #[test]
     fn timelock_persists_in_serialized_layout_tail() {
+        // AV-51 shifts the post-vesting offsets +8 (vesting schedule
+        // grew by the cliff_at u64).
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_timelock(UNLOCK_AT)
@@ -13468,7 +13712,7 @@ mod timelock_tests {
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         assert_eq!(
-            u64::from_le_bytes(bytes[679..687].try_into().unwrap()),
+            u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
             UNLOCK_AT,
             "timelock tail offset"
         );
@@ -13646,14 +13890,15 @@ mod emergency_unlock_tests {
 
     #[test]
     fn emergency_unlock_opt_in_persists_in_serialized_layout_tail() {
-        // The opt-in byte is the appended tail: offset 650, right after
-        // the AV-38 rationale_hash region — every earlier offset stays
-        // stable (the AV-27 timelock still sits at 608..616). AV-44
-        // appends the fee_recipient region after it (651..684).
+        // The opt-in byte is the appended tail, right after the AV-38
+        // rationale_hash region. AV-51 shifts every post-vesting offset
+        // +8 (the vesting schedule grew by the cliff_at u64): the AV-27
+        // timelock now sits at 687..695. AV-44 appends the fee_recipient
+        // region after the opt-in byte.
         let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes[721], 0, "emergency_unlock: off by default");
+        assert_eq!(bytes[729], 0, "emergency_unlock: off by default");
         let opted = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_timelock(UNLOCK_AT)
@@ -13661,12 +13906,12 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 919);
-        assert_eq!(bytes[721], 1, "emergency_unlock: opt-in byte set");
+        assert_eq!(bytes.len(), 927);
+        assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
-            u64::from_le_bytes(bytes[679..687].try_into().unwrap()),
+            u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
             UNLOCK_AT,
-            "timelock offset unchanged by the append"
+            "timelock offset"
         );
     }
 
@@ -13836,11 +14081,11 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 919, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49");
-        assert_eq!(bytes[687], 9, "decimals tail offset");
-        // The timelock offset is unchanged by the append.
+        assert_eq!(ESCROW_BODY_LEN, 927, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51");
+        assert_eq!(bytes[695], 9, "decimals tail offset");
+        // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
-            u64::from_le_bytes(bytes[679..687].try_into().unwrap()),
+            u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
             0,
             "timelock offset stable"
         );
@@ -13848,20 +14093,20 @@ mod decimals_tests {
         let mut plain = initialized();
         plain.fund(ALICE).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&plain);
-        assert_eq!(bytes[687], 0, "decimals zeroed without the builder");
+        assert_eq!(bytes[695], 0, "decimals zeroed without the builder");
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
     }
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 927) * 3480 * 2 = 1055 * 6960 = 7_342_800 lamports.
+        // (128 + 935) * 3480 * 2 = 1063 * 6960 = 7_398_480 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            7_342_800
+            7_398_480
         );
         // (128 + 445) * 3480 * 2 = 573 * 6960 = 3_988_080 lamports.
         assert_eq!(
@@ -13872,12 +14117,12 @@ mod decimals_tests {
             ),
             3_988_080
         );
-        // 172 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
+        // 180 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
-        // AV-45 quorum weights + AV-46 pause switch).
-        assert_eq!(VAULT_SPACE, 927);
+        // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff).
+        assert_eq!(VAULT_SPACE, 935);
         assert_eq!(VAULT_SPACE_NO_QUORUM, 445);
-        assert!(check_vault_rent_exempt(7_342_800, 3_480, 2.0).is_ok());
+        assert!(check_vault_rent_exempt(7_398_480, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -14362,11 +14607,12 @@ mod fee_recipient_tests {
         let e = fee_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes[722], 1, "fee_recipient: Some discriminant");
-        assert_eq!(&bytes[723..755], &RECIPIENT, "fee_recipient bytes");
-        // Every earlier offset is unchanged by the append.
-        assert_eq!(bytes[721], 0, "emergency_unlock offset unchanged");
-        assert_eq!(bytes[687], 0, "decimals offset unchanged");
+        // AV-51 shifts every post-vesting offset +8 (vesting schedule
+        // grew by the cliff_at u64).
+        assert_eq!(bytes[730], 1, "fee_recipient: Some discriminant");
+        assert_eq!(&bytes[731..763], &RECIPIENT, "fee_recipient bytes");
+        assert_eq!(bytes[729], 0, "emergency_unlock offset");
+        assert_eq!(bytes[695], 0, "decimals offset");
     }
 
     #[test]
@@ -14831,12 +15077,12 @@ mod pause_tests {
         let e = paused_funded();
         let body = super::account_space_tests::encode_escrow(&e);
         assert_eq!(body.len(), ESCROW_BODY_LEN);
-        // The pre-AV-46 payload ended at 755; the pause authority rides
-        // 755..788 (1-byte discriminant + 32-byte address) and the flag
-        // is the final byte at 788.
-        assert_eq!(body[755], 1, "pause_authority: Some discriminant");
-        assert_eq!(&body[756..788], &PAUSER, "pause authority address offset");
-        assert_eq!(body[788], 1, "paused flag set");
+        // AV-51 shifts the post-vesting offsets +8: the pause authority
+        // rides 763..796 (1-byte discriminant + 32-byte address) and the
+        // flag is the final byte at 796.
+        assert_eq!(body[763], 1, "pause_authority: Some discriminant");
+        assert_eq!(&body[764..796], &PAUSER, "pause authority address offset");
+        assert_eq!(body[796], 1, "paused flag set");
 
         let mut data = vault_account_discriminator().to_vec();
         data.extend_from_slice(&body);
@@ -14851,7 +15097,7 @@ mod pause_tests {
         // No authority bound at all: the whole 34-byte tail is zeroed.
         let e = base();
         let body = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(&body[755..789], &[0u8; 34], "no authority, never paused: zeroed tail");
+        assert_eq!(&body[763..797], &[0u8; 34], "no authority, never paused: zeroed tail");
         let mut data = vault_account_discriminator().to_vec();
         data.extend_from_slice(&body);
         let decoded = decode_vault_account(&data).unwrap();
@@ -14863,9 +15109,9 @@ mod pause_tests {
     fn bound_but_unpaused_escrow_encodes_authority_with_clear_flag() {
         let e = pausable();
         let body = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(body[755], 1, "pause_authority: Some discriminant");
-        assert_eq!(&body[756..788], &PAUSER, "pause authority address offset");
-        assert_eq!(body[788], 0, "paused flag clear");
+        assert_eq!(body[763], 1, "pause_authority: Some discriminant");
+        assert_eq!(&body[764..796], &PAUSER, "pause authority address offset");
+        assert_eq!(body[796], 0, "paused flag clear");
         let mut data = vault_account_discriminator().to_vec();
         data.extend_from_slice(&body);
         let decoded = decode_vault_account(&data).unwrap();
@@ -15047,13 +15293,14 @@ mod pause_rotation_tests {
         assert_eq!(e.released_amount(), 0);
         assert!(!e.is_paused());
         // Same account space: only the 33-byte authority region changed
-        // (Some discriminant + address at the AV-46 pinned offsets).
+        // (Some discriminant + address at the pinned offsets; AV-51
+        // shifts post-vesting offsets +8).
         let after = super::account_space_tests::encode_escrow(&e);
         assert_eq!(before.len(), after.len());
-        assert_eq!(after[755], 1, "pause_authority: Some discriminant");
-        assert_eq!(&after[756..788], &PAUSER2, "authority address offset");
-        assert_eq!(&after[..755], &before[..755]);
-        assert_eq!(&after[788..], &before[788..]);
+        assert_eq!(after[763], 1, "pause_authority: Some discriminant");
+        assert_eq!(&after[764..796], &PAUSER2, "authority address offset");
+        assert_eq!(&after[..763], &before[..763]);
+        assert_eq!(&after[796..], &before[796..]);
     }
 
     #[test]

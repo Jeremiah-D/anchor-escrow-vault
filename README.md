@@ -84,7 +84,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `update_quorum(initializer, taker, threshold)` | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance); `0` or `> total weight` is `InvalidQuorum` |
 | `update_attestors(initializer, taker, attestors)` | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance; no party can unilaterally reshape the electorate); empty set / `> 8` / duplicates / new set smaller than the unchanged threshold is `InvalidQuorum`; approval bits remap by pubkey (retained votes survive, removed voters' bits cleared); emits `AttestorsUpdated` on a real set change, nothing on a no-op |
 | `activate(authority)`                       | `Uninitialized`| `Uninitialized` (one party) / `Activated` (both parties) | initializer **or** taker (dual-sig escrows only) |
-| `initialize_vesting(start, end)`            | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `start < end`) |
+| `initialize_vesting(start, end, cliff)`     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `start < end`; `cliff` 0 = no cliff, else `cliff <= end`) |
 | `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise) |
 | `fund(authority)`                           | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer            |
 | `release(authority, now, amount, payout_to)` (AV-49)                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise); cumulative releases ≤ locked amount; `payout_to` must satisfy the payout policy — the taker, or a member of the payout allowlist when one is configured (`PayoutNotAllowlisted` otherwise) |
@@ -268,7 +268,16 @@ schedule (`VestingSchedule::new(start, end)`, opt-in on `Uninitialized`,
 like the quorum builder): the locked amount unlocks linearly between
 `start` and `end`, and the taker pulls the vested-but-unreleased portion
 at any time with `claim(authority, now)` — the streaming-payments
-pattern (salary streams, linear token unlocks). `claim` returns the
+pattern (salary streams, linear token unlocks). AV-51 adds an optional
+**cliff** (`with_vesting_cliff(start, end, cliff_at)`): before the cliff
+nothing unlocks, and at/after the cliff the linear curve from `start`
+applies unchanged — the cliff gates unlocking, it does not rebase the
+curve, so there is no unlock jump at the cliff. `claim` before the cliff
+computes a zero claimable and reports `AmountMismatch` (no extra gate —
+the zero falls out of the curve), and the keeper's claim scan inherits
+the gate through the same computation. `cliff_at > end` is
+`InvalidVesting` (funds that could never vest); a cliff at or before
+`start` is the no-cliff schedule. `claim` returns the
 claimed amount so the program can size the transfer; claims accumulate in
 the same `released` counter as `release`, so conservation and audit stay
 unified, and the escrow moves to `Released` once everything is out. Only
@@ -423,7 +432,10 @@ rent-exempt on mainnet. (AV-45 grows the quorum region by 71 bytes — 64 for
 the per-attestor weight array plus 7 for the wider u64 weight-sum threshold —
 so the full vault is now 763 bytes and needs **6,201,360 lamports**. AV-46
 appends the 33-byte pause-authority region plus the 1-byte pause flag (34
-bytes), so the full vault is now 927 bytes and needs **7,342,800 lamports**.)
+bytes), so the full vault is now 927 bytes and needs **7,342,800 lamports**.
+AV-51 adds the 8-byte vesting `cliff_at` timestamp to the vesting region
+(the schedule goes from 17 to 25 bytes), so the full vault is now **935
+bytes** and needs **7,398,480 lamports**.)
 
 **Fee recipient pin (AV-44).** An escrow can additionally pin *where* the
 fee goes (`initialize_fee_recipient(fee_recipient)`, opt-in on
@@ -493,7 +505,7 @@ program error per variant):
 | `InvalidQuorum` | 104 | bad quorum policy config, or `attest` with no quorum configured |
 | `QuorumNotReached` | 105 | `release` before the quorum threshold is reached |
 | `ReleaseExceedsLocked` | 106 | cumulative `release` amounts exceeding the locked amount |
-| `InvalidVesting` | 107 | bad vesting schedule (`start >= end`), or `claim` with no vesting configured |
+| `InvalidVesting` | 107 | bad vesting schedule (`start >= end`, or `cliff_at > end` since AV-51), or `claim` with no vesting configured |
 | `InvalidArbiter` | 108 | `with_arbiter` with the zero key, or `escalate`/`resolve` with no arbiter configured |
 | `DisputeWindowClosed` | 109 | `escalate` with `now >= expires_at` (past the dispute window) |
 | `InvalidMilestones` | 110 | bad milestone plan (empty list, > 8 tranches, zero-amount tranche, tranche sum ≠ locked amount), milestone op with no plan attached, out-of-range milestone index, or `release`/`claim` with a milestone plan attached |
@@ -1026,7 +1038,7 @@ two-way consistency check against the IDL parameter table:
 | state         | u8 (discriminant) | 1     |
 | quorum        | Option<Quorum>    | 338   |
 | activation    | u8 (bitmask)      | 1     |
-| vesting       | Option<VestingSchedule> | 17 |
+| vesting       | Option<VestingSchedule> | 25 |
 | arbiter       | Option<Pubkey>    | 33    |
 | milestones    | Option<MilestonePlan> | 66 |
 | milestone_flags | u64 (bitmask)   | 8     |
@@ -1046,7 +1058,7 @@ two-way consistency check against the IDL parameter table:
 | pause_authority | Option<Pubkey> | 33  |
 | paused        | bool              | 1     |
 | payout_allowlist | Option<PayoutAllowlist> | 130 |
-| **total**     |                   | **927** |
+| **total**     |                   | **935** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1055,9 +1067,9 @@ discriminant plus the 337-byte weighted policy — eight attestor keys
 (256), eight per-attestor u64 weights (64), the registered count (1),
 the u64 weight-sum threshold (8), and the approval bitmask (8). The 1-byte
 activation bitmask (AV-12) is likewise always present
-(zeroed for plain escrows), as is the 17-byte vesting region (AV-13:
+(zeroed for plain escrows), as is the 25-byte vesting region (AV-13:
 1-byte discriminant + `start`/`end` u64, zeroed when no schedule is
-attached), the 33-byte arbiter region (AV-14: 1-byte discriminant +
+attached; AV-51 appends the `cliff_at` u64), the 33-byte arbiter region (AV-14: 1-byte discriminant +
 32-byte key, zeroed when no arbiter is configured) — and the 66-byte
 milestone plan region (AV-15: 1-byte discriminant + eight tranche u64s +
 count byte, zeroed when no plan is attached), the 8-byte confirmation
@@ -1085,10 +1097,10 @@ attached no rationale) — and the 1-byte emergency timelock-unlock
 governance opt-in `emergency_unlock` (AV-41, zeroed when the feature is
 off) — and the 33-byte protocol-fee recipient region (AV-44: 1-byte
 discriminant + 32-byte address, zeroed when no recipient is bound).
-`escrow-state` exposes `VAULT_SPACE` (927) and
+`escrow-state` exposes `VAULT_SPACE` (935) and
 `VAULT_SPACE_NO_QUORUM` (445) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **7,342,800 lamports** to be
+mainnet rent parameters the full vault needs **7,398,480 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1109,11 +1121,12 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 927 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
-  weighted-quorum, AV-46 pause-switch, and AV-49 payout-allowlist growth is accounted in the layout table above); the state
+  stays 935 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
+  weighted-quorum, AV-46 pause-switch, AV-49 payout-allowlist, and AV-51
+  vesting-cliff growth is accounted in the layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**7,342,800
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**7,398,480
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the
@@ -1131,7 +1144,7 @@ the whole instruction aborts with zero side effects (state, counters
 and the event log all roll back). The initializer signs once instead
 of twice, and the rent-exempt deposit returns together with the
 payout. The indexer sees the fixed `Released` → `VaultClosed` event
-pair; the vault layout is untouched (`VAULT_SPACE` stays 927).
+pair; the vault layout is untouched (`VAULT_SPACE` stays 935).
 
 ## IDL pipeline (AV-29)
 

@@ -272,9 +272,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     let vesting = if c.option_present("vesting")? {
         let start = c.u64_le()?;
         let end = c.u64_le()?;
-        Some(VestingSchedule { start, end })
+        // AV-51: the cliff timestamp trails end (24-byte region).
+        let cliff_at = c.u64_le()?;
+        Some(VestingSchedule { start, end, cliff_at })
     } else {
-        c.skip(16)?;
+        c.skip(24)?;
         None
     };
 

@@ -196,8 +196,13 @@ fn named_type_fields(name: &str) -> &'static [(&'static str, IdlType)] {
             ("threshold", IdlType::U64),
             ("approvals", IdlType::U64),
         ],
-        // VestingSchedule { start: u64, end: u64 }.
-        "VestingSchedule" => &[("start", IdlType::U64), ("end", IdlType::U64)],
+        // VestingSchedule { start: u64, end: u64, cliff_at: u64 }
+        // (AV-51: the cliff timestamp before which zero unlocks).
+        "VestingSchedule" => &[
+            ("start", IdlType::U64),
+            ("end", IdlType::U64),
+            ("cliff_at", IdlType::U64),
+        ],
         // MilestonePlan { amounts: [u64; 8], count: u8 }.
         "MilestonePlan" => &[
             ("amounts", IdlType::Array(ArrayElem::U64, 8)),
@@ -563,7 +568,8 @@ fn named_type_sizes_pin_constants() {
             .sum::<usize>()
     };
     assert_eq!(size("QuorumPolicy"), QUORUM_POLICY_LEN);
-    assert_eq!(size("VestingSchedule"), 16);
+    // AV-51: the cliff_at u64 joins start/end.
+    assert_eq!(size("VestingSchedule"), 24);
     assert_eq!(size("MilestonePlan"), MILESTONE_PLAN_LEN);
     assert_eq!(size("PayoutAllowlist"), PAYOUT_ALLOWLIST_LEN);
 }
@@ -860,6 +866,8 @@ fn idl_field_offsets_pin_dispute_path() {
     assert_eq!(&ev[1..33], &EVIDENCE);
     // AV-38: the rationale hash lands on the IDL-computed tail offset —
     // the last field of the account — and earlier offsets are stable.
+    // AV-51 shifts the post-vesting offsets +8 (8-byte discriminator +
+    // 687-byte body prefix: the vesting schedule grew by cliff_at).
     let rh = body_field(&enc, &offsets, "rationale_hash");
     assert_eq!(rh[0], 1, "rationale discriminant");
     assert_eq!(&rh[1..33], &RATIONALE);
@@ -868,6 +876,6 @@ fn idl_field_offsets_pin_dispute_path() {
         .find(|(n, _, _)| *n == "rationale_hash")
         .copied()
         .expect("rationale_hash in IDL offsets");
-    assert_eq!((rh_offset, rh_len), (696, 33));
+    assert_eq!((rh_offset, rh_len), (704, 33));
     assert_eq!(u64_at(body_field(&enc, &offsets, "released")), 300_000);
 }

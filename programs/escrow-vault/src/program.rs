@@ -660,17 +660,33 @@ pub mod escrow_vault {
     }
 
     /// Attach a linear vesting schedule (AV-13; mirrors
-    /// `VestingSchedule::new` + `Escrow::with_vesting`). `Uninitialized`
-    /// only, like `initialize_quorum`: the unlock curve is fixed before
-    /// funds move. `start >= end` is `InvalidVesting`.
-    pub fn initialize_vesting(ctx: Context<InitializeVesting>, start: u64, end: u64) -> Result<()> {
-        let schedule =
-            escrow_state::VestingSchedule::new(start, end).map_err(|e| escrow_error(e))?;
+    /// `VestingSchedule::new` + `Escrow::with_vesting`), with an optional
+    /// cliff (AV-51). `cliff == 0` means no cliff (the plain AV-13 curve,
+    /// `cliff_at = start`); a nonzero `cliff` gates all unlocking until
+    /// that timestamp — before it nothing vests, at/after it the linear
+    /// curve from `start` applies (the cliff gates unlocking, it does not
+    /// rebase the curve). `Uninitialized` only, like `initialize_quorum`:
+    /// the unlock curve is fixed before funds move. `start >= end` or
+    /// `cliff > end` is `InvalidVesting`. The instruction discriminator
+    /// is unchanged (name-derived: a new param does not rename the
+    /// instruction).
+    pub fn initialize_vesting(
+        ctx: Context<InitializeVesting>,
+        start: u64,
+        end: u64,
+        cliff: u64,
+    ) -> Result<()> {
+        let schedule = escrow_state::VestingSchedule::new_with_cliff(
+            start,
+            end,
+            if cliff == 0 { start } else { cliff },
+        )
+        .map_err(|e| escrow_error(e))?;
         let escrow = read_escrow(&ctx.accounts.vault);
         let escrow = escrow.with_vesting(schedule).map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // The vault account already reserves the full vesting region
-        // (1 + 16 bytes, zeroed when `None`), so the schedule is written
+        // (1 + 24 bytes, zeroed when `None`), so the schedule is written
         // in place — no realloc needed in the real build.
         Ok(())
     }
@@ -1743,13 +1759,18 @@ pub struct Vault {
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
-/// window `[start, end)` in Unix seconds. See the state machine docs for
-/// the claim semantics. Serialized size is pinned by the AV-10/AV-13
-/// tests (17 bytes: 1-byte `Option` discriminant + two u64s).
+/// window `[start, end)` in Unix seconds, with an optional cliff
+/// (AV-51): before `cliff_at` nothing unlocks, at/after it the linear
+/// curve from `start` applies. See the state machine docs for the claim
+/// semantics. Serialized size is pinned by the AV-10/AV-13/AV-51 tests
+/// (25 bytes: 1-byte `Option` discriminant + three u64s).
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
 pub struct Vesting {
     pub start: u64,
     pub end: u64,
+    /// AV-51: cliff timestamp before which zero unlocks; equals `start`
+    /// for the no-cliff schedule.
+    pub cliff_at: u64,
 }
 
 /// Skeleton mirror of `escrow_state::QuorumPolicy`: up to 8 registered

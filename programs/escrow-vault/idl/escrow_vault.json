@@ -97,7 +97,8 @@
       "accounts": [],
       "args": [
         {"name": "start", "type": "u64"},
-        {"name": "end", "type": "u64"}
+        {"name": "end", "type": "u64"},
+        {"name": "cliff", "type": "u64"}
       ]
     },
     {
@@ -317,25 +318,25 @@
           {"name": "quorum", "type": {"option": {"defined": "QuorumPolicy"}}, "offset": 97},
           {"name": "activation", "type": "u8", "offset": 435},
           {"name": "vesting", "type": {"option": {"defined": "VestingSchedule"}}, "offset": 436},
-          {"name": "arbiter", "type": {"option": "publicKey"}, "offset": 453},
-          {"name": "milestones", "type": {"option": {"defined": "MilestonePlan"}}, "offset": 486},
-          {"name": "milestone_flags", "type": "u64", "offset": 552},
-          {"name": "skipped", "type": "u64", "offset": 560},
-          {"name": "mint", "type": {"option": "publicKey"}, "offset": 568},
-          {"name": "fee_bps", "type": "u16", "offset": 601},
-          {"name": "fees_paid", "type": "u64", "offset": 603},
-          {"name": "grace_period", "type": "u64", "offset": 611},
-          {"name": "evidence_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 619},
-          {"name": "refund_to", "type": {"option": "publicKey"}, "offset": 652},
-          {"name": "penalty_bps", "type": "u16", "offset": 685},
-          {"name": "timelock", "type": "u64", "offset": 687},
-          {"name": "decimals", "type": "u8", "offset": 695},
-          {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 696},
-          {"name": "emergency_unlock", "type": "bool", "offset": 729},
-          {"name": "fee_recipient", "type": {"option": "publicKey"}, "offset": 730},
-          {"name": "pause_authority", "type": {"option": "publicKey"}, "offset": 763},
-          {"name": "paused", "type": "bool", "offset": 796},
-          {"name": "payout_allowlist", "type": {"option": {"defined": "PayoutAllowlist"}}, "offset": 797}
+          {"name": "arbiter", "type": {"option": "publicKey"}, "offset": 461},
+          {"name": "milestones", "type": {"option": {"defined": "MilestonePlan"}}, "offset": 494},
+          {"name": "milestone_flags", "type": "u64", "offset": 560},
+          {"name": "skipped", "type": "u64", "offset": 568},
+          {"name": "mint", "type": {"option": "publicKey"}, "offset": 576},
+          {"name": "fee_bps", "type": "u16", "offset": 609},
+          {"name": "fees_paid", "type": "u64", "offset": 611},
+          {"name": "grace_period", "type": "u64", "offset": 619},
+          {"name": "evidence_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 627},
+          {"name": "refund_to", "type": {"option": "publicKey"}, "offset": 660},
+          {"name": "penalty_bps", "type": "u16", "offset": 693},
+          {"name": "timelock", "type": "u64", "offset": 695},
+          {"name": "decimals", "type": "u8", "offset": 703},
+          {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 704},
+          {"name": "emergency_unlock", "type": "bool", "offset": 737},
+          {"name": "fee_recipient", "type": {"option": "publicKey"}, "offset": 738},
+          {"name": "pause_authority", "type": {"option": "publicKey"}, "offset": 771},
+          {"name": "paused", "type": "bool", "offset": 804},
+          {"name": "payout_allowlist", "type": {"option": {"defined": "PayoutAllowlist"}}, "offset": 805}
         ]
       }
     }
@@ -360,7 +361,8 @@
         "kind": "struct",
         "fields": [
           {"name": "start", "type": "u64", "offset": 0},
-          {"name": "end", "type": "u64", "offset": 8}
+          {"name": "end", "type": "u64", "offset": 8},
+          {"name": "cliff_at", "type": "u64", "offset": 16}
         ]
       }
     },

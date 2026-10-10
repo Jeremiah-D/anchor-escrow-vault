@@ -854,6 +854,32 @@ mod keeper_tests {
     }
 
     #[test]
+    fn vesting_before_cliff_lists_nothing() {
+        // AV-51: the keeper's claim listing goes through
+        // `claimable_amount` -> `vested_amount`, so it inherits the
+        // cliff gate — a pre-cliff escrow is never listed as an
+        // executable claim.
+        const CLIFF: u64 = 1_750_000_000;
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_vesting_cliff(VEST_START, VEST_END, CLIFF)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let watched = [watch(ID1, e)];
+        let report = scan_keeper_actions(&watched, CLIFF - 1);
+        assert!(
+            report.is_empty(),
+            "pre-cliff: nothing vested, no executable claim"
+        );
+        // At the cliff the claim becomes executable and lists the
+        // linear value.
+        let report = scan_keeper_actions(&watched, CLIFF);
+        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions[0].kind, KeeperActionKind::Claim);
+        assert_eq!(report.actions[0].amount, 500_000);
+    }
+
+    #[test]
     fn claim_amount_is_vested_minus_released() {
         // The initializer released ahead of the curve: the claimable
         // remainder is what is vested but not yet released.
