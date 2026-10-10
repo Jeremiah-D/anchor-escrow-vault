@@ -1051,6 +1051,28 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Declare the protocol-fee recipient (AV-44; mirrors
+    /// `Escrow::with_fee_recipient`): after this, every fee leg the
+    /// AV-17 fee rate charges must go to `fee_recipient`
+    /// (`RecipientMismatch` on a swapped destination in the settlement
+    /// plan) — a fee cannot be silently redirected. With no pinned
+    /// recipient the fee legs route to the program-level fee account.
+    /// `Uninitialized` only; the zero address is `InvalidFeeRecipient`.
+    pub fn initialize_fee_recipient(
+        ctx: Context<InitializeFeeRecipient>,
+        fee_recipient: Pubkey,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_fee_recipient(fee_recipient.to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.fee_recipient` is always present (33 bytes, zeroed by
+        // default), so the address is written in place — no realloc
+        // needed in the real build.
+        Ok(())
+    }
+
     /// Clear the AV-27 timelock by dual-signed emergency governance
     /// (AV-41; mirrors `Escrow::emergency_unlock`). Both the initializer
     /// and the taker must sign — one party alone is `Unauthorized`.
@@ -1293,6 +1315,16 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `rationale_hash`).
     pub emergency_unlock: bool,
+    /// AV-44: opt-in protocol-fee recipient; mirrors
+    /// `escrow_state`'s `fee_recipient`. `None` for an escrow with no
+    /// pinned recipient (fee legs route to the program-level fee
+    /// account). The account always reserves the full 33-byte region
+    /// (1-byte discriminant + 32-byte address, zeroed when `None`) so
+    /// `initialize_fee_recipient` writes the address in place without
+    /// reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `emergency_unlock`).
+    pub fee_recipient: Option<Pubkey>,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -1795,6 +1827,16 @@ pub struct InitializeEmergencyUnlock<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitializeFeeRecipient<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer pins the protocol-fee recipient; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`, and rejects the zero address.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct EmergencyUnlock<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
@@ -2127,6 +2169,7 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidCpiTarget => error!(ErrorCode::InvalidCpiTarget),
         escrow_state::EscrowError::CpiExecutionFailed => error!(ErrorCode::CpiExecutionFailed),
         escrow_state::EscrowError::ReentrantCall => error!(ErrorCode::ReentrantCall),
+        escrow_state::EscrowError::InvalidFeeRecipient => error!(ErrorCode::InvalidFeeRecipient),
     }
 }
 
@@ -2178,4 +2221,6 @@ pub enum ErrorCode {
     CpiExecutionFailed,
     #[msg("Reentrant call rejected: a fund-moving transition was entered while the AV-36 reentrancy lock was held (nested entry from inside release_via_cpi's executor window)")]
     ReentrantCall,
+    #[msg("Invalid protocol-fee recipient: with_fee_recipient with the zero address (a zero address can never be the legitimate fee destination)")]
+    InvalidFeeRecipient,
 }

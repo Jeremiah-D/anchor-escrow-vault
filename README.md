@@ -73,6 +73,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `skip_milestone(authority, index)`           | `Funded`       | — (no state change) | initializer **or** taker, **both** must approve (dual-sig skip; skipped tranche refunded to the initializer) |
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
 | `initialize_protocol_fee(fee_bps)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `fee_bps` in 0–10000 basis points; the fee slices every taker payout into net payout + protocol fee) |
+| `initialize_fee_recipient(fee_recipient)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding; pins the destination of every fee leg — the settlement builders reject a `fee_leg` that does not equal it; zero address is `InvalidFeeRecipient`; with no pin the fee goes to the program-level fee account) |
 | `initialize_quorum(attestors, threshold)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
@@ -404,8 +405,25 @@ milestones are never fee'd: only value the taker receives carries a fee.
 The rate (`fee_bps`, 2 bytes) and the cumulative counter (`fees_paid`,
 8 bytes) are persisted in the vault account (see the layout table),
 appended last so every earlier field offset stays stable; with the fee
-region the full vault is 540 bytes and needs **4,649,280 lamports** to be
+region the full vault is 692 bytes and needs **5,707,200 lamports** to be
 rent-exempt on mainnet.
+
+**Fee recipient pin (AV-44).** An escrow can additionally pin *where* the
+fee goes (`initialize_fee_recipient(fee_recipient)`, opt-in on
+`Uninitialized`, like every other `with_*` builder): after this, every fee
+leg the AV-17 rate charges must go to the pinned address. With no pinned
+recipient the fee legs route to the program-level fee account (the
+pre-AV-44 behavior). The zero address is rejected (`InvalidFeeRecipient`,
+code 123) — it can never be the legitimate fee destination, paralleling
+the AV-23 refund-whitelist policy — and the pin is immutable once the
+escrow leaves `Uninitialized`, like the fee rate itself. The settlement
+builders enforce the pin: `payout_plan` / `resolve_plan` reject a `fee_leg`
+that does not equal the pinned address (`RecipientMismatch`), so a
+malicious client cannot silently redirect the fee; a zero fee still emits
+no fee leg (dust payouts carry no fee, floor-rounded). The recipient is a
+persisted 33-byte region in the vault account (see the layout table),
+appended last so every earlier field offset stays stable, and is exported
+in the AV-26 snapshot JSON (`"fee_recipient"`, `null` when unpinned).
 
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
@@ -435,6 +453,7 @@ program error per variant):
 | `InvalidCpiTarget` | 120 | `release_via_cpi` with a zero program id, an empty account list, or a zero account key (malformed third-party invocation) |
 | `CpiExecutionFailed` | 121 | `release_via_cpi` whose injected CPI executor reported failure after the gates passed (whole release rolled back) |
 | `ReentrantCall` | 122 | a fund-moving transition entered while the AV-36 reentrancy lock was held (nested entry from inside `release_via_cpi`'s executor window) |
+| `InvalidFeeRecipient` | 123 | `with_fee_recipient` with the zero address (a zero address can never be the legitimate protocol-fee destination) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -833,9 +852,9 @@ order; batches in first-seen caller order, actions in input order):
 
 ```json
 {"scanned":2,"batches":[
-  {"caller":"...","total_reclaimed":10955040,"actions":[
+  {"caller":"...","total_reclaimed":11414400,"actions":[
     {"escrow_id":"...","action":"close_vault","caller":"...",
-     "caller_role":"initializer","rent_reclaimed":5477520,
+     "caller_role":"initializer","rent_reclaimed":5707200,
      "reason":"released"}
   ]}
 ]}
@@ -881,7 +900,7 @@ Raw fields: `initializer`, `taker`, `state` (`uninitialized` / `activated` /
 `decimals` (AV-28; `0` = no decimal metadata declared), `released`,
 `expires_at`, `grace_period`, `dual_sig`
 (`required` / `initializer_activated` / `taker_activated`), `fee_bps`,
-`fees_paid`, `skipped`, `penalty_bps`, `unlock_at` (AV-27; `0` = no
+`fees_paid`, `fee_recipient` (AV-44; hex or `null`), `skipped`, `penalty_bps`, `unlock_at` (AV-27; `0` = no
 timelock), plus the optional `quorum`,
 `vesting`, `arbiter`, `mint`, `evidence_hash`, `rationale_hash` (AV-38;
 hex or `null`), `refund_to` (hex or `null`)
@@ -917,7 +936,7 @@ diffing numbers while operators read whole tokens.
  "dual_sig":{"required":false,"initializer_activated":false,"taker_activated":false},
  "quorum":null,"vesting":null,"vested":0,"display_vested":"0.000000",
  "claimable":0,"display_claimable":"0.000000",
- "arbiter":null,"mint":null,"fee_bps":0,"fees_paid":0,"display_fees_paid":"0.000000",
+ "arbiter":null,"mint":null,"fee_bps":0,"fees_paid":0,"display_fees_paid":"0.000000","fee_recipient":null,
  "milestones":null,"skipped":0,"display_skipped":"0.000000",
  "evidence_hash":null,"rationale_hash":null,"refund_to":null,"refund_recipient":"...",
  "penalty_bps":0,"unlock_at":0,"unlock_eligible":true}
@@ -957,7 +976,8 @@ two-way consistency check against the IDL parameter table:
 | decimals      | u8                | 1     |
 | rationale_hash | Option<[u8; 32]> | 33    |
 | emergency_unlock | bool           | 1     |
-| **total**     |                   | **659** |
+| fee_recipient | Option<Pubkey> | 33    |
+| **total**     |                   | **692** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -990,11 +1010,12 @@ is declared) — and the 33-byte arbiter's rationale-document hash region
 (AV-38: 1-byte discriminant + 32-byte commitment, zeroed when the arbiter
 attached no rationale) — and the 1-byte emergency timelock-unlock
 governance opt-in `emergency_unlock` (AV-41, zeroed when the feature is
-off).
-`escrow-state` exposes `VAULT_SPACE` (659) and
-`VAULT_SPACE_NO_QUORUM` (248) for the Anchor `space =` constraint, plus a
+off) — and the 33-byte protocol-fee recipient region (AV-44: 1-byte
+discriminant + 32-byte address, zeroed when no recipient is bound).
+`escrow-state` exposes `VAULT_SPACE` (692) and
+`VAULT_SPACE_NO_QUORUM` (281) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **5,477,520 lamports** to be
+mainnet rent parameters the full vault needs **5,707,200 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1015,11 +1036,11 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 658 — the AV-38 rationale-hash growth is accounted in the
-  layout table above); the state
+  stays 692 — the AV-38 rationale-hash and AV-44 fee-recipient growth is
+  accounted in the layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**5,470,560
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**5,707,200
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the
@@ -1160,9 +1181,10 @@ becomes a leg of a larger composed transaction:
   the same audit (`EscrowEvent.cpi`, mirrored on-chain as
   `EscrowVaultEvent.cpi_target` / `cpi_accounts_hash`), so an indexer
   re-derives the hash and confirms the release authorized exactly this
-  instruction. The protocol fee still settles to the fee account through
-  the normal payout path, so fee accounting is identical with or
-  without CPI routing.
+  instruction. The protocol fee still settles through the normal payout
+  path — to the pinned `fee_recipient` when one is configured (AV-44),
+  else to the program-level fee account — so fee accounting is identical
+  with or without CPI routing.
 
 ## Account discriminators & panic-free decoding (AV-32)
 

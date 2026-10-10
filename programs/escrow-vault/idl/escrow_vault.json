@@ -224,6 +224,14 @@
       "args": []
     },
     {
+      "name": "initialize_fee_recipient",
+      "discriminator": [218, 87, 142, 200, 206, 197, 22, 200],
+      "accounts": [],
+      "args": [
+        {"name": "fee_recipient", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "emergency_unlock",
       "discriminator": [17, 106, 80, 63, 244, 220, 225, 70],
       "accounts": [],
@@ -265,7 +273,8 @@
           {"name": "timelock", "type": "u64", "offset": 616},
           {"name": "decimals", "type": "u8", "offset": 624},
           {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 625},
-          {"name": "emergency_unlock", "type": "bool", "offset": 658}
+          {"name": "emergency_unlock", "type": "bool", "offset": 658},
+          {"name": "fee_recipient", "type": {"option": "publicKey"}, "offset": 659}
         ]
       }
     }
@@ -327,7 +336,8 @@
     {"code": 119, "name": "InvalidDecimals"},
     {"code": 120, "name": "InvalidCpiTarget"},
     {"code": 121, "name": "CpiExecutionFailed"},
-    {"code": 122, "name": "ReentrantCall"}
+    {"code": 122, "name": "ReentrantCall"},
+    {"code": 123, "name": "InvalidFeeRecipient"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

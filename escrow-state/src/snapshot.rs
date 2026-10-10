@@ -186,6 +186,9 @@ pub struct EscrowSnapshot {
     pub fee_bps: u16,
     /// Cumulative protocol fee charged across all payouts (AV-17).
     pub fees_paid: u64,
+    /// Pinned protocol-fee recipient, or `None` when fees route to the
+    /// program-level fee account (AV-44).
+    pub fee_recipient: Option<[u8; 32]>,
     /// Milestone plan progress, or `None` when none is attached
     /// (AV-15).
     pub milestones: Option<MilestoneSnapshot>,
@@ -287,6 +290,7 @@ impl Escrow {
             mint: self.mint(),
             fee_bps: self.fee_bps(),
             fees_paid: self.fees_paid(),
+            fee_recipient: self.fee_recipient(),
             milestones,
             skipped: self.skipped_amount(),
             evidence_hash: self.evidence_hash(),
@@ -414,8 +418,14 @@ impl EscrowSnapshot {
         s.push_str(&self.fees_paid.to_string());
         s.push_str(",\"display_fees_paid\":\"");
         s.push_str(&format_amount(self.fees_paid, self.decimals));
-        // AV-15: milestone plan progress.
-        s.push_str("\",\"milestones\":");
+        // AV-44: the pinned protocol-fee recipient — `null` when fees
+        // route to the program-level fee account.
+        s.push_str("\",\"fee_recipient\":");
+        write_opt_hex(&mut s, self.fee_recipient);
+        // AV-15: milestone plan progress. (`fee_recipient` is self-
+        // quoted-or-null via `write_opt_hex`, so no dangling quote to
+        // close here — unlike the `display_*` fields above.)
+        s.push_str(",\"milestones\":");
         match &self.milestones {
             Some(m) => {
                 s.push_str("{\"count\":");
@@ -523,7 +533,7 @@ mod snapshot_tests {
              \"quorum\":null,\
              \"vesting\":null,\"vested\":0,\"display_vested\":\"0\",\"claimable\":0,\"display_claimable\":\"0\",\
              \"arbiter\":null,\"mint\":null,\
-             \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\
+             \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\
              \"milestones\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\

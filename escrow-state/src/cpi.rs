@@ -103,7 +103,8 @@ pub enum CpiError {
     /// transition results).
     SettlementMismatch,
     /// A recipient does not match the escrow's taker / initializer /
-    /// refund policy — a swapped destination is rejected, not built.
+    /// refund / fee-recipient policy — a swapped destination is
+    /// rejected, not built.
     RecipientMismatch,
     /// The escrow is not in a state that produces this settlement
     /// (e.g. a release plan for a `Cancelled` escrow).
@@ -208,7 +209,8 @@ pub struct PayoutAddrs {
     /// token account (token path).
     pub taker_leg: Pubkey,
     /// Protocol-fee destination. `fee == 0` emits no fee leg; `fee > 0`
-    /// with a zero address is rejected.
+    /// with a zero address is rejected. When the escrow pins a fee
+    /// recipient (AV-44), the address must equal it.
     pub fee_leg: Pubkey,
 }
 
@@ -251,6 +253,8 @@ pub struct ResolveAddrs {
     /// Taker-payout destination account.
     pub taker_leg: Pubkey,
     /// Protocol-fee destination account (`fee == 0` → no leg emitted).
+    /// Pinned against the escrow's fee recipient when one is configured
+    /// (AV-44).
     pub fee_leg: Pubkey,
     /// Initializer identity, pinned against `escrow.initializer()`.
     pub initializer: Pubkey,
@@ -308,6 +312,15 @@ fn push_fee_leg(
         return Ok(());
     }
     require_nonzero(&fee_leg)?;
+    // AV-44: when the escrow pins a protocol-fee recipient, the plan's
+    // fee leg must point at it — a swapped destination is rejected, not
+    // built. With no pinned recipient any nonzero address stands (the
+    // program-level fee account, backward compatible).
+    if let Some(recipient) = escrow.fee_recipient() {
+        if fee_leg != recipient {
+            return Err(CpiError::RecipientMismatch);
+        }
+    }
     transfers.push(leg(escrow, source, vault_authority, fee_leg, fee)?);
     Ok(())
 }
@@ -322,6 +335,8 @@ fn push_fee_leg(
 ///   recorded total is built from tampered or stale results;
 /// - `addrs.taker` equals the escrow's taker; on the native path the payout
 ///   must go straight to the taker wallet (`taker_leg == taker`);
+/// - `addrs.fee_leg` equals the escrow's pinned fee recipient when one
+///   is configured (AV-44);
 /// - the transfer program follows the escrow's mint binding.
 pub fn payout_plan(
     kind: PayoutKind,
@@ -442,7 +457,9 @@ pub fn refund_plan(
 /// - `refund` equals the post-settlement remainder
 ///   (`amount - released_amount()`);
 /// - taker / initializer identities pinned; native-path legs go to the
-///   pinned wallets.
+///   pinned wallets;
+/// - `addrs.fee_leg` equals the escrow's pinned fee recipient when one
+///   is configured (AV-44).
 pub fn resolve_plan(
     escrow: &Escrow,
     addrs: &ResolveAddrs,
@@ -863,5 +880,96 @@ mod cpi_tests {
         let plan = resolve_plan(&e, &addrs, taker_payout, fee, refund).unwrap();
         assert_eq!(plan.transfers.len(), 3);
         assert_eq!(plan.total_amount(), 1_000_000);
+    }
+
+    // --- AV-44: fee-recipient pinning ------------------------------------------
+
+    #[test]
+    fn fee_recipient_pin_rejects_swapped_fee_leg() {
+        let init = key(1);
+        let recipient = key(7);
+        let mut e = Escrow::initialize(init, key(2), 1_000_000, u64::MAX)
+            .unwrap()
+            .with_protocol_fee(100)
+            .unwrap()
+            .with_fee_recipient(recipient)
+            .unwrap();
+        e.fund(init).unwrap();
+        // Protocol fee: 1% → fee 5_000 on a 500_000 release.
+        let (payout, fee) = e.release(init, 0, 500_000, None).unwrap();
+        assert_eq!((payout, fee), (495_000, 5_000));
+
+        // A swapped fee destination is rejected, not built.
+        let mut addrs = payout_addrs_native();
+        addrs.fee_leg = key(8);
+        assert_eq!(
+            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee),
+            Err(CpiError::RecipientMismatch)
+        );
+        // The pinned recipient builds, and the fee leg points at it.
+        addrs.fee_leg = recipient;
+        let plan = payout_plan(PayoutKind::Release, &e, &addrs, payout, fee).unwrap();
+        assert_eq!(plan.transfers.len(), 2);
+        assert_eq!(plan.transfers[1].amount(), Some(5_000));
+        assert_eq!(plan.transfers[1].accounts[1].pubkey, recipient);
+    }
+
+    #[test]
+    fn fee_recipient_pin_applies_to_resolve_plan() {
+        let init = key(1);
+        let taker = key(2);
+        let arbiter = key(5);
+        let recipient = key(7);
+        let mut e = Escrow::initialize(init, taker, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_arbiter(arbiter)
+            .unwrap()
+            .with_protocol_fee(200) // 2%
+            .unwrap()
+            .with_fee_recipient(recipient)
+            .unwrap();
+        e.fund(init).unwrap();
+        e.escalate(taker, 0, None).unwrap();
+        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None).unwrap();
+        // 2% of 600_000 = 12_000 fee; the initializer is refunded the rest.
+        assert_eq!((taker_payout, fee, refund), (588_000, 12_000, 400_000));
+
+        let mut addrs = ResolveAddrs {
+            source: key(10),
+            vault_authority: key(10),
+            taker,
+            taker_leg: taker,
+            fee_leg: key(8), // swapped
+            initializer: init,
+            refund_leg: init,
+        };
+        assert_eq!(
+            resolve_plan(&e, &addrs, taker_payout, fee, refund),
+            Err(CpiError::RecipientMismatch)
+        );
+        addrs.fee_leg = recipient;
+        let plan = resolve_plan(&e, &addrs, taker_payout, fee, refund).unwrap();
+        assert_eq!(plan.transfers.len(), 3); // taker leg + fee leg + refund leg
+        assert!(plan
+            .transfers
+            .iter()
+            .any(|t| t.accounts[1].pubkey == recipient && t.amount() == Some(12_000)));
+        assert_eq!(plan.total_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn no_fee_recipient_keeps_program_level_fee_leg() {
+        // Backward compatibility: with no pinned recipient any nonzero
+        // fee_leg stands (the program-level fee account).
+        let init = key(1);
+        let mut e = Escrow::initialize(init, key(2), 1_000_000, u64::MAX)
+            .unwrap()
+            .with_protocol_fee(100)
+            .unwrap();
+        e.fund(init).unwrap();
+        let (payout, fee) = e.release(init, 0, 500_000, None).unwrap();
+        let plan = payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout, fee).unwrap();
+        assert_eq!(plan.transfers.len(), 2);
+        assert_eq!(plan.transfers[1].accounts[1].pubkey, key(9));
     }
 }

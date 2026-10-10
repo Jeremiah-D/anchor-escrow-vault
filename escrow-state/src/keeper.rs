@@ -454,9 +454,9 @@ impl CloseReport {
     ///
     /// ```json
     /// {"scanned":2,"batches":[
-    ///   {"caller":"...","total_reclaimed":5470560,"actions":[
+    ///   {"caller":"...","total_reclaimed":5707200,"actions":[
     ///     {"escrow_id":"...","action":"close_vault","caller":"...",
-    ///      "caller_role":"initializer","rent_reclaimed":5470560,
+    ///      "caller_role":"initializer","rent_reclaimed":5707200,
     ///      "reason":"released"}
     ///   ]}
     /// ]}
@@ -2147,10 +2147,10 @@ impl RentHealthReport {
     /// integers — the exact unit the top-up transfer moves.
     ///
     /// ```json
-    /// {"at":1000000,"scanned":1,"required_lamports":5477520,
+    /// {"at":1000000,"scanned":1,"required_lamports":5707200,
     ///  "critical_threshold_pct":90,"top_ups":[
     ///   {"escrow_id":"...","state":"funded","vault_lamports":4000000,
-    ///    "required_lamports":5477520,"top_up_lamports":1477520,
+    ///    "required_lamports":5707200,"top_up_lamports":1707200,
     ///    "caller":"...","caller_role":"initializer",
     ///    "reason":"underfunded"}
     /// ]}

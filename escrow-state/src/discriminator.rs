@@ -332,6 +332,15 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // present (zeroed when the feature is off); appended last so every
     // earlier offset above is unchanged.
     let emergency_unlock = c.u8()? != 0;
+    // AV-44: protocol-fee recipient pin, always reserved like
+    // `refund_to`: the `None` discriminant followed by a zeroed 32-byte
+    // address, appended last so every earlier offset above is unchanged.
+    let fee_recipient = if c.option_present("fee_recipient")? {
+        Some(c.pubkey()?)
+    } else {
+        c.skip(32)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -363,6 +372,7 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         decimals,
         rationale_hash,
         emergency_unlock,
+        fee_recipient,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

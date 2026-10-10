@@ -421,6 +421,25 @@ pub struct Escrow {
     /// the vault account) so the on-chain program enforces the opt-in.
     /// Appended last so every earlier field offset stays stable.
     emergency_unlock: bool,
+    /// AV-44: opt-in protocol-fee recipient. `None` (the default) means
+    /// the protocol's fee account receives the AV-17 fee — backward
+    /// compatible; the Anchor program routes each payout's fee leg to
+    /// the program-level fee account. `Some(addr)` pins every fee leg to
+    /// `addr` instead: the CPI settlement builders
+    /// ([`cpi::payout_plan`], [`cpi::resolve_plan`]) reject a `fee_leg`
+    /// that does not equal this address
+    /// ([`CpiError::RecipientMismatch`]), so a fee cannot be silently
+    /// redirected. Set once via [`Escrow::with_fee_recipient`] on an
+    /// `Uninitialized` escrow, like the other `with_*` builders.
+    /// Persisted (33 bytes in the vault account) so the policy survives
+    /// serialization. Appended last so every earlier field offset stays
+    /// stable.
+    ///
+    /// Design: the recipient only takes effect when a fee is actually
+    /// charged (`fee_bps > 0` and a non-dust payout). Binding a recipient
+    /// with `fee_bps == 0` is accepted but inert — builders stay
+    /// order-independent, and a zero fee charges nothing regardless.
+    fee_recipient: Option<[u8; 32]>,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -610,6 +629,12 @@ pub enum EscrowError {
     /// exception to the "failed calls emit nothing" rule, because a
     /// blocked reentry is a security signal the indexer must see.
     ReentrantCall,
+    /// Invalid protocol-fee recipient (AV-44):
+    /// [`Escrow::with_fee_recipient`] with the zero address — a zero
+    /// address can never be the legitimate fee destination, so binding
+    /// it is a policy mismatch by construction. Parallels
+    /// [`EscrowError::RefundAddressMismatch`] (config error).
+    InvalidFeeRecipient,
 }
 
 impl EscrowError {
@@ -645,6 +670,7 @@ impl EscrowError {
             EscrowError::InvalidCpiTarget => 120,
             EscrowError::CpiExecutionFailed => 121,
             EscrowError::ReentrantCall => 122,
+            EscrowError::InvalidFeeRecipient => 123,
         }
     }
 
@@ -674,6 +700,7 @@ impl EscrowError {
             EscrowError::InvalidCpiTarget,
             EscrowError::CpiExecutionFailed,
             EscrowError::ReentrantCall,
+            EscrowError::InvalidFeeRecipient,
         ]
     }
 }
@@ -1060,6 +1087,11 @@ impl Escrow {
             // AV-41: emergency timelock-unlock governance is opt-in —
             // off by default (backward compatible).
             emergency_unlock: false,
+            // AV-44: no protocol-fee recipient pinned by default — fee
+            // legs route to the program-level fee account (backward
+            // compatible). Opt in via `with_fee_recipient` before
+            // funding.
+            fee_recipient: None,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -1930,6 +1962,51 @@ impl Escrow {
     /// gross payouts, and `payout + fee == gross` for every payout.
     pub fn fees_paid(&self) -> u64 {
         self.fees_paid
+    }
+
+    /// Opt in to a per-escrow protocol-fee recipient (AV-44 — Solana /
+    /// payment fintech): every fee leg the AV-17 fee rate charges is
+    /// pinned to `recipient` instead of the program-level fee account.
+    ///
+    /// Why: a protocol that routes fees per deal (e.g. a marketplace
+    /// escrow whose fee belongs to the listing's fee wallet, or a
+    /// white-label deployment settling into the operator's treasury)
+    /// cannot rely on one global fee account. Pinning the recipient at
+    /// `initialize` time makes the destination part of the escrow's
+    /// auditable terms, and the settlement builders enforce it
+    /// ([`CpiError::RecipientMismatch`] when a plan's `fee_leg` points
+    /// anywhere else), so a malicious client cannot redirect the fee.
+    ///
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// recipient is fixed before any funds move — mirroring
+    /// [`Escrow::with_protocol_fee`], [`Escrow::with_mint`] and
+    /// [`Escrow::with_refund_address`]. Re-configuring a live escrow is
+    /// rejected with `InvalidStateTransition`. The zero address is
+    /// rejected with [`EscrowError::InvalidFeeRecipient`]: it can never
+    /// be the legitimate fee destination, paralleling
+    /// [`Escrow::with_refund_address`]'s zero-address policy.
+    ///
+    /// The recipient only takes effect when a fee is actually charged
+    /// (`fee_bps > 0` and a non-dust payout): binding a recipient with
+    /// `fee_bps == 0` is accepted but inert, keeping builders
+    /// order-independent.
+    pub fn with_fee_recipient(mut self, recipient: [u8; 32]) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if recipient == [0u8; 32] {
+            return Err(EscrowError::InvalidFeeRecipient);
+        }
+        self.fee_recipient = Some(recipient);
+        Ok(self)
+    }
+
+    /// The protocol-fee recipient bound via [`Escrow::with_fee_recipient`];
+    /// `None` when no recipient was pinned (backward compatible): fee
+    /// legs then route to the program-level fee account.
+    pub fn fee_recipient(&self) -> Option<[u8; 32]> {
+        self.fee_recipient
     }
 
     /// Opt in to an expiry grace period (AV-21 — Solana operations /
@@ -3090,6 +3167,13 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // (zeroed when the feature is off). Appended last so every earlier
     // field offset stays stable.
     ("emergency_unlock", "bool", 1),
+    // AV-44: protocol-fee recipient pin (see
+    // `Escrow::with_fee_recipient`): one discriminant byte, then the
+    // 32-byte address. The region is always reserved (zeroed when
+    // `None`) so `with_fee_recipient` writes in place — same treatment
+    // as `arbiter` / `mint` / `evidence_hash`. Appended last so every
+    // earlier field offset stays stable.
+    ("fee_recipient", "Option<Pubkey>", 1 + PUBKEY_LEN),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -3142,9 +3226,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// likewise always present: 1-byte discriminant + 32-byte commitment
 /// (zeroed when the arbiter attached no rationale). The emergency
 /// timelock-unlock governance opt-in (AV-41) is always present too:
-/// 1 byte, zeroed when the feature is off.
+/// 1 byte, zeroed when the feature is off. The protocol-fee recipient
+/// pin (AV-44) is always present as well: 1-byte discriminant +
+/// 32-byte address (zeroed when no recipient is bound).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -3534,7 +3620,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 5_477_520, "from {state:?}");
+            assert_eq!(rent, 5_707_200, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -3630,8 +3716,9 @@ mod tests {
         // re-asserted here so this feature cannot silently grow the
         // account (every byte of VAULT_SPACE is rent the initializer
         // paid for). AV-38 grew the account by 33 bytes (rationale
-        // hash), so the pin tracks the new total deliberately.
-        assert_eq!(VAULT_SPACE, 659, "full Vault account space");
+        // hash) and AV-44 by 33 more (fee recipient), so the pin tracks
+        // the new total deliberately.
+        assert_eq!(VAULT_SPACE, 692, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -5038,6 +5125,29 @@ pub(crate) mod anchor_idl_tests {
                             enabling the emergency_unlock instruction",
         },
         InstructionSpec {
+            // AV-44: per-escrow protocol-fee recipient pin.
+            name: "initialize_fee_recipient",
+            params: &[(
+                "fee_recipient",
+                "Pubkey",
+                "instruction param; every fee leg charged by the AV-17 \
+                 protocol fee rate must go to this address",
+            )],
+            method: "Escrow::with_fee_recipient",
+            input_mapping: "fee_recipient <- param (Pubkey -> [u8; 32] \
+                            conversion); authority <- accounts.initializer \
+                            (signer), enforced by the Anchor account \
+                            constraint, not the state machine; \
+                            Uninitialized only, like initialize_quorum; \
+                            the zero address is InvalidFeeRecipient; \
+                            with no pinned recipient the fee legs route \
+                            to the program-level fee account (backward \
+                            compatible); the CPI settlement builders \
+                            reject a fee_leg that does not equal the \
+                            pinned address (RecipientMismatch) — a fee \
+                            cannot be silently redirected",
+        },
+        InstructionSpec {
             // AV-41: dual-signed emergency timelock unlock.
             name: "emergency_unlock",
             params: &[],
@@ -5143,6 +5253,7 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::with_penalty_bps",
             "Escrow::with_timelock",
             "Escrow::with_decimals",
+            "Escrow::with_fee_recipient",
             "Escrow::with_emergency_unlock",
             "Escrow::emergency_unlock",
             "Escrow::close_vault",
@@ -5169,7 +5280,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_twenty_one_instructions_take_params() {
+    fn only_twenty_two_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -5200,7 +5311,8 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_refund_address",
                 &"initialize_penalty",
                 &"initialize_timelock",
-                &"initialize_decimals"
+                &"initialize_decimals",
+                &"initialize_fee_recipient"
             ]
         );
     }
@@ -6398,6 +6510,10 @@ pub(crate) mod anchor_idl_tests {
         // AV-28: the decimal-places param populates `decimals` directly
         // (u8 — 0 is the valid "no decimal metadata" default).
         ("initialize_decimals", "decimals", "decimals"),
+        // AV-44: the fee-recipient param populates `fee_recipient`; the
+        // `Option` discriminant is implied (a bound recipient is
+        // `Some`), mirroring `initialize_mint` / `initialize_refund_address`.
+        ("initialize_fee_recipient", "fee_recipient", "fee_recipient"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -6690,6 +6806,11 @@ mod error_code_tests {
             EscrowError::ReentrantCall,
             122,
             "a fund-moving transition entered while the AV-36 reentrancy lock was held (nested entry from inside release_via_cpi's executor window)",
+        ),
+        (
+            EscrowError::InvalidFeeRecipient,
+            123,
+            "with_fee_recipient with the zero address (a zero address can never be the legitimate protocol-fee destination)",
         ),
     ];
 
@@ -8037,6 +8158,21 @@ mod account_space_tests {
         // present (zeroed when the feature is off); appended last so
         // every earlier offset above is unchanged.
         out.push(e.emergency_unlock as u8);
+        // AV-44: protocol-fee recipient pin, always reserved like
+        // `refund_to`: the `None` discriminant followed by a zeroed
+        // address, so `with_fee_recipient` writes in place without
+        // reallocating; appended last so every earlier offset above is
+        // unchanged.
+        match e.fee_recipient {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; 32]);
+            }
+            Some(addr) => {
+                out.push(1);
+                out.extend_from_slice(&addr);
+            }
+        }
         out
     }
 
@@ -8058,10 +8194,11 @@ mod account_space_tests {
         // evidence hash) + (1 + 32) (AV-23 refund address whitelist)
         // + 2 (AV-24 anti-griefing penalty rate) + 8 (AV-27 timelock)
         // + 1 (AV-28 token decimal metadata) + (1 + 32) (AV-38 arbiter's
-        // rationale-document hash).
-        assert_eq!(ESCROW_BODY_LEN, 651, "escrow payload bytes");
+        // rationale-document hash) + 1 (AV-41 emergency timelock-unlock
+        // governance opt-in) + (1 + 32) (AV-44 protocol-fee recipient pin).
+        assert_eq!(ESCROW_BODY_LEN, 684, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 659, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 692, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -8082,13 +8219,14 @@ mod account_space_tests {
         // configured) + (1 + 32)-byte arbiter's rationale-document hash
         // (AV-38, zeroed when the arbiter attached no rationale) +
         // 1-byte emergency timelock-unlock governance opt-in (AV-41,
-        // zeroed when the feature is off).
+        // zeroed when the feature is off) + (1 + 32)-byte protocol-fee
+        // recipient pin (AV-44, zeroed when no recipient is bound).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 248);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 281);
     }
 
     #[test]
@@ -8442,16 +8580,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 659) * 3480 * 2 = 787 * 6960 = 5_477_520 lamports.
-        assert_eq!(full, 5_477_520);
+        // (128 + 692) * 3480 * 2 = 820 * 6960 = 5_707_200 lamports.
+        assert_eq!(full, 5_707_200);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 248) * 3480 * 2 = 376 * 6960 = 2_616_960 lamports.
-        assert_eq!(no_quorum, 2_616_960);
+        // (128 + 281) * 3480 * 2 = 409 * 6960 = 2_846_640 lamports.
+        assert_eq!(no_quorum, 2_846_640);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -8495,13 +8633,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(5_477_520, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(5_707_200, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(5_470_559, params.0, params.1),
+            check_vault_rent_exempt(5_707_199, params.0, params.1),
             Err(RentShortfall {
-                required: 5_477_520,
-                provided: 5_470_559,
+                required: 5_707_200,
+                provided: 5_707_199,
             })
         );
         // Generous funding: exempt.
@@ -8513,7 +8651,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 5_477_520,
+                required: 5_707_200,
                 provided: 0,
             })
         );
@@ -10947,13 +11085,17 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH)).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 651, "body grew by 33 (AV-38) + 1 (AV-41) bytes");
+        assert_eq!(bytes.len(), 684, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) bytes");
         assert_eq!(bytes[616], 0, "decimals offset unchanged");
         assert_eq!(bytes[617], 1, "rationale_hash: Some discriminant");
         assert_eq!(&bytes[618..650], &RATIONALE_HASH, "rationale_hash bytes");
         // The AV-22 evidence region is untouched by the append.
         assert_eq!(bytes[540], 0, "evidence_hash: None discriminant");
         assert_eq!(&bytes[541..573], &[0u8; 32], "evidence_hash: zeroed");
+        // AV-44: the new tail region — fee_recipient unset serializes
+        // zeroed.
+        assert_eq!(bytes[651], 0, "fee_recipient: None discriminant");
+        assert_eq!(&bytes[652..684], &[0u8; 32], "fee_recipient: zeroed");
     }
 
     #[test]
@@ -10964,33 +11106,35 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 651);
+        assert_eq!(bytes.len(), 684);
         assert_eq!(bytes[617], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[618..650], &[0u8; 32], "rationale_hash: zeroed");
+        assert_eq!(bytes[651], 0, "fee_recipient: None discriminant");
+        assert_eq!(&bytes[652..684], &[0u8; 32], "fee_recipient: zeroed");
     }
 
     #[test]
     fn rationale_hash_rent_recomputed_from_mainnet_formula() {
-        // AV-38 grows the account by 33 bytes; the rent-exempt minimums
-        // are recomputed from the mainnet formula, not copied from the
-        // AV-28 numbers.
+        // AV-44 grows the account by 33 bytes on top of AV-38/AV-41;
+        // the rent-exempt minimums are recomputed from the mainnet
+        // formula, not copied from the AV-38 numbers.
         let full = rent_exempt_minimum_lamports(
             VAULT_SPACE,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 659) * 3480 * 2 = 787 * 6960 = 5_477_520 lamports.
-        assert_eq!(VAULT_SPACE, 659);
-        assert_eq!(full, 5_477_520);
+        // (128 + 692) * 3480 * 2 = 820 * 6960 = 5_707_200 lamports.
+        assert_eq!(VAULT_SPACE, 692);
+        assert_eq!(full, 5_707_200);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 248) * 3480 * 2 = 376 * 6960 = 2_616_960 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 248);
-        assert_eq!(no_quorum, 2_616_960);
+        // (128 + 281) * 3480 * 2 = 409 * 6960 = 2_846_640 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 281);
+        assert_eq!(no_quorum, 2_846_640);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -11730,7 +11874,8 @@ mod emergency_unlock_tests {
     fn emergency_unlock_opt_in_persists_in_serialized_layout_tail() {
         // The opt-in byte is the appended tail: offset 650, right after
         // the AV-38 rationale_hash region — every earlier offset stays
-        // stable (the AV-27 timelock still sits at 608..616).
+        // stable (the AV-27 timelock still sits at 608..616). AV-44
+        // appends the fee_recipient region after it (651..684).
         let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
@@ -11742,7 +11887,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 651);
+        assert_eq!(bytes.len(), 684);
         assert_eq!(bytes[650], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[608..616].try_into().unwrap()),
@@ -11917,7 +12062,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 651, "33 bytes appended by AV-38, 1 by AV-41");
+        assert_eq!(ESCROW_BODY_LEN, 684, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44");
         assert_eq!(bytes[616], 9, "decimals tail offset");
         // The timelock offset is unchanged by the append.
         assert_eq!(
@@ -11935,30 +12080,30 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 659) * 3480 * 2 = 787 * 6960 = 5_477_520 lamports.
+        // (128 + 692) * 3480 * 2 = 820 * 6960 = 5_707_200 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            5_477_520
+            5_707_200
         );
-        // (128 + 248) * 3480 * 2 = 376 * 6960 = 2_616_960 lamports.
+        // (128 + 281) * 3480 * 2 = 409 * 6960 = 2_846_640 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            2_616_960
+            2_846_640
         );
-        // 34 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
-        // AV-41 emergency-unlock opt-in byte).
-        assert_eq!(VAULT_SPACE, 659);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 248);
-        assert!(check_vault_rent_exempt(5_477_520, 3_480, 2.0).is_ok());
-        assert!(check_vault_rent_exempt(5_477_519, 3_480, 2.0).is_err());
+        // 67 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
+        // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin).
+        assert_eq!(VAULT_SPACE, 692);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 281);
+        assert!(check_vault_rent_exempt(5_707_200, 3_480, 2.0).is_ok());
+        assert!(check_vault_rent_exempt(5_707_199, 3_480, 2.0).is_err());
     }
 
     #[test]
@@ -12358,5 +12503,181 @@ mod cpi_release_tests {
         let mut tampered = inv.clone();
         tampered.accounts[1].is_signer = true;
         assert_ne!(cpi_accounts_hash(&tampered), receipt.accounts_hash);
+    }
+}
+
+// ---------- AV-44: protocol-fee recipient pin ----------
+//
+// The AV-17 fee rate charges a slice of every taker payout; AV-44 pins
+// *where* that slice goes. A per-escrow `fee_recipient` (opt-in at
+// initialize time) replaces the program-level fee account as the fee
+// leg's destination, and the settlement builders reject any plan whose
+// fee leg points anywhere else.
+#[cfg(test)]
+mod fee_recipient_tests {
+    use super::*;
+    use crate::discriminator::{decode_vault_account, vault_account_discriminator};
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const RECIPIENT: [u8; 32] = [0x42; 32];
+
+    fn fee_escrow() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(1000) // 10%
+            .unwrap()
+            .with_fee_recipient(RECIPIENT)
+            .unwrap()
+    }
+
+    #[test]
+    fn with_fee_recipient_pins_and_getter_reads_back() {
+        let e = fee_escrow();
+        assert_eq!(e.fee_recipient(), Some(RECIPIENT));
+    }
+
+    #[test]
+    fn with_fee_recipient_defaults_to_none_backward_compatible() {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.fee_recipient(), None);
+    }
+
+    #[test]
+    fn with_fee_recipient_rejects_zero_address_with_stable_code() {
+        let err = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_recipient([0u8; 32])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidFeeRecipient);
+        assert_eq!(err.code(), 123);
+    }
+
+    #[test]
+    fn with_fee_recipient_only_before_funding() {
+        let mut e = fee_escrow();
+        e.fund(ALICE).unwrap();
+        // Re-configuring a live escrow is rejected; the failed builder
+        // leaves the pinned recipient untouched.
+        assert_eq!(
+            e.with_fee_recipient([0x43; 32]).unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        assert_eq!(e.fee_recipient(), Some(RECIPIENT));
+    }
+
+    #[test]
+    fn fee_recipient_is_inert_without_a_fee_rate() {
+        // Builder order-independence: binding a recipient with
+        // `fee_bps == 0` is accepted but charges nothing.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_recipient(RECIPIENT)
+            .unwrap();
+        assert_eq!(e.fee_recipient(), Some(RECIPIENT));
+        e.fund(ALICE).unwrap();
+        let (payout, fee) = e.release(ALICE, 0, 1_000_000, None).unwrap();
+        assert_eq!((payout, fee), (1_000_000, 0));
+        assert_eq!(e.fees_paid(), 0);
+    }
+
+    #[test]
+    fn fee_recipient_persists_in_serialized_layout_tail() {
+        let e = fee_escrow();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes[651], 1, "fee_recipient: Some discriminant");
+        assert_eq!(&bytes[652..684], &RECIPIENT, "fee_recipient bytes");
+        // Every earlier offset is unchanged by the append.
+        assert_eq!(bytes[650], 0, "emergency_unlock offset unchanged");
+        assert_eq!(bytes[616], 0, "decimals offset unchanged");
+    }
+
+    #[test]
+    fn fee_recipient_survives_decode_round_trip() {
+        let e = fee_escrow();
+        let body = super::account_space_tests::encode_escrow(&e);
+        let mut data = vault_account_discriminator().to_vec();
+        data.extend_from_slice(&body);
+        let decoded = decode_vault_account(&data).unwrap();
+        assert_eq!(decoded.fee_recipient(), Some(RECIPIENT));
+        assert_eq!(decoded.fee_bps(), 1000);
+    }
+
+    #[test]
+    fn fee_conservation_with_partial_releases() {
+        // Two partial releases under a 10% fee: payout + fee == gross
+        // every time, and the cumulative fee never exceeds released.
+        let mut e = fee_escrow();
+        e.fund(ALICE).unwrap();
+        let (p1, f1) = e.release(ALICE, 0, 400_000, None).unwrap();
+        assert_eq!((p1, f1), (360_000, 40_000));
+        let (p2, f2) = e.release(ALICE, 0, 600_000, None).unwrap();
+        assert_eq!((p2, f2), (540_000, 60_000));
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.fees_paid(), 100_000);
+        assert!(e.fees_paid() <= e.released_amount());
+        assert_eq!(p1 + f1 + p2 + f2, 1_000_000, "locked conservation");
+        assert_eq!(e.remaining_amount(), 0);
+    }
+
+    #[test]
+    fn fee_conservation_with_milestone_releases() {
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap()
+            .with_protocol_fee(500) // 5%
+            .unwrap()
+            .with_fee_recipient(RECIPIENT)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let mut gross = 0u64;
+        for i in 0..2u8 {
+            e.confirm_milestone(ALICE, i).unwrap();
+            e.confirm_milestone(BOB, i).unwrap();
+            let (tranche, fee) = e.release_milestone(ALICE, 1_750_000_000, i, None).unwrap();
+            assert_eq!(tranche + fee, if i == 0 { 400_000 } else { 600_000 });
+            assert_eq!(fee, (if i == 0 { 400_000u64 } else { 600_000 }) * 500 / 10_000);
+            gross += tranche + fee;
+        }
+        assert_eq!(gross, 1_000_000, "locked conservation");
+        assert_eq!(e.fees_paid(), 50_000);
+        assert!(e.fees_paid() <= e.released_amount());
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn fee_conservation_with_vesting_claim() {
+        let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap()
+            .with_protocol_fee(1000) // 10%
+            .unwrap()
+            .with_fee_recipient(RECIPIENT)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        // At the end of the window the full amount is vested.
+        let (claimed, fee) = e.claim(BOB, 1_800_000_000, None).unwrap();
+        assert_eq!((claimed, fee), (900_000, 100_000));
+        assert_eq!(claimed + fee, 1_000_000, "locked conservation");
+        assert_eq!(e.fees_paid(), 100_000);
+        assert!(e.fees_paid() <= e.released_amount());
+    }
+
+    #[test]
+    fn dust_payout_charges_zero_fee_and_emits_no_fee_leg() {
+        // Floor rounding: a 10% fee on a 5-unit payout is zero — the
+        // protocol never rounds up into the taker's pocket, and no fee
+        // leg is emitted for a zero fee.
+        let mut e = fee_escrow();
+        e.fund(ALICE).unwrap();
+        let (payout, fee) = e.release(ALICE, 0, 5, None).unwrap();
+        assert_eq!((payout, fee), (5, 0));
+        assert_eq!(e.fees_paid(), 0);
     }
 }
