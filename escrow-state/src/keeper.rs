@@ -1357,3 +1357,668 @@ mod close_keeper_tests {
         assert_eq!(report.to_json(), r#"{"scanned":0,"batches":[]}"#);
     }
 }
+
+// ============================================================================
+// Milestone tranche keeper scan (AV-42)
+// ============================================================================
+//
+// `scan_keeper_actions` (AV-20) answers "which vault needs a keeper call
+// *right now*". Milestone-plan escrows (AV-15) need a finer answer: each
+// tranche moves through confirm -> release, or the dual-signed skip path,
+// strictly in order, so the keeper must know *which party's signature is
+// missing* and *which tranche is sequence-blocked*.
+//
+// [`scan_milestones`] is the third keeper scan. It walks the same watch
+// list and, per escrow, emits:
+//
+// - `actions`: the immediately executable milestone calls — each party's
+//   missing `confirm_milestone` approval, each party's missing
+//   `skip_milestone` approval, and the initializer's `release_milestone`
+//   once every gate passes. Every action carries the exact arguments the
+//   keeper needs: `escrow_id`, `index`, `caller` (+ `caller_role`),
+//   `mint`, and the tranche amount split (`tranche`, `fee`,
+//   `taker_payout` — the AV-17 protocol-fee preview, `0` on
+//   confirm/skip actions which move no funds).
+// - `blocked`: per-tranche `release_milestone` items that are *not*
+//   executable yet, each with the machine-readable reason:
+//   `"unconfirmed"` (confirmations missing), `"quorum_not_satisfied"`,
+//   `"timelock_not_reached"`, or `"prerequisite"` (an earlier tranche is
+//   still unsettled — settlement is strictly in-order).
+//
+// Skipping is dual-signed on-chain: each party records their skip
+// approval with a *separate* `skip_milestone` call, and the skip executes
+// only once both approvals are present. The scan therefore lists each
+// missing party's approval as its own executable call — exactly like
+// confirmations — rather than inventing a combined call the chain has no
+// instruction for.
+//
+// Like the other scans this is a dry-run over `&Escrow` snapshots: no
+// mutation, no events, no clock. Escrows without a milestone plan, not in
+// `Funded` state, or whose plan is fully settled contribute nothing —
+// there is no executable milestone call on them.
+//
+// Output is the same hand-rolled deterministic JSON as the other scans
+// (AV-33 conventions): fixed field order, 64-char lowercase hex keys,
+// `mint` as hex or `null`, actions and blocked entries in scan order.
+
+/// The milestone-tranche keeper action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MilestoneActionKind {
+    /// `confirm_milestone(authority, index)`: one party's acceptance of
+    /// the deliverable. Per-party and idempotent — the scan lists the
+    /// missing party's call.
+    ConfirmMilestone,
+    /// `skip_milestone(authority, index)`: one party's skip approval.
+    /// Dual-signed on-chain (both parties approve separately); the scan
+    /// lists each missing party's approval call.
+    SkipMilestone,
+    /// `release_milestone(initializer, now, index, mint)`: the
+    /// initializer's push of a dual-confirmed tranche to the taker.
+    ReleaseMilestone,
+}
+
+impl MilestoneActionKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            MilestoneActionKind::ConfirmMilestone => "confirm_milestone",
+            MilestoneActionKind::SkipMilestone => "skip_milestone",
+            MilestoneActionKind::ReleaseMilestone => "release_milestone",
+        }
+    }
+}
+
+/// One executable milestone call: everything needed to build the
+/// instruction, nothing more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MilestoneAction {
+    /// Which escrow this call targets.
+    pub escrow_id: [u8; 32],
+    /// Which transition to invoke.
+    pub kind: MilestoneActionKind,
+    /// The 0-based tranche index.
+    pub index: u8,
+    /// The key that must sign the call.
+    pub caller: [u8; 32],
+    /// Which role `caller` plays: `"initializer"` or `"taker"`.
+    pub caller_role: &'static str,
+    /// The `mint` argument to pass: the escrow's bound mint, or `None`
+    /// on the native-SOL path.
+    pub mint: Option<[u8; 32]>,
+    /// The tranche's gross amount.
+    pub tranche: u64,
+    /// Protocol-fee preview for `release_milestone`
+    /// ([`Escrow::protocol_fee_for`]); `0` on confirm/skip actions,
+    /// which move no funds.
+    pub fee: u64,
+    /// `tranche - fee` for `release_milestone`: the taker's net payout;
+    /// `0` on confirm/skip actions.
+    pub taker_payout: u64,
+    /// The escrow's token decimal metadata (AV-28): the SPL mint's
+    /// decimal places, `0` when none is declared. Feeds the report's
+    /// `display_amount` rendering only.
+    pub decimals: u8,
+    /// Machine-readable reason: `"confirmation_pending"`,
+    /// `"skip_approval_pending"`, or `"confirmed"`.
+    pub reason: &'static str,
+}
+
+/// One not-yet-executable `release_milestone`: the tranche, and why the
+/// keeper must wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MilestoneBlocked {
+    /// Which escrow this item belongs to.
+    pub escrow_id: [u8; 32],
+    /// The 0-based tranche index.
+    pub index: u8,
+    /// Always `"release_milestone"` today: confirmations and skip
+    /// approvals are the executable path *toward* this call.
+    pub action: &'static str,
+    /// `"unconfirmed"`, `"quorum_not_satisfied"`,
+    /// `"timelock_not_reached"`, or `"prerequisite"`.
+    pub reason: &'static str,
+}
+
+/// The milestone scan result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MilestoneReport {
+    /// The `now` (Unix seconds) the scan ran at.
+    pub at: u64,
+    /// How many escrows were scanned.
+    pub scanned: usize,
+    /// Executable actions, in the input's order.
+    pub actions: Vec<MilestoneAction>,
+    /// Blocked `release_milestone` items, in the input's order.
+    pub blocked: Vec<MilestoneBlocked>,
+}
+
+impl MilestoneReport {
+    /// True when the scan found neither an executable action nor a
+    /// blocked tranche.
+    pub fn is_empty(&self) -> bool {
+        self.actions.is_empty() && self.blocked.is_empty()
+    }
+
+    /// Hand-serialized JSON (the crate is dependency-free). Deterministic
+    /// field order; keys are 64-char lowercase hex; `mint` is a hex
+    /// string or `null`.
+    ///
+    /// ```json
+    /// {"at":1000000,"scanned":1,"actions":[
+    ///   {"escrow_id":"...","action":"confirm_milestone","index":0,
+    ///    "caller":"...","caller_role":"taker","mint":null,
+    ///    "tranche":300000,"fee":0,"taker_payout":0,"decimals":6,
+    ///    "display_amount":"0.300000","reason":"confirmation_pending"}
+    /// ],"blocked":[
+    ///   {"escrow_id":"...","index":1,"action":"release_milestone",
+    ///    "reason":"prerequisite"}
+    /// ]}
+    /// ```
+    pub fn to_json(&self) -> String {
+        let mut s = String::with_capacity(128 + self.actions.len() * 380);
+        s.push_str("{\"at\":");
+        s.push_str(&self.at.to_string());
+        s.push_str(",\"scanned\":");
+        s.push_str(&self.scanned.to_string());
+        s.push_str(",\"actions\":[");
+        for (i, a) in self.actions.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"escrow_id\":\"");
+            s.push_str(&hex32(&a.escrow_id));
+            s.push_str("\",\"action\":\"");
+            s.push_str(a.kind.as_str());
+            s.push_str("\",\"index\":");
+            s.push_str(&a.index.to_string());
+            s.push_str(",\"caller\":\"");
+            s.push_str(&hex32(&a.caller));
+            s.push_str("\",\"caller_role\":\"");
+            s.push_str(a.caller_role);
+            s.push_str("\",\"mint\":");
+            match a.mint {
+                Some(m) => {
+                    s.push('"');
+                    s.push_str(&hex32(&m));
+                    s.push('"');
+                }
+                None => s.push_str("null"),
+            }
+            s.push_str(",\"tranche\":");
+            s.push_str(&a.tranche.to_string());
+            s.push_str(",\"fee\":");
+            s.push_str(&a.fee.to_string());
+            s.push_str(",\"taker_payout\":");
+            s.push_str(&a.taker_payout.to_string());
+            s.push_str(",\"decimals\":");
+            s.push_str(&a.decimals.to_string());
+            s.push_str(",\"display_amount\":\"");
+            s.push_str(&format_amount(a.tranche, a.decimals));
+            s.push_str("\",\"reason\":\"");
+            s.push_str(a.reason);
+            s.push_str("\"}");
+        }
+        s.push_str("],\"blocked\":[");
+        for (i, b) in self.blocked.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"escrow_id\":\"");
+            s.push_str(&hex32(&b.escrow_id));
+            s.push_str("\",\"index\":");
+            s.push_str(&b.index.to_string());
+            s.push_str(",\"action\":\"");
+            s.push_str(b.action);
+            s.push_str("\",\"reason\":\"");
+            s.push_str(b.reason);
+            s.push_str("\"}");
+        }
+        s.push_str("]}");
+        s
+    }
+}
+
+/// Build one [`MilestoneAction`] with the escrow-derived fields filled in.
+/// `fee`/`taker_payout` are the release amount split; callers pass `0`
+/// for confirm/skip actions, which move no funds.
+fn milestone_action(
+    escrow_id: [u8; 32],
+    kind: MilestoneActionKind,
+    index: u8,
+    caller: [u8; 32],
+    caller_role: &'static str,
+    e: &Escrow,
+    tranche: u64,
+    fee: u64,
+    taker_payout: u64,
+    reason: &'static str,
+) -> MilestoneAction {
+    MilestoneAction {
+        escrow_id,
+        kind,
+        index,
+        caller,
+        caller_role,
+        mint: e.mint(),
+        tranche,
+        fee,
+        taker_payout,
+        decimals: e.decimals(),
+        reason,
+    }
+}
+
+/// Scan `watched` at `now` and return every executable milestone call
+/// plus every sequence/gate-blocked tranche. Pure read over the
+/// snapshots: zero side effects, deterministic output in input order.
+///
+/// Only the first unsettled tranche of a `Funded` escrow with a plan can
+/// carry executable calls — confirmations and skip approvals are
+/// strictly in-order on-chain, and `release_milestone` additionally
+/// requires every earlier tranche settled. Later unsettled tranches are
+/// reported as blocked with reason `"prerequisite"`.
+pub fn scan_milestones(watched: &[WatchedEscrow], now: u64) -> MilestoneReport {
+    let mut actions = Vec::new();
+    let mut blocked = Vec::new();
+    for w in watched {
+        let e = &w.escrow;
+        if e.state() != EscrowState::Funded {
+            continue;
+        }
+        let plan = match e.milestone_plan() {
+            Some(p) => p,
+            None => continue,
+        };
+        let count = plan.count() as usize;
+        let next = match e.next_milestone() {
+            Some(i) => i,
+            None => continue,
+        };
+        let tranche = plan
+            .amount_at(next)
+            .expect("next_milestone is always in plan range");
+        let index = next as u8;
+        let init = e.initializer();
+        let taker = e.taker();
+
+        // Confirmations: each missing party's approval is an executable
+        // call (idempotent per party on-chain).
+        if !e.milestone_confirmed_by_initializer(next) {
+            actions.push(milestone_action(
+                w.escrow_id,
+                MilestoneActionKind::ConfirmMilestone,
+                index,
+                init,
+                "initializer",
+                e,
+                tranche,
+                0,
+                0,
+                "confirmation_pending",
+            ));
+        }
+        if !e.milestone_confirmed_by_taker(next) {
+            actions.push(milestone_action(
+                w.escrow_id,
+                MilestoneActionKind::ConfirmMilestone,
+                index,
+                taker,
+                "taker",
+                e,
+                tranche,
+                0,
+                0,
+                "confirmation_pending",
+            ));
+        }
+        // Skip approvals: dual-signed on-chain, one executable call per
+        // missing party — the same shape as confirmations.
+        if !e.milestone_skip_approved_by_initializer(next) {
+            actions.push(milestone_action(
+                w.escrow_id,
+                MilestoneActionKind::SkipMilestone,
+                index,
+                init,
+                "initializer",
+                e,
+                tranche,
+                0,
+                0,
+                "skip_approval_pending",
+            ));
+        }
+        if !e.milestone_skip_approved_by_taker(next) {
+            actions.push(milestone_action(
+                w.escrow_id,
+                MilestoneActionKind::SkipMilestone,
+                index,
+                taker,
+                "taker",
+                e,
+                tranche,
+                0,
+                0,
+                "skip_approval_pending",
+            ));
+        }
+
+        // Release: the full on-chain gate set, read-only. Mirrors
+        // `release_milestone`'s check order (quorum, timelock, then
+        // confirmation); the sequence gate holds by construction since
+        // only the first unsettled tranche is considered.
+        let quorum_ok = e.quorum().map(|q| q.is_satisfied()).unwrap_or(true);
+        let timelock_ok = e.is_unlock_eligible(now);
+        let confirmed = e.milestone_confirmed(next);
+        if quorum_ok && timelock_ok && confirmed {
+            let fee = e.protocol_fee_for(tranche);
+            actions.push(milestone_action(
+                w.escrow_id,
+                MilestoneActionKind::ReleaseMilestone,
+                index,
+                init,
+                "initializer",
+                e,
+                tranche,
+                fee,
+                tranche - fee,
+                "confirmed",
+            ));
+        } else {
+            let reason = if !quorum_ok {
+                "quorum_not_satisfied"
+            } else if !timelock_ok {
+                "timelock_not_reached"
+            } else {
+                "unconfirmed"
+            };
+            blocked.push(MilestoneBlocked {
+                escrow_id: w.escrow_id,
+                index,
+                action: "release_milestone",
+                reason,
+            });
+        }
+
+        // Later unsettled tranches: sequence-blocked until every earlier
+        // tranche settles.
+        for i in (next + 1)..count {
+            if !e.milestone_settled(i) {
+                blocked.push(MilestoneBlocked {
+                    escrow_id: w.escrow_id,
+                    index: i as u8,
+                    action: "release_milestone",
+                    reason: "prerequisite",
+                });
+            }
+        }
+    }
+    MilestoneReport {
+        at: now,
+        scanned: watched.len(),
+        actions,
+        blocked,
+    }
+}
+
+#[cfg(test)]
+mod keeper_milestone_tests {
+    use super::*;
+    use crate::{EscrowError, MilestonePlan, QuorumPolicy};
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const A1: [u8; 32] = [0xA1; 32]; // attestors
+    const A2: [u8; 32] = [0xA2; 32];
+    const A3: [u8; 32] = [0xA3; 32];
+    const ID1: [u8; 32] = [0x01; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_750_000_000;
+
+    fn watch(id: [u8; 32], escrow: Escrow) -> WatchedEscrow {
+        WatchedEscrow {
+            escrow_id: id,
+            escrow,
+        }
+    }
+
+    /// Funded escrow with a milestone plan splitting `amounts`. The
+    /// `build` closure configures pre-funding options (fee, quorum,
+    /// timelock) on the `Uninitialized` escrow before it is funded.
+    fn milestone_escrow(amounts: &[u64]) -> Escrow {
+        milestone_escrow_with(amounts, Ok)
+    }
+
+    fn milestone_escrow_with(
+        amounts: &[u64],
+        build: impl FnOnce(Escrow) -> Result<Escrow, EscrowError>,
+    ) -> Escrow {
+        let total: u64 = amounts.iter().sum();
+        let e = Escrow::initialize(ALICE, BOB, total, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(amounts).unwrap())
+            .unwrap();
+        let mut e = build(e).unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    fn hex_of(byte: u8) -> String {
+        format!("{:02x}", byte).repeat(32)
+    }
+
+    #[test]
+    fn confirm_lists_only_the_missing_party() {
+        let mut e = milestone_escrow(&[300_000, 700_000]);
+        e.confirm_milestone(ALICE, 0).unwrap();
+        let report = scan_milestones(&[watch(ID1, e)], NOW);
+        // The initializer's confirmation is done: only the taker's
+        // confirm remains, plus both skip approvals, and the release is
+        // blocked as unconfirmed.
+        let confirms: Vec<_> = report
+            .actions
+            .iter()
+            .filter(|a| a.kind == MilestoneActionKind::ConfirmMilestone)
+            .collect();
+        assert_eq!(confirms.len(), 1, "actions: {:?}", report.actions);
+        assert_eq!(confirms[0].caller, BOB);
+        assert_eq!(confirms[0].caller_role, "taker");
+        assert_eq!(confirms[0].index, 0);
+        assert_eq!(confirms[0].tranche, 300_000);
+        assert_eq!(report.blocked.len(), 2);
+        assert_eq!(report.blocked[0].reason, "unconfirmed");
+        assert_eq!(report.blocked[0].index, 0);
+        assert_eq!(report.blocked[1].reason, "prerequisite");
+        assert_eq!(report.blocked[1].index, 1);
+    }
+
+    #[test]
+    fn skip_lists_only_the_missing_approval() {
+        let mut e = milestone_escrow(&[300_000, 700_000]);
+        e.skip_milestone(BOB, 0).unwrap();
+        let report = scan_milestones(&[watch(ID1, e)], NOW);
+        let skips: Vec<_> = report
+            .actions
+            .iter()
+            .filter(|a| a.kind == MilestoneActionKind::SkipMilestone)
+            .collect();
+        assert_eq!(skips.len(), 1, "actions: {:?}", report.actions);
+        assert_eq!(skips[0].caller, ALICE);
+        assert_eq!(skips[0].caller_role, "initializer");
+        assert_eq!(skips[0].reason, "skip_approval_pending");
+    }
+
+    #[test]
+    fn release_lists_with_fee_split_when_fully_gated() {
+        let mut e = milestone_escrow_with(&[300_000, 700_000], |e| {
+            e.with_protocol_fee(100)
+        });
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        let report = scan_milestones(&[watch(ID1, e)], NOW);
+        let releases: Vec<_> = report
+            .actions
+            .iter()
+            .filter(|a| a.kind == MilestoneActionKind::ReleaseMilestone)
+            .collect();
+        assert_eq!(releases.len(), 1, "actions: {:?}", report.actions);
+        let r = releases[0];
+        assert_eq!(r.caller, ALICE);
+        assert_eq!(r.caller_role, "initializer");
+        assert_eq!(r.tranche, 300_000);
+        assert_eq!(r.fee, 3_000); // floor(300_000 * 100 / 10_000)
+        assert_eq!(r.taker_payout, 297_000);
+        assert_eq!(r.reason, "confirmed");
+        // The next tranche is still sequence-blocked.
+        assert_eq!(report.blocked.len(), 1);
+        assert_eq!(report.blocked[0].reason, "prerequisite");
+    }
+
+    #[test]
+    fn release_blocked_by_quorum_reports_reason() {
+        let mut e = milestone_escrow_with(&[300_000, 700_000], |e| {
+            e.with_quorum(QuorumPolicy::new(&[A1, A2, A3], 2).unwrap())
+        });
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        // No attestations: quorum not satisfied, even though both
+        // parties confirmed.
+        let report = scan_milestones(&[watch(ID1, e)], NOW);
+        assert!(
+            report
+                .actions
+                .iter()
+                .all(|a| a.kind != MilestoneActionKind::ReleaseMilestone),
+            "release must not be listed: {:?}",
+            report.actions
+        );
+        assert_eq!(report.blocked[0].reason, "quorum_not_satisfied");
+        // Confirm/skip approvals are not quorum-gated: nothing blocks
+        // them, and both parties already confirmed so none are listed.
+        assert!(
+            report
+                .actions
+                .iter()
+                .all(|a| a.kind == MilestoneActionKind::SkipMilestone),
+            "only skip approvals remain: {:?}",
+            report.actions
+        );
+    }
+
+    #[test]
+    fn release_blocked_by_timelock_reports_reason() {
+        let mut e = milestone_escrow_with(&[300_000, 700_000], |e| {
+            e.with_timelock(NOW + 1_000)
+        });
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        let report = scan_milestones(&[watch(ID1, e)], NOW);
+        assert!(
+            report
+                .actions
+                .iter()
+                .all(|a| a.kind != MilestoneActionKind::ReleaseMilestone),
+            "release must not be listed before unlock_at"
+        );
+        assert_eq!(report.blocked[0].reason, "timelock_not_reached");
+        // After the timelock passes the same state releases.
+        let later = scan_milestones(&[watch(ID1, e)], NOW + 1_000);
+        assert!(
+            later
+                .actions
+                .iter()
+                .any(|a| a.kind == MilestoneActionKind::ReleaseMilestone),
+            "release must unlock at unlock_at: {:?}",
+            later.actions
+        );
+    }
+
+    #[test]
+    fn json_is_deterministic_and_pinned() {
+        let mut e = milestone_escrow(&[300_000, 700_000]);
+        e.confirm_milestone(ALICE, 0).unwrap();
+        let watched = [watch(ID1, e)];
+        let a = scan_milestones(&watched, NOW).to_json();
+        let b = scan_milestones(&watched, NOW).to_json();
+        assert_eq!(a, b, "equal input must serialize byte-identically");
+        // Pinned shape: the taker's missing confirmation plus the
+        // unconfirmed/prerequisite blocked entries.
+        let expected = format!(
+            "{{\"at\":1750000000,\"scanned\":1,\"actions\":[\
+             {{\"escrow_id\":\"{id}\",\"action\":\"confirm_milestone\",\"index\":0,\
+             \"caller\":\"{bob}\",\"caller_role\":\"taker\",\"mint\":null,\
+             \"tranche\":300000,\"fee\":0,\"taker_payout\":0,\"decimals\":0,\
+             \"display_amount\":\"300000\",\"reason\":\"confirmation_pending\"}},\
+             {{\"escrow_id\":\"{id}\",\"action\":\"skip_milestone\",\"index\":0,\
+             \"caller\":\"{alice}\",\"caller_role\":\"initializer\",\"mint\":null,\
+             \"tranche\":300000,\"fee\":0,\"taker_payout\":0,\"decimals\":0,\
+             \"display_amount\":\"300000\",\"reason\":\"skip_approval_pending\"}},\
+             {{\"escrow_id\":\"{id}\",\"action\":\"skip_milestone\",\"index\":0,\
+             \"caller\":\"{bob}\",\"caller_role\":\"taker\",\"mint\":null,\
+             \"tranche\":300000,\"fee\":0,\"taker_payout\":0,\"decimals\":0,\
+             \"display_amount\":\"300000\",\"reason\":\"skip_approval_pending\"}}\
+             ],\"blocked\":[\
+             {{\"escrow_id\":\"{id}\",\"index\":0,\"action\":\"release_milestone\",\"reason\":\"unconfirmed\"}},\
+             {{\"escrow_id\":\"{id}\",\"index\":1,\"action\":\"release_milestone\",\"reason\":\"prerequisite\"}}\
+             ]}}",
+            id = hex_of(0x01),
+            alice = hex_of(0xAA),
+            bob = hex_of(0xBB),
+        );
+        assert_eq!(a, expected, "pinned JSON shape");
+    }
+
+    #[test]
+    fn skips_escrows_without_plan_or_not_funded() {
+        // Funded but no milestone plan: nothing milestone-related.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE).unwrap();
+        // Plan attached but never funded: not executable.
+        let unplanned = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[1_000_000]).unwrap())
+            .unwrap();
+        let report = scan_milestones(&[watch(ID1, plain), watch([0x02; 32], unplanned)], NOW);
+        assert!(report.is_empty(), "nothing actionable: {report:?}");
+        assert_eq!(report.scanned, 2);
+    }
+
+    #[test]
+    fn scan_is_dry_run() {
+        let mut e = milestone_escrow(&[300_000, 700_000]);
+        e.confirm_milestone(ALICE, 0).unwrap();
+        let before = e;
+        let _ = scan_milestones(&[watch(ID1, e)], NOW);
+        assert_eq!(e, before, "scan must not mutate the escrow");
+    }
+
+    #[test]
+    fn per_party_accessors_match_bits() {
+        let mut e = milestone_escrow(&[300_000, 700_000]);
+        assert!(!e.milestone_confirmed_by_initializer(0));
+        assert!(!e.milestone_confirmed_by_taker(0));
+        e.confirm_milestone(ALICE, 0).unwrap();
+        assert!(e.milestone_confirmed_by_initializer(0));
+        assert!(!e.milestone_confirmed_by_taker(0));
+        assert!(!e.milestone_confirmed(0));
+        e.skip_milestone(BOB, 0).unwrap();
+        assert!(e.milestone_skip_approved_by_taker(0));
+        assert!(!e.milestone_skip_approved_by_initializer(0));
+        // Out of range: false, never panics.
+        assert!(!e.milestone_confirmed_by_initializer(63));
+        assert!(!e.milestone_skip_approved_by_taker(63));
+    }
+
+    #[test]
+    fn stranger_cannot_confirm_or_skip() {
+        // Sanity: the accessors report what the state machine did, and
+        // the state machine rejects strangers.
+        let mut e = milestone_escrow(&[300_000, 700_000]);
+        assert_eq!(
+            e.confirm_milestone([0xCC; 32], 0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.skip_milestone([0xCC; 32], 0),
+            Err(EscrowError::Unauthorized)
+        );
+    }
+}

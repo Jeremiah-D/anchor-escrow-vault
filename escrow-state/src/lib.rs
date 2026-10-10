@@ -2806,6 +2806,45 @@ impl Escrow {
             | Self::milestone_bit(index, MILESTONE_CONFIRM_TAKER_BIT);
         self.milestone_flags & mask == mask
     }
+    /// True when the initializer confirmed milestone `index` for the
+    /// release path (see [`Escrow::confirm_milestone`]). Out-of-range
+    /// indices report `false`. The milestone keeper scan (AV-42) uses
+    /// this to list the *missing* party's confirmation as the executable
+    /// call — confirmations are per-party and idempotent.
+    pub fn milestone_confirmed_by_initializer(&self, index: usize) -> bool {
+        if index >= MAX_MILESTONES {
+            return false;
+        }
+        self.milestone_flags & Self::milestone_bit(index, MILESTONE_CONFIRM_INIT_BIT) != 0
+    }
+    /// True when the taker confirmed milestone `index` for the release
+    /// path (see [`Escrow::confirm_milestone`]). Out-of-range indices
+    /// report `false`.
+    pub fn milestone_confirmed_by_taker(&self, index: usize) -> bool {
+        if index >= MAX_MILESTONES {
+            return false;
+        }
+        self.milestone_flags & Self::milestone_bit(index, MILESTONE_CONFIRM_TAKER_BIT) != 0
+    }
+    /// True when the initializer skip-approved milestone `index` (see
+    /// [`Escrow::skip_milestone`]). Out-of-range indices report `false`.
+    /// The milestone keeper scan (AV-42) lists the missing party's
+    /// skip approval as the executable call — skipping is dual-signed,
+    /// each party records their approval with a separate call.
+    pub fn milestone_skip_approved_by_initializer(&self, index: usize) -> bool {
+        if index >= MAX_MILESTONES {
+            return false;
+        }
+        self.milestone_flags & Self::milestone_bit(index, MILESTONE_SKIP_INIT_BIT) != 0
+    }
+    /// True when the taker skip-approved milestone `index` (see
+    /// [`Escrow::skip_milestone`]). Out-of-range indices report `false`.
+    pub fn milestone_skip_approved_by_taker(&self, index: usize) -> bool {
+        if index >= MAX_MILESTONES {
+            return false;
+        }
+        self.milestone_flags & Self::milestone_bit(index, MILESTONE_SKIP_TAKER_BIT) != 0
+    }
     /// Index of the first unsettled milestone, or `None` when no plan is
     /// configured or every tranche is settled. The next milestone to
     /// confirm, release, or skip.
