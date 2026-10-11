@@ -207,7 +207,10 @@ pub enum EscrowState {
     /// exit is locked — `release`, `cancel`, `cancel_expired`, and
     /// `claim` all return `InvalidStateTransition` — so neither party
     /// can move funds while the arbiter deliberates. Only
-    /// [`Escrow::resolve`] leaves this state.
+    /// [`Escrow::resolve`] leaves this state — or, when the parties
+    /// pre-agreed a fallback at setup, the AV-55
+    /// [`Escrow::trigger_default_judgment`] once the arbitration
+    /// deadline passes.
     Disputed,
     /// AV-14: the arbiter settled the dispute (via [`Escrow::resolve`])
     /// with a single atomic split of the remaining locked funds between
@@ -486,6 +489,33 @@ pub struct Escrow {
     /// the correlation survives serialization. Appended last so every
     /// earlier field offset stays stable.
     reference: Option<[u8; 32]>,
+    /// AV-55: Unix timestamp at which the escrow entered `Disputed`,
+    /// recorded by [`Escrow::escalate`]. The deadline of the
+    /// pre-agreed default judgment (see [`Escrow::default_judgment`])
+    /// is measured from this timestamp: the judgment becomes
+    /// triggerable once `now >= disputed_at + deadline_secs`.
+    /// Always present (zeroed for an escrow that was never disputed).
+    /// Appended last so every earlier field offset stays stable.
+    disputed_at: u64,
+    /// AV-55: the dual-signed pre-agreed default judgment (see
+    /// [`Escrow::with_arbitration_deadline`] /
+    /// [`Escrow::confirm_default_judgment`]): the split applied when a
+    /// live dispute outlives its arbitration deadline and the arbiter
+    /// never resolved. `None` (the default) means no default judgment
+    /// was configured — backward compatible. The region is always
+    /// reserved (zeroed when `None`) so `with_arbitration_deadline`
+    /// writes in place — same treatment as `arbiter` / `mint` /
+    /// `reference`. Appended last so every earlier field offset stays
+    /// stable.
+    default_judgment: Option<DefaultJudgment>,
+    /// AV-55: whether the taker confirmed the pre-agreed split via
+    /// [`Escrow::confirm_default_judgment`]. The judgment is only
+    /// triggerable once both parties signed off on the terms — the
+    /// initializer declares them, the taker confirms — so a
+    /// one-sided fallback split can never take effect. Always present
+    /// (zeroed when unconfirmed). Appended last so every earlier field
+    /// offset stays stable.
+    default_confirmed: bool,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -714,6 +744,18 @@ pub enum EscrowError {
     /// counterparty, so binding it is a policy mismatch by construction.
     /// Parallels [`EscrowError::InvalidFeeRecipient`] (config error).
     InvalidTaker,
+    /// Default judgment not due (AV-55): the arbitration default
+    /// judgment is not available — no default judgment configured, the
+    /// taker never confirmed the pre-agreed split, the deadline has
+    /// not passed yet, or a zero deadline was configured (a zero
+    /// deadline can never become due, so it is rejected at setup).
+    /// Returned by [`Escrow::with_arbitration_deadline`] for a zero
+    /// `deadline_secs`, by [`Escrow::confirm_default_judgment`] /
+    /// [`Escrow::trigger_default_judgment`] when no judgment is
+    /// configured or the taker never confirmed, and by
+    /// [`Escrow::trigger_default_judgment`] when the arbitration
+    /// deadline has not passed yet.
+    DefaultJudgmentNotDue,
 }
 
 impl EscrowError {
@@ -755,6 +797,7 @@ impl EscrowError {
             EscrowError::InvalidPayoutAllowlist => 126,
             EscrowError::PayoutNotAllowlisted => 127,
             EscrowError::InvalidTaker => 128,
+            EscrowError::DefaultJudgmentNotDue => 129,
         }
     }
 
@@ -790,6 +833,7 @@ impl EscrowError {
             EscrowError::InvalidPayoutAllowlist,
             EscrowError::PayoutNotAllowlisted,
             EscrowError::InvalidTaker,
+            EscrowError::DefaultJudgmentNotDue,
         ]
     }
 }
@@ -843,6 +887,49 @@ impl PayoutAllowlist {
     pub fn contains(&self, addr: &[u8; 32]) -> bool {
         self.as_slice().contains(addr)
     }
+}
+
+/// Serialized length of [`DefaultJudgment`]: two u64s (the arbitration
+/// deadline and the pre-agreed default taker share).
+pub const DEFAULT_JUDGMENT_LEN: usize = 8 + 8;
+
+/// The pre-agreed arbitration default judgment (AV-55): the split the
+/// parties agree — at setup, by dual-signed agreement — to apply if the
+/// arbiter never resolves the dispute before a deadline.
+///
+/// Why: an escalated escrow can stall when the arbiter goes silent or
+/// becomes unreachable. Without a fallback, the funds sit in `Disputed`
+/// forever — neither party can exit unilaterally, and the arbiter is
+/// not coming back. The default judgment is a liveness backstop the
+/// parties negotiate *while they still trust each other* (before
+/// funding): after `deadline_secs` seconds in `Disputed`, either party
+/// may trigger the pre-agreed split via
+/// [`Escrow::trigger_default_judgment`], so a deadlocked arbitration
+/// cannot trap funds.
+///
+/// The agreement is dual-signed by construction: the initializer sets
+/// the terms ([`Escrow::with_arbitration_deadline`]) and the taker
+/// confirms them ([`Escrow::confirm_default_judgment`]) — one party
+/// alone cannot dictate the fallback split. The arbiter's
+/// [`Escrow::resolve`] is unchanged and keeps priority: after the
+/// deadline either the arbiter resolves or a party triggers the
+/// default; first writer wins. Persisted (17 bytes in the vault
+/// account: 1-byte `Option` discriminant + 16 bytes) so the agreement
+/// survives serialization; appended last so every earlier field offset
+/// stays stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultJudgment {
+    /// Seconds in `Disputed` after which the default judgment becomes
+    /// triggerable (see [`Escrow::trigger_default_judgment`]). Must be
+    /// non-zero: a zero deadline would make the judgment immediately
+    /// due and is rejected at setup with
+    /// [`EscrowError::DefaultJudgmentNotDue`].
+    pub deadline_secs: u64,
+    /// The taker's share of the remaining locked funds under the
+    /// default judgment (the initializer is refunded the rest). Must
+    /// be `<= amount` at setup; [`Escrow::trigger_default_judgment`]
+    /// re-checks against the then-current remainder.
+    pub default_taker_amount: u64,
 }
 
 /// Maximum number of attestors in a [`QuorumPolicy`]. Fixed-size so the
@@ -1361,6 +1448,14 @@ impl Escrow {
             // AV-53: no off-chain reference memo by default (backward
             // compatible). Opt in via `with_reference` before funding.
             reference: None,
+            // AV-55: the escrow is never born disputed — `disputed_at`
+            // is only written by `escalate`. No default judgment
+            // configured and nothing confirmed by default (backward
+            // compatible): opt in via `with_arbitration_deadline` /
+            // `confirm_default_judgment` before the dispute.
+            disputed_at: 0,
+            default_judgment: None,
+            default_confirmed: false,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -2750,6 +2845,12 @@ impl Escrow {
             return Err(EscrowError::DisputeWindowClosed);
         }
         self.state = EscrowState::Disputed;
+        // AV-55: record when the escrow entered `Disputed` — the
+        // pre-agreed default judgment's deadline (see
+        // `Escrow::trigger_default_judgment`) is measured from this
+        // timestamp, so an arbitration the arbiter never resolves can
+        // still settle.
+        self.disputed_at = now;
         self.evidence_hash = evidence_hash;
         Ok(())
     }
@@ -3322,6 +3423,239 @@ impl Escrow {
         // the settlement — never cleared, following the AV-22
         // evidence_hash audit-trail convention.
         self.rationale_hash = rationale_hash;
+        self.state = EscrowState::Settled;
+        Ok((taker_amount - fee, fee, remaining - taker_amount))
+    }
+
+    /// The Unix timestamp at which the escrow entered `Disputed`,
+    /// recorded by [`Escrow::escalate`]; `0` when the escrow was never
+    /// disputed (AV-55). The pre-agreed default judgment's deadline is
+    /// measured from this timestamp (see
+    /// [`Escrow::trigger_default_judgment`]).
+    pub fn disputed_at(&self) -> u64 {
+        self.disputed_at
+    }
+
+    /// The pre-agreed arbitration default judgment (AV-55), or `None`
+    /// when no judgment was configured (backward compatible). Set once
+    /// via [`Escrow::with_arbitration_deadline`] and confirmed by the
+    /// taker via [`Escrow::confirm_default_judgment`].
+    pub fn default_judgment(&self) -> Option<DefaultJudgment> {
+        self.default_judgment
+    }
+
+    /// Whether the taker confirmed the pre-agreed default judgment via
+    /// [`Escrow::confirm_default_judgment`] (AV-55). The judgment is
+    /// only triggerable once confirmed — a one-sided fallback split
+    /// can never take effect.
+    pub fn default_judgment_confirmed(&self) -> bool {
+        self.default_confirmed
+    }
+
+    /// Opt in to the arbitration default judgment (AV-55 — Solana
+    /// escrow liveness / payment fintech): declare the fallback split
+    /// applied when a live dispute outlives its arbitration deadline
+    /// and the arbiter never resolves (see
+    /// [`Escrow::trigger_default_judgment`]).
+    ///
+    /// Why: an escalated escrow can stall when the arbiter goes silent
+    /// or becomes unreachable — without a fallback the funds sit in
+    /// `Disputed` forever, with every unilateral exit locked. The
+    /// default judgment is a liveness backstop the parties negotiate
+    /// *while they still trust each other* (before funding): the
+    /// initializer proposes the terms here, and the taker countersigns
+    /// them via [`Escrow::confirm_default_judgment`] — one party alone
+    /// cannot dictate the fallback split.
+    ///
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// fallback terms are fixed before any funds move — mirroring
+    /// [`Escrow::with_arbiter`]. The arbiter must already be configured
+    /// ([`EscrowError::InvalidArbiter`] otherwise — the default judgment
+    /// is a fallback *for* arbitration, so a no-arbiter escrow has
+    /// nothing to fall back from; configure the arbiter first). A zero
+    /// `deadline_secs` is [`EscrowError::DefaultJudgmentNotDue`]: a
+    /// judgment due immediately would fire on the very first trigger
+    /// call, before the arbiter had any chance to rule — the deadline
+    /// must be a real window. `default_taker_amount > amount` is
+    /// [`EscrowError::ReleaseExceedsLocked`]: the fallback split can
+    /// never outrun the lockup. Re-configuring a live escrow is
+    /// rejected with `InvalidStateTransition`.
+    ///
+    /// Design: the deadline counts from `disputed_at` (the moment the
+    /// escrow entered `Disputed`, recorded by [`Escrow::escalate`]) —
+    /// not from setup time — so the arbiter always gets the full
+    /// window regardless of when the dispute started.
+    pub fn with_arbitration_deadline(
+        mut self,
+        deadline_secs: u64,
+        default_taker_amount: u64,
+    ) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // The default judgment is a fallback for arbitration: without
+        // a configured arbiter there is no dispute to outlive, so the
+        // builder must come after `with_arbiter`.
+        if self.arbiter.is_none() {
+            return Err(EscrowError::InvalidArbiter);
+        }
+        if deadline_secs == 0 {
+            return Err(EscrowError::DefaultJudgmentNotDue);
+        }
+        if default_taker_amount > self.amount {
+            return Err(EscrowError::ReleaseExceedsLocked);
+        }
+        self.default_judgment = Some(DefaultJudgment {
+            deadline_secs,
+            default_taker_amount,
+        });
+        // `default_confirmed` starts false (the zeroed default) — the
+        // taker must still countersign via `confirm_default_judgment`.
+        Ok(self)
+    }
+
+    /// Confirm the pre-agreed arbitration default judgment (AV-55): the
+    /// taker countersigns the fallback split declared by
+    /// [`Escrow::with_arbitration_deadline`], completing the
+    /// dual-signed agreement.
+    ///
+    /// Why the taker (not the initializer): the initializer already
+    /// declared the terms in the builder — having the initializer
+    /// "confirm" their own proposal would be a single-signature
+    /// rubber stamp. The taker's confirmation is the second signature
+    /// that makes the agreement bilateral, mirroring AV-12's
+    /// dual-signature activation and AV-15's dual-confirmed
+    /// milestones. A stranger or the initializer is
+    /// [`EscrowError::Unauthorized`].
+    ///
+    /// Only valid on `Uninitialized` or `Funded` — the agreement must
+    /// be complete before the escrow is disputed, and it can never be
+    /// re-signed from a terminal state. No judgment configured is
+    /// [`EscrowError::DefaultJudgmentNotDue`]. Idempotent: confirming
+    /// an already-confirmed judgment returns `Ok(())` without
+    /// changing anything, so a retried transaction cannot fail on a
+    /// replayed confirmation.
+    ///
+    /// Check order is deliberate: pause, then authority (a stranger
+    /// learns nothing about config), then configuration, then state —
+    /// and the idempotency check last, since confirming an already
+    /// confirmed judgment is always `Ok` regardless of state.
+    pub fn confirm_default_judgment(&mut self, authority: [u8; 32]) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        if authority != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.default_judgment.is_none() {
+            return Err(EscrowError::DefaultJudgmentNotDue);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Idempotent: a retried confirmation is a no-op success.
+        if self.default_confirmed {
+            return Ok(());
+        }
+        self.default_confirmed = true;
+        Ok(())
+    }
+
+    /// Trigger the pre-agreed arbitration default judgment (AV-55):
+    /// `Disputed -> Settled`. Either party may call once the dispute
+    /// has outlived the arbitration deadline (`now >= disputed_at +
+    /// deadline_secs`) without the arbiter resolving — the escrow
+    /// settles on the fallback split instead of staying locked
+    /// forever.
+    ///
+    /// Why either party: the default judgment is a liveness backstop,
+    /// not a power grant — restricting the trigger to one party would
+    /// let that party hold the other's funds hostage by simply not
+    /// calling. Whoever calls first (either party, or the arbiter via
+    /// [`Escrow::resolve`]) settles the escrow; the second call finds
+    /// `Settled` and fails `InvalidStateTransition` — first writer
+    /// wins. The arbiter's [`Escrow::resolve`] is unchanged and keeps
+    /// priority: after the deadline it is a race between the arbiter's
+    /// ruling and the parties' trigger, and the arbiter can still win
+    /// it.
+    ///
+    /// Gate order is deliberate (pause, reentrancy, caller, state,
+    /// configuration, deadline, mint, payout policy — paralleling
+    /// `resolve`'s order): a stranger learns nothing about state; an
+    /// unconfigured or unconfirmed judgment fails before the time
+    /// logic runs.
+    ///
+    /// The settlement mirrors [`Escrow::resolve`] exactly: the fee
+    /// (AV-17) slices the taker's share (the `released` counter keeps
+    /// the gross so conservation is untouched; the initializer's
+    /// refund is never fee'd). The quorum gate does NOT apply — the
+    /// arbiter was the resolution mechanism, and the default judgment
+    /// is its agreed fallback. Vesting is overridden by the settlement
+    /// (same as `resolve`): an unsettled tranche is part of the split
+    /// remainder. The timelock does NOT gate — same as `resolve`, so a
+    /// misconfigured lock can never trap disputed funds forever.
+    /// [`Escrow::trigger_default_judgment`] re-checks the taker share
+    /// against the current remainder (`ReleaseExceedsLocked`
+    /// otherwise): the setup-time check was against the full lockup,
+    /// and nothing moved funds in `Disputed`, so the two agree unless
+    /// the caller replays a stale transaction.
+    ///
+    /// Returns `(taker_payout, fee, initializer_refund)` like
+    /// `resolve`: the taker's net payout, the protocol fee, and the
+    /// initializer's share of the split.
+    pub fn trigger_default_judgment(
+        &mut self,
+        caller: [u8; 32],
+        now: u64,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+    ) -> Result<(u64, u64, u64), EscrowError> {
+        // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        // AV-46: pause guard first — a paused escrow fails fast,
+        // before the reentrancy guard and the authority check.
+        self.require_not_paused()?;
+        self.require_not_reentrant()?;
+        if caller != self.initializer && caller != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Disputed => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let judgment = self
+            .default_judgment
+            .ok_or(EscrowError::DefaultJudgmentNotDue)?;
+        if !self.default_confirmed {
+            return Err(EscrowError::DefaultJudgmentNotDue);
+        }
+        // AV-55: the deadline is measured from `disputed_at`, recorded
+        // by `escalate` — the arbiter always gets the full window from
+        // the moment the dispute started, whenever that was.
+        // `saturating_add` so a near-`u64::MAX` dispute timestamp can
+        // never wrap into a falsely-early deadline.
+        if now < self.disputed_at.saturating_add(judgment.deadline_secs) {
+            return Err(EscrowError::DefaultJudgmentNotDue);
+        }
+        // AV-16: the split moves the escrow's locked tokens — they must
+        // be the bound mint (`MintMismatch` otherwise).
+        self.require_mint_match(mint)?;
+        // AV-49: the taker's share of the split must satisfy the payout
+        // policy (`PayoutNotAllowlisted` otherwise).
+        self.require_payout_recipient(payout_to)?;
+        // `released <= amount` is the crate invariant, so `remaining`
+        // cannot underflow; the setup-time check was against the full
+        // lockup, so this only trips on a stale replay.
+        let remaining = self.amount - self.released;
+        let taker_amount = judgment.default_taker_amount;
+        if taker_amount > remaining {
+            return Err(EscrowError::ReleaseExceedsLocked);
+        }
+        // AV-17: the fee slices the taker's share; the `released`
+        // counter keeps the gross so conservation is untouched. The
+        // initializer's refund is never fee'd.
+        let fee = self.charge_protocol_fee(taker_amount)?;
+        self.released += taker_amount;
         self.state = EscrowState::Settled;
         Ok((taker_amount - fee, fee, remaining - taker_amount))
     }
@@ -4094,6 +4428,23 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // treatment as `arbiter` / `mint` / `refund_to`. Appended last so
     // every earlier field offset stays stable.
     ("reference", "Option<[u8; 32]>", 1 + 32),
+    // AV-55: dispute timestamp (see `Escrow::escalate`): one u64, always
+    // present (zeroed when the escrow was never disputed). Appended
+    // last so every earlier field offset stays stable.
+    ("disputed_at", "u64", 8),
+    // AV-55: pre-agreed arbitration default judgment (see
+    // `Escrow::with_arbitration_deadline`): one discriminant byte, then
+    // the 16-byte `DefaultJudgment` (deadline + taker share). The region
+    // is always reserved (zeroed when `None`) so
+    // `with_arbitration_deadline` writes in place — same treatment as
+    // `arbiter` / `mint` / `reference`. Appended last so every earlier
+    // field offset stays stable.
+    ("default_judgment", "Option<DefaultJudgment>", 1 + DEFAULT_JUDGMENT_LEN),
+    // AV-55: taker's confirmation of the pre-agreed split (see
+    // `Escrow::confirm_default_judgment`): one bool byte, always
+    // present (zeroed when the split is unconfirmed). Appended last so
+    // every earlier field offset stays stable.
+    ("default_confirmed", "bool", 1),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -4154,9 +4505,15 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// and so is the emergency pause flag (AV-46): 1 byte, zeroed when the
 /// escrow is not paused. The off-chain reference memo (AV-53) is always
 /// present as well: 1-byte discriminant + 32-byte correlation id
-/// (zeroed when no reference is attached).
+/// (zeroed when no reference is attached). The dispute timestamp
+/// (AV-55) is always present too: 8 bytes, zeroed when the escrow was
+/// never disputed. The pre-agreed default judgment (AV-55) is likewise
+/// always present: 1-byte discriminant + 16-byte judgment (zeroed when
+/// no default judgment is configured), and so is the taker's
+/// confirmation bit (AV-55): 1 byte, zeroed when the split is
+/// unconfirmed.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -4700,7 +5057,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 7_628_160, "from {state:?}");
+            assert_eq!(rent, 7_809_120, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -4798,9 +5155,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 7_628_160 by
+        // VAULT_SPACE — pinned at 7_809_120 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 7_628_160);
+        assert_eq!(rent, 7_809_120);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -4958,11 +5315,11 @@ mod tests {
     fn release_and_close_adds_no_fields_and_keeps_space() {
         // AV-50 touches no persisted field: the release leg moves the
         // `released` / `fees_paid` counters and the state byte, and
-        // then the account is closed. VAULT_SPACE stays 968 — re-asserted
+        // then the account is closed. VAULT_SPACE stays 994 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 968, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 7_628_160);
+        assert_eq!(VAULT_SPACE, 994, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 7_809_120);
     }
 
     #[test]
@@ -4974,9 +5331,11 @@ mod tests {
         // paid for). AV-38 grew the account by 33 bytes (rationale
         // hash), AV-44 by 33 more (fee recipient), AV-46 by 34
         // (pause authority + pause flag), AV-51 by 8 (vesting
-        // cliff), and AV-53 by 33 (off-chain reference memo), so the
+        // cliff), AV-53 by 33 (off-chain reference memo), and AV-55 by
+        // 26 (dispute timestamp + default judgment + confirmation
+        // bit), so the
         // pin tracks the new total deliberately.
-        assert_eq!(VAULT_SPACE, 968, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 994, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -6875,6 +7234,101 @@ pub(crate) mod anchor_idl_tests {
                             writes in place without reallocating; emits \
                             no event (pre-fund configuration)",
         },
+        InstructionSpec {
+            // AV-55: declare the arbitration default judgment (the
+            // fallback split if the arbiter never resolves).
+            name: "initialize_default_judgment",
+            params: &[
+                (
+                    "deadline_secs",
+                    "u64",
+                    "instruction param; seconds in Disputed after which \\
+                     the pre-agreed default judgment becomes \\
+                     triggerable (measured from disputed_at, recorded by \\
+                     escalate); must be non-zero - a zero deadline would \\
+                     fire immediately and is DefaultJudgmentNotDue",
+                ),
+                (
+                    "default_taker_amount",
+                    "u64",
+                    "instruction param; the taker's share of the \\
+                     remaining locked funds under the default judgment \\
+                     (the initializer is refunded the rest); must be <= \\
+                     the locked amount (ReleaseExceedsLocked otherwise)",
+                ),
+            ],
+            method: "Escrow::with_arbitration_deadline",
+            input_mapping: "deadline_secs <- param; default_taker_amount \\
+                            <- param; authority <- accounts.initializer \\
+                            (signer), enforced by the Anchor account \\
+                            constraint, not the state machine; \\
+                            Uninitialized only, like initialize_arbiter; \\
+                            the arbiter must already be configured \\
+                            (with_arbiter first - InvalidArbiter \\
+                            otherwise); the 17-byte region is always \\
+                            reserved (zeroed when None) so the opt-in \\
+                            writes in place without reallocating; the \\
+                            initializer proposes the terms here and the \\
+                            taker must still countersign via \\
+                            confirm_default_judgment (dual-signed \\
+                            agreement); emits no event (pre-fund \\
+                            configuration)",
+        },
+        InstructionSpec {
+            // AV-55: the taker countersigns the pre-agreed default
+            // judgment split.
+            name: "confirm_default_judgment",
+            params: &[],
+            method: "Escrow::confirm_default_judgment",
+            input_mapping: "no params; authority <- accounts.taker \\
+                            (signer) - the taker's signature is the \\
+                            second half of the dual-signed agreement \\
+                            (a stranger or the initializer is \\
+                            Unauthorized); Uninitialized / Funded only \\
+                            (InvalidStateTransition otherwise - the \\
+                            agreement must be complete before the \\
+                            dispute); no judgment configured is \\
+                            DefaultJudgmentNotDue (code 129); idempotent \\
+                            (re-confirming an already-confirmed judgment \\
+                            is Ok, no event re-emitted); emits no event \\
+                            on the state machine's Escalated-style path - \\
+                            pre-dispute configuration",
+        },
+        InstructionSpec {
+            // AV-55: settle a deadlocked dispute on the pre-agreed
+            // fallback split.
+            name: "trigger_default_judgment",
+            params: &[],
+            method: "Escrow::trigger_default_judgment",
+            input_mapping: "no params; caller <- accounts.caller \\
+                            (signer: initializer OR taker - the trigger \\
+                            is a liveness backstop, not a power grant, \\
+                            so either party may call); now <- clock \\
+                            sysvar (NOT an instruction param - a \\
+                            caller-supplied timestamp could fast-forward \\
+                            the deadline); mint <- vault token account \\
+                            (MintMismatch against vault.mint otherwise); \\
+                            payout_to <- accounts.payout_to, pinned \\
+                            against the payout policy exactly like \\
+                            resolve (AV-49); Disputed -> Settled per the \\
+                            pre-agreed split once now >= disputed_at + \\
+                            deadline_secs (DefaultJudgmentNotDue \\
+                            otherwise - unconfigured, unconfirmed, or the \\
+                            deadline has not passed); the taker's share \\
+                            carries the AV-17 protocol fee slice like \\
+                            resolve (fee slices the taker share, released \\
+                            counts gross, the refund is never fee'd); the \\
+                            quorum gate does NOT apply (the arbiter was \\
+                            the resolution mechanism), vesting is \\
+                            overridden (same as resolve), the timelock \\
+                            does NOT gate (same as resolve); the arbiter's \\
+                            resolve is unchanged and keeps priority - \\
+                            after the deadline either the arbiter resolves \\
+                            or a party triggers; first writer wins; emits \\
+                            the DefaultJudgment indexer event (from == \\
+                            Disputed, to == Settled; evidence_hash \\
+                            carried, rationale None)",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -6953,6 +7407,9 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::with_payout_allowlist",
             "Escrow::update_payout_allowlist",
             "Escrow::with_reference",
+            "Escrow::with_arbitration_deadline",
+            "Escrow::confirm_default_judgment",
+            "Escrow::trigger_default_judgment",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -6976,7 +7433,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_twenty_eight_instructions_take_params() {
+    fn only_twenty_nine_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -7015,6 +7472,7 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_payout_allowlist",
                 &"update_payout_allowlist",
                 &"initialize_reference",
+                &"initialize_default_judgment",
             ]
         );
     }
@@ -8543,6 +9001,14 @@ pub(crate) mod anchor_idl_tests {
         // discriminant is implied (an attached memo is `Some`),
         // mirroring `initialize_pause_authority`.
         ("initialize_reference", "reference", "reference"),
+        // AV-55: the two default-judgment params both populate the
+        // single `default_judgment` vault field — multiple param
+        // sources for one field are allowed (like `released`, which
+        // `release`, `release_via_cpi`, `release_milestone` and
+        // `resolve` all write). The `Option` discriminant is implied
+        // (a configured judgment is `Some`).
+        ("initialize_default_judgment", "deadline_secs", "default_judgment"),
+        ("initialize_default_judgment", "default_taker_amount", "default_judgment"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -8615,6 +9081,24 @@ pub(crate) mod anchor_idl_tests {
             "paused",
             "zeroed by initialize; flipped by pause / unpause (pause \\
              authority signer only)",
+        ),
+        // AV-55: no instruction param writes this field: `escalate`
+        // reads `now` from the clock sysvar (never an instruction
+        // param), so the dispute timestamp is a field source, not a
+        // param mapping.
+        (
+            "disputed_at",
+            "zeroed by initialize; set by escalate from the clock \\
+             sysvar (NOT an instruction param); the pre-agreed default \\
+             judgment deadline is measured from it",
+        ),
+        // AV-55: no instruction param writes this field:
+        // `confirm_default_judgment` is a param-less instruction, so it
+        // is a field source, not a param mapping.
+        (
+            "default_confirmed",
+            "zeroed by initialize; set by confirm_default_judgment \\
+             (taker signer only)",
         ),
     ];
 
@@ -8879,6 +9363,11 @@ mod error_code_tests {
             EscrowError::InvalidTaker,
             128,
             "rotate_taker with the zero address (a zero address can never be the legitimate payout counterparty)",
+        ),
+        (
+            EscrowError::DefaultJudgmentNotDue,
+            129,
+            "trigger_default_judgment with no default judgment configured, the taker never confirmed the split, or the arbitration deadline not yet passed; with_arbitration_deadline with a zero deadline",
         ),
     ];
 
@@ -9557,6 +10046,33 @@ mod error_code_tests {
             .unwrap_err();
         assert_eq!(err, EscrowError::InvalidPauseAuthority);
         assert_eq!(err.code(), 125);
+    }
+
+    #[test]
+    fn default_judgment_not_due_triggered_by_early_trigger() {
+        // A configured + confirmed default judgment, disputed at T:
+        // triggering before T + deadline fails DefaultJudgmentNotDue,
+        // at exactly the deadline it succeeds.
+        let arbiter = [0xA8; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(arbiter)
+            .unwrap()
+            .with_arbitration_deadline(3_600, 600_000)
+            .unwrap();
+        e.confirm_default_judgment(BOB).unwrap();
+        e.fund(ALICE).unwrap();
+        let disputed_at = EXPIRES_AT - 10_000;
+        e.escalate(ALICE, disputed_at, None).unwrap();
+        // One second before the deadline: not due.
+        let err = e
+            .trigger_default_judgment(ALICE, disputed_at + 3_599, None, BOB)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::DefaultJudgmentNotDue);
+        assert_eq!(err.code(), 129);
+        // Nothing moved: still Disputed, nothing released.
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(e.released_amount(), 0);
     }
 }
 
@@ -10429,6 +10945,30 @@ mod account_space_tests {
                 out.extend_from_slice(&r);
             }
         }
+        // AV-55: dispute timestamp, always present (zeroed when the
+        // escrow was never disputed); appended last so every earlier
+        // offset above is unchanged.
+        out.extend_from_slice(&e.disputed_at.to_le_bytes());
+        // AV-55: pre-agreed arbitration default judgment, always
+        // reserved like `reference`: the `None` discriminant followed
+        // by a zeroed 16-byte judgment, so `with_arbitration_deadline`
+        // writes in place without reallocating; appended last so every
+        // earlier offset above is unchanged.
+        match e.default_judgment {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; DEFAULT_JUDGMENT_LEN]);
+            }
+            Some(j) => {
+                out.push(1);
+                out.extend_from_slice(&j.deadline_secs.to_le_bytes());
+                out.extend_from_slice(&j.default_taker_amount.to_le_bytes());
+            }
+        }
+        // AV-55: taker's confirmation of the pre-agreed split, always
+        // present (zeroed when unconfirmed); appended last so every
+        // earlier offset above is unchanged.
+        out.push(e.default_confirmed as u8);
         out
     }
 
@@ -10460,10 +11000,12 @@ mod account_space_tests {
         // governance opt-in) + (1 + 32) (AV-44 protocol-fee recipient pin)
         // + (1 + 32) (AV-46 emergency-pause authority) + 1 (AV-46
         // emergency pause flag) + (1 + 128) (AV-49 payout destination
-        // allowlist) + (1 + 32) (AV-53 off-chain reference memo).
-        assert_eq!(ESCROW_BODY_LEN, 960, "escrow payload bytes");
+        // allowlist) + (1 + 32) (AV-53 off-chain reference memo) + 8
+        // (AV-55 dispute timestamp) + (1 + 16) (AV-55 pre-agreed default
+        // judgment) + 1 (AV-55 taker confirmation bit).
+        assert_eq!(ESCROW_BODY_LEN, 986, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 968, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 994, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -10491,13 +11033,17 @@ mod account_space_tests {
         // zeroed when the escrow is not paused) + (1 + 129)-byte payout
         // destination allowlist (AV-49, zeroed when no allowlist is
         // configured) + (1 + 32)-byte off-chain reference memo (AV-53,
-        // zeroed when no reference is attached).
+        // zeroed when no reference is attached) + 8-byte dispute
+        // timestamp (AV-55, zeroed when the escrow was never disputed) +
+        // (1 + 16)-byte pre-agreed default judgment (AV-55, zeroed when
+        // no default judgment is configured) + 1-byte taker confirmation
+        // bit (AV-55, zeroed when the split is unconfirmed).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 478);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 504);
     }
 
     #[test]
@@ -10635,6 +11181,21 @@ mod account_space_tests {
         // AV-28: token decimal metadata u8, zeroed for a plain escrow
         // (no decimal metadata declared).
         assert_eq!(bytes[695], 0, "decimals: zeroed");
+        // AV-55: dispute timestamp u64 (offset 960), zeroed for an
+        // escrow that was never disputed.
+        assert_eq!(
+            u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
+            0,
+            "disputed_at: zeroed"
+        );
+        // AV-55: pre-agreed default judgment (offset 968): None
+        // discriminant + zeroed 16-byte judgment (no judgment
+        // configured here).
+        assert_eq!(bytes[968], 0, "default_judgment: None discriminant");
+        assert_eq!(&bytes[969..985], &[0u8; 16], "default_judgment: zeroed");
+        // AV-55: taker confirmation bit (offset 985), zeroed for an
+        // unconfirmed split.
+        assert_eq!(bytes[985], 0, "default_confirmed: zeroed");
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "tail byte is the last byte");
 
         // With quorum: same total length (space is always reserved), Some
@@ -10889,16 +11450,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 968) * 3480 * 2 = 1096 * 6960 = 7_628_160 lamports.
-        assert_eq!(full, 7_628_160);
+        // (128 + 994) * 3480 * 2 = 1122 * 6960 = 7_809_120 lamports.
+        assert_eq!(full, 7_809_120);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 478) * 3480 * 2 = 606 * 6960 = 4_217_760 lamports.
-        assert_eq!(no_quorum, 4_217_760);
+        // (128 + 504) * 3480 * 2 = 632 * 6960 = 4_398_720 lamports.
+        assert_eq!(no_quorum, 4_398_720);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -10942,12 +11503,12 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(7_628_160, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(7_809_120, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(7_628_159, params.0, params.1),
             Err(RentShortfall {
-                required: 7_628_160,
+                required: 7_809_120,
                 provided: 7_628_159,
             })
         );
@@ -10960,7 +11521,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 7_628_160,
+                required: 7_809_120,
                 provided: 0,
             })
         );
@@ -13396,7 +13957,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 960, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) bytes");
+        assert_eq!(bytes.len(), 986, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -13421,7 +13982,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 960);
+        assert_eq!(bytes.len(), 986);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -13440,18 +14001,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 968) * 3480 * 2 = 1096 * 6960 = 7_628_160 lamports.
-        assert_eq!(VAULT_SPACE, 968);
-        assert_eq!(full, 7_628_160);
+        // (128 + 994) * 3480 * 2 = 1122 * 6960 = 7_809_120 lamports.
+        assert_eq!(VAULT_SPACE, 994);
+        assert_eq!(full, 7_809_120);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 478) * 3480 * 2 = 606 * 6960 = 4_217_760 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 478);
-        assert_eq!(no_quorum, 4_217_760);
+        // (128 + 504) * 3480 * 2 = 632 * 6960 = 4_398_720 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 504);
+        assert_eq!(no_quorum, 4_398_720);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -13595,7 +14156,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 960);
+        assert_eq!(bytes.len(), 986);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -13610,7 +14171,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 960);
+        assert_eq!(bytes.len(), 986);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -13640,18 +14201,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 968) * 3480 * 2 = 1096 * 6960 = 7_628_160 lamports.
-        assert_eq!(VAULT_SPACE, 968);
-        assert_eq!(full, 7_628_160);
+        // (128 + 994) * 3480 * 2 = 1122 * 6960 = 7_809_120 lamports.
+        assert_eq!(VAULT_SPACE, 994);
+        assert_eq!(full, 7_809_120);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 478) * 3480 * 2 = 606 * 6960 = 4_217_760 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 478);
-        assert_eq!(no_quorum, 4_217_760);
+        // (128 + 504) * 3480 * 2 = 632 * 6960 = 4_398_720 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 504);
+        assert_eq!(no_quorum, 4_398_720);
     }
 
     #[test]
@@ -14506,7 +15067,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 960);
+        assert_eq!(bytes.len(), 986);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -14681,7 +15242,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 960, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53");
+        assert_eq!(ESCROW_BODY_LEN, 986, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -14699,31 +15260,31 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 968) * 3480 * 2 = 1096 * 6960 = 7_628_160 lamports.
+        // (128 + 994) * 3480 * 2 = 1122 * 6960 = 7_809_120 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            7_628_160
+            7_809_120
         );
-        // (128 + 478) * 3480 * 2 = 606 * 6960 = 4_217_760 lamports.
+        // (128 + 504) * 3480 * 2 = 632 * 6960 = 4_398_720 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            4_217_760
+            4_398_720
         );
         // 213 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo).
-        assert_eq!(VAULT_SPACE, 968);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 478);
-        assert!(check_vault_rent_exempt(7_628_160, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 994);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 504);
+        assert!(check_vault_rent_exempt(7_809_120, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -16203,3 +16764,605 @@ mod taker_rotation_tests {
     }
 }
 
+
+// ---------- AV-55: arbitration default judgment (dispute timeout fallback) ----------
+
+/// A pre-agreed fallback split — negotiated at setup by dual-signed
+/// agreement — settles a dispute the arbiter never resolves: after
+/// `deadline_secs` seconds in `Disputed`, either party may trigger the
+/// split via [`Escrow::trigger_default_judgment`] instead of letting the
+/// funds sit locked forever.
+#[cfg(test)]
+mod default_judgment_tests {
+    use super::*;
+    use crate::account_space_tests::encode_escrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const MINT: [u8; 32] = [0xD0; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const DEADLINE: u64 = 3_600;
+    const TAKER_SHARE: u64 = 600_000;
+
+    fn escrow() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap()
+    }
+
+    /// Escrow with a configured + taker-confirmed default judgment:
+    /// disputed at `disputed_at`, deadline 3_600s later, taker share
+    /// 600_000 of 1_000_000.
+    fn disputed_with_judgment() -> (Escrow, u64) {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap();
+        assert!(
+            !e.default_judgment_confirmed(),
+            "judgment starts unconfirmed"
+        );
+        e.confirm_default_judgment(BOB).unwrap();
+        e.fund(ALICE).unwrap();
+        let disputed_at = EXPIRES_AT - 10_000;
+        e.escalate(ALICE, disputed_at, None).unwrap();
+        assert_eq!(e.disputed_at(), disputed_at, "escalate records disputed_at");
+        assert_eq!(e.state(), EscrowState::Disputed);
+        (e, disputed_at)
+    }
+
+    // ----- builder validation matrix -----
+
+    #[test]
+    fn builder_rejects_non_uninitialized_state() {
+        // The fallback terms are fixed before funds move — like every
+        // other with_* builder.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.with_arbitration_deadline(DEADLINE, TAKER_SHARE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn builder_rejects_missing_arbiter() {
+        // The default judgment is a fallback *for* arbitration: without
+        // a configured arbiter there is no dispute to outlive, so the
+        // builder requires `with_arbiter` first (builder order).
+        let err = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidArbiter);
+        assert_eq!(err.code(), 108);
+    }
+
+    #[test]
+    fn builder_rejects_zero_deadline() {
+        // A zero deadline would fire immediately — before the arbiter
+        // had any chance to rule — so it is rejected at setup.
+        let err = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(0, TAKER_SHARE)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::DefaultJudgmentNotDue);
+        assert_eq!(err.code(), 129);
+    }
+
+    #[test]
+    fn builder_rejects_split_above_locked_amount() {
+        // The fallback split can never outrun the lockup.
+        let err = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, 1_000_001)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::ReleaseExceedsLocked);
+        assert_eq!(err.code(), 106);
+    }
+
+    #[test]
+    fn builder_stores_terms_unconfirmed() {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap();
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: DEADLINE,
+                default_taker_amount: TAKER_SHARE,
+            })
+        );
+        assert!(
+            !e.default_judgment_confirmed(),
+            "the taker must still countersign"
+        );
+    }
+
+    // ----- confirm matrix -----
+
+    #[test]
+    fn confirm_rejects_stranger() {
+        // A stranger learns nothing about config: authority first.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap();
+        assert_eq!(
+            e.confirm_default_judgment(MALLORY),
+            Err(EscrowError::Unauthorized)
+        );
+        assert!(!e.default_judgment_confirmed());
+    }
+
+    #[test]
+    fn confirm_rejects_initializer() {
+        // The initializer proposed the terms — only the taker's
+        // signature completes the dual-signed agreement.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap();
+        assert_eq!(
+            e.confirm_default_judgment(ALICE),
+            Err(EscrowError::Unauthorized)
+        );
+        assert!(!e.default_judgment_confirmed());
+    }
+
+    #[test]
+    fn confirm_rejects_no_judgment_configured() {
+        // The taker cannot confirm a judgment that was never proposed.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.confirm_default_judgment(BOB),
+            Err(EscrowError::DefaultJudgmentNotDue)
+        );
+    }
+
+    #[test]
+    fn confirm_is_idempotent() {
+        // A retried confirmation is a no-op success — a replayed
+        // transaction cannot fail on an already-confirmed agreement.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap();
+        assert_eq!(e.confirm_default_judgment(BOB), Ok(()));
+        assert_eq!(e.confirm_default_judgment(BOB), Ok(()));
+        assert!(e.default_judgment_confirmed());
+    }
+
+    #[test]
+    fn confirm_rejects_post_dispute() {
+        // The agreement must be complete before the dispute: `Disputed`
+        // is past the confirmation window (Uninitialized | Funded only).
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 10_000, None).unwrap();
+        assert_eq!(
+            e.confirm_default_judgment(BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(!e.default_judgment_confirmed());
+    }
+
+    #[test]
+    fn confirm_blocked_while_paused() {
+        // A paused escrow fails fast, even on the taker's confirmation.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap();
+        e.pause([0xDD; 32]).unwrap();
+        assert_eq!(
+            e.confirm_default_judgment(BOB),
+            Err(EscrowError::Paused)
+        );
+    }
+
+    // ----- trigger matrix -----
+
+    #[test]
+    fn trigger_rejects_stranger() {
+        // A stranger learns nothing about state: caller authority first.
+        let (mut e, disputed_at) = disputed_with_judgment();
+        assert_eq!(
+            e.trigger_default_judgment(MALLORY, disputed_at + DEADLINE, None, BOB),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.state(), EscrowState::Disputed);
+    }
+
+    #[test]
+    fn trigger_rejects_non_disputed_state() {
+        // The trigger only settles a live dispute.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap();
+        e.confirm_default_judgment(BOB).unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.trigger_default_judgment(ALICE, EXPIRES_AT, None, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn trigger_rejects_unconfirmed_judgment() {
+        // One-sided terms can never take effect: the taker must have
+        // countersigned before the dispute.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let disputed_at = EXPIRES_AT - 10_000;
+        e.escalate(ALICE, disputed_at, None).unwrap();
+        let err = e
+            .trigger_default_judgment(ALICE, disputed_at + DEADLINE, None, BOB)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::DefaultJudgmentNotDue);
+        assert_eq!(e.state(), EscrowState::Disputed);
+    }
+
+    #[test]
+    fn trigger_rejects_no_judgment_configured() {
+        // Without a configured judgment there is nothing to trigger.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 10_000, None).unwrap();
+        assert_eq!(
+            e.trigger_default_judgment(ALICE, EXPIRES_AT, None, BOB),
+            Err(EscrowError::DefaultJudgmentNotDue)
+        );
+    }
+
+    #[test]
+    fn trigger_rejects_early() {
+        // The arbiter gets the full window: one second early is still
+        // not due.
+        let (mut e, disputed_at) = disputed_with_judgment();
+        let err = e
+            .trigger_default_judgment(BOB, disputed_at + DEADLINE - 1, None, BOB)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::DefaultJudgmentNotDue);
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(e.released_amount(), 0, "nothing moved before the deadline");
+    }
+
+    #[test]
+    fn trigger_succeeds_at_exact_deadline() {
+        // Boundary: `now == disputed_at + deadline` is due (the
+        // comparison is `now < due` for the rejection).
+        let (mut e, disputed_at) = disputed_with_judgment();
+        let (payout, fee, refund) = e
+            .trigger_default_judgment(BOB, disputed_at + DEADLINE, None, BOB)
+            .unwrap();
+        assert_eq!((payout, fee, refund), (TAKER_SHARE, 0, 400_000));
+        assert_eq!(e.state(), EscrowState::Settled);
+        assert_eq!(e.released_amount(), TAKER_SHARE);
+    }
+
+    #[test]
+    fn trigger_works_for_either_party() {
+        // The trigger is a liveness backstop, not a power grant: the
+        // initializer may call it too.
+        let (mut e, disputed_at) = disputed_with_judgment();
+        let (payout, fee, refund) = e
+            .trigger_default_judgment(ALICE, disputed_at + DEADLINE + 1, None, BOB)
+            .unwrap();
+        assert_eq!((payout, fee, refund), (TAKER_SHARE, 0, 400_000));
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn trigger_rejects_mint_mismatch() {
+        // The split moves the escrow's locked tokens — they must be the
+        // bound mint (same as resolve).
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap();
+        e.confirm_default_judgment(BOB).unwrap();
+        e.fund(ALICE).unwrap();
+        let disputed_at = EXPIRES_AT - 10_000;
+        e.escalate(ALICE, disputed_at, None).unwrap();
+        assert_eq!(
+            e.trigger_default_judgment(ALICE, disputed_at + DEADLINE, None, BOB),
+            Err(EscrowError::MintMismatch)
+        );
+        assert_eq!(
+            e.trigger_default_judgment(ALICE, disputed_at + DEADLINE, Some(MINT), BOB)
+                .map(|(p, f, r)| (p, f, r)),
+            Ok((TAKER_SHARE, 0, 400_000))
+        );
+    }
+
+    #[test]
+    fn trigger_rejects_payout_not_allowlisted() {
+        // The taker's share still satisfies the payout policy (same as
+        // resolve) — a phishing destination fails before funds move.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap()
+            .with_payout_allowlist(&[BOB])
+            .unwrap();
+        e.confirm_default_judgment(BOB).unwrap();
+        e.fund(ALICE).unwrap();
+        let disputed_at = EXPIRES_AT - 10_000;
+        e.escalate(ALICE, disputed_at, None).unwrap();
+        assert_eq!(
+            e.trigger_default_judgment(ALICE, disputed_at + DEADLINE, None, MALLORY),
+            Err(EscrowError::PayoutNotAllowlisted)
+        );
+        assert_eq!(e.state(), EscrowState::Disputed);
+    }
+
+    #[test]
+    fn trigger_slices_protocol_fee_and_conserves() {
+        // The fee slices the taker's share; `released` keeps the gross
+        // (same as resolve): payout + fee + refund == the lockup.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap()
+            .with_protocol_fee(1_000) // 10%
+            .unwrap();
+        e.confirm_default_judgment(BOB).unwrap();
+        e.fund(ALICE).unwrap();
+        let disputed_at = EXPIRES_AT - 10_000;
+        e.escalate(ALICE, disputed_at, None).unwrap();
+        // 1000 bps of 600_000 = 60_000; the refund is never fee'd.
+        let (payout, fee, refund) = e
+            .trigger_default_judgment(BOB, disputed_at + DEADLINE, None, BOB)
+            .unwrap();
+        assert_eq!((payout, fee, refund), (540_000, 60_000, 400_000));
+        assert_eq!(e.released_amount(), TAKER_SHARE, "released counts the gross");
+        assert_eq!(e.fees_paid(), 60_000);
+        assert_eq!(e.remaining_amount(), 400_000);
+        assert_eq!(
+            payout + fee + refund,
+            1_000_000,
+            "conservation: payout + fee + refund == the locked amount"
+        );
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn trigger_is_single_shot_first_writer_wins() {
+        // The settlement is one-shot: a second trigger finds `Settled`
+        // and fails the state gate.
+        let (mut e, disputed_at) = disputed_with_judgment();
+        e.trigger_default_judgment(ALICE, disputed_at + DEADLINE, None, BOB)
+            .unwrap();
+        assert_eq!(
+            e.trigger_default_judgment(BOB, disputed_at + DEADLINE + 1, None, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn arbiter_resolve_still_works_after_deadline_and_beats_trigger() {
+        // The arbiter's `resolve` is unchanged and keeps priority:
+        // after the deadline it is a race, and the arbiter can still
+        // win it.
+        let (mut e, disputed_at) = disputed_with_judgment();
+        let (payout, fee, refund) = e
+            .resolve(ARBITER, 300_000, None, None, BOB)
+            .unwrap();
+        assert_eq!((payout, fee, refund), (300_000, 0, 700_000));
+        assert_eq!(e.state(), EscrowState::Settled);
+        // The fallback trigger is now too late: first writer won.
+        assert_eq!(
+            e.trigger_default_judgment(BOB, disputed_at + DEADLINE, None, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn trigger_beats_silent_arbiter_then_resolve_fails() {
+        // When the arbiter stays silent, either party settles on the
+        // fallback split — and the arbiter's later ruling fails.
+        let (mut e, disputed_at) = disputed_with_judgment();
+        let (payout, fee, refund) = e
+            .trigger_default_judgment(BOB, disputed_at + DEADLINE + 100, None, BOB)
+            .unwrap();
+        assert_eq!((payout, fee, refund), (TAKER_SHARE, 0, 400_000));
+        assert_eq!(e.state(), EscrowState::Settled);
+        assert_eq!(
+            e.resolve(ARBITER, 300_000, None, None, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn trigger_blocked_while_paused() {
+        // A paused escrow fails fast — even after the deadline.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap();
+        e.confirm_default_judgment(BOB).unwrap();
+        e.fund(ALICE).unwrap();
+        let disputed_at = EXPIRES_AT - 10_000;
+        e.escalate(ALICE, disputed_at, None).unwrap();
+        e.pause([0xDD; 32]).unwrap();
+        assert_eq!(
+            e.trigger_default_judgment(ALICE, disputed_at + DEADLINE, None, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(e.state(), EscrowState::Disputed);
+    }
+
+    // ----- escalation records the deadline origin -----
+
+    #[test]
+    fn escalate_records_disputed_at() {
+        // `disputed_at` starts zeroed and is stamped by `escalate`.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.disputed_at(), 0, "never disputed yet");
+        let disputed_at = EXPIRES_AT - 10_000;
+        e.escalate(BOB, disputed_at, None).unwrap();
+        assert_eq!(e.disputed_at(), disputed_at);
+        assert_eq!(e.default_judgment(), None, "no judgment configured here");
+        assert!(!e.default_judgment_confirmed());
+    }
+
+    // ----- error code pin -----
+
+    #[test]
+    fn default_judgment_not_due_is_code_129() {
+        // The code is a public contract (the Anchor program maps one
+        // program error per variant): never renumber.
+        assert_eq!(EscrowError::DefaultJudgmentNotDue.code(), 129);
+        assert!(EscrowError::all().contains(&EscrowError::DefaultJudgmentNotDue));
+    }
+
+    // ----- layout pins -----
+
+    #[test]
+    fn borsh_tail_pins_default_judgment_fields() {
+        // Offsets: `reference` ends the old body at 960; `disputed_at`
+        // at 960, `default_judgment` at 968, `default_confirmed` at 985
+        // (body total 986).
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap();
+        e.confirm_default_judgment(BOB).unwrap();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes.len(), 986);
+        // Not yet disputed: zeroed timestamp.
+        assert_eq!(
+            u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
+            0,
+            "disputed_at: zeroed before escalation"
+        );
+        // Configured judgment: Some discriminant + the 16-byte terms.
+        assert_eq!(bytes[968], 1, "default_judgment: Some discriminant");
+        assert_eq!(
+            u64::from_le_bytes(bytes[969..977].try_into().unwrap()),
+            DEADLINE,
+            "default_judgment.deadline_secs"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[977..985].try_into().unwrap()),
+            TAKER_SHARE,
+            "default_judgment.default_taker_amount"
+        );
+        // Confirmed split: the bit is set.
+        assert_eq!(bytes[985], 1, "default_confirmed: set");
+    }
+
+    #[test]
+    fn borsh_tail_zeroed_without_judgment() {
+        // Backward compatible: the 26-byte tail is fully zeroed for an
+        // escrow that never opted into the default judgment.
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(&bytes[960..986], &[0u8; 26], "AV-55 tail zeroed");
+    }
+
+    // ----- event emission via IndexedEscrow -----
+
+    #[test]
+    fn indexed_escrow_emits_default_judgment_event() {
+        // Mirrors the `resolve` wrapper: the DefaultJudgment event
+        // carries the gross taker share / fee / initializer refund, the
+        // evidence hash the escrow still holds, and rationale None.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE5; 32], 1)
+            .unwrap();
+        e = e
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap();
+        let mut e = e.with_protocol_fee(1_000).unwrap();
+        e.fund(ALICE, 2).unwrap();
+        e = e.confirm_default_judgment(BOB).unwrap();
+        let disputed_at = EXPIRES_AT - 10_000;
+        let evidence = [0xE8; 32];
+        e.escalate(ALICE, disputed_at, Some(evidence)).unwrap();
+        let (payout, fee, refund) = e
+            .trigger_default_judgment(BOB, disputed_at + DEADLINE, None, BOB, disputed_at + DEADLINE)
+            .unwrap();
+        // 1000 bps of 600_000 = 60_000; the refund is never fee'd.
+        assert_eq!((payout, fee, refund), (540_000, 60_000, 400_000));
+        let ev = e.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::DefaultJudgment);
+        assert_eq!((ev.from, ev.to), (EscrowState::Disputed, EscrowState::Settled));
+        assert_eq!(ev.amounts.payout, TAKER_SHARE, "gross taker share");
+        assert_eq!(ev.amounts.fee, 60_000);
+        assert_eq!(ev.amounts.refund, 400_000);
+        assert_eq!(ev.amounts.penalty, 0);
+        assert_eq!(ev.evidence_hash, Some(evidence), "evidence survives the fallback");
+        assert_eq!(ev.rationale_hash, None, "no arbiter ruled");
+        // seq order: initialize(0), fund(1), escalate(2),
+        // trigger_default_judgment(3). The with_* builders and
+        // confirm_default_judgment emit nothing.
+        assert_eq!(e.events().len(), 4);
+        assert_eq!(ev.seq, 3);
+    }
+}

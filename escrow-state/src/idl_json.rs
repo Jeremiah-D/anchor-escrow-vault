@@ -161,6 +161,7 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "Option<MilestonePlan>" => IdlType::Option(Box::new(IdlType::Named("MilestonePlan"))),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         "Option<PayoutAllowlist>" => IdlType::Option(Box::new(IdlType::Named("PayoutAllowlist"))),
+        "Option<DefaultJudgment>" => IdlType::Option(Box::new(IdlType::Named("DefaultJudgment"))),
         other => panic!("idl_json: unmapped VAULT_FIELDS type string: {other}"),
     }
 }
@@ -213,6 +214,12 @@ fn named_type_fields(name: &str) -> &'static [(&'static str, IdlType)] {
         "PayoutAllowlist" => &[
             ("addrs", IdlType::Array(ArrayElem::PublicKey, 4)),
             ("len", IdlType::U8),
+        ],
+        // DefaultJudgment { deadline_secs: u64, default_taker_amount: u64 }
+        // (AV-55: 16 bytes).
+        "DefaultJudgment" => &[
+            ("deadline_secs", IdlType::U64),
+            ("default_taker_amount", IdlType::U64),
         ],
         other => panic!("idl_json: unknown named type: {other}"),
     }
@@ -419,10 +426,14 @@ fn render_idl_json() -> String {
     // ---- types ----
     w.line("\"types\": [");
     w.indent += 1;
-    for (ti, type_name) in ["QuorumPolicy", "VestingSchedule", "MilestonePlan", "PayoutAllowlist"]
-        .iter()
-        .enumerate()
-    {
+    let type_names = [
+        "QuorumPolicy",
+        "VestingSchedule",
+        "MilestonePlan",
+        "PayoutAllowlist",
+        "DefaultJudgment",
+    ];
+    for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
         w.indent += 1;
         w.buf.push_str(&"  ".repeat(w.indent));
@@ -456,7 +467,7 @@ fn render_idl_json() -> String {
         w.indent -= 1;
         w.buf.push_str(&"  ".repeat(w.indent));
         w.buf.push('}');
-        if ti + 1 < 3 {
+        if ti + 1 < type_names.len() {
             w.buf.push(',');
         }
         w.buf.push('\n');
@@ -572,6 +583,9 @@ fn named_type_sizes_pin_constants() {
     assert_eq!(size("VestingSchedule"), 24);
     assert_eq!(size("MilestonePlan"), MILESTONE_PLAN_LEN);
     assert_eq!(size("PayoutAllowlist"), PAYOUT_ALLOWLIST_LEN);
+    // AV-55: deadline + taker share.
+    assert_eq!(size("DefaultJudgment"), DEFAULT_JUDGMENT_LEN);
+    assert_eq!(size("DefaultJudgment"), 16);
 }
 
 #[test]
@@ -639,7 +653,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 29, "error variant count drift");
+    assert_eq!(errors.len(), 30, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -650,6 +664,7 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::InvalidPayoutAllowlist.code(), 126);
     assert_eq!(EscrowError::PayoutNotAllowlisted.code(), 127);
     assert_eq!(EscrowError::InvalidTaker.code(), 128);
+    assert_eq!(EscrowError::DefaultJudgmentNotDue.code(), 129);
 }
 
 #[test]
@@ -866,9 +881,11 @@ fn idl_field_offsets_pin_dispute_path() {
     let ev = body_field(&enc, &offsets, "evidence_hash");
     assert_eq!(&ev[1..33], &EVIDENCE);
     // AV-38: the rationale hash lands on the IDL-computed tail offset —
-    // the last field of the account — and earlier offsets are stable.
-    // AV-51 shifts the post-vesting offsets +8 (8-byte discriminator +
-    // 687-byte body prefix: the vesting schedule grew by cliff_at).
+    // no longer the last field of the account (AV-55 appends the
+    // dispute timestamp + default judgment + confirmation bit after
+    // it) — and earlier offsets are stable. AV-51 shifts the
+    // post-vesting offsets +8 (8-byte discriminator + 687-byte body
+    // prefix: the vesting schedule grew by cliff_at).
     let rh = body_field(&enc, &offsets, "rationale_hash");
     assert_eq!(rh[0], 1, "rationale discriminant");
     assert_eq!(&rh[1..33], &RATIONALE);
@@ -879,4 +896,39 @@ fn idl_field_offsets_pin_dispute_path() {
         .expect("rationale_hash in IDL offsets");
     assert_eq!((rh_offset, rh_len), (704, 33));
     assert_eq!(u64_at(body_field(&enc, &offsets, "released")), 300_000);
+    // AV-55: the new tail fields land on the IDL-computed offsets after
+    // `reference` (body offsets 960/968/985; +8 for the account-data
+    // offsets below). The dispute timestamp was recorded by `escalate`
+    // above; no default judgment is configured on this escrow.
+    let (_, da_offset, da_len) = offsets
+        .iter()
+        .find(|(n, _, _)| *n == "disputed_at")
+        .copied()
+        .expect("disputed_at in IDL offsets");
+    assert_eq!((da_offset, da_len), (968, 8));
+    assert_eq!(
+        u64_at(body_field(&enc, &offsets, "disputed_at")),
+        EXPIRES_AT - 100,
+        "escalate recorded the dispute timestamp"
+    );
+    let (_, dj_offset, dj_len) = offsets
+        .iter()
+        .find(|(n, _, _)| *n == "default_judgment")
+        .copied()
+        .expect("default_judgment in IDL offsets");
+    assert_eq!((dj_offset, dj_len), (976, 17));
+    let dj = body_field(&enc, &offsets, "default_judgment");
+    assert_eq!(dj[0], 0, "default_judgment: None discriminant");
+    assert_eq!(&dj[1..17], &[0u8; 16], "default_judgment: zeroed");
+    let (_, dc_offset, dc_len) = offsets
+        .iter()
+        .find(|(n, _, _)| *n == "default_confirmed")
+        .copied()
+        .expect("default_confirmed in IDL offsets");
+    assert_eq!((dc_offset, dc_len), (993, 1));
+    assert_eq!(
+        body_field(&enc, &offsets, "default_confirmed"),
+        &[0u8],
+        "default_confirmed: zeroed"
+    );
 }

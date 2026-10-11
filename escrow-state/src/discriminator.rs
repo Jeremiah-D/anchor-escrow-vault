@@ -36,9 +36,10 @@
 //! the result.
 
 use super::{
-    sha256, Escrow, EscrowState, MilestonePlan, PayoutAllowlist, QuorumPolicy, VestingSchedule,
-    ANCHOR_DISCRIMINATOR_LEN, ESCROW_BODY_LEN, MAX_ATTESTORS, MAX_MILESTONES, MAX_PAYOUT_ALLOWLIST,
-    MILESTONE_PLAN_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, VAULT_SPACE,
+    sha256, DefaultJudgment, Escrow, EscrowState, MilestonePlan, PayoutAllowlist, QuorumPolicy,
+    VestingSchedule, ANCHOR_DISCRIMINATOR_LEN, DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN,
+    MAX_ATTESTORS, MAX_MILESTONES, MAX_PAYOUT_ALLOWLIST, MILESTONE_PLAN_LEN, PAYOUT_ALLOWLIST_LEN,
+    PUBKEY_LEN, QUORUM_POLICY_LEN, VAULT_SPACE,
 };
 
 /// Program-side `#[account]` type names, in Anchor IDL order. The single
@@ -405,6 +406,33 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(32)?;
         None
     };
+    // AV-55: dispute timestamp, always present (zeroed when the escrow
+    // was never disputed); appended last so every earlier offset above
+    // is unchanged.
+    let disputed_at = c.u64_le()?;
+    // AV-55: pre-agreed arbitration default judgment, always reserved
+    // like `reference`: the `None` discriminant followed by a zeroed
+    // 16-byte judgment, appended last so every earlier offset above is
+    // unchanged.
+    let default_judgment = if c.option_present("default_judgment")? {
+        let deadline_secs = c.u64_le()?;
+        let default_taker_amount = c.u64_le()?;
+        debug_assert_eq!(
+            DEFAULT_JUDGMENT_LEN, 16,
+            "default-judgment region drift vs DEFAULT_JUDGMENT_LEN"
+        );
+        Some(DefaultJudgment {
+            deadline_secs,
+            default_taker_amount,
+        })
+    } else {
+        c.skip(DEFAULT_JUDGMENT_LEN)?;
+        None
+    };
+    // AV-55: taker's confirmation of the pre-agreed split, always
+    // present (zeroed when unconfirmed); appended last so every earlier
+    // offset above is unchanged.
+    let default_confirmed = c.u8()? != 0;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -443,6 +471,16 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-53: the off-chain reference memo is persisted — a decoded
         // escrow carries the same correlation id the initializer bound.
         reference,
+        // AV-55: the dispute timestamp is persisted — a decoded escrow
+        // carries the same deadline origin `escalate` recorded.
+        disputed_at,
+        // AV-55: the pre-agreed default judgment is persisted — a
+        // decoded escrow carries the same fallback terms the parties
+        // agreed at setup.
+        default_judgment,
+        // AV-55: the taker's confirmation bit is persisted — a decoded
+        // escrow carries the same agreement state.
+        default_confirmed,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

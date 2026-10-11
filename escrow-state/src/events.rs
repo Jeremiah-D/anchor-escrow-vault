@@ -111,6 +111,7 @@
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
 //! | ExpiredCranked (AV-48) | 0 | 0 | remainder minus penalty, to the whitelisted destination (the cranker receives nothing) | anti-griefing penalty to the initializer (AV-24; 0 unless the cranker is the taker) |
 //! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
+//! | DefaultJudgment (AV-55) | gross taker share (`default_taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
 //! | MilestoneSkipped | 0 | 0 | skipped tranche (the initializer's refund) | 0 |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //!
@@ -226,6 +227,18 @@ pub enum EscrowEventKind {
     /// no-op that emits nothing (paralleling
     /// [`EscrowEventKind::QuorumUpdated`]'s no-op rule).
     TakerRotated,
+    /// AV-55: a deadlocked dispute was settled on the pre-agreed
+    /// fallback split ([`Escrow::trigger_default_judgment`]). `from ==
+    /// Disputed`, `to == Settled` — the same lifecycle move as
+    /// [`EscrowEventKind::Resolved`], but executed by either party
+    /// after the arbitration deadline instead of by the arbiter.
+    /// Amounts follow the `Resolved` shape (`payout` = gross taker
+    /// share, `fee` = protocol fee on the taker's share, `refund` =
+    /// initializer's share of the split). The dispute evidence hash
+    /// the escrow still holds rides the event (survives on the escrow);
+    /// the rationale-document commitment is `None` — there is no
+    /// arbiter's ruling to reference.
+    DefaultJudgment,
 }
 
 /// Fund movements carried by an [`EscrowEvent`].
@@ -340,15 +353,18 @@ pub struct CpiRouteAudit {
 /// transition itself ran on.
 ///
 /// `evidence_hash` (AV-22) carries the dispute-evidence commitment on
-/// the two dispute events: `Escalated` carries the hash attached at
+/// the dispute events: `Escalated` carries the hash attached at
 /// escalation, `Resolved` carries the hash the escrow still holds (the
-/// arbiter's settlement references the evidence it reviewed). It is
-/// `None` on every other kind — the event log never invents evidence.
+/// arbiter's settlement references the evidence it reviewed), and
+/// `DefaultJudgment` (AV-55) carries the hash the escrow still holds —
+/// the fallback settlement references the same evidence. It is `None`
+/// on every other kind — the event log never invents evidence.
 ///
 /// `rationale_hash` (AV-38) carries the arbiter's rationale-document
 /// commitment on `Resolved`: the hash the arbiter attached at settlement,
 /// so the settlement references the ruling it wrote. It is `None` on
-/// every other kind — the event log never invents a rationale.
+/// every other kind — including `DefaultJudgment` (AV-55), where no
+/// arbiter ruled — the event log never invents a rationale.
 ///
 /// `cpi` (AV-35) carries the CPI-routing audit on a `Released` event
 /// whose payout flowed through a third-party program
@@ -595,6 +611,29 @@ impl IndexedEscrow {
     /// Configuration: emits no event.
     pub fn with_arbiter(mut self, arbiter: [u8; 32]) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_arbiter(arbiter)?;
+        Ok(self)
+    }
+
+    /// Opt in to the arbitration default judgment (mirrors
+    /// [`Escrow::with_arbitration_deadline`]): declare the fallback
+    /// split applied when a live dispute outlives its arbitration
+    /// deadline. Configuration: emits no event (pre-fund setup).
+    pub fn with_arbitration_deadline(
+        mut self,
+        deadline_secs: u64,
+        default_taker_amount: u64,
+    ) -> Result<Self, EscrowError> {
+        self.inner = self
+            .inner
+            .with_arbitration_deadline(deadline_secs, default_taker_amount)?;
+        Ok(self)
+    }
+
+    /// The taker countersigns the pre-agreed default judgment (mirrors
+    /// [`Escrow::confirm_default_judgment`]). Configuration: emits no
+    /// event (pre-dispute setup).
+    pub fn confirm_default_judgment(mut self, authority: [u8; 32]) -> Result<Self, EscrowError> {
+        self.inner.confirm_default_judgment(authority)?;
         Ok(self)
     }
 
@@ -1315,6 +1354,59 @@ impl IndexedEscrow {
             at,
             evidence_hash,
             rationale_hash,
+            None,
+            None,
+        );
+        Ok((payout, fee, refund))
+    }
+
+    /// Trigger the pre-agreed arbitration default judgment (mirrors
+    /// [`Escrow::trigger_default_judgment`]). Emits `DefaultJudgment`
+    /// (`Disputed -> Settled`) with the gross taker share in
+    /// `amounts.payout`, the protocol fee in `amounts.fee`, and the
+    /// initializer's share in `amounts.refund` — the same amounts shape
+    /// as `Resolved` — and the dispute evidence hash the escrow still
+    /// holds, so the fallback settlement references the evidence the
+    /// (absent) arbiter never reviewed. The rationale-document
+    /// commitment is `None`: there is no arbiter's ruling to reference.
+    /// Returns `(taker_payout, fee, initializer_refund)` like the inner
+    /// method.
+    pub fn trigger_default_judgment(
+        &mut self,
+        caller: [u8; 32],
+        now: u64,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+        at: u64,
+    ) -> Result<(u64, u64, u64), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self
+            .inner
+            .trigger_default_judgment(caller, now, mint, payout_to);
+        let (payout, fee, refund) = self.map_reentrant(result, at)?;
+        // `default_taker_amount` is the gross taker share by construction
+        // (`payout + fee == default_taker_amount`).
+        let amounts = EventAmounts {
+            payout: payout + fee,
+            fee,
+            refund,
+            penalty: 0,
+            rent_reclaimed: 0,
+        };
+        // AV-22: the evidence hash survives on the escrow, so the
+        // fallback settlement event carries the same commitment the
+        // `Escalated` event carried.
+        let evidence_hash = self.inner.evidence_hash();
+        self.push_event(
+            EscrowEventKind::DefaultJudgment,
+            from,
+            self.inner.state(),
+            amounts,
+            at,
+            evidence_hash,
+            None,
             None,
             None,
         );

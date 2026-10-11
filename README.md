@@ -67,6 +67,9 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_arbiter(arbiter)`               | `Uninitialized`| `Uninitialized` | initializer (once, before funding; zero key rejected) |
 | `escalate(authority, now, evidence_hash)`   | `Funded`       | `Disputed` | initializer **or** taker, only when `now < expires_at` (locks `release`/`cancel`/`cancel_expired`/`claim`); `evidence_hash` is the optional 32-byte off-chain-evidence commitment, persisted |
 | `resolve(authority, taker_amount, rationale_hash)` | `Disputed`     | `Settled` | arbiter only; atomic split of the remainder (taker payout / initializer refund); `rationale_hash` is the optional 32-byte commitment to the arbiter's off-chain rationale document, persisted in `Settled` (never cleared) |
+| `initialize_default_judgment(deadline_secs, default_taker_amount)` (AV-55) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — and only after `initialize_arbiter`; the arbiter must be configured first); declares the fallback split applied when the arbiter never resolves: `deadline_secs` seconds in `Disputed` before the judgment becomes triggerable (must be non-zero — `DefaultJudgmentNotDue` otherwise), `default_taker_amount` the taker's share of the remainder (must be ≤ the locked amount — `ReleaseExceedsLocked` otherwise); the initializer proposes the terms, the taker must still countersign (dual-signed agreement) |
+| `confirm_default_judgment()` (AV-55) | `Uninitialized` / `Funded` | — (no state change; sets the confirmation bit) | **taker only** (`Unauthorized` for a stranger or the initializer); no judgment configured is `DefaultJudgmentNotDue`; idempotent (re-confirming is `Ok`) |
+| `trigger_default_judgment(caller, now, payout_to)` (AV-55) | `Disputed` | `Settled` | **initializer or taker** (either party — a liveness backstop, not a power grant); only once `now >= disputed_at + deadline_secs` (the judgment's due time, `DefaultJudgmentNotDue` otherwise); settles on the pre-agreed split — fee slices the taker's share like `resolve`, quorum/vesting/timelock do *not* gate (same as `resolve`); the arbiter's `resolve` is unchanged and keeps priority — after the deadline either the arbiter resolves or a party triggers, first writer wins; emits `DefaultJudgment` |
 | `initialize_milestones(milestones)`          | `Uninitialized`| `Uninitialized` | initializer (once, before funding; tranche amounts must sum to the locked amount) |
 | `confirm_milestone(authority, index)`        | `Funded`       | — (no state change) | initializer **or** taker (in order; a milestone is confirmed once *both* parties confirmed) |
 | `release_milestone(authority, now, index)`        | `Funded`       | `Funded` (partial) / `Released` (final tranche) | initializer; milestone dual-confirmed (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise) |
@@ -330,6 +333,41 @@ and indexers can verify what the ruling referenced; `None` attaches no
 rationale (backward compatible). Like the evidence hash, it is never
 cleared, and the `Resolved` indexer event carries it.
 
+**Arbitration default judgment (AV-55).** An escalated escrow can stall
+when the arbiter goes silent or becomes unreachable — without a fallback
+the funds sit in `Disputed` forever, every unilateral exit locked and
+the arbiter not coming back. The default judgment is a liveness backstop
+the parties negotiate *while they still trust each other* (before
+funding): the initializer declares the fallback split
+(`with_arbitration_deadline(deadline_secs, default_taker_amount)` /
+`initialize_default_judgment`, `Uninitialized` only and only after
+`with_arbiter` — the judgment is a fallback *for* arbitration), and the
+taker countersigns it (`confirm_default_judgment`, taker only) — one
+party alone cannot dictate the fallback terms. The deadline must be
+non-zero (`DefaultJudgmentNotDue` otherwise — a zero deadline would fire
+before the arbiter had any chance to rule) and the taker share must not
+exceed the locked amount (`ReleaseExceedsLocked` otherwise).
+`escalate` records the dispute timestamp `disputed_at`, and once
+`now >= disputed_at + deadline_secs` *either* party may
+`trigger_default_judgment` to settle `Disputed -> Settled` on the
+pre-agreed split — the keeper/operator flow needs no arbiter signature,
+so a bot watching the clock can sweep a deadlocked arbitration. The
+arbiter's `resolve` is unchanged and keeps priority: after the deadline
+it is a race between the arbiter's ruling and the parties' trigger,
+first writer wins. The settlement mirrors `resolve` exactly — the
+protocol fee slices the taker's share (the `released` counter keeps the
+gross, the initializer's refund is never fee'd) — and quorum, vesting
+and timelock do *not* gate it (same as `resolve`, so a misconfigured
+lock can never trap disputed funds). Unconfigured, unconfirmed, or
+early triggers fail with the new `DefaultJudgmentNotDue` (code 129).
+The `DefaultJudgment` indexer event carries the `Resolved` amounts shape
+(gross taker share / fee / initializer refund) plus the dispute evidence
+hash the escrow still holds; the rationale commitment is `None` (no
+arbiter ruled). New vault fields (appended last): `disputed_at` (u64),
+`default_judgment` (17 bytes: 1-byte discriminant + 16-byte judgment),
+`default_confirmed` (bool) — 26 bytes, so the full vault is now 994
+bytes / 7,809,120 lamports rent-exempt.
+
 **Reference memo (off-chain correlation).** The initializer may bind an
 opt-in 32-byte **reference memo** (`with_reference` /
 `initialize_reference(reference)` on `Uninitialized`, e.g. an order id or
@@ -454,7 +492,12 @@ AV-51 adds the 8-byte vesting `cliff_at` timestamp to the vesting region
 bytes** and needs **7,398,480 lamports**. AV-53 appends the 33-byte
 off-chain reference memo region (1-byte discriminant + 32-byte
 correlation id), so the full vault is now **968 bytes** and needs
-**7,628,160 lamports**.)
+**7,628,160 lamports**. AV-55 appends the 8-byte dispute timestamp
+`disputed_at` (zeroed when the escrow was never disputed), the 17-byte
+default-judgment region (1-byte discriminant + 16-byte judgment,
+zeroed when no default judgment is configured), and the 1-byte taker
+confirmation bit (26 bytes), so the full vault is now **994 bytes** and
+needs **7,809,120 lamports**.)
 
 **Fee recipient pin (AV-44).** An escrow can additionally pin *where* the
 fee goes (`initialize_fee_recipient(fee_recipient)`, opt-in on
@@ -568,6 +611,7 @@ program error per variant):
 | `InvalidPayoutAllowlist` | 126 | `with_payout_allowlist` / `update_payout_allowlist` with an empty list, more than 4 addresses, or a zero address (the AV-49 allowlist must be 1-4 live payout destinations) |
 | `PayoutNotAllowlisted` | 127 | a payout transition (`release` / `claim` / `resolve` / `release_milestone` / `release_via_cpi`) naming a `payout_to` that is neither the taker nor a member of the payout allowlist |
 | `InvalidTaker` | 128 | `rotate_taker` with the zero address (a zero address can never be the legitimate payout counterparty) |
+| `DefaultJudgmentNotDue` | 129 | `trigger_default_judgment` with no default judgment configured, the taker never confirmed the split, or the arbitration deadline not yet passed; `with_arbitration_deadline` with a zero deadline |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1102,7 +1146,10 @@ two-way consistency check against the IDL parameter table:
 | paused        | bool              | 1     |
 | payout_allowlist | Option<PayoutAllowlist> | 130 |
 | reference | Option<[u8; 32]> | 33 |
-| **total**     |                   | **968** |
+| disputed_at | u64 | 8 |
+| default_judgment | Option<DefaultJudgment> | 17 |
+| default_confirmed | bool | 1 |
+| **total**     |                   | **994** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1142,11 +1189,16 @@ governance opt-in `emergency_unlock` (AV-41, zeroed when the feature is
 off) — and the 33-byte protocol-fee recipient region (AV-44: 1-byte
 discriminant + 32-byte address, zeroed when no recipient is bound) — and
 the 33-byte off-chain reference memo region (AV-53: 1-byte discriminant
-+ 32-byte correlation id, zeroed when no memo is attached).
-`escrow-state` exposes `VAULT_SPACE` (968) and
-`VAULT_SPACE_NO_QUORUM` (478) for the Anchor `space =` constraint, plus a
++ 32-byte correlation id, zeroed when no memo is attached) — and the
+8-byte dispute timestamp `disputed_at` (AV-55, zeroed when the escrow
+was never disputed) — and the 17-byte default-judgment region (AV-55:
+1-byte discriminant + 16-byte judgment, zeroed when no default
+judgment is configured) — and the 1-byte taker confirmation bit
+(AV-55, zeroed when the split is unconfirmed).
+`escrow-state` exposes `VAULT_SPACE` (994) and
+`VAULT_SPACE_NO_QUORUM` (504) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **7,628,160 lamports** to be
+mainnet rent parameters the full vault needs **7,809,120 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1167,13 +1219,14 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 968 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
+  stays 994 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
   weighted-quorum, AV-46 pause-switch, AV-49 payout-allowlist, AV-51
-  vesting-cliff, and AV-53 reference-memo growth is accounted in the
+  vesting-cliff, AV-53 reference-memo, and AV-55 default-judgment
+  growth is accounted in the
   layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**7,628,160
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**7,809,120
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the
@@ -1191,7 +1244,7 @@ the whole instruction aborts with zero side effects (state, counters
 and the event log all roll back). The initializer signs once instead
 of twice, and the rent-exempt deposit returns together with the
 payout. The indexer sees the fixed `Released` → `VaultClosed` event
-pair; the vault layout is untouched (`VAULT_SPACE` stays 968).
+pair; the vault layout is untouched (`VAULT_SPACE` stays 994).
 
 ## IDL pipeline (AV-29)
 

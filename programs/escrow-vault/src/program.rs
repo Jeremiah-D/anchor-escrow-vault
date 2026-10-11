@@ -863,6 +863,102 @@ pub mod escrow_vault {
         Ok((payout, fee, refund))
     }
 
+    /// Opt in to the arbitration default judgment (AV-55; mirrors
+    /// `Escrow::with_arbitration_deadline`): declare the fallback split
+    /// applied when a live dispute outlives its arbitration deadline
+    /// and the arbiter never resolves. `Uninitialized` only, like
+    /// `initialize_arbiter`: the fallback terms are fixed before funds
+    /// move. The arbiter must already be configured (`with_arbiter`
+    /// first — `InvalidArbiter` otherwise); the deadline must be
+    /// non-zero (`DefaultJudgmentNotDue` otherwise); the taker share
+    /// must not exceed the locked amount (`ReleaseExceedsLocked`
+    /// otherwise). The initializer proposes the terms here; the taker
+    /// must still countersign via `confirm_default_judgment` before the
+    /// judgment can ever be triggered.
+    pub fn initialize_default_judgment(
+        ctx: Context<InitializeDefaultJudgment>,
+        deadline_secs: u64,
+        default_taker_amount: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_arbitration_deadline(deadline_secs, default_taker_amount)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the full default-judgment
+        // region (17 bytes, zeroed when `None`), so the judgment is
+        // written in place — no realloc needed in the real build.
+        Ok(())
+    }
+
+    /// The taker countersigns the pre-agreed default judgment (AV-55;
+    /// mirrors `Escrow::confirm_default_judgment`), completing the
+    /// dual-signed agreement. Only the taker signs — a stranger or the
+    /// initializer is `Unauthorized`. `Uninitialized` / `Funded` only;
+    /// no judgment configured is `DefaultJudgmentNotDue`; confirming an
+    /// already-confirmed judgment is an idempotent no-op.
+    pub fn confirm_default_judgment(ctx: Context<ConfirmDefaultJudgment>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .confirm_default_judgment(ctx.accounts.taker.key().to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
+    /// Trigger the pre-agreed arbitration default judgment (AV-55;
+    /// mirrors `Escrow::trigger_default_judgment`): `Disputed ->
+    /// Settled`. Either party signs once the dispute has outlived the
+    /// arbitration deadline (`now >= disputed_at + deadline_secs`,
+    /// `now` from the Solana clock sysvar — never an instruction param);
+    /// the escrow settles on the fallback split instead of staying
+    /// locked forever. The arbiter's `resolve` is unchanged and keeps
+    /// priority — after the deadline either the arbiter resolves or a
+    /// party triggers; first writer wins. Returns `(taker_payout, fee,
+    /// initializer_refund)` so the real build can size all three
+    /// transfers: the protocol fee (AV-17) slices the taker's share,
+    /// the refund is never fee'd. The quorum gate does not apply, the
+    /// vesting schedule is overridden, and the timelock does not gate —
+    /// exactly like `resolve`. `MintMismatch` and
+    /// `PayoutNotAllowlisted` guard the fund movement like `resolve`.
+    pub fn trigger_default_judgment(
+        ctx: Context<TriggerDefaultJudgment>,
+    ) -> Result<(u64, u64, u64)> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        let (payout, fee, refund) = escrow
+            .trigger_default_judgment(
+                ctx.accounts.caller.key().to_bytes(),
+                now,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+                ctx.accounts.payout_to.key().to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: the taker's share is the gross (`payout + fee`); the
+        // refund is never fee'd. AV-22: the DefaultJudgment event
+        // carries the dispute evidence hash the escrow still holds —
+        // the fallback settlement references the evidence the (absent)
+        // arbiter never reviewed; rationale is None (no arbiter ruled).
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::DefaultJudgment,
+            from,
+            escrow.state() as u8,
+            payout + fee,
+            fee,
+            refund,
+            now,
+            escrow.evidence_hash(),
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok((payout, fee, refund))
+    }
+
     /// Attach a milestone tranche plan (AV-15; mirrors
     /// `MilestonePlan::new` + `Escrow::with_milestones`). `Uninitialized`
     /// only, like `initialize_quorum`: the tranche schedule is fixed
@@ -1838,6 +1934,30 @@ pub struct Vault {
     /// `EscrowVaultEvent::reference` indexer field, the keeper report
     /// and the snapshot export for off-chain reconciliation.
     pub reference: Option<[u8; 32]>,
+    /// AV-55: Unix timestamp at which the escrow entered `Disputed`,
+    /// recorded by `escalate`; mirrors `escrow_state`'s `disputed_at`.
+    /// The pre-agreed default judgment's deadline is measured from this
+    /// timestamp (`trigger_default_judgment` fires once `now >=
+    /// disputed_at + deadline_secs`). Always present (8 bytes, zeroed
+    /// when the escrow was never disputed). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after `reference`).
+    pub disputed_at: u64,
+    /// AV-55: the dual-signed pre-agreed arbitration default judgment;
+    /// mirrors `escrow_state`'s `default_judgment`. `None` for an escrow
+    /// with no configured judgment. The account always reserves the
+    /// full 17-byte region (1-byte discriminant + 16-byte judgment,
+    /// zeroed when `None`) so `initialize_default_judgment` writes it
+    /// in place without reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `disputed_at`).
+    pub default_judgment: Option<DefaultJudgment>,
+    /// AV-55: whether the taker confirmed the pre-agreed split via
+    /// `confirm_default_judgment`; mirrors `escrow_state`'s
+    /// `default_confirmed`. Always present (1 byte, zeroed when
+    /// unconfirmed). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `default_judgment`).
+    pub default_confirmed: bool,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -1901,6 +2021,25 @@ pub struct MilestonePlan {
 pub struct PayoutAllowlist {
     pub addrs: [Pubkey; 4],
     pub len: u8,
+}
+
+/// AV-55: skeleton mirror of `escrow_state::DefaultJudgment`: the
+/// pre-agreed arbitration default judgment — the deadline (seconds in
+/// `Disputed` after which the judgment becomes triggerable, measured
+/// from `Vault::disputed_at`) and the taker's share of the remaining
+/// locked funds under the fallback split (the initializer is refunded
+/// the rest). See the state machine docs for the dual-signed
+/// agreement / trigger semantics. Serialized size is pinned by
+/// `escrow_state::DEFAULT_JUDGMENT_LEN` (16 bytes: two u64s).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct DefaultJudgment {
+    /// Seconds in `Disputed` after which the default judgment becomes
+    /// triggerable; mirrors `escrow_state::DefaultJudgment::deadline_secs`.
+    pub deadline_secs: u64,
+    /// The taker's share of the remaining locked funds under the
+    /// default judgment; mirrors
+    /// `escrow_state::DefaultJudgment::default_taker_amount`.
+    pub default_taker_amount: u64,
 }
 
 /// AV-18: on-chain indexer event, the `emit!` mirror of
@@ -2022,6 +2161,15 @@ pub enum EscrowVaultEventKind {
     /// rent-exempt deposit reclaimed (`Cancelled | Released | Settled ->
     /// Closed`).
     VaultClosed,
+    /// AV-55: a deadlocked dispute was settled on the pre-agreed
+    /// fallback split (`Escrow::trigger_default_judgment`).
+    /// `from == Disputed`, `to == Settled` — the same lifecycle move as
+    /// `Resolved`, but executed by either party after the arbitration
+    /// deadline instead of by the arbiter. Amounts follow the `Resolved`
+    /// shape; the dispute evidence hash the escrow still holds rides the
+    /// event; the rationale-document commitment is `None` (no arbiter
+    /// ruled). Mirrors `escrow_state::EscrowEventKind::DefaultJudgment`.
+    DefaultJudgment,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -2063,12 +2211,15 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
             EscrowVaultEventKind::PauseAuthorityRotated
         }
         escrow_state::EscrowEventKind::VaultClosed => EscrowVaultEventKind::VaultClosed,
+        escrow_state::EscrowEventKind::DefaultJudgment => {
+            EscrowVaultEventKind::DefaultJudgment
+        }
     }
 }
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    // Full vault space: 8-byte discriminator + 755-byte payload = 763
+    // Full vault space: 8-byte discriminator + 986-byte payload = 994
     // bytes (see `escrow_state::VAULT_SPACE`; AV-12 added the 1-byte
     // activation bitmask, AV-13 the 17-byte vesting region, AV-14 the
     // 33-byte arbiter region, AV-15 the 66-byte milestone plan + the
@@ -2080,11 +2231,14 @@ pub struct Initialize<'info> {
     // AV-28 the 1-byte decimals metadata, AV-38 the 33-byte rationale
     // hash region, AV-41 the 1-byte emergency-unlock flag, AV-44 the
     // 33-byte fee-recipient region, AV-45 the 64-byte quorum weight
-    // array + the 7-byte wider weight-sum threshold).
+    // array + the 7-byte wider weight-sum threshold, AV-49 the 130-byte
+    // payout-allowlist region, AV-53 the 33-byte reference-memo region,
+    // AV-55 the 8-byte dispute timestamp + the 17-byte default-judgment
+    // region + the 1-byte confirmation bit).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 6_201_360 lamports.
+    // rent parameters the minimum is 7_809_120 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
@@ -2303,6 +2457,57 @@ pub struct Claim<'info> {
     pub payout_to: AccountInfo<'info>,
     /// CHECK: Solana clock sysvar, read for the vesting curve (never an
     /// instruction param).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build reads its `mint` for the state machine's `MintMismatch`
+    /// check; unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeDefaultJudgment<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer proposes the fallback terms; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`, and the taker must still countersign via
+    /// `confirm_default_judgment` before the judgment can be triggered.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ConfirmDefaultJudgment<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the taker completes the dual-signed agreement; the state
+    /// machine rejects anyone else with `Unauthorized`. A constraint in
+    /// the real build additionally asserts `taker.key() ==
+    /// vault.taker`.
+    pub taker: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct TriggerDefaultJudgment<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker — the trigger is a liveness
+    /// backstop, not a power grant. The state machine enforces the
+    /// either-party rule; a constraint in the real build additionally
+    /// asserts `caller.key() == vault.initializer || caller.key() ==
+    /// vault.taker`.
+    pub caller: Signer<'info>,
+    /// CHECK: beneficiary of the taker's share of the fallback split.
+    pub taker: AccountInfo<'info>,
+    /// CHECK: explicit payout destination for the taker's share (AV-49;
+    /// see `Release`). The state machine enforces the payout policy on
+    /// it.
+    pub payout_to: AccountInfo<'info>,
+    /// CHECK: beneficiary of the initializer's refund share of the
+    /// fallback split.
+    pub initializer: AccountInfo<'info>,
+    /// CHECK: Solana clock sysvar, read for the arbitration-deadline
+    /// check (never an instruction param — a caller-supplied timestamp
+    /// could fast-forward the deadline).
     pub clock: AccountInfo<'info>,
     /// CHECK: the vault's SPL token account (see `Release`). The real
     /// build reads its `mint` for the state machine's `MintMismatch`
@@ -2924,6 +3129,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidPauseAuthority => error!(ErrorCode::InvalidPauseAuthority),
         escrow_state::EscrowError::InvalidPayoutAllowlist => error!(ErrorCode::InvalidPayoutAllowlist),
         escrow_state::EscrowError::PayoutNotAllowlisted => error!(ErrorCode::PayoutNotAllowlisted),
+        escrow_state::EscrowError::DefaultJudgmentNotDue => {
+            error!(ErrorCode::DefaultJudgmentNotDue)
+        }
     }
 }
 
@@ -2985,4 +3193,6 @@ pub enum ErrorCode {
     InvalidPayoutAllowlist,
     #[msg("Payout destination not allowlisted: a payout transition named a payout_to that is neither the taker nor a member of the AV-49 payout destination allowlist")]
     PayoutNotAllowlisted,
+    #[msg("Default judgment not due (AV-55): trigger_default_judgment with no default judgment configured, the taker never confirmed the split, or the arbitration deadline not yet passed; with_arbitration_deadline with a zero deadline")]
+    DefaultJudgmentNotDue,
 }
