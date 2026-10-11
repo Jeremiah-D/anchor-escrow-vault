@@ -516,6 +516,34 @@ pub struct Escrow {
     /// (zeroed when unconfirmed). Appended last so every earlier field
     /// offset stays stable.
     default_confirmed: bool,
+    /// AV-56: periodic (subscription) release schedule (see
+    /// [`Escrow::with_subscription`]). `None` means no subscription
+    /// (backward compatible): [`Escrow::release_period`] fails with
+    /// [`EscrowError::InvalidSubscription`], and plain
+    /// [`Escrow::release`] keeps its existing semantics. Set once via
+    /// [`Escrow::with_subscription`] on an `Uninitialized` escrow, like
+    /// the other `with_*` builders. Persisted (18 bytes in the vault
+    /// account: 1-byte discriminant + 17-byte
+    /// [`SubscriptionSchedule`]) so the schedule survives
+    /// serialization. Appended last so every earlier field offset stays
+    /// stable.
+    subscription: Option<SubscriptionSchedule>,
+    /// AV-56: index of the next subscription period to release.
+    /// Periods release strictly in order — [`Escrow::release_period`]
+    /// only accepts `period_index == subscription_next`
+    /// ([`EscrowError::PeriodNotDue`] otherwise) — so this counter
+    /// doubles as the replay guard. Always present (zeroed when no
+    /// schedule is attached). Appended last so every earlier field
+    /// offset stays stable.
+    subscription_next: u8,
+    /// AV-56: per-period released bitmap — bit `i` is set once period
+    /// `i` releases. At most [`MAX_SUBSCRIPTION_PERIODS`] periods fit
+    /// a `u64`, so the bitmap can never overflow its domain. The
+    /// bitmap is the audit trail of which periods paid out; the
+    /// in-order `subscription_next` counter is what gates execution.
+    /// Always present (zeroed when no schedule is attached). Appended
+    /// last so every earlier field offset stays stable.
+    subscription_released: u64,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -756,6 +784,27 @@ pub enum EscrowError {
     /// [`Escrow::trigger_default_judgment`] when the arbitration
     /// deadline has not passed yet.
     DefaultJudgmentNotDue,
+    /// Subscription schedule misconfiguration or misuse (AV-56):
+    /// [`Escrow::with_subscription`] with a zero `period_secs`, zero or
+    /// over-long `periods`, a zero `per_period`, a schedule whose
+    /// per-period amounts do not sum to the locked amount, a
+    /// `u64::MAX` expiry (back-scheduling needs a bounded lifetime), a
+    /// schedule that does not fit inside the escrow's lifetime, or on a
+    /// non-`Uninitialized` escrow; `with_milestones` after a
+    /// subscription (mutually exclusive release schedules); any
+    /// subscription operation on an escrow with no schedule attached;
+    /// or plain [`Escrow::release`] on an escrow with a subscription
+    /// (the schedule owns the release path). Parallels
+    /// [`EscrowError::InvalidMilestones`] (config error, plus the
+    /// no-config call path).
+    InvalidSubscription,
+    /// Subscription period not due (AV-56): [`Escrow::release_period`]
+    /// with a `period_index` that is not the next due period (skipping
+    /// ahead or replaying a released period), or with `now` before
+    /// that period's back-scheduled due timestamp. Periods release
+    /// strictly in order, one at a time, each only once due —
+    /// [`EscrowError::PeriodNotDue`] covers both sequencing and timing.
+    PeriodNotDue,
 }
 
 impl EscrowError {
@@ -798,6 +847,8 @@ impl EscrowError {
             EscrowError::PayoutNotAllowlisted => 127,
             EscrowError::InvalidTaker => 128,
             EscrowError::DefaultJudgmentNotDue => 129,
+            EscrowError::InvalidSubscription => 130,
+            EscrowError::PeriodNotDue => 131,
         }
     }
 
@@ -834,6 +885,8 @@ impl EscrowError {
             EscrowError::PayoutNotAllowlisted,
             EscrowError::InvalidTaker,
             EscrowError::DefaultJudgmentNotDue,
+            EscrowError::InvalidSubscription,
+            EscrowError::PeriodNotDue,
         ]
     }
 }
@@ -930,6 +983,76 @@ pub struct DefaultJudgment {
     /// be `<= amount` at setup; [`Escrow::trigger_default_judgment`]
     /// re-checks against the then-current remainder.
     pub default_taker_amount: u64,
+}
+
+/// Maximum number of subscription periods (AV-56). Fixed so the
+/// per-period released bitmap (`Escrow::subscription_released`) fits a
+/// `u64` — one bit per period, `1 << period_index` — and so the crate
+/// stays heap-free and `Copy`.
+pub const MAX_SUBSCRIPTION_PERIODS: u8 = 64;
+
+/// Serialized length of [`SubscriptionSchedule`]: two u64s (the period
+/// length and the per-period amount) plus the one-byte period count.
+pub const SUBSCRIPTION_SCHEDULE_LEN: usize = 8 + 1 + 8;
+
+/// A periodic (subscription-style) release schedule (AV-56): the
+/// locked amount is paid to the taker in `periods` equal tranches of
+/// `per_period`, one per `period_secs` seconds. A per-period
+/// alternative to the milestone tranche plan (AV-15) — milestones are
+/// driven by deliverable confirmation, subscriptions by the clock —
+/// so the two are mutually exclusive: an escrow carries at most one
+/// release schedule (see [`Escrow::with_subscription`]).
+///
+/// Semantics: periods are BACK-SCHEDULED from `expires_at` — period
+/// `i` (0-based) is due at `expires_at - (periods - 1 - i) *
+/// period_secs` (see [`Escrow::subscription_period_due_at`]).
+///
+/// Why back-scheduled: the subscription must complete within the
+/// escrow's lifetime. A forward-scheduled plan (first period due at
+/// setup + `period_secs`) could push its final periods past
+/// `expires_at`, trapping funds behind a payout path that can never
+/// legally run — after expiry the unilateral `cancel_expired` path is
+/// the way out, but funds already due to the taker should not be
+/// silently swept into a refund. Back-scheduling pins the *last*
+/// period to `expires_at` and lays the earlier periods behind it, so
+/// everything unreleased by expiry is exactly the refundable
+/// remainder: what is due goes to the taker via
+/// [`Escrow::release_period`], what never became due stays
+/// refundable via [`Escrow::cancel_expired`]. A late-funded escrow
+/// simply finds its early periods immediately due (graceful
+/// catch-up): the due check is `now >= due_at(i)`, so no period is
+/// ever owed twice or skipped, only released early in order.
+///
+/// Persisted (18 bytes in the vault account: 1-byte `Option`
+/// discriminant + 17 bytes) so the schedule survives serialization;
+/// appended last so every earlier field offset stays stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionSchedule {
+    /// Seconds between period due dates (the schedule's cadence).
+    /// Non-zero, enforced by [`Escrow::with_subscription`].
+    pub period_secs: u64,
+    /// How many periods the lockup is split into (`1..=64`).
+    pub periods: u8,
+    /// The taker's payout per period. `periods * per_period` must equal
+    /// the locked amount (checked in `u128`, so it can never wrap).
+    pub per_period: u64,
+}
+
+impl SubscriptionSchedule {
+    /// The Unix timestamp at which period `index` becomes due:
+    /// back-scheduled from `expires_at`, so period `periods - 1` (the
+    /// last) is always due exactly at expiry.
+    ///
+    /// Callers guarantee `index < periods`, `expires_at != u64::MAX`
+    /// and that the schedule fits inside the lifetime (all enforced by
+    /// [`Escrow::with_subscription`]); the saturating arithmetic here
+    /// is a backstop, never the validator.
+    pub fn due_at(&self, index: u8, expires_at: u64) -> u64 {
+        let remaining = self.periods.saturating_sub(1).saturating_sub(index);
+        expires_at.saturating_sub(
+            (remaining as u128 * self.period_secs as u128).min(u64::MAX as u128) as u64,
+        )
+    }
 }
 
 /// Maximum number of attestors in a [`QuorumPolicy`]. Fixed-size so the
@@ -1456,6 +1579,14 @@ impl Escrow {
             disputed_at: 0,
             default_judgment: None,
             default_confirmed: false,
+            // AV-56: no subscription schedule by default (backward
+            // compatible): `release_period` fails with
+            // `InvalidSubscription`, and plain `release` keeps its
+            // existing semantics. Opt in via `with_subscription`
+            // before funding.
+            subscription: None,
+            subscription_next: 0,
+            subscription_released: 0,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -1684,6 +1815,14 @@ impl Escrow {
         // once a plan is attached.
         if self.milestones.is_some() {
             return Err(EscrowError::InvalidMilestones);
+        }
+        // AV-56: a subscription schedule owns the release path, exactly
+        // like a milestone plan (AV-15): arbitrary amounts would break
+        // the per-period accounting, so plain `release` is a config
+        // error once a schedule is attached — periods pay out through
+        // `release_period`.
+        if self.subscription.is_some() {
+            return Err(EscrowError::InvalidSubscription);
         }
         if let Some(policy) = &self.quorum {
             if !policy.is_satisfied() {
@@ -3826,6 +3965,13 @@ impl Escrow {
         if plan.total() != self.amount as u128 {
             return Err(EscrowError::InvalidMilestones);
         }
+        // AV-56: a subscription schedule owns the release schedule just
+        // like a milestone plan does — the two release schedules are
+        // mutually exclusive (see `with_subscription`), in either
+        // builder order.
+        if self.subscription.is_some() {
+            return Err(EscrowError::InvalidMilestones);
+        }
         self.milestones = Some(plan);
         Ok(self)
     }
@@ -4158,6 +4304,234 @@ impl Escrow {
     pub fn next_milestone(&self) -> Option<usize> {
         self.next_milestone_index()
     }
+
+    // ----- AV-56: periodic (subscription) release schedule -----
+
+    /// Attach a periodic release schedule (AV-56): the locked amount is
+    /// paid to the taker in `periods` equal tranches of `per_period`,
+    /// one per `period_secs` seconds, released via
+    /// [`Escrow::release_period`]. The subscription counterpart to
+    /// [`Escrow::with_milestones`] — milestones are driven by
+    /// deliverable confirmation, subscriptions by the clock — so the
+    /// two release schedules are mutually exclusive
+    /// ([`EscrowError::InvalidSubscription`] when a milestone plan is
+    /// already attached; [`EscrowError::InvalidMilestones`] in
+    /// [`Escrow::with_milestones`] when a schedule is already
+    /// attached). Builder-style: only valid on an `Uninitialized`
+    /// escrow, so the release schedule is fixed before any funds move.
+    ///
+    /// Validation: `period_secs == 0` is rejected (a period-less
+    /// schedule would make every period due at once);
+    /// `periods == 0 || periods > `[`MAX_SUBSCRIPTION_PERIODS`]
+    /// (the per-period released bitmap fits a `u64`);
+    /// `per_period == 0`; `periods * per_period != amount` (the
+    /// schedule is the *complete* release schedule — summed in `u128`
+    /// so it can never wrap); `expires_at == u64::MAX` (the periods
+    /// are back-scheduled from expiry, which needs a bounded
+    /// lifetime); and a schedule whose first period would predate
+    /// timestamp 0 — `(periods - 1) * period_secs > expires_at`
+    /// (the whole plan must fit inside the escrow's lifetime, see
+    /// [`SubscriptionSchedule`] for why).
+    ///
+    /// Note: `claim` (vesting taker-pull) is deliberately *not*
+    /// blocked by a subscription schedule. Vesting and subscription
+    /// compose on the shared `released` counter — both are taker
+    /// payouts owned by different initiators (the vesting claim is the
+    /// taker's pull, `release_period` is the initializer's push) — and
+    /// the `checked_add` backstop in `release_period`
+    /// (`ReleaseExceedsLocked`) keeps the counter from ever outrunning
+    /// the lockup even when a vesting claim drew first.
+    pub fn with_subscription(
+        mut self,
+        period_secs: u64,
+        periods: u8,
+        per_period: u64,
+    ) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if self.milestones.is_some() {
+            return Err(EscrowError::InvalidSubscription);
+        }
+        if period_secs == 0 {
+            return Err(EscrowError::InvalidSubscription);
+        }
+        if periods == 0 || periods > MAX_SUBSCRIPTION_PERIODS {
+            return Err(EscrowError::InvalidSubscription);
+        }
+        if per_period == 0 {
+            return Err(EscrowError::InvalidSubscription);
+        }
+        if periods as u128 * per_period as u128 != self.amount as u128 {
+            return Err(EscrowError::InvalidSubscription);
+        }
+        // Back-scheduling pins the last period to `expires_at`: the
+        // no-timeout convention has no expiry to pin to.
+        if self.expires_at == u64::MAX {
+            return Err(EscrowError::InvalidSubscription);
+        }
+        // The whole schedule must fit inside the escrow's lifetime —
+        // the first period's due date must not underflow timestamp 0.
+        // u128, so it can never wrap.
+        if (periods as u128 - 1) * period_secs as u128 > self.expires_at as u128 {
+            return Err(EscrowError::InvalidSubscription);
+        }
+        self.subscription = Some(SubscriptionSchedule {
+            period_secs,
+            periods,
+            per_period,
+        });
+        // `subscription_next` starts 0 and `subscription_released`
+        // starts 0 (the zeroed defaults) — period 0 is the first to
+        // become due.
+        Ok(self)
+    }
+
+    /// The attached subscription schedule (AV-56), or `None` when no
+    /// schedule was attached via [`Escrow::with_subscription`]
+    /// (backward compatible).
+    pub fn subscription_schedule(&self) -> Option<SubscriptionSchedule> {
+        self.subscription
+    }
+
+    /// Index of the next subscription period to release (AV-56): the
+    /// only period [`Escrow::release_period`] accepts.
+    pub fn subscription_next_period(&self) -> u8 {
+        self.subscription_next
+    }
+
+    /// The Unix timestamp at which subscription period `index`
+    /// becomes due (AV-56) — back-scheduled from `expires_at`
+    /// ([`SubscriptionSchedule::due_at`]). `None` when no schedule is
+    /// attached or `index` is out of range. Public for the keeper: it
+    /// decides when a period becomes executable.
+    pub fn subscription_period_due_at(&self, index: u8) -> Option<u64> {
+        let schedule = self.subscription?;
+        if index >= schedule.periods {
+            return None;
+        }
+        Some(schedule.due_at(index, self.expires_at))
+    }
+
+    /// The per-period released bitmap (AV-56): bit `i` is set once
+    /// period `i` released. The audit trail of which periods paid out;
+    /// the in-order [`Escrow::subscription_next_period`] counter is
+    /// what gates execution.
+    pub fn subscription_released_periods(&self) -> u64 {
+        self.subscription_released
+    }
+
+    /// Release the next due subscription period to the taker (AV-56).
+    /// Returns `(taker_payout, fee)` — the taker's net payout and the
+    /// protocol fee (AV-17) — so the caller (and the Anchor layer) can
+    /// size both transfers; `taker_payout + fee == per_period` always.
+    ///
+    /// Only the initializer may drive the release (`Unauthorized`
+    /// otherwise): like [`Escrow::release`], period release is the
+    /// initializer's push path. Requires `Funded` state, an attached
+    /// schedule, `period_index == subscription_next` (strictly
+    /// in-order: skipping ahead or replaying a released period is
+    /// [`EscrowError::PeriodNotDue`]), and `now >= due_at(period_index)`
+    /// ([`EscrowError::PeriodNotDue`] for an early call — exact due
+    /// boundary is accepted). A configured quorum gates this exactly
+    /// like `release` / `claim` (`QuorumNotReached` — the quorum
+    /// guards every release path), and the AV-27 timelock gates it
+    /// too (`TimelockNotReached` — every taker payout path). The
+    /// period's tokens must be the escrow's bound mint (`MintMismatch`)
+    /// and the destination must satisfy the payout policy
+    /// (`PayoutNotAllowlisted`).
+    ///
+    /// The tranche accumulates in the shared `released` counter, so the
+    /// conservation invariant and the audit trail stay unified with
+    /// `release` / `claim` / `release_milestone`: the `checked_add`
+    /// backstop ([`EscrowError::ReleaseExceedsLocked`]) keeps the
+    /// counter from outrunning the lockup even if a vesting `claim`
+    /// drew first (vesting is deliberately *not* blocked — taker-pull
+    /// composes on the shared counter; see `with_subscription`).
+    /// Each period releases at most once (the in-order counter plus the
+    /// released bitmap) and the tranches sum to the locked amount, so
+    /// when the last period releases the escrow moves
+    /// `Funded -> Released`.
+    ///
+    /// Check order is deliberate: pause, reentrancy, authority, state,
+    /// schedule configuration, then sequence (index), then timing —
+    /// before the mint binding, payout policy, quorum and timelock —
+    /// paralleling `release_milestone`'s order: a stranger learns
+    /// nothing, and a misconfigured call fails before the gates run.
+    pub fn release_period(
+        &mut self,
+        authority: [u8; 32],
+        now: u64,
+        period_index: u8,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+    ) -> Result<(u64, u64), EscrowError> {
+        // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        // AV-46: pause guard first — a paused escrow fails fast,
+        // before the reentrancy guard and the authority check.
+        self.require_not_paused()?;
+        self.require_not_reentrant()?;
+        self.require_initializer(authority)?;
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let schedule = self.subscription.ok_or(EscrowError::InvalidSubscription)?;
+        // Strictly in-order: only the next period may release — this
+        // is both the sequence gate and the replay guard.
+        if period_index != self.subscription_next {
+            return Err(EscrowError::PeriodNotDue);
+        }
+        // The period must actually be due: `now >= due_at(period_index)`.
+        let due_at = schedule.due_at(period_index, self.expires_at);
+        if now < due_at {
+            return Err(EscrowError::PeriodNotDue);
+        }
+        // AV-16: the period's tokens must be the tokens this escrow
+        // locks (`MintMismatch` otherwise).
+        self.require_mint_match(mint)?;
+        // AV-49: the period payout destination must satisfy the
+        // escrow's payout policy (`PayoutNotAllowlisted` otherwise) —
+        // checked right after the mint binding, like `release`.
+        self.require_payout_recipient(payout_to)?;
+        if let Some(policy) = &self.quorum {
+            if !policy.is_satisfied() {
+                return Err(EscrowError::QuorumNotReached);
+            }
+        }
+        // AV-27: the timelock gates every taker payout path, including
+        // subscription periods.
+        if !self.is_unlock_eligible(now) {
+            return Err(EscrowError::TimelockNotReached);
+        }
+        let per_period = schedule.per_period;
+        // Each period releases at most once (the in-order counter) and
+        // the tranches sum to the locked amount: released + per_period
+        // <= amount always — unless a vesting `claim` already drew on
+        // the shared counter (vesting composes, see
+        // `with_subscription`). The checked_add and the cap are
+        // backstops, paralleling `release`.
+        let new_released = self
+            .released
+            .checked_add(per_period)
+            .ok_or(EscrowError::ReleaseExceedsLocked)?;
+        if new_released > self.amount {
+            return Err(EscrowError::ReleaseExceedsLocked);
+        }
+        // AV-17: the protocol fee slices the period; the `released`
+        // counter keeps the gross so conservation is untouched. Charged
+        // only after every gate passes — a rejected payout never
+        // touches `fees_paid`.
+        let fee = self.charge_protocol_fee(per_period)?;
+        self.released = new_released;
+        self.subscription_released |= 1u64 << period_index;
+        self.subscription_next += 1;
+        if self.subscription_next == schedule.periods {
+            self.state = EscrowState::Released;
+        }
+        Ok((per_period - fee, fee))
+    }
     pub fn initializer(&self) -> [u8; 32] {
         self.initializer
     }
@@ -4445,6 +4819,24 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // present (zeroed when the split is unconfirmed). Appended last so
     // every earlier field offset stays stable.
     ("default_confirmed", "bool", 1),
+    // AV-56: periodic release schedule (see `Escrow::with_subscription`):
+    // one discriminant byte, then the 17-byte `SubscriptionSchedule`
+    // (period_secs u64, periods u8, per_period u64). The region is
+    // always reserved (zeroed when `None`) so `with_subscription`
+    // writes in place — same treatment as `arbiter` / `mint` /
+    // `reference`. Appended last so every earlier field offset stays
+    // stable.
+    ("subscription", "Option<SubscriptionSchedule>", 1 + SUBSCRIPTION_SCHEDULE_LEN),
+    // AV-56: index of the next subscription period to release (see
+    // `Escrow::release_period`): one u8, always present (zeroed when
+    // no schedule is attached). Appended last so every earlier field
+    // offset stays stable.
+    ("subscription_next", "u8", 1),
+    // AV-56: per-period released bitmap (see
+    // `Escrow::subscription_released_periods`): one u64, always present
+    // (zeroed when no schedule is attached). Appended last so every
+    // earlier field offset stays stable.
+    ("subscription_released", "u64 (bitmask)", 8),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -4511,9 +4903,12 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// always present: 1-byte discriminant + 16-byte judgment (zeroed when
 /// no default judgment is configured), and so is the taker's
 /// confirmation bit (AV-55): 1 byte, zeroed when the split is
-/// unconfirmed.
+/// unconfirmed. The subscription schedule (AV-56) is likewise always
+/// present: 1-byte discriminant + 17-byte schedule (zeroed when no
+/// schedule is attached), followed by the always-present 1-byte next
+/// period index and 8-byte per-period released bitmap.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -5057,7 +5452,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 7_809_120, "from {state:?}");
+            assert_eq!(rent, 7_997_040, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -5155,9 +5550,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 7_809_120 by
+        // VAULT_SPACE — pinned at 7_997_040 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 7_809_120);
+        assert_eq!(rent, 7_997_040);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -5315,11 +5710,11 @@ mod tests {
     fn release_and_close_adds_no_fields_and_keeps_space() {
         // AV-50 touches no persisted field: the release leg moves the
         // `released` / `fees_paid` counters and the state byte, and
-        // then the account is closed. VAULT_SPACE stays 994 — re-asserted
+        // then the account is closed. VAULT_SPACE stays 1021 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 994, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 7_809_120);
+        assert_eq!(VAULT_SPACE, 1021, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 7_997_040);
     }
 
     #[test]
@@ -5335,7 +5730,7 @@ mod tests {
         // 26 (dispute timestamp + default judgment + confirmation
         // bit), so the
         // pin tracks the new total deliberately.
-        assert_eq!(VAULT_SPACE, 994, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 1021, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -7329,6 +7724,75 @@ pub(crate) mod anchor_idl_tests {
                             Disputed, to == Settled; evidence_hash \\
                             carried, rationale None)",
         },
+        InstructionSpec {
+            // AV-56: the periodic (subscription-style) release schedule,
+            // declared before funding.
+            name: "initialize_subscription",
+            params: &[
+                (
+                    "period_secs",
+                    "u64",
+                    "instruction param; seconds between period due dates; must be non-zero",
+                ),
+                (
+                    "periods",
+                    "u8",
+                    "instruction param; how many periods the lockup is split into (1..=64 — the per-period released bitmap is a u64)",
+                ),
+                (
+                    "per_period",
+                    "u64",
+                    "instruction param; the taker's payout per period; periods * per_period must equal the locked amount (summed in u128)",
+                ),
+            ],
+            method: "Escrow::with_subscription",
+            input_mapping: "period_secs, periods, per_period <- \\
+                            instruction params; Uninitialized only, like \\
+                            initialize_milestones; mutually exclusive \\
+                            with with_milestones (InvalidSubscription if \\
+                            a milestone plan is attached); validation: \\
+                            period_secs must be non-zero, periods in \\
+                            1..=64, per_period non-zero, \\
+                            periods * per_period (in u128) == amount, \\
+                            expires_at != u64::MAX (back-scheduling needs \\
+                            a bounded lifetime), and the schedule must \\
+                            fit the lifetime: (periods - 1) * period_secs \\
+                            <= expires_at; the 18-byte region is always \\
+                            reserved (zeroed when None) so the opt-in \\
+                            writes in place; emits no event (pre-fund \\
+                            configuration)",
+        },
+        InstructionSpec {
+            // AV-56: release one due subscription period to the taker,
+            // strictly in order.
+            name: "release_period",
+            params: &[(
+                "period_index",
+                "u8",
+                "instruction param; must equal the next due period (PeriodNotDue otherwise — skip-ahead and replay rejected)",
+            )],
+            method: "Escrow::release_period",
+            input_mapping: "authority <- accounts.initializer (signer); \\
+                            period_index <- param (must equal the next \\
+                            due period, PeriodNotDue otherwise); now <- \\
+                            clock sysvar (NOT an instruction param); \\
+                            mint <- vault token account; payout_to <- \\
+                            accounts.payout_to; Funded only; schedule \\
+                            required (InvalidSubscription); the period \\
+                            must be due (now >= due_at, PeriodNotDue); \\
+                            the quorum gate applies like release \\
+                            (QuorumNotReached); the timelock gates every \\
+                            taker payout path (TimelockNotReached); \\
+                            MintMismatch / PayoutNotAllowlisted guard the \\
+                            fund movement like release; the fee slices \\
+                            the period (payout + fee == per_period); the \\
+                            last period moves Funded -> Released; the \\
+                            vesting claim composes (not blocked); emits \\
+                            the SubscriptionPeriodReleased indexer event \\
+                            (from == Funded, to == Funded — or Released \\
+                            on the last period; payout = gross \\
+                            per-period amount, fee, refund = 0)",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -7410,6 +7874,9 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::with_arbitration_deadline",
             "Escrow::confirm_default_judgment",
             "Escrow::trigger_default_judgment",
+            // AV-56: periodic (subscription-style) release schedule.
+            "Escrow::with_subscription",
+            "Escrow::release_period",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -7433,7 +7900,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_twenty_nine_instructions_take_params() {
+    fn only_thirty_one_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -7473,6 +7940,8 @@ pub(crate) mod anchor_idl_tests {
                 &"update_payout_allowlist",
                 &"initialize_reference",
                 &"initialize_default_judgment",
+                &"initialize_subscription",
+                &"release_period",
             ]
         );
     }
@@ -9009,6 +9478,18 @@ pub(crate) mod anchor_idl_tests {
         // (a configured judgment is `Some`).
         ("initialize_default_judgment", "deadline_secs", "default_judgment"),
         ("initialize_default_judgment", "default_taker_amount", "default_judgment"),
+        // AV-56: the three subscription params all populate the single
+        // `subscription` vault field — multiple param mappings onto one
+        // field are fine, like `released` (which `release`,
+        // `release_via_cpi`, `release_milestone` and `resolve` all
+        // write). The `Option` discriminant is implied (an attached
+        // schedule is `Some`). The `period_index` param selects which
+        // bit flips in `subscription_released` (zeroed by `initialize`,
+        // advanced strictly in order by `release_period`).
+        ("initialize_subscription", "period_secs", "subscription"),
+        ("initialize_subscription", "periods", "subscription"),
+        ("initialize_subscription", "per_period", "subscription"),
+        ("release_period", "period_index", "subscription_released"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -9099,6 +9580,16 @@ pub(crate) mod anchor_idl_tests {
             "default_confirmed",
             "zeroed by initialize; set by confirm_default_judgment \\
              (taker signer only)",
+        ),
+        // AV-56: no instruction param writes this field directly — the
+        // `period_index` param maps to `subscription_released` (see
+        // PARAM_FIELD_MAP), while the next-period counter advances
+        // strictly in order, so it is a field source, not a param
+        // mapping.
+        (
+            "subscription_next",
+            "zeroed by initialize; advanced by release_period in \\
+             strict period order",
         ),
     ];
 
@@ -9368,6 +9859,16 @@ mod error_code_tests {
             EscrowError::DefaultJudgmentNotDue,
             129,
             "trigger_default_judgment with no default judgment configured, the taker never confirmed the split, or the arbitration deadline not yet passed; with_arbitration_deadline with a zero deadline",
+        ),
+        (
+            EscrowError::InvalidSubscription,
+            130,
+            "with_subscription with a zero period_secs, zero or >64 periods, a zero per_period, a period-sum != amount, u64::MAX expiry, a schedule overflowing the escrow's lifetime, after funding, or after a milestone plan; with_milestones after a subscription; release_period / subscription ops with no schedule; release with a subscription attached (the schedule owns the release path)",
+        ),
+        (
+            EscrowError::PeriodNotDue,
+            131,
+            "release_period with a period_index that is not the next due period (skip-ahead or replay), or with now before that period's back-scheduled due timestamp",
         ),
     ];
 
@@ -10969,6 +11470,29 @@ mod account_space_tests {
         // present (zeroed when unconfirmed); appended last so every
         // earlier offset above is unchanged.
         out.push(e.default_confirmed as u8);
+        // AV-56: subscription schedule, always reserved like
+        // `reference`: the `None` discriminant followed by a zeroed
+        // 17-byte schedule, so `with_subscription` writes in place
+        // without reallocating; appended last so every earlier offset
+        // above is unchanged.
+        match e.subscription {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; SUBSCRIPTION_SCHEDULE_LEN]);
+            }
+            Some(s) => {
+                out.push(1);
+                out.extend_from_slice(&s.period_secs.to_le_bytes());
+                out.push(s.periods);
+                out.extend_from_slice(&s.per_period.to_le_bytes());
+            }
+        }
+        // AV-56: index of the next subscription period to release,
+        // always present (zeroed when no schedule is attached).
+        out.push(e.subscription_next);
+        // AV-56: per-period released bitmap, always present (zeroed
+        // when no schedule is attached).
+        out.extend_from_slice(&e.subscription_released.to_le_bytes());
         out
     }
 
@@ -11002,10 +11526,12 @@ mod account_space_tests {
         // emergency pause flag) + (1 + 128) (AV-49 payout destination
         // allowlist) + (1 + 32) (AV-53 off-chain reference memo) + 8
         // (AV-55 dispute timestamp) + (1 + 16) (AV-55 pre-agreed default
-        // judgment) + 1 (AV-55 taker confirmation bit).
-        assert_eq!(ESCROW_BODY_LEN, 986, "escrow payload bytes");
+        // judgment) + 1 (AV-55 taker confirmation bit) + (1 + 17)
+        // (AV-56 subscription schedule) + 1 (AV-56 next period index)
+        // + 8 (AV-56 per-period released bitmap).
+        assert_eq!(ESCROW_BODY_LEN, 1013, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 994, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 1021, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -11037,13 +11563,17 @@ mod account_space_tests {
         // timestamp (AV-55, zeroed when the escrow was never disputed) +
         // (1 + 16)-byte pre-agreed default judgment (AV-55, zeroed when
         // no default judgment is configured) + 1-byte taker confirmation
-        // bit (AV-55, zeroed when the split is unconfirmed).
+        // bit (AV-55, zeroed when the split is unconfirmed) + (1 +
+        // 17)-byte subscription schedule (AV-56, zeroed when no
+        // schedule is attached) + 1-byte next period index (AV-56,
+        // zeroed when no schedule is attached) + 8-byte per-period
+        // released bitmap (AV-56, zeroed when no schedule is attached).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 504);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 531);
     }
 
     #[test]
@@ -11450,16 +11980,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 994) * 3480 * 2 = 1122 * 6960 = 7_809_120 lamports.
-        assert_eq!(full, 7_809_120);
+        // (128 + 1021) * 3480 * 2 = 1149 * 6960 = 7_997_040 lamports.
+        assert_eq!(full, 7_997_040);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 504) * 3480 * 2 = 632 * 6960 = 4_398_720 lamports.
-        assert_eq!(no_quorum, 4_398_720);
+        // (128 + 531) * 3480 * 2 = 659 * 6960 = 4_586_640 lamports.
+        assert_eq!(no_quorum, 4_586_640);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -11503,12 +12033,12 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(7_809_120, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(7_997_040, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(7_628_159, params.0, params.1),
             Err(RentShortfall {
-                required: 7_809_120,
+                required: 7_997_040,
                 provided: 7_628_159,
             })
         );
@@ -11521,7 +12051,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 7_809_120,
+                required: 7_997_040,
                 provided: 0,
             })
         );
@@ -13957,7 +14487,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 986, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) bytes");
+        assert_eq!(bytes.len(), 1013, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -13982,7 +14512,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 986);
+        assert_eq!(bytes.len(), 1013);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -14001,18 +14531,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 994) * 3480 * 2 = 1122 * 6960 = 7_809_120 lamports.
-        assert_eq!(VAULT_SPACE, 994);
-        assert_eq!(full, 7_809_120);
+        // (128 + 1021) * 3480 * 2 = 1149 * 6960 = 7_997_040 lamports.
+        assert_eq!(VAULT_SPACE, 1021);
+        assert_eq!(full, 7_997_040);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 504) * 3480 * 2 = 632 * 6960 = 4_398_720 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 504);
-        assert_eq!(no_quorum, 4_398_720);
+        // (128 + 531) * 3480 * 2 = 659 * 6960 = 4_586_640 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 531);
+        assert_eq!(no_quorum, 4_586_640);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -14156,7 +14686,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 986);
+        assert_eq!(bytes.len(), 1013);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -14171,7 +14701,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 986);
+        assert_eq!(bytes.len(), 1013);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -14201,18 +14731,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 994) * 3480 * 2 = 1122 * 6960 = 7_809_120 lamports.
-        assert_eq!(VAULT_SPACE, 994);
-        assert_eq!(full, 7_809_120);
+        // (128 + 1021) * 3480 * 2 = 1149 * 6960 = 7_997_040 lamports.
+        assert_eq!(VAULT_SPACE, 1021);
+        assert_eq!(full, 7_997_040);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 504) * 3480 * 2 = 632 * 6960 = 4_398_720 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 504);
-        assert_eq!(no_quorum, 4_398_720);
+        // (128 + 531) * 3480 * 2 = 659 * 6960 = 4_586_640 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 531);
+        assert_eq!(no_quorum, 4_586_640);
     }
 
     #[test]
@@ -15067,7 +15597,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 986);
+        assert_eq!(bytes.len(), 1013);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -15242,7 +15772,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 986, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55");
+        assert_eq!(ESCROW_BODY_LEN, 1013, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -15260,31 +15790,31 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 994) * 3480 * 2 = 1122 * 6960 = 7_809_120 lamports.
+        // (128 + 1021) * 3480 * 2 = 1149 * 6960 = 7_997_040 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            7_809_120
+            7_997_040
         );
-        // (128 + 504) * 3480 * 2 = 632 * 6960 = 4_398_720 lamports.
+        // (128 + 531) * 3480 * 2 = 659 * 6960 = 4_586_640 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            4_398_720
+            4_586_640
         );
         // 213 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo).
-        assert_eq!(VAULT_SPACE, 994);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 504);
-        assert!(check_vault_rent_exempt(7_809_120, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 1021);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 531);
+        assert!(check_vault_rent_exempt(7_997_040, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -17281,7 +17811,9 @@ mod default_judgment_tests {
     fn borsh_tail_pins_default_judgment_fields() {
         // Offsets: `reference` ends the old body at 960; `disputed_at`
         // at 960, `default_judgment` at 968, `default_confirmed` at 985
-        // (body total 986).
+        // (AV-55 body total 986). AV-56 appends `subscription` at 986,
+        // `subscription_next` at 1004, `subscription_released` at 1005
+        // (body total 1013).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter(ARBITER)
@@ -17291,7 +17823,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 986);
+        assert_eq!(bytes.len(), 1013);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -17322,7 +17854,7 @@ mod default_judgment_tests {
         e.fund(ALICE).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(&bytes[960..986], &[0u8; 26], "AV-55 tail zeroed");
+        assert_eq!(&bytes[960..1013], &[0u8; 53], "AV-55+AV-56 tail zeroed");
     }
 
     // ----- event emission via IndexedEscrow -----
@@ -17364,5 +17896,554 @@ mod default_judgment_tests {
         // confirm_default_judgment emit nothing.
         assert_eq!(e.events().len(), 4);
         assert_eq!(ev.seq, 3);
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+    use crate::account_space_tests::encode_escrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ATTESTOR: [u8; 32] = [0xA1; 32];
+    const MINT: [u8; 32] = [0xD0; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const PERIOD_SECS: u64 = 86_400; // one day
+    const PERIODS: u8 = 4;
+    const PER_PERIOD: u64 = 250_000; // 4 * 250_000 == 1_000_000
+
+    fn subscription_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    /// Period `i` is due at `expires_at - (periods - 1 - i) * period_secs`.
+    fn due(i: u8) -> u64 {
+        EXPIRES_AT - (PERIODS - 1 - i) as u64 * PERIOD_SECS
+    }
+
+    // ----- builder validation matrix -----
+
+    #[test]
+    fn builder_rejects_post_fund_configuration() {
+        // The release schedule is fixed before any funds move — like
+        // every other with_* builder.
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    fn escrow() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap()
+    }
+
+    #[test]
+    fn builder_rejects_zero_period_secs() {
+        assert_eq!(
+            escrow().with_subscription(0, PERIODS, PER_PERIOD),
+            Err(EscrowError::InvalidSubscription)
+        );
+    }
+
+    #[test]
+    fn builder_rejects_zero_periods() {
+        assert_eq!(
+            escrow().with_subscription(PERIOD_SECS, 0, PER_PERIOD),
+            Err(EscrowError::InvalidSubscription)
+        );
+    }
+
+    #[test]
+    fn builder_rejects_too_many_periods() {
+        // The per-period released bitmap is a u64: at most 64 periods.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 65, EXPIRES_AT)
+                .unwrap()
+                .with_subscription(1, 65, 1),
+            Err(EscrowError::InvalidSubscription)
+        );
+        // The boundary is inclusive: 64 periods is legal.
+        let e = Escrow::initialize(ALICE, BOB, 64, 1_000_000)
+            .unwrap()
+            .with_subscription(1, 64, 1)
+            .unwrap();
+        assert_eq!(e.subscription_schedule().unwrap().periods, 64);
+    }
+
+    #[test]
+    fn builder_rejects_zero_per_period() {
+        assert_eq!(
+            escrow().with_subscription(PERIOD_SECS, PERIODS, 0),
+            Err(EscrowError::InvalidSubscription)
+        );
+    }
+
+    #[test]
+    fn builder_rejects_sum_mismatch() {
+        // The schedule is the *complete* release schedule: the
+        // per-period amounts must cover the lockup exactly.
+        assert_eq!(
+            escrow().with_subscription(PERIOD_SECS, 3, PER_PERIOD),
+            Err(EscrowError::InvalidSubscription),
+            "under-cover"
+        );
+        assert_eq!(
+            escrow().with_subscription(PERIOD_SECS, 5, PER_PERIOD),
+            Err(EscrowError::InvalidSubscription),
+            "over-cover"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_wrapping_sum() {
+        // Summed in u128, so it can never wrap: two near-MAX tranches
+        // cannot alias onto the locked amount.
+        let e = Escrow::initialize(ALICE, BOB, u64::MAX - 1, EXPIRES_AT).unwrap();
+        assert_eq!(
+            e.with_subscription(1, 2, u64::MAX),
+            Err(EscrowError::InvalidSubscription),
+            "2 * u64::MAX wraps to u64::MAX - 1 in u64; u128 sees the truth"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_u64_max_expiry() {
+        // Back-scheduling pins the last period to `expires_at`: the
+        // no-timeout convention has no expiry to pin to.
+        let e = Escrow::initialize(ALICE, BOB, 1_000, u64::MAX).unwrap();
+        assert_eq!(
+            e.with_subscription(1, 2, 500),
+            Err(EscrowError::InvalidSubscription)
+        );
+    }
+
+    #[test]
+    fn builder_rejects_schedule_that_does_not_fit() {
+        // The first period's due date must not predate timestamp 0:
+        // (periods - 1) * period_secs <= expires_at.
+        let e = Escrow::initialize(ALICE, BOB, 4, EXPIRES_AT).unwrap();
+        assert_eq!(
+            e.with_subscription(EXPIRES_AT, 4, 1),
+            Err(EscrowError::InvalidSubscription),
+            "3 * EXPIRES_AT > EXPIRES_AT"
+        );
+        // Exactly fitting is legal: the first period is due at 0.
+        let e = Escrow::initialize(ALICE, BOB, 4, EXPIRES_AT).unwrap();
+        let e = e.with_subscription(EXPIRES_AT / 3, 4, 1).unwrap();
+        assert_eq!(e.subscription_period_due_at(0), Some(0));
+        assert_eq!(e.subscription_period_due_at(3), Some(EXPIRES_AT));
+    }
+
+    #[test]
+    fn builder_rejects_subscription_after_milestones() {
+        // Mutual exclusion, order 1: a milestone plan already owns the
+        // release schedule.
+        let e = escrow()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        assert_eq!(
+            e.with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD),
+            Err(EscrowError::InvalidSubscription)
+        );
+    }
+
+    #[test]
+    fn builder_rejects_milestones_after_subscription() {
+        // Mutual exclusion, order 2: a subscription schedule already
+        // owns the release schedule.
+        let e = escrow()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        assert_eq!(
+            e.with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap()),
+            Err(EscrowError::InvalidMilestones)
+        );
+    }
+
+    #[test]
+    fn builder_sets_schedule_and_zeroed_progress() {
+        let e = escrow()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        let s = e.subscription_schedule().expect("schedule attached");
+        assert_eq!(s.period_secs, PERIOD_SECS);
+        assert_eq!(s.periods, PERIODS);
+        assert_eq!(s.per_period, PER_PERIOD);
+        assert_eq!(e.subscription_next_period(), 0);
+        assert_eq!(e.subscription_released_periods(), 0);
+    }
+
+    // ----- accessors -----
+
+    #[test]
+    fn due_at_is_back_scheduled_from_expiry() {
+        let e = subscription_escrow();
+        // The last period is due exactly at expiry; earlier periods step
+        // back by period_secs.
+        for i in 0..PERIODS {
+            assert_eq!(e.subscription_period_due_at(i), Some(due(i)), "period {i}");
+        }
+        // Due dates are strictly increasing.
+        let mut prev = 0u64;
+        for i in 0..PERIODS {
+            let d = e.subscription_period_due_at(i).unwrap();
+            assert!(d > prev, "period {i} due after the previous");
+            prev = d;
+        }
+    }
+
+    #[test]
+    fn due_at_none_without_schedule_or_out_of_range() {
+        let e = escrow();
+        assert_eq!(e.subscription_period_due_at(0), None, "no schedule");
+        let e = subscription_escrow();
+        assert_eq!(e.subscription_period_due_at(PERIODS), None, "out of range");
+        assert_eq!(e.subscription_period_due_at(u8::MAX), None, "out of range");
+    }
+
+    #[test]
+    fn schedule_helper_due_at_unit() {
+        let s = SubscriptionSchedule {
+            period_secs: 100,
+            periods: 3,
+            per_period: 10,
+        };
+        assert_eq!(s.due_at(0, 1_000), 800);
+        assert_eq!(s.due_at(1, 1_000), 900);
+        assert_eq!(s.due_at(2, 1_000), 1_000, "last period pinned to expiry");
+        // A single period is due at expiry.
+        let one = SubscriptionSchedule {
+            period_secs: 100,
+            periods: 1,
+            per_period: 10,
+        };
+        assert_eq!(one.due_at(0, 1_000), 1_000);
+        assert_eq!(SUBSCRIPTION_SCHEDULE_LEN, 17, "serialized schedule bytes");
+        assert_eq!(MAX_SUBSCRIPTION_PERIODS, 64);
+    }
+
+    // ----- release owns nothing once a schedule is attached -----
+
+    #[test]
+    fn release_rejected_with_subscription() {
+        let mut e = subscription_escrow();
+        assert_eq!(
+            e.release(ALICE, due(3), 100_000, None, BOB),
+            Err(EscrowError::InvalidSubscription),
+            "the schedule owns the release path — periods pay out via release_period"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    // ----- release_period matrix -----
+
+    #[test]
+    fn release_period_rejects_stranger() {
+        let mut e = subscription_escrow();
+        assert_eq!(
+            e.release_period(MALLORY, due(0), 0, None, BOB),
+            Err(EscrowError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn release_period_rejects_non_funded_state() {
+        let mut e = escrow()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        assert_eq!(
+            e.release_period(ALICE, due(0), 0, None, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn release_period_rejects_without_schedule() {
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.release_period(ALICE, EXPIRES_AT, 0, None, BOB),
+            Err(EscrowError::InvalidSubscription)
+        );
+    }
+
+    #[test]
+    fn release_period_rejects_skip_ahead() {
+        let mut e = subscription_escrow();
+        // Skipping ahead is PeriodNotDue even when that period's due
+        // date has passed.
+        assert_eq!(
+            e.release_period(ALICE, due(3), 2, None, BOB),
+            Err(EscrowError::PeriodNotDue)
+        );
+        assert_eq!(e.subscription_next_period(), 0, "no progress made");
+    }
+
+    #[test]
+    fn release_period_rejects_early_but_accepts_exact_boundary() {
+        let mut e = subscription_escrow();
+        assert_eq!(
+            e.release_period(ALICE, due(0) - 1, 0, None, BOB),
+            Err(EscrowError::PeriodNotDue)
+        );
+        let (payout, fee) = e.release_period(ALICE, due(0), 0, None, BOB).unwrap();
+        assert_eq!((payout, fee), (PER_PERIOD, 0), "exact due boundary is due");
+        assert_eq!(e.subscription_next_period(), 1);
+    }
+
+    #[test]
+    fn release_period_rejects_replay() {
+        let mut e = subscription_escrow();
+        e.release_period(ALICE, due(0), 0, None, BOB).unwrap();
+        assert_eq!(
+            e.release_period(ALICE, due(0), 0, None, BOB),
+            Err(EscrowError::PeriodNotDue),
+            "already released — only the next period may release"
+        );
+        assert_eq!(e.subscription_released_periods(), 0b1);
+    }
+
+    #[test]
+    fn release_period_mint_mismatch() {
+        // Bound mint: the period's tokens must be the bound mint.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.release_period(ALICE, due(0), 0, None, BOB),
+            Err(EscrowError::MintMismatch)
+        );
+        // Unbound escrow: a token mint never matches the native path.
+        let mut e = subscription_escrow();
+        assert_eq!(
+            e.release_period(ALICE, due(0), 0, Some(MINT), BOB),
+            Err(EscrowError::MintMismatch)
+        );
+    }
+
+    #[test]
+    fn release_period_payout_policy() {
+        // Default policy pins payouts to the taker.
+        let mut e = subscription_escrow();
+        assert_eq!(
+            e.release_period(ALICE, due(0), 0, None, MALLORY),
+            Err(EscrowError::PayoutNotAllowlisted)
+        );
+        let (payout, _) = e.release_period(ALICE, due(0), 0, None, BOB).unwrap();
+        assert_eq!(payout, PER_PERIOD);
+    }
+
+    #[test]
+    fn release_period_quorum_gating() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR], &[1], 1).unwrap())
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.release_period(ALICE, due(0), 0, None, BOB),
+            Err(EscrowError::QuorumNotReached)
+        );
+        e.attest(ATTESTOR).unwrap();
+        let (payout, _) = e.release_period(ALICE, due(0), 0, None, BOB).unwrap();
+        assert_eq!(payout, PER_PERIOD);
+    }
+
+    #[test]
+    fn release_period_timelock_gating() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(due(0) + 1)
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.release_period(ALICE, due(0), 0, None, BOB),
+            Err(EscrowError::TimelockNotReached)
+        );
+        let (payout, _) = e
+            .release_period(ALICE, due(0) + 1, 0, None, BOB)
+            .unwrap();
+        assert_eq!(payout, PER_PERIOD);
+    }
+
+    #[test]
+    fn release_period_charges_protocol_fee() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(1_000) // 10%
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let (payout, fee) = e.release_period(ALICE, due(0), 0, None, BOB).unwrap();
+        // 10% of 250_000 = 25_000; the released counter keeps the gross.
+        assert_eq!((payout, fee), (225_000, 25_000));
+        assert_eq!(e.fees_paid(), 25_000);
+        assert_eq!(e.released_amount(), PER_PERIOD, "counter keeps the gross");
+    }
+
+    #[test]
+    fn release_period_full_run_conserves_and_settles() {
+        let mut e = subscription_escrow();
+        let mut total_payout = 0u64;
+        for i in 0..PERIODS {
+            let (payout, fee) = e.release_period(ALICE, due(i), i, None, BOB).unwrap();
+            assert_eq!((payout, fee), (PER_PERIOD, 0));
+            total_payout += payout;
+            assert_eq!(e.subscription_next_period(), i + 1);
+            assert_eq!(e.subscription_released_periods(), (1u64 << (i + 1)) - 1);
+            if i + 1 < PERIODS {
+                assert_eq!(e.state(), EscrowState::Funded, "mid-run stays Funded");
+            }
+        }
+        assert_eq!(total_payout, 1_000_000, "every lamport reaches the taker");
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.remaining_amount(), 0);
+        assert_eq!(e.state(), EscrowState::Released, "last period settles");
+        // Terminal: no further period may release.
+        assert_eq!(
+            e.release_period(ALICE, due(3), 3, None, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn release_period_vesting_claim_composes_with_backstop() {
+        // Vesting (taker-pull) is deliberately NOT blocked by a
+        // subscription schedule: the two compose on the shared
+        // `released` counter, and the checked_add backstop keeps the
+        // counter from outrunning the lockup.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(0, 2 * EXPIRES_AT).unwrap())
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        // At EXPIRES_AT half is vested; the taker pulls it.
+        let (payout, _) = e.claim(BOB, EXPIRES_AT, None, BOB).unwrap();
+        assert_eq!(payout, 500_000);
+        assert_eq!(e.released_amount(), 500_000);
+        // Periods still release in order on the shared counter...
+        e.release_period(ALICE, EXPIRES_AT, 0, None, BOB).unwrap();
+        e.release_period(ALICE, EXPIRES_AT, 1, None, BOB).unwrap();
+        assert_eq!(e.released_amount(), 1_000_000);
+        // ...until the counter would outrun the lockup: the backstop
+        // fires instead of wrapping.
+        assert_eq!(
+            e.release_period(ALICE, EXPIRES_AT, 2, None, BOB),
+            Err(EscrowError::ReleaseExceedsLocked)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    // ----- error code pins -----
+
+    #[test]
+    fn error_codes_are_pinned() {
+        // The codes are a public contract (the Anchor program maps one
+        // program error per variant): never renumber.
+        assert_eq!(EscrowError::InvalidSubscription.code(), 130);
+        assert_eq!(EscrowError::PeriodNotDue.code(), 131);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidSubscription));
+        assert!(EscrowError::all().contains(&EscrowError::PeriodNotDue));
+    }
+
+    // ----- layout pins -----
+
+    #[test]
+    fn borsh_tail_pins_subscription_fields() {
+        // Offsets: `default_confirmed` ends the AV-55 body at 986;
+        // `subscription` at 986, `subscription_next` at 1004,
+        // `subscription_released` at 1005 (body total 1013).
+        let mut e = escrow()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes.len(), 1013);
+        // Configured schedule: Some discriminant + the 17-byte terms.
+        assert_eq!(bytes[986], 1, "subscription: Some discriminant");
+        assert_eq!(
+            u64::from_le_bytes(bytes[987..995].try_into().unwrap()),
+            PERIOD_SECS,
+            "subscription.period_secs"
+        );
+        assert_eq!(bytes[995], PERIODS, "subscription.periods");
+        assert_eq!(
+            u64::from_le_bytes(bytes[996..1004].try_into().unwrap()),
+            PER_PERIOD,
+            "subscription.per_period"
+        );
+        // No period released yet: zeroed progress.
+        assert_eq!(bytes[1004], 0, "subscription_next: zeroed");
+        assert_eq!(
+            u64::from_le_bytes(bytes[1005..1013].try_into().unwrap()),
+            0,
+            "subscription_released: zeroed"
+        );
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN, "tail byte is the last byte");
+    }
+
+    #[test]
+    fn borsh_tail_tracks_release_progress() {
+        let mut e = subscription_escrow();
+        e.release_period(ALICE, due(0), 0, None, BOB).unwrap();
+        e.release_period(ALICE, due(1), 1, None, BOB).unwrap();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes[1004], 2, "subscription_next: advanced");
+        assert_eq!(
+            u64::from_le_bytes(bytes[1005..1013].try_into().unwrap()),
+            0b11,
+            "subscription_released: periods 0 and 1 set"
+        );
+    }
+
+    #[test]
+    fn borsh_tail_zeroed_without_schedule() {
+        // Backward compatible: the 27-byte tail is fully zeroed for an
+        // escrow that never opted into the subscription schedule.
+        let mut e = escrow();
+        e.fund(ALICE).unwrap();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(&bytes[986..1013], &[0u8; 27], "AV-56 tail zeroed");
+    }
+
+    #[test]
+    fn decode_round_trips_subscription_schedule() {
+        // The discriminator's structural decode consumes the new tail
+        // and restores the schedule plus release progress.
+        use crate::discriminator::{decode_vault_account, vault_account_discriminator};
+        let mut e = subscription_escrow();
+        e.release_period(ALICE, due(0), 0, None, BOB).unwrap();
+        let mut full = Vec::with_capacity(VAULT_SPACE);
+        full.extend_from_slice(&vault_account_discriminator());
+        full.extend_from_slice(&encode_escrow(&e));
+        let d = decode_vault_account(&full).expect("decodes");
+        assert_eq!(d.subscription_schedule(), e.subscription_schedule());
+        assert_eq!(d.subscription_next_period(), 1);
+        assert_eq!(d.subscription_released_periods(), 0b1);
+        assert_eq!(d.state(), EscrowState::Funded);
     }
 }

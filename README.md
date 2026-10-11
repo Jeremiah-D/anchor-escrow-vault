@@ -70,6 +70,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_default_judgment(deadline_secs, default_taker_amount)` (AV-55) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — and only after `initialize_arbiter`; the arbiter must be configured first); declares the fallback split applied when the arbiter never resolves: `deadline_secs` seconds in `Disputed` before the judgment becomes triggerable (must be non-zero — `DefaultJudgmentNotDue` otherwise), `default_taker_amount` the taker's share of the remainder (must be ≤ the locked amount — `ReleaseExceedsLocked` otherwise); the initializer proposes the terms, the taker must still countersign (dual-signed agreement) |
 | `confirm_default_judgment()` (AV-55) | `Uninitialized` / `Funded` | — (no state change; sets the confirmation bit) | **taker only** (`Unauthorized` for a stranger or the initializer); no judgment configured is `DefaultJudgmentNotDue`; idempotent (re-confirming is `Ok`) |
 | `trigger_default_judgment(caller, now, payout_to)` (AV-55) | `Disputed` | `Settled` | **initializer or taker** (either party — a liveness backstop, not a power grant); only once `now >= disputed_at + deadline_secs` (the judgment's due time, `DefaultJudgmentNotDue` otherwise); settles on the pre-agreed split — fee slices the taker's share like `resolve`, quorum/vesting/timelock do *not* gate (same as `resolve`); the arbiter's `resolve` is unchanged and keeps priority — after the deadline either the arbiter resolves or a party triggers, first writer wins; emits `DefaultJudgment` |
+| `initialize_subscription(period_secs, periods, per_period)` (AV-56) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — mutually exclusive with `initialize_milestones`; declares the periodic release schedule, back-scheduled from `expires_at`: period `i` is due at `expires_at - (periods-1-i) * period_secs`; validation — `period_secs` non-zero, `periods` in 1..=64, `per_period` non-zero, `periods * per_period` == locked amount (in u128), `expires_at != u64::MAX`, and the schedule must fit the lifetime — is `InvalidSubscription` otherwise) |
+| `release_period(period_index)` (AV-56) | `Funded` | `Funded` (partial) / `Released` (last period) | initializer only (the initializer's push path); strictly in-order (`period_index` must equal the next due period — skip-ahead and replay are `PeriodNotDue`) and due-date gated (`now >= due_at(period_index)` — `PeriodNotDue` otherwise); quorum satisfied when configured (`QuorumNotReached`), `now >= unlock_at` when a timelock is configured (`TimelockNotReached` — the timelock gates every taker payout path); `MintMismatch` / `PayoutNotAllowlisted` guard the fund movement like `release`; the protocol fee slices the period (`payout + fee == per_period`); vesting claim composes (not blocked); emits `SubscriptionPeriodReleased` |
 | `initialize_milestones(milestones)`          | `Uninitialized`| `Uninitialized` | initializer (once, before funding; tranche amounts must sum to the locked amount) |
 | `confirm_milestone(authority, index)`        | `Funded`       | — (no state change) | initializer **or** taker (in order; a milestone is confirmed once *both* parties confirmed) |
 | `release_milestone(authority, now, index)`        | `Funded`       | `Funded` (partial) / `Released` (final tranche) | initializer; milestone dual-confirmed (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise) |
@@ -368,6 +370,51 @@ arbiter ruled). New vault fields (appended last): `disputed_at` (u64),
 `default_confirmed` (bool) — 26 bytes, so the full vault is now 994
 bytes / 7,809,120 lamports rent-exempt.
 
+**Subscription release (AV-56).** A subscription is the clock-driven
+counterpart to the milestone tranche plan (AV-15): the initializer may
+opt in on `Uninitialized` (`with_subscription(period_secs, periods,
+per_period)` / `initialize_subscription`, mutually exclusive with
+`with_milestones` — an escrow carries at most one release schedule) and
+the locked amount then pays out in `periods` equal tranches of
+`per_period`, one per `period_secs` seconds, released by the
+initializer's push (`release_period(period_index)`). The schedule is
+**back-scheduled** from `expires_at`: period `i` (0-based) is due at
+`expires_at - (periods - 1 - i) * period_secs`, so the last period is
+always due exactly at expiry and the whole schedule completes inside the
+escrow's lifetime. That pinning is deliberate — a forward-scheduled plan
+could strand its final periods past expiry behind a payout path that can
+never legally run, while here everything not yet due at expiry is exactly
+the refundable remainder: what became due pays out to the taker via
+`release_period`, what never became due stays refundable via
+`cancel_expired`. The validation list is the natural corollary —
+`period_secs` non-zero, `periods` in 1..=64 (the released bitmap is a
+u64), `per_period` non-zero, `periods * per_period` == the locked amount
+(summed in u128), `expires_at != u64::MAX` (back-scheduling needs a
+bounded lifetime), and the schedule must fit the lifetime — anything
+else is `InvalidSubscription`. Release is strictly in order: the
+`period_index` must equal the next due period (`PeriodNotDue` for
+skip-ahead or replay) and `now >= due_at(period_index)` (`PeriodNotDue`
+for an early call). A late-funded escrow simply finds its early periods
+immediately due — catch-up, not an error: no period is owed twice or
+skipped, only released early, still in order. All the familiar release
+gates ride along: quorum (`QuorumNotReached`), the timelock
+(`TimelockNotReached` — every taker payout path), `MintMismatch` and the
+payout policy (`PayoutNotAllowlisted`), and the AV-17 protocol fee slices
+each period (`payout + fee == per_period`); the last period moves `Funded
+-> Released`, and each release emits `SubscriptionPeriodReleased` (`from
+== Funded`, `to == Funded` — or `Released` on the last period; payout =
+gross per-period amount, fee, refund = 0). Keeper flow: the keeper scans
+for the next due period and submits `release_period` for it,
+initializer-signed — no keeper can skip ahead or double-release. Vesting
+plays along rather than blocking: the tranche accumulates in the shared
+`released` counter, so a taker-pull `claim` composes on the same
+schedule, and the `checked_add` backstop (`ReleaseExceedsLocked`) keeps
+the counter from outrunning the lockup even when vesting drew first.
+New vault fields (appended last): `subscription` (18 bytes: 1-byte
+discriminant + 17-byte schedule), `subscription_next` (u8),
+`subscription_released` (u64 bitmask) — 27 bytes, so the full vault is
+now 1021 bytes / 7,997,040 lamports rent-exempt.
+
 **Reference memo (off-chain correlation).** The initializer may bind an
 opt-in 32-byte **reference memo** (`with_reference` /
 `initialize_reference(reference)` on `Uninitialized`, e.g. an order id or
@@ -497,7 +544,11 @@ correlation id), so the full vault is now **968 bytes** and needs
 default-judgment region (1-byte discriminant + 16-byte judgment,
 zeroed when no default judgment is configured), and the 1-byte taker
 confirmation bit (26 bytes), so the full vault is now **994 bytes** and
-needs **7,809,120 lamports**.)
+needs **7,809,120 lamports**. AV-56 appends the 18-byte subscription
+schedule region (1-byte discriminant + 17-byte schedule, zeroed when no
+schedule is attached), the 1-byte next-period index, and the 8-byte
+per-period released bitmap (27 bytes), so the full vault is now **1021
+bytes** and needs **7,997,040 lamports**.)
 
 **Fee recipient pin (AV-44).** An escrow can additionally pin *where* the
 fee goes (`initialize_fee_recipient(fee_recipient)`, opt-in on
@@ -612,6 +663,8 @@ program error per variant):
 | `PayoutNotAllowlisted` | 127 | a payout transition (`release` / `claim` / `resolve` / `release_milestone` / `release_via_cpi`) naming a `payout_to` that is neither the taker nor a member of the payout allowlist |
 | `InvalidTaker` | 128 | `rotate_taker` with the zero address (a zero address can never be the legitimate payout counterparty) |
 | `DefaultJudgmentNotDue` | 129 | `trigger_default_judgment` with no default judgment configured, the taker never confirmed the split, or the arbitration deadline not yet passed; `with_arbitration_deadline` with a zero deadline |
+| `InvalidSubscription` | 130 | `with_subscription` with a zero `period_secs`, zero or over-long `periods`, a zero `per_period`, per-period amounts that do not sum to the locked amount, a `u64::MAX` expiry (back-scheduling needs a bounded lifetime), a schedule that does not fit inside the escrow's lifetime, or on a non-`Uninitialized` escrow; `with_milestones` after a subscription (mutually exclusive release schedules); any subscription operation on an escrow with no schedule attached; or plain `release` on an escrow with a subscription (the schedule owns the release path) |
+| `PeriodNotDue` | 131 | `release_period` with a `period_index` that is not the next due period (skipping ahead or replaying a released period), or with `now` before that period's back-scheduled due timestamp; periods release strictly in order, one at a time, each only once due |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1149,7 +1202,10 @@ two-way consistency check against the IDL parameter table:
 | disputed_at | u64 | 8 |
 | default_judgment | Option<DefaultJudgment> | 17 |
 | default_confirmed | bool | 1 |
-| **total**     |                   | **994** |
+| subscription | Option<SubscriptionSchedule> | 18 |
+| subscription_next | u8 | 1 |
+| subscription_released | u64 | 8 |
+| **total**     |                   | **1013** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1194,11 +1250,17 @@ the 33-byte off-chain reference memo region (AV-53: 1-byte discriminant
 was never disputed) — and the 17-byte default-judgment region (AV-55:
 1-byte discriminant + 16-byte judgment, zeroed when no default
 judgment is configured) — and the 1-byte taker confirmation bit
-(AV-55, zeroed when the split is unconfirmed).
-`escrow-state` exposes `VAULT_SPACE` (994) and
-`VAULT_SPACE_NO_QUORUM` (504) for the Anchor `space =` constraint, plus a
+(AV-55, zeroed when the split is unconfirmed) — and the 18-byte
+subscription schedule region (AV-56: 1-byte discriminant + 17-byte
+schedule, zeroed when no schedule is attached) — and the 1-byte
+next-period index (AV-56, zeroed when no schedule is attached,
+advanced strictly in order by `release_period`) — and the 8-byte
+per-period released bitmap (AV-56, zeroed when no schedule is
+attached; the `period_index` param selects which bit flips).
+`escrow-state` exposes `VAULT_SPACE` (1021) and
+`VAULT_SPACE_NO_QUORUM` (531) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **7,809,120 lamports** to be
+mainnet rent parameters the full vault needs **7,997,040 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1219,14 +1281,14 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 994 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
+  stays 1021 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
   weighted-quorum, AV-46 pause-switch, AV-49 payout-allowlist, AV-51
-  vesting-cliff, AV-53 reference-memo, and AV-55 default-judgment
-  growth is accounted in the
+  vesting-cliff, AV-53 reference-memo, AV-55 default-judgment, and
+  AV-56 subscription growth is accounted in the
   layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**7,809,120
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**7,997,040
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the
@@ -1244,7 +1306,7 @@ the whole instruction aborts with zero side effects (state, counters
 and the event log all roll back). The initializer signs once instead
 of twice, and the rent-exempt deposit returns together with the
 payout. The indexer sees the fixed `Released` → `VaultClosed` event
-pair; the vault layout is untouched (`VAULT_SPACE` stays 994).
+pair; the vault layout is untouched (`VAULT_SPACE` stays 1021).
 
 ## IDL pipeline (AV-29)
 

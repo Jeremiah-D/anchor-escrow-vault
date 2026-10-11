@@ -162,6 +162,8 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         "Option<PayoutAllowlist>" => IdlType::Option(Box::new(IdlType::Named("PayoutAllowlist"))),
         "Option<DefaultJudgment>" => IdlType::Option(Box::new(IdlType::Named("DefaultJudgment"))),
+        // AV-56: periodic subscription release schedule.
+        "Option<SubscriptionSchedule>" => IdlType::Option(Box::new(IdlType::Named("SubscriptionSchedule"))),
         other => panic!("idl_json: unmapped VAULT_FIELDS type string: {other}"),
     }
 }
@@ -220,6 +222,13 @@ fn named_type_fields(name: &str) -> &'static [(&'static str, IdlType)] {
         "DefaultJudgment" => &[
             ("deadline_secs", IdlType::U64),
             ("default_taker_amount", IdlType::U64),
+        ],
+        // SubscriptionSchedule { period_secs: u64, periods: u8,
+        // per_period: u64 } (AV-56: 17 bytes).
+        "SubscriptionSchedule" => &[
+            ("period_secs", IdlType::U64),
+            ("periods", IdlType::U8),
+            ("per_period", IdlType::U64),
         ],
         other => panic!("idl_json: unknown named type: {other}"),
     }
@@ -432,6 +441,7 @@ fn render_idl_json() -> String {
         "MilestonePlan",
         "PayoutAllowlist",
         "DefaultJudgment",
+        "SubscriptionSchedule",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -586,6 +596,9 @@ fn named_type_sizes_pin_constants() {
     // AV-55: deadline + taker share.
     assert_eq!(size("DefaultJudgment"), DEFAULT_JUDGMENT_LEN);
     assert_eq!(size("DefaultJudgment"), 16);
+    // AV-56: period length + period count + per-period amount.
+    assert_eq!(size("SubscriptionSchedule"), SUBSCRIPTION_SCHEDULE_LEN);
+    assert_eq!(size("SubscriptionSchedule"), 17);
 }
 
 #[test]
@@ -653,7 +666,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 30, "error variant count drift");
+    assert_eq!(errors.len(), 32, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -665,6 +678,8 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::PayoutNotAllowlisted.code(), 127);
     assert_eq!(EscrowError::InvalidTaker.code(), 128);
     assert_eq!(EscrowError::DefaultJudgmentNotDue.code(), 129);
+    assert_eq!(EscrowError::InvalidSubscription.code(), 130);
+    assert_eq!(EscrowError::PeriodNotDue.code(), 131);
 }
 
 #[test]

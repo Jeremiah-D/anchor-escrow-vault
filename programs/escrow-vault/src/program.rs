@@ -1110,6 +1110,98 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Attach a periodic subscription release schedule (AV-56; mirrors
+    /// `Escrow::with_subscription`). `Uninitialized` only, like
+    /// `initialize_milestones`: the release cadence is fixed before
+    /// funds move. The locked amount is split into `periods` equal
+    /// tranches of `per_period`, one per `period_secs` seconds,
+    /// back-scheduled from `expires_at` — period `i` (0-based) is due
+    /// at `expires_at - (periods - 1 - i) * period_secs`, so the last
+    /// period is always due exactly at expiry and the schedule
+    /// completes within the escrow's lifetime. Validation:
+    /// `period_secs` non-zero, `periods` in 1..=64 (the released bitmap
+    /// is a u64), `per_period` non-zero, `periods * per_period` (in
+    /// u128) == the locked amount, `expires_at != u64::MAX`
+    /// (back-scheduling needs a bounded lifetime), and the schedule
+    /// must fit inside the lifetime. Mutually exclusive with the
+    /// milestone plan (`InvalidSubscription` if one is attached) — an
+    /// escrow carries at most one release schedule.
+    pub fn initialize_subscription(
+        ctx: Context<InitializeSubscription>,
+        period_secs: u64,
+        periods: u8,
+        per_period: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_subscription(period_secs, periods, per_period)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the full subscription
+        // region (18 bytes, zeroed when `None`), so the schedule is
+        // written in place — no realloc needed in the real build.
+        Ok(())
+    }
+
+    /// Release one due subscription period to the taker (AV-56; mirrors
+    /// `Escrow::release_period`). Only the initializer signs — like
+    /// `release`, period release is the initializer's push path. The
+    /// `period_index` must equal the next due period (`PeriodNotDue`
+    /// for skip-ahead or replay: periods release strictly in order,
+    /// each exactly once) and the period must be due (`now >= due_at`,
+    /// read from the Solana clock sysvar — never an instruction
+    /// param). Returns `(taker_payout, fee)` so the real build can size
+    /// the taker's transfer and the protocol fee (AV-17): the fee
+    /// slices the period (`payout + fee == per_period`). `Funded` only;
+    /// the schedule must be attached (`InvalidSubscription`); the
+    /// AV-04 quorum gate applies exactly as for `release`
+    /// (`QuorumNotReached`); the AV-27 timelock gates every taker
+    /// payout path (`TimelockNotReached` while `now < unlock_at`);
+    /// `MintMismatch` and `PayoutNotAllowlisted` guard the fund
+    /// movement like `release`. The tranche accumulates in the shared
+    /// `released` counter, so a vesting `claim` composes (not blocked).
+    /// The last period moves `Funded -> Released`. Emits
+    /// `SubscriptionPeriodReleased` (`from == Funded`, `to == Funded`
+    /// — or `Released` on the last period; payout = gross per-period
+    /// amount, fee, refund = 0).
+    pub fn release_period(ctx: Context<ReleasePeriod>, period_index: u8) -> Result<(u64, u64)> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        // AV-27: the timelock gate reads the Solana clock sysvar (see
+        // `release`).
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let (payout, fee) = escrow
+            .release_period(
+                ctx.accounts.initializer.key().to_bytes(),
+                now,
+                period_index,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+                ctx.accounts.payout_to.key().to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-31: settle via `cpi_settle_payout` — see `release` (the
+        // period payout settles as one payout + one fee leg).
+        // AV-18: `payout + fee` is the gross period; the final period
+        // carries to == Released.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::SubscriptionPeriodReleased,
+            from,
+            escrow.state() as u8,
+            payout + fee,
+            fee,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok((payout, fee))
+    }
+
     /// Bind one SPL token mint to the escrow (AV-16; mirrors
     /// `escrow_state::parse_mint_address` + `Escrow::with_mint`).
     /// `Uninitialized` only, like `initialize_quorum`: the token scope is
@@ -1958,6 +2050,35 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `default_judgment`).
     pub default_confirmed: bool,
+    /// AV-56: the periodic (subscription-style) release schedule;
+    /// mirrors `escrow_state`'s `subscription`. `None` for an escrow
+    /// with no schedule attached. The account always reserves the full
+    /// 18-byte region (1-byte discriminant + 17-byte schedule, zeroed
+    /// when `None`) so `initialize_subscription` writes it in place
+    /// without reallocating. Mutually exclusive with the milestone
+    /// tranche plan (AV-15) — an escrow carries at most one release
+    /// schedule. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `default_confirmed`).
+    pub subscription: Option<SubscriptionSchedule>,
+    /// AV-56: the index of the next subscription period due for
+    /// release; mirrors `escrow_state`'s `subscription_next`. Always
+    /// present (1 byte, zeroed when no schedule is attached), advanced
+    /// strictly in order by `release_period` — the `period_index`
+    /// param must equal this counter, so skipping ahead or replaying a
+    /// released period is impossible. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `subscription`).
+    pub subscription_next: u8,
+    /// AV-56: the per-period released bitmap — bit `i` is set once
+    /// period `i` has paid out; mirrors `escrow_state`'s
+    /// `subscription_released`. Always present (8 bytes, zeroed when
+    /// no schedule is attached); the `release_period` `period_index`
+    /// param selects which bit flips, so the bitmap and the in-order
+    /// counter double-guard the each-period-releases-once rule.
+    /// Layout position matches `escrow_state::VAULT_FIELDS`
+    /// (appended last, after `subscription_next`).
+    pub subscription_released: u64,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -2040,6 +2161,34 @@ pub struct DefaultJudgment {
     /// default judgment; mirrors
     /// `escrow_state::DefaultJudgment::default_taker_amount`.
     pub default_taker_amount: u64,
+}
+
+/// AV-56: skeleton mirror of `escrow_state::SubscriptionSchedule`: the
+/// periodic (subscription-style) release schedule — the locked amount
+/// is paid to the taker in `periods` equal tranches of `per_period`,
+/// one per `period_secs` seconds. A per-period alternative to the
+/// milestone tranche plan (AV-15): milestones are driven by deliverable
+/// confirmation, subscriptions by the clock — so the two are mutually
+/// exclusive and an escrow carries at most one release schedule. Periods
+/// are back-scheduled from the escrow's `expires_at` (period `i` is due
+/// at `expires_at - (periods - 1 - i) * period_secs`), so the schedule
+/// always completes within the escrow's lifetime; see the state machine
+/// docs for the validation / release semantics. Serialized size is
+/// pinned by `escrow_state::SUBSCRIPTION_SCHEDULE_LEN` (17 bytes).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct SubscriptionSchedule {
+    /// Seconds between period due dates (the schedule's cadence),
+    /// non-zero; mirrors
+    /// `escrow_state::SubscriptionSchedule::period_secs`.
+    pub period_secs: u64,
+    /// How many periods the lockup is split into (`1..=64` — the
+    /// per-period released bitmap is a u64); mirrors
+    /// `escrow_state::SubscriptionSchedule::periods`.
+    pub periods: u8,
+    /// The taker's payout per period; `periods * per_period` equals the
+    /// locked amount. Mirrors
+    /// `escrow_state::SubscriptionSchedule::per_period`.
+    pub per_period: u64,
 }
 
 /// AV-18: on-chain indexer event, the `emit!` mirror of
@@ -2170,6 +2319,14 @@ pub enum EscrowVaultEventKind {
     /// event; the rationale-document commitment is `None` (no arbiter
     /// ruled). Mirrors `escrow_state::EscrowEventKind::DefaultJudgment`.
     DefaultJudgment,
+    /// AV-56: one subscription period released to the taker
+    /// (`Escrow::release_period`). `from == Funded`, `to == Funded` —
+    /// or `Released` on the last period. Amounts follow the
+    /// `MilestoneReleased` shape (gross per-period amount / fee /
+    /// refund = 0); periods release strictly in order, each only once
+    /// due. Mirrors
+    /// `escrow_state::EscrowEventKind::SubscriptionPeriodReleased`.
+    SubscriptionPeriodReleased,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -2214,12 +2371,15 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         escrow_state::EscrowEventKind::DefaultJudgment => {
             EscrowVaultEventKind::DefaultJudgment
         }
+        escrow_state::EscrowEventKind::SubscriptionPeriodReleased => {
+            EscrowVaultEventKind::SubscriptionPeriodReleased
+        }
     }
 }
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    // Full vault space: 8-byte discriminator + 986-byte payload = 994
+    // Full vault space: 8-byte discriminator + 1013-byte payload = 1021
     // bytes (see `escrow_state::VAULT_SPACE`; AV-12 added the 1-byte
     // activation bitmask, AV-13 the 17-byte vesting region, AV-14 the
     // 33-byte arbiter region, AV-15 the 66-byte milestone plan + the
@@ -2234,11 +2394,13 @@ pub struct Initialize<'info> {
     // array + the 7-byte wider weight-sum threshold, AV-49 the 130-byte
     // payout-allowlist region, AV-53 the 33-byte reference-memo region,
     // AV-55 the 8-byte dispute timestamp + the 17-byte default-judgment
-    // region + the 1-byte confirmation bit).
+    // region + the 1-byte confirmation bit, AV-56 the 18-byte
+    // subscription-schedule region + the 1-byte next-period index + the
+    // 8-byte per-period released bitmap).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 7_809_120 lamports.
+    // rent parameters the minimum is 7_997_040 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
@@ -2595,6 +2757,41 @@ pub struct ReleaseMilestone<'info> {
     pub payout_to: AccountInfo<'info>,
     /// CHECK: Solana clock sysvar, read for the AV-27 timelock gate
     /// (never an instruction param — see `Release`).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build reads its `mint` for the state machine's `MintMismatch`
+    /// check; unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
+}
+
+/// AV-56: declare the periodic subscription release schedule
+/// (periods / cadence / per-period amount as instruction params).
+#[derive(Accounts)]
+pub struct InitializeSubscription<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer declares the release schedule; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized` (and rejects a schedule when a milestone plan
+    /// is already attached — the two are mutually exclusive).
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ReleasePeriod<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer drives period releases; the state machine
+    /// enforces the in-order, due-date, quorum and timelock gates.
+    pub initializer: Signer<'info>,
+    /// CHECK: beneficiary of the period tranche; receives the funds.
+    pub taker: AccountInfo<'info>,
+    /// CHECK: explicit payout destination (AV-49; see `Release`). The
+    /// state machine enforces the payout policy on it.
+    pub payout_to: AccountInfo<'info>,
+    /// CHECK: Solana clock sysvar, read for the period due-date check
+    /// (and the AV-27 timelock gate) — never an instruction param
+    /// (see `Release`).
     pub clock: AccountInfo<'info>,
     /// CHECK: the vault's SPL token account (see `Release`). The real
     /// build reads its `mint` for the state machine's `MintMismatch`
@@ -3132,6 +3329,10 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::DefaultJudgmentNotDue => {
             error!(ErrorCode::DefaultJudgmentNotDue)
         }
+        escrow_state::EscrowError::InvalidSubscription => {
+            error!(ErrorCode::InvalidSubscription)
+        }
+        escrow_state::EscrowError::PeriodNotDue => error!(ErrorCode::PeriodNotDue),
     }
 }
 
@@ -3195,4 +3396,8 @@ pub enum ErrorCode {
     PayoutNotAllowlisted,
     #[msg("Default judgment not due (AV-55): trigger_default_judgment with no default judgment configured, the taker never confirmed the split, or the arbitration deadline not yet passed; with_arbitration_deadline with a zero deadline")]
     DefaultJudgmentNotDue,
+    #[msg("Invalid subscription schedule (AV-56): with_subscription with a zero period_secs, zero or over-long periods, a zero per_period, per-period amounts that do not sum to the locked amount, a u64::MAX expiry (back-scheduling needs a bounded lifetime), a schedule that does not fit inside the escrow's lifetime, or on a non-Uninitialized escrow; with_milestones after a subscription (mutually exclusive release schedules); any subscription operation with no schedule attached; or plain release on an escrow with a subscription (the schedule owns the release path)")]
+    InvalidSubscription,
+    #[msg("Subscription period not due (AV-56): release_period with a period_index that is not the next due period (skipping ahead or replaying a released period), or with now before that period's back-scheduled due timestamp; periods release strictly in order, one at a time, each only once due")]
+    PeriodNotDue,
 }

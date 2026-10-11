@@ -138,6 +138,12 @@ pub enum KeeperActionKind {
     /// commitment are the arbiter's call-time judgment, not keeper
     /// inputs.
     Resolve,
+    /// `release_period(initializer, now, period_index, mint, payout_to)`
+    /// (AV-56): the initializer's push of the next due subscription
+    /// period. Listed for `Funded` escrows with an attached schedule
+    /// whose next period is due at the scan time — strictly in order,
+    /// one per scan.
+    ReleasePeriod,
 }
 
 impl KeeperActionKind {
@@ -149,6 +155,7 @@ impl KeeperActionKind {
             KeeperActionKind::CrankExpired => "crank_expired",
             KeeperActionKind::Claim => "claim",
             KeeperActionKind::Resolve => "resolve",
+            KeeperActionKind::ReleasePeriod => "release_period",
         }
     }
 }
@@ -202,8 +209,9 @@ pub struct KeeperAction {
     /// Carried for correlation only: it is never an instruction input
     /// and never affects which actions are listed.
     pub reference: Option<[u8; 32]>,
-    /// Machine-readable reason: `"expired"`, `"vesting_unlocked"`, or
-    /// `"disputed"` (AV-38, `resolve` actions).
+    /// Machine-readable reason: `"expired"`, `"vesting_unlocked"`,
+    /// `"disputed"` (AV-38, `resolve` actions), or
+    /// `"subscription_period_due"` (AV-56, `release_period` actions).
     pub reason: &'static str,
 }
 
@@ -460,6 +468,44 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 reference: w.reference,
                 reason: "vesting_unlocked",
             });
+        }
+        // AV-56: the initializer's push path for the next due
+        // subscription period. An escrow may legitimately list both a
+        // `Claim` (the taker's pull on the vesting curve) and a
+        // `ReleasePeriod` (the initializer's push of the next due
+        // period) — at most one per kind.
+        if let Some(schedule) = e.subscription_schedule() {
+            let next = e.subscription_next_period();
+            // `subscription_next` only ever runs in order, so the scan
+            // names exactly the period `release_period` accepts. The
+            // `per_period > 0` guard mirrors the builder's invariant;
+            // the schedule gates keep zero-value actions off the list.
+            if next < schedule.periods
+                && schedule.per_period > 0
+                && e.subscription_period_due_at(next)
+                    .map(|due_at| now >= due_at)
+                    .unwrap_or(false)
+            {
+                actions.push(KeeperAction {
+                    escrow_id: w.escrow_id,
+                    kind: KeeperActionKind::ReleasePeriod,
+                    caller: e.initializer(),
+                    caller_role: "initializer",
+                    mint: e.mint(),
+                    // A period release pays the taker, not a refund: no
+                    // refund destination applies.
+                    refund_to: None,
+                    amount: schedule.per_period,
+                    // AV-28: the report renders the amount in human
+                    // units alongside the raw value.
+                    decimals: e.decimals(),
+                    // AV-53: the off-chain correlation id rides the
+                    // action so the report JSON joins it to the
+                    // operator's records.
+                    reference: w.reference,
+                    reason: "subscription_period_due",
+                });
+            }
         }
     }
     KeeperReport {
@@ -1234,6 +1280,104 @@ mod keeper_tests {
             json.contains("\"amount\":500000,\"decimals\":6,\"display_amount\":\"0.500000\""),
             "claim display amount must serialize, got: {json}"
         );
+    }
+
+    // ----- AV-56: subscription period release -----
+
+    const SUB_PERIOD_SECS: u64 = 86_400;
+    const SUB_PERIODS: u8 = 4;
+    const SUB_PER_PERIOD: u64 = 250_000;
+    const SUB_EXPIRES: u64 = 1_800_000_000;
+
+    // The schedule is back-pinned so the last period is due at
+    // SUB_EXPIRES: period `i` is due at
+    // `SUB_EXPIRES - (4 - 1 - i) * 86_400`.
+    fn sub_due_at(i: u8) -> u64 {
+        SUB_EXPIRES - (SUB_PERIODS as u64 - 1 - i as u64) * SUB_PERIOD_SECS
+    }
+
+    fn funded_subscription() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, SUB_EXPIRES)
+            .unwrap()
+            .with_subscription(SUB_PERIOD_SECS, SUB_PERIODS, SUB_PER_PERIOD)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    #[test]
+    fn subscription_due_period_lists_release_period_for_initializer() {
+        // AV-56: at a period's due date the keeper lists the
+        // initializer's push path for exactly the next period — and
+        // nothing else (the escrow is unexpired and has no vesting).
+        let watched = [watch(ID1, funded_subscription())];
+        let report = scan_keeper_actions(&watched, sub_due_at(0));
+        assert_eq!(report.actions.len(), 1);
+        let a = report.actions[0];
+        assert_eq!(a.kind, KeeperActionKind::ReleasePeriod);
+        assert_eq!(a.escrow_id, ID1);
+        assert_eq!(a.caller, ALICE);
+        assert_eq!(a.caller_role, "initializer");
+        assert_eq!(a.mint, None);
+        assert_eq!(
+            a.refund_to, None,
+            "a period release pays the taker, it does not refund"
+        );
+        assert_eq!(a.amount, SUB_PER_PERIOD);
+        assert_eq!(a.decimals, 0);
+        assert_eq!(a.reason, "subscription_period_due");
+        // JSON shape: the new action name and reason serialize so
+        // operator tooling can route the push call.
+        let json = report.to_json();
+        assert!(json.contains("\"action\":\"release_period\""), "got: {json}");
+        assert!(
+            json.contains("\"reason\":\"subscription_period_due\""),
+            "got: {json}"
+        );
+    }
+
+    #[test]
+    fn subscription_not_yet_due_lists_no_release_period() {
+        // One second before the due date: the on-chain call would fail
+        // with PeriodNotDue, so the keeper lists nothing.
+        let watched = [watch(ID1, funded_subscription())];
+        let report = scan_keeper_actions(&watched, sub_due_at(0) - 1);
+        assert!(
+            report.is_empty(),
+            "a not-yet-due period is not executable: {report:?}"
+        );
+    }
+
+    #[test]
+    fn escrow_without_schedule_lists_no_release_period() {
+        // Neither a plain funded escrow nor a vesting one (which lists
+        // Claim) ever lists the subscription push path.
+        let watched = [
+            watch(ID1, funded(AMOUNT, NEVER)),
+            watch(ID2, funded_vesting(NEVER)),
+        ];
+        let report = scan_keeper_actions(&watched, MID);
+        assert!(
+            report
+                .actions
+                .iter()
+                .all(|a| a.kind != KeeperActionKind::ReleasePeriod),
+            "no schedule, no release_period: {report:?}"
+        );
+    }
+
+    #[test]
+    fn subscription_fully_released_lists_no_release_period() {
+        // All four periods released at their due dates: the escrow is
+        // Released — no keeper action at all.
+        let mut e = funded_subscription();
+        for i in 0..SUB_PERIODS {
+            e.release_period(ALICE, sub_due_at(i), i, None, BOB).unwrap();
+        }
+        assert_eq!(e.state(), EscrowState::Released);
+        let watched = [watch(ID1, e)];
+        let report = scan_keeper_actions(&watched, sub_due_at(SUB_PERIODS - 1));
+        assert!(report.is_empty());
     }
 }
 

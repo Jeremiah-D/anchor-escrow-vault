@@ -338,6 +338,24 @@
       "discriminator": [191, 214, 53, 76, 192, 229, 127, 24],
       "accounts": [],
       "args": []
+    },
+    {
+      "name": "initialize_subscription",
+      "discriminator": [208, 156, 144, 38, 56, 65, 152, 18],
+      "accounts": [],
+      "args": [
+        {"name": "period_secs", "type": "u64"},
+        {"name": "periods", "type": "u8"},
+        {"name": "per_period", "type": "u64"}
+      ]
+    },
+    {
+      "name": "release_period",
+      "discriminator": [157, 185, 134, 132, 89, 6, 95, 95],
+      "accounts": [],
+      "args": [
+        {"name": "period_index", "type": "u8"}
+      ]
     }
   ],
   "accounts": [
@@ -377,7 +395,10 @@
           {"name": "reference", "type": {"option": {"array": ["u8", 32]}}, "offset": 935},
           {"name": "disputed_at", "type": "u64", "offset": 968},
           {"name": "default_judgment", "type": {"option": {"defined": "DefaultJudgment"}}, "offset": 976},
-          {"name": "default_confirmed", "type": "bool", "offset": 993}
+          {"name": "default_confirmed", "type": "bool", "offset": 993},
+          {"name": "subscription", "type": {"option": {"defined": "SubscriptionSchedule"}}, "offset": 994},
+          {"name": "subscription_next", "type": "u8", "offset": 1012},
+          {"name": "subscription_released", "type": "u64", "offset": 1013}
         ]
       }
     }
@@ -436,6 +457,17 @@
           {"name": "default_taker_amount", "type": "u64", "offset": 8}
         ]
       }
+    },
+    {
+      "name": "SubscriptionSchedule",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "period_secs", "type": "u64", "offset": 0},
+          {"name": "periods", "type": "u8", "offset": 8},
+          {"name": "per_period", "type": "u64", "offset": 9}
+        ]
+      }
     }
   ],
   "errors": [
@@ -468,7 +500,9 @@
     {"code": 126, "name": "InvalidPayoutAllowlist"},
     {"code": 127, "name": "PayoutNotAllowlisted"},
     {"code": 128, "name": "InvalidTaker"},
-    {"code": 129, "name": "DefaultJudgmentNotDue"}
+    {"code": 129, "name": "DefaultJudgmentNotDue"},
+    {"code": 130, "name": "InvalidSubscription"},
+    {"code": 131, "name": "PeriodNotDue"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

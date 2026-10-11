@@ -37,9 +37,9 @@
 
 use super::{
     sha256, DefaultJudgment, Escrow, EscrowState, MilestonePlan, PayoutAllowlist, QuorumPolicy,
-    VestingSchedule, ANCHOR_DISCRIMINATOR_LEN, DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN,
-    MAX_ATTESTORS, MAX_MILESTONES, MAX_PAYOUT_ALLOWLIST, MILESTONE_PLAN_LEN, PAYOUT_ALLOWLIST_LEN,
-    PUBKEY_LEN, QUORUM_POLICY_LEN, VAULT_SPACE,
+    SubscriptionSchedule, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN, DEFAULT_JUDGMENT_LEN,
+    ESCROW_BODY_LEN, MAX_ATTESTORS, MAX_MILESTONES, MAX_PAYOUT_ALLOWLIST, MILESTONE_PLAN_LEN,
+    PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
 };
 
 /// Program-side `#[account]` type names, in Anchor IDL order. The single
@@ -433,6 +433,35 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // present (zeroed when unconfirmed); appended last so every earlier
     // offset above is unchanged.
     let default_confirmed = c.u8()? != 0;
+    // AV-56: periodic subscription release schedule, always reserved
+    // like `reference`: the `None` discriminant followed by a zeroed
+    // 17-byte schedule, so `with_subscription` writes in place;
+    // appended last so every earlier offset above is unchanged.
+    let subscription = if c.option_present("subscription")? {
+        let period_secs = c.u64_le()?;
+        let periods = c.u8()?;
+        let per_period = c.u64_le()?;
+        debug_assert_eq!(
+            SUBSCRIPTION_SCHEDULE_LEN, 17,
+            "subscription region drift vs SUBSCRIPTION_SCHEDULE_LEN"
+        );
+        Some(SubscriptionSchedule {
+            period_secs,
+            periods,
+            per_period,
+        })
+    } else {
+        c.skip(SUBSCRIPTION_SCHEDULE_LEN)?;
+        None
+    };
+    // AV-56: index of the next subscription period to release, always
+    // present (zeroed when no schedule is attached); appended last so
+    // every earlier offset above is unchanged.
+    let subscription_next = c.u8()?;
+    // AV-56: per-period released bitmap, always present (zeroed when no
+    // schedule is attached); appended last so every earlier offset
+    // above is unchanged.
+    let subscription_released = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -481,6 +510,15 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-55: the taker's confirmation bit is persisted — a decoded
         // escrow carries the same agreement state.
         default_confirmed,
+        // AV-56: the subscription schedule is persisted — a decoded
+        // escrow carries the same release cadence the initializer
+        // bound at setup.
+        subscription,
+        // AV-56: the next-period counter and the per-period released
+        // bitmap are persisted — a decoded escrow resumes the same
+        // strictly-in-order release progress.
+        subscription_next,
+        subscription_released,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

@@ -106,7 +106,7 @@
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
 //! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52) | 0 | 0 | 0 | 0 |
-//! | Released, Claimed, MilestoneReleased | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
+//! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
 //! | ExpiredCranked (AV-48) | 0 | 0 | remainder minus penalty, to the whitelisted destination (the cranker receives nothing) | anti-griefing penalty to the initializer (AV-24; 0 unless the cranker is the taker) |
@@ -239,6 +239,14 @@ pub enum EscrowEventKind {
     /// the rationale-document commitment is `None` — there is no
     /// arbiter's ruling to reference.
     DefaultJudgment,
+    /// AV-56: a subscription period was paid out to the taker
+    /// ([`Escrow::release_period`]) — the initializer's push path for a
+    /// periodic subscription schedule. `from == Funded`, `to ==
+    /// Funded` — or `to == Released` on the last period. Amounts follow
+    /// the `Released` shape (`payout` = the gross per-period amount =
+    /// taker_payout + fee, `fee` = the AV-17 protocol fee, `refund` =
+    /// 0).
+    SubscriptionPeriodReleased,
 }
 
 /// Fund movements carried by an [`EscrowEvent`].
@@ -662,6 +670,21 @@ impl IndexedEscrow {
     /// [`Escrow::with_milestones`]). Configuration: emits no event.
     pub fn with_milestones(mut self, plan: MilestonePlan) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_milestones(plan)?;
+        Ok(self)
+    }
+
+    /// Attach a periodic subscription schedule (mirrors
+    /// [`Escrow::with_subscription`], AV-56). Configuration: emits no
+    /// event.
+    pub fn with_subscription(
+        mut self,
+        period_secs: u64,
+        periods: u8,
+        per_period: u64,
+    ) -> Result<Self, EscrowError> {
+        self.inner = self
+            .inner
+            .with_subscription(period_secs, periods, per_period)?;
         Ok(self)
     }
 
@@ -1481,6 +1504,44 @@ impl IndexedEscrow {
         Ok((payout, fee))
     }
 
+    /// Release a subscription period to the taker (mirrors
+    /// [`Escrow::release_period`], AV-56). Emits
+    /// `SubscriptionPeriodReleased` with the gross per-period amount in
+    /// `amounts.payout`; `from == Funded`, `to == Funded` — or `to ==
+    /// Released` on the last period. Returns `(taker_payout, fee)` like
+    /// the inner method. `at` is both the event timestamp and the state
+    /// machine's `now` (due-date + AV-27 timelock gates).
+    pub fn release_period(
+        &mut self,
+        authority: [u8; 32],
+        index: u8,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+        at: u64,
+    ) -> Result<(u64, u64), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self
+            .inner
+            .release_period(authority, at, index, mint, payout_to);
+        let (payout, fee) = self.map_reentrant(result, at)?;
+        // `payout + fee` is the gross per-period amount
+        // (`== per_period` by construction); no overflow possible.
+        self.push_event(
+            EscrowEventKind::SubscriptionPeriodReleased,
+            from,
+            self.inner.state(),
+            EventAmounts::payout(payout + fee, fee),
+            at,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok((payout, fee))
+    }
+
     /// Skip a milestone by mutual agreement (mirrors
     /// [`Escrow::skip_milestone`]). Emits `MilestoneSkipped` only when
     /// the skip executes (both approvals present); a lone approval emits
@@ -1645,6 +1706,24 @@ mod event_tests {
         IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
             .unwrap()
             .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap()
+    }
+
+    // AV-56: 4 periods of 250_000 == the 1_000_000 lockup. The schedule
+    // is back-pinned so the last period is due at EXPIRES_AT: period
+    // `i` is due at `EXPIRES_AT - (4 - 1 - i) * 86_400`.
+    const SUB_PERIOD_SECS: u64 = 86_400;
+    const SUB_PERIODS: u8 = 4;
+    const SUB_PER_PERIOD: u64 = 250_000;
+
+    fn sub_due_at(i: u8) -> u64 {
+        EXPIRES_AT - (SUB_PERIODS as u64 - 1 - i as u64) * SUB_PERIOD_SECS
+    }
+
+    fn subscription_indexed() -> IndexedEscrow {
+        IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_subscription(SUB_PERIOD_SECS, SUB_PERIODS, SUB_PER_PERIOD)
             .unwrap()
     }
 
@@ -2158,6 +2237,48 @@ mod event_tests {
             600_000,
             T0 + 6,
         );
+    }
+
+    #[test]
+    fn subscription_period_release_emits() {
+        // AV-56: every period pays out to the taker in due-date order.
+        // The first three releases are partial (`from == to == Funded`);
+        // the last one closes the escrow (`to == Released`).
+        let mut e = subscription_indexed();
+        e.fund(ALICE, T0 + 1).unwrap();
+        for (i, seq) in (0..SUB_PERIODS - 1).zip(2..5u64) {
+            let due = sub_due_at(i);
+            let (payout, fee) = e.release_period(ALICE, i, None, BOB, due).unwrap();
+            assert_eq!((payout, fee), (SUB_PER_PERIOD, 0));
+            assert_event(
+                &last(&e),
+                EscrowEventKind::SubscriptionPeriodReleased,
+                seq,
+                EscrowState::Funded,
+                EscrowState::Funded,
+                SUB_PER_PERIOD,
+                0,
+                0,
+                due,
+            );
+        }
+        let due_last = sub_due_at(SUB_PERIODS - 1);
+        let (payout, fee) = e
+            .release_period(ALICE, SUB_PERIODS - 1, None, BOB, due_last)
+            .unwrap();
+        assert_eq!((payout, fee), (SUB_PER_PERIOD, 0));
+        assert_event(
+            &last(&e),
+            EscrowEventKind::SubscriptionPeriodReleased,
+            5,
+            EscrowState::Funded,
+            EscrowState::Released,
+            SUB_PER_PERIOD,
+            0,
+            0,
+            due_last,
+        );
+        assert_eq!(e.inner().subscription_released_periods(), 0b1111);
     }
 
     // ----- failed transitions emit nothing -----
