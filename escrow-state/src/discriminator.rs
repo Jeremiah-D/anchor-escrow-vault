@@ -503,6 +503,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // above is unchanged.
     let max_extension_secs = c.u64_le()?;
     let extension_count = c.u64_le()?;
+    // AV-63: the absolute protocol-fee ceiling, always present (zeroed
+    // = uncapped when no cap was configured); appended last so every
+    // earlier offset above is unchanged.
+    let fee_cap = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -574,6 +578,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // history the setup and the extensions recorded.
         max_extension_secs,
         extension_count,
+        // AV-63: the protocol-fee ceiling is persisted — a decoded
+        // escrow carries the same cap the setup recorded, so the fee
+        // charged on-chain after a decode matches the fee charged
+        // before serialization.
+        fee_cap,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

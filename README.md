@@ -77,7 +77,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `release_milestone(authority, now, index)`        | `Funded`       | `Funded` (partial) / `Released` (final tranche) | initializer; milestone dual-confirmed (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise) |
 | `skip_milestone(authority, index)`           | `Funded`       | — (no state change) | initializer **or** taker, **both** must approve (dual-sig skip; skipped tranche refunded to the initializer) |
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
-| `initialize_protocol_fee(fee_bps)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `fee_bps` in 0–10000 basis points; the fee slices every taker payout into net payout + protocol fee) |
+| `initialize_protocol_fee(fee_bps)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `fee_bps` in 0–10000 basis points; the fee slices every taker payout into net payout + protocol fee; the AV-63 fee cap can floor it per payout) |
+| `initialize_fee_cap(max_fee_cents)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; absolute per-payout fee ceiling in lamports — the effective fee is `min(bps fee, fee_cap)`; `0` means uncapped; no new error code) |
 | `initialize_fee_recipient(fee_recipient)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding; pins the destination of every fee leg — the settlement builders reject a `fee_leg` that does not equal it; zero address is `InvalidFeeRecipient`; with no pin the fee goes to the program-level fee account) |
 | `initialize_pause_authority(pause_authority)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding; binds the key allowed to engage/release the emergency pause; zero address is `InvalidPauseAuthority`) |
 | `pause()`                                     | any            | — (no state change; sets the pause flag) | the bound pause authority only (`Unauthorized` otherwise; `InvalidStateTransition` with no authority bound or when already paused); emits `Paused` |
@@ -525,7 +526,9 @@ immutable afterwards, like every other `with_*` builder.
 
 The fee is charged on every taker payout — `release`, `claim`,
 `release_milestone`, and the taker's share of `resolve` — as
-`floor(gross_payout × fee_bps / 10_000)`, computed in `u128` so the
+`floor(gross_payout × fee_bps / 10_000)`, floored by the AV-63 absolute
+fee ceiling when one is configured (the effective fee is `min(bps fee,
+fee_cap)`), computed in `u128` so the
 multiplication can never overflow (the quotient is always `<=` the gross,
 so the downcast is exact). Floor rounding means dust payouts may carry a
 zero fee: the protocol never rounds *up* into the taker's pocket. Each
@@ -536,7 +539,9 @@ initializer). The fee always slices the gross payout: `taker_payout + fee
 == gross` for every payout, and the cumulative `fees_paid` counter is a
 routing slice of the gross `released` counter — so the conservation
 invariant (`inflow == locked + released + refunded`, pinned by the
-model-based fuzz test) is untouched by fees. Refunds (`cancel`,
+model-based fuzz test) is untouched by fees, and the AV-63 ceiling keeps
+that guarantee by construction (a capped fee is always `<=` the uncapped
+bps fee `<=` the gross). Refunds (`cancel`,
 `cancel_expired`), the initializer's `resolve` share, and skipped
 milestones are never fee'd: only value the taker receives carries a fee.
 The rate (`fee_bps`, 2 bytes) and the cumulative counter (`fees_paid`,
@@ -573,7 +578,10 @@ needs a realloc — so the full vault is now **2184 bytes** and needs
 `max_extension_secs` (zeroed when extension is not enabled) and the
 8-byte extension counter `extension_count` (zeroed when never
 extended) — 16 bytes, so the full vault is now **2200 bytes** and
-needs **16,202,880 lamports**.)
+needs **16,202,880 lamports**. AV-63 appends the 8-byte absolute
+protocol-fee ceiling `fee_cap` (zeroed = uncapped when no ceiling is
+configured) — 8 bytes, so the full vault is now **2208 bytes** and
+needs **16,258,560 lamports**.)
 
 **Fee recipient pin (AV-44).** An escrow can additionally pin *where* the
 fee goes (`initialize_fee_recipient(fee_recipient)`, opt-in on
@@ -591,6 +599,35 @@ no fee leg (dust payouts carry no fee, floor-rounded). The recipient is a
 persisted 33-byte region in the vault account (see the layout table),
 appended last so every earlier field offset stays stable, and is exported
 in the AV-26 snapshot JSON (`"fee_recipient"`, `null` when unpinned).
+
+**Absolute fee ceiling (AV-63).** An escrow can additionally cap the
+*size* of the AV-17 fee (`initialize_fee_cap(max_fee_cents)`, opt-in on
+`Uninitialized`, like every other `with_*` builder): after the bps rate
+computes the fee for a payout, the ceiling floors it — the effective fee
+is `min(floor(gross_payout × fee_bps / 10_000), fee_cap)`. A pure bps rate
+grows without bound on whale-sized payouts (10 bps of a 9-figure
+settlement is a 6-figure fee); pinning a ceiling at `initialize` time
+makes the maximum per-payout fee a term of the escrow itself — a
+consumer-protection-style cap the taker can read on-chain before
+activating — while small payouts stay on the fair bps rate (the cap only
+binds when the bps fee would exceed it). `0` is valid and means
+"uncapped" (the default, backward compatible): a zero *fee* is expressed
+via `fee_bps == 0`, so the sentinel cannot be confused with a fee waiver —
+this mirrors the AV-27 timelock (`0` = no lock) and the AV-51 cliff (`0` =
+no cliff) conventions. There is deliberately **no new error code**: a
+zero cap is a legitimate choice, and the builder is order-independent
+with `with_protocol_fee` (the ceiling applies at fee-computation time,
+so either call order gives the same effective fees). The cap applies
+inside `protocol_fee_for` — the one fee-computation point — so every
+taker-payout path (`release`, `claim`, `release_milestone`, the taker's
+share of `resolve`, and `release_period`) charges the capped fee, and the
+keeper / batch / settlement-plan previews that call `protocol_fee_for`
+preview the same number the chain will charge. Events keep their shape:
+the payout events already report `(payout, fee)`, and the capped fee
+flows through automatically. The ceiling is a persisted 8-byte region in
+the vault account (see the layout table), appended last so every earlier
+field offset stays stable, and is exported in the AV-26 snapshot JSON
+(`"fee_cap"`, `0` when uncapped).
 
 **Emergency pause (AV-46).** An escrow can bind an emergency-pause
 authority (`initialize_pause_authority(pause_authority)`, opt-in on
@@ -738,7 +775,9 @@ deadlines and the count). The keeper's `cancel_expired` listing and the
 snapshot export read the live `expires_at`, so both follow extensions
 automatically. New vault fields (appended last): `max_extension_secs`
 (u64), `extension_count` (u64) — 16 bytes, so the full vault is now
-2200 bytes / 16,202,880 lamports rent-exempt.
+2200 bytes / 16,202,880 lamports rent-exempt. AV-63 appends
+`fee_cap` (u64) — 8 bytes, so the full vault is now 2208 bytes /
+16,258,560 lamports rent-exempt.
 
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
@@ -1272,7 +1311,8 @@ Raw fields: `initializer`, `taker`, `state` (`uninitialized` / `activated` /
 `decimals` (AV-28; `0` = no decimal metadata declared), `released`,
 `expires_at`, `grace_period`, `dual_sig`
 (`required` / `initializer_activated` / `taker_activated`), `fee_bps`,
-`fees_paid`, `fee_recipient` (AV-44; hex or `null`), `skipped`, `penalty_bps`, `unlock_at` (AV-27; `0` = no
+`fees_paid`, `fee_recipient` (AV-44; hex or `null`), `fee_cap` (AV-63;
+`0` = uncapped), `skipped`, `penalty_bps`, `unlock_at` (AV-27; `0` = no
 timelock), plus the optional `quorum`,
 `vesting`, `arbiter`, `mint`, `evidence_hash`, `rationale_hash` (AV-38;
 hex or `null`), `reference` (AV-53; hex or `null`), `refund_to` (hex or
@@ -1312,7 +1352,7 @@ diffing numbers while operators read whole tokens.
  "dual_sig":{"required":false,"initializer_activated":false,"taker_activated":false},
  "quorum":null,"vesting":null,"vested":0,"display_vested":"0.000000",
  "claimable":0,"display_claimable":"0.000000",
- "arbiter":null,"mint":null,"fee_bps":0,"fees_paid":0,"display_fees_paid":"0.000000","fee_recipient":null,
+ "arbiter":null,"mint":null,"fee_bps":0,"fees_paid":0,"display_fees_paid":"0.000000","fee_recipient":null,"fee_cap":0,
  "milestones":null,"skipped":0,"display_skipped":"0.000000",
  "evidence_hash":null,"rationale_hash":null,"refund_to":null,"refund_recipient":"...",
  "penalty_bps":0,"unlock_at":0,"unlock_eligible":true,"payout_allowlist":null,"reference":null,
@@ -1371,7 +1411,8 @@ two-way consistency check against the IDL parameter table:
 | event_slots | [EventHistorySlot; 64] | 1152 |
 | max_extension_secs | u64 | 8 |
 | extension_count | u64 | 8 |
-| **total**     |                   | **2192** |
+| fee_cap | u64 | 8 |
+| **total**     |                   | **2200** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1430,11 +1471,15 @@ valid-entry count (AV-57, zeroed when no events were recorded) — and
 the 1-byte configured ring capacity (AV-57, 64 by default) — and the
 1152-byte event slots (AV-57: 64 × 18-byte kind/at/actor entries,
 zeroed when no events were recorded; always reserved at the 64-entry
-ceiling so a smaller configured capacity never needs a realloc).
-`escrow-state` exposes `VAULT_SPACE` (2200) and
-`VAULT_SPACE_NO_QUORUM` (1710) for the Anchor `space =` constraint, plus a
+ceiling so a smaller configured capacity never needs a realloc) — and
+the 8-byte extension bound (AV-59: zeroed when extension is not enabled)
+— and the 8-byte extension counter (AV-59: zeroed when never extended) —
+and the 8-byte absolute protocol-fee ceiling (AV-63: zeroed = uncapped
+when no ceiling is configured).
+`escrow-state` exposes `VAULT_SPACE` (2208) and
+`VAULT_SPACE_NO_QUORUM` (1718) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **16,202,880 lamports** to be
+mainnet rent parameters the full vault needs **16,258,560 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1455,15 +1500,15 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 2200 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
+  stays 2208 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
   weighted-quorum, AV-46 pause-switch, AV-49 payout-allowlist, AV-51
   vesting-cliff, AV-53 reference-memo, AV-55 default-judgment,
-  AV-56 subscription, AV-57 event-history, and AV-59 extension growth
-  is accounted in the
+  AV-56 subscription, AV-57 event-history, AV-59 extension, and AV-63
+  fee-cap growth is accounted in the
   layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**16,202,880
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**16,258,560
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the
@@ -1481,7 +1526,7 @@ the whole instruction aborts with zero side effects (state, counters
 and the event log all roll back). The initializer signs once instead
 of twice, and the rent-exempt deposit returns together with the
 payout. The indexer sees the fixed `Released` → `VaultClosed` event
-pair; the vault layout is untouched (`VAULT_SPACE` stays 2200).
+pair; the vault layout is untouched (`VAULT_SPACE` stays 2208).
 
 ## IDL pipeline (AV-29)
 

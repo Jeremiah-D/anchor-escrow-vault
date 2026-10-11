@@ -390,6 +390,14 @@
       ]
     },
     {
+      "name": "initialize_fee_cap",
+      "discriminator": [252, 51, 179, 111, 77, 245, 39, 246],
+      "accounts": [],
+      "args": [
+        {"name": "max_fee_cents", "type": "u64"}
+      ]
+    },
+    {
       "name": "extend_expiry",
       "discriminator": [216, 39, 141, 15, 230, 100, 24, 26],
       "accounts": [],
@@ -445,7 +453,8 @@
           {"name": "event_capacity", "type": "u8", "offset": 1031},
           {"name": "event_slots", "type": {"array": [{"defined": "EventHistorySlot"}, 64]}, "offset": 1032},
           {"name": "max_extension_secs", "type": "u64", "offset": 2184},
-          {"name": "extension_count", "type": "u64", "offset": 2192}
+          {"name": "extension_count", "type": "u64", "offset": 2192},
+          {"name": "fee_cap", "type": "u64", "offset": 2200}
         ]
       }
     }

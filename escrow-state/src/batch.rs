@@ -564,7 +564,8 @@ fn scan_one(item: &BatchWatchItem, now: u64) -> BatchItemOutcome {
                 amount: remaining,
                 // `payout + fee == amount` by construction
                 // (`protocol_fee_for` is `floor(amount * fee_bps /
-                // 10_000) <= amount`).
+                // 10_000) <= amount`, floored by the AV-63 fee cap when
+                // one is configured).
                 payout: remaining - fee,
                 fee,
                 accounts,

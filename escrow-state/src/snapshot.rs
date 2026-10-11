@@ -206,6 +206,10 @@ pub struct EscrowSnapshot {
     /// Pinned protocol-fee recipient, or `None` when fees route to the
     /// program-level fee account (AV-44).
     pub fee_recipient: Option<[u8; 32]>,
+    /// Absolute protocol-fee ceiling in lamports, or `0` when no cap
+    /// was configured (AV-63): the effective fee per payout is
+    /// `min(bps fee, fee_cap)` when nonzero.
+    pub fee_cap: u64,
     /// Milestone plan progress, or `None` when none is attached
     /// (AV-15).
     pub milestones: Option<MilestoneSnapshot>,
@@ -337,6 +341,7 @@ impl Escrow {
             fee_bps: self.fee_bps(),
             fees_paid: self.fees_paid(),
             fee_recipient: self.fee_recipient(),
+            fee_cap: self.fee_cap(),
             milestones,
             skipped: self.skipped_amount(),
             evidence_hash: self.evidence_hash(),
@@ -489,6 +494,8 @@ impl EscrowSnapshot {
         // route to the program-level fee account.
         s.push_str("\",\"fee_recipient\":");
         write_opt_hex(&mut s, self.fee_recipient);
+        s.push_str(",\"fee_cap\":");
+        s.push_str(&self.fee_cap.to_string());
         // AV-15: milestone plan progress. (`fee_recipient` is self-
         // quoted-or-null via `write_opt_hex`, so no dangling quote to
         // close here — unlike the `display_*` fields above.)
@@ -660,7 +667,7 @@ mod snapshot_tests {
              \"quorum\":null,\
              \"vesting\":null,\"vested\":0,\"display_vested\":\"0\",\"claimable\":0,\"display_claimable\":\"0\",\
              \"arbiter\":null,\"mint\":null,\
-             \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\
+             \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\
              \"milestones\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\

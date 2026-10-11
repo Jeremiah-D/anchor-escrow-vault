@@ -1847,6 +1847,34 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to an absolute protocol-fee ceiling at setup time (AV-63;
+    /// mirrors `Escrow::with_fee_cap`). `Uninitialized` only — the
+    /// ceiling is fixed before any funds move, like every other
+    /// `with_*` builder. After this, the effective fee per payout is
+    /// `min(bps fee, fee_cap)`: whale-sized payouts stop growing the
+    /// protocol's fee leg without bound. A zero cap is valid and means
+    /// "uncapped" (the default) — no new error code: a zero *fee* is
+    /// expressed via `fee_bps == 0`, so the sentinel cannot be confused
+    /// with a fee waiver, paralleling the AV-27 timelock and AV-51
+    /// cliff conventions. The 8-byte `vault.fee_cap` region is always
+    /// present (zeroed = uncapped), so the opt-in writes in place —
+    /// no realloc, no rent change. Emits no event (pre-fund
+    /// configuration).
+    pub fn initialize_fee_cap(
+        ctx: Context<InitializeFeeCap>,
+        max_fee_cents: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_fee_cap(max_fee_cents)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.fee_cap` is always present (8 bytes, zeroed = uncapped
+        // by default), so the ceiling is written in place — no realloc
+        // needed in the real build.
+        Ok(())
+    }
+
     /// Extend the expiry deadline in place (AV-59; mirrors
     /// `Escrow::extend_expiry`). A unilateral initializer power:
     /// extension only lengthens the taker's window, so no
@@ -2362,6 +2390,15 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `max_extension_secs`).
     pub extension_count: u64,
+    /// AV-63: absolute protocol-fee ceiling in lamports; mirrors
+    /// `escrow_state`'s `fee_cap`. `0` for an escrow with no cap
+    /// configured (uncapped — a zero *fee* is expressed via
+    /// `fee_bps == 0`). Always present (8 bytes, zeroed by default) so
+    /// `initialize_fee_cap` writes the ceiling in place without
+    /// reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `extension_count`).
+    pub fee_cap: u64,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -2728,7 +2765,7 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    // Full vault space: 8-byte discriminator + 2192-byte payload = 2200
+    // Full vault space: 8-byte discriminator + 2200-byte payload = 2208
     // bytes (see `escrow_state::VAULT_SPACE`; AV-12 added the 1-byte
     // activation bitmask, AV-13 the 17-byte vesting region, AV-14 the
     // 33-byte arbiter region, AV-15 the 66-byte milestone plan + the
@@ -2749,11 +2786,11 @@ pub struct Initialize<'info> {
     // head + the 8-byte monotonic event total + the 1-byte valid-entry
     // count + the 1-byte configured capacity + the 1152-byte event
     // slots, AV-59 the 8-byte extension bound + the 8-byte extension
-    // counter).
+    // counter, AV-63 the 8-byte absolute protocol-fee ceiling).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 16_202_880 lamports.
+    // rent parameters the minimum is 16_258_560 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
@@ -3325,6 +3362,17 @@ pub struct InitializeExtension<'info> {
     /// state machine rejects re-configuration once the escrow leaves
     /// `Uninitialized`, and rejects a zero bound (`InvalidExpiryExtension`,
     /// code 134).
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeFeeCap<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer sets the setup-time fee ceiling; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`. A zero cap is valid — it means "uncapped" (no
+    /// error, unlike the extension bound above).
     pub initializer: Signer<'info>,
 }
 

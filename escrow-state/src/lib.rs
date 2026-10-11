@@ -612,6 +612,36 @@ pub struct Escrow {
     /// (zeroed when never extended). Appended last so every earlier
     /// field offset stays stable.
     extension_count: u64,
+    /// AV-63: opt-in absolute protocol-fee ceiling in lamports (see
+    /// [`Escrow::with_fee_cap`]). `0` (the default) means no cap —
+    /// backward compatible: the fee is whatever
+    /// [`Escrow::protocol_fee_for`] computes from `fee_bps`. A nonzero
+    /// cap floors the fee — the effective fee is `min(bps fee, fee_cap)`
+    /// — so protocol revenue stays predictable on whale-sized payouts
+    /// (a consumer-protection-style ceiling: no matter how large the
+    /// payout, the taker's fee leg never exceeds this number).
+    ///
+    /// Why `0` means "uncapped" rather than "zero fee": a zero fee is
+    /// expressed by `fee_bps == 0` ([`Escrow::with_protocol_fee`]); a
+    /// zero *cap* would be indistinguishable from "free", so the
+    /// sentinel mirrors the AV-27 timelock (`0` = no lock) and the
+    /// AV-51 cliff (`0` = no cliff) conventions instead. Set once via
+    /// `with_fee_cap` on an `Uninitialized` escrow, like the other
+    /// `with_*` builders. Persisted (8 bytes in the vault account) so
+    /// the ceiling survives serialization. Appended last so every
+    /// earlier field offset stays stable.
+    ///
+    /// Design: the cap lives in [`Escrow::protocol_fee_for`] — not in
+    /// [`Escrow::charge_protocol_fee`] — so the one fee-computation
+    /// point serves every taker-payout path (`release`, `claim`,
+    /// `release_milestone`, the taker's share of `resolve`,
+    /// `release_period`) *and* the keeper / batch / settlement-plan
+    /// previews that call `protocol_fee_for` directly. The capped fee
+    /// is `<=` the uncapped bps fee `<=` the gross payout, so the
+    /// `fees_paid <= released` invariant (AV-17) holds under any cap —
+    /// even a cap below the smallest dust fee, which pins the fee to
+    /// exactly the cap.
+    fee_cap: u64,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -1776,6 +1806,12 @@ impl Escrow {
             // before funding; `extend_expiry` increments the counter.
             max_extension_secs: 0,
             extension_count: 0,
+            // AV-63: no protocol-fee cap by default (backward
+            // compatible): the fee is whatever `with_protocol_fee`'s
+            // rate computes. Opt in via `with_fee_cap` before funding;
+            // `0` means "uncapped" — a zero fee is expressed by
+            // `fee_bps == 0`.
+            fee_cap: 0,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -1944,7 +1980,9 @@ impl Escrow {
     /// protocol fee (AV-17) routed to the protocol fee account, so the
     /// caller (and the Anchor layer) can size both transfers.
     /// `taker_payout + fee == amount` always; the fee is
-    /// `floor(amount * fee_bps / 10_000)` and accumulates in
+    /// `floor(amount * fee_bps / 10_000)` (floored by the AV-63
+    /// [`Escrow::with_fee_cap`] ceiling when one is set) and
+    /// accumulates in
     /// [`Escrow::fees_paid`]. With no fee configured (`fee_bps == 0`)
     /// the fee is `0` and the taker receives the full amount — the
     /// pre-AV-17 behavior.
@@ -2787,7 +2825,9 @@ impl Escrow {
     /// share of [`Escrow::resolve`] — as
     /// `floor(gross_payout * fee_bps / 10_000)` (see
     /// [`Escrow::protocol_fee_for`]), accumulated in the `fees_paid`
-    /// counter. The refund paths (`cancel`, `cancel_expired`), the
+    /// counter. An absolute per-payout ceiling can be set on top via
+    /// [`Escrow::with_fee_cap`]: the effective fee is then `min(bps
+    /// fee, fee_cap)`. The refund paths (`cancel`, `cancel_expired`), the
     /// initializer's `resolve` share, and skipped milestones never
     /// carry a fee: only value the taker receives is feeable, and the
     /// fee is always a routing slice of the gross payout — it never
@@ -2813,14 +2853,36 @@ impl Escrow {
     /// `fee_bps <= 10_000`), so the downcast is exact. Floor rounding
     /// means dust payouts may carry a zero fee — the protocol never
     /// rounds *up* into the taker's pocket.
+    ///
+    /// AV-63: when an absolute fee ceiling is set
+    /// ([`Escrow::with_fee_cap`], `fee_cap > 0`), the effective fee is
+    /// `min(bps fee, fee_cap)` — the floor is applied here, at the one
+    /// fee-computation point, so every taker-payout path
+    /// ([`Escrow::release`], [`Escrow::claim`],
+    /// [`Escrow::release_milestone`], the taker's share of
+    /// [`Escrow::resolve`], [`Escrow::release_period`]) charges the
+    /// capped fee through [`Escrow::charge_protocol_fee`], and the
+    /// keeper / batch / settlement-plan previews that call this method
+    /// directly preview the same number the chain will charge. The
+    /// capped fee is `<=` the uncapped bps fee `<=` the gross payout,
+    /// so the `fees_paid <= released` invariant holds under any cap.
     pub fn protocol_fee_for(&self, amount: u64) -> u64 {
-        ((amount as u128 * self.fee_bps as u128) / 10_000u128) as u64
+        let bps_fee = ((amount as u128 * self.fee_bps as u128) / 10_000u128) as u64;
+        if self.fee_cap > 0 {
+            bps_fee.min(self.fee_cap)
+        } else {
+            bps_fee
+        }
     }
 
     /// Charge the protocol fee on a gross taker payout of `amount`
     /// (AV-17): accumulate it in `fees_paid` and return it. Called after
     /// all gates pass, immediately before mutating `released` — a failed
-    /// payout never touches the fee counter.
+    /// payout never touches the fee counter. The fee is the effective
+    /// (AV-63 cap-adjusted) one from [`Escrow::protocol_fee_for`], so
+    /// every caller — `release`, `claim`, `release_milestone`,
+    /// `resolve`'s taker share, `release_period` — charges the same
+    /// capped fee from this single point.
     ///
     /// `fees_paid` provably cannot overflow: each fee is `<=` its gross
     /// payout and the gross payouts cumulatively cap at `amount <=
@@ -2892,6 +2954,50 @@ impl Escrow {
     /// legs then route to the program-level fee account.
     pub fn fee_recipient(&self) -> Option<[u8; 32]> {
         self.fee_recipient
+    }
+
+    /// Opt in to an absolute protocol-fee ceiling (AV-63 — Solana /
+    /// payment fintech): after the [`Escrow::with_protocol_fee`] bps
+    /// rate computes the fee for a payout, `max_fee_cents` floors it —
+    /// the effective fee is `min(bps fee, fee_cap)`.
+    ///
+    /// Why: a pure bps rate grows without bound on whale-sized payouts
+    /// (10 bps of a 9-figure settlement is a 6-figure fee). Pinning a
+    /// ceiling at `initialize` time makes the maximum per-payout fee a
+    /// term of the escrow itself — a consumer-protection-style cap the
+    /// taker can read on-chain before activating — while keeping small
+    /// payouts on the fair bps rate (the cap only binds when the bps
+    /// fee would exceed it).
+    ///
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// ceiling is fixed before any funds move — mirroring
+    /// [`Escrow::with_protocol_fee`], [`Escrow::with_mint`] and
+    /// [`Escrow::with_fee_recipient`]. Re-configuring a live escrow is
+    /// rejected with `InvalidStateTransition`. `0` is valid and means
+    /// "uncapped" (the default, backward compatible) — a zero *fee* is
+    /// expressed via `fee_bps == 0`, so the zero sentinel cannot be
+    /// confused with a fee waiver; this mirrors the AV-27 timelock
+    /// (`0` = no lock) and AV-51 cliff (`0` = no cliff) conventions.
+    ///
+    /// Order-independent with [`Escrow::with_protocol_fee`]: the cap is
+    /// applied at fee-computation time ([`Escrow::protocol_fee_for`]),
+    /// not at builder time, so either call order gives the same
+    /// effective fees. Binding a cap with `fee_bps == 0` is accepted
+    /// but inert — nothing is charged regardless.
+    pub fn with_fee_cap(mut self, max_fee_cents: u64) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        self.fee_cap = max_fee_cents;
+        Ok(self)
+    }
+
+    /// The protocol-fee ceiling configured via [`Escrow::with_fee_cap`];
+    /// `0` when no cap was set (backward compatible: the fee is
+    /// whatever the bps rate computes).
+    pub fn fee_cap(&self) -> u64 {
+        self.fee_cap
     }
 
     /// Opt in to the emergency pause switch (AV-46 — Solana safety):
@@ -5533,6 +5639,11 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // never extended). Appended last so every earlier field offset
     // stays stable.
     ("extension_count", "u64", 8),
+    // AV-63: absolute protocol-fee ceiling in lamports (see
+    // `Escrow::with_fee_cap`): one u64, always present (zeroed = no
+    // cap, backward compatible). Appended last so every earlier field
+    // offset stays stable.
+    ("fee_cap", "u64", 8),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -5610,9 +5721,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// ceiling regardless of the configured capacity. The expiry-extension
 /// bound (AV-59) is always present too: 8 bytes, zeroed when extension
 /// is not enabled — and so is the extension counter (AV-59): 8 bytes,
-/// zeroed when the deadline was never extended.
+/// zeroed when the deadline was never extended. The absolute
+/// protocol-fee ceiling (AV-63) is likewise always present: 8 bytes,
+/// zeroed (uncapped) when no cap was configured.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -6156,7 +6269,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 16_202_880, "from {state:?}");
+            assert_eq!(rent, 16_258_560, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -6254,9 +6367,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 16_202_880 by
+        // VAULT_SPACE — pinned at 16_258_560 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 16_202_880);
+        assert_eq!(rent, 16_258_560);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -6414,11 +6527,11 @@ mod tests {
     fn release_and_close_adds_no_fields_and_keeps_space() {
         // AV-50 touches no persisted field: the release leg moves the
         // `released` / `fees_paid` counters and the state byte, and
-        // then the account is closed. VAULT_SPACE stays 2184 — re-asserted
+        // then the account is closed. VAULT_SPACE stays 2208 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 2200, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 16_202_880);
+        assert_eq!(VAULT_SPACE, 2208, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 16_258_560);
     }
 
     #[test]
@@ -6432,9 +6545,9 @@ mod tests {
         // (pause authority + pause flag), AV-51 by 8 (vesting
         // cliff), AV-53 by 33 (off-chain reference memo), and AV-55 by
         // 26 (dispute timestamp + default judgment + confirmation
-        // bit), so the
+        // bit), and AV-63 by 8 (absolute protocol-fee ceiling), so the
         // pin tracks the new total deliberately.
-        assert_eq!(VAULT_SPACE, 2200, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 2208, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -8617,6 +8730,36 @@ pub(crate) mod anchor_idl_tests {
                             no event (pre-fund configuration)",
         },
         InstructionSpec {
+            // AV-63: opt in to an absolute protocol-fee ceiling at setup
+            // time.
+            name: "initialize_fee_cap",
+            params: &[(
+                "max_fee_cents",
+                "u64",
+                "instruction param; the absolute ceiling (in lamports) \\
+                 that floors the AV-17 bps-computed fee per payout — \\
+                 the effective fee is min(bps fee, fee_cap)",
+            )],
+            method: "Escrow::with_fee_cap",
+            input_mapping: "max_fee_cents <- param (u64); authority \\
+                            <- accounts.initializer (signer), enforced by \\
+                            the Anchor account constraint, not the state \\
+                            machine; Uninitialized only, like \\
+                            initialize_quorum; a zero cap is valid — it \\
+                            means \"uncapped\" (no new error code: a zero \\
+                            fee is expressed via fee_bps == 0, so the \\
+                            sentinel cannot be confused with a fee \\
+                            waiver); the 8-byte region is always reserved \\
+                            (zeroed = uncapped when unset) so the opt-in \\
+                            writes in place without reallocating; the cap \\
+                            applies inside protocol_fee_for, so every \\
+                            fee-charging path (release, claim, \\
+                            release_milestone, the taker's share of \\
+                            resolve, release_period) charges the capped \\
+                            fee and the fee/indexer previews agree; emits \\
+                            no event (pre-fund configuration)",
+        },
+        InstructionSpec {
             // AV-59: extend the expiry deadline in place.
             name: "extend_expiry",
             params: &[(
@@ -8742,6 +8885,8 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::release_period",
             "Escrow::with_max_extension_secs",
             "Escrow::extend_expiry",
+            // AV-63: absolute protocol-fee ceiling.
+            "Escrow::with_fee_cap",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -8765,7 +8910,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_thirty_six_instructions_take_params() {
+    fn only_thirty_seven_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -8811,6 +8956,7 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_subscription",
                 &"release_period",
                 &"initialize_extension",
+                &"initialize_fee_cap",
                 &"extend_expiry",
             ]
         );
@@ -10410,6 +10556,10 @@ pub(crate) mod anchor_idl_tests {
         // field in place — a second param source for `expires_at`,
         // like `released` (written by multiple transitions).
         ("extend_expiry", "new_expires_at", "expires_at"),
+        // AV-63: the fee-cap param populates `fee_cap` directly (u64
+        // — 0 is the valid "uncapped" default, mirroring
+        // `initialize_grace_period`'s 0-sentinel).
+        ("initialize_fee_cap", "max_fee_cents", "fee_cap"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -12506,6 +12656,10 @@ mod account_space_tests {
         // when never extended); appended last so every earlier offset
         // above is unchanged.
         out.extend_from_slice(&e.extension_count.to_le_bytes());
+        // AV-63: absolute protocol-fee ceiling, always present (zeroed
+        // = uncapped when no cap is configured); appended last so
+        // every earlier offset above is unchanged.
+        out.extend_from_slice(&e.fee_cap.to_le_bytes());
         out
     }
 
@@ -12545,9 +12699,11 @@ mod account_space_tests {
         // ring head) + 8 (AV-57 monotonic event total) + 1 (AV-57
         // valid-entry count) + 1 (AV-57 configured capacity) + 1152
         // (AV-57 event slots: 64 x 18-byte kind/at/actor entries).
-        assert_eq!(ESCROW_BODY_LEN, 2192, "escrow payload bytes");
+        // + 8 (AV-59 extension bound) + 8 (AV-59 extension counter)
+        // + 8 (AV-63 absolute protocol-fee ceiling).
+        assert_eq!(ESCROW_BODY_LEN, 2200, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 2200, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 2208, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -12592,13 +12748,14 @@ mod account_space_tests {
         // (AV-57, 64 x 18-byte entries, zeroed when no events were
         // recorded) + 8-byte extension bound (AV-59, zeroed when
         // extension is not enabled) + 8-byte extension counter (AV-59,
-        // zeroed when never extended).
+        // zeroed when never extended) + 8-byte absolute protocol-fee
+        // ceiling (AV-63, zeroed = uncapped when no cap is configured).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1710);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1718);
     }
 
     #[test]
@@ -13005,16 +13162,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2200) * 3480 * 2 = 2328 * 6960 = 16_202_880 lamports.
-        assert_eq!(full, 16_202_880);
+        // (128 + 2208) * 3480 * 2 = 2336 * 6960 = 16_258_560 lamports.
+        assert_eq!(full, 16_258_560);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1710) * 3480 * 2 = 1838 * 6960 = 12_792_480 lamports.
-        assert_eq!(no_quorum, 12_792_480);
+        // (128 + 1718) * 3480 * 2 = 1846 * 6960 = 12_848_160 lamports.
+        assert_eq!(no_quorum, 12_848_160);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -13058,12 +13215,12 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(16_202_880, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(16_258_560, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(16_091_519, params.0, params.1),
             Err(RentShortfall {
-                required: 16_202_880,
+                required: 16_258_560,
                 provided: 16_091_519,
             })
         );
@@ -13076,7 +13233,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 16_202_880,
+                required: 16_258_560,
                 provided: 0,
             })
         );
@@ -15512,7 +15669,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2192, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) bytes");
+        assert_eq!(bytes.len(), 2200, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -15537,7 +15694,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 2192);
+        assert_eq!(bytes.len(), 2200);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -15559,18 +15716,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2200) * 3480 * 2 = 2328 * 6960 = 16_202_880 lamports.
-        assert_eq!(VAULT_SPACE, 2200);
-        assert_eq!(full, 16_202_880);
+        // (128 + 2208) * 3480 * 2 = 2336 * 6960 = 16_258_560 lamports.
+        assert_eq!(VAULT_SPACE, 2208);
+        assert_eq!(full, 16_258_560);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1710) * 3480 * 2 = 1838 * 6960 = 12_792_480 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1710);
-        assert_eq!(no_quorum, 12_792_480);
+        // (128 + 1718) * 3480 * 2 = 1846 * 6960 = 12_848_160 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1718);
+        assert_eq!(no_quorum, 12_848_160);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -15714,7 +15871,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2192);
+        assert_eq!(bytes.len(), 2200);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -15729,7 +15886,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 2192);
+        assert_eq!(bytes.len(), 2200);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -15760,18 +15917,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2200) * 3480 * 2 = 2328 * 6960 = 16_202_880 lamports.
-        assert_eq!(VAULT_SPACE, 2200);
-        assert_eq!(full, 16_202_880);
+        // (128 + 2208) * 3480 * 2 = 2336 * 6960 = 16_258_560 lamports.
+        assert_eq!(VAULT_SPACE, 2208);
+        assert_eq!(full, 16_258_560);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1710) * 3480 * 2 = 1838 * 6960 = 12_792_480 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1710);
-        assert_eq!(no_quorum, 12_792_480);
+        // (128 + 1718) * 3480 * 2 = 1846 * 6960 = 12_848_160 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1718);
+        assert_eq!(no_quorum, 12_848_160);
     }
 
     #[test]
@@ -16626,7 +16783,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 2192);
+        assert_eq!(bytes.len(), 2200);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -16801,7 +16958,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 2192, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59");
+        assert_eq!(ESCROW_BODY_LEN, 2200, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -16819,32 +16976,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 2200) * 3480 * 2 = 2328 * 6960 = 16_202_880 lamports.
+        // (128 + 2208) * 3480 * 2 = 2336 * 6960 = 16_258_560 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            16_202_880
+            16_258_560
         );
-        // (128 + 1710) * 3480 * 2 = 1838 * 6960 = 12_792_480 lamports.
+        // (128 + 1718) * 3480 * 2 = 1846 * 6960 = 12_848_160 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            12_792_480
+            12_848_160
         );
         // 1376 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 2200);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1710);
-        assert!(check_vault_rent_exempt(16_202_880, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 2208);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1718);
+        assert!(check_vault_rent_exempt(16_258_560, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -19271,9 +19428,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2192, "body 2176 + 16");
-        assert_eq!(VAULT_SPACE, 2200);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1710);
+        assert_eq!(bytes.len(), 2200, "body 2184 + 16");
+        assert_eq!(VAULT_SPACE, 2208);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1718);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -19817,7 +19974,7 @@ mod default_judgment_tests {
         // at 960, `default_judgment` at 968, `default_confirmed` at 985
         // (AV-55 body total 986). AV-56 appends `subscription` at 986,
         // `subscription_next` at 1004, `subscription_released` at 1005
-        // (body total 2192 after the AV-57 event-history + AV-59 extension appends).
+        // (body total 2200 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter(ARBITER)
@@ -19827,7 +19984,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2192);
+        assert_eq!(bytes.len(), 2200);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -20384,14 +20541,14 @@ mod subscription_tests {
     fn borsh_tail_pins_subscription_fields() {
         // Offsets: `default_confirmed` ends the AV-55 body at 986;
         // `subscription` at 986, `subscription_next` at 1004,
-        // `subscription_released` at 1005 (body total 2192 after the AV-57 + AV-59 appends).
+        // `subscription_released` at 1005 (body total 2200 after the AV-57 + AV-59 + AV-63 appends).
         let mut e = escrow()
             .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
             .unwrap();
         e.fund(ALICE).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2192);
+        assert_eq!(bytes.len(), 2200);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -20633,9 +20790,9 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 531 + EVENT_HISTORY_LEN + 16);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 531 + EVENT_HISTORY_LEN + 16 + 8);
     }
 
     #[test]
@@ -20643,13 +20800,13 @@ mod event_history_tests {
         // Offsets: `subscription_released` ends the AV-56 body at 1013;
         // `event_head` at 1013, `event_total` at 1014, `event_count` at
         // 1022, `event_capacity` at 1023, `event_slots` at 1024 (body
-        // total 2192 after the AV-59 append).
+        // total 2200 after the AV-59 + AV-63 appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2192);
+        assert_eq!(bytes.len(), 2200);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -20677,7 +20834,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16, "AV-59 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8, "AV-63 tail");
     }
 
     #[test]
@@ -20692,18 +20849,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2200) * 3480 * 2 = 2328 * 6960 = 16_202_880 lamports.
-        assert_eq!(VAULT_SPACE, 2200);
-        assert_eq!(full, 16_202_880);
+        // (128 + 2208) * 3480 * 2 = 2336 * 6960 = 16_258_560 lamports.
+        assert_eq!(VAULT_SPACE, 2208);
+        assert_eq!(full, 16_258_560);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1710) * 3480 * 2 = 1838 * 6960 = 12_792_480 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1710);
-        assert_eq!(no_quorum, 12_792_480);
+        // (128 + 1718) * 3480 * 2 = 1846 * 6960 = 12_848_160 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1718);
+        assert_eq!(no_quorum, 12_848_160);
     }
 
     // ----- decode -----
@@ -21010,5 +21167,486 @@ mod cancel_partial_tests {
         assert_eq!(ev.amounts.payout, 0);
         assert_eq!(ev.amounts.fee, 0);
         assert_eq!(ev.amounts.penalty, 0);
+    }
+}
+
+// ---------- AV-63: absolute protocol-fee ceiling ----------
+//
+// `with_fee_cap` fixes an absolute per-payout fee ceiling (0 = uncapped,
+// the default) before funding. The floor is applied inside
+// `protocol_fee_for` — the one fee-computation point — so every
+// taker-payout path (`release`, `claim`, `release_milestone`, the
+// taker's share of `resolve`, `release_period`) charges the capped fee,
+// and the keeper / batch / settlement-plan previews that call
+// `protocol_fee_for` preview the same number the chain will charge.
+#[cfg(test)]
+mod fee_cap_tests {
+    use super::*;
+    use crate::discriminator::{
+        decode_vault_account, instruction_discriminator, vault_account_discriminator,
+    };
+    use crate::keeper::{scan_milestones, MilestoneActionKind, WatchedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    /// A funded-time timestamp inside the vesting window used below.
+    const NOW: u64 = 1_750_000_000;
+
+    /// 10% fee with an absolute ceiling, built in the (rate, cap) order.
+    fn capped_escrow(cap: u64) -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(1_000) // 10%
+            .unwrap()
+            .with_fee_cap(cap)
+            .unwrap()
+    }
+
+    fn funded_capped_escrow(cap: u64) -> Escrow {
+        let mut e = capped_escrow(cap);
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    // ----- builder -----
+
+    #[test]
+    fn with_fee_cap_sets_and_getter_reads_back() {
+        let e = capped_escrow(7_500);
+        assert_eq!(e.fee_cap(), 7_500);
+    }
+
+    #[test]
+    fn with_fee_cap_zero_is_default_uncapped_backward_compatible() {
+        // No cap configured: the getter reads 0 and the fee is the pure
+        // AV-17 bps fee — the pre-AV-63 behavior is unchanged.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.fee_cap(), 0);
+        // An explicit 0 is a valid "uncapped", not a fee waiver.
+        let e = capped_escrow(0);
+        assert_eq!(e.fee_cap(), 0);
+        assert_eq!(e.protocol_fee_for(1_000_000), 100_000);
+        // The zero cap leaves every AV-17 fee expectation untouched.
+        let none = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_cap(0)
+            .unwrap();
+        assert_eq!(none.protocol_fee_for(u64::MAX), 0);
+    }
+
+    #[test]
+    fn with_fee_cap_rejects_reconfiguration_after_uninitialized() {
+        let e = funded_capped_escrow(7_500);
+        assert_eq!(
+            e.with_fee_cap(9_000).unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        // The failed builder leaves the pinned ceiling untouched.
+        assert_eq!(e.fee_cap(), 7_500);
+    }
+
+    #[test]
+    fn builder_order_is_independent() {
+        // (cap, rate) order gives the same escrow as (rate, cap): the
+        // ceiling is applied at fee-computation time, not builder time.
+        let forward = capped_escrow(7_500);
+        let reversed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_cap(7_500)
+            .unwrap()
+            .with_protocol_fee(1_000)
+            .unwrap();
+        assert_eq!(forward.fee_bps(), reversed.fee_bps());
+        assert_eq!(forward.fee_cap(), reversed.fee_cap());
+        assert_eq!(
+            forward.protocol_fee_for(400_000),
+            reversed.protocol_fee_for(400_000)
+        );
+    }
+
+    // ----- the floor itself -----
+
+    #[test]
+    fn cap_above_uncapped_fee_is_a_noop() {
+        // 10% of 400_000 = 40_000; the cap never binds.
+        let e = capped_escrow(50_000);
+        assert_eq!(e.protocol_fee_for(400_000), 40_000);
+    }
+
+    #[test]
+    fn cap_below_uncapped_fee_floors_exactly() {
+        // 10% of 400_000 = 40_000 -> floored to the cap.
+        let e = capped_escrow(7_500);
+        assert_eq!(e.protocol_fee_for(400_000), 7_500);
+    }
+
+    #[test]
+    fn cap_below_the_smallest_dust_fee_pins_to_cap() {
+        // Maximal cap pressure: a 100% rate makes every lamport feeable,
+        // so a cap of 1 is below even the smallest dust fee — and the
+        // effective fee becomes exactly the cap.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(10_000)
+            .unwrap()
+            .with_fee_cap(1)
+            .unwrap();
+        assert_eq!(e.protocol_fee_for(100), 1);
+        assert_eq!(e.protocol_fee_for(1), 1);
+        // A dust payout whose bps fee rounds to zero still rounds to
+        // zero under a cap: the protocol never rounds up.
+        let dust = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(1)
+            .unwrap()
+            .with_fee_cap(5_000)
+            .unwrap();
+        assert_eq!(dust.protocol_fee_for(1), 0);
+    }
+
+    #[test]
+    fn cap_never_floors_up_and_never_exceeds_gross() {
+        // The capped fee is <= the uncapped bps fee <= the gross payout
+        // by construction, even at u64::MAX with a 100% rate.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(10_000)
+            .unwrap()
+            .with_fee_cap(42)
+            .unwrap();
+        assert_eq!(e.protocol_fee_for(u64::MAX), 42);
+    }
+
+    // ----- all five charge paths charge the capped fee -----
+
+    #[test]
+    fn release_charges_capped_fee() {
+        let mut e = funded_capped_escrow(7_500);
+        // 10% of 400_000 = 40_000 -> 7_500 capped; the taker nets the rest.
+        let (payout, fee) = e.release(ALICE, NOW, 400_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (392_500, 7_500));
+        assert_eq!(payout + fee, 400_000, "fee is a slice of the gross");
+        assert_eq!(e.fees_paid(), 7_500);
+        assert_eq!(e.released_amount(), 400_000, "released keeps the gross");
+    }
+
+    #[test]
+    fn claim_charges_capped_fee() {
+        let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(1_000) // 10%
+            .unwrap()
+            .with_fee_cap(7_500)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        // Half the window elapsed: 500_000 vested; 10% = 50_000 -> 7_500.
+        let (payout, fee) = e.claim(BOB, NOW, None, BOB).unwrap();
+        assert_eq!((payout, fee), (492_500, 7_500));
+        assert_eq!(e.fees_paid(), 7_500);
+        assert_eq!(e.released_amount(), 500_000, "released keeps the gross");
+    }
+
+    #[test]
+    fn release_milestone_charges_capped_fee() {
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(1_000) // 10%
+            .unwrap()
+            .with_fee_cap(7_500)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        // 10% of 400_000 = 40_000 -> 7_500.
+        let (payout, fee) = e.release_milestone(ALICE, NOW, 0, None, BOB).unwrap();
+        assert_eq!((payout, fee), (392_500, 7_500));
+        assert_eq!(e.fees_paid(), 7_500);
+        assert_eq!(e.released_amount(), 400_000, "released keeps the gross");
+    }
+
+    #[test]
+    fn resolve_charges_capped_fee_on_taker_share_only() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(1_000) // 10%
+            .unwrap()
+            .with_fee_cap(7_500)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        // 10% of the 600_000 taker share = 60_000 -> 7_500; the
+        // initializer's 400_000 refund is untouched by the cap and by the fee.
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
+        assert_eq!((payout, fee, refund), (592_500, 7_500, 400_000));
+        assert_eq!(payout + fee, 600_000, "fee slices the taker's share");
+        assert_eq!(e.fees_paid(), 7_500);
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn release_period_charges_capped_fee() {
+        // The fifth fee-charging path (AV-56 subscription releases)
+        // charges the same capped fee — it calls the same
+        // `charge_protocol_fee`.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(1_000) // 10%
+            .unwrap()
+            .with_fee_cap(7_500)
+            .unwrap()
+            .with_subscription(EXPIRES_AT / 3, 4, 250_000)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        // Period 0 due at time 0; 10% of 250_000 = 25_000 -> 7_500.
+        let (payout, fee) = e.release_period(ALICE, 0, 0, None, BOB).unwrap();
+        assert_eq!((payout, fee), (242_500, 7_500));
+        assert_eq!(e.fees_paid(), 7_500);
+    }
+
+    #[test]
+    fn keeper_milestone_preview_previews_the_capped_fee() {
+        // The keeper's `release_milestone` preview reads
+        // `protocol_fee_for` directly (keeper.rs): the capped fee shows
+        // up in the off-chain report, never the uncapped one.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(1_000) // 10%
+            .unwrap()
+            .with_fee_cap(7_500)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        let report = scan_milestones(
+            &[WatchedEscrow {
+                escrow_id: [0x01; 32],
+                escrow: e,
+                reference: None,
+            }],
+            NOW,
+        );
+        let releases: Vec<_> = report
+            .actions
+            .iter()
+            .filter(|a| a.kind == MilestoneActionKind::ReleaseMilestone)
+            .collect();
+        assert_eq!(releases.len(), 1, "actions: {:?}", report.actions);
+        let r = releases[0];
+        assert_eq!(r.tranche, 400_000);
+        assert_eq!(r.fee, 7_500, "preview carries the capped fee");
+        assert_eq!(r.taker_payout, 392_500);
+    }
+
+    // ----- invariants -----
+
+    #[test]
+    fn fees_paid_never_exceeds_released_under_cap() {
+        // Capped fees accumulate across partial payouts and always stay
+        // a routing slice of the gross `released` counter — the AV-17
+        // invariant holds under maximal cap pressure too.
+        let mut e = funded_capped_escrow(1);
+        for (i, amount) in [300_000u64, 300_000, 400_000].iter().enumerate() {
+            e.release(ALICE, NOW, *amount, None, BOB).unwrap();
+            assert!(
+                e.fees_paid() <= e.released_amount(),
+                "payout {i}: fees_paid <= released"
+            );
+        }
+        assert_eq!(e.fees_paid(), 3, "one lamport per payout, capped");
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn fees_paid_conservation_across_combined_release_and_claim_flow() {
+        // A release followed by a claim on the same capped escrow:
+        // `fees_paid` equals the sum of the *effective* (capped) fees,
+        // and every payout keeps `taker_payout + fee == gross`.
+        let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(1_000) // 10%
+            .unwrap()
+            .with_fee_cap(15_000)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        // 10% of 400_000 = 40_000 -> capped at 15_000.
+        let (p1, f1) = e.release(ALICE, NOW, 400_000, None, BOB).unwrap();
+        assert_eq!((p1, f1), (385_000, 15_000));
+        assert_eq!(p1 + f1, 400_000);
+        // Half the window vested: 500_000 - 400_000 released = 100_000
+        // claimable; 10% = 10_000 < the cap, so no floor binds.
+        let (p2, f2) = e.claim(BOB, NOW, None, BOB).unwrap();
+        assert_eq!((p2, f2), (90_000, 10_000));
+        assert_eq!(p2 + f2, 100_000);
+        assert_eq!(e.fees_paid(), f1 + f2);
+        assert_eq!(e.fees_paid(), 25_000, "sum of effective fees");
+        assert!(e.fees_paid() <= e.released_amount());
+        assert_eq!(e.released_amount(), 500_000);
+    }
+
+    #[test]
+    fn refunds_skips_and_initializer_share_stay_fee_free() {
+        // cancel.
+        let mut e = funded_capped_escrow(7_500);
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(e.fees_paid(), 0);
+        // cancel_expired.
+        let mut e = funded_capped_escrow(7_500);
+        e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!(e.fees_paid(), 0);
+        // skip_milestone.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(1_000)
+            .unwrap()
+            .with_fee_cap(7_500)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.skip_milestone(ALICE, 0).unwrap();
+        e.skip_milestone(BOB, 0).unwrap();
+        assert_eq!(e.fees_paid(), 0);
+        // resolve with a zero taker share: the initializer takes
+        // everything and no fee is charged.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(1_000)
+            .unwrap()
+            .with_fee_cap(7_500)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        let (payout, fee, refund) = e.resolve(ARBITER, 0, None, None, BOB).unwrap();
+        assert_eq!((payout, fee, refund), (0, 0, 1_000_000));
+        assert_eq!(e.fees_paid(), 0);
+    }
+
+    // ----- layout -----
+
+    #[test]
+    fn layout_pins_include_the_fee_cap_tail() {
+        // +8 over the AV-59 numbers.
+        assert_eq!(ESCROW_BODY_LEN, 2200, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 2208, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1718, "no-quorum Vault account space");
+        assert_eq!(
+            rent_exempt_minimum_lamports(
+                VAULT_SPACE,
+                MAINNET_LAMPORTS_PER_BYTE_YEAR,
+                MAINNET_EXEMPTION_THRESHOLD_YEARS
+            ),
+            16_258_560,
+            "(128 + 2208) * 3480 * 2 = 2336 * 6960"
+        );
+        assert_eq!(
+            rent_exempt_minimum_lamports(
+                VAULT_SPACE_NO_QUORUM,
+                MAINNET_LAMPORTS_PER_BYTE_YEAR,
+                MAINNET_EXEMPTION_THRESHOLD_YEARS
+            ),
+            12_848_160,
+            "(128 + 1718) * 3480 * 2 = 1846 * 6960"
+        );
+    }
+
+    #[test]
+    fn fee_cap_persists_in_serialized_layout_tail() {
+        // `fee_cap` is the last persisted field: the final 8 bytes of
+        // the body, right after `extension_count` (AV-59).
+        let e = capped_escrow(7_500);
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes.len(), 2200);
+        assert_eq!(
+            u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
+            7_500,
+            "fee_cap at the tail"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[2184..2192].try_into().unwrap()),
+            0,
+            "extension_count offset unchanged"
+        );
+        // The structural decoder round-trips the cap.
+        let mut full = vault_account_discriminator().to_vec();
+        full.extend_from_slice(&bytes);
+        let decoded = decode_vault_account(&full).unwrap();
+        assert_eq!(decoded.fee_cap(), 7_500);
+        assert_eq!(decoded.fee_bps(), 1_000);
+    }
+
+    #[test]
+    fn fee_cap_defaults_zeroed_in_serialized_layout() {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(
+            &bytes[2192..2200],
+            &[0u8; 8],
+            "fee_cap: zeroed when uncapped"
+        );
+    }
+
+    // ----- IDL -----
+
+    #[test]
+    fn initialize_fee_cap_instruction_discriminator_is_pinned() {
+        // IDL: sha256("global:initialize_fee_cap")[..8] — the Anchor
+        // instruction discriminator, pinned here and in the generated
+        // escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("initialize_fee_cap"),
+            [0xfc, 0x33, 0xb3, 0x6f, 0x4d, 0xf5, 0x27, 0xf6]
+        );
+    }
+
+    #[test]
+    fn idl_spec_covers_with_fee_cap() {
+        // The INSTRUCTIONS table carries the new instruction with the
+        // right method and param, like every other with_* builder.
+        let spec = crate::anchor_idl_tests::INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "initialize_fee_cap")
+            .expect("INSTRUCTIONS covers initialize_fee_cap");
+        assert_eq!(spec.method, "Escrow::with_fee_cap");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "max_fee_cents");
+        assert_eq!(spec.params[0].1, "u64");
+    }
+
+    // ----- snapshot -----
+
+    #[test]
+    fn snapshot_exports_fee_cap() {
+        let e = funded_capped_escrow(7_500);
+        let snap = e.snapshot(NOW);
+        assert_eq!(snap.fee_cap, 7_500);
+        let json = snap.to_json();
+        assert!(
+            json.contains("\"fee_cap\":7500"),
+            "snapshot JSON exports the cap: {json}"
+        );
+        // Uncapped escrows keep the zero sentinel in the export.
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let plain_snap = plain.snapshot(NOW);
+        assert_eq!(plain_snap.fee_cap, 0);
+        assert!(plain_snap.to_json().contains("\"fee_cap\":0"));
     }
 }
