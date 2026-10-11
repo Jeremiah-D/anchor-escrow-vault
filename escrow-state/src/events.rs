@@ -57,6 +57,10 @@
 //!   payout counterparty moved, and the indexer reads the new taker
 //!   from the vault. A no-op rotation (same taker) emits nothing,
 //!   paralleling `update_quorum`'s no-op rule.
+//! - `rotate_initializer` emits [`EscrowEventKind::InitializerRotated`]
+//!   when the initializer actually changes (AV-58) — the exact mirror
+//!   of `rotate_taker`'s emission rule: `from == to ==` the current
+//!   state, all amounts zero; a no-op rotation emits nothing.
 //! - Partial `release` / `claim` calls emit [`EscrowEventKind::Released`]
 //!   / [`EscrowEventKind::Claimed`] with `from == to == Funded`: the
 //!   `EscrowState` variant does not change, but funds moved and the
@@ -105,7 +109,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
@@ -247,6 +251,16 @@ pub enum EscrowEventKind {
     /// taker_payout + fee, `fee` = the AV-17 protocol fee, `refund` =
     /// 0).
     SubscriptionPeriodReleased,
+    /// AV-58: the initializer (funding authority) was rotated by
+    /// dual-signed governance ([`Escrow::rotate_initializer`]) — the
+    /// mirror of [`EscrowEventKind::TakerRotated`]. `from == to ==`
+    /// the current state (a config change, not a lifecycle move —
+    /// like [`EscrowEventKind::QuorumUpdated`]); the new initializer
+    /// is read from the vault, the event is the ordering signal.
+    /// Emitted only on an actual change: rotating to the current
+    /// initializer is an idempotent no-op that emits nothing
+    /// (paralleling [`EscrowEventKind::TakerRotated`]'s no-op rule).
+    InitializerRotated,
 }
 
 impl EscrowEventKind {
@@ -288,6 +302,7 @@ impl EscrowEventKind {
             23 => Self::TakerRotated,
             24 => Self::DefaultJudgment,
             25 => Self::SubscriptionPeriodReleased,
+            26 => Self::InitializerRotated,
             _ => return None,
         })
     }
@@ -322,6 +337,7 @@ impl EscrowEventKind {
             Self::TakerRotated => "taker_rotated",
             Self::DefaultJudgment => "default_judgment",
             Self::SubscriptionPeriodReleased => "subscription_period_released",
+            Self::InitializerRotated => "initializer_rotated",
         }
     }
 }
@@ -1384,6 +1400,45 @@ impl IndexedEscrow {
             let state = self.inner.state();
             self.push_event(
             EscrowEventKind::TakerRotated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
+    /// Rotate the initializer by dual-signed governance (mirrors
+    /// [`Escrow::rotate_initializer`]) — the mirror of
+    /// [`IndexedEscrow::rotate_taker`]. Emits `InitializerRotated`
+    /// only when the initializer actually changes; `from == to ==`
+    /// the current state (a config change, not a lifecycle move —
+    /// like `QuorumUpdated`). `at` is the caller-supplied event
+    /// timestamp.
+    pub fn rotate_initializer(
+        &mut self,
+        old_initializer: [u8; 32],
+        taker: [u8; 32],
+        new_initializer: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.initializer();
+        self.inner
+            .rotate_initializer(old_initializer, taker, new_initializer)?;
+        let after = self.inner.initializer();
+        // The inner call rejects a stranger pair, wrong states, and the
+        // zero address, so a changed initializer here always means real
+        // governance — and a same-initializer no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+            EscrowEventKind::InitializerRotated,
             state,
             state,
             EventAmounts::none(),

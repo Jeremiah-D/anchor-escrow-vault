@@ -1658,6 +1658,63 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Rotate the initializer (funding authority) by dual-signed
+    /// governance (AV-58; mirrors `Escrow::rotate_initializer`). Both
+    /// the *current* initializer and the taker must sign — one party
+    /// alone (or a stranger pair) is `Unauthorized`; the degenerate
+    /// initializer == taker self-escrow authorizes with one key passed
+    /// twice, like AV-12 activation. Only `Uninitialized` / `Activated`
+    /// / `Funded`: the terminal states and `Disputed` are
+    /// `InvalidStateTransition` (no live escrow left to re-key, and
+    /// arbitration in flight adjudicates the initializer's identity —
+    /// it pays the refund to the initializer). The zero address is
+    /// `InvalidInitializer` (code 133). A paused escrow fails fast
+    /// (`Paused`) — rotation is a config transition, not the pause
+    /// key-loss escape hatch. On an actual change the initializer's
+    /// activation bit is cleared (the new key never signed activation);
+    /// rotating to the current initializer is an idempotent no-op.
+    /// Refunds follow automatically: the AV-23 whitelist pins the
+    /// destination when configured, else refunds resolve to the new
+    /// initializer. Emits `InitializerRotated` only on an actual change
+    /// (from == to == the current state), mirroring
+    /// `IndexedEscrow::rotate_initializer`.
+    pub fn rotate_initializer(
+        ctx: Context<RotateInitializer>,
+        new_initializer: Pubkey,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.initializer();
+        escrow
+            .rotate_initializer(
+                ctx.accounts.old_initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_initializer.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.initializer` in place in the real build (32
+        // bytes, always present) — no realloc, no rent change.
+        if escrow.initializer() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::InitializerRotated,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Clear the AV-27 timelock by dual-signed emergency governance
     /// (AV-41; mirrors `Escrow::emergency_unlock`). Both the initializer
     /// and the taker must sign — one party alone is `Unauthorized`.
@@ -2385,6 +2442,18 @@ pub enum EscrowVaultEventKind {
     /// due. Mirrors
     /// `escrow_state::EscrowEventKind::SubscriptionPeriodReleased`.
     SubscriptionPeriodReleased,
+    /// AV-49: the payout destination allowlist was updated by owner
+    /// governance (`Escrow::update_payout_allowlist`). Mirrors
+    /// `escrow_state::EscrowEventKind::PayoutAllowlistUpdated`.
+    PayoutAllowlistUpdated,
+    /// AV-52: the taker (payout counterparty) was rotated by
+    /// dual-signed governance (`Escrow::rotate_taker`). Mirrors
+    /// `escrow_state::EscrowEventKind::TakerRotated`.
+    TakerRotated,
+    /// AV-58: the initializer (funding authority) was rotated by
+    /// dual-signed governance (`Escrow::rotate_initializer`). Mirrors
+    /// `escrow_state::EscrowEventKind::InitializerRotated`.
+    InitializerRotated,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -2431,6 +2500,16 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::SubscriptionPeriodReleased => {
             EscrowVaultEventKind::SubscriptionPeriodReleased
+        }
+        // AV-49 / AV-52: pre-existing gaps — the skeleton mapped every
+        // emitted kind except these two; the one-event-per-kind
+        // convention (AV-18) requires them.
+        escrow_state::EscrowEventKind::PayoutAllowlistUpdated => {
+            EscrowVaultEventKind::PayoutAllowlistUpdated
+        }
+        escrow_state::EscrowEventKind::TakerRotated => EscrowVaultEventKind::TakerRotated,
+        escrow_state::EscrowEventKind::InitializerRotated => {
+            EscrowVaultEventKind::InitializerRotated
         }
     }
 }
@@ -2973,6 +3052,23 @@ pub struct RotateTaker<'info> {
 }
 
 #[derive(Accounts)]
+pub struct RotateInitializer<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's *current*
+    /// initializer. The old key consents to its own replacement, so a
+    /// stolen new key cannot self-install. A constraint in the real
+    /// build additionally asserts `old_initializer.key() ==
+    /// vault.initializer`.
+    pub old_initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. Both
+    /// parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`; the degenerate initializer == taker self-escrow
+    /// authorizes with one key passed twice, like AV-12 activation.
+    pub taker: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitializePayoutAllowlist<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
@@ -3394,6 +3490,16 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
             error!(ErrorCode::InvalidSubscription)
         }
         escrow_state::EscrowError::PeriodNotDue => error!(ErrorCode::PeriodNotDue),
+        escrow_state::EscrowError::InvalidEventCapacity => {
+            error!(ErrorCode::InvalidEventCapacity)
+        }
+        // AV-52: pre-existing gap — the skeleton mapped every variant
+        // except InvalidTaker; the one-error-per-variant convention
+        // (AV-06) requires it.
+        escrow_state::EscrowError::InvalidTaker => error!(ErrorCode::InvalidTaker),
+        escrow_state::EscrowError::InvalidInitializer => {
+            error!(ErrorCode::InvalidInitializer)
+        }
     }
 }
 
@@ -3461,4 +3567,10 @@ pub enum ErrorCode {
     InvalidSubscription,
     #[msg("Subscription period not due (AV-56): release_period with a period_index that is not the next due period (skipping ahead or replaying a released period), or with now before that period's back-scheduled due timestamp; periods release strictly in order, one at a time, each only once due")]
     PeriodNotDue,
+    #[msg("Invalid taker address (AV-52): rotate_taker with the zero address (a zero address can never be the legitimate payout counterparty)")]
+    InvalidTaker,
+    #[msg("Invalid event-history capacity (AV-57): with_event_capacity with capacity == 0 or capacity > 64")]
+    InvalidEventCapacity,
+    #[msg("Invalid initializer address (AV-58): rotate_initializer with the zero address (a zero address can never be the legitimate initializer)")]
+    InvalidInitializer,
 }

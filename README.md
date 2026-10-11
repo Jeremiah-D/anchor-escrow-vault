@@ -84,6 +84,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `unpause()`                                   | any            | — (no state change; clears the pause flag) | the bound pause authority only (same rules as `pause`; `InvalidStateTransition` when not paused); emits `Unpaused` |
 | `rotate_pause_authority(new_authority)`       | any (post-`Uninitialized`) | — (no state change; rewrites the bound pause authority) | the escrow authority (initializer) only — a stranger/taker is `Unauthorized`; `InvalidStateTransition` on `Uninitialized` or with no authority bound; zero address is `InvalidPauseAuthority`; works while paused (key-loss escape hatch); emits `PauseAuthorityRotated` only on an actual change |
 | `rotate_taker(new_taker)`                   | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the taker) | **both** the initializer and the *current* taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition` (no live counterparty left; arbitration in flight adjudicates the taker's identity); zero address is `InvalidTaker`; amount / released / attest records / milestone state all preserved; emits `TakerRotated` only on an actual change |
+| `rotate_initializer(new_initializer)`      | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the initializer) | **both** the *current* initializer and the taker must sign (dual-signature governance — the mirror of `rotate_taker`; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (arbitration in flight adjudicates the initializer's identity — the refund goes to the initializer); zero address is `InvalidInitializer`; on an actual change the initializer's activation signature bit is cleared (the new key never signed activation); the AV-23 whitelist pins the refund destination when configured, otherwise refunds resolve to the new initializer (keeper/snapshot follow automatically); emits `InitializerRotated` only on an actual change |
 | `initialize_quorum(attestors, weights, threshold)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
@@ -635,6 +636,36 @@ change emits the `TakerRotated` indexer event (`from == to ==` the
 current state). The keeper's claim listing and the snapshot export read
 the live taker field, so both follow the rotation automatically.
 
+**Initializer rotation (AV-58).** The *current* initializer and the taker
+may jointly rotate the funding authority (`rotate_initializer(new_initializer)`)
+— the mirror of taker rotation: a lost or compromised initializer key, a
+treasury wallet migration, an operator key rollover. Both parties must
+sign (one alone, or a stranger pair, is `Unauthorized`); the initializer
+side is authenticated against the *current* initializer, so the old key
+consents to its own replacement, and the degenerate initializer == taker
+self-escrow authorizes with one key passed twice (like AV-12 activation).
+Only `Uninitialized` / `Activated` / `Funded` — the terminal states have
+no live escrow left to re-key, and `Disputed` is excluded because
+arbitration is in flight (the arbiter's `resolve` pays the refund to the
+initializer, so rotating mid-dispute would let a party swap in a fresh
+key to dodge the ruling). Check order is authority → state → config: the
+zero address is `InvalidInitializer`. On an actual change the
+initializer's activation signature bit is cleared — the new key never
+signed activation, so on a dual-sig `Uninitialized` escrow it must call
+`activate` again before funding (the one deliberate asymmetry with taker
+rotation: the taker bit records a vote, the initializer bit is the
+funding-policy gate). Refunds follow automatically: the AV-23 whitelist
+pins the destination when configured, otherwise refunds resolve to the
+*current* initializer — the keeper's `cancel_expired` listing and the
+snapshot export read the live field, so both follow the rotation with no
+extra writes. Unlike the pause-authority rotation, this one *is* gated by
+the pause (`Paused`) — it is a config transition, not the key-loss escape
+hatch. Rotating to the current initializer is an idempotent no-op (the
+activation bit untouched); an actual change emits the
+`InitializerRotated` indexer event (`from == to ==` the current state).
+The 32-byte initializer region is rewritten in place — no layout or rent
+change.
+
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
 
@@ -672,6 +703,8 @@ program error per variant):
 | `DefaultJudgmentNotDue` | 129 | `trigger_default_judgment` with no default judgment configured, the taker never confirmed the split, or the arbitration deadline not yet passed; `with_arbitration_deadline` with a zero deadline |
 | `InvalidSubscription` | 130 | `with_subscription` with a zero `period_secs`, zero or over-long `periods`, a zero `per_period`, per-period amounts that do not sum to the locked amount, a `u64::MAX` expiry (back-scheduling needs a bounded lifetime), a schedule that does not fit inside the escrow's lifetime, or on a non-`Uninitialized` escrow; `with_milestones` after a subscription (mutually exclusive release schedules); any subscription operation on an escrow with no schedule attached; or plain `release` on an escrow with a subscription (the schedule owns the release path) |
 | `PeriodNotDue` | 131 | `release_period` with a `period_index` that is not the next due period (skipping ahead or replaying a released period), or with `now` before that period's back-scheduled due timestamp; periods release strictly in order, one at a time, each only once due |
+| `InvalidEventCapacity` | 132 | `with_event_capacity` with `capacity == 0` or `capacity > 64` (the event-history ring holds 1..=64 entries) |
+| `InvalidInitializer` | 133 | `rotate_initializer` with the zero address (a zero address can never be the legitimate initializer) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert

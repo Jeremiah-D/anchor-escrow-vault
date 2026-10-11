@@ -295,6 +295,14 @@
       ]
     },
     {
+      "name": "rotate_initializer",
+      "discriminator": [117, 75, 191, 252, 13, 163, 28, 68],
+      "accounts": [],
+      "args": [
+        {"name": "new_initializer", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "initialize_payout_allowlist",
       "discriminator": [155, 187, 116, 255, 95, 174, 219, 118],
       "accounts": [],
@@ -519,7 +527,8 @@
     {"code": 129, "name": "DefaultJudgmentNotDue"},
     {"code": 130, "name": "InvalidSubscription"},
     {"code": 131, "name": "PeriodNotDue"},
-    {"code": 132, "name": "InvalidEventCapacity"}
+    {"code": 132, "name": "InvalidEventCapacity"},
+    {"code": 133, "name": "InvalidInitializer"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

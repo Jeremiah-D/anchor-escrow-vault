@@ -846,6 +846,12 @@ pub enum EscrowError {
     /// at least one and at most 64 events. Parallels
     /// [`EscrowError::InvalidDecimals`] (config error).
     InvalidEventCapacity,
+    /// Invalid initializer address (AV-58): [`Escrow::rotate_initializer`]
+    /// with the zero address — a zero address can never be the
+    /// legitimate initializer, so binding it is a policy mismatch by
+    /// construction. Parallels [`EscrowError::InvalidTaker`] (config
+    /// error).
+    InvalidInitializer,
 }
 
 impl EscrowError {
@@ -891,6 +897,7 @@ impl EscrowError {
             EscrowError::InvalidSubscription => 130,
             EscrowError::PeriodNotDue => 131,
             EscrowError::InvalidEventCapacity => 132,
+            EscrowError::InvalidInitializer => 133,
         }
     }
 
@@ -930,6 +937,7 @@ impl EscrowError {
             EscrowError::InvalidSubscription,
             EscrowError::PeriodNotDue,
             EscrowError::InvalidEventCapacity,
+            EscrowError::InvalidInitializer,
         ]
     }
 }
@@ -2992,6 +3000,95 @@ impl Escrow {
             return Ok(());
         }
         self.taker = new_taker;
+        Ok(())
+    }
+
+    /// Rotate the initializer (funding authority) by dual-signed
+    /// governance (AV-58 — Solana governance): the mirror of
+    /// [`Escrow::rotate_taker`]. Key-rotation for the funding side:
+    /// when the initializer's key is compromised, lost, or moved to a
+    /// new wallet, the escrow's authority can follow without cancelling
+    /// and re-creating the escrow (which would strand in-flight
+    /// quorum votes, attestations and milestone progress).
+    ///
+    /// Check order mirrors [`Escrow::rotate_taker`] (see its doc for
+    /// the rationale — authentication against the *current* key, so the
+    /// old key consents to its own replacement):
+    /// 1. the old initializer AND the current taker must both authorize —
+    ///    one party alone (or a stranger pair) is
+    ///    [`EscrowError::Unauthorized`]. Independent `==` checks (not
+    ///    `||`): the degenerate initializer == taker self-escrow
+    ///    authorizes with one key passed twice (old_initializer ==
+    ///    taker), like AV-12's activation;
+    /// 2. the escrow must be `Uninitialized`, `Activated` or `Funded` —
+    ///    the non-terminal pre-release states. The terminal states
+    ///    (`Released` / `Cancelled` / `Settled` / `Closed`) have no live
+    ///    escrow left to re-key, and `Disputed` is excluded because
+    ///    arbitration is in flight: the initializer's identity is part
+    ///    of what the arbiter's [`Escrow::resolve`] adjudicates (it
+    ///    pays the refund to the initializer), so rotating mid-dispute
+    ///    would let a party swap in a fresh key to dodge or confuse
+    ///    the ruling — the dispute must settle first
+    ///    ([`EscrowError::InvalidStateTransition`]);
+    /// 3. the zero address is [`EscrowError::InvalidInitializer`] — a
+    ///    zero address can never be the legitimate initializer.
+    ///
+    /// AV-46: a paused escrow fails fast (`Paused`) — rotation is a
+    /// config transition, not the pause key-loss escape hatch (that is
+    /// [`Escrow::rotate_pause_authority`], which deliberately works
+    /// while paused).
+    ///
+    /// On an actual change the initializer's activation signature bit
+    /// ([`ACTIVATION_INITIALIZER_BIT`]) is cleared: the new key has
+    /// never recorded its activation signature, and on a dual-sig
+    /// `Uninitialized` escrow it must call [`Escrow::activate`] again
+    /// before funding. (The taker's bit and the dual-sig-required bit
+    /// are identity-independent attestations and survive.) This is the
+    /// one deliberate asymmetry with [`Escrow::rotate_taker`]: the
+    /// taker bit records a vote, while the initializer bit is the
+    /// funding-policy gate.
+    ///
+    /// The refund policy follows automatically: [`Escrow::refund_recipient`]
+    /// resolves the AV-23 whitelist when configured, else the *current*
+    /// initializer — so the keeper report and the AV-26 snapshot pick
+    /// up the new key with no extra writes.
+    ///
+    /// Rotating to the current initializer is a no-op success
+    /// (idempotent, activation bit untouched); the `InitializerRotated`
+    /// indexer event fires only on an actual change, paralleling
+    /// `update_quorum`'s no-op rule.
+    pub fn rotate_initializer(
+        &mut self,
+        old_initializer: [u8; 32],
+        taker: [u8; 32],
+        new_initializer: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the old initializer and the
+        // *current* taker must authorize — one party alone (or a
+        // stranger pair) is Unauthorized. Degenerate initializer ==
+        // taker self-escrow: one key passed twice.
+        if old_initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Activated | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if new_initializer == [0u8; 32] {
+            return Err(EscrowError::InvalidInitializer);
+        }
+        if new_initializer == self.initializer {
+            return Ok(());
+        }
+        self.initializer = new_initializer;
+        // The new key never signed activation: clear the initializer's
+        // bit so a dual-sig escrow cannot be funded on the old key's
+        // signature alone. Post-activation (Activated / Funded) the bit
+        // is historical and state stays as-is — rotation does not
+        // un-activate or un-fund.
+        self.activation &= !ACTIVATION_INITIALIZER_BIT;
         Ok(())
     }
 
@@ -7820,6 +7917,42 @@ pub(crate) mod anchor_idl_tests {
                             in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-58: rotate the initializer (funding authority) by
+            // dual-signed governance — the mirror of rotate_taker.
+            name: "rotate_initializer",
+            params: &[(
+                "new_initializer",
+                "Pubkey",
+                "instruction param; the replacement initializer - the \\
+                 old key stops being the funding authority immediately; \\
+                 refunds (AV-23) follow the new key unless a whitelist \\
+                 is configured",
+            )],
+            method: "Escrow::rotate_initializer",
+            input_mapping: "old_initializer <- accounts.old_initializer \\
+                            (signer) AND taker <- accounts.taker (signer) \\
+                            - both parties must sign, one alone (or a \\
+                            stranger pair) is Unauthorized; the degenerate \\
+                            initializer == taker self-escrow authorizes \\
+                            with one key passed twice, like AV-12 \\
+                            activation; new_initializer <- param (Pubkey \\
+                            -> [u8; 32] conversion); only Uninitialized / \\
+                            Activated / Funded - the terminal states and \\
+                            Disputed are InvalidStateTransition (no live \\
+                            escrow left to re-key, and arbitration in \\
+                            flight adjudicates the initializer's \\
+                            identity); the zero address is \\
+                            InvalidInitializer (code 133); rotating to the \\
+                            current initializer is an idempotent no-op; \\
+                            on an actual change the initializer's \\
+                            activation bit is cleared (the new key never \\
+                            signed activation); emits the InitializerRotated \\
+                            indexer event only on an actual change (from \\
+                            == to == the current state); the 32-byte \\
+                            initializer region is rewritten in place - no \\
+                            layout / rent change",
+        },
+        InstructionSpec {
             // AV-49: set the payout destination allowlist at
             // initialize time.
             name: "initialize_payout_allowlist",
@@ -8132,6 +8265,7 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::unpause",
             "Escrow::rotate_pause_authority",
             "Escrow::rotate_taker",
+            "Escrow::rotate_initializer",
             "Escrow::with_payout_allowlist",
             "Escrow::update_payout_allowlist",
             "Escrow::with_reference",
@@ -8164,7 +8298,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_thirty_one_instructions_take_params() {
+    fn only_thirty_two_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -8200,6 +8334,7 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_pause_authority",
                 &"rotate_pause_authority",
                 &"rotate_taker",
+                &"rotate_initializer",
                 &"initialize_payout_allowlist",
                 &"update_payout_allowlist",
                 &"initialize_reference",
@@ -9722,6 +9857,12 @@ pub(crate) mod anchor_idl_tests {
         // documents the param source, like `rotate_pause_authority`'s
         // new_authority.
         ("rotate_taker", "new_taker", "taker"),
+        // AV-58: the rotation param rewrites the initializer field in
+        // place — the mirror of `rotate_taker`. The field's initial
+        // value comes from accounts.initializer at `initialize` (a
+        // non-param account input); this entry documents the param
+        // source, like `rotate_taker`'s new_taker.
+        ("rotate_initializer", "new_initializer", "initializer"),
         // AV-49: the allowlist param populates `payout_allowlist`; the
         // `Option` discriminant is implied (a configured list is
         // `Some`), mirroring `initialize_pause_authority`.
@@ -9759,10 +9900,13 @@ pub(crate) mod anchor_idl_tests {
     /// Vault field paths not populated by instruction params, with their
     /// documented source.
     const FIELD_SOURCES: &[(&str, &str)] = &[
-        (
-            "initializer",
-            "accounts.initializer signer, stored by initialize",
-        ),
+        // `initializer` is rewritten by the `rotate_initializer`
+        // instruction param (see PARAM_FIELD_MAP), so it is not listed
+        // here — like `taker` / `arbiter`, every field gets exactly one
+        // source kind. The field's *initial* value comes from
+        // accounts.initializer at `initialize` (a non-param account
+        // input, so it cannot appear in the param table); the param
+        // entry documents the rotation source.
         // `taker` is populated by the `rotate_taker` instruction param
         // (see PARAM_FIELD_MAP), so it is not listed here — like
         // `arbiter`, every field gets exactly one source. The field's
@@ -10168,6 +10312,11 @@ mod error_code_tests {
             EscrowError::InvalidEventCapacity,
             132,
             "with_event_capacity with capacity == 0 or capacity > 64 (the event-history ring holds 1..=64 entries)",
+        ),
+        (
+            EscrowError::InvalidInitializer,
+            133,
+            "rotate_initializer with the zero address (a zero address can never be the legitimate initializer)",
         ),
     ];
 
@@ -17633,6 +17782,326 @@ mod taker_rotation_tests {
     }
 }
 
+// ---------- AV-58: initializer rotation (funding-authority key rollover) ----------
+
+#[cfg(test)]
+mod initializer_rotation_tests {
+    use super::*;
+    use crate::account_space_tests::encode_escrow;
+    use crate::events::{EscrowEventKind, IndexedEscrow};
+    use crate::keeper::{scan_keeper_actions, KeeperActionKind, WatchedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const CAROL: [u8; 32] = [0xC4; 32]; // new initializer
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const WHITELIST: [u8; 32] = [0xD0; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const ESCROW_ID: [u8; 32] = [0x1D; 32];
+    const T0: u64 = 1_700_000_000;
+
+    /// Serialized offset of the `activation` bitmask byte:
+    /// initializer(32) + taker(32) + amount(8) + released(8) +
+    /// expires_at(8) + state(1) + quorum(1 + QUORUM_POLICY_LEN).
+    const ACTIVATION_OFFSET: usize = 32 + 32 + 8 + 8 + 8 + 1 + 1 + QUORUM_POLICY_LEN;
+
+    fn funded() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    #[test]
+    fn rotation_preserves_everything_but_initializer() {
+        let mut e = funded();
+        let before = encode_escrow(&e);
+        e.rotate_initializer(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.initializer(), CAROL);
+        assert_eq!(e.taker(), BOB, "taker untouched");
+        assert_eq!(e.state(), EscrowState::Funded, "state untouched");
+        assert_eq!(e.amount(), 1_000_000);
+        // Byte-level: only the 32-byte initializer region (bytes 0..32)
+        // differs — every other field is bit-identical (no dual-sig
+        // here, so the activation bit is unset and untouched).
+        let after = encode_escrow(&e);
+        assert_eq!(before.len(), after.len());
+        assert_eq!(&after[0..32], &CAROL, "initializer region rewritten");
+        assert_eq!(&after[32..], &before[32..], "all other fields bit-identical");
+    }
+
+    #[test]
+    fn rotation_clears_the_old_key_activation_signature() {
+        // The new key never recorded its activation signature: on an
+        // actual rotation the initializer's activation bit is cleared,
+        // so a dual-sig escrow cannot be funded on the old key's
+        // signature alone.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        assert!(e.initializer_activated());
+        assert!(!e.taker_activated());
+        let before = encode_escrow(&e);
+        assert_eq!(before[ACTIVATION_OFFSET], 0b101, "bit0 + dual-sig-required");
+
+        e.rotate_initializer(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.initializer(), CAROL);
+        assert!(!e.initializer_activated(), "old signature does not transfer");
+        assert!(!e.taker_activated());
+        assert!(e.dual_sig_required(), "opt-in survives");
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+
+        let after = encode_escrow(&e);
+        assert_eq!(&after[32..ACTIVATION_OFFSET], &before[32..ACTIVATION_OFFSET]);
+        assert_eq!(
+            after[ACTIVATION_OFFSET],
+            before[ACTIVATION_OFFSET] & !ACTIVATION_INITIALIZER_BIT,
+            "only the initializer activation bit clears"
+        );
+        assert_eq!(&after[ACTIVATION_OFFSET + 1..], &before[ACTIVATION_OFFSET + 1..]);
+
+        // The new initializer must record its own signature before a
+        // dual-sig escrow can be funded.
+        e.activate(CAROL).unwrap();
+        assert!(e.initializer_activated());
+    }
+
+    #[test]
+    fn rotation_authority_matrix() {
+        // The initializer alone cannot rotate without the taker.
+        let mut e = funded();
+        assert_eq!(
+            e.rotate_initializer(ALICE, MALLORY, CAROL),
+            Err(EscrowError::Unauthorized)
+        );
+        // The taker alone cannot rotate without the initializer.
+        assert_eq!(
+            e.rotate_initializer(MALLORY, BOB, CAROL),
+            Err(EscrowError::Unauthorized)
+        );
+        // A stranger pair cannot rotate.
+        assert_eq!(
+            e.rotate_initializer(MALLORY, MALLORY, CAROL),
+            Err(EscrowError::Unauthorized)
+        );
+        // The old key must be the *current* initializer: after a
+        // rotation the previous key is stale.
+        e.rotate_initializer(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(
+            e.rotate_initializer(ALICE, BOB, MALLORY),
+            Err(EscrowError::Unauthorized),
+            "stale old-initializer key"
+        );
+        // Dual-sig success with the fresh key pair.
+        e.rotate_initializer(CAROL, BOB, MALLORY).unwrap();
+        assert_eq!(e.initializer(), MALLORY);
+        assert_eq!(e.state(), EscrowState::Funded, "failed calls change nothing else");
+    }
+
+    #[test]
+    fn rotation_allows_self_escrow_single_key() {
+        // Degenerate initializer == taker self-escrow: one key passed
+        // twice, like AV-12's activation.
+        let mut e = Escrow::initialize(ALICE, ALICE, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        e.rotate_initializer(ALICE, ALICE, CAROL).unwrap();
+        assert_eq!(e.initializer(), CAROL);
+        assert_eq!(e.taker(), ALICE, "taker side untouched");
+    }
+
+    #[test]
+    fn rotation_rejects_zero_new_initializer() {
+        // Check order: authority -> state -> config. Valid authority on
+        // a live escrow reaches the config check: the zero address is
+        // InvalidInitializer (code 133).
+        let mut e = funded();
+        let err = e.rotate_initializer(ALICE, BOB, [0u8; 32]).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidInitializer);
+        assert_eq!(err.code(), 133);
+        assert_eq!(e.initializer(), ALICE, "failed call changes nothing");
+    }
+
+    #[test]
+    fn rotation_state_gates() {
+        // Allowed: the non-terminal pre-release states.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.rotate_initializer(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.initializer(), CAROL);
+
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Activated);
+        e.rotate_initializer(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.initializer(), CAROL);
+
+        let mut e = funded();
+        e.rotate_initializer(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.initializer(), CAROL);
+
+        // Rejected: the terminal states have no live escrow left to
+        // re-key, and Disputed is excluded because arbitration
+        // adjudicates the initializer's identity (it pays the refund
+        // to the initializer).
+        let mut released = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        released.fund(ALICE).unwrap();
+        released.release(ALICE, EXPIRES_AT, 1_000_000, None, BOB).unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+
+        let mut cancelled = funded();
+        cancelled.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(cancelled.state(), EscrowState::Cancelled);
+
+        let mut disputed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        disputed.fund(ALICE).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        assert_eq!(disputed.state(), EscrowState::Disputed);
+
+        let mut settled = disputed;
+        settled.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
+        assert_eq!(settled.state(), EscrowState::Settled);
+
+        let mut closed = released;
+        closed.close_vault(ALICE).unwrap();
+        assert_eq!(closed.state(), EscrowState::Closed);
+
+        // Rebuild the disputed case (it was moved into `settled` above).
+        let mut disputed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        disputed.fund(ALICE).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+
+        for (name, e) in [
+            ("Released", released),
+            ("Cancelled", cancelled),
+            ("Disputed", disputed),
+            ("Settled", settled),
+            ("Closed", closed),
+        ] {
+            let mut e = e;
+            assert_eq!(
+                e.rotate_initializer(ALICE, BOB, CAROL),
+                Err(EscrowError::InvalidStateTransition),
+                "{name}"
+            );
+            assert_eq!(e.initializer(), ALICE, "{name}: initializer unchanged");
+        }
+    }
+
+    #[test]
+    fn rotation_to_current_initializer_is_an_idempotent_noop() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        e.activate(ALICE, T0 + 1).unwrap();
+        assert!(e.inner().initializer_activated());
+        let base = e.events().len();
+        // No-op: emits nothing AND leaves the activation bit alone.
+        e.rotate_initializer(ALICE, BOB, ALICE, T0 + 2).unwrap();
+        assert_eq!(e.events().len(), base, "no-op emits nothing");
+        assert!(e.inner().initializer_activated(), "no-op clears nothing");
+        assert_eq!(e.inner().initializer(), ALICE);
+    }
+
+    #[test]
+    fn rotation_emits_initializer_rotated_only_on_change() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let base = e.events().len();
+        e.rotate_initializer(ALICE, BOB, CAROL, T0 + 2).unwrap();
+        let ev = *e.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::InitializerRotated);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(e.events().len(), base + 1);
+        // The inner escrow carries the new initializer.
+        assert_eq!(e.inner().initializer(), CAROL);
+    }
+
+    #[test]
+    fn rotation_blocked_while_paused() {
+        // AV-46: rotation is a config transition, not the pause key-loss
+        // escape hatch — a paused escrow fails fast.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.pause([0xDD; 32]).unwrap();
+        assert_eq!(
+            e.rotate_initializer(ALICE, BOB, CAROL),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(e.initializer(), ALICE);
+    }
+
+    #[test]
+    fn refund_recipient_follows_the_new_initializer() {
+        // No whitelist: refunds resolve to the *current* initializer.
+        let mut e = funded();
+        assert_eq!(e.refund_recipient(), ALICE);
+        e.rotate_initializer(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.refund_recipient(), CAROL, "refund follows the new key");
+
+        // Whitelist configured: the pinned destination wins, untouched
+        // by the rotation.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_refund_address(WHITELIST)
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.rotate_initializer(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.refund_to(), Some(WHITELIST));
+        assert_eq!(e.refund_recipient(), WHITELIST, "whitelist pins the destination");
+    }
+
+    #[test]
+    fn keeper_and_snapshot_follow_the_new_initializer() {
+        // The keeper's cancel_expired listing and the snapshot export
+        // read the live initializer field, so both follow the rotation
+        // with no extra plumbing.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        e.rotate_initializer(ALICE, BOB, CAROL).unwrap();
+        // Snapshot exports the new initializer.
+        let snap = e.snapshot(EXPIRES_AT + 1);
+        assert_eq!(snap.initializer, CAROL);
+        assert_eq!(snap.refund_recipient, CAROL);
+        // The keeper lists the expired cancel for the new initializer
+        // (alongside the permissionless AV-48 crank).
+        let watched = [WatchedEscrow {
+            escrow_id: ESCROW_ID,
+            escrow: e,
+            // AV-53: no reference memo on this escrow.
+            reference: None,
+        }];
+        let report = scan_keeper_actions(&watched, EXPIRES_AT + 1);
+        let action = report
+            .actions
+            .iter()
+            .find(|a| a.kind == KeeperActionKind::CancelExpired)
+            .expect("cancel_expired listed");
+        assert_eq!(action.caller, CAROL);
+        assert_eq!(action.caller_role, "initializer");
+        assert_eq!(action.refund_to, Some(CAROL));
+        // And the new initializer can actually cancel the expired escrow.
+        let mut e = watched[0].escrow;
+        e.cancel_expired(CAROL, EXPIRES_AT + 1, None, CAROL).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+}
+
 
 // ---------- AV-55: arbitration default judgment (dispute timeout fallback) ----------
 
@@ -18704,9 +19173,11 @@ mod subscription_tests {
         assert_eq!(EscrowError::InvalidSubscription.code(), 130);
         assert_eq!(EscrowError::PeriodNotDue.code(), 131);
         assert_eq!(EscrowError::InvalidEventCapacity.code(), 132);
+        assert_eq!(EscrowError::InvalidInitializer.code(), 133);
         assert!(EscrowError::all().contains(&EscrowError::InvalidSubscription));
         assert!(EscrowError::all().contains(&EscrowError::PeriodNotDue));
         assert!(EscrowError::all().contains(&EscrowError::InvalidEventCapacity));
+        assert!(EscrowError::all().contains(&EscrowError::InvalidInitializer));
     }
 
     // ----- layout pins -----
@@ -18929,7 +19400,8 @@ mod event_history_tests {
             EscrowEventKind::SubscriptionPeriodReleased.discriminant(),
             25
         );
-        for d in 0..=25u8 {
+        assert_eq!(EscrowEventKind::InitializerRotated.discriminant(), 26);
+        for d in 0..=26u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -18940,7 +19412,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(26), None);
+        assert_eq!(EscrowEventKind::from_discriminant(27), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -19052,7 +19524,7 @@ mod event_history_tests {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         // First slot's kind byte sits at body offset 1024.
         let kind_off = ANCHOR_DISCRIMINATOR_LEN + 1024;
-        for bad in [26u8, 42, 255] {
+        for bad in [27u8, 42, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
