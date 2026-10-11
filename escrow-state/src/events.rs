@@ -67,6 +67,13 @@
 //!   is the ordering signal that the deadline moved, and the indexer
 //!   reads the new `expires_at` (and the monotonic `extension_count`)
 //!   from the vault.
+//! - `cancel_partial` (AV-60) emits [`EscrowEventKind::PartiallyCancelled`]
+//!   with `from == to == Funded`: the [`EscrowState`] variant does not
+//!   change, but funds moved (a tranche of the lockup refunded to the
+//!   AV-23-pinned destination) and the refund stream must be complete
+//!   for the indexer — the exact mirror of a partial `Released` event.
+//!   `amounts.refund` carries the partially-cancelled amount; the
+//!   `released` counter is untouched.
 //! - Partial `release` / `claim` calls emit [`EscrowEventKind::Released`]
 //!   / [`EscrowEventKind::Claimed`] with `from == to == Funded`: the
 //!   `EscrowState` variant does not change, but funds moved and the
@@ -118,6 +125,7 @@
 //! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
+//! | PartiallyCancelled (AV-60) | 0 | 0 | the partially-cancelled tranche, refunded to the whitelisted destination (the escrow stays `Funded`; the `released` counter is untouched) | 0 |
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
 //! | ExpiredCranked (AV-48) | 0 | 0 | remainder minus penalty, to the whitelisted destination (the cranker receives nothing) | anti-griefing penalty to the initializer (AV-24; 0 unless the cranker is the taker) |
 //! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
@@ -276,6 +284,15 @@ pub enum EscrowEventKind {
     /// the call fails unless the deadline strictly moved, so there is
     /// no no-op case.
     ExpiryExtended,
+    /// AV-60: the initializer partially cancelled the escrow
+    /// ([`Escrow::cancel_partial`]) — a tranche of the lockup refunded
+    /// to the AV-23-pinned destination while the escrow stays `Funded`.
+    /// `from == to == Funded`: the [`EscrowState`] variant does not
+    /// change, but funds moved and the refund stream must be complete
+    /// for the indexer (the complement of a partial `Released` event).
+    /// `amounts.refund` carries the partially-cancelled amount; the
+    /// `released` counter is untouched.
+    PartiallyCancelled,
 }
 
 impl EscrowEventKind {
@@ -319,6 +336,9 @@ impl EscrowEventKind {
             25 => Self::SubscriptionPeriodReleased,
             26 => Self::InitializerRotated,
             27 => Self::ExpiryExtended,
+            // AV-60: appended after ExpiryExtended so discriminants 0–27
+            // stay stable for already-serialized histories.
+            28 => Self::PartiallyCancelled,
             _ => return None,
         })
     }
@@ -355,6 +375,7 @@ impl EscrowEventKind {
             Self::SubscriptionPeriodReleased => "subscription_period_released",
             Self::InitializerRotated => "initializer_rotated",
             Self::ExpiryExtended => "expiry_extended",
+            Self::PartiallyCancelled => "partially_cancelled",
         }
     }
 }
@@ -1052,6 +1073,41 @@ impl IndexedEscrow {
             Some(authority),
         );
         Ok(())
+    }
+
+    /// Partially cancel the escrow and refund a tranche to the
+    /// initializer (mirrors [`Escrow::cancel_partial`], AV-60). Emits
+    /// `PartiallyCancelled` with `from == to == Funded` and
+    /// `amounts.refund` carrying the partially-cancelled amount;
+    /// `refund_to` is the refund destination, pinned against the
+    /// escrow's refund policy (AV-23). Returns the refunded amount.
+    pub fn cancel_partial(
+        &mut self,
+        authority: [u8; 32],
+        amount: u64,
+        mint: Option<[u8; 32]>,
+        refund_to: [u8; 32],
+        at: u64,
+    ) -> Result<u64, EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.cancel_partial(authority, amount, mint, refund_to);
+        let refund = self.map_reentrant(result, at)?;
+        let to = self.inner.state();
+        self.push_event(
+            EscrowEventKind::PartiallyCancelled,
+            from,
+            to,
+            EventAmounts::refund(refund),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(refund)
     }
 
     /// Cancel an expired escrow (mirrors [`Escrow::cancel_expired`]).

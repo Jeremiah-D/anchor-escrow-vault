@@ -103,6 +103,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_decimals(decimals)`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `decimals` is the SPL mint's decimal places — SPL mints declare at most 9, `> 18` is rejected; `0` = no decimal metadata; display-only, never gates a transition or moves funds) |
 | `cancel(authority, refund_to)`               | `Funded`       | `Cancelled` | initializer; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise |
 | `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); the refund still goes to the whitelisted address even when the taker calls; returns `(refund, penalty)` — a taker-initiated cancel with `penalty_bps > 0` slices an anti-griefing penalty for the initializer (see below) |
+| `cancel_partial(authority, amount, refund_to)` (AV-60) | `Funded` | `Funded` (no state change) | initializer; Funded-only; the initializer's counterpart to AV-11's partial release — reclaims a tranche of the lockup instead of streaming it to the taker; `amount == 0` is `AmountMismatch`, `amount` above the still-locked remainder is `ReleaseExceedsLocked`; the `released` counter is untouched and the locked total shrinks; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise; quorum / timelock / vesting do **not** gate it (same as `cancel`); emits `PartiallyCancelled`; returns the refunded amount |
 | `crank_expired(caller, now)` (AV-48) | `Funded` | `Cancelled` | **anyone** — permissionless crank (Solana crank pattern), only when `now >= expires_at + grace_period`; no counterparty signature needed, so a keeper bot that is party to nothing can sweep timed-out vaults; the refund follows the same pinned refund policy (whitelisted address, or the initializer) — the cranker receives nothing (anti-MEV); a taker cranker still pays the anti-griefing penalty; rejected with `Paused` while the escrow is paused |
 | `initialize_payout_allowlist(allowlist)` (AV-49) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–4 live payout-destination addresses; empty / over-long / zero-address input is `InvalidPayoutAllowlist`); the payout policy gates every fund-moving transition's `payout_to` |
 | `update_payout_allowlist(initializer, taker, allowlist)` (AV-49) | `Uninitialized` / `Funded` | same (no state change) | dual-signature governance — both initializer and taker on a dual-sig escrow, initializer alone on a plain escrow (`Unauthorized` otherwise); empty clears the allowlist (back to taker-only payouts); emits `PayoutAllowlistUpdated` only on an actual change |
@@ -203,6 +204,15 @@ locked amount (`ReleaseExceedsLocked`, code 106); a zero-amount release is
 `AmountMismatch`. `released_amount()` / `remaining_amount()` expose the
 progress, and `cancel` / `cancel_expired` after partial releases refund
 only the remainder while `released_amount()` stays preserved for audit.
+
+**Partial cancel (initializer tranche refund, AV-60).** `cancel_partial(authority, amount, refund_to)` is the
+initializer's counterpart to partial release: it walks the lockup back to the
+initializer in tranches instead of streaming it to the taker. The escrow stays
+`Funded` at the reduced lockup; `released_amount()` is untouched; the refund
+follows the whitelist pin below. `amount == 0` is `AmountMismatch`; an
+`amount` above the still-locked remainder is `ReleaseExceedsLocked`. Like
+`cancel`, quorum / timelock / vesting do not gate it, and the indexer sees one
+`PartiallyCancelled` event per call.
 
 **Attestor quorum (weighted release gate, AV-45).** An escrow can be created with an
 optional quorum policy (`QuorumPolicy::new(attestors, weights, threshold)`,
@@ -706,11 +716,11 @@ program error per variant):
 |-------|------|---------|
 | `Unauthorized` | 100 | caller is not the transition authority (checked before state validity) |
 | `InvalidStateTransition` | 101 | transition illegal from the current state (double fund, release before fund, …) |
-| `AmountMismatch` | 102 | `initialize` with `amount == 0` |
+| `AmountMismatch` | 102 | `initialize` with `amount == 0`; `release` / `cancel_partial` with `amount == 0` |
 | `NotExpired` | 103 | `cancel_expired` with `now < expires_at + grace_period` |
 | `InvalidQuorum` | 104 | bad quorum policy config, or `attest` with no quorum configured |
 | `QuorumNotReached` | 105 | `release` before the quorum threshold is reached |
-| `ReleaseExceedsLocked` | 106 | cumulative `release` amounts exceeding the locked amount |
+| `ReleaseExceedsLocked` | 106 | cumulative `release` amounts exceeding the locked amount; `cancel_partial` with `amount` above the still-locked remainder |
 | `InvalidVesting` | 107 | bad vesting schedule (`start >= end`, or `cliff_at > end` since AV-51), or `claim` with no vesting configured |
 | `InvalidArbiter` | 108 | `with_arbiter` with the zero key, or `escalate`/`resolve` with no arbiter configured |
 | `DisputeWindowClosed` | 109 | `escalate` with `now >= expires_at` (past the dispute window) |
@@ -1008,7 +1018,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `PartiallyCancelled` (AV-60) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -1049,6 +1059,9 @@ successful calls that change nothing observable:
   `(refund, penalty)` split in `amounts` (AV-24): a taker-initiated
   cancel carries the penalty earmarked for the initializer, an
   initializer-initiated cancel carries `penalty == 0`.
+- `cancel_partial` (AV-60) emits `PartiallyCancelled` with
+  `from == to == Funded` and `amounts.refund` carrying the refunded
+  tranche — the refund stream's mirror of a partial `Released` event.
 - `close_vault` emits `VaultClosed` with `from` the terminal state the
   escrow was in (`Cancelled` / `Released` / `Settled`) and `to ==
   Closed`; `amounts.rent_reclaimed` carries the reclaimed rent-exempt

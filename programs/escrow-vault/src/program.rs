@@ -358,6 +358,60 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Partially cancel the escrow and refund a tranche to the
+    /// initializer (`Funded -> Funded`, AV-60) — the initializer's
+    /// counterpart to AV-11's partial release. `amount` is the
+    /// instruction param; the escrow stays live at the reduced lockup,
+    /// and the `released` counter is untouched.
+    /// AV-16: the vault token account's mint must equal the bound
+    /// `vault.mint` (`MintMismatch` otherwise); `None` on the native-SOL
+    /// path (no mint bound).
+    /// AV-23: the refund goes to `accounts.refund_to`, pinned by the
+    /// state machine against the escrow's refund policy (the whitelisted
+    /// address, or the initializer with no whitelist;
+    /// `RefundAddressMismatch` otherwise).
+    /// Amount rules reuse the AV-11 semantics: `amount == 0` is
+    /// `AmountMismatch`, `amount` above the still-locked remainder is
+    /// `ReleaseExceedsLocked`. Like `cancel`, quorum / timelock / vesting
+    /// do not gate this path.
+    pub fn cancel_partial(ctx: Context<CancelPartial>, amount: u64) -> Result<u64> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        let refund = escrow
+            .cancel_partial(
+                ctx.accounts.initializer.key().to_bytes(),
+                amount,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+                ctx.accounts.refund_to.key().to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-31: settle via `cpi_settle_refund` (`RefundKind::Cancel`) —
+        // `escrow_state::cpi::refund_plan` builds and validates the
+        // refund transfer bytes against the AV-23-pinned `refund_to`;
+        // the real build executes the validated plan once the token
+        // accounts are wired up.
+        // AV-18: `from == to == Funded`; `refund` carries the
+        // partially-cancelled tranche, mirroring
+        // `IndexedEscrow::cancel_partial`.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::PartiallyCancelled,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            refund,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(refund)
+    }
+
     /// Permissionless expiry crank (AV-48 — Solana crank pattern;
     /// mirrors `Escrow::crank_expired`). ANY signer may execute the
     /// expiry cancel on a `Funded` escrow once the clock (Solana clock
@@ -2535,6 +2589,12 @@ pub enum EscrowVaultEventKind {
     /// (`Escrow::extend_expiry`). Mirrors
     /// `escrow_state::EscrowEventKind::ExpiryExtended`.
     ExpiryExtended,
+    /// AV-60: the initializer partially cancelled the escrow
+    /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
+    /// while the escrow stays `Funded`. `from == to == Funded`;
+    /// `amounts.refund` carries the partially-cancelled tranche.
+    /// Mirrors `escrow_state::EscrowEventKind::PartiallyCancelled`.
+    PartiallyCancelled,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -2594,6 +2654,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::ExpiryExtended => {
             EscrowVaultEventKind::ExpiryExtended
+        }
+        escrow_state::EscrowEventKind::PartiallyCancelled => {
+            EscrowVaultEventKind::PartiallyCancelled
         }
     }
 }
@@ -2735,6 +2798,25 @@ pub struct CancelExpired<'info> {
     /// is the caller, the refund goes to the declared address, never to
     /// the caller. The real build transfers the refund to this account
     /// after the state machine's `RefundAddressMismatch` check passes.
+    pub refund_to: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CancelPartial<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    pub initializer: Signer<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build reads its `mint` for the state machine's `MintMismatch`
+    /// check; unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
+    /// CHECK: the refund destination account. AV-23: the state machine
+    /// pins it against the escrow's refund policy (the whitelisted
+    /// address, or the initializer with no whitelist) — a phishing
+    /// frontend cannot redirect the refund by swapping this account.
+    /// The real build transfers the partially-cancelled tranche to this
+    /// account after the state machine's `RefundAddressMismatch` check
+    /// passes.
     pub refund_to: AccountInfo<'info>,
 }
 

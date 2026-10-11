@@ -47,6 +47,14 @@
       "args": []
     },
     {
+      "name": "cancel_partial",
+      "discriminator": [150, 240, 43, 134, 158, 7, 111, 216],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"}
+      ]
+    },
+    {
       "name": "crank_expired",
       "discriminator": [242, 214, 197, 141, 189, 175, 150, 24],
       "accounts": [],

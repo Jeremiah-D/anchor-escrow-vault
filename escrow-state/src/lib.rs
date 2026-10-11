@@ -2201,6 +2201,74 @@ impl Escrow {
         Ok(())
     }
 
+    /// Partially cancel the escrow and refund `amount` to the
+    /// initializer. `Funded -> Funded` (no state change).
+    ///
+    /// AV-60: the initializer's counterpart to AV-11's partial release —
+    /// where `release` streams funds *out to the taker* in tranches,
+    /// `cancel_partial` walks the lockup *back to the initializer* in
+    /// tranches. The escrow stays `Funded` (still live, still listed by
+    /// the keeper at the reduced remainder), the `released` counter is
+    /// untouched (`released_amount()` is preserved for audit exactly as
+    /// on [`Escrow::cancel`]), and only the locked total shrinks —
+    /// [`Escrow::remaining_amount`] decreases by `amount`.
+    ///
+    /// AV-23: the refund goes to the whitelisted address when one is
+    /// configured, otherwise the initializer — the same
+    /// [`Escrow::require_refund_recipient`] pin as [`Escrow::cancel`]
+    /// (`RefundAddressMismatch` otherwise).
+    ///
+    /// Amount rules mirror AV-11's partial release: `amount == 0` is
+    /// [`EscrowError::AmountMismatch`]; `amount` above the still-locked
+    /// remainder is [`EscrowError::ReleaseExceedsLocked`] (the semantics
+    /// the spec names — the surplus would outrun the lockup exactly the
+    /// way an over-large release would).
+    ///
+    /// Like [`Escrow::cancel`], quorum / timelock / vesting do not gate
+    /// this path: the initializer reclaims *their own* unreleased funds,
+    /// so an unsatisfied quorum, an unreached `unlock_at`, or an attached
+    /// vesting/milestone schedule (which gates payouts, not refunds)
+    /// never vetoes the call. Check order mirrors `cancel`: pause, then
+    /// reentrancy, then authority, then state, then the mint binding,
+    /// then the refund destination, then the amount math.
+    ///
+    /// Returns the refunded `amount` so the caller (and the Anchor
+    /// layer) can size the refund transfer.
+    pub fn cancel_partial(
+        &mut self,
+        authority: [u8; 32],
+        amount: u64,
+        mint: Option<[u8; 32]>,
+        refund_to: [u8; 32],
+    ) -> Result<u64, EscrowError> {
+        // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        // AV-46: pause guard first — a paused escrow fails fast,
+        // before the reentrancy guard and the authority check.
+        self.require_not_paused()?;
+        self.require_not_reentrant()?;
+        self.require_initializer(authority)?;
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // AV-16: the refunded tokens must be the tokens this escrow
+        // locks — same mint binding as `cancel`.
+        self.require_mint_match(mint)?;
+        // AV-23: the refund destination pin — same as `cancel`.
+        self.require_refund_recipient(refund_to)?;
+        if amount == 0 {
+            return Err(EscrowError::AmountMismatch);
+        }
+        if amount > self.remaining_amount() {
+            return Err(EscrowError::ReleaseExceedsLocked);
+        }
+        // The `released` counter is untouched; only the locked total
+        // shrinks. `amount <= remaining == self.amount - self.released`
+        // implies `amount <= self.amount`, so this cannot underflow.
+        self.amount -= amount;
+        Ok(amount)
+    }
+
     /// Cancel an escrow that has timed out and refund the initializer.
     /// `Funded -> Cancelled`.
     ///
@@ -7423,6 +7491,26 @@ pub(crate) mod anchor_idl_tests {
                             return (remaining, 0)",
         },
         InstructionSpec {
+            // AV-60: the initializer's partial-cancel counterpart to
+            // AV-11's partial release.
+            name: "cancel_partial",
+            params: &[("amount", "u64", "instruction param")],
+            method: "Escrow::cancel_partial",
+            input_mapping: "authority <- accounts.initializer (signer); \
+                            amount <- param; refund destination <- \
+                            accounts.refund_to (must equal the whitelisted \
+                            address, or the initializer with no whitelist — \
+                            RefundAddressMismatch otherwise; AV-23 \
+                            anti-phishing pin); amount == 0 is \
+                            AmountMismatch; amount above the still-locked \
+                            remainder is ReleaseExceedsLocked (the AV-11 \
+                            partial-release semantics); Funded-only; the \
+                            escrow stays Funded and the `released` counter \
+                            is untouched; quorum / timelock / vesting do \
+                            NOT gate it (same as `cancel`); returns the \
+                            refunded amount",
+        },
+        InstructionSpec {
             // AV-48: permissionless expiry crank (Solana crank pattern).
             name: "crank_expired",
             params: &[],
@@ -8466,6 +8554,7 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::release_via_cpi",
             "Escrow::cancel",
             "Escrow::cancel_expired",
+            "Escrow::cancel_partial",
             "Escrow::crank_expired",
             "QuorumPolicy::new + Escrow::with_quorum",
             "Escrow::update_quorum",
@@ -8534,7 +8623,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_thirty_four_instructions_take_params() {
+    fn only_thirty_five_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -8548,6 +8637,7 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize",
                 &"release",
                 &"release_via_cpi",
+                &"cancel_partial",
                 &"initialize_quorum",
                 &"update_quorum",
                 &"update_attestors",
@@ -9259,6 +9349,31 @@ pub(crate) mod anchor_idl_tests {
             Err(EscrowError::NotExpired)
         );
         assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn cancel_partial_maps_amount_param_and_initializer_signer() {
+        // IDL: cancel_partial(amount: u64). authority <- accounts.initializer
+        // (signer); amount <- param; the refund destination <-
+        // accounts.refund_to, pinned against the AV-23 refund policy by
+        // the state machine (RefundAddressMismatch otherwise).
+        let mut e = funded_escrow();
+        assert_eq!(e.cancel_partial(ALICE, 400_000, None, ALICE), Ok(400_000));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 600_000);
+        assert_eq!(e.released_amount(), 0);
+        // Documented failure modes: signer is not the initializer; the
+        // amount outruns the remaining lockup.
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.cancel_partial(MALLORY, 400_000, None, ALICE),
+            Err(EscrowError::Unauthorized)
+        );
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.cancel_partial(ALICE, 1_000_001, None, ALICE),
+            Err(EscrowError::ReleaseExceedsLocked)
+        );
     }
 
     #[test]
@@ -10003,6 +10118,10 @@ pub(crate) mod anchor_idl_tests {
     ];
     const PARAM_FIELD_MAP: &[(&str, &str, &str)] = &[
         ("initialize", "amount", "amount"),
+        // AV-60: the partial-cancel tranche shrinks the locked `amount`
+        // field (the `released` counter is untouched — a refund, not a
+        // payout).
+        ("cancel_partial", "amount", "amount"),
         ("initialize", "expires_at", "expires_at"),
         ("release", "amount", "released"),
         // AV-35: the CPI-routed release accumulates into the same
@@ -17358,6 +17477,8 @@ mod pause_tests {
         let mut e = paused_funded();
         assert_paused(e.cancel(ALICE, None, ALICE));
         assert_paused(e.cancel_expired(ALICE, EXPIRES_AT, None, ALICE));
+        // AV-60: the partial-cancel path is fund-moving too — same gate.
+        assert_paused(e.cancel_partial(ALICE, 1, None, ALICE));
         assert_eq!(e.state(), EscrowState::Funded);
     }
 
@@ -19952,7 +20073,12 @@ mod event_history_tests {
         );
         assert_eq!(EscrowEventKind::InitializerRotated.discriminant(), 26);
         assert_eq!(EscrowEventKind::ExpiryExtended.discriminant(), 27);
-        for d in 0..=27u8 {
+        assert_eq!(
+            EscrowEventKind::PartiallyCancelled.discriminant(),
+            28,
+            "AV-60: appended after ExpiryExtended"
+        );
+        for d in 0..=28u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -19963,7 +20089,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(28), None);
+        assert_eq!(EscrowEventKind::from_discriminant(29), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -20077,7 +20203,9 @@ mod event_history_tests {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         // First slot's kind byte sits at body offset 1024.
         let kind_off = ANCHOR_DISCRIMINATOR_LEN + 1024;
-        for bad in [28u8, 42, 255] {
+        // AV-60: discriminant 28 is now `PartiallyCancelled`; 29 is the
+        // first still-unknown byte.
+        for bad in [29u8, 42, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -20086,5 +20214,269 @@ mod event_history_tests {
                 "kind byte {bad}"
             );
         }
+    }
+}
+
+// ---------- AV-60: initializer partial cancel ----------
+//
+// `cancel_partial` is the initializer's counterpart to AV-11's partial
+// release: where `release` streams funds *out to the taker* in tranches,
+// `cancel_partial` walks the lockup *back to the initializer* in
+// tranches. Funded-only; the escrow stays `Funded`, the `released`
+// counter is untouched, and the locked total shrinks by `amount`.
+// The refund follows the AV-23 whitelist pin (`require_refund_recipient`,
+// shared with `cancel`); amount rules reuse the AV-11 semantics
+// (`AmountMismatch` on zero, `ReleaseExceedsLocked` above the remaining).
+// Quorum / timelock / vesting never gate it — same as `cancel` — and
+// the indexer sees one `PartiallyCancelled` event per call.
+#[cfg(test)]
+mod cancel_partial_tests {
+    use super::*;
+    use crate::{EscrowEventKind, IndexedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const WHITELIST: [u8; 32] = [0xC4; 32];
+    const MINT: [u8; 32] = [0xD0; 32];
+    const ATTESTOR_1: [u8; 32] = [0xA1; 32];
+    const ATTESTOR_2: [u8; 32] = [0xA2; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn funded_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE).unwrap();
+        e
+    }
+
+    #[test]
+    fn partial_cancel_shrinks_lockup_and_stays_funded() {
+        let mut e = funded_escrow();
+        let refund = e.cancel_partial(ALICE, 400_000, None, ALICE).unwrap();
+        assert_eq!(refund, 400_000, "the call returns the refunded amount");
+        assert_eq!(e.state(), EscrowState::Funded, "stays live");
+        assert_eq!(
+            e.released_amount(),
+            0,
+            "the released counter is untouched"
+        );
+        assert_eq!(e.amount(), 600_000);
+        assert_eq!(e.remaining_amount(), 600_000);
+        // A second tranche accumulates on top of the first.
+        let refund = e.cancel_partial(ALICE, 100_000, None, ALICE).unwrap();
+        assert_eq!(refund, 100_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.remaining_amount(), 500_000);
+    }
+
+    #[test]
+    fn cancelling_the_full_remaining_is_allowed() {
+        let mut e = funded_escrow();
+        assert_eq!(e.cancel_partial(ALICE, 1_000_000, None, ALICE), Ok(1_000_000));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 0);
+        assert_eq!(e.released_amount(), 0);
+        // A full `cancel` after a full partial cancel is a no-op refund.
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn zero_amount_is_amount_mismatch_and_changes_nothing() {
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.cancel_partial(ALICE, 0, None, ALICE),
+            Err(EscrowError::AmountMismatch),
+            "zero is the AV-11 release semantic, not a free no-op"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn amount_above_remaining_is_release_exceeds_locked() {
+        let mut e = funded_escrow();
+        // AV-11 interplay: release part first, so the remaining is
+        // smaller than the locked total.
+        e.release(ALICE, 1_750_000_000, 400_000, None, BOB).unwrap();
+        assert_eq!(e.remaining_amount(), 600_000);
+        assert_eq!(
+            e.cancel_partial(ALICE, 600_001, None, ALICE),
+            Err(EscrowError::ReleaseExceedsLocked),
+            "over-remaining is the AV-11 release semantic"
+        );
+        assert_eq!(
+            e.cancel_partial(ALICE, 600_000, None, ALICE),
+            Ok(600_000),
+            "exactly the remaining is fine"
+        );
+        assert_eq!(e.released_amount(), 400_000, "released survives the cancel");
+        assert_eq!(e.remaining_amount(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn released_counter_survives_a_partial_cancel() {
+        let mut e = funded_escrow();
+        e.release(ALICE, 1_750_000_000, 400_000, None, BOB).unwrap();
+        e.cancel_partial(ALICE, 100_000, None, ALICE).unwrap();
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.amount(), 900_000);
+        assert_eq!(e.remaining_amount(), 500_000);
+        // A later full `cancel` refunds only the remainder while the
+        // released progress stays auditable.
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.remaining_amount(), 500_000);
+    }
+
+    #[test]
+    fn only_the_initializer_may_partially_cancel() {
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.cancel_partial(BOB, 1, None, ALICE),
+            Err(EscrowError::Unauthorized),
+            "the taker cannot reclaim the initializer's funds"
+        );
+        assert_eq!(
+            e.cancel_partial(MALLORY, 1, None, ALICE),
+            Err(EscrowError::Unauthorized),
+            "a stranger learns nothing beyond Unauthorized"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn non_funded_states_reject_partial_cancel() {
+        // Unfunded.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            e.cancel_partial(ALICE, 1, None, ALICE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Terminal: cancelled.
+        let mut e = funded_escrow();
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(
+            e.cancel_partial(ALICE, 1, None, ALICE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Terminal: fully released via AV-11.
+        let mut e = funded_escrow();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.cancel_partial(ALICE, 1, None, ALICE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn refund_destination_follows_the_av23_whitelist_pin() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_refund_address(WHITELIST)
+            .expect("whitelist setup");
+        e.fund(ALICE).unwrap();
+        // The initializer personally is NOT the refund destination while
+        // a whitelist is configured — same pin as `cancel`.
+        assert_eq!(
+            e.cancel_partial(ALICE, 100_000, None, ALICE),
+            Err(EscrowError::RefundAddressMismatch)
+        );
+        let refund = e
+            .cancel_partial(ALICE, 100_000, None, WHITELIST)
+            .unwrap();
+        assert_eq!(refund, 100_000);
+        assert_eq!(e.refund_recipient(), WHITELIST);
+        assert_eq!(e.remaining_amount(), 900_000);
+    }
+
+    #[test]
+    fn mint_binding_applies_like_cancel() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint(MINT)
+            .expect("mint setup");
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.cancel_partial(ALICE, 100_000, None, ALICE),
+            Err(EscrowError::MintMismatch),
+            "native path on a bound mint is rejected, as on `cancel`"
+        );
+        assert_eq!(e.cancel_partial(ALICE, 100_000, Some(MINT), ALICE), Ok(100_000));
+        assert_eq!(e.remaining_amount(), 900_000);
+    }
+
+    #[test]
+    fn quorum_timelock_and_vesting_do_not_gate_partial_cancel() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap())
+            .unwrap()
+            .with_timelock(1_900_000_000)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(1_700_000_000, 1_950_000_000).unwrap())
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        // None of the three is satisfied / reached, yet the initializer
+        // still reclaims their own unreleased funds — same as `cancel`.
+        let refund = e.cancel_partial(ALICE, 250_000, None, ALICE).unwrap();
+        assert_eq!(refund, 250_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 750_000);
+    }
+
+    #[test]
+    fn milestone_plan_does_not_disable_partial_cancel() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .expect("milestone setup");
+        e.fund(ALICE).unwrap();
+        // AV-15 disables plain `release` under a plan, but the cancel
+        // paths are refunds, not payouts — same as `cancel`.
+        assert_eq!(
+            e.release(ALICE, 1_750_000_000, 1, None, BOB),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(e.cancel_partial(ALICE, 100_000, None, ALICE), Ok(100_000));
+        assert_eq!(e.remaining_amount(), 900_000);
+    }
+
+    #[test]
+    fn indexed_wrapper_emits_partially_cancelled() {
+        let mut e = IndexedEscrow::initialize(
+            ALICE,
+            BOB,
+            1_000_000,
+            EXPIRES_AT,
+            [0xE5; 32],
+            1_700_000_000,
+        )
+        .unwrap();
+        e.fund(ALICE, 1_700_000_001).unwrap();
+        let refund = e
+            .cancel_partial(ALICE, 400_000, None, ALICE, 1_750_000_000)
+            .unwrap();
+        assert_eq!(refund, 400_000);
+        let events = e.drain_events();
+        // initialize + fund + cancel_partial.
+        assert_eq!(events.len(), 3);
+        let ev = &events[2];
+        assert_eq!(ev.kind, EscrowEventKind::PartiallyCancelled);
+        assert_eq!(ev.kind.name(), "partially_cancelled");
+        assert_eq!(ev.kind as u8, 28, "discriminant pinned after ExpiryExtended");
+        assert_eq!(ev.from, EscrowState::Funded);
+        assert_eq!(ev.to, EscrowState::Funded);
+        assert_eq!(ev.amounts.refund, 400_000);
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        assert_eq!(ev.amounts.penalty, 0);
     }
 }
