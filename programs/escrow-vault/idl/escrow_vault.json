@@ -311,6 +311,14 @@
       ]
     },
     {
+      "name": "rotate_arbiter",
+      "discriminator": [249, 81, 161, 140, 86, 60, 98, 68],
+      "accounts": [],
+      "args": [
+        {"name": "new_arbiter", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "initialize_payout_allowlist",
       "discriminator": [155, 187, 116, 255, 95, 174, 219, 118],
       "accounts": [],

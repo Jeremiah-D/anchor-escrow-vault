@@ -1769,6 +1769,64 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Rotate the dispute arbiter by dual-signed governance (AV-62;
+    /// mirrors `Escrow::rotate_arbiter`). Both the *current* initializer
+    /// and the *current* taker must sign — one party alone (or a stranger
+    /// pair) is `Unauthorized`; the arbiter itself does not sign (a lost
+    /// arbiter key must not block its own replacement); the degenerate
+    /// initializer == taker self-escrow authorizes with one key passed
+    /// twice, like AV-12 activation. Only `Uninitialized` / `Activated`
+    /// / `Funded`: the terminal states and `Disputed` are
+    /// `InvalidStateTransition` (no live dispute path left to referee,
+    /// and arbitration in flight must settle with the referee that heard
+    /// it). A paused escrow fails fast (`Paused`) — rotation is a config
+    /// transition, not the pause key-loss escape hatch. With no arbiter
+    /// configured there is nothing to rotate (`InvalidArbiter`, code
+    /// 108, the arbiter-config error); the zero address is likewise
+    /// `InvalidArbiter`. Rotating to the current arbiter is an
+    /// idempotent no-op (the activation bitmask is untouched — it tracks
+    /// only the initializer and taker). The keeper's `resolve` listing
+    /// and the snapshot export read the live arbiter field, so both
+    /// follow the rotation automatically. Emits `ArbiterRotated` only on
+    /// an actual change (from == to == the current state), mirroring
+    /// `IndexedEscrow::rotate_arbiter`.
+    pub fn rotate_arbiter(
+        ctx: Context<RotateArbiter>,
+        new_arbiter: Pubkey,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.arbiter();
+        escrow
+            .rotate_arbiter(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_arbiter.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.arbiter` in place in the real build (33 bytes,
+        // always present, zeroed when None) — no realloc, no rent change.
+        if escrow.arbiter() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::ArbiterRotated,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Opt in to bounded expiry extension at setup time (AV-59;
     /// mirrors `Escrow::with_max_extension_secs`). `Uninitialized`
     /// only — the extension policy is fixed before any funds move. A
@@ -2595,6 +2653,10 @@ pub enum EscrowVaultEventKind {
     /// `amounts.refund` carries the partially-cancelled tranche.
     /// Mirrors `escrow_state::EscrowEventKind::PartiallyCancelled`.
     PartiallyCancelled,
+    /// AV-62: the dispute arbiter was rotated by dual-signed
+    /// governance (`Escrow::rotate_arbiter`). Mirrors
+    /// `escrow_state::EscrowEventKind::ArbiterRotated`.
+    ArbiterRotated,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -2657,6 +2719,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
+        }
+        escrow_state::EscrowEventKind::ArbiterRotated => {
+            EscrowVaultEventKind::ArbiterRotated
         }
     }
 }
@@ -3232,6 +3297,23 @@ pub struct RotateInitializer<'info> {
     /// parties must sign — one alone (or a stranger pair) is
     /// `Unauthorized`; the degenerate initializer == taker self-escrow
     /// authorizes with one key passed twice, like AV-12 activation.
+    pub taker: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct RotateArbiter<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's *current*
+    /// initializer. Both parties must sign — one alone (or a stranger
+    /// pair) is `Unauthorized`; the degenerate initializer == taker
+    /// self-escrow authorizes with one key passed twice, like AV-12
+    /// activation.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's *current*
+    /// taker. The arbiter itself does not sign: rotation is the two
+    /// parties' governance, not an arbiter power — a lost arbiter key
+    /// must not block its own replacement.
     pub taker: Signer<'info>,
 }
 

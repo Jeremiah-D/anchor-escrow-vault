@@ -85,6 +85,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `rotate_pause_authority(new_authority)`       | any (post-`Uninitialized`) | — (no state change; rewrites the bound pause authority) | the escrow authority (initializer) only — a stranger/taker is `Unauthorized`; `InvalidStateTransition` on `Uninitialized` or with no authority bound; zero address is `InvalidPauseAuthority`; works while paused (key-loss escape hatch); emits `PauseAuthorityRotated` only on an actual change |
 | `rotate_taker(new_taker)`                   | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the taker) | **both** the initializer and the *current* taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition` (no live counterparty left; arbitration in flight adjudicates the taker's identity); zero address is `InvalidTaker`; amount / released / attest records / milestone state all preserved; emits `TakerRotated` only on an actual change |
 | `rotate_initializer(new_initializer)`      | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the initializer) | **both** the *current* initializer and the taker must sign (dual-signature governance — the mirror of `rotate_taker`; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (arbitration in flight adjudicates the initializer's identity — the refund goes to the initializer); zero address is `InvalidInitializer`; on an actual change the initializer's activation signature bit is cleared (the new key never signed activation); the AV-23 whitelist pins the refund destination when configured, otherwise refunds resolve to the new initializer (keeper/snapshot follow automatically); emits `InitializerRotated` only on an actual change |
+| `rotate_arbiter(new_arbiter)`                | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the arbiter) | **both** the *current* initializer and the *current* taker must sign (dual-signature governance — the mirror of `rotate_initializer` for the arbitration role; the arbiter itself does not sign, so a lost arbiter key cannot block its own replacement; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (no live dispute path left to referee, and arbitration in flight must settle with the referee that heard it); no arbiter configured or the zero address is `InvalidArbiter`; the activation bitmask is untouched (it tracks only the initializer and taker); the keeper's `resolve` listing and the snapshot export read the live arbiter field (follow automatically); emits `ArbiterRotated` only on an actual change |
 | `initialize_quorum(attestors, weights, threshold)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_extension(max_extension_secs)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding); zero bound is `InvalidExpiryExtension`; persists the extension budget (`max_extension_secs`, `extension_count` starts 0) |
@@ -682,6 +683,36 @@ activation bit untouched); an actual change emits the
 The 32-byte initializer region is rewritten in place — no layout or rent
 change.
 
+**Arbiter rotation (AV-62).** The *current* initializer and the *current*
+taker may jointly rotate the dispute arbiter (`rotate_arbiter(new_arbiter)`)
+— the mirror of initializer rotation for the arbitration role: a lost or
+compromised arbiter key, an arbitration provider migration, an operator
+key rollover. Both parties must sign (one alone, or a stranger pair, is
+`Unauthorized`); the initializer/taker sides are authenticated against
+the *current* keys, so the old keys consent to the referee's replacement,
+and the degenerate initializer == taker self-escrow authorizes with one
+key passed twice (like AV-12 activation). The arbiter itself does not
+sign — rotation is the two parties' governance, not an arbiter power, so
+a lost arbiter key cannot block its own replacement. Only `Uninitialized`
+/ `Activated` / `Funded` — the terminal states have no live dispute path
+left to referee, and `Disputed` is excluded because arbitration is in
+flight (never swap the referee mid-arbitration — the dispute must settle
+first). Check order is authority → state → config: with no arbiter
+configured there is nothing to rotate, and the zero address is rejected —
+both are `InvalidArbiter` (code 108, the arbiter-config error, matching
+`with_arbiter`'s zero-key rejection). Unlike initializer rotation there
+is no activation bit to clear — the bitmask tracks only the initializer
+and taker, so it is untouched on both the no-op and the actual change.
+Unlike the pause-authority rotation, this one *is* gated by the pause
+(`Paused`) — it is a config transition, not the key-loss escape hatch.
+Rotating to the current arbiter is an idempotent no-op; an actual change
+emits the `ArbiterRotated` indexer event (`from == to ==` the current
+state). The 32-byte arbiter region is rewritten in place — no layout or
+rent change. The keeper's `resolve` listing names the live arbiter as the
+caller (so an arbiter-operated keeper bot follows the rotation
+automatically) and the snapshot export carries the new arbiter — both
+read the live field, no extra writes.
+
 **Expiry extension (AV-59).** An escrow with a hard deadline can outlive
 its usefulness when both sides still want the deal: the initializer may
 declare, at setup, a bounded extension budget
@@ -722,7 +753,7 @@ program error per variant):
 | `QuorumNotReached` | 105 | `release` before the quorum threshold is reached |
 | `ReleaseExceedsLocked` | 106 | cumulative `release` amounts exceeding the locked amount; `cancel_partial` with `amount` above the still-locked remainder |
 | `InvalidVesting` | 107 | bad vesting schedule (`start >= end`, or `cliff_at > end` since AV-51), or `claim` with no vesting configured |
-| `InvalidArbiter` | 108 | `with_arbiter` with the zero key, or `escalate`/`resolve` with no arbiter configured |
+| `InvalidArbiter` | 108 | `with_arbiter` with the zero key, `escalate`/`resolve` with no arbiter configured, or `rotate_arbiter` with no arbiter configured / with the zero key |
 | `DisputeWindowClosed` | 109 | `escalate` with `now >= expires_at` (past the dispute window) |
 | `InvalidMilestones` | 110 | bad milestone plan (empty list, > 8 tranches, zero-amount tranche, tranche sum ≠ locked amount), milestone op with no plan attached, out-of-range milestone index, or `release`/`claim` with a milestone plan attached |
 | `MilestoneNotConfirmed` | 111 | `release_milestone` before both parties confirmed the milestone |
@@ -1018,7 +1049,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `PartiallyCancelled` (AV-60) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |

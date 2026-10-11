@@ -61,6 +61,12 @@
 //!   when the initializer actually changes (AV-58) — the exact mirror
 //!   of `rotate_taker`'s emission rule: `from == to ==` the current
 //!   state, all amounts zero; a no-op rotation emits nothing.
+//! - `rotate_arbiter` emits [`EscrowEventKind::ArbiterRotated`]
+//!   when the arbiter actually changes (AV-62) — the exact mirror
+//!   of `rotate_initializer`'s emission rule: `from == to ==` the
+//!   current state, all amounts zero; a no-op rotation emits nothing.
+//!   A rotation with no arbiter configured is rejected, so the event
+//!   can never fire on an arbiter-less escrow.
 //! - `extend_expiry` emits [`EscrowEventKind::ExpiryExtended`] when the
 //!   deadline moves (AV-59) — `from == to ==` the current state (a
 //!   config change, not a lifecycle move), all amounts zero: the event
@@ -122,7 +128,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | PartiallyCancelled (AV-60) | 0 | 0 | the partially-cancelled tranche, refunded to the whitelisted destination (the escrow stays `Funded`; the `released` counter is untouched) | 0 |
@@ -293,6 +299,19 @@ pub enum EscrowEventKind {
     /// `amounts.refund` carries the partially-cancelled amount; the
     /// `released` counter is untouched.
     PartiallyCancelled,
+    /// AV-62: the dispute arbiter was rotated by dual-signed governance
+    /// ([`Escrow::rotate_arbiter`]) — the mirror of
+    /// [`EscrowEventKind::InitializerRotated`] for the arbitration
+    /// role. `from == to ==` the current state (a config change, not a
+    /// lifecycle move — like [`EscrowEventKind::QuorumUpdated`]); the
+    /// new arbiter is read from the vault, the event is the ordering
+    /// signal. Emitted only on an actual change: rotating to the
+    /// current arbiter is an idempotent no-op that emits nothing
+    /// (paralleling [`EscrowEventKind::TakerRotated`]'s no-op rule). A
+    /// rotation with no arbiter configured is rejected
+    /// (`InvalidArbiter`), so the event can never fire on an
+    /// arbiter-less escrow.
+    ArbiterRotated,
 }
 
 impl EscrowEventKind {
@@ -339,6 +358,9 @@ impl EscrowEventKind {
             // AV-60: appended after ExpiryExtended so discriminants 0–27
             // stay stable for already-serialized histories.
             28 => Self::PartiallyCancelled,
+            // AV-62: appended after PartiallyCancelled so discriminants
+            // 0–28 stay stable for already-serialized histories.
+            29 => Self::ArbiterRotated,
             _ => return None,
         })
     }
@@ -376,6 +398,7 @@ impl EscrowEventKind {
             Self::InitializerRotated => "initializer_rotated",
             Self::ExpiryExtended => "expiry_extended",
             Self::PartiallyCancelled => "partially_cancelled",
+            Self::ArbiterRotated => "arbiter_rotated",
         }
     }
 }
@@ -1520,6 +1543,46 @@ impl IndexedEscrow {
             let state = self.inner.state();
             self.push_event(
             EscrowEventKind::InitializerRotated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
+    /// Rotate the dispute arbiter by dual-signed governance (mirrors
+    /// [`Escrow::rotate_arbiter`]) — the mirror of
+    /// [`IndexedEscrow::rotate_initializer`]. Emits `ArbiterRotated`
+    /// only when the arbiter actually changes; `from == to ==`
+    /// the current state (a config change, not a lifecycle move —
+    /// like `QuorumUpdated`). `at` is the caller-supplied event
+    /// timestamp.
+    pub fn rotate_arbiter(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_arbiter: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.arbiter();
+        self.inner
+            .rotate_arbiter(initializer, taker, new_arbiter)?;
+        let after = self.inner.arbiter();
+        // The inner call rejects a stranger pair, wrong states, the
+        // zero address, and the no-arbiter case, so a changed arbiter
+        // here always means real governance — and a same-arbiter no-op
+        // stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+            EscrowEventKind::ArbiterRotated,
             state,
             state,
             EventAmounts::none(),
