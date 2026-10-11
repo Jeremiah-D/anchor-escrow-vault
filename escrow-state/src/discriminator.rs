@@ -507,6 +507,12 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // = uncapped when no cap was configured); appended last so every
     // earlier offset above is unchanged.
     let fee_cap = c.u64_le()?;
+    // AV-64: the relative timelock duration and the funding timestamp,
+    // always present (zeroed when no relative lock is configured /
+    // never funded); appended last so every earlier offset above is
+    // unchanged.
+    let relative_timelock_secs = c.u64_le()?;
+    let fund_at = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -583,6 +589,13 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // charged on-chain after a decode matches the fee charged
         // before serialization.
         fee_cap,
+        // AV-64: the relative timelock duration and the funding
+        // timestamp are persisted — a decoded escrow carries the same
+        // lock and the same funding origin the setup and `fund`
+        // recorded, so the payout gates decide identically after a
+        // decode.
+        relative_timelock_secs,
+        fund_at,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
@@ -617,7 +630,7 @@ mod discriminator_tests {
 
     fn funded(amount: u64, expires_at: u64) -> Escrow {
         let mut e = Escrow::initialize(ALICE, BOB, amount, expires_at).unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         e
     }
 
@@ -727,7 +740,7 @@ mod discriminator_tests {
             .unwrap();
         e.attest(A1).unwrap();
         e.attest(A2).unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let decoded = decode_vault_account(&account_bytes(&e)).unwrap();
         assert_eq!(decoded, e);
         assert!(decoded.quorum().unwrap().is_satisfied());
@@ -746,7 +759,7 @@ mod discriminator_tests {
             .unwrap();
         e.activate(ALICE).unwrap();
         e.activate(BOB).unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         e.escalate(BOB, EXPIRES_AT - 1, Some([0xE0; 32])).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         let decoded = decode_vault_account(&account_bytes(&e)).unwrap();

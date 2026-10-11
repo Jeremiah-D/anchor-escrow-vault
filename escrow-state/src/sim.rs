@@ -501,7 +501,7 @@ impl Runner {
                 }
             }
             ValidOp::Fund => {
-                Self::expect_ok(s.escrow.fund(ALICE), "fund", ctx, idx);
+                Self::expect_ok(s.escrow.fund(ALICE, NOW0), "fund", ctx, idx);
                 s.deposited += s.escrow.amount() as u128;
             }
             ValidOp::Attest(i) => {
@@ -608,13 +608,13 @@ impl Runner {
             });
             cands.push(Probe {
                 name: "stranger fund",
-                run: |s, _| s.escrow.fund(MALLORY),
+                run: |s, now| s.escrow.fund(MALLORY, now),
                 expected: EscrowError::Unauthorized,
             });
             if live {
                 cands.push(Probe {
                     name: "taker fund",
-                    run: |s, _| s.escrow.fund(BOB),
+                    run: |s, now| s.escrow.fund(BOB, now),
                     expected: EscrowError::Unauthorized,
                 });
             }
@@ -628,7 +628,7 @@ impl Runner {
                 // the double-fund probe only applies once funded.
                 EscrowState::Funded => cands.push(Probe {
                     name: "double fund",
-                    run: |s, _| s.escrow.fund(ALICE),
+                    run: |s, _| s.escrow.fund(ALICE, NOW0),
                     expected: EscrowError::InvalidStateTransition,
                 }),
                 _ => {}

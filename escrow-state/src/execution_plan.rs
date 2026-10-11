@@ -314,6 +314,8 @@ impl ExecutionPlan {
 #[cfg(test)]
 mod execution_plan_tests {
     use super::*;
+
+    const FUND_AT: u64 = 1_700_000_000;
     use crate::{scan_keeper_actions, Escrow, WatchedEscrow};
 
     const ALICE: [u8; 32] = [0xAA; 32]; // initializer
@@ -503,7 +505,7 @@ mod execution_plan_tests {
         // first) and the party-signed cancel_expired — each carrying the
         // pinned refund_to account.
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, 0).unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
         let watched = [WatchedEscrow {
             escrow_id: ID1,
             escrow: e,

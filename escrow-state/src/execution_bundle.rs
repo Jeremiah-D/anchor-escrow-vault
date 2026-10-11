@@ -469,7 +469,7 @@ mod execution_bundle_tests {
         if let Some(m) = mint {
             e = e.with_mint(m).unwrap();
         }
-        e.fund(initializer).unwrap();
+        e.fund(initializer, NOW).unwrap();
         e
     }
 
@@ -717,7 +717,7 @@ mod execution_bundle_tests {
             .unwrap()
             .with_protocol_fee(100)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, NOW).unwrap();
         let items = [
             watch(ID1, None, ALICE),          // initialize
             watch(ID2, Some(e), ALICE),       // release (1% fee)

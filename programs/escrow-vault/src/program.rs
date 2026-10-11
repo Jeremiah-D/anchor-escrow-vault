@@ -95,11 +95,18 @@ pub mod escrow_vault {
     }
 
     /// Lock funds into the vault (`Uninitialized -> Funded`).
+    /// AV-64: the funding timestamp is read from the Solana clock
+    /// sysvar (never an instruction param) and recorded as
+    /// `vault.fund_at` — the origin the relative timelock measures
+    /// from.
     pub fn fund(ctx: Context<Fund>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let from = escrow.state() as u8;
+        // AV-64: `fund_at` anchors the relative timelock at funding
+        // time — the clock sysvar, like the AV-27 gate's `now`.
+        let now = Clock::get()?.unix_timestamp as u64;
         escrow
-            .fund(ctx.accounts.initializer.key().to_bytes())
+            .fund(ctx.accounts.initializer.key().to_bytes(), now)
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // AV-18: one indexer event per state transition (mirrors
@@ -112,7 +119,7 @@ pub mod escrow_vault {
             0,
             0,
             0,
-            Clock::get()?.unix_timestamp as u64,
+            now,
             None,
             None,
             None,
@@ -1387,6 +1394,32 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Declare the relative timelock (AV-64; mirrors
+    /// `Escrow::with_relative_timelock`): after this, `release` /
+    /// `claim` / `release_milestone` require the Solana clock to have
+    /// passed `fund_at + secs` (`TimelockNotReached` otherwise), where
+    /// `fund_at` is the clock `fund` recorded. `secs == 0` means no
+    /// lock (the default). Mutually exclusive with the AV-27 absolute
+    /// timelock — a nonzero `secs` together with a nonzero `unlock_at`
+    /// is `InvalidTimelock` (code 135), in either builder order.
+    /// `Uninitialized` only. `cancel` / `cancel_expired` / `resolve` are
+    /// deliberately NOT gated, so a misconfigured lock can never trap
+    /// funds forever.
+    pub fn initialize_relative_timelock(
+        ctx: Context<InitializeRelativeTimelock>,
+        secs: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_relative_timelock(secs)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.relative_timelock_secs` is always present (8 bytes,
+        // zeroed by default), so the duration is written in place — no
+        // realloc needed in the real build.
+        Ok(())
+    }
+
     /// Declare the token decimal metadata (AV-28; mirrors
     /// `Escrow::with_decimals`): the SPL mint's decimal places, used
     /// only to render human-readable amounts in the keeper report and
@@ -2399,6 +2432,22 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `extension_count`).
     pub fee_cap: u64,
+    /// AV-64: relative timelock duration in seconds; mirrors
+    /// `escrow_state`'s `relative_timelock_secs`. `0` for an escrow
+    /// with no relative timelock configured. Always present (8 bytes,
+    /// zeroed by default) so `initialize_relative_timelock` writes the
+    /// duration in place without reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after `fee_cap`).
+    pub relative_timelock_secs: u64,
+    /// AV-64: Unix timestamp at which the escrow was funded, recorded
+    /// by `fund` from the Solana clock sysvar; mirrors
+    /// `escrow_state`'s `fund_at`. The origin the relative timelock is
+    /// measured from: payouts unlock at `fund_at +
+    /// relative_timelock_secs`. Always present (8 bytes, zeroed when
+    /// the escrow was never funded). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `relative_timelock_secs`).
+    pub fund_at: u64,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -2765,7 +2814,7 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    // Full vault space: 8-byte discriminator + 2200-byte payload = 2208
+    // Full vault space: 8-byte discriminator + 2216-byte payload = 2224
     // bytes (see `escrow_state::VAULT_SPACE`; AV-12 added the 1-byte
     // activation bitmask, AV-13 the 17-byte vesting region, AV-14 the
     // 33-byte arbiter region, AV-15 the 66-byte milestone plan + the
@@ -2786,11 +2835,13 @@ pub struct Initialize<'info> {
     // head + the 8-byte monotonic event total + the 1-byte valid-entry
     // count + the 1-byte configured capacity + the 1152-byte event
     // slots, AV-59 the 8-byte extension bound + the 8-byte extension
-    // counter, AV-63 the 8-byte absolute protocol-fee ceiling).
+    // counter, AV-63 the 8-byte absolute protocol-fee ceiling, AV-64
+    // the 8-byte relative timelock duration + the 8-byte funding
+    // timestamp).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 16_258_560 lamports.
+    // rent parameters the minimum is 16_369_920 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
@@ -3234,6 +3285,17 @@ pub struct InitializeTimelock<'info> {
     pub vault: Account<'info, Vault>,
     /// Only the initializer declares the timelock; the state machine
     /// rejects re-configuration once the escrow leaves `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeRelativeTimelock<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer declares the relative timelock; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`, and rejects a nonzero duration together with a
+    /// nonzero AV-27 absolute timelock (`InvalidTimelock`).
     pub initializer: Signer<'info>,
 }
 
@@ -3761,7 +3823,7 @@ fn cpi_settle_resolve(
 }
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error per EscrowError variant, so on-chain failures
-    // surface the exact `escrow_state` reason (code 100–118) to clients.
+    // surface the exact `escrow_state` reason (code 100–135) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
         escrow_state::EscrowError::InvalidStateTransition => {
@@ -3820,6 +3882,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         }
         escrow_state::EscrowError::InvalidExpiryExtension => {
             error!(ErrorCode::InvalidExpiryExtension)
+        }
+        escrow_state::EscrowError::InvalidTimelock => {
+            error!(ErrorCode::InvalidTimelock)
         }
     }
 }
@@ -3896,4 +3961,6 @@ pub enum ErrorCode {
     InvalidInitializer,
     #[msg("Invalid expiry extension (AV-59): extend_expiry with no extension bound configured, by a non-initializer, on a non-Uninitialized/Funded escrow, with a deadline that does not move forward, with a single increment above the bound, or on an already-expiry-eligible escrow; with_max_extension_secs with a zero bound")]
     InvalidExpiryExtension,
+    #[msg("Invalid timelock (AV-64): with_timelock with a nonzero unlock_at while a nonzero relative timelock is configured, or with_relative_timelock with a nonzero secs while a nonzero absolute timelock is configured — one clock per escrow")]
+    InvalidTimelock,
 }

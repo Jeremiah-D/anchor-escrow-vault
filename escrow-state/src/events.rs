@@ -949,14 +949,16 @@ impl IndexedEscrow {
     }
 
     /// Lock funds into the vault (mirrors [`Escrow::fund`]). Emits
-    /// `Funded`.
+    /// `Funded`. `at` is both the event timestamp and the state
+    /// machine's `now` (so the AV-64 `fund_at` the relative timelock
+    /// measures from sees the same clock the event log records).
     pub fn fund(&mut self, authority: [u8; 32], at: u64) -> Result<(), EscrowError> {
         let from = self.inner.state();
         // AV-36: a rejected reentrant entry emits `ReentryRejected`
         // (the deliberate exception to the no-events-on-failure rule).
         // (The inner result is bound first so its `&mut` borrow ends
         // before `map_reentrant` reborrows `self`.)
-        let result = self.inner.fund(authority);
+        let result = self.inner.fund(authority, at);
         self.map_reentrant(result, at)?;
         self.push_event(
             EscrowEventKind::Funded,

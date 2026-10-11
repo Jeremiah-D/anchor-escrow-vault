@@ -111,7 +111,7 @@ fn initialize_fund_release_happy_path() {
     assert_eq!(escrow.state(), EscrowState::Uninitialized);
 
     // `fund`: authority <- accounts.initializer (signer).
-    escrow.fund(ALICE).expect("fund by initializer must succeed");
+    escrow.fund(ALICE, EXPIRES_AT - 3_600).expect("fund by initializer must succeed");
     assert_eq!(escrow.state(), EscrowState::Funded);
 
     // `release(amount)`: authority <- accounts.initializer (signer);
@@ -154,7 +154,7 @@ fn quorum_attest_release_happy_path() {
         .expect("quorum must be set")
         .is_satisfied());
 
-    escrow.fund(ALICE).expect("fund by initializer must succeed");
+    escrow.fund(ALICE, EXPIRES_AT - 3_600).expect("fund by initializer must succeed");
     escrow
         .release(ALICE, 1_750_000_000, AMOUNT, None, BOB)
         .expect("release with satisfied quorum must succeed");
@@ -176,7 +176,7 @@ fn release_by_non_initializer_is_rejected() {
         signers: vec![ALICE],
     };
     let mut escrow = apply_initialize(&init_call, ALICE, BOB);
-    escrow.fund(ALICE).expect("fund by initializer must succeed");
+    escrow.fund(ALICE, EXPIRES_AT - 3_600).expect("fund by initializer must succeed");
 
     let release_call = InstructionCall {
         name: "release",
@@ -211,7 +211,7 @@ fn release_before_quorum_threshold_is_rejected() {
     let mut escrow = apply_initialize(&init_call, ALICE, BOB)
         .with_quorum(policy)
         .expect("quorum attach on Uninitialized must succeed");
-    escrow.fund(ALICE).expect("fund by initializer must succeed");
+    escrow.fund(ALICE, EXPIRES_AT - 3_600).expect("fund by initializer must succeed");
 
     // Only one of the two required attestations: below threshold.
     escrow.attest(ATTESTOR_2).expect("a2 attests");

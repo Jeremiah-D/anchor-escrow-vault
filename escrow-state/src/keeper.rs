@@ -741,7 +741,7 @@ mod keeper_tests {
 
     fn funded(amount: u64, expires_at: u64) -> Escrow {
         let mut e = Escrow::initialize(ALICE, BOB, amount, expires_at).unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         e
     }
 
@@ -750,7 +750,7 @@ mod keeper_tests {
             .unwrap()
             .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         e
     }
 
@@ -823,7 +823,7 @@ mod keeper_tests {
             .unwrap()
             .with_pause_authority(PAUSE_AUTH)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         e.pause(PAUSE_AUTH).unwrap();
         assert!(e.is_paused());
         let watched = [watch(ID1, e)];
@@ -872,7 +872,7 @@ mod keeper_tests {
             .unwrap()
             .with_grace_period(GRACE)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         let watched = [watch(ID1, e)];
         // At expires_at: the chain would reject — the keeper lists nothing.
         let report = scan_keeper_actions(&watched, MID);
@@ -921,7 +921,7 @@ mod keeper_tests {
             .unwrap()
             .with_mint(MINT)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
         assert_eq!(report.actions.len(), 2);
@@ -968,7 +968,7 @@ mod keeper_tests {
             .unwrap()
             .with_vesting_cliff(VEST_START, VEST_END, CLIFF)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, CLIFF - 1);
         assert!(
@@ -1003,7 +1003,7 @@ mod keeper_tests {
             .unwrap()
             .with_quorum(QuorumPolicy::new(&[A1, A2, A3], &[1, 1, 1], 2).unwrap())
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         e.attest(A1).unwrap(); // 1 of 2: the claim call would fail
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
@@ -1028,7 +1028,7 @@ mod keeper_tests {
             .unwrap()
             .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
         // The plan owns the release schedule (`claim` would fail with
@@ -1049,7 +1049,7 @@ mod keeper_tests {
             .unwrap()
             .with_arbiter(ARBITER)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         e.escalate(ALICE, MID, None).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         let watched = [watch(ID1, e)];
@@ -1083,7 +1083,7 @@ mod keeper_tests {
             .unwrap()
             .with_arbiter([0xA8; 32])
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         e.escalate(BOB, MID, Some(EVIDENCE)).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
@@ -1177,7 +1177,7 @@ mod keeper_tests {
             .unwrap()
             .with_mint(MINT)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         let watched = [watch(ID2, e)];
         let report = scan_keeper_actions(&watched, MID);
         let expected = format!(
@@ -1199,7 +1199,7 @@ mod keeper_tests {
             .unwrap()
             .with_refund_address(WHITELIST)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, 1_000_000);
         assert_eq!(report.actions.len(), 2);
@@ -1254,7 +1254,7 @@ mod keeper_tests {
             .unwrap()
             .with_decimals(6)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, 1_000_000);
         assert_eq!(report.actions.len(), 2);
@@ -1284,7 +1284,7 @@ mod keeper_tests {
             .unwrap()
             .with_decimals(6)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         let watched = [watch(ID2, e)];
         let report = scan_keeper_actions(&watched, MID);
         assert_eq!(report.actions.len(), 1);
@@ -1318,7 +1318,7 @@ mod keeper_tests {
             .unwrap()
             .with_subscription(SUB_PERIOD_SECS, SUB_PERIODS, SUB_PER_PERIOD)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         e
     }
 
@@ -1432,7 +1432,7 @@ mod close_keeper_tests {
 
     fn funded(initializer: [u8; 32]) -> Escrow {
         let mut e = Escrow::initialize(initializer, BOB, AMOUNT, NEVER).unwrap();
-        e.fund(initializer).unwrap();
+        e.fund(initializer, MID).unwrap();
         e
     }
 
@@ -1455,7 +1455,7 @@ mod close_keeper_tests {
             .unwrap()
             .with_arbiter(ARBITER)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         e.escalate(ALICE, MID, None).unwrap();
         e.resolve(ARBITER, 400_000, None, None, BOB).unwrap();
         assert_eq!(e.state(), EscrowState::Settled);
@@ -1474,7 +1474,7 @@ mod close_keeper_tests {
             .unwrap()
             .with_arbiter(ARBITER)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, MID).unwrap();
         e.escalate(ALICE, MID, None).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         e
@@ -2177,7 +2177,7 @@ mod keeper_milestone_tests {
             .with_milestones(MilestonePlan::new(amounts).unwrap())
             .unwrap();
         let mut e = build(e).unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         e
     }
 
@@ -2350,7 +2350,7 @@ mod keeper_milestone_tests {
     fn skips_escrows_without_plan_or_not_funded() {
         // Funded but no milestone plan: nothing milestone-related.
         let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
-        plain.fund(ALICE).unwrap();
+        plain.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         // Plan attached but never funded: not executable.
         let unplanned = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
@@ -2678,7 +2678,7 @@ mod rent_health_tests {
 
     fn funded() -> Escrow {
         let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER).unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, NOW).unwrap();
         e
     }
 

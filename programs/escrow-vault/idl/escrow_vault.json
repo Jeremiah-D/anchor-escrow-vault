@@ -404,6 +404,14 @@
       "args": [
         {"name": "new_expires_at", "type": "u64"}
       ]
+    },
+    {
+      "name": "initialize_relative_timelock",
+      "discriminator": [130, 0, 30, 18, 28, 26, 206, 111],
+      "accounts": [],
+      "args": [
+        {"name": "secs", "type": "u64"}
+      ]
     }
   ],
   "accounts": [
@@ -454,7 +462,9 @@
           {"name": "event_slots", "type": {"array": [{"defined": "EventHistorySlot"}, 64]}, "offset": 1032},
           {"name": "max_extension_secs", "type": "u64", "offset": 2184},
           {"name": "extension_count", "type": "u64", "offset": 2192},
-          {"name": "fee_cap", "type": "u64", "offset": 2200}
+          {"name": "fee_cap", "type": "u64", "offset": 2200},
+          {"name": "relative_timelock_secs", "type": "u64", "offset": 2208},
+          {"name": "fund_at", "type": "u64", "offset": 2216}
         ]
       }
     }
@@ -572,7 +582,8 @@
     {"code": 131, "name": "PeriodNotDue"},
     {"code": 132, "name": "InvalidEventCapacity"},
     {"code": 133, "name": "InvalidInitializer"},
-    {"code": 134, "name": "InvalidExpiryExtension"}
+    {"code": 134, "name": "InvalidExpiryExtension"},
+    {"code": 135, "name": "InvalidTimelock"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

@@ -623,7 +623,7 @@ mod batch_tests {
 
     fn funded(amount: u64) -> Escrow {
         let mut e = Escrow::initialize(ALICE, BOB, amount, EXPIRES).unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, NOW).unwrap();
         e
     }
 
@@ -733,7 +733,7 @@ mod batch_tests {
             .unwrap()
             .with_mint(MINT)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, NOW).unwrap();
         // Partial plain release first: the batch releases the remainder.
         e.release(ALICE, NOW, 400_000, Some(MINT), BOB).unwrap();
         let report = scan_batch_lifecycle(&[watch(ID1, Some(e))], NOW);
@@ -761,20 +761,20 @@ mod batch_tests {
             .unwrap()
             .with_quorum(QuorumPolicy::new(&[A1, A2], &[1, 1], 2).unwrap())
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, NOW).unwrap();
         e.attest(A1).unwrap(); // 1 of 2
         // Locked timelock.
         let mut e2 = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES)
             .unwrap()
             .with_timelock(NOW + 1_000)
             .unwrap();
-        e2.fund(ALICE).unwrap();
+        e2.fund(ALICE, NOW).unwrap();
         // Milestone plan attached (plain `release` disabled).
         let mut e3 = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES)
             .unwrap()
             .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
             .unwrap();
-        e3.fund(ALICE).unwrap();
+        e3.fund(ALICE, NOW).unwrap();
         let report = scan_batch_lifecycle(
             &[watch(ID1, Some(e)), watch(ID2, Some(e2)), watch(ID3, Some(e3))],
             NOW,
@@ -791,7 +791,7 @@ mod batch_tests {
             .unwrap()
             .with_arbiter([0xA8; 32])
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, NOW).unwrap();
         e.escalate(ALICE, NOW, None).unwrap();
         let mut e2 = funded(AMOUNT);
         e2.release(ALICE, NOW, AMOUNT, None, BOB).unwrap();
@@ -818,7 +818,7 @@ mod batch_tests {
             .unwrap()
             .with_quorum(QuorumPolicy::new(&[A1, A2], &[1, 1], 2).unwrap())
             .unwrap();
-        blocked.fund(ALICE).unwrap();
+        blocked.fund(ALICE, NOW).unwrap();
         let items = [
             watch(ID1, None),            // -> initialize
             watch(ID2, Some(blocked)),   // -> blocked
@@ -845,12 +845,12 @@ mod batch_tests {
             .unwrap()
             .with_mint(MINT)
             .unwrap();
-        e1.fund(ALICE).unwrap();
+        e1.fund(ALICE, NOW).unwrap();
         let mut e2 = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES)
             .unwrap()
             .with_mint(MINT)
             .unwrap();
-        e2.fund(ALICE).unwrap();
+        e2.fund(ALICE, NOW).unwrap();
         let report = scan_batch_lifecycle(&[watch(ID1, Some(e1)), watch(ID2, Some(e2))], NOW);
         // First-seen order: ID1 (vault), MINT, ID2 (vault).
         assert_eq!(report.alt_table, vec![ID1, MINT, ID2]);

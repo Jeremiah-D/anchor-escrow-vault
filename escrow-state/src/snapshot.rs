@@ -23,6 +23,10 @@
 //! - `unlock_at` / `unlock_eligible`: the timelock (AV-27) and whether the
 //!   payout gates pass at the snapshot time — the same predicate the
 //!   keeper scan uses for `claim` actions;
+//! - `relative_timelock_secs` / `fund_at`: the relative timelock
+//!   (AV-64) — the lock duration and the funding timestamp it is
+//!   measured from — so indexers compute the same unlock time the
+//!   chain's payout gates enforce;
 //! - `decimals` / `display_*`: the token decimal metadata (AV-28) and
 //!   every shown amount rendered in human units (`amount`, `released`,
 //!   `remaining`, `vested`, `claimable`, `fees_paid`, `skipped`, and
@@ -239,6 +243,13 @@ pub struct EscrowSnapshot {
     /// `release_milestone`) pass the timelock at [`EscrowSnapshot::at`]:
     /// `at >= unlock_at`. Same predicate the keeper scan uses (AV-27).
     pub unlock_eligible: bool,
+    /// Relative timelock duration in seconds, or `0` when no relative
+    /// timelock is configured (AV-64): payouts unlock at
+    /// `fund_at + relative_timelock_secs`.
+    pub relative_timelock_secs: u64,
+    /// Unix timestamp at which the escrow was funded, or `0` when never
+    /// funded (AV-64): the origin the relative timelock is measured from.
+    pub fund_at: u64,
     /// Payout destination allowlist, or `None` when no allowlist is
     /// configured (AV-49). When `Some`, every fund-moving transition
     /// requires its `payout_to` to be a member.
@@ -368,6 +379,11 @@ impl Escrow {
             penalty_bps: self.penalty_bps(),
             unlock_at: self.unlock_at(),
             unlock_eligible: self.is_unlock_eligible(now),
+            // AV-64: the relative lock and its funding origin ride the
+            // export, so an off-chain indexer can compute the same
+            // unlock time the chain's payout gates enforce.
+            relative_timelock_secs: self.relative_timelock_secs(),
+            fund_at: self.fund_at(),
         }
     }
 }
@@ -558,6 +574,12 @@ impl EscrowSnapshot {
         s.push_str(&self.unlock_at.to_string());
         s.push_str(",\"unlock_eligible\":");
         s.push_str(if self.unlock_eligible { "true" } else { "false" });
+        // AV-64: relative timelock duration and the funding timestamp
+        // it is measured from.
+        s.push_str(",\"relative_timelock_secs\":");
+        s.push_str(&self.relative_timelock_secs.to_string());
+        s.push_str(",\"fund_at\":");
+        s.push_str(&self.fund_at.to_string());
         // AV-49: payout destination allowlist — `null` when none is
         // configured, else the allowlisted addresses as hex strings.
         s.push_str(",\"payout_allowlist\":");
@@ -643,7 +665,7 @@ mod snapshot_tests {
 
     fn funded(amount: u64, expires_at: u64) -> Escrow {
         let mut e = Escrow::initialize(ALICE, BOB, amount, expires_at).unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, VEST_START).unwrap();
         e
     }
 
@@ -671,7 +693,7 @@ mod snapshot_tests {
              \"milestones\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
-             \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"payout_allowlist\":null,\
+             \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
              \"max_extension_secs\":0,\"extension_count\":0\
@@ -700,7 +722,7 @@ mod snapshot_tests {
             .unwrap()
             .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, VEST_START).unwrap();
         // Before the schedule starts: nothing vested.
         let snap = e.snapshot(VEST_START - 1);
         assert_eq!(snap.vested, 0);
@@ -728,7 +750,7 @@ mod snapshot_tests {
             .unwrap()
             .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, VEST_START).unwrap();
         e.release(ALICE, 1_750_000_000, 200_000, None, BOB).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.released, 200_000);
@@ -742,7 +764,7 @@ mod snapshot_tests {
             .unwrap()
             .with_quorum(QuorumPolicy::new(&[A1, A2, A3], &[1, 1, 1], 2).unwrap())
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, VEST_START).unwrap();
         e.attest(A1).unwrap();
         let snap = e.snapshot(MID);
         let q = snap.quorum.expect("quorum must snapshot");
@@ -771,7 +793,7 @@ mod snapshot_tests {
             .unwrap()
             .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, VEST_START).unwrap();
         // Both parties confirm tranche 0 for the release path.
         e.confirm_milestone(ALICE, 0).unwrap();
         e.confirm_milestone(BOB, 0).unwrap();
@@ -817,7 +839,7 @@ mod snapshot_tests {
             .unwrap()
             .with_grace_period(GRACE)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, VEST_START).unwrap();
         assert!(!e.snapshot(MID).expiry_eligible);
         assert!(!e.snapshot(MID + GRACE - 1).expiry_eligible);
         assert!(e.snapshot(MID + GRACE).expiry_eligible);
@@ -831,7 +853,7 @@ mod snapshot_tests {
             .unwrap()
             .with_arbiter(ARBITER)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, VEST_START).unwrap();
         e.escalate(BOB, MID, Some(EVIDENCE)).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.state, "disputed");
@@ -853,7 +875,7 @@ mod snapshot_tests {
             .unwrap()
             .with_arbiter(ARBITER)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, VEST_START).unwrap();
         e.escalate(BOB, MID, None).unwrap();
         assert_eq!(e.snapshot(MID).rationale_hash, None);
         e.resolve(ARBITER, 400_000, None, Some(RATIONALE), BOB).unwrap();
@@ -890,7 +912,7 @@ mod snapshot_tests {
             .unwrap();
         e.activate(ALICE).unwrap();
         e.activate(BOB).unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, VEST_START).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.state, "funded");
         assert!(snap.dual_sig.required);
@@ -949,7 +971,7 @@ mod snapshot_tests {
             .unwrap()
             .with_decimals(6)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, VEST_START).unwrap();
         e.release(ALICE, MID, 250_000, None, BOB).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.decimals, 6);
@@ -983,7 +1005,7 @@ mod snapshot_tests {
             .unwrap()
             .with_protocol_fee(100)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, VEST_START).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.vested, 500_000);
         assert_eq!(snap.claimable, 500_000);
@@ -1012,7 +1034,7 @@ mod snapshot_tests {
             .unwrap()
             .with_decimals(6)
             .unwrap();
-        e.fund(ALICE).unwrap();
+        e.fund(ALICE, VEST_START).unwrap();
         let json = e.snapshot(MID).to_json();
         assert!(
             json.contains("\"amount\":400000,\"display_amount\":\"0.400000\""),

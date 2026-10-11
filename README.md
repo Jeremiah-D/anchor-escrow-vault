@@ -71,10 +71,10 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `confirm_default_judgment()` (AV-55) | `Uninitialized` / `Funded` | — (no state change; sets the confirmation bit) | **taker only** (`Unauthorized` for a stranger or the initializer); no judgment configured is `DefaultJudgmentNotDue`; idempotent (re-confirming is `Ok`) |
 | `trigger_default_judgment(caller, now, payout_to)` (AV-55) | `Disputed` | `Settled` | **initializer or taker** (either party — a liveness backstop, not a power grant); only once `now >= disputed_at + deadline_secs` (the judgment's due time, `DefaultJudgmentNotDue` otherwise); settles on the pre-agreed split — fee slices the taker's share like `resolve`, quorum/vesting/timelock do *not* gate (same as `resolve`); the arbiter's `resolve` is unchanged and keeps priority — after the deadline either the arbiter resolves or a party triggers, first writer wins; emits `DefaultJudgment` |
 | `initialize_subscription(period_secs, periods, per_period)` (AV-56) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — mutually exclusive with `initialize_milestones`; declares the periodic release schedule, back-scheduled from `expires_at`: period `i` is due at `expires_at - (periods-1-i) * period_secs`; validation — `period_secs` non-zero, `periods` in 1..=64, `per_period` non-zero, `periods * per_period` == locked amount (in u128), `expires_at != u64::MAX`, and the schedule must fit the lifetime — is `InvalidSubscription` otherwise) |
-| `release_period(period_index)` (AV-56) | `Funded` | `Funded` (partial) / `Released` (last period) | initializer only (the initializer's push path); strictly in-order (`period_index` must equal the next due period — skip-ahead and replay are `PeriodNotDue`) and due-date gated (`now >= due_at(period_index)` — `PeriodNotDue` otherwise); quorum satisfied when configured (`QuorumNotReached`), `now >= unlock_at` when a timelock is configured (`TimelockNotReached` — the timelock gates every taker payout path); `MintMismatch` / `PayoutNotAllowlisted` guard the fund movement like `release`; the protocol fee slices the period (`payout + fee == per_period`); vesting claim composes (not blocked); emits `SubscriptionPeriodReleased` |
+| `release_period(period_index)` (AV-56) | `Funded` | `Funded` (partial) / `Released` (last period) | initializer only (the initializer's push path); strictly in-order (`period_index` must equal the next due period — skip-ahead and replay are `PeriodNotDue`) and due-date gated (`now >= due_at(period_index)` — `PeriodNotDue` otherwise); quorum satisfied when configured (`QuorumNotReached`), the timelock gate when a lock is configured (`now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64); `TimelockNotReached` — the timelock gates every taker payout path); `MintMismatch` / `PayoutNotAllowlisted` guard the fund movement like `release`; the protocol fee slices the period (`payout + fee == per_period`); vesting claim composes (not blocked); emits `SubscriptionPeriodReleased` |
 | `initialize_milestones(milestones)`          | `Uninitialized`| `Uninitialized` | initializer (once, before funding; tranche amounts must sum to the locked amount) |
 | `confirm_milestone(authority, index)`        | `Funded`       | — (no state change) | initializer **or** taker (in order; a milestone is confirmed once *both* parties confirmed) |
-| `release_milestone(authority, now, index)`        | `Funded`       | `Funded` (partial) / `Released` (final tranche) | initializer; milestone dual-confirmed (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise) |
+| `release_milestone(authority, now, index)`        | `Funded`       | `Funded` (partial) / `Released` (final tranche) | initializer; milestone dual-confirmed (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise) |
 | `skip_milestone(authority, index)`           | `Funded`       | — (no state change) | initializer **or** taker, **both** must approve (dual-sig skip; skipped tranche refunded to the initializer) |
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
 | `initialize_protocol_fee(fee_bps)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `fee_bps` in 0–10000 basis points; the fee slices every taker payout into net payout + protocol fee; the AV-63 fee cap can floor it per payout) |
@@ -96,12 +96,13 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `update_attestors(initializer, taker, attestors)` | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance; no party can unilaterally reshape the electorate); empty set / `> 8` / duplicates / new set smaller than the unchanged threshold is `InvalidQuorum`; approval bits remap by pubkey (retained votes survive, removed voters' bits cleared); emits `AttestorsUpdated` on a real set change, nothing on a no-op |
 | `activate(authority)`                       | `Uninitialized`| `Uninitialized` (one party) / `Activated` (both parties) | initializer **or** taker (dual-sig escrows only) |
 | `initialize_vesting(start, end, cliff)`     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `start < end`; `cliff` 0 = no cliff, else `cliff <= end`) |
-| `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise) |
-| `fund(authority)`                           | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer            |
-| `release(authority, now, amount, payout_to)` (AV-49)                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; `now >= unlock_at` when a timelock is configured — `TimelockNotReached` otherwise); cumulative releases ≤ locked amount; `payout_to` must satisfy the payout policy — the taker, or a member of the payout allowlist when one is configured (`PayoutNotAllowlisted` otherwise) |
+| `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise) |
+| `fund(authority, now)`                      | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer (`now` <- clock sysvar, recorded as `fund_at` — the origin the AV-64 relative timelock measures from) |
+| `release(authority, now, amount, payout_to)` (AV-49)                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); cumulative releases ≤ locked amount; `payout_to` must satisfy the payout policy — the taker, or a member of the payout allowlist when one is configured (`PayoutNotAllowlisted` otherwise) |
 | `initialize_timelock(unlock_at)`            | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `unlock_at` is the Unix timestamp before which no taker payout may leave; `0` = no lock) |
+| `initialize_relative_timelock(secs)` (AV-64) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `secs` is the duration in seconds after *funding* before which no taker payout may leave; `0` = no lock; mutually exclusive with the AV-27 absolute timelock — both nonzero is `InvalidTimelock`, code 135) |
 | `initialize_emergency_unlock()`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opts into dual-signed emergency timelock-unlock governance) |
-| `emergency_unlock(initializer, taker)`       | `Funded`       | `Funded` (no state change) | **both** parties must sign (dual-signature governance; one party alone is `Unauthorized`); requires the opt-in and an active timelock (`InvalidStateTransition` otherwise); clears `timelock` to `0` so payouts become immediately eligible — state and amounts untouched; emits `EmergencyUnlock` |
+| `emergency_unlock(initializer, taker)`       | `Funded`       | `Funded` (no state change) | **both** parties must sign (dual-signature governance; one party alone is `Unauthorized`); requires the opt-in and an active timelock (`InvalidStateTransition` otherwise); clears the timelock (`timelock`, or the AV-64 relative lock) to `0` so payouts become immediately eligible — state and amounts untouched; emits `EmergencyUnlock` |
 | `initialize_decimals(decimals)`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `decimals` is the SPL mint's decimal places — SPL mints declare at most 9, `> 18` is rejected; `0` = no decimal metadata; display-only, never gates a transition or moves funds) |
 | `cancel(authority, refund_to)`               | `Funded`       | `Cancelled` | initializer; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise |
 | `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); the refund still goes to the whitelisted address even when the taker calls; returns `(refund, penalty)` — a taker-initiated cancel with `penalty_bps > 0` slices an anti-griefing penalty for the initializer (see below) |
@@ -172,6 +173,24 @@ a misconfigured or abandoned timelock can never trap funds forever — after
 dispute still settles via arbitration. The keeper report lists a `claim`
 action only once the timelock is unlocked, and the state snapshot exposes
 `unlock_at` / `unlock_eligible` for indexers.
+
+**Relative timelock.** An escrow can instead opt into a *relative* timelock
+(`with_relative_timelock(secs)`, once, before funding; `secs` is a duration
+in seconds, `0` = no lock). After that, every taker payout path — `release`,
+`claim`, and `release_milestone` — requires `now >= fund_at + secs`
+(`TimelockNotReached`, code 118, otherwise), where `fund_at` is the clock
+`fund` recorded: the lock is anchored at funding, not at a fixed
+wall-clock timestamp — the right shape when the deal's clock starts when
+the money lands (e.g. "payouts unlock 30 days after funding", negotiated
+before anyone knows the funding date). The two locks are mutually exclusive
+— one clock per escrow: configuring both is `InvalidTimelock`, code 135, in
+either builder order (the zero sentinels stay order-independent no-ops).
+Like the absolute lock, the relative lock gates only *payouts*: `cancel`,
+`cancel_expired`, and the arbiter's `resolve` are deliberately not gated, so
+a misconfigured lock can never trap funds forever. The dual-signed
+`emergency_unlock` clears the relative lock exactly like the absolute one.
+The snapshot exposes `relative_timelock_secs` / `fund_at` for indexers, so
+they compute the same unlock time the chain enforces.
 
 **Emergency timelock unlock.** An escrow can additionally opt into
 dual-signed emergency governance (`with_emergency_unlock()`, once, before
@@ -777,7 +796,9 @@ automatically. New vault fields (appended last): `max_extension_secs`
 (u64), `extension_count` (u64) — 16 bytes, so the full vault is now
 2200 bytes / 16,202,880 lamports rent-exempt. AV-63 appends
 `fee_cap` (u64) — 8 bytes, so the full vault is now 2208 bytes /
-16,258,560 lamports rent-exempt.
+16,258,560 lamports rent-exempt. AV-64 appends `relative_timelock_secs`
+(u64) and `fund_at` (u64) — 16 bytes, so the full vault is now 2216 bytes /
+16,369,920 lamports rent-exempt.
 
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
@@ -802,7 +823,7 @@ program error per variant):
 | `InvalidGracePeriod` | 115 | `with_grace_period` where `expires_at + grace_period` would overflow `u64` (grace on a no-timeout escrow) |
 | `RefundAddressMismatch` | 116 | `cancel`/`cancel_expired` with a refund destination ≠ the whitelisted address (or ≠ the initializer with no whitelist), or `with_refund_address` with the zero address |
 | `InvalidPenalty` | 117 | `with_penalty_bps` with `penalty_bps` > 10_000 (not a valid basis-point rate) |
-| `TimelockNotReached` | 118 | `release`/`claim`/`release_milestone` while `now < unlock_at` (AV-27 timelock); `cancel`/`cancel_expired`/`resolve` are never gated |
+| `TimelockNotReached` | 118 | `release`/`claim`/`release_milestone` while `now < unlock_at` (AV-27 absolute timelock) or `now < fund_at + secs` (AV-64 relative timelock); `cancel`/`cancel_expired`/`resolve` are never gated |
 | `InvalidDecimals` | 119 | `with_decimals` with `decimals` > 18 (not a valid token precision) |
 | `InvalidCpiTarget` | 120 | `release_via_cpi` with a zero program id, an empty account list, or a zero account key (malformed third-party invocation) |
 | `CpiExecutionFailed` | 121 | `release_via_cpi` whose injected CPI executor reported failure after the gates passed (whole release rolled back) |
@@ -819,6 +840,7 @@ program error per variant):
 | `InvalidEventCapacity` | 132 | `with_event_capacity` with `capacity == 0` or `capacity > 64` (the event-history ring holds 1..=64 entries) |
 | `InvalidInitializer` | 133 | `rotate_initializer` with the zero address (a zero address can never be the legitimate initializer) |
 | `InvalidExpiryExtension` | 134 | `initialize_extension` with a zero bound or on a non-`Uninitialized` escrow; `extend_expiry` with a deadline that is not later than the current one, whose increment exceeds the remaining budget, on an `Activated`/`Disputed`/terminal escrow, or when the deadline is already keeper-eligible (`now >= expires_at + grace_period`) |
+| `InvalidTimelock` | 135 | `with_timelock` with a nonzero `unlock_at` while a nonzero relative timelock is configured, or `with_relative_timelock` with a nonzero `secs` while a nonzero absolute timelock is configured (one clock per escrow) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1046,7 +1068,7 @@ initializer            escrow                 state
 
 **K. Emergency timelock unlock — dual-signed early clearing.** The
 governance is opted in before funding; both parties must sign, and the
-call clears the timelock without moving state or funds:
+call clears the timelock (absolute or AV-64 relative) without moving state or funds:
 
 ```
 initializer    taker            escrow                 state
@@ -1204,7 +1226,7 @@ returns a `KeeperReport` of immediately executable calls:
 |--------|-------------|--------|----------|
 | `cancel_expired(authority, now, mint, refund_to)` | `Funded`, `now >= expires_at + grace_period` (grace-aware: the keeper never lists a call the chain would reject as `NotExpired`), remainder > 0 | initializer (canonical; the taker may also call) | refundable remainder (never fee'd) |
 | `crank_expired(caller, now, mint)` (AV-48) | `Funded`, `now >= expires_at + grace_period`, remainder > 0, **not paused** (the crank fails on a paused escrow, so it is only listed when executable) | `"anyone"` — permissionless; the keeper substitutes its own key (serialized as the zero key) | refundable remainder (never fee'd); the refund goes to the same pinned `refund_to` as the party path — the cranker receives nothing |
-| `claim(taker, now, mint)` | `Funded`, vesting attached, no milestone plan, vested − released > 0, quorum satisfied if configured, timelock unlocked (`now >= unlock_at`) | taker | gross vested-but-unreleased (`payout + fee == amount`) |
+| `claim(taker, now, mint)` | `Funded`, vesting attached, no milestone plan, vested − released > 0, quorum satisfied if configured, timelock unlocked (`now >= unlock_at` (AV-27) / `now >= fund_at + secs` (AV-64)) | taker | gross vested-but-unreleased (`payout + fee == amount`) |
 | `resolve(arbiter, taker_amount, mint, rationale_hash)` (AV-38) | `Disputed`, arbiter configured, remainder > 0 | arbiter | remaining locked amount the arbiter's split divides (the split itself and the rationale-document commitment are the arbiter's call-time judgment) |
 | `close_vault(authority)` (AV-40) | `Cancelled` / `Released` / `Settled` — the terminal states AV-34's `close_vault` accepts. `Disputed` is never listed (the arbitration is still live; the vault account is the arbiter's audit surface) and `Closed` is never listed (the rent is already reclaimed) — the scan lists only calls the chain would accept | initializer (the only key `close_vault` accepts — AV-34 checks authority before state) | `rent_reclaimed`: the mainnet rent-exempt minimum for the current `VAULT_SPACE` (via `vault_close_rent_reclaimed()`, never a hardcoded figure) |
 
@@ -1313,7 +1335,8 @@ Raw fields: `initializer`, `taker`, `state` (`uninitialized` / `activated` /
 (`required` / `initializer_activated` / `taker_activated`), `fee_bps`,
 `fees_paid`, `fee_recipient` (AV-44; hex or `null`), `fee_cap` (AV-63;
 `0` = uncapped), `skipped`, `penalty_bps`, `unlock_at` (AV-27; `0` = no
-timelock), plus the optional `quorum`,
+timelock), `relative_timelock_secs` (AV-64; `0` = no relative lock),
+`fund_at` (AV-64; `0` = never funded), plus the optional `quorum`,
 `vesting`, `arbiter`, `mint`, `evidence_hash`, `rationale_hash` (AV-38;
 hex or `null`), `reference` (AV-53; hex or `null`), `refund_to` (hex or
 `null`)
@@ -1331,8 +1354,8 @@ what `cancel` / `cancel_expired` would refund, skipped tranches included),
 `amount` / `confirmed` / `settled`, counts, and the `next` unsettled
 tranche), `expiry_eligible` (the chain's `cancel_expired` gate at `at`,
 grace included — the same predicate the keeper scan uses, so a snapshot
-never disagrees with the scan), and `unlock_eligible` (the AV-27 timelock
-gate at `at` — the same predicate the keeper scan uses for `claim`).
+never disagrees with the scan), and `unlock_eligible` (the timelock
+gate at `at` — absolute (AV-27) and relative (AV-64) — the same predicate the keeper scan uses for `claim`).
 
 Human-readable companions (AV-28): alongside every raw amount the
 snapshot renders a `display_*` string in whole-token units —
@@ -1355,7 +1378,7 @@ diffing numbers while operators read whole tokens.
  "arbiter":null,"mint":null,"fee_bps":0,"fees_paid":0,"display_fees_paid":"0.000000","fee_recipient":null,"fee_cap":0,
  "milestones":null,"skipped":0,"display_skipped":"0.000000",
  "evidence_hash":null,"rationale_hash":null,"refund_to":null,"refund_recipient":"...",
- "penalty_bps":0,"unlock_at":0,"unlock_eligible":true,"payout_allowlist":null,"reference":null,
+ "penalty_bps":0,"unlock_at":0,"unlock_eligible":true,"relative_timelock_secs":0,"fund_at":1700000000,"payout_allowlist":null,"reference":null,
  "event_history":{"capacity":64,"total":0,"count":0,"entries":[]}}
 ```
 
@@ -1412,7 +1435,9 @@ two-way consistency check against the IDL parameter table:
 | max_extension_secs | u64 | 8 |
 | extension_count | u64 | 8 |
 | fee_cap | u64 | 8 |
-| **total**     |                   | **2200** |
+| relative_timelock_secs | u64 | 8 |
+| fund_at | u64 | 8 |
+| **total**     |                   | **2216** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1475,11 +1500,13 @@ ceiling so a smaller configured capacity never needs a realloc) — and
 the 8-byte extension bound (AV-59: zeroed when extension is not enabled)
 — and the 8-byte extension counter (AV-59: zeroed when never extended) —
 and the 8-byte absolute protocol-fee ceiling (AV-63: zeroed = uncapped
-when no ceiling is configured).
-`escrow-state` exposes `VAULT_SPACE` (2208) and
-`VAULT_SPACE_NO_QUORUM` (1718) for the Anchor `space =` constraint, plus a
+when no ceiling is configured) — and the 8-byte relative timelock duration
+(AV-64: zeroed when no relative timelock is configured) — and the 8-byte
+funding timestamp (AV-64: zeroed when the escrow was never funded).
+`escrow-state` exposes `VAULT_SPACE` (2224) and
+`VAULT_SPACE_NO_QUORUM` (1734) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **16,258,560 lamports** to be
+mainnet rent parameters the full vault needs **16,369,920 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1500,15 +1527,15 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 2208 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
+  stays 2224 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
   weighted-quorum, AV-46 pause-switch, AV-49 payout-allowlist, AV-51
   vesting-cliff, AV-53 reference-memo, AV-55 default-judgment,
-  AV-56 subscription, AV-57 event-history, AV-59 extension, and AV-63
-  fee-cap growth is accounted in the
+  AV-56 subscription, AV-57 event-history, AV-59 extension, AV-63
+  fee-cap, and AV-64 relative-timelock growth is accounted in the
   layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**16,258,560
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**16,369,920
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the
@@ -1526,7 +1553,7 @@ the whole instruction aborts with zero side effects (state, counters
 and the event log all roll back). The initializer signs once instead
 of twice, and the rent-exempt deposit returns together with the
 payout. The indexer sees the fixed `Released` → `VaultClosed` event
-pair; the vault layout is untouched (`VAULT_SPACE` stays 2208).
+pair; the vault layout is untouched (`VAULT_SPACE` stays 2224).
 
 ## IDL pipeline (AV-29)
 

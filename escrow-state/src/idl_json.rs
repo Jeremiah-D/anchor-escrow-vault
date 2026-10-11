@@ -705,7 +705,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 35, "error variant count drift");
+    assert_eq!(errors.len(), 36, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -722,6 +722,7 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::InvalidEventCapacity.code(), 132);
     assert_eq!(EscrowError::InvalidInitializer.code(), 133);
     assert_eq!(EscrowError::InvalidExpiryExtension.code(), 134);
+    assert_eq!(EscrowError::InvalidTimelock.code(), 135);
 }
 
 #[test]
@@ -802,7 +803,7 @@ fn max_config_funded_escrow() -> Escrow {
         .unwrap();
     e.activate(ALICE).unwrap();
     e.activate(BOB).unwrap();
-    e.fund(ALICE).unwrap();
+    e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
     e.attest(ATTESTOR_1).unwrap();
     e.attest(ATTESTOR_2).unwrap();
     // Milestone 0: dual-confirm then release. Tranche 400_000 at 250 bps
@@ -920,7 +921,7 @@ fn idl_field_offsets_pin_dispute_path() {
     const RATIONALE: [u8; 32] = [0xA1; 32];
     let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
     e = e.with_arbiter(ARB).unwrap();
-    e.fund(ALICE).unwrap();
+    e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
     e.escalate(BOB, EXPIRES_AT - 100, Some(EVIDENCE)).unwrap();
 
     let enc = encode_escrow(&e);

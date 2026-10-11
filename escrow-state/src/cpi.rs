@@ -517,6 +517,8 @@ pub fn resolve_plan(
 #[cfg(test)]
 mod cpi_tests {
     use super::*;
+
+    const FUND_AT: u64 = 1_700_000_000;
     use crate::{Escrow, EscrowError, VestingSchedule};
 
     fn key(n: u8) -> Pubkey {
@@ -527,7 +529,7 @@ mod cpi_tests {
         let init = key(1);
         let taker = key(2);
         let mut e = Escrow::initialize(init, taker, amount, u64::MAX).unwrap();
-        e.fund(init).unwrap();
+        e.fund(init, FUND_AT).unwrap();
         assert_eq!(e.state(), EscrowState::Funded);
         e
     }
@@ -619,7 +621,7 @@ mod cpi_tests {
             .unwrap()
             .with_protocol_fee(100)
             .unwrap();
-        e.fund(init).unwrap();
+        e.fund(init, FUND_AT).unwrap();
         // Protocol fee: 1% → fee 5_000 on a 500_000 release.
         let (payout, fee) = e.release(init, 0, 500_000, None, key(2)).unwrap();
         assert_eq!((payout, fee), (495_000, 5_000));
@@ -700,7 +702,7 @@ mod cpi_tests {
             .unwrap()
             .with_vesting(VestingSchedule::new(1000, 2000).unwrap())
             .unwrap();
-        e.fund(init).unwrap();
+        e.fund(init, FUND_AT).unwrap();
         // Half vested at t=1500.
         let (payout, fee) = e.claim(taker, 1500, None, key(2)).unwrap();
         assert_eq!((payout, fee), (500_000, 0));
@@ -720,7 +722,7 @@ mod cpi_tests {
             .unwrap()
             .with_mint(mint)
             .unwrap();
-        e.fund(init).unwrap();
+        e.fund(init, FUND_AT).unwrap();
         let (payout, fee) = e.release(init, 0, 1_000_000, Some(mint), key(2)).unwrap();
         assert_eq!(fee, 0);
 
@@ -770,7 +772,7 @@ mod cpi_tests {
             .unwrap()
             .with_penalty_bps(200)
             .unwrap();
-        e.fund(init).unwrap();
+        e.fund(init, FUND_AT).unwrap();
         let (refund, penalty) = e.cancel_expired(taker, 1000, None, init).unwrap();
         assert!(penalty > 0 && refund + penalty == 1_000_000);
         let addrs = RefundAddrs {
@@ -831,7 +833,7 @@ mod cpi_tests {
             .unwrap()
             .with_arbiter(arbiter)
             .unwrap();
-        e.fund(init).unwrap();
+        e.fund(init, FUND_AT).unwrap();
         e.escalate(taker, 0, None).unwrap();
         let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None, key(2)).unwrap();
         assert_eq!(fee, 0);
@@ -868,7 +870,7 @@ mod cpi_tests {
             .unwrap()
             .with_protocol_fee(100)
             .unwrap();
-        e.fund(init).unwrap();
+        e.fund(init, FUND_AT).unwrap();
         e.escalate(taker, 0, None).unwrap();
         let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None, key(2)).unwrap();
         assert!(fee > 0);
@@ -898,7 +900,7 @@ mod cpi_tests {
             .unwrap()
             .with_fee_recipient(recipient)
             .unwrap();
-        e.fund(init).unwrap();
+        e.fund(init, FUND_AT).unwrap();
         // Protocol fee: 1% → fee 5_000 on a 500_000 release.
         let (payout, fee) = e.release(init, 0, 500_000, None, key(2)).unwrap();
         assert_eq!((payout, fee), (495_000, 5_000));
@@ -932,7 +934,7 @@ mod cpi_tests {
             .unwrap()
             .with_fee_recipient(recipient)
             .unwrap();
-        e.fund(init).unwrap();
+        e.fund(init, FUND_AT).unwrap();
         e.escalate(taker, 0, None).unwrap();
         let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None, key(2)).unwrap();
         // 2% of 600_000 = 12_000 fee; the initializer is refunded the rest.
@@ -970,7 +972,7 @@ mod cpi_tests {
             .unwrap()
             .with_protocol_fee(100)
             .unwrap();
-        e.fund(init).unwrap();
+        e.fund(init, FUND_AT).unwrap();
         let (payout, fee) = e.release(init, 0, 500_000, None, key(2)).unwrap();
         let plan = payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout, fee).unwrap();
         assert_eq!(plan.transfers.len(), 2);
