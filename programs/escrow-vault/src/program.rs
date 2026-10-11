@@ -815,6 +815,35 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to the arbiter-panel multisig judgment (AV-65; mirrors
+    /// `Escrow::with_arbiter_panel`): replace the single dispute
+    /// arbiter with an N-member panel and an M-vote judgment threshold.
+    /// `Uninitialized` only, like `initialize_arbiter`: the committee
+    /// is fixed before funds move. Mutually exclusive with the single
+    /// arbiter — last-wins in both directions: configuring the panel
+    /// clears any single arbiter set earlier, and a later
+    /// `initialize_arbiter` clears the panel. Empty / over-long /
+    /// zero-address / duplicate member input, a zero threshold, or a
+    /// threshold above the member count is `InvalidArbiterPanel` (code
+    /// 136). The vault account already reserves the full 595-byte panel
+    /// region (1-byte discriminant + 594-byte panel, zeroed when
+    /// `None`), so the committee is written in place — no realloc
+    /// needed in the real build. Emits no event (pre-fund
+    /// configuration).
+    pub fn initialize_arbiter_panel(
+        ctx: Context<InitializeArbiterPanel>,
+        members: Vec<Pubkey>,
+        threshold: u8,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let member_keys: Vec<[u8; 32]> = members.iter().map(|m| m.to_bytes()).collect();
+        let escrow = escrow
+            .with_arbiter_panel(&member_keys, threshold)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
     /// Escalate the escrow into arbitration (AV-14; mirrors
     /// `Escrow::escalate`): `Funded -> Disputed`. Either the initializer
     /// or the taker signs; `now` comes from the Solana clock sysvar (never
@@ -922,6 +951,85 @@ pub mod escrow_vault {
             None,
         );
         Ok((payout, fee, refund))
+    }
+
+    /// Submit one panel member's judgment (AV-65; mirrors
+    /// `Escrow::submit_panel_judgment`): `Disputed -> Disputed` per
+    /// vote, `Disputed -> Settled` once the M-th matching vote arrives.
+    /// Only a panel member signs — the state machine rejects strangers
+    /// with `Unauthorized` and non-`Disputed` escrows with
+    /// `InvalidStateTransition`; no panel configured is
+    /// `InvalidArbiterPanel` (code 136). Each member holds one effective
+    /// vote: re-voting overwrites the previous vote in place (the
+    /// overwritten vote stays in the event log as the audit trail).
+    /// The first `(taker_amount, rationale_hash)` pair to collect M
+    /// matching current votes settles the escrow automatically with
+    /// `resolve` semantics (the fee slices the taker's share, the
+    /// `released` counter keeps the gross, the initializer's refund is
+    /// never fee'd); the settling vote checks the mint and the payout
+    /// policy before mutating state, like `resolve`. Returns
+    /// `(taker_payout, fee, initializer_refund)` on the settling vote
+    /// so the real build can size all three transfers, `None`
+    /// otherwise. Emits `PanelJudgment` per submission and
+    /// `PanelResolved` on the settling vote (the vote event first, then
+    /// the settlement), mirroring
+    /// `IndexedEscrow::submit_panel_judgment`.
+    pub fn submit_panel_judgment(
+        ctx: Context<SubmitPanelJudgment>,
+        taker_amount: u64,
+        rationale_hash: Option<[u8; 32]>,
+    ) -> Result<Option<(u64, u64, u64)>> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        let settled = escrow
+            .submit_panel_judgment(
+                ctx.accounts.member.key().to_bytes(),
+                taker_amount,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+                rationale_hash,
+                ctx.accounts.payout_to.key().to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `now` doubles as the event's `at`, mirroring
+        // `IndexedEscrow::submit_panel_judgment`. Every submission
+        // emits PanelJudgment (the vote is the audit trail); the
+        // settling vote additionally emits PanelResolved with the
+        // `Resolved` amounts shape.
+        let now = Clock::get()?.unix_timestamp as u64;
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::PanelJudgment,
+            from,
+            escrow.state() as u8,
+            taker_amount,
+            0,
+            0,
+            now,
+            None,
+            rationale_hash,
+            None,
+            None,
+            Some(ctx.accounts.member.key()),
+        );
+        if let Some((payout, fee, refund)) = settled {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::PanelResolved,
+                from,
+                escrow.state() as u8,
+                taker_amount,
+                fee,
+                refund,
+                now,
+                escrow.evidence_hash(),
+                rationale_hash,
+                None,
+                None,
+                Some(ctx.accounts.member.key()),
+            );
+        }
+        Ok(settled)
     }
 
     /// Opt in to the arbitration default judgment (AV-55; mirrors
@@ -2448,6 +2556,18 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `relative_timelock_secs`).
     pub fund_at: u64,
+    /// AV-65: opt-in arbiter panel; mirrors `escrow_state`'s
+    /// `arbiter_panel`. `None` for an escrow with no panel configured
+    /// (single-arbiter mode or no arbitration). The account always
+    /// reserves the full 595-byte region (1-byte discriminant +
+    /// 594-byte panel: member count + threshold + 8 member keys + 8
+    /// vote slots + voted bitmask, zeroed when `None`) so
+    /// `initialize_arbiter_panel` writes the committee in place without
+    /// reallocating. Mutually exclusive with the single arbiter
+    /// (`arbiter`) — last-wins in both directions. Layout position
+    /// matches `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `fund_at`).
+    pub arbiter_panel: Option<ArbiterPanel>,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -2530,6 +2650,48 @@ pub struct DefaultJudgment {
     /// default judgment; mirrors
     /// `escrow_state::DefaultJudgment::default_taker_amount`.
     pub default_taker_amount: u64,
+}
+
+/// AV-65: skeleton mirror of `escrow_state::PanelVote`: one panel
+/// member's current effective judgment vote — the voted taker share of
+/// the remaining locked funds plus the member's optional
+/// rationale-document commitment. Serialized size is pinned by
+/// `escrow_state::PANEL_VOTE_LEN` (41 bytes: u64 + 1-byte option tag +
+/// 32-byte rationale).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct PanelVote {
+    /// The taker's share of the remaining locked funds this vote
+    /// awards; mirrors `escrow_state::PanelVote::taker_amount`.
+    pub taker_amount: u64,
+    /// The member's optional commitment to the off-chain rationale
+    /// document behind this vote; mirrors
+    /// `escrow_state::PanelVote::rationale_hash`.
+    pub rationale_hash: Option<[u8; 32]>,
+}
+
+/// AV-65: skeleton mirror of `escrow_state::ArbiterPanel`: the opt-in
+/// N-member arbitration committee with its M-vote judgment threshold.
+/// See the state machine docs for the multisig judgment / auto-settle
+/// semantics. Serialized size is pinned by
+/// `escrow_state::ARBITER_PANEL_LEN` (594 bytes: member count + threshold
+/// + 8 member keys + 8 vote slots + voted bitmask).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct ArbiterPanel {
+    /// How many members sit on the panel (1..=8); mirrors
+    /// `escrow_state::ArbiterPanel::n`.
+    pub n: u8,
+    /// How many matching votes settle the dispute (1..=n); mirrors
+    /// `escrow_state::ArbiterPanel::threshold`.
+    pub threshold: u8,
+    /// The member keys in slot order; mirrors
+    /// `escrow_state::ArbiterPanel::members`.
+    pub members: [Pubkey; 8],
+    /// The current effective vote per member, in slot order; mirrors
+    /// `escrow_state::ArbiterPanel::votes`.
+    pub votes: [PanelVote; 8],
+    /// Bitmask of members who have voted; mirrors
+    /// `escrow_state::ArbiterPanel::voted`.
+    pub voted: u64,
 }
 
 /// AV-56: skeleton mirror of `escrow_state::SubscriptionSchedule`: the
@@ -3146,6 +3308,19 @@ pub struct InitializeArbiter<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-65: opt in to the arbiter-panel multisig judgment at initialize
+/// time (replaces the single arbiter).
+#[derive(Accounts)]
+pub struct InitializeArbiterPanel<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer opts into panel arbitration; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`. Mutually exclusive with the single arbiter —
+    /// last-wins in both directions.
+    pub initializer: Signer<'info>,
+}
+
 #[derive(Accounts)]
 pub struct Escalate<'info> {
     #[account(mut)]
@@ -3176,6 +3351,31 @@ pub struct Resolve<'info> {
     /// it.
     pub payout_to: AccountInfo<'info>,
     /// CHECK: beneficiary of the initializer's refund share of the split.
+    pub initializer: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build reads its `mint` for the state machine's `MintMismatch`
+    /// check; unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
+}
+
+/// AV-65: one panel member submits their judgment on a disputed escrow.
+#[derive(Accounts)]
+pub struct SubmitPanelJudgment<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Must be one of the panel's member keys; the state machine
+    /// rejects anyone else with `Unauthorized`. A constraint in the real
+    /// build additionally asserts the key is a panel member.
+    pub member: Signer<'info>,
+    /// CHECK: beneficiary of the taker's share of the split (on the
+    /// settling vote).
+    pub taker: AccountInfo<'info>,
+    /// CHECK: explicit payout destination for the taker's share (AV-49;
+    /// see `Resolve`). The state machine enforces the payout policy on
+    /// it — checked only on the settling vote.
+    pub payout_to: AccountInfo<'info>,
+    /// CHECK: beneficiary of the initializer's refund share of the split
+    /// (on the settling vote).
     pub initializer: AccountInfo<'info>,
     /// CHECK: the vault's SPL token account (see `Release`). The real
     /// build reads its `mint` for the state machine's `MintMismatch`
@@ -3886,6 +4086,12 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidTimelock => {
             error!(ErrorCode::InvalidTimelock)
         }
+        escrow_state::EscrowError::InvalidArbiterPanel => {
+            error!(ErrorCode::InvalidArbiterPanel)
+        }
+        escrow_state::EscrowError::PanelResolveDisabled => {
+            error!(ErrorCode::PanelResolveDisabled)
+        }
     }
 }
 
@@ -3963,4 +4169,8 @@ pub enum ErrorCode {
     InvalidExpiryExtension,
     #[msg("Invalid timelock (AV-64): with_timelock with a nonzero unlock_at while a nonzero relative timelock is configured, or with_relative_timelock with a nonzero secs while a nonzero absolute timelock is configured — one clock per escrow")]
     InvalidTimelock,
+    #[msg("Invalid arbiter panel (AV-65): with_arbiter_panel with an empty member list, more than 8 members, a zero threshold, a threshold above the member count, a zero member key, or a duplicate member; or submit_panel_judgment with no panel configured")]
+    InvalidArbiterPanel,
+    #[msg("Single-arbiter settlement disabled (AV-65): resolve called on a panel-mode escrow — the panel's multisig judgment (submit_panel_judgment) is the only settlement path; the AV-55 default-judgment fallback is retained")]
+    PanelResolveDisabled,
 }

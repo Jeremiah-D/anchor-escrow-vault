@@ -672,6 +672,22 @@ pub struct Escrow {
     /// an escrow that was never funded). Appended last so every earlier
     /// field offset stays stable.
     fund_at: u64,
+    /// AV-65: opt-in arbiter panel (see [`Escrow::with_arbiter_panel`]).
+    /// `None` (the default) means no panel — backward compatible: the
+    /// single arbiter ([`Escrow::with_arbiter`]) or no arbitration at
+    /// all. `Some(panel)` replaces the single arbiter as the dispute
+    /// settlement mechanism (mutually exclusive, last-wins): after
+    /// [`Escrow::escalate`], panel members submit judgments via
+    /// [`Escrow::submit_panel_judgment`], and M matching votes settle
+    /// the escrow automatically; the single-arbiter
+    /// [`Escrow::resolve`] is disabled in panel mode
+    /// ([`EscrowError::PanelResolveDisabled`]). Set once on an
+    /// `Uninitialized` escrow, like the other `with_*` builders.
+    /// Persisted as 595 bytes in the vault account (a 1-byte
+    /// discriminant plus [`ARBITER_PANEL_LEN`] bytes) so the committee
+    /// and its votes survive serialization. Appended last, so every
+    /// earlier field offset stays stable.
+    arbiter_panel: Option<ArbiterPanel>,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -968,6 +984,22 @@ pub enum EscrowError {
     /// [`EscrowError::InvalidSubscription`] (mutually exclusive
     /// release schedules) (config error).
     InvalidTimelock,
+    /// Arbiter-panel misconfiguration or misuse (AV-65):
+    /// [`Escrow::with_arbiter_panel`] with an empty member list, more
+    /// than [`MAX_PANEL_MEMBERS`] members, a zero threshold, a
+    /// threshold above the member count, a zero member key, or a
+    /// duplicate member; or [`Escrow::submit_panel_judgment`] on an
+    /// escrow with no panel configured. Parallels
+    /// [`EscrowError::InvalidArbiter`] (config error, plus the
+    /// no-config call path).
+    InvalidArbiterPanel,
+    /// Single-arbiter settlement disabled (AV-65): [`Escrow::resolve`]
+    /// called on a panel-mode escrow — the panel's multisig judgment
+    /// ([`Escrow::submit_panel_judgment`]) is the only settlement path
+    /// once a panel is configured (mutually exclusive with the single
+    /// arbiter, last-wins); the AV-55 default-judgment fallback is
+    /// retained and still triggerable.
+    PanelResolveDisabled,
 }
 
 impl EscrowError {
@@ -1016,6 +1048,8 @@ impl EscrowError {
             EscrowError::InvalidInitializer => 133,
             EscrowError::InvalidExpiryExtension => 134,
             EscrowError::InvalidTimelock => 135,
+            EscrowError::InvalidArbiterPanel => 136,
+            EscrowError::PanelResolveDisabled => 137,
         }
     }
 
@@ -1058,6 +1092,8 @@ impl EscrowError {
             EscrowError::InvalidInitializer,
             EscrowError::InvalidExpiryExtension,
             EscrowError::InvalidTimelock,
+            EscrowError::InvalidArbiterPanel,
+            EscrowError::PanelResolveDisabled,
         ]
     }
 }
@@ -1232,7 +1268,182 @@ pub struct DefaultJudgment {
     pub default_taker_amount: u64,
 }
 
-/// Maximum number of subscription periods (AV-56). Fixed so the
+/// Maximum number of panel arbiters (AV-65). Fixed at 8 — the attestor
+/// convention ([`MAX_ATTESTORS`], AV-04/AV-45) — so the crate stays
+/// heap-free and `Copy`: the member keys, the per-member vote slots
+/// and the voted bitmask are all fixed-size.
+pub const MAX_PANEL_MEMBERS: usize = 8;
+
+/// Serialized length of one panel vote slot (AV-65): the voted
+/// taker-amount (`u64`), the 1-byte rationale discriminant, and the
+/// 32-byte rationale-document commitment — `8 + 1 + 32`.
+pub const PANEL_VOTE_LEN: usize = 8 + 1 + 32;
+
+/// Serialized length of [`ArbiterPanel`] (AV-65): the member count
+/// (`u8`), the judgment threshold (`u8`), the 8 fixed member-key slots
+/// (`8 * 32` bytes), the 8 fixed vote slots (`8 * `[`PANEL_VOTE_LEN`]
+/// bytes), and the voted bitmask (`u64`) — `1 + 1 + 256 + 328 + 8`.
+pub const ARBITER_PANEL_LEN: usize =
+    1 + 1 + MAX_PANEL_MEMBERS * PUBKEY_LEN + MAX_PANEL_MEMBERS * PANEL_VOTE_LEN + 8;
+
+/// One panel member's current judgment vote (AV-65): the split the
+/// member voted for, as the taker's share of the remaining locked
+/// funds (the initializer is refunded the rest — the same split
+/// semantics as [`Escrow::resolve`]), plus the member's optional
+/// rationale-document commitment (the AV-38 convention:
+/// `Option<[u8; 32]>`, 1-byte discriminant + 32 bytes).
+///
+/// A member holds exactly one *effective* vote: re-voting overwrites
+/// the previous vote in place. The overwritten vote is not lost — the
+/// [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits a
+/// `PanelJudgment` event per submission, so the full vote history
+/// survives as the audit trail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanelVote {
+    /// The taker's share of the remaining locked funds this vote
+    /// awards. Must be `<= amount - released` at submission
+    /// ([`EscrowError::ReleaseExceedsLocked`] otherwise) — the same
+    /// conservation gate as [`Escrow::resolve`].
+    pub taker_amount: u64,
+    /// The member's optional commitment to the off-chain rationale
+    /// document behind this vote (AV-38 convention).
+    pub rationale_hash: Option<[u8; 32]>,
+}
+
+/// The opt-in arbiter panel (AV-65 — Solana governance / payment
+/// anti-single-point-of-failure): an N-member arbitration committee
+/// with an M-vote judgment threshold, replacing the single arbiter
+/// (AV-14) as the dispute settlement mechanism.
+///
+/// Why: a single arbiter is a single point of failure — a lost key, a
+/// compromised key, or a bribed referee stalls or corrupts the
+/// settlement. The panel spreads the arbitration role across N
+/// independent members: after [`Escrow::escalate`], each member
+/// submits their judgment via
+/// [`Escrow::submit_panel_judgment`], and the first split (the
+/// `(taker_amount, rationale_hash)` pair) to collect M matching votes
+/// settles the escrow automatically — dissenting votes stay on the
+/// record (and in the event log) as the audit trail, but they cannot
+/// block the M-vote majority.
+///
+/// Set once via [`Escrow::with_arbiter_panel`] on an `Uninitialized`
+/// escrow, mutually exclusive with the single arbiter
+/// ([`Escrow::with_arbiter`]): the two builders are last-wins —
+/// configuring one clears the other — so an escrow always has at most
+/// one arbitration mechanism. Persisted (595 bytes in the vault
+/// account: 1-byte `Option` discriminant + [`ARBITER_PANEL_LEN`]
+/// bytes) so the committee and its votes survive serialization;
+/// appended last so every earlier field offset stays stable.
+///
+/// Design notes (pinned by test):
+/// - `n` members (`1..= `[`MAX_PANEL_MEMBERS`]`), `threshold` M
+///   (`1..= n`); the tail member/vote slots are zeroed.
+/// - `voted` is the bitmask of members who cast a vote — bit `i` set
+///   once member `i` voted (a re-vote keeps the bit set).
+/// - An unset (zeroed) vote slot is never counted: only members in
+///   the `voted` mask participate in the threshold tally.
+/// - Quorum does NOT gate the panel (AV-14 convention: the arbiter —
+///   here the panel — *is* the adjudication mechanism).
+/// - The AV-55 default-judgment fallback is retained in panel mode:
+///   [`Escrow::trigger_default_judgment`] works unchanged (the panel
+///   is a configured arbitration mechanism for the
+///   `with_arbitration_deadline` gate), so a panel that never reaches
+///   M matching votes still cannot trap funds forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArbiterPanel {
+    /// How many members sit on the panel (`1..=8`).
+    pub n: u8,
+    /// How many matching votes settle the dispute (`1..= n`).
+    pub threshold: u8,
+    /// The member keys in slot order; only `members[..n]` are
+    /// meaningful, the tail is zeroed.
+    pub members: [[u8; 32]; MAX_PANEL_MEMBERS],
+    /// The current effective vote per member, in slot order; only
+    /// `votes[..n]` are meaningful, and only slots in the `voted`
+    /// mask carry a real vote.
+    pub votes: [PanelVote; MAX_PANEL_MEMBERS],
+    /// Bitmask of members who have voted — bit `i` set once member
+    /// `i` submitted a judgment (re-votes keep the bit set).
+    pub voted: u64,
+}
+
+impl ArbiterPanel {
+    /// Build a panel from the member keys and the judgment threshold
+    /// `M`. [`EscrowError::InvalidArbiterPanel`] on an empty or
+    /// over-long member list, a zero threshold, a threshold above the
+    /// member count, a zero member key, or a duplicate member.
+    pub fn new(members: &[[u8; 32]], threshold: u8) -> Result<Self, EscrowError> {
+        if members.is_empty() || members.len() > MAX_PANEL_MEMBERS {
+            return Err(EscrowError::InvalidArbiterPanel);
+        }
+        if threshold == 0 || threshold as usize > members.len() {
+            return Err(EscrowError::InvalidArbiterPanel);
+        }
+        if members.contains(&[0u8; 32]) {
+            return Err(EscrowError::InvalidArbiterPanel);
+        }
+        for (i, a) in members.iter().enumerate() {
+            if members[..i].contains(a) {
+                return Err(EscrowError::InvalidArbiterPanel);
+            }
+        }
+        let mut out = Self {
+            n: members.len() as u8,
+            threshold,
+            members: [[0u8; 32]; MAX_PANEL_MEMBERS],
+            votes: [PanelVote {
+                taker_amount: 0,
+                rationale_hash: None,
+            }; MAX_PANEL_MEMBERS],
+            voted: 0,
+        };
+        out.members[..members.len()].copy_from_slice(members);
+        Ok(out)
+    }
+
+    /// The slot index of `member`, or `None` when the key is not on
+    /// the panel.
+    pub fn member_index(&self, member: &[u8; 32]) -> Option<usize> {
+        self.members[..self.n as usize]
+            .iter()
+            .position(|m| m == member)
+    }
+
+    /// Record `member_index`'s judgment, overwriting any previous
+    /// vote (one effective vote per member), and set the voted bit.
+    fn record_vote(
+        &mut self,
+        member_index: usize,
+        taker_amount: u64,
+        rationale_hash: Option<[u8; 32]>,
+    ) {
+        self.votes[member_index] = PanelVote {
+            taker_amount,
+            rationale_hash,
+        };
+        self.voted |= 1 << member_index;
+    }
+
+    /// How many members' *current effective* votes equal `vote`.
+    /// Only members in the `voted` mask are tallied — a zeroed slot
+    /// never matches, so an unset vote can never manufacture a
+    /// threshold.
+    fn matching_votes(&self, vote: &PanelVote) -> usize {
+        let mut count = 0;
+        for i in 0..self.n as usize {
+            if self.voted & (1 << i) != 0 && self.votes[i] == *vote {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// True once `matching_votes(vote) >= threshold`: the M-th
+    /// matching vote has arrived and the escrow settles on `vote`.
+    fn threshold_reached(&self, vote: &PanelVote) -> bool {
+        self.matching_votes(vote) >= self.threshold as usize
+    }
+}
 /// per-period released bitmap (`Escrow::subscription_released`) fits a
 /// `u64` — one bit per period, `1 << period_index` — and so the crate
 /// stays heap-free and `Copy`.
@@ -1859,6 +2070,11 @@ impl Escrow {
             // — a fresh escrow was never funded.
             relative_timelock_secs: 0,
             fund_at: 0,
+            // AV-65: no arbiter panel by default (backward compatible):
+            // the single arbiter or no arbitration. Opt in via
+            // `with_arbiter_panel` before funding — mutually exclusive
+            // with `with_arbiter`, last-wins.
+            arbiter_panel: None,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -2834,8 +3050,78 @@ impl Escrow {
         if arbiter == [0u8; 32] {
             return Err(EscrowError::InvalidArbiter);
         }
+        // AV-65: mutually exclusive with the arbiter panel — last-wins:
+        // configuring the single arbiter clears any panel configured
+        // earlier, so an escrow always has at most one arbitration
+        // mechanism.
+        self.arbiter_panel = None;
         self.arbiter = Some(arbiter);
         Ok(self)
+    }
+
+    /// Opt in to an arbiter-panel multisig judgment (AV-65 — Solana
+    /// governance / payment anti-single-point-of-failure): replace the
+    /// single dispute arbiter with an N-member panel and an M-vote
+    /// judgment threshold.
+    ///
+    /// Why: a single arbiter is a single point of failure — a lost or
+    /// compromised key, or a bribed referee, stalls or corrupts the
+    /// settlement. The panel spreads the arbitration role across
+    /// `members.len()` independent keys: after [`Escrow::escalate`],
+    /// each member submits their judgment via
+    /// [`Escrow::submit_panel_judgment`], and the first split
+    /// (`(taker_amount, rationale_hash)`) to collect `threshold`
+    /// matching votes settles the escrow automatically — the dissenting
+    /// votes stay on the record (and in the event log) as the audit
+    /// trail, but they cannot block the M-vote majority.
+    ///
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// committee is fixed before any funds move — mirroring
+    /// [`Escrow::with_arbiter`]. Mutually exclusive with the single
+    /// arbiter — last-wins, in both directions: configuring the panel
+    /// clears any single arbiter set earlier, and a later
+    /// [`Escrow::with_arbiter`] clears the panel. Validation (see
+    /// [`ArbiterPanel::new`]): 1–8 members, threshold `1..= n`, no zero
+    /// keys, no duplicates — [`EscrowError::InvalidArbiterPanel`]
+    /// otherwise.
+    ///
+    /// Panel-mode semantics (pinned by test):
+    /// - [`Escrow::escalate`] works unchanged — the panel is a
+    ///   configured arbitration mechanism.
+    /// - The single-arbiter [`Escrow::resolve`] is disabled in panel
+    ///   mode ([`EscrowError::PanelResolveDisabled`]) — the panel's
+    ///   multisig judgment is the only settlement path.
+    /// - [`Escrow::rotate_arbiter`] is single-arbiter-mode only; in
+    ///   panel mode it is [`EscrowError::InvalidStateTransition`].
+    /// - The AV-55 default-judgment fallback is retained:
+    ///   [`Escrow::with_arbitration_deadline`] accepts the panel as the
+    ///   arbitration mechanism, and
+    ///   [`Escrow::trigger_default_judgment`] works unchanged — a panel
+    ///   that never reaches M matching votes still cannot trap funds.
+    /// - Quorum does not gate the panel (AV-14 convention).
+    pub fn with_arbiter_panel(
+        mut self,
+        members: &[[u8; 32]],
+        threshold: u8,
+    ) -> Result<Self, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast, even
+        // for pre-fund configuration.
+        self.require_not_paused()?;
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        self.arbiter_panel = Some(ArbiterPanel::new(members, threshold)?);
+        // Mutually exclusive with the single arbiter — last-wins: the
+        // panel replaces any single arbiter set earlier.
+        self.arbiter = None;
+        Ok(self)
+    }
+
+    /// The arbiter panel attached via [`Escrow::with_arbiter_panel`],
+    /// if any. `None` means single-arbiter mode (or no arbitration).
+    pub fn arbiter_panel(&self) -> Option<ArbiterPanel> {
+        self.arbiter_panel
     }
 
     /// Bind one SPL token mint to the escrow (AV-16). Builder-style: only
@@ -3460,6 +3746,12 @@ impl Escrow {
             EscrowState::Uninitialized | EscrowState::Activated | EscrowState::Funded => {}
             _ => return Err(EscrowError::InvalidStateTransition),
         }
+        // AV-65: single-arbiter-mode only — in panel mode the committee
+        // owns the arbitration role and rotating the (cleared)
+        // single-arbiter slot would bypass the multisig.
+        if self.arbiter_panel.is_some() {
+            return Err(EscrowError::InvalidStateTransition);
+        }
         // No arbiter configured: there is nothing to rotate. The zero
         // address can never be the legitimate arbiter.
         if self.arbiter.is_none() || new_arbiter == [0u8; 32] {
@@ -3700,7 +3992,10 @@ impl Escrow {
             EscrowState::Funded => {}
             _ => return Err(EscrowError::InvalidStateTransition),
         }
-        if self.arbiter.is_none() {
+        // AV-65: the panel is a configured arbitration mechanism — a
+        // panel-mode escrow escalates into the panel's multisig
+        // judgment.
+        if self.arbiter.is_none() && self.arbiter_panel.is_none() {
             return Err(EscrowError::InvalidArbiter);
         }
         if now >= self.expires_at {
@@ -4342,6 +4637,14 @@ impl Escrow {
         // before the reentrancy guard and the authority check.
         self.require_not_paused()?;
         self.require_not_reentrant()?;
+        // AV-65: panel mode disables the single-arbiter path — the
+        // panel's multisig judgment (`submit_panel_judgment`) is the
+        // only settlement mechanism. Checked before the arbiter lookup
+        // so the panel-specific error surfaces (in panel mode the
+        // single-arbiter slot is `None` by mutual exclusion).
+        if self.arbiter_panel.is_some() {
+            return Err(EscrowError::PanelResolveDisabled);
+        }
         let arbiter = self.arbiter.ok_or(EscrowError::InvalidArbiter)?;
         match self.state {
             EscrowState::Disputed => {}
@@ -4376,6 +4679,99 @@ impl Escrow {
         self.rationale_hash = rationale_hash;
         self.state = EscrowState::Settled;
         Ok((taker_amount - fee, fee, remaining - taker_amount))
+    }
+
+    /// Submit one panel member's judgment (AV-65): `Disputed ->
+    /// Disputed` per vote, `Disputed -> Settled` once the M-th
+    /// matching vote arrives.
+    ///
+    /// Each member holds one *effective* vote: submitting again
+    /// overwrites the member's previous vote in place (the overwritten
+    /// vote survives in the event log — the
+    /// [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits a
+    /// `PanelJudgment` event per submission — as the audit trail).
+    /// The first split (`(taker_amount, rationale_hash)`) to collect
+    /// `threshold` matching current votes settles the escrow
+    /// automatically: the settlement mirrors [`Escrow::resolve`]
+    /// exactly — the fee (AV-17) slices the taker's share (the
+    /// `released` counter keeps the gross; the initializer's refund is
+    /// never fee'd), the escrow's `rationale_hash` is set to the
+    /// winning vote's rationale (AV-38), and the state moves to
+    /// `Settled`. Dissenting votes stay recorded but cannot block the
+    /// M-vote majority.
+    ///
+    /// Check order is deliberate (pause, reentrancy, authority, config,
+    /// state, amount — the crate convention): a stranger learns nothing
+    /// about the vote tally. The mint / payout-policy gates
+    /// (`MintMismatch`, `PayoutNotAllowlisted`) apply only on the
+    /// settling vote — a non-settling vote moves no funds, so there is
+    /// nothing to route. The quorum gate does NOT apply (AV-14
+    /// convention: the panel is the adjudication mechanism).
+    ///
+    /// Returns `Ok(None)` when the vote did not reach the threshold
+    /// (the escrow stays `Disputed`), or
+    /// `Ok(Some((taker_payout, fee, initializer_refund)))` when this
+    /// vote was the M-th match — the same triple `resolve` returns.
+    /// No panel configured is [`EscrowError::InvalidArbiterPanel`]; a
+    /// non-member caller is [`EscrowError::Unauthorized`].
+    pub fn submit_panel_judgment(
+        &mut self,
+        member: [u8; 32],
+        taker_amount: u64,
+        mint: Option<[u8; 32]>,
+        rationale_hash: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+    ) -> Result<Option<(u64, u64, u64)>, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // AV-36: reentrancy guard before the authority check.
+        self.require_not_reentrant()?;
+        let panel = self.arbiter_panel.ok_or(EscrowError::InvalidArbiterPanel)?;
+        let slot = panel
+            .member_index(&member)
+            .ok_or(EscrowError::Unauthorized)?;
+        match self.state {
+            EscrowState::Disputed => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // `released <= amount` is the crate invariant, so `remaining`
+        // cannot underflow; `taker_amount <= remaining` keeps
+        // `released + taker_amount <= amount` without a checked add —
+        // the same conservation gate as `resolve`.
+        let remaining = self.amount - self.released;
+        if taker_amount > remaining {
+            return Err(EscrowError::ReleaseExceedsLocked);
+        }
+        // Record the vote (overwriting any previous vote by this
+        // member), then tally the member's *current effective* vote.
+        let mut panel = panel;
+        let vote = PanelVote {
+            taker_amount,
+            rationale_hash,
+        };
+        panel.record_vote(slot, taker_amount, rationale_hash);
+        self.arbiter_panel = Some(panel);
+        if !panel.threshold_reached(&vote) {
+            return Ok(None);
+        }
+        // The M-th matching vote: settle with `resolve` semantics.
+        // AV-16: the split moves the escrow's locked tokens — they must
+        // be the bound mint (`MintMismatch` otherwise).
+        self.require_mint_match(mint)?;
+        // AV-49: the taker's share of the split must satisfy the payout
+        // policy (`PayoutNotAllowlisted` otherwise).
+        self.require_payout_recipient(payout_to)?;
+        // AV-17: the fee slices the taker's share; the `released`
+        // counter keeps the gross so conservation is untouched. The
+        // initializer's refund is never fee'd.
+        let fee = self.charge_protocol_fee(taker_amount)?;
+        self.released += taker_amount;
+        // AV-38: persist the winning vote's rationale commitment
+        // alongside the settlement — never cleared, following the
+        // AV-22 evidence_hash audit-trail convention.
+        self.rationale_hash = rationale_hash;
+        self.state = EscrowState::Settled;
+        Ok(Some((taker_amount - fee, fee, remaining - taker_amount)))
     }
 
     /// The Unix timestamp at which the escrow entered `Disputed`,
@@ -4447,8 +4843,11 @@ impl Escrow {
         }
         // The default judgment is a fallback for arbitration: without
         // a configured arbiter there is no dispute to outlive, so the
-        // builder must come after `with_arbiter`.
-        if self.arbiter.is_none() {
+        // builder must come after `with_arbiter` — or after
+        // `with_arbiter_panel` (AV-65): the panel is a configured
+        // arbitration mechanism, so the fallback is retained in panel
+        // mode.
+        if self.arbiter.is_none() && self.arbiter_panel.is_none() {
             return Err(EscrowError::InvalidArbiter);
         }
         if deadline_secs == 0 {
@@ -5808,6 +6207,14 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // present (zeroed when the escrow was never funded). Appended last
     // so every earlier field offset stays stable.
     ("fund_at", "u64", 8),
+    // AV-65: opt-in arbiter panel (see `Escrow::with_arbiter_panel`):
+    // one discriminant byte, then the fixed `ARBITER_PANEL_LEN`-byte
+    // panel (member count + threshold + 8 member keys + 8 vote slots +
+    // voted bitmask — see `ArbiterPanel`). The region is always
+    // reserved (zeroed when `None`) so `with_arbiter_panel` writes in
+    // place — same treatment as `arbiter` / `mint` / `reference`.
+    // Appended last so every earlier field offset stays stable.
+    ("arbiter_panel", "Option<ArbiterPanel>", 1 + ARBITER_PANEL_LEN),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -5891,9 +6298,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// timelock duration (AV-64) is likewise always present: 8 bytes,
 /// zeroed when no relative timelock is configured — and so is the
 /// funding timestamp (AV-64): 8 bytes, zeroed when the escrow was
-/// never funded.
+/// never funded. The opt-in arbiter panel (AV-65) is likewise always
+/// present: 1-byte discriminant + 594-byte panel region, zeroed when no
+/// panel is configured.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -6437,7 +6846,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 16_369_920, "from {state:?}");
+            assert_eq!(rent, 20_511_120, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -6535,9 +6944,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 16_369_920 by
+        // VAULT_SPACE — pinned at 20_511_120 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 16_369_920);
+        assert_eq!(rent, 20_511_120);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -6695,11 +7104,11 @@ mod tests {
     fn release_and_close_adds_no_fields_and_keeps_space() {
         // AV-50 touches no persisted field: the release leg moves the
         // `released` / `fees_paid` counters and the state byte, and
-        // then the account is closed. VAULT_SPACE stays 2224 — re-asserted
+        // then the account is closed. VAULT_SPACE stays 2819 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 2224, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 16_369_920);
+        assert_eq!(VAULT_SPACE, 2819, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 20_511_120);
     }
 
     #[test]
@@ -6713,9 +7122,11 @@ mod tests {
         // (pause authority + pause flag), AV-51 by 8 (vesting
         // cliff), AV-53 by 33 (off-chain reference memo), and AV-55 by
         // 26 (dispute timestamp + default judgment + confirmation
-        // bit), and AV-63 by 8 (absolute protocol-fee ceiling), so the
-        // pin tracks the new total deliberately.
-        assert_eq!(VAULT_SPACE, 2224, "full Vault account space");
+        // bit), and AV-63 by 8 (absolute protocol-fee ceiling), AV-64
+        // by 16 (relative timelock + funding timestamp), and AV-65 by
+        // 595 (arbiter panel), so the pin tracks the new total
+        // deliberately.
+        assert_eq!(VAULT_SPACE, 2819, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -8094,7 +8505,10 @@ pub(crate) mod anchor_idl_tests {
                             evidence_hash <- param, persisted on the \
                             escrow so the arbiter and indexers can read \
                             it; Funded -> Disputed, locks every \
-                            unilateral exit until resolve",
+                            unilateral exit until resolve; requires a \
+                            configured arbitration mechanism - the \
+                            single arbiter or the AV-65 panel \
+                            (InvalidArbiter otherwise)",
         },
         InstructionSpec {
             name: "resolve",
@@ -8127,7 +8541,11 @@ pub(crate) mod anchor_idl_tests {
                             (AV-17: the fee slices the taker's share, the \
                             refund is never fee'd); the \
                             quorum gate does NOT apply (the arbiter is \
-                            the resolution mechanism)",
+                            the resolution mechanism); AV-65: disabled \
+                            in panel mode (PanelResolveDisabled, code \
+                            137) - the panel's multisig judgment is the \
+                            only settlement path once a panel is \
+                            configured",
         },
         InstructionSpec {
             // AV-15: milestone tranche schedule.
@@ -8642,6 +9060,98 @@ pub(crate) mod anchor_idl_tests {
                             rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-65: opt in to the arbiter-panel multisig judgment at
+            // initialize time (replaces the single arbiter).
+            name: "initialize_arbiter_panel",
+            params: &[
+                (
+                    "members",
+                    "Vec<Pubkey>",
+                    "instruction param; the panel member keys (1-8 \\
+                     live addresses)",
+                ),
+                (
+                    "threshold",
+                    "u8",
+                    "instruction param; the M-vote judgment threshold \\
+                     (1 <= M <= member count) - the first split to \\
+                     collect M matching member votes settles the \\
+                     escrow automatically",
+                ),
+            ],
+            method: "Escrow::with_arbiter_panel",
+            input_mapping: "members <- param (Vec<Pubkey> -> Vec<[u8; \\
+                            32]> conversion); threshold <- param; \\
+                            authority <- accounts.initializer (signer), \\
+                            enforced by the Anchor account constraint, \\
+                            not the state machine; Uninitialized only, \\
+                            like initialize_arbiter; mutually exclusive \\
+                            with the single arbiter - last-wins in both \\
+                            directions (configuring the panel clears any \\
+                            single arbiter set earlier, and a later \\
+                            initialize_arbiter clears the panel); empty \\
+                            / over-long / zero-address / duplicate \\
+                            member input, a zero threshold, or a \\
+                            threshold above the member count is \\
+                            InvalidArbiterPanel (code 136); the 595-byte \\
+                            region is always reserved (zeroed when None) \\
+                            so the opt-in writes in place without \\
+                            reallocating; emits no event (pre-fund \\
+                            configuration)",
+        },
+        InstructionSpec {
+            // AV-65: one panel member submits their judgment on a
+            // disputed escrow; the M-th matching vote auto-settles.
+            name: "submit_panel_judgment",
+            params: &[
+                (
+                    "taker_amount",
+                    "u64",
+                    "instruction param; the taker's share of the \\
+                     remaining locked funds under this member's \\
+                     judgment (the initializer is refunded the rest); \\
+                     must be <= the remainder (ReleaseExceedsLocked \\
+                     otherwise)",
+                ),
+                (
+                    "rationale_hash",
+                    "Option<[u8; 32]>",
+                    "instruction param; the member's optional 32-byte \\
+                     commitment to the off-chain rationale document \\
+                     behind this vote (AV-38 convention)",
+                ),
+            ],
+            method: "Escrow::submit_panel_judgment",
+            input_mapping: "taker_amount, rationale_hash <- params; \\
+                            authority <- accounts.member (signer) - must \\
+                            be one of the panel's member keys (a \\
+                            stranger is Unauthorized); mint <- vault \\
+                            token account (MintMismatch against \\
+                            vault.mint otherwise); payout_to <- \\
+                            accounts.payout_to, pinned against the \\
+                            payout policy exactly like resolve (AV-49); \\
+                            no panel configured is InvalidArbiterPanel \\
+                            (code 136); Disputed only \\
+                            (InvalidStateTransition otherwise); each \\
+                            member holds one effective vote - a re-vote \\
+                            overwrites the member's previous vote in \\
+                            place; the first (taker_amount, \\
+                            rationale_hash) pair to collect M matching \\
+                            current votes settles Disputed -> Settled \\
+                            automatically (the settling vote checks \\
+                            mint / payout policy before mutating state, \\
+                            like resolve; the fee slices the taker's \\
+                            share and the released counter keeps the \\
+                            gross; the winning vote's rationale is \\
+                            persisted); single-arbiter resolve is \\
+                            disabled in panel mode (PanelResolveDisabled, \\
+                            code 137); the AV-55 default-judgment \\
+                            fallback is retained; emits PanelJudgment \\
+                            per submission (from == to == Disputed) and \\
+                            PanelResolved on the settling vote \\
+                            (Disputed -> Settled)",
+        },
+        InstructionSpec {
             // AV-49: set the payout destination allowlist at
             // initialize time.
             name: "initialize_payout_allowlist",
@@ -8745,8 +9255,11 @@ pub(crate) mod anchor_idl_tests {
                             constraint, not the state machine; \\
                             Uninitialized only, like initialize_arbiter; \\
                             the arbiter must already be configured \\
-                            (with_arbiter first - InvalidArbiter \\
-                            otherwise); the 17-byte region is always \\
+                            (with_arbiter or with_arbiter_panel first - \\
+                            InvalidArbiter otherwise; AV-65: the panel \\
+                            is a configured arbitration mechanism, so \\
+                            the fallback is retained in panel mode); the \\
+                            17-byte region is always \\
                             reserved (zeroed when None) so the opt-in \\
                             writes in place without reallocating; the \\
                             initializer proposes the terms here and the \\
@@ -9081,6 +9594,9 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::rotate_taker",
             "Escrow::rotate_initializer",
             "Escrow::rotate_arbiter",
+            // AV-65: arbiter-panel multisig judgment.
+            "Escrow::with_arbiter_panel",
+            "Escrow::submit_panel_judgment",
             "Escrow::with_payout_allowlist",
             "Escrow::update_payout_allowlist",
             "Escrow::with_reference",
@@ -9119,7 +9635,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_thirty_eight_instructions_take_params() {
+    fn only_forty_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -9158,6 +9674,8 @@ pub(crate) mod anchor_idl_tests {
                 &"rotate_taker",
                 &"rotate_initializer",
                 &"rotate_arbiter",
+                &"initialize_arbiter_panel",
+                &"submit_panel_judgment",
                 &"initialize_payout_allowlist",
                 &"update_payout_allowlist",
                 &"initialize_reference",
@@ -10646,6 +11164,22 @@ pub(crate) mod anchor_idl_tests {
         // `Some`), mirroring `initialize_mint`.
         ("initialize_vesting", "cliff", "vesting.cliff_at"),
         ("initialize_arbiter", "arbiter", "arbiter"),
+        // AV-65: the panel member keys populate the panel's member
+        // array; the `Option` discriminant is implied (a configured
+        // panel is `Some`), mirroring `initialize_mint`.
+        ("initialize_arbiter_panel", "members", "arbiter_panel"),
+        // AV-65: the M-vote threshold param populates the panel's
+        // threshold; mutually exclusive with the single arbiter —
+        // last-wins in both directions.
+        ("initialize_arbiter_panel", "threshold", "arbiter_panel"),
+        // AV-65: a panel member's voted split accumulates in `released`
+        // on the settling vote — the same dual-writing the direction-2
+        // note allows for `resolve`'s taker_amount.
+        ("submit_panel_judgment", "taker_amount", "released"),
+        // AV-65: the winning vote's rationale-document commitment param
+        // populates `rationale_hash` on the settling vote (AV-38
+        // convention).
+        ("submit_panel_judgment", "rationale_hash", "rationale_hash"),
         // The arbiter's split awards the taker `taker_amount` out of the
         // remaining funds; the taker's share accumulates in `released`,
         // like `release`'s amount param.
@@ -11229,6 +11763,16 @@ mod error_code_tests {
             EscrowError::InvalidTimelock,
             135,
             "with_timelock with a nonzero unlock_at while a nonzero relative timelock is configured, or with_relative_timelock with a nonzero secs while a nonzero absolute timelock is configured (one clock per escrow)",
+        ),
+        (
+            EscrowError::InvalidArbiterPanel,
+            136,
+            "with_arbiter_panel with an empty member list, more than 8 members, a zero threshold, a threshold above the member count, a zero member key, or a duplicate member; submit_panel_judgment with no panel configured",
+        ),
+        (
+            EscrowError::PanelResolveDisabled,
+            137,
+            "resolve called on a panel-mode escrow — the panel's multisig judgment (submit_panel_judgment) is the only settlement path once a panel is configured",
         ),
     ];
 
@@ -12898,6 +13442,40 @@ mod account_space_tests {
         // (zeroed when the escrow was never funded); appended last so
         // every earlier offset above is unchanged.
         out.extend_from_slice(&e.fund_at.to_le_bytes());
+        // AV-65: opt-in arbiter panel, always reserved like `quorum`:
+        // the `None` discriminant followed by the zeroed 594-byte
+        // panel region (member count + threshold + 8 member keys + 8
+        // vote slots + voted bitmask), so `with_arbiter_panel` writes
+        // in place without reallocating; appended last so every earlier
+        // offset above is unchanged.
+        match e.arbiter_panel {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; ARBITER_PANEL_LEN]);
+            }
+            Some(p) => {
+                out.push(1);
+                out.push(p.n);
+                out.push(p.threshold);
+                for member in p.members.iter() {
+                    out.extend_from_slice(member);
+                }
+                for vote in p.votes.iter() {
+                    out.extend_from_slice(&vote.taker_amount.to_le_bytes());
+                    match vote.rationale_hash {
+                        None => {
+                            out.push(0);
+                            out.extend_from_slice(&[0u8; 32]);
+                        }
+                        Some(h) => {
+                            out.push(1);
+                            out.extend_from_slice(&h);
+                        }
+                    }
+                }
+                out.extend_from_slice(&p.voted.to_le_bytes());
+            }
+        }
         out
     }
 
@@ -12939,10 +13517,12 @@ mod account_space_tests {
         // (AV-57 event slots: 64 x 18-byte kind/at/actor entries).
         // + 8 (AV-59 extension bound) + 8 (AV-59 extension counter)
         // + 8 (AV-63 absolute protocol-fee ceiling) + 8 (AV-64 relative
-        // timelock duration) + 8 (AV-64 funding timestamp).
-        assert_eq!(ESCROW_BODY_LEN, 2216, "escrow payload bytes");
+        // timelock duration) + 8 (AV-64 funding timestamp) + (1 + 594)
+        // (AV-65 opt-in arbiter panel: member count + threshold + 8
+        // member keys + 8 vote slots + voted bitmask).
+        assert_eq!(ESCROW_BODY_LEN, 2811, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 2224, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 2819, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -12991,13 +13571,15 @@ mod account_space_tests {
         // ceiling (AV-63, zeroed = uncapped when no cap is configured)
         // + 8-byte relative timelock duration (AV-64, zeroed when no
         // relative timelock is configured) + 8-byte funding timestamp
-        // (AV-64, zeroed when the escrow was never funded).
+        // (AV-64, zeroed when the escrow was never funded) + (1 +
+        // 594)-byte opt-in arbiter panel (AV-65, zeroed when no panel
+        // is configured).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1734);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2329);
     }
 
     #[test]
@@ -13404,16 +13986,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2224) * 3480 * 2 = 2352 * 6960 = 16_369_920 lamports.
-        assert_eq!(full, 16_369_920);
+        // (128 + 2819) * 3480 * 2 = 2947 * 6960 = 20_511_120 lamports.
+        assert_eq!(full, 20_511_120);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1734) * 3480 * 2 = 1862 * 6960 = 12_959_520 lamports.
-        assert_eq!(no_quorum, 12_959_520);
+        // (128 + 2329) * 3480 * 2 = 2457 * 6960 = 17_100_720 lamports.
+        assert_eq!(no_quorum, 17_100_720);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -13457,25 +14039,25 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(16_369_920, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(20_511_120, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(16_091_519, params.0, params.1),
             Err(RentShortfall {
-                required: 16_369_920,
+                required: 20_511_120,
                 provided: 16_091_519,
             })
         );
         // Generous funding: exempt.
         assert_eq!(
-            check_vault_rent_exempt(20_000_000, params.0, params.1),
+            check_vault_rent_exempt(21_000_000, params.0, params.1),
             Ok(())
         );
         // Zero lamports: the full minimum is the shortfall.
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 16_369_920,
+                required: 20_511_120,
                 provided: 0,
             })
         );
@@ -15911,7 +16493,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2216, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) bytes");
+        assert_eq!(bytes.len(), 2811, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -15936,7 +16518,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 2216);
+        assert_eq!(bytes.len(), 2811);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -15958,18 +16540,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2224) * 3480 * 2 = 2352 * 6960 = 16_369_920 lamports.
-        assert_eq!(VAULT_SPACE, 2224);
-        assert_eq!(full, 16_369_920);
+        // (128 + 2819) * 3480 * 2 = 2947 * 6960 = 20_511_120 lamports.
+        assert_eq!(VAULT_SPACE, 2819);
+        assert_eq!(full, 20_511_120);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1734) * 3480 * 2 = 1862 * 6960 = 12_959_520 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1734);
-        assert_eq!(no_quorum, 12_959_520);
+        // (128 + 2329) * 3480 * 2 = 2457 * 6960 = 17_100_720 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2329);
+        assert_eq!(no_quorum, 17_100_720);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -16113,7 +16695,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2216);
+        assert_eq!(bytes.len(), 2811);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -16128,7 +16710,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 2216);
+        assert_eq!(bytes.len(), 2811);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -16159,18 +16741,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2224) * 3480 * 2 = 2352 * 6960 = 16_369_920 lamports.
-        assert_eq!(VAULT_SPACE, 2224);
-        assert_eq!(full, 16_369_920);
+        // (128 + 2819) * 3480 * 2 = 2947 * 6960 = 20_511_120 lamports.
+        assert_eq!(VAULT_SPACE, 2819);
+        assert_eq!(full, 20_511_120);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1734) * 3480 * 2 = 1862 * 6960 = 12_959_520 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1734);
-        assert_eq!(no_quorum, 12_959_520);
+        // (128 + 2329) * 3480 * 2 = 2457 * 6960 = 17_100_720 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2329);
+        assert_eq!(no_quorum, 17_100_720);
     }
 
     #[test]
@@ -17025,7 +17607,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 2216);
+        assert_eq!(bytes.len(), 2811);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -17200,7 +17782,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 2216, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64");
+        assert_eq!(ESCROW_BODY_LEN, 2811, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -17218,32 +17800,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 2224) * 3480 * 2 = 2352 * 6960 = 16_369_920 lamports.
+        // (128 + 2819) * 3480 * 2 = 2947 * 6960 = 20_511_120 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            16_369_920
+            20_511_120
         );
-        // (128 + 1734) * 3480 * 2 = 1862 * 6960 = 12_959_520 lamports.
+        // (128 + 2329) * 3480 * 2 = 2457 * 6960 = 17_100_720 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            12_959_520
+            17_100_720
         );
         // 1376 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 2224);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1734);
-        assert!(check_vault_rent_exempt(16_369_920, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 2819);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2329);
+        assert!(check_vault_rent_exempt(20_511_120, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -19670,9 +20252,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2216, "body 2200 + 16");
-        assert_eq!(VAULT_SPACE, 2224);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1734);
+        assert_eq!(bytes.len(), 2811, "body 2216 + 595 (AV-65 arbiter panel)");
+        assert_eq!(VAULT_SPACE, 2819);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2329);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -20216,7 +20798,7 @@ mod default_judgment_tests {
         // at 960, `default_judgment` at 968, `default_confirmed` at 985
         // (AV-55 body total 986). AV-56 appends `subscription` at 986,
         // `subscription_next` at 1004, `subscription_released` at 1005
-        // (body total 2216 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock appends).
+        // (body total 2811 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter(ARBITER)
@@ -20226,7 +20808,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2216);
+        assert_eq!(bytes.len(), 2811);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -20783,14 +21365,14 @@ mod subscription_tests {
     fn borsh_tail_pins_subscription_fields() {
         // Offsets: `default_confirmed` ends the AV-55 body at 986;
         // `subscription` at 986, `subscription_next` at 1004,
-        // `subscription_released` at 1005 (body total 2216 after the AV-57 + AV-59 + AV-63 + AV-64 appends).
+        // `subscription_released` at 1005 (body total 2811 after the AV-57 + AV-59 + AV-63 + AV-64 + AV-65 appends).
         let mut e = escrow()
             .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2216);
+        assert_eq!(bytes.len(), 2811);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -21009,7 +21591,17 @@ mod event_history_tests {
             29,
             "AV-62: appended after PartiallyCancelled"
         );
-        for d in 0..=29u8 {
+        assert_eq!(
+            EscrowEventKind::PanelJudgment.discriminant(),
+            30,
+            "AV-65: appended after ArbiterRotated"
+        );
+        assert_eq!(
+            EscrowEventKind::PanelResolved.discriminant(),
+            31,
+            "AV-65: appended after PanelJudgment"
+        );
+        for d in 0..=31u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -21020,7 +21612,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(30), None);
+        assert_eq!(EscrowEventKind::from_discriminant(32), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -21032,9 +21624,9 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 531 + EVENT_HISTORY_LEN + 16 + 8 + 16);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595);
     }
 
     #[test]
@@ -21042,13 +21634,13 @@ mod event_history_tests {
         // Offsets: `subscription_released` ends the AV-56 body at 1013;
         // `event_head` at 1013, `event_total` at 1014, `event_count` at
         // 1022, `event_capacity` at 1023, `event_slots` at 1024 (body
-        // total 2216 after the AV-59 + AV-63 + AV-64 appends).
+        // total 2811 after the AV-59 + AV-63 + AV-64 appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2216);
+        assert_eq!(bytes.len(), 2811);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -21076,7 +21668,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16, "AV-64 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595, "AV-65 tail");
     }
 
     #[test]
@@ -21091,18 +21683,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2224) * 3480 * 2 = 2352 * 6960 = 16_369_920 lamports.
-        assert_eq!(VAULT_SPACE, 2224);
-        assert_eq!(full, 16_369_920);
+        // (128 + 2819) * 3480 * 2 = 2947 * 6960 = 20_511_120 lamports.
+        assert_eq!(VAULT_SPACE, 2819);
+        assert_eq!(full, 20_511_120);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1734) * 3480 * 2 = 1862 * 6960 = 12_959_520 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1734);
-        assert_eq!(no_quorum, 12_959_520);
+        // (128 + 2329) * 3480 * 2 = 2457 * 6960 = 17_100_720 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2329);
+        assert_eq!(no_quorum, 17_100_720);
     }
 
     // ----- decode -----
@@ -21134,9 +21726,9 @@ mod event_history_tests {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         // First slot's kind byte sits at body offset 1024.
         let kind_off = ANCHOR_DISCRIMINATOR_LEN + 1024;
-        // AV-62: discriminant 29 is now `ArbiterRotated`; 30 is the
-        // first still-unknown byte.
-        for bad in [30u8, 42, 255] {
+        // AV-65: discriminants 30/31 are now `PanelJudgment` /
+        // `PanelResolved`; 32 is the first still-unknown byte.
+        for bad in [32u8, 42, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -21785,18 +22377,18 @@ mod fee_cap_tests {
 
     #[test]
     fn layout_pins_include_the_fee_cap_tail() {
-        // +8 over the AV-59 numbers.
-        assert_eq!(ESCROW_BODY_LEN, 2216, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 2224, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1734, "no-quorum Vault account space");
+        // +595 over the AV-64 numbers (the AV-65 arbiter-panel region).
+        assert_eq!(ESCROW_BODY_LEN, 2811, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 2819, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2329, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            16_369_920,
-            "(128 + 2224) * 3480 * 2 = 2352 * 6960"
+            20_511_120,
+            "(128 + 2819) * 3480 * 2 = 2947 * 6960"
         );
         assert_eq!(
             rent_exempt_minimum_lamports(
@@ -21804,19 +22396,20 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            12_959_520,
-            "(128 + 1734) * 3480 * 2 = 1862 * 6960"
+            17_100_720,
+            "(128 + 2329) * 3480 * 2 = 2457 * 6960"
         );
     }
 
     #[test]
     fn fee_cap_persists_in_serialized_layout_tail() {
-        // `fee_cap` is the last persisted field: the final 8 bytes of
-        // the body, right after `extension_count` (AV-59).
+        // `fee_cap` keeps its AV-63 offset (the final 8 bytes before the
+        // AV-64/AV-65 tail); `arbiter_panel` is now the last persisted
+        // field. `fee_cap` sits right after `extension_count` (AV-59).
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2216);
+        assert_eq!(bytes.len(), 2811);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -22139,21 +22732,21 @@ mod relative_timelock_tests {
 
     #[test]
     fn relative_fields_persist_in_serialized_layout_tail() {
-        // The two AV-64 fields are the last persisted fields: the final
-        // 16 bytes of the body, right after `fee_cap` (AV-63).
+        // The two AV-64 fields sit right after `fee_cap` (AV-63); the
+        // AV-65 panel region is now the last persisted field.
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2216);
+        assert_eq!(bytes.len(), 2811);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
-            "relative_timelock_secs at the tail"
+            "relative_timelock_secs offset unchanged"
         );
         assert_eq!(
             u64::from_le_bytes(bytes[2208..2216].try_into().unwrap()),
             FUND_AT,
-            "fund_at at the tail"
+            "fund_at offset unchanged"
         );
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
@@ -22265,5 +22858,624 @@ mod relative_timelock_tests {
             "claim must be listed at fund_at + secs: {:?}",
             later.actions
         );
+    }
+}
+
+// ---------- AV-65: arbiter-panel multisig judgment ----------
+
+#[cfg(test)]
+mod arbiter_panel_tests {
+    use super::*;
+    use crate::account_space_tests::encode_escrow;
+    use crate::discriminator::{
+        decode_vault_account, instruction_discriminator, vault_account_discriminator,
+    };
+    use crate::events::{EscrowEventKind, IndexedEscrow};
+    use crate::keeper::{scan_keeper_actions, KeeperActionKind, WatchedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const M1: [u8; 32] = [0xD1; 32]; // panel members
+    const M2: [u8; 32] = [0xD2; 32];
+    const M3: [u8; 32] = [0xD3; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32]; // single arbiter
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+    const ESCROW_ID: [u8; 32] = [0x1D; 32];
+
+    fn panel_escrow() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap()
+    }
+
+    fn disputed_panel() -> Escrow {
+        let mut e = panel_escrow();
+        e.fund(ALICE, T0).unwrap();
+        e.escalate(ALICE, T0 + 10, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        e
+    }
+
+    fn account_bytes(e: &Escrow) -> Vec<u8> {
+        let mut out = Vec::with_capacity(VAULT_SPACE);
+        out.extend_from_slice(&vault_account_discriminator());
+        out.extend_from_slice(&encode_escrow(e));
+        out
+    }
+
+    #[test]
+    fn panel_constants_are_pinned() {
+        assert_eq!(MAX_PANEL_MEMBERS, 8);
+        assert_eq!(PANEL_VOTE_LEN, 41, "8 + 1 + 32");
+        assert_eq!(
+            ARBITER_PANEL_LEN,
+            594,
+            "1 + 1 + 8*32 + 8*41 + 8"
+        );
+        assert_eq!(
+            ARBITER_PANEL_LEN,
+            1 + 1 + MAX_PANEL_MEMBERS * 32 + MAX_PANEL_MEMBERS * PANEL_VOTE_LEN + 8
+        );
+    }
+
+    #[test]
+    fn new_error_codes_are_pinned() {
+        assert_eq!(EscrowError::InvalidArbiterPanel.code(), 136);
+        assert_eq!(EscrowError::PanelResolveDisabled.code(), 137);
+        // never-renumber: the full table still pins every code, and
+        // `all()` covers the new variants (the AV-46 lesson: a missing
+        // variant drifts the IDL error pin).
+        assert!(EscrowError::all().contains(&EscrowError::InvalidArbiterPanel));
+        assert!(EscrowError::all().contains(&EscrowError::PanelResolveDisabled));
+        assert_eq!(EscrowError::all().len(), 38);
+    }
+
+    #[test]
+    fn builder_validates_members_and_threshold() {
+        // Empty member list.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter_panel(&[], 1),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        // Over-long member list (9 > 8).
+        let nine = [[0xE1; 32], [0xE2; 32], [0xE3; 32], [0xE4; 32], [0xE5; 32],
+                    [0xE6; 32], [0xE7; 32], [0xE8; 32], [0xE9; 32]];
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter_panel(&nine, 5),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        // Zero threshold.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter_panel(&[M1, M2], 0),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        // Threshold above the member count.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter_panel(&[M1, M2], 3),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        // Zero member key.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter_panel(&[M1, [0u8; 32]], 1),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        // Duplicate member.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter_panel(&[M1, M2, M1], 2),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        // Unanimity (M == N) is valid.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 3)
+            .unwrap();
+        let panel = e.arbiter_panel().unwrap();
+        assert_eq!((panel.n, panel.threshold), (3, 3));
+        // Single-member panel with M == 1 is valid.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1], 1)
+            .unwrap();
+        assert_eq!(e.arbiter_panel().unwrap().n, 1);
+    }
+
+    #[test]
+    fn builder_is_uninitialized_only() {
+        let mut e = panel_escrow();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            e.with_arbiter_panel(&[M1, M2], 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn panel_and_single_arbiter_are_mutually_exclusive_last_wins() {
+        // Panel after single arbiter: the single slot is cleared.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2], 2)
+            .unwrap();
+        assert!(e.arbiter_panel().is_some());
+        assert_eq!(e.arbiter(), None);
+        // Single arbiter after panel: the panel is cleared.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2], 2)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        assert_eq!(e.arbiter(), Some(ARBITER));
+        assert!(e.arbiter_panel().is_none());
+    }
+
+    #[test]
+    fn escalate_works_in_panel_mode() {
+        // The panel is a configured arbitration mechanism.
+        let mut e = panel_escrow();
+        e.fund(ALICE, T0).unwrap();
+        e.escalate(BOB, T0 + 10, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+    }
+
+    #[test]
+    fn judgment_gates_authority_config_state_amount() {
+        let mut e = disputed_panel();
+        // No panel configured.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            plain.submit_panel_judgment(M1, 600_000, None, None, BOB),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        // Stranger is not a member.
+        assert_eq!(
+            e.submit_panel_judgment(MALLORY, 600_000, None, None, BOB),
+            Err(EscrowError::Unauthorized)
+        );
+        // A party is not a member either.
+        assert_eq!(
+            e.submit_panel_judgment(ALICE, 600_000, None, None, BOB),
+            Err(EscrowError::Unauthorized)
+        );
+        // Not Disputed.
+        let mut funded = panel_escrow();
+        funded.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            funded.submit_panel_judgment(M1, 600_000, None, None, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Over-limit split.
+        assert_eq!(
+            e.submit_panel_judgment(M1, 1_000_001, None, None, BOB),
+            Err(EscrowError::ReleaseExceedsLocked)
+        );
+        // Failed votes change nothing: no vote recorded.
+        assert_eq!(e.arbiter_panel().unwrap().voted, 0);
+    }
+
+    #[test]
+    fn m_matching_votes_auto_settle_first_m_wins() {
+        let mut e = disputed_panel();
+        // First vote: below threshold, no settlement.
+        assert_eq!(
+            e.submit_panel_judgment(M1, 600_000, None, None, BOB),
+            Ok(None)
+        );
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(e.arbiter_panel().unwrap().voted, 0b001);
+        // Dissenting vote: still no settlement, dissent recorded.
+        assert_eq!(
+            e.submit_panel_judgment(M2, 400_000, None, None, BOB),
+            Ok(None)
+        );
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(e.arbiter_panel().unwrap().voted, 0b011);
+        // Second matching vote: the M-th match settles.
+        let settled = e
+            .submit_panel_judgment(M3, 600_000, None, None, BOB)
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled, (600_000, 0, 400_000));
+        assert_eq!(e.state(), EscrowState::Settled);
+        // Settlement semantics mirror `resolve`: the taker's share lands
+        // in the `released` counter (gross), the refund is the rest.
+        assert_eq!(e.released_amount(), 600_000);
+        // A settled escrow takes no more votes.
+        assert_eq!(
+            e.submit_panel_judgment(M1, 600_000, None, None, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn revote_overwrites_and_tally_uses_current_vote() {
+        let mut e = disputed_panel();
+        // M1 votes for 600k, M2 dissents with 400k.
+        e.submit_panel_judgment(M1, 600_000, None, None, BOB).unwrap();
+        e.submit_panel_judgment(M2, 400_000, None, None, BOB).unwrap();
+        // M2 changes their mind to 600k: the re-vote overwrites, and
+        // now two current votes match 600k — settles.
+        let settled = e
+            .submit_panel_judgment(M2, 600_000, None, None, BOB)
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.0, 600_000);
+        assert_eq!(e.state(), EscrowState::Settled);
+        // The voted bitmask keeps the bit set across the re-vote.
+        assert_eq!(e.arbiter_panel().unwrap().voted, 0b011);
+    }
+
+    #[test]
+    fn rationale_hash_is_part_of_the_match_key() {
+        let mut e = disputed_panel();
+        let rationale_a = [0x11; 32];
+        let rationale_b = [0x22; 32];
+        // Same taker_amount, different rationale: not a match.
+        e.submit_panel_judgment(M1, 600_000, None, Some(rationale_a), BOB)
+            .unwrap();
+        assert_eq!(
+            e.submit_panel_judgment(M2, 600_000, None, Some(rationale_b), BOB),
+            Ok(None)
+        );
+        assert_eq!(e.state(), EscrowState::Disputed);
+        // Same taker_amount AND same rationale: settles.
+        e.submit_panel_judgment(M3, 600_000, None, Some(rationale_a), BOB)
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Settled);
+        // The winning vote's rationale is persisted like `resolve`'s
+        // (AV-38).
+        assert_eq!(e.rationale_hash(), Some(rationale_a));
+    }
+
+    #[test]
+    fn settling_vote_applies_fee_mint_and_payout_policy() {
+        // Protocol fee slices the taker's share; the `released`
+        // counter keeps the gross.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2], 2)
+            .unwrap()
+            .with_protocol_fee(1_000) // 10%
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.escalate(ALICE, T0 + 10, None).unwrap();
+        e.submit_panel_judgment(M1, 600_000, None, None, BOB).unwrap();
+        let (payout, fee, refund) = e
+            .submit_panel_judgment(M2, 600_000, None, None, BOB)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fee, 60_000);
+        assert_eq!(payout, 540_000);
+        assert_eq!(refund, 400_000);
+        assert_eq!(e.released_amount(), 600_000);
+        assert_eq!(e.fees_paid(), 60_000);
+    }
+
+    #[test]
+    fn single_arbiter_resolve_is_disabled_in_panel_mode() {
+        let mut e = disputed_panel();
+        assert_eq!(
+            e.resolve(M1, 600_000, None, None, BOB),
+            Err(EscrowError::PanelResolveDisabled)
+        );
+        assert_eq!(e.state(), EscrowState::Disputed);
+        // And in single-arbiter mode the panel judgment path is
+        // unavailable.
+        let mut s = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        s.fund(ALICE, T0).unwrap();
+        s.escalate(ALICE, T0 + 10, None).unwrap();
+        assert_eq!(
+            s.submit_panel_judgment(ARBITER, 600_000, None, None, BOB),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        // Single-arbiter resolve still works there.
+        s.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
+        assert_eq!(s.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn rotate_arbiter_is_single_mode_only() {
+        let mut e = panel_escrow();
+        assert_eq!(
+            e.rotate_arbiter(ALICE, BOB, M1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Single-arbiter mode still rotates.
+        let mut s = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        s.rotate_arbiter(ALICE, BOB, M1).unwrap();
+        assert_eq!(s.arbiter(), Some(M1));
+    }
+
+    #[test]
+    fn av55_default_judgment_is_retained_in_panel_mode() {
+        // `with_arbitration_deadline` accepts the panel as the
+        // arbitration mechanism.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 3)
+            .unwrap()
+            .with_arbitration_deadline(3_600, 500_000)
+            .unwrap();
+        e.confirm_default_judgment(BOB).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.escalate(ALICE, T0 + 10, None).unwrap();
+        // Before the deadline: not due.
+        assert_eq!(
+            e.trigger_default_judgment(ALICE, T0 + 11, None, BOB),
+            Err(EscrowError::DefaultJudgmentNotDue)
+        );
+        // After the deadline with no panel resolution: the fallback
+        // settles.
+        let (payout, fee, refund) = e
+            .trigger_default_judgment(ALICE, T0 + 10 + 3_600, None, BOB)
+            .unwrap();
+        assert_eq!((payout, fee, refund), (500_000, 0, 500_000));
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn pause_gates_panel_transitions() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ARBITER)
+            .unwrap();
+        e.pause(ARBITER).unwrap();
+        assert_eq!(
+            e.with_arbiter_panel(&[M1, M2], 1),
+            Err(EscrowError::Paused)
+        );
+        e.unpause(ARBITER).unwrap();
+        // Unpaused: the builder works again.
+        e.with_arbiter_panel(&[M1, M2], 1).unwrap();
+
+        let mut d = disputed_panel();
+        d.pause(ARBITER).unwrap_err(); // no pause authority on this one
+        let mut p = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2], 2)
+            .unwrap()
+            .with_pause_authority(ARBITER)
+            .unwrap();
+        p.fund(ALICE, T0).unwrap();
+        p.escalate(ALICE, T0 + 10, None).unwrap();
+        p.pause(ARBITER).unwrap();
+        assert_eq!(
+            p.submit_panel_judgment(M1, 600_000, None, None, BOB),
+            Err(EscrowError::Paused)
+        );
+    }
+
+    #[test]
+    fn panel_serializes_at_the_tail_and_round_trips() {
+        let mut e = disputed_panel();
+        e.submit_panel_judgment(M1, 600_000, None, Some([0x11; 32]), BOB)
+            .unwrap();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes.len(), 2811);
+        // The panel region is the last 595 bytes: 1-byte discriminant +
+        // 594-byte panel.
+        let tail = &bytes[bytes.len() - 595..];
+        assert_eq!(tail[0], 1, "panel discriminant");
+        assert_eq!(tail[1], 3, "n");
+        assert_eq!(tail[2], 2, "threshold");
+        assert_eq!(&tail[3..35], &M1, "member slot 0");
+        // Vote slot 0: taker_amount 600_000 LE + rationale discriminant
+        // + rationale.
+        let vote0 = &tail[3 + 256..3 + 256 + 41];
+        assert_eq!(
+            u64::from_le_bytes(vote0[..8].try_into().unwrap()),
+            600_000
+        );
+        assert_eq!(vote0[8], 1, "rationale discriminant");
+        assert_eq!(&vote0[9..41], &[0x11; 32]);
+        // voted bitmask trails the vote slots: 2 + 256 + 328 = 586.
+        assert_eq!(
+            u64::from_le_bytes(tail[587..595].try_into().unwrap()),
+            0b001
+        );
+        // The structural decoder round-trips the panel.
+        let decoded = decode_vault_account(&account_bytes(&e)).unwrap();
+        let panel = decoded.arbiter_panel().unwrap();
+        assert_eq!((panel.n, panel.threshold, panel.voted), (3, 2, 0b001));
+        assert_eq!(&panel.members[..3], &[M1, M2, M3]);
+        assert_eq!(panel.votes[0].taker_amount, 600_000);
+        assert_eq!(panel.votes[0].rationale_hash, Some([0x11; 32]));
+        assert_eq!(panel.votes[1].taker_amount, 0);
+        assert_eq!(panel.votes[1].rationale_hash, None);
+        // A panel-less escrow decodes with `None` and a zeroed tail.
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let plain_bytes = encode_escrow(&plain);
+        assert_eq!(plain_bytes[plain_bytes.len() - 595], 0);
+        assert!(decode_vault_account(&account_bytes(&plain))
+            .unwrap()
+            .arbiter_panel()
+            .is_none());
+    }
+
+    #[test]
+    fn field_table_carries_the_panel_region() {
+        let panel = VAULT_FIELDS
+            .iter()
+            .find(|(name, _, _)| *name == "arbiter_panel")
+            .unwrap();
+        assert_eq!(panel.1, "Option<ArbiterPanel>");
+        assert_eq!(panel.2, 1 + ARBITER_PANEL_LEN);
+        assert_eq!(panel.2, 595);
+        // Appended last: every earlier field offset stays stable.
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "arbiter_panel");
+    }
+
+    #[test]
+    fn indexed_escrow_emits_panel_judgment_and_panel_resolved() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.escalate(ALICE, T0 + 10, None).unwrap();
+        e.drain_events();
+        // Vote 1: PanelJudgment only (from == to == Disputed).
+        assert_eq!(
+            e.submit_panel_judgment(M1, 600_000, None, Some([0x11; 32]), BOB, T0 + 20),
+            Ok(None)
+        );
+        let events = e.drain_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EscrowEventKind::PanelJudgment);
+        assert_eq!(events[0].from, EscrowState::Disputed);
+        assert_eq!(events[0].to, EscrowState::Disputed);
+        assert_eq!(events[0].amounts.payout, 600_000);
+        // Vote 2 (the M-th match): PanelJudgment then PanelResolved.
+        let settled = e
+            .submit_panel_judgment(M2, 600_000, None, Some([0x11; 32]), BOB, T0 + 30)
+            .unwrap();
+        assert!(settled.is_some());
+        let events = e.drain_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, EscrowEventKind::PanelJudgment);
+        assert_eq!(events[1].kind, EscrowEventKind::PanelResolved);
+        assert_eq!(events[1].from, EscrowState::Disputed);
+        assert_eq!(events[1].to, EscrowState::Settled);
+        assert_eq!(events[1].amounts.payout, 600_000);
+        assert_eq!(events[1].amounts.refund, 400_000);
+        assert_eq!(events[1].rationale_hash, Some([0x11; 32]));
+        // The on-chain ring records both kinds too, with the voting
+        // member's key summary as the actor.
+        let history = e.inner().event_history();
+        let kinds: Vec<EscrowEventKind> = history.iter().map(|h| h.kind).collect();
+        assert!(kinds.contains(&EscrowEventKind::PanelJudgment));
+        assert!(kinds.contains(&EscrowEventKind::PanelResolved));
+        let judgment_entry = history
+            .iter()
+            .find(|h| h.kind == EscrowEventKind::PanelJudgment)
+            .unwrap();
+        assert_eq!(judgment_entry.actor, Some(M1[..8].try_into().unwrap()));
+        let resolved_entry = history
+            .iter()
+            .find(|h| h.kind == EscrowEventKind::PanelResolved)
+            .unwrap();
+        assert_eq!(resolved_entry.actor, Some(M2[..8].try_into().unwrap()));
+    }
+
+    #[test]
+    fn event_kind_discriminants_and_names_are_pinned() {
+        assert_eq!(EscrowEventKind::PanelJudgment.discriminant(), 30);
+        assert_eq!(EscrowEventKind::PanelResolved.discriminant(), 31);
+        assert_eq!(EscrowEventKind::PanelJudgment.name(), "panel_judgment");
+        assert_eq!(EscrowEventKind::PanelResolved.name(), "panel_resolved");
+        assert_eq!(
+            EscrowEventKind::from_discriminant(30),
+            Some(EscrowEventKind::PanelJudgment)
+        );
+        assert_eq!(
+            EscrowEventKind::from_discriminant(31),
+            Some(EscrowEventKind::PanelResolved)
+        );
+        // Earlier discriminants stay stable.
+        assert_eq!(EscrowEventKind::ArbiterRotated.discriminant(), 29);
+    }
+
+    #[test]
+    fn keeper_lists_panel_judgment_per_member_not_single_resolve() {
+        let e = disputed_panel();
+        let watched = [WatchedEscrow {
+            escrow_id: ESCROW_ID,
+            escrow: e,
+            reference: None,
+        }];
+        let report = scan_keeper_actions(&watched, T0 + 100);
+        let panel_actions: Vec<_> = report
+            .actions
+            .iter()
+            .filter(|a| a.kind == KeeperActionKind::PanelJudgment)
+            .collect();
+        assert_eq!(panel_actions.len(), 3, "one action per panel member");
+        for a in &panel_actions {
+            assert_eq!(a.caller_role, "panel_member");
+            assert_eq!(a.amount, 1_000_000);
+            assert_eq!(a.reason, "disputed");
+        }
+        let callers: Vec<[u8; 32]> = panel_actions.iter().map(|a| a.caller).collect();
+        assert!(callers.contains(&M1) && callers.contains(&M2) && callers.contains(&M3));
+        // No single-arbiter Resolve is listed in panel mode — it would
+        // fail on-chain with PanelResolveDisabled.
+        assert!(
+            report
+                .actions
+                .iter()
+                .all(|a| a.kind != KeeperActionKind::Resolve),
+            "panel mode must not list single-arbiter resolve"
+        );
+    }
+
+    #[test]
+    fn snapshot_exports_the_panel() {
+        let mut e = disputed_panel();
+        e.submit_panel_judgment(M1, 600_000, None, Some([0x11; 32]), BOB)
+            .unwrap();
+        let snap = e.snapshot(T0 + 100);
+        let panel = snap.arbiter_panel.as_ref().unwrap();
+        assert_eq!((panel.n, panel.threshold), (3, 2));
+        assert_eq!(panel.members, vec![M1, M2, M3]);
+        assert_eq!(panel.votes.len(), 1, "only voting members are exported");
+        assert_eq!(panel.votes[0].member, M1);
+        assert_eq!(panel.votes[0].taker_amount, 600_000);
+        assert_eq!(panel.votes[0].rationale_hash, Some([0x11; 32]));
+        let json = snap.to_json();
+        assert!(json.contains("\"arbiter_panel\":{\"n\":3,\"threshold\":2"));
+        // A panel-less escrow exports null.
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .snapshot(T0);
+        assert!(plain.arbiter_panel.is_none());
+        assert!(plain.to_json().contains("\"arbiter_panel\":null"));
+    }
+
+    #[test]
+    fn new_instruction_discriminators_are_pinned() {
+        // IDL: sha256("global:<name>")[..8] — the Anchor instruction
+        // discriminator, pinned here and in the generated
+        // escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("initialize_arbiter_panel"),
+            [0xd0, 0x08, 0x59, 0xc3, 0x59, 0x9d, 0xe3, 0x5a]
+        );
+        assert_eq!(
+            instruction_discriminator("submit_panel_judgment"),
+            [0x3f, 0x13, 0xb9, 0xf5, 0x7e, 0x48, 0x92, 0xd7]
+        );
+        // And the INSTRUCTIONS table carries both specs.
+        let names: Vec<&&str> = crate::anchor_idl_tests::INSTRUCTIONS
+            .iter()
+            .map(|s| &s.name)
+            .collect();
+        assert!(names.contains(&&"initialize_arbiter_panel"));
+        assert!(names.contains(&&"submit_panel_judgment"));
     }
 }

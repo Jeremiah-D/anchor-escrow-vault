@@ -152,6 +152,35 @@ pub struct MilestoneSnapshot {
     pub tranches: Vec<MilestoneTrancheSnapshot>,
 }
 
+/// One panel member's current effective vote, as exported by the
+/// AV-65 arbiter-panel snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanelVoteSnapshot {
+    /// The voting member's key.
+    pub member: [u8; 32],
+    /// The taker's share of the remaining locked funds this vote
+    /// awards.
+    pub taker_amount: u64,
+    /// The member's optional rationale-document commitment (AV-38
+    /// convention).
+    pub rationale_hash: Option<[u8; 32]>,
+}
+
+/// Point-in-time, read-only view of the AV-65 arbiter panel: the
+/// committee, the judgment threshold, and each member's current
+/// effective vote (only members who have voted appear in `votes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArbiterPanelSnapshot {
+    /// How many members sit on the panel (`1..=8`).
+    pub n: u8,
+    /// How many matching votes settle the dispute (`1..= n`).
+    pub threshold: u8,
+    /// The member keys in slot order.
+    pub members: Vec<[u8; 32]>,
+    /// The current effective vote per voting member, in slot order.
+    pub votes: Vec<PanelVoteSnapshot>,
+}
+
 /// Point-in-time, read-only view of an [`Escrow`]. Built by
 /// [`Escrow::snapshot`]; serialized by [`EscrowSnapshot::to_json`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +306,12 @@ pub struct EscrowSnapshot {
     /// AV-59: how many times the deadline was extended via
     /// `extend_expiry` (saturating).
     pub extension_count: u64,
+    /// AV-65: the arbiter panel, or `None` when no panel is configured
+    /// (single-arbiter mode or no arbitration). Carries the committee,
+    /// the M-vote threshold, and each voting member's current effective
+    /// vote — so an off-chain indexer can tally the live multisig
+    /// judgment without replaying the vote events.
+    pub arbiter_panel: Option<ArbiterPanelSnapshot>,
 }
 
 impl Escrow {
@@ -376,6 +411,29 @@ impl Escrow {
             // times the deadline moved.
             max_extension_secs: self.max_extension_secs(),
             extension_count: self.extension_count(),
+            // AV-65: the arbiter panel rides the export — the committee,
+            // the threshold, and each voting member's current effective
+            // vote — so an off-chain indexer can tally the live multisig
+            // judgment from one snapshot.
+            arbiter_panel: self.arbiter_panel().map(|panel| {
+                let n = panel.n as usize;
+                let mut votes = Vec::new();
+                for i in 0..n {
+                    if panel.voted & (1 << i) != 0 {
+                        votes.push(PanelVoteSnapshot {
+                            member: panel.members[i],
+                            taker_amount: panel.votes[i].taker_amount,
+                            rationale_hash: panel.votes[i].rationale_hash,
+                        });
+                    }
+                }
+                ArbiterPanelSnapshot {
+                    n: panel.n,
+                    threshold: panel.threshold,
+                    members: panel.members[..n].to_vec(),
+                    votes,
+                }
+            }),
             penalty_bps: self.penalty_bps(),
             unlock_at: self.unlock_at(),
             unlock_eligible: self.is_unlock_eligible(now),
@@ -640,6 +698,42 @@ impl EscrowSnapshot {
         s.push_str(&self.max_extension_secs.to_string());
         s.push_str(",\"extension_count\":");
         s.push_str(&self.extension_count.to_string());
+        // AV-65: the arbiter panel — `null` when no panel is configured,
+        // else the committee (n, threshold, member keys) and each voting
+        // member's current effective vote.
+        s.push_str(",\"arbiter_panel\":");
+        match &self.arbiter_panel {
+            Some(p) => {
+                s.push_str("{\"n\":");
+                s.push_str(&p.n.to_string());
+                s.push_str(",\"threshold\":");
+                s.push_str(&p.threshold.to_string());
+                s.push_str(",\"members\":[");
+                for (i, m) in p.members.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push('"');
+                    s.push_str(&hex32(m));
+                    s.push('"');
+                }
+                s.push_str("],\"votes\":[");
+                for (i, v) in p.votes.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push_str("{\"member\":\"");
+                    s.push_str(&hex32(&v.member));
+                    s.push_str("\",\"taker_amount\":");
+                    s.push_str(&v.taker_amount.to_string());
+                    s.push_str(",\"rationale_hash\":");
+                    write_opt_hex(&mut s, v.rationale_hash);
+                    s.push('}');
+                }
+                s.push_str("]}");
+            }
+            None => s.push_str("null"),
+        }
         s.push('}');
         s
     }
@@ -696,7 +790,7 @@ mod snapshot_tests {
              \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
-             \"max_extension_secs\":0,\"extension_count\":0\
+             \"max_extension_secs\":0,\"extension_count\":0,\"arbiter_panel\":null\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),

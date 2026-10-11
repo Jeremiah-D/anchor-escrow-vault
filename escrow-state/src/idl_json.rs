@@ -177,6 +177,8 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         "Option<PayoutAllowlist>" => IdlType::Option(Box::new(IdlType::Named("PayoutAllowlist"))),
         "Option<DefaultJudgment>" => IdlType::Option(Box::new(IdlType::Named("DefaultJudgment"))),
+        // AV-65: opt-in arbiter panel.
+        "Option<ArbiterPanel>" => IdlType::Option(Box::new(IdlType::Named("ArbiterPanel"))),
         // AV-56: periodic subscription release schedule.
         "Option<SubscriptionSchedule>" => IdlType::Option(Box::new(IdlType::Named("SubscriptionSchedule"))),
         // AV-57: the 64 fixed event-history slots.
@@ -263,6 +265,24 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
                 "actor",
                 IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 8))),
             ),
+        ],
+        // PanelVote { taker_amount: u64, rationale_hash: Option<[u8; 32]> }
+        // (AV-65: 41 bytes — Borsh `Option<[u8; 32]>` is tag + 32 bytes).
+        "PanelVote" => vec![
+            ("taker_amount", IdlType::U64),
+            (
+                "rationale_hash",
+                IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
+            ),
+        ],
+        // ArbiterPanel { n: u8, threshold: u8, members: [[u8; 32]; 8],
+        // votes: [PanelVote; 8], voted: u64 } (AV-65: 594 bytes).
+        "ArbiterPanel" => vec![
+            ("n", IdlType::U8),
+            ("threshold", IdlType::U8),
+            ("members", IdlType::Array(ArrayElem::PublicKey, 8)),
+            ("votes", IdlType::Array(ArrayElem::Defined("PanelVote"), 8)),
+            ("voted", IdlType::U64),
         ],
         other => panic!("idl_json: unknown named type: {other}"),
     }
@@ -477,6 +497,8 @@ fn render_idl_json() -> String {
         "DefaultJudgment",
         "SubscriptionSchedule",
         "EventHistorySlot",
+        "PanelVote",
+        "ArbiterPanel",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -638,6 +660,13 @@ fn named_type_sizes_pin_constants() {
     // 8-byte actor summary.
     assert_eq!(size("EventHistorySlot"), EVENT_HISTORY_SLOT_LEN);
     assert_eq!(size("EventHistorySlot"), 18);
+    // AV-65: taker amount + rationale option tag + 32-byte rationale.
+    assert_eq!(size("PanelVote"), PANEL_VOTE_LEN);
+    assert_eq!(size("PanelVote"), 41);
+    // AV-65: member count + threshold + 8 member keys + 8 vote slots
+    // + voted bitmask.
+    assert_eq!(size("ArbiterPanel"), ARBITER_PANEL_LEN);
+    assert_eq!(size("ArbiterPanel"), 594);
 }
 
 #[test]
@@ -705,7 +734,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 36, "error variant count drift");
+    assert_eq!(errors.len(), 38, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -723,6 +752,9 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::InvalidInitializer.code(), 133);
     assert_eq!(EscrowError::InvalidExpiryExtension.code(), 134);
     assert_eq!(EscrowError::InvalidTimelock.code(), 135);
+    // AV-65: the new codes extend the table — never renumbered.
+    assert_eq!(EscrowError::InvalidArbiterPanel.code(), 136);
+    assert_eq!(EscrowError::PanelResolveDisabled.code(), 137);
 }
 
 #[test]

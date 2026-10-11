@@ -64,12 +64,14 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | Transition                                  | From           | To        | Authority              |
 |---------------------------------------------|----------------|-----------|------------------------|
 | `initialize(initializer, taker, amount, expires_at)` | — | `Uninitialized` | anyone (amount > 0) |
-| `initialize_arbiter(arbiter)`               | `Uninitialized`| `Uninitialized` | initializer (once, before funding; zero key rejected) |
+| `initialize_arbiter(arbiter)`               | `Uninitialized`| `Uninitialized` | initializer (once, before funding; zero key rejected; mutually exclusive with `initialize_arbiter_panel` — last-wins in both directions) |
+| `initialize_arbiter_panel(members, threshold)` (AV-65) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opt-in multisig arbitration: 1–8 member keys, threshold 1..=N, zero/duplicate keys rejected as `InvalidArbiterPanel`, code 136; mutually exclusive with the single arbiter — last-wins in both directions; `rotate_arbiter` is `InvalidStateTransition` in panel mode) |
 | `escalate(authority, now, evidence_hash)`   | `Funded`       | `Disputed` | initializer **or** taker, only when `now < expires_at` (locks `release`/`cancel`/`cancel_expired`/`claim`); `evidence_hash` is the optional 32-byte off-chain-evidence commitment, persisted |
-| `resolve(authority, taker_amount, rationale_hash)` | `Disputed`     | `Settled` | arbiter only; atomic split of the remainder (taker payout / initializer refund); `rationale_hash` is the optional 32-byte commitment to the arbiter's off-chain rationale document, persisted in `Settled` (never cleared) |
+| `resolve(authority, taker_amount, rationale_hash)` | `Disputed`     | `Settled` | arbiter only; atomic split of the remainder (taker payout / initializer refund); `rationale_hash` is the optional 32-byte commitment to the arbiter's off-chain rationale document, persisted in `Settled` (never cleared); **disabled in panel mode** (`PanelResolveDisabled`, code 137 — the panel's multisig judgment is the only settlement path once a panel is configured) |
+| `submit_panel_judgment(member, taker_amount, rationale_hash)` (AV-65) | `Disputed` | `Disputed` (vote recorded) / `Settled` (M matching votes) | panel member only (`Unauthorized` for a stranger); one effective vote per member — a re-vote overwrites the earlier vote (the `PanelJudgment` event keeps the audit trail); the first M votes agreeing on the same `(taker_amount, rationale_hash)` pair settle the escrow automatically (`Settled`, settlement identical to `resolve` — fee slices the taker's share, gross lands in the `released` counter, the initializer is refunded the remainder); non-matching votes stay recorded for audit; the settling vote emits `PanelResolved` after its `PanelJudgment`; `InvalidArbiterPanel` (code 136) with no panel configured |
 | `initialize_default_judgment(deadline_secs, default_taker_amount)` (AV-55) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — and only after `initialize_arbiter`; the arbiter must be configured first); declares the fallback split applied when the arbiter never resolves: `deadline_secs` seconds in `Disputed` before the judgment becomes triggerable (must be non-zero — `DefaultJudgmentNotDue` otherwise), `default_taker_amount` the taker's share of the remainder (must be ≤ the locked amount — `ReleaseExceedsLocked` otherwise); the initializer proposes the terms, the taker must still countersign (dual-signed agreement) |
 | `confirm_default_judgment()` (AV-55) | `Uninitialized` / `Funded` | — (no state change; sets the confirmation bit) | **taker only** (`Unauthorized` for a stranger or the initializer); no judgment configured is `DefaultJudgmentNotDue`; idempotent (re-confirming is `Ok`) |
-| `trigger_default_judgment(caller, now, payout_to)` (AV-55) | `Disputed` | `Settled` | **initializer or taker** (either party — a liveness backstop, not a power grant); only once `now >= disputed_at + deadline_secs` (the judgment's due time, `DefaultJudgmentNotDue` otherwise); settles on the pre-agreed split — fee slices the taker's share like `resolve`, quorum/vesting/timelock do *not* gate (same as `resolve`); the arbiter's `resolve` is unchanged and keeps priority — after the deadline either the arbiter resolves or a party triggers, first writer wins; emits `DefaultJudgment` |
+| `trigger_default_judgment(caller, now, payout_to)` (AV-55) | `Disputed` | `Settled` | **initializer or taker** (either party — a liveness backstop, not a power grant); only once `now >= disputed_at + deadline_secs` (the judgment's due time, `DefaultJudgmentNotDue` otherwise); settles on the pre-agreed split — fee slices the taker's share like `resolve`, quorum/vesting/timelock do *not* gate (same as `resolve`); the arbiter's `resolve` is unchanged and keeps priority — after the deadline either the arbiter resolves or a party triggers, first writer wins; in AV-65 panel mode the default judgment stays available (same deadline rules) and races the panel's M-vote settlement instead; emits `DefaultJudgment` |
 | `initialize_subscription(period_secs, periods, per_period)` (AV-56) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — mutually exclusive with `initialize_milestones`; declares the periodic release schedule, back-scheduled from `expires_at`: period `i` is due at `expires_at - (periods-1-i) * period_secs`; validation — `period_secs` non-zero, `periods` in 1..=64, `per_period` non-zero, `periods * per_period` == locked amount (in u128), `expires_at != u64::MAX`, and the schedule must fit the lifetime — is `InvalidSubscription` otherwise) |
 | `release_period(period_index)` (AV-56) | `Funded` | `Funded` (partial) / `Released` (last period) | initializer only (the initializer's push path); strictly in-order (`period_index` must equal the next due period — skip-ahead and replay are `PeriodNotDue`) and due-date gated (`now >= due_at(period_index)` — `PeriodNotDue` otherwise); quorum satisfied when configured (`QuorumNotReached`), the timelock gate when a lock is configured (`now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64); `TimelockNotReached` — the timelock gates every taker payout path); `MintMismatch` / `PayoutNotAllowlisted` guard the fund movement like `release`; the protocol fee slices the period (`payout + fee == per_period`); vesting claim composes (not blocked); emits `SubscriptionPeriodReleased` |
 | `initialize_milestones(milestones)`          | `Uninitialized`| `Uninitialized` | initializer (once, before funding; tranche amounts must sum to the locked amount) |
@@ -86,7 +88,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `rotate_pause_authority(new_authority)`       | any (post-`Uninitialized`) | — (no state change; rewrites the bound pause authority) | the escrow authority (initializer) only — a stranger/taker is `Unauthorized`; `InvalidStateTransition` on `Uninitialized` or with no authority bound; zero address is `InvalidPauseAuthority`; works while paused (key-loss escape hatch); emits `PauseAuthorityRotated` only on an actual change |
 | `rotate_taker(new_taker)`                   | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the taker) | **both** the initializer and the *current* taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition` (no live counterparty left; arbitration in flight adjudicates the taker's identity); zero address is `InvalidTaker`; amount / released / attest records / milestone state all preserved; emits `TakerRotated` only on an actual change |
 | `rotate_initializer(new_initializer)`      | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the initializer) | **both** the *current* initializer and the taker must sign (dual-signature governance — the mirror of `rotate_taker`; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (arbitration in flight adjudicates the initializer's identity — the refund goes to the initializer); zero address is `InvalidInitializer`; on an actual change the initializer's activation signature bit is cleared (the new key never signed activation); the AV-23 whitelist pins the refund destination when configured, otherwise refunds resolve to the new initializer (keeper/snapshot follow automatically); emits `InitializerRotated` only on an actual change |
-| `rotate_arbiter(new_arbiter)`                | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the arbiter) | **both** the *current* initializer and the *current* taker must sign (dual-signature governance — the mirror of `rotate_initializer` for the arbitration role; the arbiter itself does not sign, so a lost arbiter key cannot block its own replacement; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (no live dispute path left to referee, and arbitration in flight must settle with the referee that heard it); no arbiter configured or the zero address is `InvalidArbiter`; the activation bitmask is untouched (it tracks only the initializer and taker); the keeper's `resolve` listing and the snapshot export read the live arbiter field (follow automatically); emits `ArbiterRotated` only on an actual change |
+| `rotate_arbiter(new_arbiter)`                | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the arbiter) | **both** the *current* initializer and the *current* taker must sign (dual-signature governance — the mirror of `rotate_initializer` for the arbitration role; the arbiter itself does not sign, so a lost arbiter key cannot block its own replacement; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (no live dispute path left to referee, and arbitration in flight must settle with the referee that heard it); a configured panel is `InvalidStateTransition` too (single-arbiter governance only — rotate the panel via `initialize_arbiter_panel`); no arbiter configured or the zero address is `InvalidArbiter`; the activation bitmask is untouched (it tracks only the initializer and taker); the keeper's `resolve` listing and the snapshot export read the live arbiter field (follow automatically); emits `ArbiterRotated` only on an actual change |
 | `initialize_quorum(attestors, weights, threshold)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_extension(max_extension_secs)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding); zero bound is `InvalidExpiryExtension`; persists the extension budget (`max_extension_secs`, `extension_count` starts 0) |
@@ -403,6 +405,44 @@ arbiter ruled). New vault fields (appended last): `disputed_at` (u64),
 `default_judgment` (17 bytes: 1-byte discriminant + 16-byte judgment),
 `default_confirmed` (bool) — 26 bytes, so the full vault is now 994
 bytes / 7,809,120 lamports rent-exempt.
+
+**Arbiter panel multisig judgment (AV-65).** A single arbiter is a
+single point of failure — a compromised or bribed key rules alone. The
+opt-in panel replaces the single arbiter with an N-member committee and
+an M-of-N threshold (`with_arbiter_panel(members, threshold)` /
+`initialize_arbiter_panel`, `Uninitialized` only, like the other
+`with_*` builders; 1–8 member keys, threshold 1..=N, zero/duplicate
+keys rejected as `InvalidArbiterPanel`, code 136). The panel and the
+single arbiter are mutually exclusive — last-wins in both directions,
+so an escrow always has exactly one arbitration mechanism configured
+(or none). After `escalate` moves the escrow to `Disputed`, each member
+submits one judgment (`submit_panel_judgment(member, taker_amount,
+rationale_hash)`, member-signed — a stranger is `Unauthorized`); each
+member has exactly one *effective* vote, and a re-vote overwrites the
+earlier vote (the `PanelJudgment` event keeps the full audit trail).
+The first M votes that agree on the same `(taker_amount,
+rationale_hash)` pair settle the escrow automatically to `Settled` —
+first-to-M wins, no coordinator needed — with settlement semantics
+identical to `resolve`: the protocol fee slices the taker's share
+(the AV-63 fee cap applies), the gross lands in the shared `released`
+counter, the initializer is refunded the remainder, and the winning
+vote's `rationale_hash` is persisted like the arbiter's. Non-matching
+votes stay recorded on the panel for audit (dissent is evidence, not an
+error). In panel mode the single-arbiter `resolve` is disabled
+(`PanelResolveDisabled`, code 137), and `rotate_arbiter` is
+`InvalidStateTransition` (the panel is its own governance — rotate it
+via `with_arbiter_panel`). The AV-55 arbitration deadline / default
+judgment stays available in panel mode with the same rules, racing the
+panel's M-vote settlement. Quorum does not gate the panel (AV-14
+convention: the arbiter *is* the resolution mechanism). The keeper's
+dispute listing never shows a single-arbiter `resolve` for panel-mode
+escrows — one `submit_panel_judgment` action per member instead
+(`caller_role: "panel_member"`) — and the snapshot/IDL exports carry
+the panel (members, threshold, current votes). New vault field
+(appended last): `arbiter_panel` (`Option<ArbiterPanel>`, 595 bytes:
+1-byte discriminant + N u8 + M u8 + 8×32-byte member keys +
+8×(u64 taker_amount + 1+32-byte rationale) votes + u64 voted bitmask)
+— the full vault is now 2811 bytes / 20,511,120 lamports rent-exempt.
 
 **Subscription release (AV-56).** A subscription is the clock-driven
 counterpart to the milestone tranche plan (AV-15): the initializer may
@@ -798,7 +838,9 @@ automatically. New vault fields (appended last): `max_extension_secs`
 `fee_cap` (u64) — 8 bytes, so the full vault is now 2208 bytes /
 16,258,560 lamports rent-exempt. AV-64 appends `relative_timelock_secs`
 (u64) and `fund_at` (u64) — 16 bytes, so the full vault is now 2216 bytes /
-16,369,920 lamports rent-exempt.
+16,369,920 lamports rent-exempt. AV-65 appends `arbiter_panel`
+(`Option<ArbiterPanel>`) — 595 bytes, so the full vault is now 2811 bytes /
+20,511,120 lamports rent-exempt.
 
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
@@ -841,6 +883,8 @@ program error per variant):
 | `InvalidInitializer` | 133 | `rotate_initializer` with the zero address (a zero address can never be the legitimate initializer) |
 | `InvalidExpiryExtension` | 134 | `initialize_extension` with a zero bound or on a non-`Uninitialized` escrow; `extend_expiry` with a deadline that is not later than the current one, whose increment exceeds the remaining budget, on an `Activated`/`Disputed`/terminal escrow, or when the deadline is already keeper-eligible (`now >= expires_at + grace_period`) |
 | `InvalidTimelock` | 135 | `with_timelock` with a nonzero `unlock_at` while a nonzero relative timelock is configured, or `with_relative_timelock` with a nonzero `secs` while a nonzero absolute timelock is configured (one clock per escrow) |
+| `InvalidArbiterPanel` | 136 | `with_arbiter_panel` with an empty member list, more than 8 members, a zero threshold, a threshold above the member count, a zero member key, or a duplicate member; `submit_panel_judgment` with no panel configured |
+| `PanelResolveDisabled` | 137 | `resolve` called on a panel-mode escrow — the panel's multisig judgment (`submit_panel_judgment`) is the only settlement path once a panel is configured |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1110,7 +1154,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -1162,6 +1206,13 @@ successful calls that change nothing observable:
   `to == Released`, gross payout + fee) and then `VaultClosed`
   (`from == Released`, `to == Closed`, `rent_reclaimed`) in that fixed
   order — one payout-then-close pair per instruction.
+- `submit_panel_judgment` (AV-65) emits `PanelJudgment` for every
+  recorded vote (`from == to == Disputed`, zeroed amounts — a vote is
+  a judgment, not a payout); the vote that reaches the M-vote
+  threshold additionally emits `PanelResolved` immediately after
+  (`from == Disputed`, `to == Settled`, `amounts` carrying the
+  `Resolved` shape — gross taker payout / fee / initializer refund —
+  plus the winning vote's rationale hash).
 - `drain_events()` takes the recorded events and clears the log; the
   sequence counter keeps running, so a resuming indexer never sees
   duplicates.
@@ -1228,6 +1279,7 @@ returns a `KeeperReport` of immediately executable calls:
 | `crank_expired(caller, now, mint)` (AV-48) | `Funded`, `now >= expires_at + grace_period`, remainder > 0, **not paused** (the crank fails on a paused escrow, so it is only listed when executable) | `"anyone"` — permissionless; the keeper substitutes its own key (serialized as the zero key) | refundable remainder (never fee'd); the refund goes to the same pinned `refund_to` as the party path — the cranker receives nothing |
 | `claim(taker, now, mint)` | `Funded`, vesting attached, no milestone plan, vested − released > 0, quorum satisfied if configured, timelock unlocked (`now >= unlock_at` (AV-27) / `now >= fund_at + secs` (AV-64)) | taker | gross vested-but-unreleased (`payout + fee == amount`) |
 | `resolve(arbiter, taker_amount, mint, rationale_hash)` (AV-38) | `Disputed`, arbiter configured, remainder > 0 | arbiter | remaining locked amount the arbiter's split divides (the split itself and the rationale-document commitment are the arbiter's call-time judgment) |
+| `submit_panel_judgment(member, taker_amount, mint, rationale_hash)` (AV-65) | `Disputed`, panel configured, remainder > 0 — one action **per panel member** | panel member (`caller_role: "panel_member"`) | remaining locked amount the member's voted split divides (the split and the rationale commitment are the member's call-time judgment; the panel settles itself once M votes agree) |
 | `close_vault(authority)` (AV-40) | `Cancelled` / `Released` / `Settled` — the terminal states AV-34's `close_vault` accepts. `Disputed` is never listed (the arbitration is still live; the vault account is the arbiter's audit surface) and `Closed` is never listed (the rent is already reclaimed) — the scan lists only calls the chain would accept | initializer (the only key `close_vault` accepts — AV-34 checks authority before state) | `rent_reclaimed`: the mainnet rent-exempt minimum for the current `VAULT_SPACE` (via `vault_close_rent_reclaimed()`, never a hardcoded figure) |
 
 Only *executable* calls are listed: a vesting claim behind an unsatisfied
@@ -1236,7 +1288,10 @@ is withheld (`TimelockNotReached`), and a milestone-plan escrow
 never lists `claim` (the plan owns the release schedule). A `Disputed`
 escrow lists exactly the `resolve` action — its unilateral exits stay
 locked, so nothing else is listed — letting an arbiter-operated keeper bot
-learn which disputes await its ruling. Each action
+learn which disputes await its ruling. A panel-mode `Disputed` escrow
+lists one `submit_panel_judgment` action per panel member and never the
+single-arbiter `resolve` (which the panel disables — `PanelResolveDisabled`).
+Each action
 carries the exact instruction arguments — `caller`, `mint` (the bound SPL
 mint, or `null` on the native-SOL path), and `refund_to` (the refund
 destination for `cancel_expired` — the whitelisted address when
@@ -1339,7 +1394,10 @@ timelock), `relative_timelock_secs` (AV-64; `0` = no relative lock),
 `fund_at` (AV-64; `0` = never funded), plus the optional `quorum`,
 `vesting`, `arbiter`, `mint`, `evidence_hash`, `rationale_hash` (AV-38;
 hex or `null`), `reference` (AV-53; hex or `null`), `refund_to` (hex or
-`null`)
+`null`), `arbiter_panel` (AV-65; `null` when no panel is configured —
+otherwise `n`, `threshold`, the 64-char hex member keys, and the
+recorded `votes`: per-member `taker_amount` plus the optional hex
+`rationale_hash`)
 and the effective `refund_recipient` (whitelist when configured, else the
 initializer) — plus the retained on-chain event history (AV-57):
 `event_history` (the valid ring window, oldest-first — `kind` /
@@ -1437,7 +1495,8 @@ two-way consistency check against the IDL parameter table:
 | fee_cap | u64 | 8 |
 | relative_timelock_secs | u64 | 8 |
 | fund_at | u64 | 8 |
-| **total**     |                   | **2216** |
+| arbiter_panel | Option<ArbiterPanel> | 595 |
+| **total**     |                   | **2811** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1502,11 +1561,13 @@ the 8-byte extension bound (AV-59: zeroed when extension is not enabled)
 and the 8-byte absolute protocol-fee ceiling (AV-63: zeroed = uncapped
 when no ceiling is configured) — and the 8-byte relative timelock duration
 (AV-64: zeroed when no relative timelock is configured) — and the 8-byte
-funding timestamp (AV-64: zeroed when the escrow was never funded).
-`escrow-state` exposes `VAULT_SPACE` (2224) and
-`VAULT_SPACE_NO_QUORUM` (1734) for the Anchor `space =` constraint, plus a
+funding timestamp (AV-64: zeroed when the escrow was never funded) —
+and the 595-byte arbiter panel region (AV-65: 1-byte `Option`
+discriminant + 594-byte panel, zeroed when no panel is configured).
+`escrow-state` exposes `VAULT_SPACE` (2819) and
+`VAULT_SPACE_NO_QUORUM` (2329) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **16,369,920 lamports** to be
+mainnet rent parameters the full vault needs **20,511,120 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1527,15 +1588,16 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 2224 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
+  stays 2819 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
   weighted-quorum, AV-46 pause-switch, AV-49 payout-allowlist, AV-51
   vesting-cliff, AV-53 reference-memo, AV-55 default-judgment,
   AV-56 subscription, AV-57 event-history, AV-59 extension, AV-63
-  fee-cap, and AV-64 relative-timelock growth is accounted in the
+  fee-cap, AV-64 relative-timelock, and AV-65 arbiter-panel growth is
+  accounted in the
   layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**16,369,920
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**20,511,120
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the
@@ -1553,14 +1615,14 @@ the whole instruction aborts with zero side effects (state, counters
 and the event log all roll back). The initializer signs once instead
 of twice, and the rent-exempt deposit returns together with the
 payout. The indexer sees the fixed `Released` → `VaultClosed` event
-pair; the vault layout is untouched (`VAULT_SPACE` stays 2224).
+pair; the vault layout is untouched (`VAULT_SPACE` stays 2819).
 
 ## IDL pipeline (AV-29)
 
 `programs/escrow-vault/idl/escrow_vault.json` is a checked-in Anchor IDL
 for the program: every instruction (name, `sha256("global:<name>")[..8]`
 discriminator, args), the `Vault` account with per-field Borsh byte
-offsets, the `QuorumPolicy`/`VestingSchedule`/`MilestonePlan` subtypes,
+offsets, the `QuorumPolicy`/`VestingSchedule`/`MilestonePlan`/`PanelVote`/`ArbiterPanel` subtypes,
 and the error code table.
 
 The Anchor/Solana BPF toolchain is unavailable in this environment, so

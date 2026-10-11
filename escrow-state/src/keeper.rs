@@ -30,6 +30,15 @@
 //!   flags the escrow as awaiting resolution with the splittable pool
 //!   (`amount`) and the bound mint; the arbiter supplies the split and
 //!   the rationale hash at call time.
+//! - `submit_panel_judgment` (AV-65): the escrow is `Disputed` with a
+//!   configured arbiter panel and a positive remaining balance —
+//!   panel mode, where the single-arbiter `resolve` is disabled. One
+//!   action per panel member names that member as the caller
+//!   (`caller_role: "panel_member"`) so a member-operated keeper bot
+//!   learns which disputes await its vote; the split and the
+//!   rationale-document commitment are the member's call-time
+//!   judgment, so the action carries the splittable pool (`amount`)
+//!   and the bound mint.
 //!
 //! Every listed action carries the exact arguments the keeper needs to
 //! build the instruction: `caller` (the signing key), `mint` (the bound
@@ -41,8 +50,10 @@
 //! `claim` would move — the protocol fee slices it, `payout + fee ==
 //! amount` — or the remaining locked amount a `resolve` would split).
 //!
-//! `Disputed` escrows list exactly the `resolve` action above — their
-//! unilateral exits stay locked — and the scan never drops their state:
+//! `Disputed` escrows list exactly the `resolve` action above in
+//! single-arbiter mode — or one `submit_panel_judgment` action per
+//! panel member in panel mode (AV-65) — their unilateral exits stay
+//! locked — and the scan never drops their state:
 //! the dispute evidence hash attached at `escalate` (AV-22) stays
 //! readable on the watched snapshot ([`Escrow::evidence_hash`]) so
 //! operator tooling can fetch the off-chain evidence for the arbiter.
@@ -138,6 +149,14 @@ pub enum KeeperActionKind {
     /// commitment are the arbiter's call-time judgment, not keeper
     /// inputs.
     Resolve,
+    /// `submit_panel_judgment(member, taker_amount, mint,
+    /// rationale_hash)` (AV-65): one panel member's judgment on a
+    /// `Disputed` escrow. Listed once per panel member so a
+    /// member-operated keeper bot learns which disputes await its
+    /// vote; the split and the rationale-document commitment are the
+    /// member's call-time judgment, not keeper inputs. The M-th
+    /// matching vote settles the escrow automatically.
+    PanelJudgment,
     /// `release_period(initializer, now, period_index, mint, payout_to)`
     /// (AV-56): the initializer's push of the next due subscription
     /// period. Listed for `Funded` escrows with an attached schedule
@@ -155,6 +174,7 @@ impl KeeperActionKind {
             KeeperActionKind::CrankExpired => "crank_expired",
             KeeperActionKind::Claim => "claim",
             KeeperActionKind::Resolve => "resolve",
+            KeeperActionKind::PanelJudgment => "submit_panel_judgment",
             KeeperActionKind::ReleasePeriod => "release_period",
         }
     }
@@ -174,7 +194,8 @@ pub struct KeeperAction {
     /// building the instruction. `caller_role` is `"anyone"` then.
     pub caller: [u8; 32],
     /// Which role `caller` plays: `"initializer"`, `"taker"`,
-    /// `"arbiter"` (AV-38, `resolve` actions), or `"anyone"` (AV-48,
+    /// `"arbiter"` (AV-38, `resolve` actions), `"panel_member"` (AV-65,
+    /// `submit_panel_judgment` actions), or `"anyone"` (AV-48,
     /// `crank_expired` actions — the permissionless crank).
     pub caller_role: &'static str,
     /// The `mint` argument to pass: the escrow's bound mint, or `None`
@@ -187,8 +208,9 @@ pub struct KeeperAction {
     /// `RefundAddressMismatch`, so the keeper must build the
     /// instruction with exactly this address). `None` for `claim`
     /// actions, which pay the taker rather than refunding — and `None`
-    /// for `resolve` actions, which split the remainder between the
-    /// taker and the initializer rather than refunding to one address.
+    /// for `resolve` / `submit_panel_judgment` actions, which split
+    /// the remainder between the taker and the initializer rather
+    /// than refunding to one address.
     pub refund_to: Option<[u8; 32]>,
     /// `cancel_expired`: the refundable remainder the call would return
     /// to the initializer. `claim`: the gross vested-but-unreleased
@@ -196,6 +218,9 @@ pub struct KeeperAction {
     /// `resolve` (AV-38): the remaining locked amount the arbiter's
     /// split divides between the taker and the initializer — the split
     /// itself is the arbiter's judgment at call time.
+    /// `submit_panel_judgment` (AV-65): the remaining locked amount the
+    /// member's vote divides between the taker and the initializer —
+    /// the split itself is the member's judgment at call time.
     /// Always `> 0` — zero-value actions are never listed.
     pub amount: u64,
     /// The escrow's token decimal metadata (AV-28): the SPL mint's
@@ -216,7 +241,8 @@ pub struct KeeperAction {
     /// second look before the keeper sweeps it.
     pub extension_count: u64,
     /// Machine-readable reason: `"expired"`, `"vesting_unlocked"`,
-    /// `"disputed"` (AV-38, `resolve` actions), or
+    /// `"disputed"` (AV-38, `resolve` actions; AV-65,
+    /// `submit_panel_judgment` actions), or
     /// `"subscription_period_due"` (AV-56, `release_period` actions).
     pub reason: &'static str,
 }
@@ -355,8 +381,39 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         // (unreachable through the state machine, which requires an
         // arbiter to escalate) lists nothing — no key could sign the
         // call.
+        // AV-65: in panel mode the single-arbiter `resolve` is disabled
+        // (`PanelResolveDisabled`) — the panel's multisig judgment is
+        // the only settlement path. The scan lists one
+        // `submit_panel_judgment` action per panel member instead, so a
+        // member-operated keeper bot learns which disputes await its
+        // vote; the split and rationale are the member's call-time
+        // judgment, so the action carries the splittable pool rather
+        // than a decided split.
         if e.state() == EscrowState::Disputed {
-            if let Some(arbiter) = e.arbiter() {
+            if let Some(panel) = e.arbiter_panel() {
+                let remaining = e.remaining_amount();
+                if remaining > 0 {
+                    for member in panel.members[..panel.n as usize].iter() {
+                        actions.push(KeeperAction {
+                            escrow_id: w.escrow_id,
+                            kind: KeeperActionKind::PanelJudgment,
+                            caller: *member,
+                            caller_role: "panel_member",
+                            mint: e.mint(),
+                            // `submit_panel_judgment` splits the
+                            // remainder between the taker and the
+                            // initializer — no single refund
+                            // destination applies.
+                            refund_to: None,
+                            amount: remaining,
+                            decimals: e.decimals(),
+                            reference: w.reference,
+                            extension_count: e.extension_count(),
+                            reason: "disputed",
+                        });
+                    }
+                }
+            } else if let Some(arbiter) = e.arbiter() {
                 let remaining = e.remaining_amount();
                 if remaining > 0 {
                     actions.push(KeeperAction {

@@ -67,6 +67,15 @@
 //!   current state, all amounts zero; a no-op rotation emits nothing.
 //!   A rotation with no arbiter configured is rejected, so the event
 //!   can never fire on an arbiter-less escrow.
+//! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
+//!   on every successful vote (AV-65) — `from == to == Disputed`, the
+//!   member's key in `caller`, the voted split in `amounts.payout`:
+//!   the vote is the ordering signal and the indexer reads the live
+//!   tally from the vault. Re-votes emit too — an overwritten vote
+//!   stays in the log as the audit trail. When the vote is the M-th
+//!   match, [`EscrowEventKind::PanelResolved`] follows (`Disputed ->
+//!   Settled`, the `Resolved` amounts shape, the winning vote's
+//!   rationale) — the vote event first, then the settlement.
 //! - `extend_expiry` emits [`EscrowEventKind::ExpiryExtended`] when the
 //!   deadline moves (AV-59) — `from == to ==` the current state (a
 //!   config change, not a lifecycle move), all amounts zero: the event
@@ -136,6 +145,8 @@
 //! | ExpiredCranked (AV-48) | 0 | 0 | remainder minus penalty, to the whitelisted destination (the cranker receives nothing) | anti-griefing penalty to the initializer (AV-24; 0 unless the cranker is the taker) |
 //! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
 //! | DefaultJudgment (AV-55) | gross taker share (`default_taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
+//! | PanelResolved (AV-65) | gross taker share (the winning vote's `taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
+//! | PanelJudgment (AV-65) | the voted split (`taker_amount`) | 0 | 0 | 0 |
 //! | MilestoneSkipped | 0 | 0 | skipped tranche (the initializer's refund) | 0 |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //!
@@ -312,6 +323,31 @@ pub enum EscrowEventKind {
     /// (`InvalidArbiter`), so the event can never fire on an
     /// arbiter-less escrow.
     ArbiterRotated,
+    /// AV-65: one arbiter-panel member submitted their judgment
+    /// ([`Escrow::submit_panel_judgment`]). `from == to == Disputed`
+    /// (a vote, not a lifecycle move — like
+    /// [`EscrowEventKind::Attested`]); the voted split (`taker_amount`)
+    /// rides `amounts.payout` and the vote's rationale-document
+    /// commitment rides the rationale slot — the vote itself is the
+    /// ordering signal, and the indexer reads the live tally (and the
+    /// voting member's key summary, in the on-chain history ring's
+    /// actor slot) from the vault. Emitted on every submission,
+    /// including re-votes: an overwritten vote stays in the log as the
+    /// audit trail of the member's changed mind.
+    PanelJudgment,
+    /// AV-65: the arbiter panel settled the dispute
+    /// ([`Escrow::submit_panel_judgment`]): the M-th matching vote
+    /// arrived. `from == Disputed`, `to == Settled` — the same
+    /// lifecycle move as [`EscrowEventKind::Resolved`], but executed
+    /// by the panel's multisig instead of a single arbiter. Amounts
+    /// follow the `Resolved` shape (`payout` = gross taker share, `fee`
+    /// = protocol fee on the taker's share, `refund` = initializer's
+    /// share of the split); the dispute evidence hash the escrow still
+    /// holds rides the event, and the winning vote's rationale-document
+    /// commitment rides it as the rationale (AV-38 convention). Always
+    /// emitted together with the settling vote's `PanelJudgment` (the
+    /// vote first, then the settlement).
+    PanelResolved,
 }
 
 impl EscrowEventKind {
@@ -361,6 +397,10 @@ impl EscrowEventKind {
             // AV-62: appended after PartiallyCancelled so discriminants
             // 0–28 stay stable for already-serialized histories.
             29 => Self::ArbiterRotated,
+            // AV-65: appended after ArbiterRotated so discriminants
+            // 0–29 stay stable for already-serialized histories.
+            30 => Self::PanelJudgment,
+            31 => Self::PanelResolved,
             _ => return None,
         })
     }
@@ -399,6 +439,8 @@ impl EscrowEventKind {
             Self::ExpiryExtended => "expiry_extended",
             Self::PartiallyCancelled => "partially_cancelled",
             Self::ArbiterRotated => "arbiter_rotated",
+            Self::PanelJudgment => "panel_judgment",
+            Self::PanelResolved => "panel_resolved",
         }
     }
 }
@@ -797,6 +839,19 @@ impl IndexedEscrow {
     /// Configuration: emits no event.
     pub fn with_arbiter(mut self, arbiter: [u8; 32]) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_arbiter(arbiter)?;
+        Ok(self)
+    }
+
+    /// Opt in to the arbiter-panel multisig judgment (mirrors
+    /// [`Escrow::with_arbiter_panel`]): replace the single dispute
+    /// arbiter with an N-member panel and an M-vote judgment threshold.
+    /// Configuration: emits no event.
+    pub fn with_arbiter_panel(
+        mut self,
+        members: &[[u8; 32]],
+        threshold: u8,
+    ) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_arbiter_panel(members, threshold)?;
         Ok(self)
     }
 
@@ -1794,6 +1849,89 @@ impl IndexedEscrow {
             Some(caller),
         );
         Ok((payout, fee, refund))
+    }
+
+    /// Submit one arbiter-panel member's judgment (mirrors
+    /// [`Escrow::submit_panel_judgment`]). Emits `PanelJudgment` on
+    /// every successful submission (`from == to == Disputed`): the
+    /// member's key rides `caller`, the voted split rides
+    /// `amounts.payout`, and the vote's rationale-document commitment
+    /// rides the rationale slot — re-votes included, so an overwritten
+    /// vote stays in the log as the audit trail. When the submission is
+    /// the M-th matching vote, a `PanelResolved` event follows
+    /// (`Disputed -> Settled`) with the `Resolved` amounts shape and
+    /// the winning vote's rationale — the vote event first, then the
+    /// settlement, in `seq` order. Returns what the inner method
+    /// returns: `None` when the vote did not settle, `Some((payout,
+    /// fee, refund))` when it did.
+    pub fn submit_panel_judgment(
+        &mut self,
+        member: [u8; 32],
+        taker_amount: u64,
+        mint: Option<[u8; 32]>,
+        rationale_hash: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+        at: u64,
+    ) -> Result<Option<(u64, u64, u64)>, EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self
+            .inner
+            .submit_panel_judgment(member, taker_amount, mint, rationale_hash, payout_to);
+        let settled = self.map_reentrant(result, at)?;
+        // Every submission is recorded, settled or not: the vote is
+        // the audit trail.
+        self.push_event(
+            EscrowEventKind::PanelJudgment,
+            from,
+            self.inner.state(),
+            EventAmounts {
+                payout: taker_amount,
+                fee: 0,
+                refund: 0,
+                penalty: 0,
+                rent_reclaimed: 0,
+            },
+            at,
+            None,
+            rationale_hash,
+            None,
+            None,
+            Some(member),
+        );
+        if let Some((_payout, fee, refund)) = settled {
+            // The M-th matching vote settled the escrow: emit the
+            // settlement after the vote event. `taker_amount` is the
+            // gross taker share by construction
+            // (`payout + fee == taker_amount`).
+            let amounts = EventAmounts {
+                payout: taker_amount,
+                fee,
+                refund,
+                penalty: 0,
+                rent_reclaimed: 0,
+            };
+            // AV-22: the evidence hash survives on the escrow, so the
+            // panel settlement references the evidence the panel
+            // reviewed. AV-38: the winning vote's rationale commitment
+            // rides the settlement event.
+            let evidence_hash = self.inner.evidence_hash();
+            let rationale_hash = self.inner.rationale_hash();
+            self.push_event(
+                EscrowEventKind::PanelResolved,
+                from,
+                self.inner.state(),
+                amounts,
+                at,
+                evidence_hash,
+                rationale_hash,
+                None,
+                None,
+                Some(member),
+            );
+        }
+        Ok(settled)
     }
 
     /// Confirm a milestone for the release path (mirrors

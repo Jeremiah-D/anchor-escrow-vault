@@ -319,6 +319,24 @@
       ]
     },
     {
+      "name": "initialize_arbiter_panel",
+      "discriminator": [208, 8, 89, 195, 89, 157, 227, 90],
+      "accounts": [],
+      "args": [
+        {"name": "members", "type": {"vec": "publicKey"}},
+        {"name": "threshold", "type": "u8"}
+      ]
+    },
+    {
+      "name": "submit_panel_judgment",
+      "discriminator": [63, 19, 185, 245, 126, 72, 146, 215],
+      "accounts": [],
+      "args": [
+        {"name": "taker_amount", "type": "u64"},
+        {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}}
+      ]
+    },
+    {
       "name": "initialize_payout_allowlist",
       "discriminator": [155, 187, 116, 255, 95, 174, 219, 118],
       "accounts": [],
@@ -464,7 +482,8 @@
           {"name": "extension_count", "type": "u64", "offset": 2192},
           {"name": "fee_cap", "type": "u64", "offset": 2200},
           {"name": "relative_timelock_secs", "type": "u64", "offset": 2208},
-          {"name": "fund_at", "type": "u64", "offset": 2216}
+          {"name": "fund_at", "type": "u64", "offset": 2216},
+          {"name": "arbiter_panel", "type": {"option": {"defined": "ArbiterPanel"}}, "offset": 2224}
         ]
       }
     }
@@ -545,6 +564,29 @@
           {"name": "actor", "type": {"option": {"array": ["u8", 8]}}, "offset": 9}
         ]
       }
+    },
+    {
+      "name": "PanelVote",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "taker_amount", "type": "u64", "offset": 0},
+          {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 8}
+        ]
+      }
+    },
+    {
+      "name": "ArbiterPanel",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "n", "type": "u8", "offset": 0},
+          {"name": "threshold", "type": "u8", "offset": 1},
+          {"name": "members", "type": {"array": ["publicKey", 8]}, "offset": 2},
+          {"name": "votes", "type": {"array": [{"defined": "PanelVote"}, 8]}, "offset": 258},
+          {"name": "voted", "type": "u64", "offset": 586}
+        ]
+      }
     }
   ],
   "errors": [
@@ -583,7 +625,9 @@
     {"code": 132, "name": "InvalidEventCapacity"},
     {"code": 133, "name": "InvalidInitializer"},
     {"code": 134, "name": "InvalidExpiryExtension"},
-    {"code": 135, "name": "InvalidTimelock"}
+    {"code": 135, "name": "InvalidTimelock"},
+    {"code": 136, "name": "InvalidArbiterPanel"},
+    {"code": 137, "name": "PanelResolveDisabled"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

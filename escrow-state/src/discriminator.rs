@@ -36,10 +36,11 @@
 //! the result.
 
 use super::{
-    sha256, DefaultJudgment, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, MilestonePlan,
-    PayoutAllowlist, QuorumPolicy, SubscriptionSchedule, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
-    DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN, MAX_ATTESTORS, MAX_EVENT_HISTORY, MAX_MILESTONES,
-    MAX_PAYOUT_ALLOWLIST, MILESTONE_PLAN_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN,
+    sha256, ArbiterPanel, DefaultJudgment, Escrow, EscrowEventKind, EscrowState, EventHistorySlot,
+    MilestonePlan, PanelVote, PayoutAllowlist, QuorumPolicy, SubscriptionSchedule, VestingSchedule,
+    ANCHOR_DISCRIMINATOR_LEN, ARBITER_PANEL_LEN, DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN,
+    MAX_ATTESTORS, MAX_EVENT_HISTORY, MAX_MILESTONES, MAX_PANEL_MEMBERS, MAX_PAYOUT_ALLOWLIST,
+    MILESTONE_PLAN_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN,
     SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
 };
 
@@ -103,9 +104,17 @@ pub enum AccountDecodeError {
     /// safely read (AV-49; AV-32 panic-free guarantee).
     InvalidPayoutAllowlistLen(u8),
     /// An event-history slot's kind byte is not a known
-    /// [`EscrowEventKind`] discriminant (0–25). The mapping is pinned
+    /// [`EscrowEventKind`] discriminant (0–31). The mapping is pinned
     /// by test to declaration order (AV-57).
     InvalidEventKindDiscriminant(u8),
+    /// A present arbiter panel's member count is outside `1..=8`
+    /// ([`MAX_PANEL_MEMBERS`](crate::MAX_PANEL_MEMBERS)) or its
+    /// threshold is outside `1..=n`. The count bytes are part of the
+    /// field's layout — an out-of-range count would make the panel
+    /// accessors read past the live slots, so the decoder rejects it
+    /// rather than decoding a value the accessors cannot safely read
+    /// (AV-65; AV-32 panic-free guarantee).
+    InvalidArbiterPanelLen { n: u8, threshold: u8 },
 }
 
 /// Bounds-checked cursor over the account body. Every read is
@@ -513,6 +522,58 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // unchanged.
     let relative_timelock_secs = c.u64_le()?;
     let fund_at = c.u64_le()?;
+    // AV-65: opt-in arbiter panel, always reserved like `quorum`: the
+    // `None` discriminant followed by the zeroed 594-byte panel
+    // region, appended last so every earlier offset above is
+    // unchanged. The member count / threshold are validated `n in
+    // 1..=8`, `threshold in 1..=n` — an out-of-range count would make
+    // the panel accessors read past the live slots, so the panic-free
+    // decoder rejects it (paralleling the AV-49 allowlist-len
+    // validation).
+    let arbiter_panel = if c.option_present("arbiter_panel")? {
+        let n = c.u8()?;
+        let threshold = c.u8()?;
+        if n == 0 || n as usize > MAX_PANEL_MEMBERS || threshold == 0 || threshold > n {
+            return Err(AccountDecodeError::InvalidArbiterPanelLen { n, threshold });
+        }
+        let mut members = [[0u8; 32]; MAX_PANEL_MEMBERS];
+        for m in members.iter_mut() {
+            *m = c.pubkey()?;
+        }
+        let mut votes = [PanelVote {
+            taker_amount: 0,
+            rationale_hash: None,
+        }; MAX_PANEL_MEMBERS];
+        for v in votes.iter_mut() {
+            let taker_amount = c.u64_le()?;
+            let rationale_hash = if c.option_present("arbiter_panel.vote.rationale")? {
+                Some(c.pubkey()?)
+            } else {
+                c.skip(32)?;
+                None
+            };
+            *v = PanelVote {
+                taker_amount,
+                rationale_hash,
+            };
+        }
+        let voted = c.u64_le()?;
+        debug_assert_eq!(
+            ARBITER_PANEL_LEN,
+            1 + 1 + MAX_PANEL_MEMBERS * 32 + MAX_PANEL_MEMBERS * PANEL_VOTE_LEN + 8,
+            "panel region drift vs ARBITER_PANEL_LEN"
+        );
+        Some(ArbiterPanel {
+            n,
+            threshold,
+            members,
+            votes,
+            voted,
+        })
+    } else {
+        c.skip(ARBITER_PANEL_LEN)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -596,6 +657,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // decode.
         relative_timelock_secs,
         fund_at,
+        // AV-65: the arbiter panel is persisted — a decoded escrow
+        // carries the same committee, threshold and votes the setup
+        // and the panel judgments recorded, so the multisig tally
+        // decides identically after a decode.
+        arbiter_panel,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
