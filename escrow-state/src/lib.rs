@@ -22,6 +22,12 @@ mod execution_plan;
 // `initialize -> fund -> release` call list for many escrows, ALT
 // support, and per-item failure isolation (fleet bring-up / sweep).
 mod batch;
+// AV-61: keeper execution bundles — pack the batch lifecycle scan's
+// (AV-37) executable actions into `(mint, caller)` signing-session
+// bundles with real instruction discriminators, logical accounts, and
+// ALT tables, as deterministic multisig/CLI-ready JSON. Purely
+// additive and read-only (dry-run by construction).
+mod execution_bundle;
 #[cfg(test)]
 mod idl_json;
 #[cfg(test)]
@@ -186,6 +192,14 @@ pub use execution_plan::{
 pub use batch::{
     scan_batch_lifecycle, BatchAccount, BatchActionKind, BatchInitializeParams, BatchItem,
     BatchItemOutcome, BatchLifecycleAction, BatchReport, BatchWatchItem,
+};
+
+// AV-61: keeper execution bundles over the batch lifecycle scan —
+// `(mint, caller)` atomicity bundles with real instruction
+// discriminators, logical accounts carrying ALT indexes, and
+// multisig/CLI-ready deterministic JSON. Purely additive and read-only.
+pub use execution_bundle::{
+    bundle_execution, BundledAccount, BundledAction, ExecutionBundle,
 };
 
 /// Lifecycle states of an escrow vault.

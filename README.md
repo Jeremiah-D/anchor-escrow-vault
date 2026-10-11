@@ -1680,6 +1680,43 @@ for a whole fleet of escrows.
 - **Dry-run**: like the keeper report — no events, no clock, no
   mutation. Amounts are as of the scan; execute, then re-scan.
 
+## Keeper execution bundles (AV-61)
+
+`escrow-state/src/execution_bundle.rs` is the last off-chain step
+before submission: it packs the batch scan's (AV-37) flat call list
+into per-signing-session **execution bundles** a multisig or CLI can
+consume directly.
+
+- **Grouping key**: `(mint, caller)` — the AV-33 convention. One
+  signing key authorizes the whole bundle (one multisig proposal, one
+  CLI run with one keypair), and the token path is uniform inside it
+  (all native-SOL or all the same SPL mint). Bundles are ordered
+  deterministically — native-SOL first, then by mint, then by caller —
+  and actions keep the report's scan order inside a bundle.
+- **Real discriminators**: every action carries the Anchor
+  instruction discriminator (`sha256("global:<name>")[..8]`) computed
+  by the same constructor the IDL pipeline pins. The program-side IDL
+  names are authoritative: `Initialize → "initialize"`,
+  `Fund → "fund"`, `Release → "release"` (checked at implementation —
+  no drift between the batch kinds and the IDL instruction names).
+- **JSON shape**: each bundle is self-contained —
+  `{"bundle_id","mint","caller","caller_role","actions","action_count",
+  "alt_table","at","scanned"}`. Actions carry `escrow_id`,
+  `instruction`, `discriminator` (16-char hex), `args` (per-kind:
+  `initialize` → `taker`/`amount`/`expires_at`; `fund` → `amount`
+  only, since the program takes no instruction args; `release` →
+  `amount` plus the expected `payout`/`fee` split), `accounts` with
+  `signer`/`writable` flags and `alt_index`, and `reason`. The bundle
+  embeds the scan's `alt_table` verbatim, so one ALT creation covers
+  every transaction.
+- **Failure isolation**: vault sets are disjoint across bundles — a
+  failing bundle is retried alone, the others stand. Dry-run by
+  construction: the bundler only reads the report.
+- **Relation to AV-33**: the same idea as the batch settlement
+  execution plan, applied to the proactive lifecycle line instead of
+  the keeper report's reactive exits. Same grouping, same
+  discriminator rule, same deterministic hand-serialized JSON.
+
 ## Payout destination allowlist (AV-49)
 
 A taker payout is only as safe as its destination. `release`, `claim`,
