@@ -398,7 +398,12 @@
           {"name": "default_confirmed", "type": "bool", "offset": 993},
           {"name": "subscription", "type": {"option": {"defined": "SubscriptionSchedule"}}, "offset": 994},
           {"name": "subscription_next", "type": "u8", "offset": 1012},
-          {"name": "subscription_released", "type": "u64", "offset": 1013}
+          {"name": "subscription_released", "type": "u64", "offset": 1013},
+          {"name": "event_head", "type": "u8", "offset": 1021},
+          {"name": "event_total", "type": "u64", "offset": 1022},
+          {"name": "event_count", "type": "u8", "offset": 1030},
+          {"name": "event_capacity", "type": "u8", "offset": 1031},
+          {"name": "event_slots", "type": {"array": [{"defined": "EventHistorySlot"}, 64]}, "offset": 1032}
         ]
       }
     }
@@ -468,6 +473,17 @@
           {"name": "per_period", "type": "u64", "offset": 9}
         ]
       }
+    },
+    {
+      "name": "EventHistorySlot",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "kind", "type": "u8", "offset": 0},
+          {"name": "at", "type": "u64", "offset": 1},
+          {"name": "actor", "type": {"option": {"array": ["u8", 8]}}, "offset": 9}
+        ]
+      }
     }
   ],
   "errors": [
@@ -502,7 +518,8 @@
     {"code": 128, "name": "InvalidTaker"},
     {"code": 129, "name": "DefaultJudgmentNotDue"},
     {"code": 130, "name": "InvalidSubscription"},
-    {"code": 131, "name": "PeriodNotDue"}
+    {"code": 131, "name": "PeriodNotDue"},
+    {"code": 132, "name": "InvalidEventCapacity"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

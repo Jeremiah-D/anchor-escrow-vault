@@ -544,6 +544,41 @@ pub struct Escrow {
     /// Always present (zeroed when no schedule is attached). Appended
     /// last so every earlier field offset stays stable.
     subscription_released: u64,
+    /// AV-57: event-history ring-buffer write cursor — the index of
+    /// the oldest entry once the buffer is full (and the slot the next
+    /// record overwrites). `0` until the buffer first fills. Persisted
+    /// (1 byte in the vault account) so the ring order survives
+    /// serialization. Appended last so every earlier field offset
+    /// stays stable.
+    event_head: u8,
+    /// AV-57: monotonic total of events ever recorded on this escrow.
+    /// Never decreases — not even when the ring wraps and overwrites
+    /// the oldest entries — so an indexer can detect history loss
+    /// (`total - count` events aged out of the window). Saturates at
+    /// `u64::MAX` rather than wrapping. Persisted (8 bytes in the
+    /// vault account). Appended last so every earlier field offset
+    /// stays stable.
+    event_total: u64,
+    /// AV-57: number of valid entries currently in the ring — always
+    /// `<= event_capacity`. Persisted (1 byte in the vault account).
+    /// Appended last so every earlier field offset stays stable.
+    event_count: u8,
+    /// AV-57: configured ring capacity (1..=[`MAX_EVENT_HISTORY`]),
+    /// set once via [`Escrow::with_event_capacity`] on an
+    /// `Uninitialized` escrow; defaults to [`MAX_EVENT_HISTORY`].
+    /// The account always reserves all 64 slots, so a smaller capacity
+    /// never needs a realloc — entries past the configured capacity
+    /// simply stay zeroed. Persisted (1 byte in the vault account).
+    /// Appended last so every earlier field offset stays stable.
+    event_capacity: u8,
+    /// AV-57: the 64 fixed event-history slots in slot order (see
+    /// [`EventHistorySlot`]). Only the valid window — the first
+    /// `event_count` slots while the buffer is filling, then the ring
+    /// starting at `event_head` — carries meaning; the rest is zeroed.
+    /// Persisted (1152 bytes in the vault account) so the audit trail
+    /// survives serialization. Appended last so every earlier field
+    /// offset stays stable.
+    event_slots: [EventHistorySlot; MAX_EVENT_HISTORY],
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -805,6 +840,12 @@ pub enum EscrowError {
     /// strictly in order, one at a time, each only once due —
     /// [`EscrowError::PeriodNotDue`] covers both sequencing and timing.
     PeriodNotDue,
+    /// Event-history misconfiguration (AV-57):
+    /// [`Escrow::with_event_capacity`] with `capacity == 0` or
+    /// `capacity > 64` ([`MAX_EVENT_HISTORY`]) — the ring buffer holds
+    /// at least one and at most 64 events. Parallels
+    /// [`EscrowError::InvalidDecimals`] (config error).
+    InvalidEventCapacity,
 }
 
 impl EscrowError {
@@ -849,6 +890,7 @@ impl EscrowError {
             EscrowError::DefaultJudgmentNotDue => 129,
             EscrowError::InvalidSubscription => 130,
             EscrowError::PeriodNotDue => 131,
+            EscrowError::InvalidEventCapacity => 132,
         }
     }
 
@@ -887,6 +929,7 @@ impl EscrowError {
             EscrowError::DefaultJudgmentNotDue,
             EscrowError::InvalidSubscription,
             EscrowError::PeriodNotDue,
+            EscrowError::InvalidEventCapacity,
         ]
     }
 }
@@ -894,6 +937,82 @@ impl EscrowError {
 /// Maximum number of payout destinations in a [`PayoutAllowlist`]
 /// (AV-49). Fixed-size so the crate stays heap-free and `Copy`.
 pub const MAX_PAYOUT_ALLOWLIST: usize = 4;
+
+// ---------------------------------------------------------------------------
+// AV-57: per-escrow event-history ring buffer.
+// ---------------------------------------------------------------------------
+
+/// AV-57: maximum event-history slots per escrow — the ring buffer
+/// ceiling. The vault account always reserves all 64 slots (see
+/// [`EVENT_HISTORY_LEN`]), so [`Escrow::with_event_capacity`] never
+/// needs a realloc: a smaller configured capacity simply leaves the
+/// tail slots zeroed.
+pub const MAX_EVENT_HISTORY: usize = 64;
+
+/// AV-57: serialized length of one event-history slot: the event-kind
+/// discriminant (`u8`, [`EscrowEventKind`] declaration order), the
+/// caller-supplied Unix-seconds timestamp (`u64`), the actor-presence
+/// tag (`u8`: `0` = no single actor, `1` = the 8-byte summary follows),
+/// and the actor summary — the first 8 bytes of the actor's pubkey, a
+/// digest rather than the full address so the account stays lean.
+pub const EVENT_HISTORY_SLOT_LEN: usize = 1 + 8 + 1 + 8;
+
+/// AV-57: serialized length of the whole event-history region: the
+/// 1-byte ring head (write cursor — the index of the oldest entry once
+/// the buffer is full), the 8-byte monotonic total-event counter (never
+/// decreases, even as the ring overwrites the oldest entries), the
+/// 1-byte valid-entry count, the 1-byte configured capacity
+/// (1..=64, default 64), and the 64 fixed slots.
+pub const EVENT_HISTORY_LEN: usize = 1 + 8 + 1 + 1 + MAX_EVENT_HISTORY * EVENT_HISTORY_SLOT_LEN;
+
+/// AV-57: one fixed-size event-history slot as persisted in the vault
+/// account's ring buffer ([`Escrow::event_slots`]).
+///
+/// The slot is deliberately narrow: `kind` reuses the
+/// [`EscrowEventKind`] discriminant (declaration order, pinned by
+/// test), `at` is the caller-supplied Unix-seconds timestamp of the
+/// transition, and `actor` is the first 8 bytes of the transition
+/// actor's pubkey — a summary, not the full address. `None` means the
+/// event carries no single actor: dual-signed governance transitions
+/// (the actor is the signature pair, not one key) and reentrancy
+/// rejections (the nested call fails before the authority check, so
+/// the hostile actor is unknown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventHistorySlot {
+    /// [`EscrowEventKind`] discriminant, by declaration order.
+    pub kind: u8,
+    /// Caller-supplied Unix-seconds timestamp of the transition.
+    pub at: u64,
+    /// First 8 bytes of the actor's pubkey, or `None` when the event
+    /// carries no single actor (see the struct docs).
+    pub actor: Option<[u8; 8]>,
+}
+
+impl EventHistorySlot {
+    /// The zeroed slot: what unused ring slots (and every slot of a
+    /// fresh escrow) hold. `kind == 0` reads as `Initialized` — slots
+    /// are only ever interpreted inside the valid window
+    /// (`event_count`), never bare.
+    pub const EMPTY: Self = Self {
+        kind: 0,
+        at: 0,
+        actor: None,
+    };
+}
+
+/// AV-57: one decoded event-history entry, in chronological (oldest
+/// first) order — what [`Escrow::event_history`] and the AV-26
+/// snapshot export hand to indexers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventHistoryEntry {
+    /// The transition that was recorded.
+    pub kind: EscrowEventKind,
+    /// Caller-supplied Unix-seconds timestamp of the transition.
+    pub at: u64,
+    /// First 8 bytes of the actor's pubkey, or `None` when the event
+    /// carries no single actor.
+    pub actor: Option<[u8; 8]>,
+}
 
 /// Serialized length of [`PayoutAllowlist`]: four 32-byte addresses plus
 /// the one-byte entry count.
@@ -1587,6 +1706,13 @@ impl Escrow {
             subscription: None,
             subscription_next: 0,
             subscription_released: 0,
+            // AV-57: the event-history ring starts empty — no events
+            // recorded yet, full 64-entry capacity by default.
+            event_head: 0,
+            event_total: 0,
+            event_count: 0,
+            event_capacity: MAX_EVENT_HISTORY as u8,
+            event_slots: [EventHistorySlot::EMPTY; MAX_EVENT_HISTORY],
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -4422,6 +4548,123 @@ impl Escrow {
         self.subscription_released
     }
 
+    /// Configure the event-history ring capacity (AV-57): how many of
+    /// the most recent events the vault account retains (1..=64).
+    /// Opt-in on an `Uninitialized` escrow, like every other `with_*`
+    /// builder; the default is the full 64. The account always
+    /// reserves all 64 slots regardless, so this never needs a
+    /// realloc — a smaller capacity only narrows the valid window.
+    ///
+    /// Returns [`EscrowError::InvalidEventCapacity`] for `0` or a
+    /// capacity above [`MAX_EVENT_HISTORY`], and
+    /// [`EscrowError::InvalidStateTransition`] past `Uninitialized`.
+    pub fn with_event_capacity(mut self, capacity: u8) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if capacity == 0 || capacity as usize > MAX_EVENT_HISTORY {
+            return Err(EscrowError::InvalidEventCapacity);
+        }
+        self.event_capacity = capacity;
+        Ok(self)
+    }
+
+    /// The configured event-history ring capacity (AV-57): at most
+    /// this many of the most recent events are retained; defaults to
+    /// [`MAX_EVENT_HISTORY`].
+    pub fn event_capacity(&self) -> u8 {
+        self.event_capacity
+    }
+
+    /// Monotonic total of events ever recorded on this escrow (AV-57):
+    /// never decreases, even as the ring overwrites the oldest
+    /// entries — `total - count` events aged out of the window. An
+    /// indexer uses it to detect history loss.
+    pub fn event_total(&self) -> u64 {
+        self.event_total
+    }
+
+    /// Number of valid entries currently in the event-history ring
+    /// (AV-57): always `<= event_capacity`.
+    pub fn event_count(&self) -> u8 {
+        self.event_count
+    }
+
+    /// Record one event in the per-escrow history ring (AV-57).
+    ///
+    /// The intended caller is the [`IndexedEscrow`](crate::IndexedEscrow)
+    /// event adapter (and, on-chain, the program layer after a
+    /// successful transition): exactly one record per successful
+    /// transition, none for failed ones — the same emission rule as
+    /// the off-chain event log. `actor` is the transition's single
+    /// actor when there is one; dual-signed governance transitions and
+    /// reentrancy rejections pass `None` (see [`EventHistorySlot`]).
+    ///
+    /// The record lands in the next free slot while the buffer is
+    /// filling; once full, the oldest entry (at `event_head`) is
+    /// overwritten and the head advances. `event_total` grows
+    /// monotonically either way (saturating at `u64::MAX`).
+    pub fn record_history(&mut self, kind: EscrowEventKind, at: u64, actor: Option<[u8; 32]>) {
+        // Defensive clamp: a structurally-decoded escrow (see
+        // `decode_vault_account`) may carry an out-of-range capacity;
+        // the ring math must stay panic-free regardless.
+        let cap = (self.event_capacity as usize).clamp(1, MAX_EVENT_HISTORY);
+        let mut summary = [0u8; 8];
+        if let Some(key) = actor {
+            summary.copy_from_slice(&key[..8]);
+        }
+        let slot = EventHistorySlot {
+            kind: kind.discriminant(),
+            at,
+            actor: actor.map(|_| summary),
+        };
+        if (self.event_count as usize) < cap {
+            self.event_slots[self.event_count as usize] = slot;
+            self.event_count += 1;
+        } else {
+            let head = (self.event_head as usize) % cap;
+            self.event_slots[head] = slot;
+            self.event_head = ((head + 1) % cap) as u8;
+        }
+        self.event_total = self.event_total.saturating_add(1);
+    }
+
+    /// The retained event history (AV-57), oldest first: the valid ring
+    /// window in chronological order — the first `event_count` slots
+    /// while the buffer is filling, then the ring starting at
+    /// `event_head` once full. Pure read; indexers and the AV-26
+    /// snapshot export build on this.
+    pub fn event_history(&self) -> Vec<EventHistoryEntry> {
+        let cap = (self.event_capacity as usize).clamp(1, MAX_EVENT_HISTORY);
+        let count = (self.event_count as usize).min(cap);
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            // While filling, slots 0..count are valid in order and the
+            // head is still 0; once full, the oldest entry sits at the
+            // head and the ring wraps modulo the capacity.
+            let idx = if (self.event_count as usize) < cap {
+                i
+            } else {
+                ((self.event_head as usize) + i) % cap
+            };
+            let slot = self.event_slots[idx];
+            // The kind byte was validated at decode time
+            // (`decode_vault_account` rejects unknown discriminants),
+            // and `record_history` only writes real discriminants — so
+            // an unknown byte here means a hand-built escrow, and the
+            // fallback keeps the reader panic-free.
+            let kind =
+                EscrowEventKind::from_discriminant(slot.kind).unwrap_or(EscrowEventKind::Initialized);
+            out.push(EventHistoryEntry {
+                kind,
+                at: slot.at,
+                actor: slot.actor,
+            });
+        }
+        out
+    }
+
     /// Release the next due subscription period to the taker (AV-56).
     /// Returns `(taker_payout, fee)` — the taker's net payout and the
     /// protocol fee (AV-17) — so the caller (and the Anchor layer) can
@@ -4837,6 +5080,22 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // (zeroed when no schedule is attached). Appended last so every
     // earlier field offset stays stable.
     ("subscription_released", "u64 (bitmask)", 8),
+    // AV-57: per-escrow event-history ring buffer (see
+    // `Escrow::record_history`): 1-byte write cursor (the index of the
+    // oldest entry once the buffer is full), 8-byte monotonic total
+    // counter, 1-byte valid-entry count, 1-byte configured capacity
+    // (`with_event_capacity`, 1..=64, default 64), and the 64 fixed
+    // 18-byte slots (kind u8 + at u64 + actor tag u8 + actor summary
+    // 8 bytes — see `EVENT_HISTORY_SLOT_LEN`). The slots are always
+    // reserved at the 64-entry ceiling so a smaller configured
+    // capacity never needs a realloc; entries past the configured
+    // capacity stay zeroed. Appended last so every earlier field
+    // offset stays stable.
+    ("event_head", "u8", 1),
+    ("event_total", "u64", 8),
+    ("event_count", "u8", 1),
+    ("event_capacity", "u8", 1),
+    ("event_slots", "[EventHistorySlot; 64]", 64 * EVENT_HISTORY_SLOT_LEN),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -4906,9 +5165,14 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// unconfirmed. The subscription schedule (AV-56) is likewise always
 /// present: 1-byte discriminant + 17-byte schedule (zeroed when no
 /// schedule is attached), followed by the always-present 1-byte next
-/// period index and 8-byte per-period released bitmap.
+/// period index and 8-byte per-period released bitmap. The event
+/// history (AV-57) is likewise always present: 1-byte ring head +
+/// 8-byte monotonic total + 1-byte valid-entry count + 1-byte
+/// configured capacity + the 64 fixed 18-byte slots (zeroed when no
+/// events were recorded) — the slots are reserved at the 64-entry
+/// ceiling regardless of the configured capacity.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -5452,7 +5716,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 7_997_040, "from {state:?}");
+            assert_eq!(rent, 16_091_520, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -5550,9 +5814,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 7_997_040 by
+        // VAULT_SPACE — pinned at 16_091_520 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 7_997_040);
+        assert_eq!(rent, 16_091_520);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -5710,11 +5974,11 @@ mod tests {
     fn release_and_close_adds_no_fields_and_keeps_space() {
         // AV-50 touches no persisted field: the release leg moves the
         // `released` / `fees_paid` counters and the state byte, and
-        // then the account is closed. VAULT_SPACE stays 1021 — re-asserted
+        // then the account is closed. VAULT_SPACE stays 2184 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 1021, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 7_997_040);
+        assert_eq!(VAULT_SPACE, 2184, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 16_091_520);
     }
 
     #[test]
@@ -5730,7 +5994,7 @@ mod tests {
         // 26 (dispute timestamp + default judgment + confirmation
         // bit), so the
         // pin tracks the new total deliberately.
-        assert_eq!(VAULT_SPACE, 1021, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 2184, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -9591,6 +9855,36 @@ pub(crate) mod anchor_idl_tests {
             "zeroed by initialize; advanced by release_period in \\
              strict period order",
         ),
+        // AV-57: no instruction param writes these fields — every
+        // successful transition appends one record to the event-history
+        // ring through the IndexedEscrow adapter (see
+        // `Escrow::record_history`), so they are field sources, not
+        // param mappings.
+        (
+            "event_head",
+            "zeroed by initialize; advanced by every successful \\
+             transition's ring append (oldest-entry index once full)",
+        ),
+        (
+            "event_total",
+            "zeroed by initialize; incremented by every successful \\
+             transition's ring append (monotonic, never decreases)",
+        ),
+        (
+            "event_count",
+            "zeroed by initialize; grown by every successful \\
+             transition's ring append, up to the configured capacity",
+        ),
+        (
+            "event_capacity",
+            "64 by default; set once by with_event_capacity \\
+             (Uninitialized only)",
+        ),
+        (
+            "event_slots",
+            "zeroed by initialize; written by every successful \\
+             transition's ring append (kind/at/actor per slot)",
+        ),
     ];
 
     /// Every vault field path from `VAULT_FIELDS`, with `quorum` unfolded
@@ -9869,6 +10163,11 @@ mod error_code_tests {
             EscrowError::PeriodNotDue,
             131,
             "release_period with a period_index that is not the next due period (skip-ahead or replay), or with now before that period's back-scheduled due timestamp",
+        ),
+        (
+            EscrowError::InvalidEventCapacity,
+            132,
+            "with_event_capacity with capacity == 0 or capacity > 64 (the event-history ring holds 1..=64 entries)",
         ),
     ];
 
@@ -11493,6 +11792,31 @@ mod account_space_tests {
         // AV-56: per-period released bitmap, always present (zeroed
         // when no schedule is attached).
         out.extend_from_slice(&e.subscription_released.to_le_bytes());
+        // AV-57: event-history ring buffer, always present: the 1-byte
+        // head cursor, the 8-byte monotonic total, the 1-byte
+        // valid-entry count, the 1-byte configured capacity, then the
+        // 64 fixed slots in slot order (kind u8 + at u64 + actor tag
+        // u8 + actor summary 8 bytes; the tag is 0 with a zeroed
+        // summary when the event carries no single actor). Appended
+        // last so every earlier offset above is unchanged.
+        out.push(e.event_head);
+        out.extend_from_slice(&e.event_total.to_le_bytes());
+        out.push(e.event_count);
+        out.push(e.event_capacity);
+        for slot in e.event_slots.iter() {
+            out.push(slot.kind);
+            out.extend_from_slice(&slot.at.to_le_bytes());
+            match slot.actor {
+                None => {
+                    out.push(0);
+                    out.extend_from_slice(&[0u8; 8]);
+                }
+                Some(summary) => {
+                    out.push(1);
+                    out.extend_from_slice(&summary);
+                }
+            }
+        }
         out
     }
 
@@ -11528,10 +11852,13 @@ mod account_space_tests {
         // (AV-55 dispute timestamp) + (1 + 16) (AV-55 pre-agreed default
         // judgment) + 1 (AV-55 taker confirmation bit) + (1 + 17)
         // (AV-56 subscription schedule) + 1 (AV-56 next period index)
-        // + 8 (AV-56 per-period released bitmap).
-        assert_eq!(ESCROW_BODY_LEN, 1013, "escrow payload bytes");
+        // + 8 (AV-56 per-period released bitmap) + 1 (AV-57 event
+        // ring head) + 8 (AV-57 monotonic event total) + 1 (AV-57
+        // valid-entry count) + 1 (AV-57 configured capacity) + 1152
+        // (AV-57 event slots: 64 x 18-byte kind/at/actor entries).
+        assert_eq!(ESCROW_BODY_LEN, 2176, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 1021, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 2184, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -11567,13 +11894,20 @@ mod account_space_tests {
         // 17)-byte subscription schedule (AV-56, zeroed when no
         // schedule is attached) + 1-byte next period index (AV-56,
         // zeroed when no schedule is attached) + 8-byte per-period
-        // released bitmap (AV-56, zeroed when no schedule is attached).
+        // released bitmap (AV-56, zeroed when no schedule is attached)
+        // + 1-byte event ring head (AV-57, zeroed when no events were
+        // recorded) + 8-byte monotonic event total (AV-57, zeroed when
+        // no events were recorded) + 1-byte valid-entry count (AV-57,
+        // zeroed when no events were recorded) + 1-byte configured
+        // capacity (AV-57, 64 by default) + 1152-byte event slots
+        // (AV-57, 64 x 18-byte entries, zeroed when no events were
+        // recorded).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 531);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1694);
     }
 
     #[test]
@@ -11980,16 +12314,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1021) * 3480 * 2 = 1149 * 6960 = 7_997_040 lamports.
-        assert_eq!(full, 7_997_040);
+        // (128 + 2184) * 3480 * 2 = 2312 * 6960 = 16_091_520 lamports.
+        assert_eq!(full, 16_091_520);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 531) * 3480 * 2 = 659 * 6960 = 4_586_640 lamports.
-        assert_eq!(no_quorum, 4_586_640);
+        // (128 + 1694) * 3480 * 2 = 1822 * 6960 = 12_681_120 lamports.
+        assert_eq!(no_quorum, 12_681_120);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -12033,25 +12367,25 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(7_997_040, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(16_091_520, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(7_628_159, params.0, params.1),
+            check_vault_rent_exempt(16_091_519, params.0, params.1),
             Err(RentShortfall {
-                required: 7_997_040,
-                provided: 7_628_159,
+                required: 16_091_520,
+                provided: 16_091_519,
             })
         );
         // Generous funding: exempt.
         assert_eq!(
-            check_vault_rent_exempt(10_000_000, params.0, params.1),
+            check_vault_rent_exempt(20_000_000, params.0, params.1),
             Ok(())
         );
         // Zero lamports: the full minimum is the shortfall.
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 7_997_040,
+                required: 16_091_520,
                 provided: 0,
             })
         );
@@ -14487,7 +14821,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 1013, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) bytes");
+        assert_eq!(bytes.len(), 2176, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -14512,7 +14846,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 1013);
+        assert_eq!(bytes.len(), 2176);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -14523,26 +14857,29 @@ mod rationale_tests {
     #[test]
     fn rationale_hash_rent_recomputed_from_mainnet_formula() {
         // AV-46 grows the account by 34 bytes on top of AV-38/AV-41/AV-44/AV-45,
-        // AV-51 by 8 more (vesting cliff), and AV-53 by 33 (off-chain
-        // reference memo); the rent-exempt minimums are recomputed from
-        // the mainnet formula, not copied from the AV-51 numbers.
+        // AV-51 by 8 more (vesting cliff), AV-53 by 33 (off-chain
+        // reference memo), AV-55 by 26 (dispute timestamp + default
+        // judgment + confirmation bit), AV-56 by 27 (subscription
+        // schedule + progress), and AV-57 by 1163 (event-history ring);
+        // the rent-exempt minimums are recomputed from
+        // the mainnet formula, not copied from the AV-56 numbers.
         let full = rent_exempt_minimum_lamports(
             VAULT_SPACE,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1021) * 3480 * 2 = 1149 * 6960 = 7_997_040 lamports.
-        assert_eq!(VAULT_SPACE, 1021);
-        assert_eq!(full, 7_997_040);
+        // (128 + 2184) * 3480 * 2 = 2312 * 6960 = 16_091_520 lamports.
+        assert_eq!(VAULT_SPACE, 2184);
+        assert_eq!(full, 16_091_520);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 531) * 3480 * 2 = 659 * 6960 = 4_586_640 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 531);
-        assert_eq!(no_quorum, 4_586_640);
+        // (128 + 1694) * 3480 * 2 = 1822 * 6960 = 12_681_120 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1694);
+        assert_eq!(no_quorum, 12_681_120);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -14686,7 +15023,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 1013);
+        assert_eq!(bytes.len(), 2176);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -14701,7 +15038,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 1013);
+        assert_eq!(bytes.len(), 2176);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -14724,25 +15061,26 @@ mod reference_tests {
     #[test]
     fn reference_rent_recomputed_from_mainnet_formula() {
         // AV-53 grows the account by 33 bytes on top of the AV-51
-        // layout; the rent-exempt minimums are recomputed from the
+        // layout, AV-55 by 26, AV-56 by 27, and AV-57 by 1163; the
+        // rent-exempt minimums are recomputed from the
         // mainnet formula, not copied from the AV-51 numbers.
         let full = rent_exempt_minimum_lamports(
             VAULT_SPACE,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1021) * 3480 * 2 = 1149 * 6960 = 7_997_040 lamports.
-        assert_eq!(VAULT_SPACE, 1021);
-        assert_eq!(full, 7_997_040);
+        // (128 + 2184) * 3480 * 2 = 2312 * 6960 = 16_091_520 lamports.
+        assert_eq!(VAULT_SPACE, 2184);
+        assert_eq!(full, 16_091_520);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 531) * 3480 * 2 = 659 * 6960 = 4_586_640 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 531);
-        assert_eq!(no_quorum, 4_586_640);
+        // (128 + 1694) * 3480 * 2 = 1822 * 6960 = 12_681_120 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1694);
+        assert_eq!(no_quorum, 12_681_120);
     }
 
     #[test]
@@ -15597,7 +15935,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 1013);
+        assert_eq!(bytes.len(), 2176);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -15772,7 +16110,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 1013, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55");
+        assert_eq!(ESCROW_BODY_LEN, 2176, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -15790,31 +16128,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 1021) * 3480 * 2 = 1149 * 6960 = 7_997_040 lamports.
+        // (128 + 2184) * 3480 * 2 = 2312 * 6960 = 16_091_520 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            7_997_040
+            16_091_520
         );
-        // (128 + 531) * 3480 * 2 = 659 * 6960 = 4_586_640 lamports.
+        // (128 + 1694) * 3480 * 2 = 1822 * 6960 = 12_681_120 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            4_586_640
+            12_681_120
         );
-        // 213 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
+        // 1376 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
-        // + AV-53 off-chain reference memo).
-        assert_eq!(VAULT_SPACE, 1021);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 531);
-        assert!(check_vault_rent_exempt(7_997_040, 3_480, 2.0).is_ok());
+        // + AV-53 off-chain reference memo + AV-55 default judgment +
+        // AV-56 subscription schedule + AV-57 event-history ring).
+        assert_eq!(VAULT_SPACE, 2184);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1694);
+        assert!(check_vault_rent_exempt(16_091_520, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -17813,7 +18152,7 @@ mod default_judgment_tests {
         // at 960, `default_judgment` at 968, `default_confirmed` at 985
         // (AV-55 body total 986). AV-56 appends `subscription` at 986,
         // `subscription_next` at 1004, `subscription_released` at 1005
-        // (body total 1013).
+        // (body total 2176 after the AV-57 event-history append).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter(ARBITER)
@@ -17823,7 +18162,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 1013);
+        assert_eq!(bytes.len(), 2176);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -18364,8 +18703,10 @@ mod subscription_tests {
         // program error per variant): never renumber.
         assert_eq!(EscrowError::InvalidSubscription.code(), 130);
         assert_eq!(EscrowError::PeriodNotDue.code(), 131);
+        assert_eq!(EscrowError::InvalidEventCapacity.code(), 132);
         assert!(EscrowError::all().contains(&EscrowError::InvalidSubscription));
         assert!(EscrowError::all().contains(&EscrowError::PeriodNotDue));
+        assert!(EscrowError::all().contains(&EscrowError::InvalidEventCapacity));
     }
 
     // ----- layout pins -----
@@ -18374,14 +18715,14 @@ mod subscription_tests {
     fn borsh_tail_pins_subscription_fields() {
         // Offsets: `default_confirmed` ends the AV-55 body at 986;
         // `subscription` at 986, `subscription_next` at 1004,
-        // `subscription_released` at 1005 (body total 1013).
+        // `subscription_released` at 1005 (body total 2176).
         let mut e = escrow()
             .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
             .unwrap();
         e.fund(ALICE).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 1013);
+        assert_eq!(bytes.len(), 2176);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -18445,5 +18786,280 @@ mod subscription_tests {
         assert_eq!(d.subscription_next_period(), 1);
         assert_eq!(d.subscription_released_periods(), 0b1);
         assert_eq!(d.state(), EscrowState::Funded);
+    }
+}
+
+// ---------- AV-57: per-escrow event-history ring buffer ----------
+//
+// Each escrow retains its most recent N state-transition records
+// (kind/at/actor summary) in a fixed ring buffer persisted in the
+// vault account — the on-chain audit trail an off-chain indexer (or
+// the AV-26 snapshot export) reads without trusting a separate log.
+
+#[cfg(test)]
+mod event_history_tests {
+    use super::*;
+    use crate::discriminator::{decode_vault_account, vault_account_discriminator};
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+
+    fn actor_summary(key: [u8; 32]) -> [u8; 8] {
+        let mut s = [0u8; 8];
+        s.copy_from_slice(&key[..8]);
+        s
+    }
+
+    fn account_bytes(e: &Escrow) -> Vec<u8> {
+        let mut out = Vec::with_capacity(VAULT_SPACE);
+        out.extend_from_slice(&vault_account_discriminator());
+        out.extend_from_slice(&super::account_space_tests::encode_escrow(e));
+        out
+    }
+
+    // ----- ring mechanics -----
+
+    #[test]
+    fn fresh_escrow_has_empty_history_and_full_capacity() {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.event_capacity(), 64);
+        assert_eq!(e.event_count(), 0);
+        assert_eq!(e.event_total(), 0);
+        assert!(e.event_history().is_empty());
+    }
+
+    #[test]
+    fn record_history_appends_kind_at_and_actor_summary() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
+        e.record_history(EscrowEventKind::Released, T0 + 1, None);
+        let h = e.event_history();
+        assert_eq!(h.len(), 2);
+        assert_eq!(e.event_count(), 2);
+        assert_eq!(e.event_total(), 2);
+        assert_eq!(h[0].kind, EscrowEventKind::Funded);
+        assert_eq!(h[0].at, T0);
+        assert_eq!(h[0].actor, Some(actor_summary(ALICE)));
+        assert_eq!(h[1].kind, EscrowEventKind::Released);
+        assert_eq!(h[1].at, T0 + 1);
+        assert_eq!(h[1].actor, None);
+    }
+
+    #[test]
+    fn ring_wraps_and_oldest_is_overwritten_but_total_is_monotonic() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_event_capacity(4)
+            .unwrap();
+        for i in 0..6u64 {
+            e.record_history(EscrowEventKind::Funded, T0 + i, Some(ALICE));
+        }
+        assert_eq!(e.event_count(), 4, "count caps at the capacity");
+        assert_eq!(e.event_total(), 6, "total keeps counting past the wrap");
+        let h = e.event_history();
+        assert_eq!(h.len(), 4);
+        // The two oldest records (at T0, T0+1) aged out; the window
+        // holds T0+2..T0+5 in chronological order.
+        let ats: Vec<u64> = h.iter().map(|r| r.at).collect();
+        assert_eq!(ats, vec![T0 + 2, T0 + 3, T0 + 4, T0 + 5]);
+        // An indexer detects the loss: total - count records aged out.
+        assert_eq!(e.event_total() - e.event_count() as u64, 2);
+    }
+
+    #[test]
+    fn capacity_bounds_are_enforced() {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.with_event_capacity(64).unwrap().event_capacity(), 64);
+        assert_eq!(e.with_event_capacity(1).unwrap().event_capacity(), 1);
+        assert_eq!(
+            e.with_event_capacity(0).unwrap_err(),
+            EscrowError::InvalidEventCapacity
+        );
+        assert_eq!(
+            e.with_event_capacity(65).unwrap_err(),
+            EscrowError::InvalidEventCapacity
+        );
+        assert_eq!(
+            e.with_event_capacity(u8::MAX).unwrap_err(),
+            EscrowError::InvalidEventCapacity
+        );
+        // Past Uninitialized the builder is closed, like every other
+        // with_* builder.
+        let mut funded = e;
+        funded.fund(ALICE).unwrap();
+        assert_eq!(
+            funded.with_event_capacity(8).unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+    }
+
+    #[test]
+    fn invalid_event_capacity_trigger() {
+        let err = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_event_capacity(0)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEventCapacity);
+        assert_eq!(err.code(), 132);
+    }
+
+    #[test]
+    fn event_total_saturates_instead_of_wrapping() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.event_total = u64::MAX - 1;
+        e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
+        e.record_history(EscrowEventKind::Released, T0 + 1, Some(ALICE));
+        assert_eq!(e.event_total(), u64::MAX, "saturates, never wraps");
+    }
+
+    #[test]
+    fn kind_discriminants_are_pinned_to_declaration_order() {
+        // `record_history` persists `kind as u8`; the decoder maps it
+        // back — a reordered enum must fail here, not silently
+        // mis-decode.
+        assert_eq!(EscrowEventKind::Initialized.discriminant(), 0);
+        assert_eq!(EscrowEventKind::Funded.discriminant(), 2);
+        assert_eq!(EscrowEventKind::Released.discriminant(), 3);
+        assert_eq!(EscrowEventKind::VaultClosed.discriminant(), 16);
+        assert_eq!(EscrowEventKind::ReentryRejected.discriminant(), 17);
+        assert_eq!(EscrowEventKind::ExpiredCranked.discriminant(), 21);
+        assert_eq!(
+            EscrowEventKind::SubscriptionPeriodReleased.discriminant(),
+            25
+        );
+        for d in 0..=25u8 {
+            assert!(
+                EscrowEventKind::from_discriminant(d).is_some(),
+                "discriminant {d}"
+            );
+            assert_eq!(
+                EscrowEventKind::from_discriminant(d).unwrap().discriminant(),
+                d,
+                "round trip for discriminant {d}"
+            );
+        }
+        assert_eq!(EscrowEventKind::from_discriminant(26), None);
+        assert_eq!(EscrowEventKind::from_discriminant(255), None);
+    }
+
+    // ----- layout pins -----
+
+    #[test]
+    fn slot_and_region_lengths_pin_layout_math() {
+        assert_eq!(EVENT_HISTORY_SLOT_LEN, 18);
+        assert_eq!(MAX_EVENT_HISTORY, 64);
+        assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
+        assert_eq!(EVENT_HISTORY_LEN, 1163);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN);
+        assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 531 + EVENT_HISTORY_LEN);
+    }
+
+    #[test]
+    fn borsh_tail_pins_event_history_region() {
+        // Offsets: `subscription_released` ends the AV-56 body at 1013;
+        // `event_head` at 1013, `event_total` at 1014, `event_count` at
+        // 1022, `event_capacity` at 1023, `event_slots` at 1024 (body
+        // total 2176).
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
+        e.record_history(EscrowEventKind::Released, T0 + 9, None);
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes.len(), 2176);
+        assert_eq!(bytes[1013], 0, "event_head: still filling");
+        assert_eq!(
+            u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
+            2,
+            "event_total"
+        );
+        assert_eq!(bytes[1022], 2, "event_count");
+        assert_eq!(bytes[1023], 64, "event_capacity: default");
+        // Slot 0: Funded / T0 / actor tag 1 + ALICE summary.
+        let s0 = &bytes[1024..1042];
+        assert_eq!(s0[0], EscrowEventKind::Funded.discriminant(), "slot kind");
+        assert_eq!(
+            u64::from_le_bytes(s0[1..9].try_into().unwrap()),
+            T0,
+            "slot at"
+        );
+        assert_eq!(s0[9], 1, "slot actor tag: present");
+        assert_eq!(&s0[10..18], &actor_summary(ALICE), "slot actor summary");
+        // Slot 1: Released / T0+9 / no actor.
+        let s1 = &bytes[1042..1060];
+        assert_eq!(s1[0], EscrowEventKind::Released.discriminant());
+        assert_eq!(u64::from_le_bytes(s1[1..9].try_into().unwrap()), T0 + 9);
+        assert_eq!(s1[9], 0, "slot actor tag: absent");
+        assert_eq!(&s1[10..18], &[0u8; 8], "slot actor zeroed");
+        // Slots past the valid window stay zeroed; the tail byte is the
+        // last slot's last byte.
+        assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
+        assert_eq!(bytes.len(), 1024 + 64 * 18);
+    }
+
+    #[test]
+    fn rent_recomputed_from_mainnet_formula() {
+        // AV-57 grows the account by 1163 bytes on top of the AV-56
+        // layout; the rent-exempt minimums are recomputed from the
+        // mainnet formula, not copied from the AV-56 numbers.
+        let full = rent_exempt_minimum_lamports(
+            VAULT_SPACE,
+            MAINNET_LAMPORTS_PER_BYTE_YEAR,
+            MAINNET_EXEMPTION_THRESHOLD_YEARS,
+        );
+        // (128 + 2184) * 3480 * 2 = 2312 * 6960 = 16_091_520 lamports.
+        assert_eq!(VAULT_SPACE, 2184);
+        assert_eq!(full, 16_091_520);
+        assert_eq!(full, vault_close_rent_reclaimed());
+        let no_quorum = rent_exempt_minimum_lamports(
+            VAULT_SPACE_NO_QUORUM,
+            MAINNET_LAMPORTS_PER_BYTE_YEAR,
+            MAINNET_EXEMPTION_THRESHOLD_YEARS,
+        );
+        // (128 + 1694) * 3480 * 2 = 1822 * 6960 = 12_681_120 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1694);
+        assert_eq!(no_quorum, 12_681_120);
+    }
+
+    // ----- decode -----
+
+    #[test]
+    fn decode_round_trips_event_history() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_event_capacity(4)
+            .unwrap();
+        for i in 0..6u64 {
+            e.record_history(EscrowEventKind::Funded, T0 + i, Some(ALICE));
+        }
+        let d = decode_vault_account(&account_bytes(&e)).expect("decodes");
+        assert_eq!(d, e);
+        assert_eq!(d.event_capacity(), 4);
+        assert_eq!(d.event_count(), 4);
+        assert_eq!(d.event_total(), 6);
+        let h = d.event_history();
+        assert_eq!(h.len(), 4);
+        assert_eq!(h[0].at, T0 + 2);
+        assert_eq!(h[3].at, T0 + 5);
+        assert_eq!(h[0].actor, Some(actor_summary(ALICE)));
+    }
+
+    #[test]
+    fn decode_rejects_unknown_event_kind_discriminant() {
+        use crate::discriminator::AccountDecodeError;
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        // First slot's kind byte sits at body offset 1024.
+        let kind_off = ANCHOR_DISCRIMINATOR_LEN + 1024;
+        for bad in [26u8, 42, 255] {
+            let mut full = account_bytes(&e);
+            full[kind_off] = bad;
+            assert_eq!(
+                decode_vault_account(&full),
+                Err(AccountDecodeError::InvalidEventKindDiscriminant(bad)),
+                "kind byte {bad}"
+            );
+        }
     }
 }

@@ -53,6 +53,10 @@ enum ArrayElem {
     U8,
     U64,
     PublicKey,
+    /// A named account subtype used as the array element (AV-57: the
+    /// event-history slot). Renders as `{"defined": "<name>"}` — the
+    /// Anchor IDL spelling for an array of structs.
+    Defined(&'static str),
 }
 
 impl ArrayElem {
@@ -61,15 +65,26 @@ impl ArrayElem {
             ArrayElem::U8 => 1,
             ArrayElem::U64 => 8,
             ArrayElem::PublicKey => 32,
+            ArrayElem::Defined(name) => {
+                named_type_fields(name).iter().map(|(_, t)| t.borsh_len()).sum()
+            }
         }
     }
 
     fn render(self, w: &mut Writer) {
-        w.str_lit(match self {
-            ArrayElem::U8 => "u8",
-            ArrayElem::U64 => "u64",
-            ArrayElem::PublicKey => "publicKey",
-        });
+        match self {
+            ArrayElem::U8 => w.str_lit("u8"),
+            ArrayElem::U64 => w.str_lit("u64"),
+            ArrayElem::PublicKey => w.str_lit("publicKey"),
+            // A named account subtype as the array element renders as
+            // an object, not a string literal (the Anchor IDL spelling
+            // for an array of structs).
+            ArrayElem::Defined(name) => {
+                w.buf.push_str("{\"defined\": ");
+                w.str_lit(name);
+                w.buf.push('}');
+            }
+        }
     }
 }
 
@@ -164,6 +179,8 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "Option<DefaultJudgment>" => IdlType::Option(Box::new(IdlType::Named("DefaultJudgment"))),
         // AV-56: periodic subscription release schedule.
         "Option<SubscriptionSchedule>" => IdlType::Option(Box::new(IdlType::Named("SubscriptionSchedule"))),
+        // AV-57: the 64 fixed event-history slots.
+        "[EventHistorySlot; 64]" => IdlType::Array(ArrayElem::Defined("EventHistorySlot"), 64),
         other => panic!("idl_json: unmapped VAULT_FIELDS type string: {other}"),
     }
 }
@@ -187,12 +204,17 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
 /// Fields of the named account subtypes, in Borsh order. Mirrors the
 /// Rust structs field-for-field; `named_type_sizes_pin_constants` and
 /// the byte-level offset test below nail any drift.
-fn named_type_fields(name: &str) -> &'static [(&'static str, IdlType)] {
+///
+/// Returns an owned `Vec` (not `&'static`) because some field types —
+/// e.g. AV-57's `Option<[u8; 8]>` actor — need a heap-allocated
+/// `Box`, which cannot appear in a constant. This is test-only
+/// pipeline code; the allocation is irrelevant.
+fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
     match name {
         // QuorumPolicy { attestors: [[u8; 32]; 8], weights: [u64; 8],
         //                registered: u8, threshold: u64, approvals: u64 }
         // (AV-45 weighted).
-        "QuorumPolicy" => &[
+        "QuorumPolicy" => vec![
             ("attestors", IdlType::Array(ArrayElem::PublicKey, 8)),
             ("weights", IdlType::Array(ArrayElem::U64, 8)),
             ("registered", IdlType::U8),
@@ -201,34 +223,46 @@ fn named_type_fields(name: &str) -> &'static [(&'static str, IdlType)] {
         ],
         // VestingSchedule { start: u64, end: u64, cliff_at: u64 }
         // (AV-51: the cliff timestamp before which zero unlocks).
-        "VestingSchedule" => &[
+        "VestingSchedule" => vec![
             ("start", IdlType::U64),
             ("end", IdlType::U64),
             ("cliff_at", IdlType::U64),
         ],
         // MilestonePlan { amounts: [u64; 8], count: u8 }.
-        "MilestonePlan" => &[
+        "MilestonePlan" => vec![
             ("amounts", IdlType::Array(ArrayElem::U64, 8)),
             ("count", IdlType::U8),
         ],
         // PayoutAllowlist { addrs: [[u8; 32]; 4], len: u8 } (AV-49).
         // The 4 payout keys serialize as 4 consecutive 32-byte pubkeys.
-        "PayoutAllowlist" => &[
+        "PayoutAllowlist" => vec![
             ("addrs", IdlType::Array(ArrayElem::PublicKey, 4)),
             ("len", IdlType::U8),
         ],
         // DefaultJudgment { deadline_secs: u64, default_taker_amount: u64 }
         // (AV-55: 16 bytes).
-        "DefaultJudgment" => &[
+        "DefaultJudgment" => vec![
             ("deadline_secs", IdlType::U64),
             ("default_taker_amount", IdlType::U64),
         ],
         // SubscriptionSchedule { period_secs: u64, periods: u8,
         // per_period: u64 } (AV-56: 17 bytes).
-        "SubscriptionSchedule" => &[
+        "SubscriptionSchedule" => vec![
             ("period_secs", IdlType::U64),
             ("periods", IdlType::U8),
             ("per_period", IdlType::U64),
+        ],
+        // EventHistorySlot { kind: u8, at: u64, actor: Option<[u8; 8]> }
+        // (AV-57: 18 bytes — the actor is the first 8 bytes of the
+        // transition actor's pubkey, `None` when the event carries no
+        // single actor; Borsh `Option<[u8; 8]>` is tag + 8 bytes).
+        "EventHistorySlot" => vec![
+            ("kind", IdlType::U8),
+            ("at", IdlType::U64),
+            (
+                "actor",
+                IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 8))),
+            ),
         ],
         other => panic!("idl_json: unknown named type: {other}"),
     }
@@ -442,6 +476,7 @@ fn render_idl_json() -> String {
         "PayoutAllowlist",
         "DefaultJudgment",
         "SubscriptionSchedule",
+        "EventHistorySlot",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -599,6 +634,10 @@ fn named_type_sizes_pin_constants() {
     // AV-56: period length + period count + per-period amount.
     assert_eq!(size("SubscriptionSchedule"), SUBSCRIPTION_SCHEDULE_LEN);
     assert_eq!(size("SubscriptionSchedule"), 17);
+    // AV-57: kind discriminant + timestamp + actor option tag +
+    // 8-byte actor summary.
+    assert_eq!(size("EventHistorySlot"), EVENT_HISTORY_SLOT_LEN);
+    assert_eq!(size("EventHistorySlot"), 18);
 }
 
 #[test]
@@ -666,7 +705,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 32, "error variant count drift");
+    assert_eq!(errors.len(), 33, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -680,6 +719,7 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::DefaultJudgmentNotDue.code(), 129);
     assert_eq!(EscrowError::InvalidSubscription.code(), 130);
     assert_eq!(EscrowError::PeriodNotDue.code(), 131);
+    assert_eq!(EscrowError::InvalidEventCapacity.code(), 132);
 }
 
 #[test]

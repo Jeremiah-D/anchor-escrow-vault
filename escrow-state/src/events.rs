@@ -249,6 +249,83 @@ pub enum EscrowEventKind {
     SubscriptionPeriodReleased,
 }
 
+impl EscrowEventKind {
+    /// Discriminant by declaration order (Borsh unit-enum convention):
+    /// what the AV-57 event-history ring persists per slot. Pinned by
+    /// test — never reorder the variants.
+    pub(crate) fn discriminant(self) -> u8 {
+        self as u8
+    }
+
+    /// Inverse of [`Self::discriminant`]: `None` for an unknown byte.
+    /// The panic-free account decoder (AV-32) maps `None` to
+    /// [`AccountDecodeError::InvalidEventKindDiscriminant`](crate::AccountDecodeError::InvalidEventKindDiscriminant).
+    pub(crate) fn from_discriminant(d: u8) -> Option<Self> {
+        Some(match d {
+            0 => Self::Initialized,
+            1 => Self::Activated,
+            2 => Self::Funded,
+            3 => Self::Released,
+            4 => Self::Cancelled,
+            5 => Self::ExpiredCancelled,
+            6 => Self::Attested,
+            7 => Self::Claimed,
+            8 => Self::Escalated,
+            9 => Self::Resolved,
+            10 => Self::MilestoneConfirmed,
+            11 => Self::MilestoneReleased,
+            12 => Self::MilestoneSkipped,
+            13 => Self::QuorumUpdated,
+            14 => Self::AttestorsUpdated,
+            15 => Self::EmergencyUnlock,
+            16 => Self::VaultClosed,
+            17 => Self::ReentryRejected,
+            18 => Self::Paused,
+            19 => Self::Unpaused,
+            20 => Self::PauseAuthorityRotated,
+            21 => Self::ExpiredCranked,
+            22 => Self::PayoutAllowlistUpdated,
+            23 => Self::TakerRotated,
+            24 => Self::DefaultJudgment,
+            25 => Self::SubscriptionPeriodReleased,
+            _ => return None,
+        })
+    }
+
+    /// Canonical snake_case name, for the AV-26 snapshot JSON export
+    /// and indexer tooling. Mirrors the variant name 1:1.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Initialized => "initialized",
+            Self::Activated => "activated",
+            Self::Funded => "funded",
+            Self::Released => "released",
+            Self::Cancelled => "cancelled",
+            Self::ExpiredCancelled => "expired_cancelled",
+            Self::Attested => "attested",
+            Self::Claimed => "claimed",
+            Self::Escalated => "escalated",
+            Self::Resolved => "resolved",
+            Self::MilestoneConfirmed => "milestone_confirmed",
+            Self::MilestoneReleased => "milestone_released",
+            Self::MilestoneSkipped => "milestone_skipped",
+            Self::QuorumUpdated => "quorum_updated",
+            Self::AttestorsUpdated => "attestors_updated",
+            Self::EmergencyUnlock => "emergency_unlock",
+            Self::VaultClosed => "vault_closed",
+            Self::ReentryRejected => "reentry_rejected",
+            Self::Paused => "paused",
+            Self::Unpaused => "unpaused",
+            Self::PauseAuthorityRotated => "pause_authority_rotated",
+            Self::ExpiredCranked => "expired_cranked",
+            Self::PayoutAllowlistUpdated => "payout_allowlist_updated",
+            Self::TakerRotated => "taker_rotated",
+            Self::DefaultJudgment => "default_judgment",
+            Self::SubscriptionPeriodReleased => "subscription_period_released",
+        }
+    }
+}
+
 /// Fund movements carried by an [`EscrowEvent`].
 ///
 /// A single shape for every kind (see the module docs for the per-kind
@@ -481,6 +558,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(initializer),
         );
         Ok(indexed)
     }
@@ -489,6 +567,13 @@ impl IndexedEscrow {
     /// `caller` (AV-48) is `Some` only for the permissionless crank
     /// ([`EscrowEventKind::ExpiredCranked`]) — every other kind passes
     /// `None`, since the event log never invents a caller.
+    ///
+    /// `actor` (AV-57) is the transition's single actor when there is
+    /// one — the key the wrapper's method took as its authority — and
+    /// feeds the on-chain event-history ring
+    /// ([`Escrow::record_history`](crate::Escrow::record_history)):
+    /// dual-signed governance transitions and reentrancy rejections
+    /// pass `None` (the actor is the signature pair, or unknown).
     fn push_event(
         &mut self,
         kind: EscrowEventKind,
@@ -500,6 +585,7 @@ impl IndexedEscrow {
         rationale_hash: Option<[u8; 32]>,
         cpi: Option<CpiRouteAudit>,
         caller: Option<[u8; 32]>,
+        actor: Option<[u8; 32]>,
     ) {
         let event = EscrowEvent {
             kind,
@@ -520,6 +606,11 @@ impl IndexedEscrow {
         };
         self.next_seq += 1;
         self.events.push(event);
+        // AV-57: the on-chain ring records the same transition — one
+        // record per successful transition, none for failed ones (the
+        // AV-36 `ReentryRejected` exception aside, which records with
+        // no actor).
+        self.inner.record_history(kind, at, actor);
     }
 
     /// AV-36: map a fund-moving transition's result, emitting
@@ -550,6 +641,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            None,
         );
                 Err(EscrowError::ReentrantCall)
             }
@@ -576,6 +668,15 @@ impl IndexedEscrow {
     /// Number of recorded (not yet drained) events.
     pub fn event_count(&self) -> usize {
         self.events.len()
+    }
+
+    /// The retained on-chain event history (AV-57), oldest first —
+    /// the same ring [`Escrow::event_history`](crate::Escrow::event_history)
+    /// reads from the vault account. Every event this wrapper emitted
+    /// also landed in the ring (see `push_event`), so the two views
+    /// agree by construction.
+    pub fn event_history(&self) -> Vec<crate::EventHistoryEntry> {
+        self.inner.event_history()
     }
 
     /// The sequence number the next event will carry.
@@ -726,6 +827,15 @@ impl IndexedEscrow {
         self
     }
 
+    /// Configure the event-history ring capacity (AV-57; mirrors
+    /// [`Escrow::with_event_capacity`]). `Uninitialized` only, like
+    /// every other `with_*` builder. Configuration: emits no event —
+    /// the ring only starts recording at the `Initialized` event.
+    pub fn with_event_capacity(mut self, capacity: u8) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_event_capacity(capacity)?;
+        Ok(self)
+    }
+
     // ----- transitions: exactly one event per successful transition -----
 
     /// Record one party's activation signature (mirrors
@@ -747,6 +857,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         }
         Ok(())
@@ -772,6 +883,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         Ok(())
     }
@@ -809,6 +921,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         Ok((payout, fee))
     }
@@ -862,6 +975,7 @@ impl IndexedEscrow {
                 accounts_hash: receipt.accounts_hash,
             }),
             None,
+            Some(authority),
         );
         Ok((payout, fee, receipt))
     }
@@ -894,6 +1008,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         Ok(())
     }
@@ -928,6 +1043,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         Ok((refund, penalty))
     }
@@ -959,6 +1075,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(caller),
             Some(caller),
         );
         Ok((refund, penalty))
@@ -997,6 +1114,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(attestor),
         );
         }
         Ok(())
@@ -1030,6 +1148,7 @@ impl IndexedEscrow {
             state,
             EventAmounts::none(),
             at,
+            None,
             None,
             None,
             None,
@@ -1096,6 +1215,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            None,
         );
         }
         Ok(())
@@ -1126,6 +1246,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            None,
         );
         Ok(())
     }
@@ -1147,6 +1268,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         Ok(())
     }
@@ -1166,6 +1288,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         Ok(())
     }
@@ -1198,6 +1321,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         }
         Ok(())
@@ -1228,6 +1352,7 @@ impl IndexedEscrow {
             state,
             EventAmounts::none(),
             at,
+            None,
             None,
             None,
             None,
@@ -1267,6 +1392,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            None,
         );
         }
         Ok(())
@@ -1300,6 +1426,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         Ok((payout, fee))
     }
@@ -1325,6 +1452,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         Ok(())
     }
@@ -1379,6 +1507,7 @@ impl IndexedEscrow {
             rationale_hash,
             None,
             None,
+            Some(authority),
         );
         Ok((payout, fee, refund))
     }
@@ -1432,6 +1561,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(caller),
         );
         Ok((payout, fee, refund))
     }
@@ -1462,6 +1592,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         }
         Ok(())
@@ -1500,6 +1631,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         Ok((payout, fee))
     }
@@ -1538,6 +1670,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         Ok((payout, fee))
     }
@@ -1577,6 +1710,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         }
         Ok(())
@@ -1611,6 +1745,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         Ok(rent)
     }
@@ -1656,6 +1791,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         self.push_event(
             EscrowEventKind::VaultClosed,
@@ -1667,6 +1803,7 @@ impl IndexedEscrow {
             None,
             None,
             None,
+            Some(authority),
         );
         Ok((payout, fee, rent))
     }
@@ -2896,5 +3033,121 @@ mod event_tests {
             Err(EscrowError::RefundAddressMismatch)
         );
         assert_eq!(e.event_count(), events_before);
+    }
+
+    // ----- AV-57: the on-chain event-history ring -----
+
+    #[test]
+    fn indexed_transitions_append_to_the_ring_with_actor_summaries() {
+        // Every successful transition the wrapper emits also lands in
+        // the on-chain ring — kind, timestamp, and the actor's 8-byte
+        // summary — in the same order as the off-chain event log.
+        let mut e = indexed(1_000_000);
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.release(ALICE, 400_000, None, BOB, T0 + 2).unwrap();
+        let h = e.event_history();
+        assert_eq!(h.len(), 3);
+        assert_eq!(
+            h.iter().map(|r| r.kind).collect::<Vec<_>>(),
+            vec![
+                EscrowEventKind::Initialized,
+                EscrowEventKind::Funded,
+                EscrowEventKind::Released,
+            ]
+        );
+        assert_eq!(h[0].at, T0);
+        assert_eq!(h[1].at, T0 + 1);
+        assert_eq!(h[2].at, T0 + 2);
+        // Actor summaries are the first 8 bytes of the acting key.
+        assert_eq!(h[0].actor, Some([0xAA; 8]));
+        assert_eq!(h[1].actor, Some([0xAA; 8]));
+        assert_eq!(h[2].actor, Some([0xAA; 8]));
+        assert_eq!(e.inner().event_total(), 3);
+        assert_eq!(e.inner().event_count(), 3);
+        // The ring agrees with the off-chain event log, entry by entry.
+        let kinds: Vec<EscrowEventKind> = e.events().iter().map(|ev| ev.kind).collect();
+        assert_eq!(kinds, h.iter().map(|r| r.kind).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn crank_expired_records_the_crank_caller_as_actor() {
+        // AV-48: the permissionless crank is the one transition whose
+        // actor is neither party — the ring keeps the caller's
+        // summary, like the event's `caller` field keeps the key.
+        let mut e = funded(1_000_000);
+        e.crank_expired(MALLORY, EXPIRES_AT + 1, None).unwrap();
+        let h = e.event_history();
+        assert_eq!(h.len(), 3);
+        assert_eq!(h[2].kind, EscrowEventKind::ExpiredCranked);
+        assert_eq!(h[2].actor, Some([0xCC; 8]));
+    }
+
+    #[test]
+    fn dual_signed_governance_records_no_single_actor() {
+        // Dual-signed governance has no single actor — the ring
+        // records `None` rather than misattributing the transition to
+        // one of the two signers.
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
+        let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.update_quorum(ALICE, BOB, 1, T0 + 2).unwrap();
+        let h = e.event_history();
+        assert_eq!(h.len(), 3);
+        assert_eq!(h[2].kind, EscrowEventKind::QuorumUpdated);
+        assert_eq!(h[2].actor, None);
+    }
+
+    #[test]
+    fn failed_indexed_transitions_append_nothing_to_the_ring() {
+        // The "failed calls emit nothing" rule covers the ring too
+        // (the AV-36 `ReentryRejected` exception aside).
+        let mut e = funded(1_000_000);
+        let total_before = e.inner().event_total();
+        let count_before = e.inner().event_count();
+        assert_eq!(e.fund(MALLORY, T0 + 5), Err(EscrowError::Unauthorized));
+        assert_eq!(
+            e.release(MALLORY, 100, None, BOB, T0 + 6),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.inner().event_total(), total_before);
+        assert_eq!(e.inner().event_count(), count_before);
+    }
+
+    #[test]
+    fn indexed_ring_wraps_at_configured_capacity() {
+        // The wrapper-level ring honors `with_event_capacity`: the
+        // off-chain log keeps every event, the on-chain ring keeps the
+        // most recent N — `total` still counts them all.
+        let mut e = indexed(1_000_000).with_event_capacity(3).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.release(ALICE, 400_000, None, BOB, T0 + 2).unwrap();
+        e.release(ALICE, 600_000, None, BOB, T0 + 3).unwrap();
+        assert_eq!(e.event_count(), 4, "off-chain log keeps everything");
+        let h = e.event_history();
+        assert_eq!(h.len(), 3, "on-chain ring keeps the last 3");
+        assert_eq!(e.inner().event_total(), 4);
+        assert_eq!(
+            h.iter().map(|r| r.kind).collect::<Vec<_>>(),
+            vec![
+                EscrowEventKind::Funded,
+                EscrowEventKind::Released,
+                EscrowEventKind::Released,
+            ],
+            "the oldest (Initialized) aged out first"
+        );
+    }
+
+    #[test]
+    fn with_event_capacity_builder_is_configuration() {
+        // Like every other with_* builder: Uninitialized-only, emits
+        // no event, and the ring only starts recording at the
+        // Initialized event.
+        let e = indexed(1_000_000).with_event_capacity(8).unwrap();
+        assert_eq!(e.inner().event_capacity(), 8);
+        assert_eq!(e.event_count(), 1, "only the Initialized event");
+        assert_eq!(
+            indexed(1_000_000).with_event_capacity(0).unwrap_err(),
+            EscrowError::InvalidEventCapacity
+        );
     }
 }

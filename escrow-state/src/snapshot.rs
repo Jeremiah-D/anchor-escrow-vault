@@ -38,13 +38,25 @@
 //! The snapshot is a pure read: it borrows the escrow, emits no events,
 //! and advances no state — a dry run by construction.
 
-use crate::{format_amount, Escrow, EscrowState};
+use crate::{format_amount, Escrow, EscrowState, EventHistoryEntry};
 
 /// Render 32 bytes as 64 lowercase hex characters (same convention as
 /// [`crate::keeper`]'s serializer).
 fn hex32(bytes: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+/// Render 8 bytes as 16 lowercase hex characters — the actor summary
+/// in an AV-57 event-history entry.
+fn hex8(bytes: &[u8; 8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(16);
     for b in bytes {
         s.push(HEX[(b >> 4) as usize] as char);
         s.push(HEX[(b & 0x0f) as usize] as char);
@@ -232,6 +244,18 @@ pub struct EscrowSnapshot {
     /// when no reference was attached (AV-53). Read-only pass-through
     /// for off-chain reconciliation — never read by a check gate.
     pub reference: Option<[u8; 32]>,
+    /// The retained on-chain event history (AV-57), oldest first: the
+    /// valid ring window ([`Escrow::event_history`]) — kind, timestamp
+    /// and actor summary per entry. Empty for an escrow whose
+    /// transitions never went through the event-logging adapter.
+    pub event_history: Vec<EventHistoryEntry>,
+    /// The ring's configured capacity at snapshot time (AV-57):
+    /// 1..=64, 64 by default.
+    pub event_capacity: u8,
+    /// The monotonic total of events ever recorded at snapshot time
+    /// (AV-57): `total - event_history.len()` entries aged out of the
+    /// retained window.
+    pub event_total: u64,
 }
 
 impl Escrow {
@@ -319,6 +343,12 @@ impl Escrow {
             // AV-53: the off-chain reference memo rides the export for
             // reconciliation — read-only, never a gate input.
             reference: self.reference(),
+            // AV-57: the retained event history rides the export, so
+            // an off-chain indexer can read the full event window
+            // from one snapshot.
+            event_history: self.event_history(),
+            event_capacity: self.event_capacity(),
+            event_total: self.event_total(),
             penalty_bps: self.penalty_bps(),
             unlock_at: self.unlock_at(),
             unlock_eligible: self.is_unlock_eligible(now),
@@ -532,6 +562,37 @@ impl EscrowSnapshot {
         // or `null` — for off-chain reconciliation.
         s.push_str(",\"reference\":");
         write_opt_hex(&mut s, self.reference);
+        // AV-57: the retained event history — the ring's configured
+        // capacity, the monotonic total, the valid-entry count, and
+        // the entries oldest-first (kind name, timestamp, actor
+        // summary as 16-char hex or `null`).
+        s.push_str(",\"event_history\":{\"capacity\":");
+        s.push_str(&self.event_capacity.to_string());
+        s.push_str(",\"total\":");
+        s.push_str(&self.event_total.to_string());
+        s.push_str(",\"count\":");
+        s.push_str(&self.event_history.len().to_string());
+        s.push_str(",\"entries\":[");
+        for (i, entry) in self.event_history.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"kind\":\"");
+            s.push_str(entry.kind.name());
+            s.push_str("\",\"at\":");
+            s.push_str(&entry.at.to_string());
+            s.push_str(",\"actor\":");
+            match entry.actor {
+                Some(summary) => {
+                    s.push('"');
+                    s.push_str(&hex8(&summary));
+                    s.push('"');
+                }
+                None => s.push_str("null"),
+            }
+            s.push('}');
+        }
+        s.push_str("]}");
         s.push('}');
         s
     }
@@ -586,7 +647,8 @@ mod snapshot_tests {
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
              \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"payout_allowlist\":null,\
-             \"reference\":null\
+             \"reference\":null,\
+             \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}}\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),
@@ -945,5 +1007,47 @@ mod snapshot_tests {
         let json = snap.to_json();
         assert!(json.contains("\"display_amount\":\"1000000\""), "got: {json}");
         assert!(!json.contains("\"display_amount\":\"1."), "no decimal point without metadata");
+    }
+
+    #[test]
+    fn snapshot_exports_the_retained_event_history() {
+        // AV-57: the snapshot carries the ring's configured capacity,
+        // the monotonic total, and the retained entries oldest-first —
+        // one read gives an indexer the whole event window.
+        use crate::{EscrowEventKind, IndexedEscrow};
+        let mut indexed =
+            IndexedEscrow::initialize(ALICE, BOB, AMOUNT, NEVER, [0x1D; 32], MID).unwrap();
+        indexed.fund(ALICE, MID + 1).unwrap();
+        let e = *indexed.inner();
+        let snap = e.snapshot(MID);
+        assert_eq!(snap.event_capacity, 64);
+        assert_eq!(snap.event_total, 2);
+        assert_eq!(snap.event_history.len(), 2);
+        assert_eq!(snap.event_history[0].kind, EscrowEventKind::Initialized);
+        assert_eq!(snap.event_history[0].at, MID);
+        assert_eq!(snap.event_history[0].actor, Some([0xAA; 8]));
+        assert_eq!(snap.event_history[1].kind, EscrowEventKind::Funded);
+        assert_eq!(snap.event_history[1].at, MID + 1);
+        let json = snap.to_json();
+        assert!(
+            json.contains("\"event_history\":{\"capacity\":64,\"total\":2,\"count\":2,\"entries\":[{\"kind\":\"initialized\",\"at\":1750000000,\"actor\":\"aaaaaaaaaaaaaaaa\"},{\"kind\":\"funded\",\"at\":1750000001,\"actor\":\"aaaaaaaaaaaaaaaa\"}]}"),
+            "event history must serialize, got: {json}"
+        );
+    }
+
+    #[test]
+    fn snapshot_exports_empty_event_history_for_raw_escrows() {
+        // A raw `Escrow` (transitions outside the IndexedEscrow
+        // adapter) retains nothing: the export is honest about the
+        // empty ring rather than omitting the field.
+        let snap = funded(AMOUNT, NEVER).snapshot(MID);
+        assert!(snap.event_history.is_empty());
+        assert_eq!(snap.event_capacity, 64);
+        assert_eq!(snap.event_total, 0);
+        let json = snap.to_json();
+        assert!(
+            json.contains("\"event_history\":{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}"),
+            "empty history must serialize, got: {json}"
+        );
     }
 }

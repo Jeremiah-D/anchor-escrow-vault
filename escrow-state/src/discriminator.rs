@@ -36,10 +36,11 @@
 //! the result.
 
 use super::{
-    sha256, DefaultJudgment, Escrow, EscrowState, MilestonePlan, PayoutAllowlist, QuorumPolicy,
-    SubscriptionSchedule, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN, DEFAULT_JUDGMENT_LEN,
-    ESCROW_BODY_LEN, MAX_ATTESTORS, MAX_MILESTONES, MAX_PAYOUT_ALLOWLIST, MILESTONE_PLAN_LEN,
-    PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
+    sha256, DefaultJudgment, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, MilestonePlan,
+    PayoutAllowlist, QuorumPolicy, SubscriptionSchedule, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
+    DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN, MAX_ATTESTORS, MAX_EVENT_HISTORY, MAX_MILESTONES,
+    MAX_PAYOUT_ALLOWLIST, MILESTONE_PLAN_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN,
+    SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
 };
 
 /// Program-side `#[account]` type names, in Anchor IDL order. The single
@@ -101,6 +102,10 @@ pub enum AccountDecodeError {
     /// rejects it rather than decoding a value the accessors cannot
     /// safely read (AV-49; AV-32 panic-free guarantee).
     InvalidPayoutAllowlistLen(u8),
+    /// An event-history slot's kind byte is not a known
+    /// [`EscrowEventKind`] discriminant (0–25). The mapping is pinned
+    /// by test to declaration order (AV-57).
+    InvalidEventKindDiscriminant(u8),
 }
 
 /// Bounds-checked cursor over the account body. Every read is
@@ -462,6 +467,36 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // schedule is attached); appended last so every earlier offset
     // above is unchanged.
     let subscription_released = c.u64_le()?;
+    // AV-57: event-history ring buffer, always present (zeroed when no
+    // events were recorded); appended last so every earlier offset
+    // above is unchanged. The head is the write cursor (index of the
+    // oldest entry once the buffer is full), total is the monotonic
+    // event counter, count the valid entries, capacity the configured
+    // ring size; the 64 slots follow in slot order, each kind u8 + at
+    // u64 + actor tag u8 + actor summary 8 bytes.
+    let event_head = c.u8()?;
+    let event_total = c.u64_le()?;
+    let event_count = c.u8()?;
+    let event_capacity = c.u8()?;
+    let mut event_slots = [EventHistorySlot::EMPTY; MAX_EVENT_HISTORY];
+    for slot in event_slots.iter_mut() {
+        let kind_byte = c.u8()?;
+        let kind = EscrowEventKind::from_discriminant(kind_byte)
+            .ok_or(AccountDecodeError::InvalidEventKindDiscriminant(kind_byte))?;
+        let at = c.u64_le()?;
+        let actor_present = c.option_present("event_slots.actor")?;
+        let mut summary = [0u8; 8];
+        if actor_present {
+            summary.copy_from_slice(c.read(8)?);
+        } else {
+            c.skip(8)?;
+        }
+        *slot = EventHistorySlot {
+            kind: kind.discriminant(),
+            at,
+            actor: actor_present.then_some(summary),
+        };
+    }
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -519,6 +554,15 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // strictly-in-order release progress.
         subscription_next,
         subscription_released,
+        // AV-57: the event-history ring is persisted — a decoded escrow
+        // carries the same retained event window the transitions
+        // recorded (head cursor, monotonic total, valid-entry count,
+        // configured capacity, and the 64 slots).
+        event_head,
+        event_total,
+        event_count,
+        event_capacity,
+        event_slots,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

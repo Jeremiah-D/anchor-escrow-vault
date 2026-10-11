@@ -413,7 +413,7 @@ the counter from outrunning the lockup even when vesting drew first.
 New vault fields (appended last): `subscription` (18 bytes: 1-byte
 discriminant + 17-byte schedule), `subscription_next` (u8),
 `subscription_released` (u64 bitmask) — 27 bytes, so the full vault is
-now 1021 bytes / 7,997,040 lamports rent-exempt.
+now 2184 bytes / 16,091,520 lamports rent-exempt.
 
 **Reference memo (off-chain correlation).** The initializer may bind an
 opt-in 32-byte **reference memo** (`with_reference` /
@@ -548,7 +548,14 @@ needs **7,809,120 lamports**. AV-56 appends the 18-byte subscription
 schedule region (1-byte discriminant + 17-byte schedule, zeroed when no
 schedule is attached), the 1-byte next-period index, and the 8-byte
 per-period released bitmap (27 bytes), so the full vault is now **1021
-bytes** and needs **7,997,040 lamports**.)
+bytes** and needs **7,997,040 lamports**. AV-57 appends the per-escrow
+event-history ring buffer: the 1-byte ring head (write cursor), the
+8-byte monotonic event total, the 1-byte valid-entry count, the 1-byte
+configured capacity (1–64, default 64), and the 64 fixed 18-byte slots
+(kind u8 + at u64 + actor tag u8 + 8-byte actor summary) — 1163 bytes,
+always reserved at the 64-entry ceiling so a smaller capacity never
+needs a realloc — so the full vault is now **2184 bytes** and needs
+**16,091,520 lamports**.)
 
 **Fee recipient pin (AV-44).** An escrow can additionally pin *where* the
 fee goes (`initialize_fee_recipient(fee_recipient)`, opt-in on
@@ -999,6 +1006,43 @@ comes from the clock sysvar; `seq` is the vault's persisted per-escrow
 counter (the real build appends it to the `Vault` account, growing
 `VAULT_SPACE` 540 → 548).
 
+**Per-escrow event history (AV-57).** The off-chain event log is not
+the only record: every successful transition the `IndexedEscrow`
+adapter emits also lands in a fixed **ring buffer persisted in the
+vault account** — the on-chain audit trail. Each escrow retains its
+most recent N records; each record is the event `kind`, the `at`
+timestamp, and the actor's 8-byte summary (the first 8 bytes of the
+actor's pubkey — a digest, not the full address, so the account stays
+lean). `None` actors are honest omissions: dual-signed governance
+transitions record no single actor (the actor is the signature pair,
+not one key), and reentrancy rejections record none (the nested call
+fails before the authority check, so the hostile actor is unknown).
+
+- **Capacity:** N is configurable 1–64 via `with_event_capacity`
+  (`Uninitialized` only, like every other `with_*` builder; default
+  64). The account always reserves all 64 slots (18 bytes each: kind
+  u8 + at u64 + actor tag u8 + 8-byte summary), so a smaller capacity
+  never needs a realloc — entries past it stay zeroed.
+- **Wrap:** while the buffer is filling, records land in order; once
+  full, the oldest entry is overwritten and the head advances. The
+  `event_total` counter is monotonic regardless — it never decreases —
+  so `total − count` tells an indexer exactly how many records aged
+  out of the window.
+- **Reads:** `escrow.event_history()` returns the retained window
+  oldest-first; the AV-26 snapshot export carries the full window
+  (`capacity` / `total` / `count` / `entries`) so one snapshot read
+  gives an indexer everything.
+- **Emission rule:** the ring follows the same rule as the event log —
+  exactly one record per successful transition, none for failed ones
+  (the AV-36 `ReentryRejected` exception aside, which records with no
+  actor).
+
+New vault fields (appended last): `event_head` (u8), `event_total`
+(u64), `event_count` (u8), `event_capacity` (u8), `event_slots`
+(64 × 18 bytes) — 1163 bytes, so the full vault is now 2184 bytes /
+16,091,520 lamports rent-exempt (see [Account space &
+rent](#account-space--rent)).
+
 ## Keeper report (AV-20)
 
 A keeper bot watches many vaults and needs the executable call list, not
@@ -1123,7 +1167,10 @@ timelock), plus the optional `quorum`,
 hex or `null`), `reference` (AV-53; hex or `null`), `refund_to` (hex or
 `null`)
 and the effective `refund_recipient` (whitelist when configured, else the
-initializer).
+initializer) — plus the retained on-chain event history (AV-57):
+`event_history` (the valid ring window, oldest-first — `kind` /
+`at` / `actor` per entry), `event_capacity`, and the monotonic
+`event_total`.
 
 Derived at the snapshot time (`at`): `remaining` (`amount − released`:
 what `cancel` / `cancel_expired` would refund, skipped tranches included),
@@ -1157,7 +1204,8 @@ diffing numbers while operators read whole tokens.
  "arbiter":null,"mint":null,"fee_bps":0,"fees_paid":0,"display_fees_paid":"0.000000","fee_recipient":null,
  "milestones":null,"skipped":0,"display_skipped":"0.000000",
  "evidence_hash":null,"rationale_hash":null,"refund_to":null,"refund_recipient":"...",
- "penalty_bps":0,"unlock_at":0,"unlock_eligible":true,"payout_allowlist":null,"reference":null}
+ "penalty_bps":0,"unlock_at":0,"unlock_eligible":true,"payout_allowlist":null,"reference":null,
+ "event_history":{"capacity":64,"total":0,"count":0,"entries":[]}}
 ```
 
 ## Account space & rent
@@ -1205,7 +1253,12 @@ two-way consistency check against the IDL parameter table:
 | subscription | Option<SubscriptionSchedule> | 18 |
 | subscription_next | u8 | 1 |
 | subscription_released | u64 | 8 |
-| **total**     |                   | **1013** |
+| event_head | u8 | 1 |
+| event_total | u64 | 8 |
+| event_count | u8 | 1 |
+| event_capacity | u8 | 1 |
+| event_slots | [EventHistorySlot; 64] | 1152 |
+| **total**     |                   | **2176** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1256,11 +1309,19 @@ schedule, zeroed when no schedule is attached) — and the 1-byte
 next-period index (AV-56, zeroed when no schedule is attached,
 advanced strictly in order by `release_period`) — and the 8-byte
 per-period released bitmap (AV-56, zeroed when no schedule is
-attached; the `period_index` param selects which bit flips).
-`escrow-state` exposes `VAULT_SPACE` (1021) and
-`VAULT_SPACE_NO_QUORUM` (531) for the Anchor `space =` constraint, plus a
+attached; the `period_index` param selects which bit flips) — and the
+1-byte event-history ring head (AV-57, zeroed when no events were
+recorded) — and the 8-byte monotonic event total (AV-57, zeroed when
+no events were recorded, never decreases) — and the 1-byte
+valid-entry count (AV-57, zeroed when no events were recorded) — and
+the 1-byte configured ring capacity (AV-57, 64 by default) — and the
+1152-byte event slots (AV-57: 64 × 18-byte kind/at/actor entries,
+zeroed when no events were recorded; always reserved at the 64-entry
+ceiling so a smaller configured capacity never needs a realloc).
+`escrow-state` exposes `VAULT_SPACE` (2184) and
+`VAULT_SPACE_NO_QUORUM` (1694) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **7,997,040 lamports** to be
+mainnet rent parameters the full vault needs **16,091,520 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1281,14 +1342,14 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 1021 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
+  stays 2184 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
   weighted-quorum, AV-46 pause-switch, AV-49 payout-allowlist, AV-51
-  vesting-cliff, AV-53 reference-memo, AV-55 default-judgment, and
-  AV-56 subscription growth is accounted in the
+  vesting-cliff, AV-53 reference-memo, AV-55 default-judgment,
+  AV-56 subscription, and AV-57 event-history growth is accounted in the
   layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**7,997,040
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**16,091,520
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the
@@ -1306,7 +1367,7 @@ the whole instruction aborts with zero side effects (state, counters
 and the event log all roll back). The initializer signs once instead
 of twice, and the rent-exempt deposit returns together with the
 payout. The indexer sees the fixed `Released` → `VaultClosed` event
-pair; the vault layout is untouched (`VAULT_SPACE` stays 1021).
+pair; the vault layout is untouched (`VAULT_SPACE` stays 2184).
 
 ## IDL pipeline (AV-29)
 

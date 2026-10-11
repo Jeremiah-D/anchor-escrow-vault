@@ -2079,6 +2079,43 @@ pub struct Vault {
     /// Layout position matches `escrow_state::VAULT_FIELDS`
     /// (appended last, after `subscription_next`).
     pub subscription_released: u64,
+    /// AV-57: event-history ring-buffer write cursor — the index of
+    /// the oldest entry once the buffer is full (and the slot the
+    /// next record overwrites); mirrors `escrow_state`'s
+    /// `event_head`. Always present (1 byte, zeroed when no events
+    /// were recorded). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `subscription_released`).
+    pub event_head: u8,
+    /// AV-57: monotonic total of events ever recorded on this vault —
+    /// never decreases, even as the ring overwrites the oldest
+    /// entries, so an indexer can detect history loss; mirrors
+    /// `escrow_state`'s `event_total`. Always present (8 bytes,
+    /// zeroed when no events were recorded). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `event_head`).
+    pub event_total: u64,
+    /// AV-57: number of valid entries currently in the ring
+    /// (`<= event_capacity`); mirrors `escrow_state`'s
+    /// `event_count`. Always present (1 byte, zeroed when no events
+    /// were recorded). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `event_total`).
+    pub event_count: u8,
+    /// AV-57: configured ring capacity (1..=64, default 64); mirrors
+    /// `escrow_state`'s `event_capacity`. The account always reserves
+    /// all 64 slots, so a smaller capacity never needs a realloc.
+    /// Always present (1 byte). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `event_count`).
+    pub event_capacity: u8,
+    /// AV-57: the 64 fixed event-history slots in slot order; mirrors
+    /// `escrow_state`'s `event_slots`. Each slot is kind u8 + at u64 +
+    /// actor tag u8 + actor summary 8 bytes (18 bytes); slots past
+    /// the configured capacity stay zeroed. Always present (1152
+    /// bytes). Layout position matches `escrow_state::VAULT_FIELDS`
+    /// (appended last, after `event_capacity`).
+    pub event_slots: [EventHistorySlot; 64],
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -2189,6 +2226,27 @@ pub struct SubscriptionSchedule {
     /// locked amount. Mirrors
     /// `escrow_state::SubscriptionSchedule::per_period`.
     pub per_period: u64,
+}
+
+/// AV-57: skeleton mirror of `escrow_state::EventHistorySlot`: one
+/// fixed-size event-history ring slot — the event-kind discriminant
+/// (u8, `escrow_state::EscrowEventKind` declaration order), the
+/// caller-supplied Unix-seconds timestamp (u64), and the actor summary
+/// (the first 8 bytes of the transition actor's pubkey, `None` when
+/// the event carries no single actor). Serialized size is pinned by
+/// `escrow_state::EVENT_HISTORY_SLOT_LEN` (18 bytes).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct EventHistorySlot {
+    /// The transition's event-kind discriminant; mirrors
+    /// `escrow_state::EventHistorySlot::kind`.
+    pub kind: u8,
+    /// Caller-supplied Unix-seconds timestamp of the transition;
+    /// mirrors `escrow_state::EventHistorySlot::at`.
+    pub at: u64,
+    /// First 8 bytes of the actor's pubkey, or `None` when the event
+    /// carries no single actor; mirrors
+    /// `escrow_state::EventHistorySlot::actor`.
+    pub actor: Option<[u8; 8]>,
 }
 
 /// AV-18: on-chain indexer event, the `emit!` mirror of
@@ -2379,7 +2437,7 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    // Full vault space: 8-byte discriminator + 1013-byte payload = 1021
+    // Full vault space: 8-byte discriminator + 2176-byte payload = 2184
     // bytes (see `escrow_state::VAULT_SPACE`; AV-12 added the 1-byte
     // activation bitmask, AV-13 the 17-byte vesting region, AV-14 the
     // 33-byte arbiter region, AV-15 the 66-byte milestone plan + the
@@ -2396,11 +2454,14 @@ pub struct Initialize<'info> {
     // AV-55 the 8-byte dispute timestamp + the 17-byte default-judgment
     // region + the 1-byte confirmation bit, AV-56 the 18-byte
     // subscription-schedule region + the 1-byte next-period index + the
-    // 8-byte per-period released bitmap).
+    // 8-byte per-period released bitmap, AV-57 the 1-byte event ring
+    // head + the 8-byte monotonic event total + the 1-byte valid-entry
+    // count + the 1-byte configured capacity + the 1152-byte event
+    // slots).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 7_997_040 lamports.
+    // rent parameters the minimum is 16_091_520 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
