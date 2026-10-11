@@ -209,6 +209,12 @@ pub struct KeeperAction {
     /// Carried for correlation only: it is never an instruction input
     /// and never affects which actions are listed.
     pub reference: Option<[u8; 32]>,
+    /// AV-59: how many times the escrow's deadline was extended via
+    /// [`Escrow::extend_expiry`] (the monotonic `extension_count`).
+    /// Surfaced so operators can see at a glance how many times an
+    /// escrow's deadline moved — a heavily-extended escrow deserves a
+    /// second look before the keeper sweeps it.
+    pub extension_count: u64,
     /// Machine-readable reason: `"expired"`, `"vesting_unlocked"`,
     /// `"disputed"` (AV-38, `resolve` actions), or
     /// `"subscription_period_due"` (AV-56, `release_period` actions).
@@ -242,7 +248,7 @@ impl KeeperReport {
     ///    "caller_role":"initializer","mint":null,
     ///    "refund_to":"...","amount":1000000,"decimals":6,
     ///    "display_amount":"1.000000",
-    ///    "reason":"expired","reference":null}
+    ///    "reason":"expired","reference":null,"extension_count":0}
     /// ]}
     /// ```
     ///
@@ -313,6 +319,10 @@ impl KeeperReport {
                 }
                 None => s.push_str("null"),
             }
+            // AV-59: the renewal count — how many times the deadline
+            // was extended via `extend_expiry`.
+            s.push_str(",\"extension_count\":");
+            s.push_str(&a.extension_count.to_string());
             s.push_str("}");
         }
         s.push_str("]}");
@@ -366,6 +376,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         // AV-53: the off-chain correlation id rides the action so
                         // the report JSON joins it to the operator's records.
                         reference: w.reference,
+                        extension_count: e.extension_count(),
                         reason: "disputed",
                     });
                 }
@@ -406,6 +417,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 // AV-53: the off-chain correlation id rides the action so
                 // the report JSON joins it to the operator's records.
                 reference: w.reference,
+                extension_count: e.extension_count(),
                 reason: "expired",
             });
             // AV-48: the permissionless crank — the same expiry exit,
@@ -435,6 +447,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     // AV-53: the off-chain correlation id rides the action so
                     // the report JSON joins it to the operator's records.
                     reference: w.reference,
+                    extension_count: e.extension_count(),
                     reason: "expired",
                 });
             }
@@ -466,6 +479,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 // AV-53: the off-chain correlation id rides the action so
                 // the report JSON joins it to the operator's records.
                 reference: w.reference,
+                extension_count: e.extension_count(),
                 reason: "vesting_unlocked",
             });
         }
@@ -503,6 +517,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     // action so the report JSON joins it to the
                     // operator's records.
                     reference: w.reference,
+                    extension_count: e.extension_count(),
                     reason: "subscription_period_due",
                 });
             }
@@ -1111,6 +1126,7 @@ mod keeper_tests {
                 decimals: 0,
                 // No reference memo attached to the watched escrow.
                 reference: None,
+                extension_count: 0,
                 reason: "expired",
             }
         );
@@ -1127,6 +1143,7 @@ mod keeper_tests {
                 amount: AMOUNT,
                 decimals: 0,
                 reference: None,
+                extension_count: 0,
                 reason: "expired",
             }
         );
@@ -1141,7 +1158,7 @@ mod keeper_tests {
         // AV-48: the expired escrow lists both the party-signed
         // `cancel_expired` and the permissionless `crank_expired`.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null}},{{\"escrow_id\":\"{}\",\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null}}]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0}},{{\"escrow_id\":\"{}\",\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0}}]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -1164,7 +1181,7 @@ mod keeper_tests {
         let watched = [watch(ID2, e)];
         let report = scan_keeper_actions(&watched, MID);
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null}}]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0}}]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),

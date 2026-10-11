@@ -87,6 +87,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `rotate_initializer(new_initializer)`      | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the initializer) | **both** the *current* initializer and the taker must sign (dual-signature governance — the mirror of `rotate_taker`; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (arbitration in flight adjudicates the initializer's identity — the refund goes to the initializer); zero address is `InvalidInitializer`; on an actual change the initializer's activation signature bit is cleared (the new key never signed activation); the AV-23 whitelist pins the refund destination when configured, otherwise refunds resolve to the new initializer (keeper/snapshot follow automatically); emits `InitializerRotated` only on an actual change |
 | `initialize_quorum(attestors, weights, threshold)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
+| `initialize_extension(max_extension_secs)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding); zero bound is `InvalidExpiryExtension`; persists the extension budget (`max_extension_secs`, `extension_count` starts 0) |
+| `extend_expiry(new_expires_at)`             | `Uninitialized`/`Funded` | — (no state change; pushes `expires_at` back) | initializer **only** (`Unauthorized` otherwise, checked before state validity); `Activated`/`Disputed`/terminal states are `InvalidStateTransition`; new deadline must be strictly later and each increment ≤ the bound (saturating counter); extending at/past keeper-eligibility (`now >= expires_at + grace_period`) is `InvalidExpiryExtension`; emits `ExpiryExtended` (old/new deadline, count) |
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
 | `update_quorum(initializer, taker, threshold)` | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance); `0` or `> total weight` is `InvalidQuorum` |
 | `update_attestors(initializer, taker, attestors)` | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance; no party can unilaterally reshape the electorate); empty set / `> 8` / duplicates / new set smaller than the unchanged threshold is `InvalidQuorum`; approval bits remap by pubkey (retained votes survive, removed voters' bits cleared); emits `AttestorsUpdated` on a real set change, nothing on a no-op |
@@ -556,7 +558,11 @@ configured capacity (1–64, default 64), and the 64 fixed 18-byte slots
 (kind u8 + at u64 + actor tag u8 + 8-byte actor summary) — 1163 bytes,
 always reserved at the 64-entry ceiling so a smaller capacity never
 needs a realloc — so the full vault is now **2184 bytes** and needs
-**16,091,520 lamports**.)
+**16,091,520 lamports**. AV-59 appends the 8-byte extension bound
+`max_extension_secs` (zeroed when extension is not enabled) and the
+8-byte extension counter `extension_count` (zeroed when never
+extended) — 16 bytes, so the full vault is now **2200 bytes** and
+needs **16,202,880 lamports**.)
 
 **Fee recipient pin (AV-44).** An escrow can additionally pin *where* the
 fee goes (`initialize_fee_recipient(fee_recipient)`, opt-in on
@@ -666,6 +672,33 @@ activation bit untouched); an actual change emits the
 The 32-byte initializer region is rewritten in place — no layout or rent
 change.
 
+**Expiry extension (AV-59).** An escrow with a hard deadline can outlive
+its usefulness when both sides still want the deal: the initializer may
+declare, at setup, a bounded extension budget
+(`initialize_extension(max_extension_secs)`, `Uninitialized`-only — the
+bound is part of the deal's DNA, so a zero budget is
+`InvalidExpiryExtension`) and later push the deadline back
+(`extend_expiry(new_expires_at)`), one bound-check per step:
+`new_expires_at` must be strictly later than the current `expires_at`,
+and each extension's increment (`new − old`) must fit inside the
+remaining budget (`max_extension_secs`, saturating counter so a hostile
+increment never overflows). `Activated` is deliberately excluded: a
+dual-sig-activated escrow is a committed deal, and the initializer may
+not rewrite its terms alone — only `Uninitialized` (no counterparty
+committed yet) and `Funded` (no dual-sig committed) extend. The
+AV-21 grace semantics carry over unchanged: the deadline is already
+eligible for keeper cancellation once `now >= expires_at + grace_period`,
+so an extension *at or past* that point is `InvalidExpiryExtension`
+(the keeper has a live claim on the escrow) — a real-world "extend
+before the keeper cranks it" workflow. Gated by the pause (`Paused`) like
+every config transition; an actual extension emits the `ExpiryExtended`
+indexer event (`from == to ==` the current state, carrying old/new
+deadlines and the count). The keeper's `cancel_expired` listing and the
+snapshot export read the live `expires_at`, so both follow extensions
+automatically. New vault fields (appended last): `max_extension_secs`
+(u64), `extension_count` (u64) — 16 bytes, so the full vault is now
+2200 bytes / 16,202,880 lamports rent-exempt.
+
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
 
@@ -705,6 +738,7 @@ program error per variant):
 | `PeriodNotDue` | 131 | `release_period` with a `period_index` that is not the next due period (skipping ahead or replaying a released period), or with `now` before that period's back-scheduled due timestamp; periods release strictly in order, one at a time, each only once due |
 | `InvalidEventCapacity` | 132 | `with_event_capacity` with `capacity == 0` or `capacity > 64` (the event-history ring holds 1..=64 entries) |
 | `InvalidInitializer` | 133 | `rotate_initializer` with the zero address (a zero address can never be the legitimate initializer) |
+| `InvalidExpiryExtension` | 134 | `initialize_extension` with a zero bound or on a non-`Uninitialized` escrow; `extend_expiry` with a deadline that is not later than the current one, whose increment exceeds the remaining budget, on an `Activated`/`Disputed`/terminal escrow, or when the deadline is already keeper-eligible (`now >= expires_at + grace_period`) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1291,7 +1325,9 @@ two-way consistency check against the IDL parameter table:
 | event_count | u8 | 1 |
 | event_capacity | u8 | 1 |
 | event_slots | [EventHistorySlot; 64] | 1152 |
-| **total**     |                   | **2176** |
+| max_extension_secs | u64 | 8 |
+| extension_count | u64 | 8 |
+| **total**     |                   | **2192** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1351,10 +1387,10 @@ the 1-byte configured ring capacity (AV-57, 64 by default) — and the
 1152-byte event slots (AV-57: 64 × 18-byte kind/at/actor entries,
 zeroed when no events were recorded; always reserved at the 64-entry
 ceiling so a smaller configured capacity never needs a realloc).
-`escrow-state` exposes `VAULT_SPACE` (2184) and
-`VAULT_SPACE_NO_QUORUM` (1694) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (2200) and
+`VAULT_SPACE_NO_QUORUM` (1710) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **16,091,520 lamports** to be
+mainnet rent parameters the full vault needs **16,202,880 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1375,14 +1411,15 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 2184 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
+  stays 2200 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
   weighted-quorum, AV-46 pause-switch, AV-49 payout-allowlist, AV-51
   vesting-cliff, AV-53 reference-memo, AV-55 default-judgment,
-  AV-56 subscription, and AV-57 event-history growth is accounted in the
+  AV-56 subscription, AV-57 event-history, and AV-59 extension growth
+  is accounted in the
   layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**16,091,520
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**16,202,880
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the
@@ -1400,7 +1437,7 @@ the whole instruction aborts with zero side effects (state, counters
 and the event log all roll back). The initializer signs once instead
 of twice, and the rent-exempt deposit returns together with the
 payout. The indexer sees the fixed `Released` → `VaultClosed` event
-pair; the vault layout is untouched (`VAULT_SPACE` stays 2184).
+pair; the vault layout is untouched (`VAULT_SPACE` stays 2200).
 
 ## IDL pipeline (AV-29)
 

@@ -705,7 +705,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 34, "error variant count drift");
+    assert_eq!(errors.len(), 35, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -721,6 +721,7 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::PeriodNotDue.code(), 131);
     assert_eq!(EscrowError::InvalidEventCapacity.code(), 132);
     assert_eq!(EscrowError::InvalidInitializer.code(), 133);
+    assert_eq!(EscrowError::InvalidExpiryExtension.code(), 134);
 }
 
 #[test]

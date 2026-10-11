@@ -364,6 +364,22 @@
       "args": [
         {"name": "period_index", "type": "u8"}
       ]
+    },
+    {
+      "name": "initialize_extension",
+      "discriminator": [147, 62, 136, 75, 36, 117, 185, 148],
+      "accounts": [],
+      "args": [
+        {"name": "max_extension_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "extend_expiry",
+      "discriminator": [216, 39, 141, 15, 230, 100, 24, 26],
+      "accounts": [],
+      "args": [
+        {"name": "new_expires_at", "type": "u64"}
+      ]
     }
   ],
   "accounts": [
@@ -411,7 +427,9 @@
           {"name": "event_total", "type": "u64", "offset": 1022},
           {"name": "event_count", "type": "u8", "offset": 1030},
           {"name": "event_capacity", "type": "u8", "offset": 1031},
-          {"name": "event_slots", "type": {"array": [{"defined": "EventHistorySlot"}, 64]}, "offset": 1032}
+          {"name": "event_slots", "type": {"array": [{"defined": "EventHistorySlot"}, 64]}, "offset": 1032},
+          {"name": "max_extension_secs", "type": "u64", "offset": 2184},
+          {"name": "extension_count", "type": "u64", "offset": 2192}
         ]
       }
     }
@@ -528,7 +546,8 @@
     {"code": 130, "name": "InvalidSubscription"},
     {"code": 131, "name": "PeriodNotDue"},
     {"code": 132, "name": "InvalidEventCapacity"},
-    {"code": 133, "name": "InvalidInitializer"}
+    {"code": 133, "name": "InvalidInitializer"},
+    {"code": 134, "name": "InvalidExpiryExtension"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

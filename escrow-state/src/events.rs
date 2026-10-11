@@ -61,6 +61,12 @@
 //!   when the initializer actually changes (AV-58) — the exact mirror
 //!   of `rotate_taker`'s emission rule: `from == to ==` the current
 //!   state, all amounts zero; a no-op rotation emits nothing.
+//! - `extend_expiry` emits [`EscrowEventKind::ExpiryExtended`] when the
+//!   deadline moves (AV-59) — `from == to ==` the current state (a
+//!   config change, not a lifecycle move), all amounts zero: the event
+//!   is the ordering signal that the deadline moved, and the indexer
+//!   reads the new `expires_at` (and the monotonic `extension_count`)
+//!   from the vault.
 //! - Partial `release` / `claim` calls emit [`EscrowEventKind::Released`]
 //!   / [`EscrowEventKind::Claimed`] with `from == to == Funded`: the
 //!   `EscrowState` variant does not change, but funds moved and the
@@ -109,7 +115,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
@@ -261,6 +267,15 @@ pub enum EscrowEventKind {
     /// initializer is an idempotent no-op that emits nothing
     /// (paralleling [`EscrowEventKind::TakerRotated`]'s no-op rule).
     InitializerRotated,
+    /// AV-59: the expiry deadline was extended by the initializer
+    /// ([`Escrow::extend_expiry`]). `from == to ==` the current state
+    /// (a config change, not a lifecycle move — like
+    /// [`EscrowEventKind::InitializerRotated`]); the new `expires_at`
+    /// and the monotonic `extension_count` are read from the vault,
+    /// the event is the ordering signal. Always emitted on success:
+    /// the call fails unless the deadline strictly moved, so there is
+    /// no no-op case.
+    ExpiryExtended,
 }
 
 impl EscrowEventKind {
@@ -303,6 +318,7 @@ impl EscrowEventKind {
             24 => Self::DefaultJudgment,
             25 => Self::SubscriptionPeriodReleased,
             26 => Self::InitializerRotated,
+            27 => Self::ExpiryExtended,
             _ => return None,
         })
     }
@@ -338,6 +354,7 @@ impl EscrowEventKind {
             Self::DefaultJudgment => "default_judgment",
             Self::SubscriptionPeriodReleased => "subscription_period_released",
             Self::InitializerRotated => "initializer_rotated",
+            Self::ExpiryExtended => "expiry_extended",
         }
     }
 }
@@ -736,6 +753,14 @@ impl IndexedEscrow {
     /// Configuration: emits no event.
     pub fn with_arbiter(mut self, arbiter: [u8; 32]) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_arbiter(arbiter)?;
+        Ok(self)
+    }
+
+    /// Opt in to bounded expiry extension (mirrors
+    /// [`Escrow::with_max_extension_secs`]). Configuration: emits no
+    /// event.
+    pub fn with_max_extension_secs(mut self, max_extension_secs: u64) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_max_extension_secs(max_extension_secs)?;
         Ok(self)
     }
 
@@ -1450,6 +1475,35 @@ impl IndexedEscrow {
             None,
         );
         }
+        Ok(())
+    }
+
+    /// Extend the expiry deadline (mirrors [`Escrow::extend_expiry`]).
+    /// Emits `ExpiryExtended`; `from == to ==` the current state (a
+    /// config change, not a lifecycle move). `now` doubles as the
+    /// event's `at`. The call fails unless the deadline strictly
+    /// moved, so the event always fires on success — there is no
+    /// no-op case.
+    pub fn extend_expiry(
+        &mut self,
+        initializer: [u8; 32],
+        new_expires_at: u64,
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner.extend_expiry(initializer, new_expires_at, now)?;
+        self.push_event(
+            EscrowEventKind::ExpiryExtended,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         Ok(())
     }
 

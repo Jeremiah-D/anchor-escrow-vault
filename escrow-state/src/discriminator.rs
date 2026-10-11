@@ -497,6 +497,12 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
             actor: actor_present.then_some(summary),
         };
     }
+    // AV-59: the per-extension expiry-increase bound and the monotonic
+    // extension counter, always present (zeroed when extension is not
+    // enabled / never extended); appended last so every earlier offset
+    // above is unchanged.
+    let max_extension_secs = c.u64_le()?;
+    let extension_count = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -563,6 +569,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         event_count,
         event_capacity,
         event_slots,
+        // AV-59: the expiry-extension bound and counter are persisted —
+        // a decoded escrow carries the same extension policy and
+        // history the setup and the extensions recorded.
+        max_extension_secs,
+        extension_count,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

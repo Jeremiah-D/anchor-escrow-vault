@@ -350,6 +350,8 @@ mod execution_plan_tests {
             decimals: 0,
             // AV-53: test actions carry no reference memo.
             reference: None,
+            // AV-59: test actions carry no extension history.
+            extension_count: 0,
             reason: "test",
         }
     }

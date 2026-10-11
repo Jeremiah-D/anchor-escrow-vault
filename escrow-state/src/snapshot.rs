@@ -256,6 +256,12 @@ pub struct EscrowSnapshot {
     /// (AV-57): `total - event_history.len()` entries aged out of the
     /// retained window.
     pub event_total: u64,
+    /// AV-59: the per-extension expiry-increase bound in seconds
+    /// (`0` = extension disabled).
+    pub max_extension_secs: u64,
+    /// AV-59: how many times the deadline was extended via
+    /// `extend_expiry` (saturating).
+    pub extension_count: u64,
 }
 
 impl Escrow {
@@ -349,6 +355,11 @@ impl Escrow {
             event_history: self.event_history(),
             event_capacity: self.event_capacity(),
             event_total: self.event_total(),
+            // AV-59: the extension policy and history ride the export,
+            // so an off-chain indexer can see the bound and how many
+            // times the deadline moved.
+            max_extension_secs: self.max_extension_secs(),
+            extension_count: self.extension_count(),
             penalty_bps: self.penalty_bps(),
             unlock_at: self.unlock_at(),
             unlock_eligible: self.is_unlock_eligible(now),
@@ -593,6 +604,13 @@ impl EscrowSnapshot {
             s.push('}');
         }
         s.push_str("]}");
+        // AV-59: the expiry-extension bound and the renewal count — so
+        // an off-chain indexer can see the policy and how many times
+        // the deadline moved.
+        s.push_str(",\"max_extension_secs\":");
+        s.push_str(&self.max_extension_secs.to_string());
+        s.push_str(",\"extension_count\":");
+        s.push_str(&self.extension_count.to_string());
         s.push('}');
         s
     }
@@ -648,7 +666,8 @@ mod snapshot_tests {
              \"evidence_hash\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
              \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"payout_allowlist\":null,\
              \"reference\":null,\
-             \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}}\
+             \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
+             \"max_extension_secs\":0,\"extension_count\":0\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),

@@ -1715,6 +1715,71 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to bounded expiry extension at setup time (AV-59;
+    /// mirrors `Escrow::with_max_extension_secs`). `Uninitialized`
+    /// only — the extension policy is fixed before any funds move. A
+    /// zero bound is `InvalidExpiryExtension` (code 134): leave the
+    /// field at its default 0 (extension disabled) instead. The
+    /// 16-byte region is always reserved, so the opt-in writes in
+    /// place — no realloc, no rent change. Emits no event (pre-fund
+    /// configuration).
+    pub fn initialize_extension(
+        ctx: Context<InitializeExtension>,
+        max_extension_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .with_max_extension_secs(max_extension_secs)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
+    /// Extend the expiry deadline in place (AV-59; mirrors
+    /// `Escrow::extend_expiry`). A unilateral initializer power:
+    /// extension only lengthens the taker's window, so no
+    /// counterparty signature is needed. Only `Uninitialized` /
+    /// `Funded` — `Activated` is deliberately excluded (a dual-sig
+    /// escrow both parties activated has jointly committed to its
+    /// terms), terminal states and `Disputed` are
+    /// `InvalidStateTransition`. The extension must be opted in
+    /// (`max_extension_secs > 0`), the escrow must not already be
+    /// expiry-eligible (an expired escrow exits via `cancel_expired`),
+    /// the deadline must move strictly forward, and the single
+    /// increment must not exceed `max_extension_secs` —
+    /// `InvalidExpiryExtension` (code 134) for any violation. A
+    /// paused escrow fails fast (`Paused`). On success
+    /// `extension_count` increments (saturating). Emits
+    /// `ExpiryExtended` (from == to == the current state).
+    pub fn extend_expiry(ctx: Context<ExtendExpiry>, new_expires_at: u64) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        escrow
+            .extend_expiry(
+                ctx.accounts.initializer.key().to_bytes(),
+                new_expires_at,
+                Clock::get()?.unix_timestamp as u64,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::ExpiryExtended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// Clear the AV-27 timelock by dual-signed emergency governance
     /// (AV-41; mirrors `Escrow::emergency_unlock`). Both the initializer
     /// and the taker must sign — one party alone is `Unauthorized`.
@@ -2173,6 +2238,18 @@ pub struct Vault {
     /// bytes). Layout position matches `escrow_state::VAULT_FIELDS`
     /// (appended last, after `event_capacity`).
     pub event_slots: [EventHistorySlot; 64],
+    /// AV-59: per-extension expiry-increase bound in seconds; mirrors
+    /// `escrow_state`'s `max_extension_secs`. Always present (8 bytes,
+    /// zeroed when extension is not enabled). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `event_slots`).
+    pub max_extension_secs: u64,
+    /// AV-59: monotonic count of executed expiry extensions; mirrors
+    /// `escrow_state`'s `extension_count`. Always present (8 bytes,
+    /// zeroed when never extended). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `max_extension_secs`).
+    pub extension_count: u64,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -2454,6 +2531,10 @@ pub enum EscrowVaultEventKind {
     /// dual-signed governance (`Escrow::rotate_initializer`). Mirrors
     /// `escrow_state::EscrowEventKind::InitializerRotated`.
     InitializerRotated,
+    /// AV-59: the expiry deadline was extended by the initializer
+    /// (`Escrow::extend_expiry`). Mirrors
+    /// `escrow_state::EscrowEventKind::ExpiryExtended`.
+    ExpiryExtended,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -2511,12 +2592,15 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         escrow_state::EscrowEventKind::InitializerRotated => {
             EscrowVaultEventKind::InitializerRotated
         }
+        escrow_state::EscrowEventKind::ExpiryExtended => {
+            EscrowVaultEventKind::ExpiryExtended
+        }
     }
 }
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    // Full vault space: 8-byte discriminator + 2176-byte payload = 2184
+    // Full vault space: 8-byte discriminator + 2192-byte payload = 2200
     // bytes (see `escrow_state::VAULT_SPACE`; AV-12 added the 1-byte
     // activation bitmask, AV-13 the 17-byte vesting region, AV-14 the
     // 33-byte arbiter region, AV-15 the 66-byte milestone plan + the
@@ -2536,11 +2620,12 @@ pub struct Initialize<'info> {
     // 8-byte per-period released bitmap, AV-57 the 1-byte event ring
     // head + the 8-byte monotonic event total + the 1-byte valid-entry
     // count + the 1-byte configured capacity + the 1152-byte event
-    // slots).
+    // slots, AV-59 the 8-byte extension bound + the 8-byte extension
+    // counter).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
-    // rent parameters the minimum is 16_091_520 lamports.
+    // rent parameters the minimum is 16_202_880 lamports.
     #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
     pub vault: Account<'info, Vault>,
     pub taker: SystemAccount<'info>,
@@ -3069,6 +3154,27 @@ pub struct RotateInitializer<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitializeExtension<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer sets the setup-time extension policy; the
+    /// state machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`, and rejects a zero bound (`InvalidExpiryExtension`,
+    /// code 134).
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ExtendExpiry<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The initializer extends unilaterally — extension only
+    /// lengthens the taker's window, so no counterparty signature is
+    /// needed. A stranger is `Unauthorized`.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitializePayoutAllowlist<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
@@ -3500,6 +3606,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidInitializer => {
             error!(ErrorCode::InvalidInitializer)
         }
+        escrow_state::EscrowError::InvalidExpiryExtension => {
+            error!(ErrorCode::InvalidExpiryExtension)
+        }
     }
 }
 
@@ -3573,4 +3682,6 @@ pub enum ErrorCode {
     InvalidEventCapacity,
     #[msg("Invalid initializer address (AV-58): rotate_initializer with the zero address (a zero address can never be the legitimate initializer)")]
     InvalidInitializer,
+    #[msg("Invalid expiry extension (AV-59): extend_expiry with no extension bound configured, by a non-initializer, on a non-Uninitialized/Funded escrow, with a deadline that does not move forward, with a single increment above the bound, or on an already-expiry-eligible escrow; with_max_extension_secs with a zero bound")]
+    InvalidExpiryExtension,
 }

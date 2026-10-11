@@ -579,6 +579,25 @@ pub struct Escrow {
     /// survives serialization. Appended last so every earlier field
     /// offset stays stable.
     event_slots: [EventHistorySlot; MAX_EVENT_HISTORY],
+    /// AV-59: per-extension expiry-increase bound in seconds (see
+    /// [`Escrow::with_max_extension_secs`]). `0` (the default) means
+    /// expiry extension is not enabled — backward compatible.
+    /// [`Escrow::extend_expiry`] rejects any single increment larger
+    /// than this bound, so a misconfigured or compromised initializer
+    /// key can never push the deadline out by an unbounded amount in
+    /// one call. Set once via `with_max_extension_secs` on an
+    /// `Uninitialized` escrow, like the other `with_*` builders.
+    /// Persisted (8 bytes in the vault account) so the bound survives
+    /// serialization. Appended last so every earlier field offset
+    /// stays stable.
+    max_extension_secs: u64,
+    /// AV-59: monotonic count of executed expiry extensions (see
+    /// [`Escrow::extend_expiry`]). Saturates at `u64::MAX` rather than
+    /// wrapping. The keeper report surfaces it so operators can see
+    /// how many times an escrow's deadline was pushed. Always present
+    /// (zeroed when never extended). Appended last so every earlier
+    /// field offset stays stable.
+    extension_count: u64,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -852,6 +871,21 @@ pub enum EscrowError {
     /// construction. Parallels [`EscrowError::InvalidTaker`] (config
     /// error).
     InvalidInitializer,
+    /// Expiry extension rejected (AV-59): [`Escrow::extend_expiry`]
+    /// called with no extension bound configured (the opt-in
+    /// [`Escrow::with_max_extension_secs`] was never called), by a
+    /// caller other than the initializer, on an escrow that is not
+    /// `Uninitialized` / `Funded`, with a `new_expires_at` that does
+    /// not move the deadline forward, with a single increment larger
+    /// than the configured bound, or once the escrow is already
+    /// expiry-eligible ([`Escrow::is_expiry_eligible`] — an expired
+    /// escrow exits via `cancel_expired`, it cannot be resurrected by
+    /// extension). Also returned by
+    /// [`Escrow::with_max_extension_secs`] for a zero bound: an opt-in
+    /// bound of zero would forbid every extension — configure a
+    /// positive bound, or leave extension disabled (the default).
+    /// Parallels [`EscrowError::InvalidGracePeriod`] (config error).
+    InvalidExpiryExtension,
 }
 
 impl EscrowError {
@@ -898,6 +932,7 @@ impl EscrowError {
             EscrowError::PeriodNotDue => 131,
             EscrowError::InvalidEventCapacity => 132,
             EscrowError::InvalidInitializer => 133,
+            EscrowError::InvalidExpiryExtension => 134,
         }
     }
 
@@ -938,6 +973,7 @@ impl EscrowError {
             EscrowError::PeriodNotDue,
             EscrowError::InvalidEventCapacity,
             EscrowError::InvalidInitializer,
+            EscrowError::InvalidExpiryExtension,
         ]
     }
 }
@@ -1721,6 +1757,11 @@ impl Escrow {
             event_count: 0,
             event_capacity: MAX_EVENT_HISTORY as u8,
             event_slots: [EventHistorySlot::EMPTY; MAX_EVENT_HISTORY],
+            // AV-59: expiry extension is opt-in (backward compatible):
+            // `with_max_extension_secs` sets the per-extension bound
+            // before funding; `extend_expiry` increments the counter.
+            max_extension_secs: 0,
+            extension_count: 0,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -3151,6 +3192,126 @@ impl Escrow {
     /// saturation is a backstop, never a behavior.
     pub fn is_expiry_eligible(&self, now: u64) -> bool {
         now >= self.expires_at.saturating_add(self.grace_period)
+    }
+
+    /// Opt in to bounded expiry extension (AV-59 — Solana operations):
+    /// declare the maximum single increment (in seconds) by which
+    /// [`Escrow::extend_expiry`] may push `expires_at` forward.
+    ///
+    /// Why: long-lived escrows (multi-round OTC deals, streaming
+    /// payroll) sometimes outlive their deadline through no fault of
+    /// either party. Cancelling and re-creating the escrow strands
+    /// in-flight quorum votes, attestations and milestone progress;
+    /// extending the deadline in place keeps the escrow — and its
+    /// history — intact. The bound caps each single increment, so a
+    /// misconfigured or compromised initializer key can never push the
+    /// deadline out by an unbounded amount in one call ("上限封顶防无限
+    /// 续命"); pushing further requires another signed call, which the
+    /// indexer and the keeper both observe.
+    ///
+    /// Builder-style: only valid on an `Uninitialized` escrow, like
+    /// [`Escrow::with_grace_period`] and the other `with_*` builders —
+    /// the extension policy is fixed before any funds move.
+    /// [`EscrowError::InvalidExpiryExtension`] for a zero bound: an
+    /// opt-in bound of zero would forbid every extension, so it is
+    /// rejected at setup — leave the field at its default `0`
+    /// (extension disabled, backward compatible) instead.
+    pub fn with_max_extension_secs(mut self, max_extension_secs: u64) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if max_extension_secs == 0 {
+            return Err(EscrowError::InvalidExpiryExtension);
+        }
+        self.max_extension_secs = max_extension_secs;
+        Ok(self)
+    }
+
+    /// The per-extension expiry-increase bound in seconds configured
+    /// via [`Escrow::with_max_extension_secs`]; `0` when extension is
+    /// not enabled (backward compatible).
+    pub fn max_extension_secs(&self) -> u64 {
+        self.max_extension_secs
+    }
+
+    /// How many times [`Escrow::extend_expiry`] has pushed the deadline
+    /// forward (saturating). The keeper report surfaces it so operators
+    /// can see at a glance how many times an escrow's deadline moved.
+    pub fn extension_count(&self) -> u64 {
+        self.extension_count
+    }
+
+    /// Extend the expiry deadline (AV-59): move `expires_at` forward to
+    /// `new_expires_at`. A unilateral *initializer* power — extending
+    /// only ever lengthens the taker's window, never shortens it, so
+    /// the taker cannot be harmed and no counterparty signature is
+    /// needed.
+    ///
+    /// Check order (authority → state → config, the crate convention):
+    /// 1. the caller must be the initializer
+    ///    ([`EscrowError::Unauthorized`]);
+    /// 2. the escrow must be `Uninitialized` or `Funded`. `Activated`
+    ///    is excluded deliberately: a dual-sig escrow that both parties
+    ///    already activated has jointly committed to its terms, and a
+    ///    unilateral rewrite post-commit would break that commitment —
+    ///    extend before activation, or after funding. The terminal
+    ///    states and `Disputed` are excluded for the usual reasons
+    ///    ([`EscrowError::InvalidStateTransition`]);
+    /// 3. extension must be opted in (`max_extension_secs > 0`),
+    ///    the escrow must not already be expiry-eligible
+    ///    ([`Escrow::is_expiry_eligible`] — an expired escrow exits via
+    ///    `cancel_expired`; extension cannot resurrect it),
+    ///    `new_expires_at` must move the deadline strictly forward,
+    ///    and the single increment must not exceed `max_extension_secs`
+    ///    ([`EscrowError::InvalidExpiryExtension`] for any violation).
+    ///
+    /// AV-21: the grace-period semantics carry over unchanged — the
+    /// "already expired" gate uses [`Escrow::is_expiry_eligible`], so
+    /// the keeper's clock-skew grace window applies to extension too.
+    ///
+    /// AV-46: a paused escrow fails fast (`Paused`) — extension is a
+    /// config transition, not the pause key-loss escape hatch.
+    ///
+    /// On success the deadline moves and `extension_count` increments
+    /// (saturating); the `ExpiryExtended` indexer event fires via the
+    /// [`IndexedEscrow`](crate::IndexedEscrow) wrapper.
+    pub fn extend_expiry(
+        &mut self,
+        initializer: [u8; 32],
+        new_expires_at: u64,
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        if initializer != self.initializer {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if self.max_extension_secs == 0 {
+            return Err(EscrowError::InvalidExpiryExtension);
+        }
+        // An expired escrow cannot be resurrected by extension — the
+        // unilateral exit path (`cancel_expired`) owns the expired
+        // state. Grace semantics (AV-21) apply: the full eligibility
+        // predicate is the single source of truth.
+        if self.is_expiry_eligible(now) {
+            return Err(EscrowError::InvalidExpiryExtension);
+        }
+        if new_expires_at <= self.expires_at {
+            return Err(EscrowError::InvalidExpiryExtension);
+        }
+        // `new_expires_at > expires_at` above, so this cannot underflow.
+        let increment = new_expires_at - self.expires_at;
+        if increment > self.max_extension_secs {
+            return Err(EscrowError::InvalidExpiryExtension);
+        }
+        self.expires_at = new_expires_at;
+        self.extension_count = self.extension_count.saturating_add(1);
+        Ok(())
     }
 
     /// Escalate the escrow into arbitration: `Funded -> Disputed`
@@ -5193,6 +5354,16 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     ("event_count", "u8", 1),
     ("event_capacity", "u8", 1),
     ("event_slots", "[EventHistorySlot; 64]", 64 * EVENT_HISTORY_SLOT_LEN),
+    // AV-59: per-extension expiry-increase bound in seconds (see
+    // `Escrow::with_max_extension_secs`): one u64, always present
+    // (zeroed when extension is not enabled). Appended last so every
+    // earlier field offset stays stable.
+    ("max_extension_secs", "u64", 8),
+    // AV-59: monotonic count of executed expiry extensions (see
+    // `Escrow::extend_expiry`): one u64, always present (zeroed when
+    // never extended). Appended last so every earlier field offset
+    // stays stable.
+    ("extension_count", "u64", 8),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -5267,9 +5438,12 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// 8-byte monotonic total + 1-byte valid-entry count + 1-byte
 /// configured capacity + the 64 fixed 18-byte slots (zeroed when no
 /// events were recorded) — the slots are reserved at the 64-entry
-/// ceiling regardless of the configured capacity.
+/// ceiling regardless of the configured capacity. The expiry-extension
+/// bound (AV-59) is always present too: 8 bytes, zeroed when extension
+/// is not enabled — and so is the extension counter (AV-59): 8 bytes,
+/// zeroed when the deadline was never extended.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -5813,7 +5987,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 16_091_520, "from {state:?}");
+            assert_eq!(rent, 16_202_880, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -5911,9 +6085,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 16_091_520 by
+        // VAULT_SPACE — pinned at 16_202_880 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 16_091_520);
+        assert_eq!(rent, 16_202_880);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -6074,8 +6248,8 @@ mod tests {
         // then the account is closed. VAULT_SPACE stays 2184 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 2184, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 16_091_520);
+        assert_eq!(VAULT_SPACE, 2200, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 16_202_880);
     }
 
     #[test]
@@ -6091,7 +6265,7 @@ mod tests {
         // 26 (dispute timestamp + default judgment + confirmation
         // bit), so the
         // pin tracks the new total deliberately.
-        assert_eq!(VAULT_SPACE, 2184, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 2200, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -8190,6 +8364,66 @@ pub(crate) mod anchor_idl_tests {
                             on the last period; payout = gross \\
                             per-period amount, fee, refund = 0)",
         },
+        InstructionSpec {
+            // AV-59: opt in to bounded expiry extension at setup time.
+            name: "initialize_extension",
+            params: &[(
+                "max_extension_secs",
+                "u64",
+                "instruction param; the maximum single increment (in \\
+                 seconds) by which extend_expiry may push expires_at \\
+                 forward — the per-call cap that bounds every extension",
+            )],
+            method: "Escrow::with_max_extension_secs",
+            input_mapping: "max_extension_secs <- param (u64); authority \\
+                            <- accounts.initializer (signer), enforced by \\
+                            the Anchor account constraint, not the state \\
+                            machine; Uninitialized only, like \\
+                            initialize_quorum; a zero bound is \\
+                            InvalidExpiryExtension (code 134) — leave the \\
+                            field at its default 0 (extension disabled) \\
+                            instead; the 16-byte region is always \\
+                            reserved (zeroed when disabled) so the opt-in \\
+                            writes in place without reallocating; emits \\
+                            no event (pre-fund configuration)",
+        },
+        InstructionSpec {
+            // AV-59: extend the expiry deadline in place.
+            name: "extend_expiry",
+            params: &[(
+                "new_expires_at",
+                "u64",
+                "instruction param; the new deadline — must move strictly \\
+                 forward and by at most max_extension_secs in one call",
+            )],
+            method: "Escrow::extend_expiry",
+            input_mapping: "initializer <- accounts.initializer (signer) \\
+                            - a unilateral initializer power: extension \\
+                            only lengthens the taker's window, so no \\
+                            counterparty signature is needed; \\
+                            new_expires_at <- param (u64 -> the expires_at \\
+                            vault field, in place); now <- clock sysvar \\
+                            (NOT an instruction param); only Uninitialized \\
+                            / Funded — Activated is deliberately excluded \\
+                            (a dual-sig escrow both parties activated has \\
+                            jointly committed to its terms; extend before \\
+                            activation or after funding), terminal states \\
+                            and Disputed are InvalidStateTransition; the \\
+                            extension must be opted in (max_extension_secs \\
+                            > 0), the escrow must not already be \\
+                            expiry-eligible (is_expiry_eligible — an \\
+                            expired escrow exits via cancel_expired, it \\
+                            cannot be resurrected), the deadline must move \\
+                            strictly forward, and the single increment must \\
+                            not exceed max_extension_secs — \\
+                            InvalidExpiryExtension (code 134) for any \\
+                            violation; a paused escrow fails fast \\
+                            (Paused); on success extension_count \\
+                            increments (saturating); emits the \\
+                            ExpiryExtended indexer event (from == to == \\
+                            the current state); the 16-byte region is \\
+                            rewritten in place - no layout / rent change",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -8275,6 +8509,8 @@ pub(crate) mod anchor_idl_tests {
             // AV-56: periodic (subscription-style) release schedule.
             "Escrow::with_subscription",
             "Escrow::release_period",
+            "Escrow::with_max_extension_secs",
+            "Escrow::extend_expiry",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -8298,7 +8534,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_thirty_two_instructions_take_params() {
+    fn only_thirty_four_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -8341,6 +8577,8 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_default_judgment",
                 &"initialize_subscription",
                 &"release_period",
+                &"initialize_extension",
+                &"extend_expiry",
             ]
         );
     }
@@ -9895,6 +10133,14 @@ pub(crate) mod anchor_idl_tests {
         ("initialize_subscription", "periods", "subscription"),
         ("initialize_subscription", "per_period", "subscription"),
         ("release_period", "period_index", "subscription_released"),
+        // AV-59: the extension bound param populates
+        // `max_extension_secs` directly (u64 — 0 is the "disabled"
+        // default, rejected as an opt-in value).
+        ("initialize_extension", "max_extension_secs", "max_extension_secs"),
+        // AV-59: the new-deadline param rewrites the `expires_at`
+        // field in place — a second param source for `expires_at`,
+        // like `released` (written by multiple transitions).
+        ("extend_expiry", "new_expires_at", "expires_at"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -10028,6 +10274,14 @@ pub(crate) mod anchor_idl_tests {
             "event_slots",
             "zeroed by initialize; written by every successful \\
              transition's ring append (kind/at/actor per slot)",
+        ),
+        // AV-59: no instruction param writes this field — the counter
+        // increments (saturating) on every successful `extend_expiry`,
+        // so it is a field source, not a param mapping.
+        (
+            "extension_count",
+            "zeroed by initialize; incremented by extend_expiry \\
+             (saturating)",
         ),
     ];
 
@@ -10317,6 +10571,11 @@ mod error_code_tests {
             EscrowError::InvalidInitializer,
             133,
             "rotate_initializer with the zero address (a zero address can never be the legitimate initializer)",
+        ),
+        (
+            EscrowError::InvalidExpiryExtension,
+            134,
+            "extend_expiry with no extension bound configured, by a non-initializer, on a non-Uninitialized/Funded escrow, with a deadline that does not move forward, with a single increment above the bound, or on an already-expiry-eligible escrow; with_max_extension_secs with a zero bound",
         ),
     ];
 
@@ -11966,6 +12225,14 @@ mod account_space_tests {
                 }
             }
         }
+        // AV-59: per-extension expiry-increase bound, always present
+        // (zeroed when extension is not enabled); appended last so
+        // every earlier offset above is unchanged.
+        out.extend_from_slice(&e.max_extension_secs.to_le_bytes());
+        // AV-59: monotonic extension counter, always present (zeroed
+        // when never extended); appended last so every earlier offset
+        // above is unchanged.
+        out.extend_from_slice(&e.extension_count.to_le_bytes());
         out
     }
 
@@ -12005,9 +12272,9 @@ mod account_space_tests {
         // ring head) + 8 (AV-57 monotonic event total) + 1 (AV-57
         // valid-entry count) + 1 (AV-57 configured capacity) + 1152
         // (AV-57 event slots: 64 x 18-byte kind/at/actor entries).
-        assert_eq!(ESCROW_BODY_LEN, 2176, "escrow payload bytes");
+        assert_eq!(ESCROW_BODY_LEN, 2192, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 2184, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 2200, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -12050,13 +12317,15 @@ mod account_space_tests {
         // zeroed when no events were recorded) + 1-byte configured
         // capacity (AV-57, 64 by default) + 1152-byte event slots
         // (AV-57, 64 x 18-byte entries, zeroed when no events were
-        // recorded).
+        // recorded) + 8-byte extension bound (AV-59, zeroed when
+        // extension is not enabled) + 8-byte extension counter (AV-59,
+        // zeroed when never extended).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1694);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1710);
     }
 
     #[test]
@@ -12463,16 +12732,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2184) * 3480 * 2 = 2312 * 6960 = 16_091_520 lamports.
-        assert_eq!(full, 16_091_520);
+        // (128 + 2200) * 3480 * 2 = 2328 * 6960 = 16_202_880 lamports.
+        assert_eq!(full, 16_202_880);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1694) * 3480 * 2 = 1822 * 6960 = 12_681_120 lamports.
-        assert_eq!(no_quorum, 12_681_120);
+        // (128 + 1710) * 3480 * 2 = 1838 * 6960 = 12_792_480 lamports.
+        assert_eq!(no_quorum, 12_792_480);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -12516,12 +12785,12 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(16_091_520, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(16_202_880, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(16_091_519, params.0, params.1),
             Err(RentShortfall {
-                required: 16_091_520,
+                required: 16_202_880,
                 provided: 16_091_519,
             })
         );
@@ -12534,7 +12803,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 16_091_520,
+                required: 16_202_880,
                 provided: 0,
             })
         );
@@ -14970,7 +15239,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2176, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) bytes");
+        assert_eq!(bytes.len(), 2192, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -14995,7 +15264,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 2176);
+        assert_eq!(bytes.len(), 2192);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -15017,18 +15286,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2184) * 3480 * 2 = 2312 * 6960 = 16_091_520 lamports.
-        assert_eq!(VAULT_SPACE, 2184);
-        assert_eq!(full, 16_091_520);
+        // (128 + 2200) * 3480 * 2 = 2328 * 6960 = 16_202_880 lamports.
+        assert_eq!(VAULT_SPACE, 2200);
+        assert_eq!(full, 16_202_880);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1694) * 3480 * 2 = 1822 * 6960 = 12_681_120 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1694);
-        assert_eq!(no_quorum, 12_681_120);
+        // (128 + 1710) * 3480 * 2 = 1838 * 6960 = 12_792_480 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1710);
+        assert_eq!(no_quorum, 12_792_480);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -15172,7 +15441,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2176);
+        assert_eq!(bytes.len(), 2192);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -15187,7 +15456,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 2176);
+        assert_eq!(bytes.len(), 2192);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -15218,18 +15487,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2184) * 3480 * 2 = 2312 * 6960 = 16_091_520 lamports.
-        assert_eq!(VAULT_SPACE, 2184);
-        assert_eq!(full, 16_091_520);
+        // (128 + 2200) * 3480 * 2 = 2328 * 6960 = 16_202_880 lamports.
+        assert_eq!(VAULT_SPACE, 2200);
+        assert_eq!(full, 16_202_880);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1694) * 3480 * 2 = 1822 * 6960 = 12_681_120 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1694);
-        assert_eq!(no_quorum, 12_681_120);
+        // (128 + 1710) * 3480 * 2 = 1838 * 6960 = 12_792_480 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1710);
+        assert_eq!(no_quorum, 12_792_480);
     }
 
     #[test]
@@ -16084,7 +16353,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 2176);
+        assert_eq!(bytes.len(), 2192);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -16259,7 +16528,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 2176, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57");
+        assert_eq!(ESCROW_BODY_LEN, 2192, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -16277,32 +16546,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 2184) * 3480 * 2 = 2312 * 6960 = 16_091_520 lamports.
+        // (128 + 2200) * 3480 * 2 = 2328 * 6960 = 16_202_880 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            16_091_520
+            16_202_880
         );
-        // (128 + 1694) * 3480 * 2 = 1822 * 6960 = 12_681_120 lamports.
+        // (128 + 1710) * 3480 * 2 = 1838 * 6960 = 12_792_480 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            12_681_120
+            12_792_480
         );
         // 1376 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 2184);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1694);
-        assert!(check_vault_rent_exempt(16_091_520, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 2200);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1710);
+        assert!(check_vault_rent_exempt(16_202_880, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -18102,6 +18371,285 @@ mod initializer_rotation_tests {
     }
 }
 
+// ---------- AV-59: bounded expiry extension ----------
+
+#[cfg(test)]
+mod extension_tests {
+    use super::*;
+    use crate::account_space_tests::encode_escrow;
+    use crate::discriminator::{decode_vault_account, vault_account_discriminator};
+    use crate::events::{EscrowEventKind, IndexedEscrow};
+    use crate::keeper::{scan_keeper_actions, WatchedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const MAX_EXT: u64 = 86_400; // one day per extension
+    const T0: u64 = 1_700_000_000;
+    const ESCROW_ID: [u8; 32] = [0x1D; 32];
+
+    fn extendable() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_max_extension_secs(MAX_EXT)
+            .unwrap()
+    }
+
+    fn account_bytes(e: &Escrow) -> Vec<u8> {
+        let mut out = Vec::with_capacity(VAULT_SPACE);
+        out.extend_from_slice(&vault_account_discriminator());
+        out.extend_from_slice(&encode_escrow(e));
+        out
+    }
+
+    #[test]
+    fn builder_gates() {
+        // Uninitialized only.
+        let mut e = extendable();
+        e.fund(ALICE).unwrap();
+        assert_eq!(
+            e.with_max_extension_secs(MAX_EXT),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Zero bound is meaningless as an opt-in — rejected at setup.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let err = e.with_max_extension_secs(0).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidExpiryExtension);
+        assert_eq!(err.code(), 134);
+        // Builder order-independent: opt-in composes with the other
+        // builders.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_max_extension_secs(MAX_EXT)
+            .unwrap()
+            .with_grace_period(300)
+            .unwrap();
+        assert_eq!(e.max_extension_secs(), MAX_EXT);
+        assert_eq!(e.grace_period(), 300);
+        assert_eq!(e.extension_count(), 0);
+    }
+
+    #[test]
+    fn extension_moves_the_deadline_and_counts() {
+        let mut e = extendable();
+        e.extend_expiry(ALICE, EXPIRES_AT + 3_600, T0).unwrap();
+        assert_eq!(e.expires_at(), EXPIRES_AT + 3_600);
+        assert_eq!(e.extension_count(), 1);
+        // A second extension stacks on the moved deadline, bounded by
+        // the same per-call cap.
+        e.extend_expiry(ALICE, EXPIRES_AT + 3_600 + MAX_EXT, T0).unwrap();
+        assert_eq!(e.expires_at(), EXPIRES_AT + 3_600 + MAX_EXT);
+        assert_eq!(e.extension_count(), 2);
+        // Funded escrows extend too.
+        let mut e = extendable();
+        e.fund(ALICE).unwrap();
+        e.extend_expiry(ALICE, EXPIRES_AT + MAX_EXT, T0).unwrap();
+        assert_eq!(e.expires_at(), EXPIRES_AT + MAX_EXT);
+        assert_eq!(e.extension_count(), 1);
+    }
+
+    #[test]
+    fn extension_rejects_violations() {
+        // Not opted in: the default bound 0 means disabled.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            e.extend_expiry(ALICE, EXPIRES_AT + 1, T0),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        // Stranger (or taker) cannot extend: initializer-only power.
+        let mut e = extendable();
+        assert_eq!(
+            e.extend_expiry(MALLORY, EXPIRES_AT + 1, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.extend_expiry(BOB, EXPIRES_AT + 1, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        // Deadline must move strictly forward.
+        assert_eq!(
+            e.extend_expiry(ALICE, EXPIRES_AT, T0),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        assert_eq!(
+            e.extend_expiry(ALICE, EXPIRES_AT - 1, T0),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        // Single increment above the bound is rejected — the per-call
+        // cap that prevents unbounded pushes.
+        assert_eq!(
+            e.extend_expiry(ALICE, EXPIRES_AT + MAX_EXT + 1, T0),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        // Exactly the bound is allowed (inclusive).
+        e.extend_expiry(ALICE, EXPIRES_AT + MAX_EXT, T0).unwrap();
+        // An expired escrow cannot be resurrected by extension — the
+        // unilateral exit path owns the expired state.
+        assert_eq!(
+            e.extend_expiry(ALICE, EXPIRES_AT + MAX_EXT + 1, EXPIRES_AT + MAX_EXT),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        assert_eq!(e.expires_at(), EXPIRES_AT + MAX_EXT, "failed call changes nothing");
+        assert_eq!(e.extension_count(), 1);
+    }
+
+    #[test]
+    fn extension_respects_the_grace_window() {
+        // AV-21: the "already expired" gate uses is_expiry_eligible —
+        // inside the grace window the escrow is not yet expired, so
+        // extension is still allowed.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_grace_period(300)
+            .unwrap()
+            .with_max_extension_secs(MAX_EXT)
+            .unwrap();
+        e.extend_expiry(ALICE, EXPIRES_AT + 60, EXPIRES_AT + 120).unwrap();
+        assert_eq!(e.extension_count(), 1);
+        // Past expires_at + grace: expired, no resurrection.
+        assert_eq!(
+            e.extend_expiry(ALICE, EXPIRES_AT + 120, EXPIRES_AT + 360),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+    }
+
+    #[test]
+    fn extension_state_gates() {
+        // Uninitialized and Funded: allowed. Activated is deliberately
+        // excluded: a dual-sig escrow both parties activated has jointly
+        // committed to its terms.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_max_extension_secs(MAX_EXT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Activated);
+        assert_eq!(
+            e.extend_expiry(ALICE, EXPIRES_AT + 1, T0),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Terminal states + Disputed: rejected.
+        let mut released = extendable();
+        released.fund(ALICE).unwrap();
+        released.release(ALICE, EXPIRES_AT, 1_000_000, None, BOB).unwrap();
+        let mut cancelled = extendable();
+        cancelled.fund(ALICE).unwrap();
+        cancelled.cancel(ALICE, None, ALICE).unwrap();
+        for (name, mut e) in [("Released", released), ("Cancelled", cancelled)] {
+            assert_eq!(
+                e.extend_expiry(ALICE, EXPIRES_AT + 1, T0),
+                Err(EscrowError::InvalidStateTransition),
+                "{name}"
+            );
+            assert_eq!(e.extension_count(), 0, "{name}: counter untouched");
+        }
+    }
+
+    #[test]
+    fn extension_blocked_while_paused() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_max_extension_secs(MAX_EXT)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap();
+        e.fund(ALICE).unwrap();
+        e.pause([0xDD; 32]).unwrap();
+        assert_eq!(
+            e.extend_expiry(ALICE, EXPIRES_AT + 1, T0),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(e.expires_at(), EXPIRES_AT);
+    }
+
+    #[test]
+    fn extension_emits_expiry_extended() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_max_extension_secs(MAX_EXT)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let base = e.events().len();
+        e.extend_expiry(ALICE, EXPIRES_AT + 3_600, T0 + 2).unwrap();
+        let ev = *e.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::ExpiryExtended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.at, T0 + 2);
+        assert_eq!(e.events().len(), base + 1);
+        assert_eq!(e.inner().expires_at(), EXPIRES_AT + 3_600);
+    }
+
+    #[test]
+    fn keeper_report_annotates_the_renewal_count() {
+        // The keeper's expiry listings carry extension_count, so an
+        // operator sees how many times the deadline moved.
+        let mut e = extendable();
+        e.fund(ALICE).unwrap();
+        e.extend_expiry(ALICE, EXPIRES_AT + 3_600, T0).unwrap();
+        e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
+        let watched = [WatchedEscrow {
+            escrow_id: ESCROW_ID,
+            escrow: e,
+            reference: None,
+        }];
+        // Scan just past the *extended* deadline: the escrow is now
+        // expiry-eligible on its moved deadline.
+        let report = scan_keeper_actions(&watched, EXPIRES_AT + 7_201);
+        let cancel = report
+            .actions
+            .iter()
+            .find(|a| a.caller_role == "initializer")
+            .expect("cancel_expired listed");
+        assert_eq!(cancel.extension_count, 2);
+        assert!(report.to_json().contains("\"extension_count\":2"));
+        // The snapshot export carries the policy and the history too.
+        let snap = watched[0].escrow.snapshot(EXPIRES_AT + 7_201);
+        assert_eq!(snap.max_extension_secs, MAX_EXT);
+        assert_eq!(snap.extension_count, 2);
+        assert!(snap.to_json().contains("\"extension_count\":2"));
+        assert!(snap.to_json().contains("\"max_extension_secs\":86400"));
+    }
+
+    #[test]
+    fn extension_layout_is_append_only() {
+        // Body grows by exactly 16 bytes (two u64), appended after the
+        // AV-57 event-history region — every earlier offset is stable.
+        let mut e = extendable();
+        e.extend_expiry(ALICE, EXPIRES_AT + 3_600, T0).unwrap();
+        e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes.len(), 2192, "body 2176 + 16");
+        assert_eq!(VAULT_SPACE, 2200);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1710);
+        let body_tail = &bytes[2176..];
+        assert_eq!(
+            u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
+            MAX_EXT,
+            "max_extension_secs at the tail"
+        );
+        assert_eq!(
+            u64::from_le_bytes(body_tail[8..16].try_into().unwrap()),
+            2,
+            "extension_count at the tail"
+        );
+        // Earlier offsets untouched: expires_at still at 80..88.
+        assert_eq!(
+            u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
+            EXPIRES_AT + 7_200,
+            "expires_at offset stable"
+        );
+        // Decode round-trips the new fields.
+        let d = decode_vault_account(&account_bytes(&e)).unwrap();
+        assert_eq!(d.max_extension_secs(), MAX_EXT);
+        assert_eq!(d.extension_count(), 2);
+    }
+}
+
 
 // ---------- AV-55: arbitration default judgment (dispute timeout fallback) ----------
 
@@ -18621,7 +19169,7 @@ mod default_judgment_tests {
         // at 960, `default_judgment` at 968, `default_confirmed` at 985
         // (AV-55 body total 986). AV-56 appends `subscription` at 986,
         // `subscription_next` at 1004, `subscription_released` at 1005
-        // (body total 2176 after the AV-57 event-history append).
+        // (body total 2192 after the AV-57 event-history + AV-59 extension appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter(ARBITER)
@@ -18631,7 +19179,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2176);
+        assert_eq!(bytes.len(), 2192);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -19174,10 +19722,12 @@ mod subscription_tests {
         assert_eq!(EscrowError::PeriodNotDue.code(), 131);
         assert_eq!(EscrowError::InvalidEventCapacity.code(), 132);
         assert_eq!(EscrowError::InvalidInitializer.code(), 133);
+        assert_eq!(EscrowError::InvalidExpiryExtension.code(), 134);
         assert!(EscrowError::all().contains(&EscrowError::InvalidSubscription));
         assert!(EscrowError::all().contains(&EscrowError::PeriodNotDue));
         assert!(EscrowError::all().contains(&EscrowError::InvalidEventCapacity));
         assert!(EscrowError::all().contains(&EscrowError::InvalidInitializer));
+        assert!(EscrowError::all().contains(&EscrowError::InvalidExpiryExtension));
     }
 
     // ----- layout pins -----
@@ -19186,14 +19736,14 @@ mod subscription_tests {
     fn borsh_tail_pins_subscription_fields() {
         // Offsets: `default_confirmed` ends the AV-55 body at 986;
         // `subscription` at 986, `subscription_next` at 1004,
-        // `subscription_released` at 1005 (body total 2176).
+        // `subscription_released` at 1005 (body total 2192 after the AV-57 + AV-59 appends).
         let mut e = escrow()
             .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
             .unwrap();
         e.fund(ALICE).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2176);
+        assert_eq!(bytes.len(), 2192);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -19401,7 +19951,8 @@ mod event_history_tests {
             25
         );
         assert_eq!(EscrowEventKind::InitializerRotated.discriminant(), 26);
-        for d in 0..=26u8 {
+        assert_eq!(EscrowEventKind::ExpiryExtended.discriminant(), 27);
+        for d in 0..=27u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -19412,7 +19963,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(27), None);
+        assert_eq!(EscrowEventKind::from_discriminant(28), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -19424,9 +19975,9 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 531 + EVENT_HISTORY_LEN);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 531 + EVENT_HISTORY_LEN + 16);
     }
 
     #[test]
@@ -19434,13 +19985,13 @@ mod event_history_tests {
         // Offsets: `subscription_released` ends the AV-56 body at 1013;
         // `event_head` at 1013, `event_total` at 1014, `event_count` at
         // 1022, `event_capacity` at 1023, `event_slots` at 1024 (body
-        // total 2176).
+        // total 2192 after the AV-59 append).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2176);
+        assert_eq!(bytes.len(), 2192);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -19468,31 +20019,33 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18);
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16, "AV-59 tail");
     }
 
     #[test]
     fn rent_recomputed_from_mainnet_formula() {
         // AV-57 grows the account by 1163 bytes on top of the AV-56
-        // layout; the rent-exempt minimums are recomputed from the
-        // mainnet formula, not copied from the AV-56 numbers.
+        // layout, and AV-59 by 16 bytes on top of that (the
+        // max_extension_secs bound + the extension counter); the
+        // rent-exempt minimums are recomputed from the mainnet formula,
+        // not copied from the AV-57 numbers.
         let full = rent_exempt_minimum_lamports(
             VAULT_SPACE,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2184) * 3480 * 2 = 2312 * 6960 = 16_091_520 lamports.
-        assert_eq!(VAULT_SPACE, 2184);
-        assert_eq!(full, 16_091_520);
+        // (128 + 2200) * 3480 * 2 = 2328 * 6960 = 16_202_880 lamports.
+        assert_eq!(VAULT_SPACE, 2200);
+        assert_eq!(full, 16_202_880);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 1694) * 3480 * 2 = 1822 * 6960 = 12_681_120 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 1694);
-        assert_eq!(no_quorum, 12_681_120);
+        // (128 + 1710) * 3480 * 2 = 1838 * 6960 = 12_792_480 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 1710);
+        assert_eq!(no_quorum, 12_792_480);
     }
 
     // ----- decode -----
@@ -19524,7 +20077,7 @@ mod event_history_tests {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         // First slot's kind byte sits at body offset 1024.
         let kind_off = ANCHOR_DISCRIMINATOR_LEN + 1024;
-        for bad in [27u8, 42, 255] {
+        for bad in [28u8, 42, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
