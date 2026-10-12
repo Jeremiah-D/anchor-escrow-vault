@@ -74,6 +74,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `trigger_default_judgment(caller, now, payout_to)` (AV-55) | `Disputed` | `Settled` | **initializer or taker** (either party — a liveness backstop, not a power grant); only once `now >= disputed_at + deadline_secs` (the judgment's due time, `DefaultJudgmentNotDue` otherwise); settles on the pre-agreed split — fee slices the taker's share like `resolve`, quorum/vesting/timelock do *not* gate (same as `resolve`); the arbiter's `resolve` is unchanged and keeps priority — after the deadline either the arbiter resolves or a party triggers, first writer wins; in AV-65 panel mode the default judgment stays available (same deadline rules) and races the panel's M-vote settlement instead; emits `DefaultJudgment` |
 | `initialize_evidence_deadline(deadline_secs)` (AV-68) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — and only after the arbiter/panel is configured, `InvalidArbiter` otherwise); declares the window the escalating party gets to disclose the dispute evidence, measured from `disputed_at`; must be non-zero (`InvalidEvidenceDeadline`, code 138, otherwise) |
 | `submit_evidence(authority, evidence_hash, now)` (AV-68) | `Disputed` | `Disputed` (commitment recorded) | **escalating party only** (the party `escalate` recorded — a stranger or the counterparty is `Unauthorized`); overwrites any previously attached hash (a within-deadline submission may always refine the bundle); at or past the disclosure deadline the submission is rejected (`EvidenceDisclosureLate`, code 139) — the deadline is a hard bar, so a missed deadline locks in the judgment-time adverse inference; with no deadline configured disclosure is accepted at any time while `Disputed`; emits `EvidenceSubmitted` |
+| `update_panel_threshold(initializer, taker, new_threshold)` (AV-69) | `Uninitialized` | `Uninitialized` | **dual-signed** — the initializer AND the taker must both sign (one party alone, or a stranger pair, is `Unauthorized`); retunes the arbiter panel's M-of-N judgment threshold, 1 ≤ M ≤ N (`InvalidArbiterPanel`, code 136, for 0, above N, or no panel configured); a panel must be configured — there is no threshold to retune on a single-arbiter escrow; `Uninitialized` only — the threshold must be settled before the dispute starts, so an in-flight arbitration tallies under stable rules; the retune rewrites only the threshold — cast votes and the `voted` bitmask survive, counting continues under the new M; retuning to the current threshold is an idempotent no-op; emits `PanelThresholdChanged` only on an actual change |
 | `initialize_subscription(period_secs, periods, per_period)` (AV-56) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — mutually exclusive with `initialize_milestones`; declares the periodic release schedule, back-scheduled from `expires_at`: period `i` is due at `expires_at - (periods-1-i) * period_secs`; validation — `period_secs` non-zero, `periods` in 1..=64, `per_period` non-zero, `periods * per_period` == locked amount (in u128), `expires_at != u64::MAX`, and the schedule must fit the lifetime — is `InvalidSubscription` otherwise) |
 | `release_period(period_index)` (AV-56) | `Funded` | `Funded` (partial) / `Released` (last period) | initializer only (the initializer's push path); strictly in-order (`period_index` must equal the next due period — skip-ahead and replay are `PeriodNotDue`) and due-date gated (`now >= due_at(period_index)` — `PeriodNotDue` otherwise); quorum satisfied when configured (`QuorumNotReached`), the timelock gate when a lock is configured (`now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64); `TimelockNotReached` — the timelock gates every taker payout path); `MintMismatch` / `PayoutNotAllowlisted` guard the fund movement like `release`; the protocol fee slices the period (`payout + fee == per_period`); vesting claim composes (not blocked); emits `SubscriptionPeriodReleased` |
 | `initialize_milestones(milestones)`          | `Uninitialized`| `Uninitialized` | initializer (once, before funding; tranche amounts must sum to the locked amount) |
@@ -487,6 +488,30 @@ each disclosure. New vault fields (appended last):
 `evidence_deadline_secs` (u64) + `escalated_by`
 (`Option<Pubkey>`, 33 bytes) — 41 bytes, so the full vault is now 2941
 bytes / 21,360,240 lamports rent-exempt.
+
+**Panel threshold governance (AV-69).** The right M-of-N is not always
+obvious at setup — a 2-of-3 panel may prove too slow (one member goes
+quiet) or too lax (the parties want stronger consensus before a
+dispute can settle). `update_panel_threshold(initializer, taker,
+new_threshold)` retunes the panel's judgment threshold *before the
+dispute starts*: **dual-signed** (the initializer AND the taker must
+both authorize — one party alone must never be able to lower the bar
+toward a friendly minority or raise it to deadlock the panel),
+`Uninitialized` only (the threshold must be settled before the dispute,
+so an in-flight arbitration tallies under stable rules), and the new M
+must satisfy 1..=N — the same validation as the
+`with_arbiter_panel` builder, reusing `InvalidArbiterPanel` (code 136)
+for 0, above N, or no panel configured (there is no threshold to
+retune on a single-arbiter escrow). The retune rewrites only the
+threshold: cast votes and the `voted` bitmask survive, and counting
+continues under the new M — the panel's judgment history is
+append-only. Retuning to the current threshold is an idempotent no-op.
+The `PanelThresholdChanged` indexer event (`from == to ==
+Uninitialized`) fires only on an actual change — the event is the
+ordering signal, the new M is read from the vault. The snapshot export
+carries the retuned threshold, the IDL JSON carries the new
+instruction, and no vault layout change is needed (the threshold
+already lives in the persisted panel region).
 
 **Subscription release (AV-56).** A subscription is the clock-driven
 counterpart to the milestone tranche plan (AV-15): the initializer may
@@ -991,7 +1016,7 @@ program error per variant):
 | `InvalidInitializer` | 133 | `rotate_initializer` with the zero address (a zero address can never be the legitimate initializer) |
 | `InvalidExpiryExtension` | 134 | `initialize_extension` with a zero bound or on a non-`Uninitialized` escrow; `extend_expiry` with a deadline that is not later than the current one, whose increment exceeds the remaining budget, on an `Activated`/`Disputed`/terminal escrow, or when the deadline is already keeper-eligible (`now >= expires_at + grace_period`) |
 | `InvalidTimelock` | 135 | `with_timelock` with a nonzero `unlock_at` while a nonzero relative timelock is configured, or `with_relative_timelock` with a nonzero `secs` while a nonzero absolute timelock is configured (one clock per escrow) |
-| `InvalidArbiterPanel` | 136 | `with_arbiter_panel` with an empty member list, more than 8 members, a zero threshold, a threshold above the member count, a zero member key, or a duplicate member; `submit_panel_judgment` with no panel configured |
+| `InvalidArbiterPanel` | 136 | `with_arbiter_panel` with an empty member list, more than 8 members, a zero threshold, a threshold above the member count, a zero member key, or a duplicate member; `submit_panel_judgment` with no panel configured; `update_panel_threshold` (AV-69) with no panel configured or a new threshold outside 1..=N |
 | `PanelResolveDisabled` | 137 | `resolve` called on a panel-mode escrow — the panel's multisig judgment (`submit_panel_judgment`) is the only settlement path once a panel is configured |
 | `InvalidEvidenceDeadline` | 138 | `with_evidence_deadline` with a zero deadline — a zero-second deadline would lapse the moment the dispute starts |
 | `EvidenceDisclosureLate` | 139 | `submit_evidence` at or past the disclosure deadline without evidence on record — a missed deadline locks in the judgment-time adverse inference |
@@ -1264,7 +1289,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -1294,6 +1319,13 @@ successful calls that change nothing observable:
   changed, the new set is read from the vault (approval bits are
   remapped by pubkey: retained votes survive, removed voters' bits are
   cleared); a no-op same-set update emits nothing.
+- `update_panel_threshold` emits `PanelThresholdChanged` when the
+  panel's M-of-N threshold actually changes (`from == to ==
+  Uninitialized`, all amounts zero) — the ordering signal that the
+  judgment rule moved, the new M is read from the vault; cast votes
+  are untouched by the retune (the panel's judgment history is
+  append-only); a no-op retune to the current threshold emits
+  nothing.
 - `confirm_milestone` emits when the milestone becomes fully confirmed
   (the completing vote); the first party's confirmation alone emits
   nothing, paralleling `activate`.

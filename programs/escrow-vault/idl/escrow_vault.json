@@ -462,6 +462,14 @@
       "args": [
         {"name": "evidence_hash", "type": {"array": ["u8", 32]}}
       ]
+    },
+    {
+      "name": "update_panel_threshold",
+      "discriminator": [41, 32, 206, 239, 57, 111, 208, 123],
+      "accounts": [],
+      "args": [
+        {"name": "new_threshold", "type": "u8"}
+      ]
     }
   ],
   "accounts": [

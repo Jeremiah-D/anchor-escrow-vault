@@ -929,6 +929,55 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Retune the arbiter panel's judgment threshold by dual-signed
+    /// governance (AV-69; mirrors `Escrow::update_panel_threshold`):
+    /// the initializer AND the taker jointly set the M-of-N threshold
+    /// (1..=N), `Uninitialized` only. The retune rewrites only the
+    /// threshold — cast votes and the voted bitmask survive, and
+    /// counting continues under the new M. Retuning to the current
+    /// threshold is an idempotent no-op (no event). Mirrors
+    /// `EscrowEventKind::PanelThresholdChanged`, emitted only on an
+    /// actual change.
+    pub fn update_panel_threshold(
+        ctx: Context<UpdatePanelThreshold>,
+        new_threshold: u8,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        let threshold_before = escrow.arbiter_panel().map(|p| p.threshold);
+        escrow
+            .update_panel_threshold(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_threshold,
+            )
+            .map_err(|e| escrow_error(e))?;
+        let threshold_after = escrow.arbiter_panel().map(|p| p.threshold);
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-69: the PanelThresholdChanged event fires only on an
+        // actual change, paralleling `rotate_fee_recipient`'s no-op
+        // rule; `now` doubles as the event's `at`.
+        if threshold_before != threshold_after {
+            let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::PanelThresholdChanged,
+                from,
+                escrow.state() as u8,
+                0,
+                0,
+                0,
+                now,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Settle a disputed escrow (AV-14; mirrors `Escrow::resolve`):
     /// `Disputed -> Settled`. Only the configured arbiter signs;
     /// `taker_amount` is the taker's share of the remaining locked funds
@@ -3126,6 +3175,12 @@ pub enum EscrowVaultEventKind {
     /// event's evidence slot. Mirrors
     /// `escrow_state::EscrowEventKind::EvidenceSubmitted`.
     EvidenceSubmitted,
+    /// AV-69: the arbiter panel's judgment threshold was retuned by
+    /// dual-signed governance (`Escrow::update_panel_threshold`).
+    /// `from == to == Uninitialized`; emitted only on an actual
+    /// change. Mirrors
+    /// `escrow_state::EscrowEventKind::PanelThresholdChanged`.
+    PanelThresholdChanged,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -3194,6 +3249,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::EvidenceSubmitted => {
             EscrowVaultEventKind::EvidenceSubmitted
+        }
+        escrow_state::EscrowEventKind::PanelThresholdChanged => {
+            EscrowVaultEventKind::PanelThresholdChanged
         }
     }
 }
@@ -3573,6 +3631,23 @@ pub struct SubmitEvidence<'info> {
     /// CHECK: Solana clock sysvar, read for the disclosure-deadline
     /// check (never an instruction param — a caller-supplied timestamp
     /// could rewind past the deadline).
+    pub clock: AccountInfo<'info>,
+}
+
+/// Accounts for AV-69 `update_panel_threshold`: the vault plus both
+/// parties as signers (dual-signed governance — one party alone must
+/// never be able to lower the bar toward a friendly minority or raise
+/// it to deadlock the panel). The state machine rejects a stranger
+/// pair with `Unauthorized`; a constraint in the real build
+/// additionally asserts `initializer.key() == vault.initializer` and
+/// `taker.key() == vault.taker`.
+#[derive(Accounts)]
+pub struct UpdatePanelThreshold<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the event's `at` timestamp.
     pub clock: AccountInfo<'info>,
 }
 

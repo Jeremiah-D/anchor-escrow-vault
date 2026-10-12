@@ -143,7 +143,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | PartiallyCancelled (AV-60) | 0 | 0 | the partially-cancelled tranche, refunded to the whitelisted destination (the escrow stays `Funded`; the `released` counter is untouched) | 0 |
@@ -375,6 +375,17 @@ pub enum EscrowEventKind {
     /// what the arbiter can review. All amounts are zero — disclosure
     /// moves no funds.
     EvidenceSubmitted,
+    /// AV-69: the arbiter panel's judgment threshold was retuned by
+    /// dual-signed governance ([`Escrow::update_panel_threshold`]).
+    /// `from == to == Uninitialized` (a config change, not a lifecycle
+    /// move — like [`EscrowEventKind::QuorumUpdated`]); the new
+    /// threshold is read from the vault, the event is the ordering
+    /// signal. Emitted only on an actual change: retuning to the
+    /// current threshold is an idempotent no-op that emits nothing
+    /// (paralleling [`EscrowEventKind::FeeRecipientRotated`]'s no-op
+    /// rule). Cast votes are untouched by the retune — the panel's
+    /// judgment history is append-only.
+    PanelThresholdChanged,
 }
 
 impl EscrowEventKind {
@@ -435,6 +446,9 @@ impl EscrowEventKind {
             // discriminants 0–32 stay stable for already-serialized
             // histories.
             33 => Self::EvidenceSubmitted,
+            // AV-69: appended after EvidenceSubmitted so discriminants
+            // 0–33 stay stable for already-serialized histories.
+            34 => Self::PanelThresholdChanged,
             _ => return None,
         })
     }
@@ -477,6 +491,7 @@ impl EscrowEventKind {
             Self::PanelResolved => "panel_resolved",
             Self::FeeRecipientRotated => "fee_recipient_rotated",
             Self::EvidenceSubmitted => "evidence_submitted",
+            Self::PanelThresholdChanged => "panel_threshold_changed",
         }
     }
 }
@@ -2080,6 +2095,42 @@ impl IndexedEscrow {
             );
         }
         Ok(settled)
+    }
+
+    /// Retune the arbiter panel's judgment threshold by dual-signed
+    /// governance (mirrors [`Escrow::update_panel_threshold`], AV-69).
+    /// Emits `PanelThresholdChanged` (`from == to == Uninitialized`)
+    /// only on an actual change — retuning to the current threshold is
+    /// an idempotent no-op that emits nothing (paralleling
+    /// `rotate_fee_recipient`'s no-op rule); `at` is the caller-supplied
+    /// event timestamp. Cast votes are untouched by the retune.
+    pub fn update_panel_threshold(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_threshold: u8,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let threshold_before = self.inner.arbiter_panel().map(|p| p.threshold);
+        self.inner
+            .update_panel_threshold(initializer, taker, new_threshold)?;
+        let threshold_after = self.inner.arbiter_panel().map(|p| p.threshold);
+        if threshold_before != threshold_after {
+            self.push_event(
+                EscrowEventKind::PanelThresholdChanged,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
     }
 
     /// Confirm a milestone for the release path (mirrors
@@ -3813,4 +3864,66 @@ mod event_tests {
             EscrowError::InvalidEventCapacity
         );
     }
+    // ---------- AV-69: PanelThresholdChanged events ----------
+    const PM1: [u8; 32] = [0xC1; 32];
+    const PM2: [u8; 32] = [0xC2; 32];
+    const PM3: [u8; 32] = [0xC3; 32];
+
+    fn panel_indexed(threshold: u8) -> IndexedEscrow {
+        IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_arbiter_panel(&[PM1, PM2, PM3], threshold)
+            .unwrap()
+    }
+
+    #[test]
+    fn panel_threshold_changed_emits_event_on_change() {
+        let mut e = panel_indexed(3);
+        let before = e.event_count();
+        e.update_panel_threshold(ALICE, BOB, 2, T0 + 1).unwrap();
+        assert_eq!(e.event_count(), before + 1, "one event on change");
+        let ev = e.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::PanelThresholdChanged);
+        assert_eq!(ev.from, EscrowState::Uninitialized);
+        assert_eq!(ev.to, EscrowState::Uninitialized);
+        assert_eq!(ev.amounts, EventAmounts::none(), "moves no funds");
+        // The new threshold is read from the vault: the event is the
+        // ordering signal.
+        assert_eq!(
+            e.inner().arbiter_panel().unwrap().threshold,
+            2,
+            "vault carries the retuned M"
+        );
+    }
+
+    #[test]
+    fn panel_threshold_changed_no_op_emits_nothing() {
+        let mut e = panel_indexed(2);
+        let before = e.event_count();
+        e.update_panel_threshold(ALICE, BOB, 2, T0 + 1).unwrap();
+        assert_eq!(e.event_count(), before, "no-op retune emits nothing");
+    }
+
+    #[test]
+    fn panel_threshold_changed_unauthorized_emits_nothing() {
+        let mut e = panel_indexed(2);
+        let before = e.event_count();
+        assert_eq!(
+            e.update_panel_threshold(ALICE, MALLORY, 1, T0 + 1)
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(e.event_count(), before, "failed call emits nothing");
+    }
+
+    #[test]
+    fn panel_threshold_changed_kind_round_trips() {
+        // discriminant 34: appended last, 0–33 stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::PanelThresholdChanged;
+        assert_eq!(kind.discriminant(), 34);
+        assert_eq!(EscrowEventKind::from_discriminant(34), Some(kind));
+        assert_eq!(kind.name(), "panel_threshold_changed");
+    }
+
 }

@@ -5311,6 +5311,80 @@ impl Escrow {
         Ok(Some((taker_amount - fee, fee, remaining - taker_amount)))
     }
 
+    /// Update the arbiter panel's judgment threshold by dual-signed
+    /// governance (AV-69 — Solana governance): the initializer AND the
+    /// taker jointly retune the M-of-N threshold of the opt-in panel
+    /// ([`Escrow::with_arbiter_panel`]).
+    ///
+    /// Why: the right M is not always obvious at setup — a 2-of-3 panel
+    /// may prove too slow (one member goes quiet) or too lax (the
+    /// parties want stronger consensus before a dispute can settle).
+    /// Retuning needs *both* parties: one party alone must never be
+    /// able to lower the bar toward a friendly minority (or raise it to
+    /// deadlock the panel) — the threshold is a bilateral governance
+    /// parameter, mirroring AV-25's dual-signed quorum updates and
+    /// AV-67's dual-signed fee-recipient rotation.
+    ///
+    /// Only valid on an `Uninitialized` escrow — the item's
+    /// "Uninitialized/Initialized" is the setup phase (there is no
+    /// `Initialized` [`EscrowState`] variant; the setup-phase state is
+    /// `Uninitialized`), and `Disputed` is excluded a fortiori: the
+    /// threshold must be settled before the dispute starts, so an
+    /// in-flight arbitration tallies under stable rules
+    /// ([`EscrowError::InvalidStateTransition`] otherwise). A panel
+    /// must be configured ([`EscrowError::InvalidArbiterPanel`]
+    /// otherwise — there is no threshold to retune on a single-arbiter
+    /// or arbiter-less escrow). The new threshold must satisfy `1 <= M
+    /// <= N` ([`EscrowError::InvalidArbiterPanel`] otherwise — the same
+    /// validation as the [`ArbiterPanel::new`] builder, so the update
+    /// can never produce a panel the builder would reject).
+    ///
+    /// Votes are untouched: the update rewrites only `threshold`, so
+    /// every cast vote (and the `voted` bitmask) survives and counting
+    /// continues under the new M — the panel's judgment history is
+    /// append-only. Retuning to the current threshold is an idempotent
+    /// no-op success (paralleling
+    /// [`Escrow::rotate_fee_recipient`]'s no-op rule); the
+    /// [`EscrowEventKind::PanelThresholdChanged`](crate::EscrowEventKind::PanelThresholdChanged)
+    /// indexer event fires only on an actual change.
+    ///
+    /// Check order is deliberate: pause, then the dual authority (one
+    /// party alone — or a stranger pair — learns nothing), then state,
+    /// then panel configuration, then the threshold value — mirroring
+    /// [`Escrow::rotate_fee_recipient`]'s check order.
+    pub fn update_panel_threshold(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_threshold: u8,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the *current* initializer and
+        // the *current* taker must authorize. Independent `==` checks
+        // (not `||`): the degenerate initializer == taker self-escrow
+        // authorizes with one key passed twice, like AV-12's
+        // activation.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let mut panel = self.arbiter_panel.ok_or(EscrowError::InvalidArbiterPanel)?;
+        // The builder's threshold validation, reused: M in 1..=N.
+        if new_threshold == 0 || new_threshold > panel.n {
+            return Err(EscrowError::InvalidArbiterPanel);
+        }
+        if new_threshold == panel.threshold {
+            return Ok(());
+        }
+        panel.threshold = new_threshold;
+        self.arbiter_panel = Some(panel);
+        Ok(())
+    }
+
     /// The Unix timestamp at which the escrow entered `Disputed`,
     /// recorded by [`Escrow::escalate`]; `0` when the escrow was never
     /// disputed (AV-55). The pre-agreed default judgment's deadline is
@@ -10194,6 +10268,18 @@ pub(crate) mod anchor_idl_tests {
             method: "Escrow::submit_evidence",
             input_mapping: "evidence_hash <- param; authority <- accounts.authority (signer: must equal the escalating party recorded by escalate - a stranger or the counterparty is Unauthorized); now <- clock sysvar (NOT an instruction param - a caller-supplied timestamp could rewind past the disclosure deadline); Disputed only (InvalidStateTransition otherwise); at or past the disclosure deadline the submission is rejected (EvidenceDisclosureLate, code 139); with no deadline configured disclosure is accepted at any time while Disputed; emits the EvidenceSubmitted indexer event",
         },
+        InstructionSpec {
+            // AV-69: retune the arbiter panel's M-of-N judgment
+            // threshold by dual-signed governance.
+            name: "update_panel_threshold",
+            params: &[(
+                "new_threshold",
+                "u8",
+                "instruction param; the panel's new judgment threshold M (1..=N)",
+            )],
+            method: "Escrow::update_panel_threshold",
+            input_mapping: "new_threshold <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) - both current parties must authorize (a stranger pair or one party alone is Unauthorized); Uninitialized only (InvalidStateTransition otherwise - the threshold must be settled before the dispute, so an in-flight arbitration tallies under stable rules); a panel must be configured (InvalidArbiterPanel otherwise); new_threshold must satisfy 1 <= M <= N (InvalidArbiterPanel otherwise - the builder's validation, reused); the update rewrites only threshold - cast votes and the voted bitmask survive, counting continues under the new M; retuning to the current threshold is an idempotent no-op; emits the PanelThresholdChanged indexer event only on an actual change",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -10298,6 +10384,8 @@ pub(crate) mod anchor_idl_tests {
             // AV-68: dispute-evidence disclosure deadline + disclosure.
             "Escrow::with_evidence_deadline",
             "Escrow::submit_evidence",
+            // AV-69: panel threshold governance.
+            "Escrow::update_panel_threshold",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -10321,7 +10409,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_forty_three_instructions_take_params() {
+    fn only_forty_four_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -10376,6 +10464,7 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_relative_timelock",
                 &"initialize_evidence_deadline",
                 &"submit_evidence",
+                &"update_panel_threshold",
             ]
         );
     }
@@ -12025,6 +12114,10 @@ pub(crate) mod anchor_idl_tests {
         // authority account (a non-param account input, documented in
         // FIELD_SOURCES).
         ("submit_evidence", "evidence_hash", "evidence_hash"),
+        // AV-69: the dual-signed governance update writes the panel's
+        // threshold (a dotted sub-field path, like `quorum.threshold`
+        // for AV-25's update_quorum).
+        ("update_panel_threshold", "new_threshold", "arbiter_panel.threshold"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -12064,6 +12157,31 @@ pub(crate) mod anchor_idl_tests {
         (
             "quorum.registered",
             "derived from attestors.len() by initialize_quorum",
+        ),
+        // AV-69: the panel region's non-threshold sub-fields — all
+        // written by `initialize_arbiter_panel` (members and n from its
+        // params, votes zeroed, voted zeroed) and never rewritten
+        // afterward: `update_panel_threshold` rewrites only
+        // `arbiter_panel.threshold` (a PARAM_FIELD_MAP param source),
+        // and `submit_panel_judgment` mutates votes/voted in place as
+        // transition side effects, not as instruction params.
+        (
+            "arbiter_panel.n",
+            "set by initialize_arbiter_panel (member count 1..=8)",
+        ),
+        (
+            "arbiter_panel.members",
+            "set by initialize_arbiter_panel (the 1..=8 member keys)",
+        ),
+        (
+            "arbiter_panel.votes",
+            "zeroed by initialize_arbiter_panel; entries written in place \
+             by submit_panel_judgment (one effective vote per member)",
+        ),
+        (
+            "arbiter_panel.voted",
+            "zeroed by initialize_arbiter_panel; bits set in place by \
+             submit_panel_judgment",
         ),
         (
             "quorum.approvals",
@@ -12210,6 +12328,19 @@ pub(crate) mod anchor_idl_tests {
                 paths.extend(["vesting.start", "vesting.end", "vesting.cliff_at"]);
             } else if *name == "milestones" {
                 paths.extend(["milestones.amounts", "milestones.count"]);
+            } else if *name == "arbiter_panel" {
+                // AV-69: the whole panel region (the builder's target)
+                // plus its sub-fields, for dotted param mappings like
+                // `arbiter_panel.threshold` (the dual-signed governance
+                // update's target).
+                paths.push(name);
+                paths.extend([
+                    "arbiter_panel.n",
+                    "arbiter_panel.threshold",
+                    "arbiter_panel.members",
+                    "arbiter_panel.votes",
+                    "arbiter_panel.voted",
+                ]);
             } else {
                 paths.push(name);
             }
@@ -17422,6 +17553,216 @@ mod evidence_deadline_tests {
         assert_eq!(&bytes[2892..2900], &[0u8; 8], "deadline zeroed");
         assert_eq!(bytes[2900], 0, "escalated_by: None discriminant");
         assert_eq!(&bytes[2901..2933], &[0u8; 32], "escalated_by zeroed");
+    }
+}
+
+// ---------- AV-69: panel threshold governance ----------
+//
+// The arbiter panel's M-of-N judgment threshold is retunable by
+// dual-signed governance before the dispute starts; the retune
+// rewrites only the threshold — cast votes (and the voted bitmask)
+// survive, and counting continues under the new M.
+mod panel_threshold_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const M1: [u8; 32] = [0xC1; 32];
+    const M2: [u8; 32] = [0xC2; 32];
+    const M3: [u8; 32] = [0xC3; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+
+    fn panel_escrow(threshold: u8) -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], threshold)
+            .unwrap()
+    }
+
+    fn threshold_of(e: &Escrow) -> u8 {
+        e.arbiter_panel().expect("panel configured").threshold
+    }
+
+    #[test]
+    fn dual_signature_required() {
+        // One party alone — or a stranger pair — cannot retune.
+        let mut e = panel_escrow(2);
+        assert_eq!(
+            e.update_panel_threshold(ALICE, MALLORY, 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.update_panel_threshold(MALLORY, BOB, 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.update_panel_threshold(MALLORY, MALLORY, 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(threshold_of(&e), 2, "failed call changes nothing");
+        // Both current parties: ok.
+        e.update_panel_threshold(ALICE, BOB, 1).unwrap();
+        assert_eq!(threshold_of(&e), 1);
+    }
+
+    #[test]
+    fn self_escrow_authorizes_with_one_key_twice() {
+        // Degenerate initializer == taker: one key passed twice, like
+        // AV-12's activation.
+        let mut e = Escrow::initialize(ALICE, ALICE, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.update_panel_threshold(ALICE, ALICE, 3).unwrap();
+        assert_eq!(threshold_of(&e), 3);
+    }
+
+    #[test]
+    fn uninitialized_only_disputed_excluded() {
+        // The threshold must be settled before the dispute starts, so
+        // an in-flight arbitration tallies under stable rules.
+        let mut e = panel_escrow(2);
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            e.update_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        e.escalate(ALICE, T0 + 10, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(
+            e.update_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(threshold_of(&e), 2, "failed call changes nothing");
+    }
+
+    #[test]
+    fn requires_a_configured_panel() {
+        // No panel (single arbiter or arbiter-less): nothing to
+        // retune.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        assert_eq!(
+            e.update_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            e.update_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(EscrowError::InvalidArbiterPanel.code(), 136);
+    }
+
+    #[test]
+    fn threshold_bounds_are_one_to_n() {
+        // The builder's validation, reused: M in 1..=N.
+        let mut e = panel_escrow(2);
+        assert_eq!(
+            e.update_panel_threshold(ALICE, BOB, 0),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(
+            e.update_panel_threshold(ALICE, BOB, 4),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(threshold_of(&e), 2, "failed call changes nothing");
+        e.update_panel_threshold(ALICE, BOB, 1).unwrap();
+        assert_eq!(threshold_of(&e), 1);
+        e.update_panel_threshold(ALICE, BOB, 3).unwrap();
+        assert_eq!(threshold_of(&e), 3);
+    }
+
+    #[test]
+    fn same_threshold_is_an_idempotent_no_op() {
+        let mut e = panel_escrow(2);
+        e.update_panel_threshold(ALICE, BOB, 2).unwrap();
+        assert_eq!(threshold_of(&e), 2);
+    }
+
+    #[test]
+    fn retune_rewrites_only_the_threshold() {
+        // Members, votes and the voted bitmask survive the retune —
+        // the panel's judgment history is append-only.
+        let mut e = panel_escrow(3);
+        e.update_panel_threshold(ALICE, BOB, 1).unwrap();
+        let panel = e.arbiter_panel().unwrap();
+        assert_eq!(panel.n, 3);
+        assert_eq!(panel.threshold, 1);
+        assert_eq!(&panel.members[..3], &[M1, M2, M3]);
+        assert_eq!(panel.voted, 0);
+    }
+
+    #[test]
+    fn lowered_threshold_governs_later_settlement() {
+        // 3-of-3 retuned to 1-of-3: a single vote settles once the
+        // dispute starts — counting continues under the new M.
+        let mut e = panel_escrow(3);
+        e.update_panel_threshold(ALICE, BOB, 1).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.escalate(ALICE, T0 + 10, None).unwrap();
+        let settled = e
+            .submit_panel_judgment(M1, 600_000, None, None, BOB)
+            .unwrap();
+        assert!(settled.is_some(), "one vote settles at M=1");
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn raised_threshold_delays_settlement() {
+        // 1-of-3 retuned to 3-of-3: two matching votes no longer
+        // settle; the third does.
+        let mut e = panel_escrow(1);
+        e.update_panel_threshold(ALICE, BOB, 3).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.escalate(ALICE, T0 + 10, None).unwrap();
+        assert!(e
+            .submit_panel_judgment(M1, 600_000, None, None, BOB)
+            .unwrap()
+            .is_none());
+        assert!(e
+            .submit_panel_judgment(M2, 600_000, None, None, BOB)
+            .unwrap()
+            .is_none());
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert!(e
+            .submit_panel_judgment(M3, 600_000, None, None, BOB)
+            .unwrap()
+            .is_some());
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn paused_escrow_rejects_the_retune() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap();
+        e.pause(ALICE).unwrap();
+        assert_eq!(
+            e.update_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::Paused)
+        );
+    }
+
+    #[test]
+    fn retune_persists_through_serialization() {
+        // The threshold lives in the persisted panel region — a
+        // decode carries the retuned M.
+        let mut e = panel_escrow(3);
+        e.update_panel_threshold(ALICE, BOB, 2).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        let mut full = crate::discriminator::vault_account_discriminator().to_vec();
+        full.extend_from_slice(&bytes);
+        let decoded = crate::discriminator::decode_vault_account(&full).unwrap();
+        assert_eq!(threshold_of(&decoded), 2);
     }
 }
 
@@ -23031,7 +23372,12 @@ mod event_history_tests {
             33,
             "AV-68: appended after FeeRecipientRotated"
         );
-        for d in 0..=33u8 {
+        assert_eq!(
+            EscrowEventKind::PanelThresholdChanged.discriminant(),
+            34,
+            "AV-69: appended after EvidenceSubmitted"
+        );
+        for d in 0..=34u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -23042,7 +23388,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(34), None);
+        assert_eq!(EscrowEventKind::from_discriminant(35), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -23159,10 +23505,11 @@ mod event_history_tests {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         // First slot's kind byte sits at body offset 1024.
         let kind_off = ANCHOR_DISCRIMINATOR_LEN + 1024;
-        // AV-68: discriminants 30/31 are `PanelJudgment` /
-        // `PanelResolved`, 32 is `FeeRecipientRotated` and 33 is
-        // `EvidenceSubmitted`; 34 is the first still-unknown byte.
-        for bad in [34u8, 42, 255] {
+        // AV-69: discriminants 30/31 are `PanelJudgment` /
+        // `PanelResolved`, 32 is `FeeRecipientRotated`, 33 is
+        // `EvidenceSubmitted` and 34 is `PanelThresholdChanged`; 35 is
+        // the first still-unknown byte.
+        for bad in [35u8, 42, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

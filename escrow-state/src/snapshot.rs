@@ -1316,4 +1316,29 @@ mod snapshot_tests {
             "empty history must serialize, got: {json}"
         );
     }
+    #[test]
+    fn snapshot_exports_retuned_panel_threshold() {
+        // AV-69 passthrough: the retuned M shows up in the panel
+        // snapshot, and the JSON round-trips it.
+        const M1: [u8; 32] = [0xC1; 32];
+        const M2: [u8; 32] = [0xC2; 32];
+        const M3: [u8; 32] = [0xC3; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, VEST_END)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 3)
+            .unwrap();
+        e.update_panel_threshold(ALICE, BOB, 2).unwrap();
+        let snap = e.snapshot(MID);
+        let panel = snap.arbiter_panel.as_ref().expect("panel exported");
+        assert_eq!(panel.n, 3);
+        assert_eq!(panel.threshold, 2, "retuned M exported");
+        assert_eq!(panel.members.len(), 3);
+        assert!(panel.votes.is_empty(), "no votes yet");
+        let json = snap.to_json();
+        assert!(
+            json.contains("\"threshold\":2"),
+            "JSON carries the retuned M, got: {json}"
+        );
+    }
+
 }

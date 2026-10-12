@@ -228,3 +228,59 @@ fn release_before_quorum_threshold_is_rejected() {
     assert_eq!(escrow.state(), EscrowState::Funded, "funds stay locked");
     assert_eq!(escrow.amount(), AMOUNT, "amount untouched");
 }
+
+/// Governance path: `update_panel_threshold` retunes the arbiter
+/// panel's M-of-N judgment threshold by dual-signed governance
+/// (AV-69). The Anchor instruction carries `new_threshold` plus two
+/// signers (initializer + taker); the state machine rejects one party
+/// alone with `Unauthorized`.
+#[test]
+#[ignore]
+fn panel_threshold_retune_happy_path() {
+    require_local_validator();
+
+    const M1: [u8; 32] = [0xC1; 32];
+    const M2: [u8; 32] = [0xC2; 32];
+    const M3: [u8; 32] = [0xC3; 32];
+    let init_call = InstructionCall {
+        name: "initialize",
+        params: vec![("amount", AMOUNT), ("expires_at", EXPIRES_AT)],
+        signers: vec![ALICE],
+    };
+    let mut escrow = apply_initialize(&init_call, ALICE, BOB)
+        .with_arbiter_panel(&[M1, M2, M3], 3)
+        .expect("panel attach on Uninitialized must succeed");
+
+    // The instruction the Anchor program would receive:
+    // `update_panel_threshold(new_threshold = 2)` with initializer and
+    // taker as signers.
+    let retune_call = InstructionCall {
+        name: "update_panel_threshold",
+        params: vec![("new_threshold", 2)],
+        signers: vec![ALICE, BOB],
+    };
+    let new_threshold = retune_call.params[0].1;
+    assert!(retune_call.signers.contains(&ALICE));
+    assert!(retune_call.signers.contains(&BOB));
+    escrow
+        .update_panel_threshold(ALICE, BOB, new_threshold as u8)
+        .expect("dual-signed retune must succeed");
+    assert_eq!(
+        escrow.arbiter_panel().expect("panel must exist").threshold,
+        2,
+        "retuned M must persist"
+    );
+    assert_eq!(escrow.state(), EscrowState::Uninitialized);
+
+    // One party alone: Unauthorized, threshold untouched.
+    assert_eq!(
+        escrow.update_panel_threshold(ALICE, ALICE, 1),
+        Err(EscrowError::Unauthorized),
+        "single-party retune must be Unauthorized"
+    );
+    assert_eq!(
+        escrow.arbiter_panel().expect("panel must exist").threshold,
+        2,
+        "failed retune changes nothing"
+    );
+}
