@@ -688,6 +688,18 @@ pub struct Escrow {
     /// and its votes survive serialization. Appended last, so every
     /// earlier field offset stays stable.
     arbiter_panel: Option<ArbiterPanel>,
+    /// AV-66: opt-in tiered protocol-fee schedule (see
+    /// [`Escrow::with_fee_schedule`]). `tier_count == 0` (the default)
+    /// means no schedule — backward compatible: the fee falls back to
+    /// the flat [`Escrow::with_protocol_fee`] rate. Mutually exclusive
+    /// with the flat rate: [`EscrowError::InvalidProtocolFee`] when a
+    /// nonzero flat rate is already configured. Set once on an
+    /// `Uninitialized` escrow, like the other `with_*` builders.
+    /// Persisted as [`FEE_SCHEDULE_LEN`] bytes in the vault account
+    /// (the 1-byte live-tier count plus 8 fixed 10-byte tier slots)
+    /// so the tiers survive serialization. Appended last, so every
+    /// earlier field offset stays stable.
+    fee_schedule: FeeSchedule,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -809,6 +821,11 @@ pub enum EscrowError {
     /// valid rate. Parallels [`EscrowError::InvalidQuorum`],
     /// [`EscrowError::InvalidVesting`], [`EscrowError::InvalidArbiter`]
     /// and [`EscrowError::InvalidMint`] (config error).
+    /// AV-66: also the tiered-schedule error — [`Escrow::with_fee_schedule`]
+    /// with an empty or over-long tier list, a tier `bps > 10_000`, or
+    /// non-strictly-ascending `min_amount` floors, and the flat-rate /
+    /// schedule mutual-exclusion conflict in either direction (fail-fast:
+    /// a rate configuration must never silently drop another).
     InvalidProtocolFee,
     /// Grace period misconfiguration (AV-21):
     /// [`Escrow::with_grace_period`] where `expires_at + grace_period`
@@ -1444,6 +1461,94 @@ impl ArbiterPanel {
         self.matching_votes(vote) >= self.threshold as usize
     }
 }
+
+/// Maximum number of tiers in a protocol-fee schedule (AV-66 — the
+/// attestor/panel 8-slot convention): fixed-size arrays keep the vault
+/// layout static and the crate heap-free.
+pub const MAX_FEE_TIERS: usize = 8;
+
+/// Serialized length of one [`FeeTier`] (AV-66): the tier floor
+/// (`u64` min amount in lamports) plus the tier rate (`u16` basis
+/// points) — `8 + 2`.
+pub const FEE_TIER_LEN: usize = 8 + 2;
+
+/// Serialized length of [`FeeSchedule`] (AV-66): the live-tier count
+/// (`u8`) plus the 8 fixed tier slots (`8 * `[`FEE_TIER_LEN`] bytes)
+/// — `1 + 80`.
+pub const FEE_SCHEDULE_LEN: usize = 1 + MAX_FEE_TIERS * FEE_TIER_LEN;
+
+/// One tier of the opt-in protocol-fee schedule (AV-66 — Solana/DeFi
+/// volume pricing: the protocol fee rate steps down (or up) with the
+/// payout size, like exchange maker/taker ladders). Tiers are ordered
+/// by `min_amount` strictly ascending; the fee for a gross payout
+/// uses the *highest* tier whose `min_amount <= amount`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FeeTier {
+    /// The smallest gross payout (in lamports) this tier applies to.
+    /// Tier 0's floor is conventionally `0` (every payout hits at
+    /// least one tier); strictly increasing across the schedule,
+    /// enforced by [`Escrow::with_fee_schedule`].
+    pub min_amount: u64,
+    /// The protocol-fee rate for payouts in this tier, in basis
+    /// points (`0..=10_000`), enforced by
+    /// [`Escrow::with_fee_schedule`].
+    pub bps: u16,
+}
+
+/// The opt-in tiered protocol-fee schedule (AV-66): replaces the flat
+/// [`Escrow::with_protocol_fee`] rate (the two are mutually exclusive)
+/// with up to 8 amount-based tiers, so the protocol can charge
+/// volume-priced fees — e.g. 250 bps under 1 SOL, 100 bps from 1 SOL,
+/// 25 bps from 100 SOL.
+///
+/// Set once via [`Escrow::with_fee_schedule`] on an `Uninitialized`
+/// escrow. Always present in the vault account (81 bytes: 1-byte live
+/// tier count + 8 fixed 10-byte tier slots, zeroed when no schedule is
+/// configured) so the opt-in writes in place; appended last so every
+/// earlier field offset stays stable. `tier_count == 0` (the default)
+/// means "no schedule" — backward compatible: the fee falls back to
+/// the flat `fee_bps` rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FeeSchedule {
+    /// How many tier slots are live (`0..=8`); `0` means no schedule.
+    pub tier_count: u8,
+    /// The tiers in slot order; only `tiers[..tier_count]` are
+    /// meaningful, the tail is zeroed. Sorted by `min_amount`
+    /// strictly ascending (enforced at configuration time).
+    pub tiers: [FeeTier; MAX_FEE_TIERS],
+}
+
+impl FeeSchedule {
+    /// True when a schedule is configured (at least one live tier).
+    pub fn is_configured(&self) -> bool {
+        self.tier_count > 0
+    }
+
+    /// The basis-point rate for a gross payout of `amount` (AV-66):
+    /// the rate of the highest live tier whose `min_amount <=
+    /// amount`. Tiers are stored strictly ascending, so a forward
+    /// scan with early break finds it in one pass. An amount below
+    /// the first floor matches no tier, so the rate is `0` — a
+    /// schedule whose first floor sits above zero leaves sub-floor
+    /// payouts fee-free, the conservative reading of "the highest
+    /// tier with `min_amount <= amount`"; the conventional schedule
+    /// floors tier 0 at `0` so every payout hits a tier.
+    ///
+    /// Panic-free: only reads `tiers[..tier_count]` (`tier_count <= 8`
+    /// is enforced at configuration and decode time).
+    pub fn bps_for(&self, amount: u64) -> u16 {
+        let mut rate = 0u16;
+        let live = (self.tier_count as usize).min(MAX_FEE_TIERS);
+        for tier in self.tiers[..live].iter() {
+            if amount >= tier.min_amount {
+                rate = tier.bps;
+            } else {
+                break;
+            }
+        }
+        rate
+    }
+}
 /// per-period released bitmap (`Escrow::subscription_released`) fits a
 /// `u64` — one bit per period, `1 << period_index` — and so the crate
 /// stays heap-free and `Copy`.
@@ -2075,6 +2180,7 @@ impl Escrow {
             // `with_arbiter_panel` before funding — mutually exclusive
             // with `with_arbiter`, last-wins.
             arbiter_panel: None,
+            fee_schedule: FeeSchedule::default(),
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -3182,10 +3288,18 @@ impl Escrow {
     /// carry a fee: only value the taker receives is feeable, and the
     /// fee is always a routing slice of the gross payout — it never
     /// takes the cumulative released total past the locked amount.
+    ///
+    /// AV-66: mutually exclusive with [`Escrow::with_fee_schedule`]
+    /// (fail-fast, [`EscrowError::InvalidProtocolFee`]): a flat rate
+    /// cannot silently replace a configured tier schedule, nor vice
+    /// versa — silent rate replacement is a fund-routing hazard.
     pub fn with_protocol_fee(mut self, fee_bps: u16) -> Result<Self, EscrowError> {
         match self.state {
             EscrowState::Uninitialized => {}
             _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if self.fee_schedule.is_configured() {
+            return Err(EscrowError::InvalidProtocolFee);
         }
         if fee_bps > 10_000 {
             return Err(EscrowError::InvalidProtocolFee);
@@ -3197,10 +3311,16 @@ impl Escrow {
     /// The protocol fee for a gross taker payout of `amount` (AV-17):
     /// `floor(amount * fee_bps / 10_000)`.
     ///
-    /// Computed in `u128`: `amount * fee_bps` can reach
+    /// AV-66: when a tiered schedule is configured
+    /// ([`Escrow::with_fee_schedule`]), the rate is the schedule's
+    /// tier rate for `amount` ([`FeeSchedule::bps_for`]) instead of
+    /// the flat `fee_bps`; the `floor(amount * bps / 10_000)`
+    /// computation is identical otherwise.
+    ///
+    /// Computed in `u128`: `amount * bps` can reach
     /// `u64::MAX * 10_000 < u128::MAX`, so the multiplication cannot
     /// overflow, and the floored quotient is `<= amount` (since
-    /// `fee_bps <= 10_000`), so the downcast is exact. Floor rounding
+    /// `bps <= 10_000`), so the downcast is exact. Floor rounding
     /// means dust payouts may carry a zero fee — the protocol never
     /// rounds *up* into the taker's pocket.
     ///
@@ -3217,7 +3337,12 @@ impl Escrow {
     /// capped fee is `<=` the uncapped bps fee `<=` the gross payout,
     /// so the `fees_paid <= released` invariant holds under any cap.
     pub fn protocol_fee_for(&self, amount: u64) -> u64 {
-        let bps_fee = ((amount as u128 * self.fee_bps as u128) / 10_000u128) as u64;
+        let rate = if self.fee_schedule.is_configured() {
+            self.fee_schedule.bps_for(amount)
+        } else {
+            self.fee_bps
+        };
+        let bps_fee = ((amount as u128 * rate as u128) / 10_000u128) as u64;
         if self.fee_cap > 0 {
             bps_fee.min(self.fee_cap)
         } else {
@@ -3249,7 +3374,9 @@ impl Escrow {
 
     /// The protocol fee rate in basis points configured via
     /// [`Escrow::with_protocol_fee`]; `0` when no fee is configured
-    /// (backward compatible).
+    /// (backward compatible) or when the AV-66 tiered schedule is in
+    /// use — the flat rate and the schedule are mutually exclusive,
+    /// so a configured schedule always pairs with `fee_bps == 0`.
     pub fn fee_bps(&self) -> u16 {
         self.fee_bps
     }
@@ -3348,6 +3475,73 @@ impl Escrow {
     /// whatever the bps rate computes).
     pub fn fee_cap(&self) -> u64 {
         self.fee_cap
+    }
+
+    /// Opt in to a tiered protocol-fee schedule (AV-66 — Solana/DeFi
+    /// volume pricing): `tiers` is the amount-to-rate ladder as
+    /// `(min_amount, bps)` pairs — the fee for a gross payout uses
+    /// the rate of the highest tier with `min_amount <= amount` (see
+    /// [`FeeSchedule::bps_for`]), then still floored by the AV-63
+    /// `fee_cap` when one is set.
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// ladder is fixed before any funds move — mirroring
+    /// [`Escrow::with_protocol_fee`]. Re-configuring a live escrow is
+    /// rejected with `InvalidStateTransition`.
+    ///
+    /// Validation ([`EscrowError::InvalidProtocolFee`] — no new code,
+    /// the schedule is a fee-rate configuration): at least one tier
+    /// and at most [`MAX_FEE_TIERS`] (8); every `bps <= 10_000`; the
+    /// `min_amount` floors strictly ascending (the tier lookup scans
+    /// them in slot order). A flat rate and a schedule are mutually
+    /// exclusive — fail-fast, never silent last-wins: configuring
+    /// when a nonzero `fee_bps` is already set (or calling
+    /// [`Escrow::with_protocol_fee`] after a schedule is configured)
+    /// is `InvalidProtocolFee`, because a silently dropped rate would
+    /// misroute protocol revenue. Order-independent with
+    /// [`Escrow::with_fee_cap`]: the cap applies at fee-computation
+    /// time ([`Escrow::protocol_fee_for`]), so either call order
+    /// gives the same effective fees.
+    pub fn with_fee_schedule(mut self, tiers: &[(u64, u16)]) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if self.fee_bps != 0 {
+            // A flat rate is configured: accepting the schedule would
+            // silently discard it (or silently discard the schedule).
+            return Err(EscrowError::InvalidProtocolFee);
+        }
+        if tiers.is_empty() || tiers.len() > MAX_FEE_TIERS {
+            return Err(EscrowError::InvalidProtocolFee);
+        }
+        let mut schedule = FeeSchedule::default();
+        let mut prev_floor: Option<u64> = None;
+        for (i, (min_amount, bps)) in tiers.iter().enumerate() {
+            if *bps > 10_000 {
+                return Err(EscrowError::InvalidProtocolFee);
+            }
+            if let Some(prev) = prev_floor {
+                if *min_amount <= prev {
+                    return Err(EscrowError::InvalidProtocolFee);
+                }
+            }
+            prev_floor = Some(*min_amount);
+            schedule.tiers[i] = FeeTier {
+                min_amount: *min_amount,
+                bps: *bps,
+            };
+        }
+        schedule.tier_count = tiers.len() as u8;
+        self.fee_schedule = schedule;
+        Ok(self)
+    }
+
+    /// The tiered protocol-fee schedule configured via
+    /// [`Escrow::with_fee_schedule`]; `tier_count == 0` when no
+    /// schedule was set (backward compatible: the fee falls back to
+    /// the flat `fee_bps` rate).
+    pub fn fee_schedule(&self) -> FeeSchedule {
+        self.fee_schedule
     }
 
     /// Opt in to the emergency pause switch (AV-46 — Solana safety):
@@ -6215,6 +6409,15 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // place — same treatment as `arbiter` / `mint` / `reference`.
     // Appended last so every earlier field offset stays stable.
     ("arbiter_panel", "Option<ArbiterPanel>", 1 + ARBITER_PANEL_LEN),
+    // AV-66: opt-in tiered protocol-fee schedule (see
+    // `Escrow::with_fee_schedule`): one live-tier-count byte, then the
+    // 8 fixed 10-byte tier slots (min_amount u64 + bps u16 — see
+    // `FeeSchedule`). The region is always reserved (zeroed when no
+    // schedule is configured, `tier_count == 0`) so
+    // `with_fee_schedule` writes in place — same treatment as
+    // `arbiter_panel`. Appended last so every earlier field offset
+    // stays stable.
+    ("fee_schedule", "FeeSchedule", FEE_SCHEDULE_LEN),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -6300,9 +6503,12 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// funding timestamp (AV-64): 8 bytes, zeroed when the escrow was
 /// never funded. The opt-in arbiter panel (AV-65) is likewise always
 /// present: 1-byte discriminant + 594-byte panel region, zeroed when no
-/// panel is configured.
+/// panel is configured. The opt-in tiered protocol-fee schedule (AV-66)
+/// is likewise always present: the 1-byte live-tier count + 8 fixed
+/// 10-byte tier slots (81 bytes), zeroed (no schedule) when no
+/// schedule is configured.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -6846,7 +7052,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 20_511_120, "from {state:?}");
+            assert_eq!(rent, 21_074_880, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -6944,9 +7150,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 20_511_120 by
+        // VAULT_SPACE — pinned at 21_074_880 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 20_511_120);
+        assert_eq!(rent, 21_074_880);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -7104,11 +7310,11 @@ mod tests {
     fn release_and_close_adds_no_fields_and_keeps_space() {
         // AV-50 touches no persisted field: the release leg moves the
         // `released` / `fees_paid` counters and the state byte, and
-        // then the account is closed. VAULT_SPACE stays 2819 — re-asserted
+        // then the account is closed. VAULT_SPACE stays 2900 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 2819, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 20_511_120);
+        assert_eq!(VAULT_SPACE, 2900, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 21_074_880);
     }
 
     #[test]
@@ -7126,7 +7332,7 @@ mod tests {
         // by 16 (relative timelock + funding timestamp), and AV-65 by
         // 595 (arbiter panel), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 2819, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 2900, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -9446,6 +9652,49 @@ pub(crate) mod anchor_idl_tests {
                             no event (pre-fund configuration)",
         },
         InstructionSpec {
+            // AV-66: opt in to the tiered protocol-fee schedule at
+            // setup time (volume-priced rates instead of the flat
+            // bps rate).
+            name: "initialize_fee_schedule",
+            params: &[(
+                "tiers",
+                "Vec<FeeTier>",
+                "instruction param; the amount-to-rate ladder as \\
+                 (min_amount, bps) pairs — the fee for a gross payout \\
+                 uses the rate of the highest tier with min_amount <= \\
+                 amount (FeeSchedule::bps_for), then still floored by \\
+                 the AV-63 fee_cap when one is configured",
+            )],
+            method: "Escrow::with_fee_schedule",
+            input_mapping: "tiers <- param (Vec<FeeTier> -> Vec<(u64, \\
+                            u16)> conversion); authority <- \\
+                            accounts.initializer (signer), enforced by \\
+                            the Anchor account constraint, not the state \\
+                            machine; Uninitialized only, like \\
+                            initialize_protocol_fee; mutually exclusive \\
+                            with the flat rate — fail-fast, not \\
+                            last-wins: configuring a schedule with a \\
+                            nonzero fee_bps already set, or a later \\
+                            initialize_protocol_fee on a scheduled \\
+                            escrow, is InvalidProtocolFee (code 114 — a \\
+                            rate must never silently drop another); an \\
+                            empty or over-long tier list, a tier bps > \\
+                            10_000, or non-strictly-ascending min_amount \\
+                            floors is InvalidProtocolFee (code 114); the \\
+                            81-byte region is always reserved (zeroed = \\
+                            no schedule when tier_count == 0) so the \\
+                            opt-in writes in place without reallocating; \\
+                            the tiered rate applies inside \\
+                            protocol_fee_for, so every fee-charging path \\
+                            (release, claim, release_milestone, the \\
+                            taker's share of resolve, release_period, \\
+                            and the panel's submit_panel_judgment \\
+                            settlement) charges the tiered fee and the \\
+                            keeper / batch / settlement-plan previews \\
+                            agree; emits no event (pre-fund \\
+                            configuration)",
+        },
+        InstructionSpec {
             // AV-59: extend the expiry deadline in place.
             name: "extend_expiry",
             params: &[(
@@ -9610,6 +9859,8 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::extend_expiry",
             // AV-63: absolute protocol-fee ceiling.
             "Escrow::with_fee_cap",
+            // AV-66: tiered protocol-fee schedule.
+            "Escrow::with_fee_schedule",
             // AV-64: relative timelock (fund-anchored unlock).
             "Escrow::with_relative_timelock",
         ];
@@ -9684,6 +9935,7 @@ pub(crate) mod anchor_idl_tests {
                 &"release_period",
                 &"initialize_extension",
                 &"initialize_fee_cap",
+                &"initialize_fee_schedule",
                 &"extend_expiry",
                 &"initialize_relative_timelock",
             ]
@@ -11304,6 +11556,11 @@ pub(crate) mod anchor_idl_tests {
         // — 0 is the valid "uncapped" default, mirroring
         // `initialize_grace_period`'s 0-sentinel).
         ("initialize_fee_cap", "max_fee_cents", "fee_cap"),
+        // AV-66: the tier ladder param populates the fee schedule; the
+        // `tier_count` byte is derived from the ladder length (the
+        // region is zeroed by `initialize`), mirroring
+        // `initialize_milestones`.
+        ("initialize_fee_schedule", "tiers", "fee_schedule"),
         // AV-64: the relative-timelock param populates
         // `relative_timelock_secs` directly (u64 — 0 is the valid "no
         // lock" default, mirroring `initialize_timelock`'s 0-sentinel).
@@ -11657,7 +11914,7 @@ mod error_code_tests {
         (
             EscrowError::InvalidProtocolFee,
             114,
-            "with_protocol_fee with fee_bps > 10_000 (not a valid basis-point rate)",
+            "with_protocol_fee with fee_bps > 10_000 (not a valid basis-point rate); with_fee_schedule with an empty / over-long tier list, a tier bps > 10_000, or non-strictly-ascending min_amount floors; the flat-rate / tier-schedule mutual-exclusion conflict in either direction (AV-66)",
         ),
         (
             EscrowError::InvalidGracePeriod,
@@ -13476,6 +13733,18 @@ mod account_space_tests {
                 out.extend_from_slice(&p.voted.to_le_bytes());
             }
         }
+        // AV-66: opt-in tiered protocol-fee schedule, always reserved
+        // like `arbiter_panel`: the 1-byte live-tier count followed by
+        // the 8 fixed 10-byte tier slots (min_amount u64 + bps u16),
+        // zeroed when no schedule is configured
+        // (`tier_count == 0`), so `with_fee_schedule` writes in place
+        // without reallocating; appended last so every earlier offset
+        // above is unchanged.
+        out.push(e.fee_schedule.tier_count);
+        for tier in e.fee_schedule.tiers.iter() {
+            out.extend_from_slice(&tier.min_amount.to_le_bytes());
+            out.extend_from_slice(&tier.bps.to_le_bytes());
+        }
         out
     }
 
@@ -13519,10 +13788,12 @@ mod account_space_tests {
         // + 8 (AV-63 absolute protocol-fee ceiling) + 8 (AV-64 relative
         // timelock duration) + 8 (AV-64 funding timestamp) + (1 + 594)
         // (AV-65 opt-in arbiter panel: member count + threshold + 8
-        // member keys + 8 vote slots + voted bitmask).
-        assert_eq!(ESCROW_BODY_LEN, 2811, "escrow payload bytes");
+        // member keys + 8 vote slots + voted bitmask) + (1 + 80)
+        // (AV-66 opt-in tiered protocol-fee schedule: live-tier count
+        // + 8 fixed 10-byte tier slots).
+        assert_eq!(ESCROW_BODY_LEN, 2892, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 2819, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 2900, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -13573,13 +13844,15 @@ mod account_space_tests {
         // relative timelock is configured) + 8-byte funding timestamp
         // (AV-64, zeroed when the escrow was never funded) + (1 +
         // 594)-byte opt-in arbiter panel (AV-65, zeroed when no panel
-        // is configured).
+        // is configured) + 81-byte opt-in tiered protocol-fee schedule
+        // (AV-66: 1-byte live-tier count + 8 fixed 10-byte tier slots,
+        // zeroed when no schedule is configured).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2329);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2410);
     }
 
     #[test]
@@ -13986,16 +14259,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2819) * 3480 * 2 = 2947 * 6960 = 20_511_120 lamports.
-        assert_eq!(full, 20_511_120);
+        // (128 + 2900) * 3480 * 2 = 3028 * 6960 = 21_074_880 lamports.
+        assert_eq!(full, 21_074_880);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2329) * 3480 * 2 = 2457 * 6960 = 17_100_720 lamports.
-        assert_eq!(no_quorum, 17_100_720);
+        // (128 + 2410) * 3480 * 2 = 2538 * 6960 = 17_664_480 lamports.
+        assert_eq!(no_quorum, 17_664_480);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -14039,25 +14312,25 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(20_511_120, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(21_074_880, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(16_091_519, params.0, params.1),
             Err(RentShortfall {
-                required: 20_511_120,
+                required: 21_074_880,
                 provided: 16_091_519,
             })
         );
         // Generous funding: exempt.
         assert_eq!(
-            check_vault_rent_exempt(21_000_000, params.0, params.1),
+            check_vault_rent_exempt(22_000_000, params.0, params.1),
             Ok(())
         );
         // Zero lamports: the full minimum is the shortfall.
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 20_511_120,
+                required: 21_074_880,
                 provided: 0,
             })
         );
@@ -16493,7 +16766,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2811, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) bytes");
+        assert_eq!(bytes.len(), 2892, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -16518,7 +16791,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 2811);
+        assert_eq!(bytes.len(), 2892);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -16540,18 +16813,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2819) * 3480 * 2 = 2947 * 6960 = 20_511_120 lamports.
-        assert_eq!(VAULT_SPACE, 2819);
-        assert_eq!(full, 20_511_120);
+        // (128 + 2900) * 3480 * 2 = 3028 * 6960 = 21_074_880 lamports.
+        assert_eq!(VAULT_SPACE, 2900);
+        assert_eq!(full, 21_074_880);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2329) * 3480 * 2 = 2457 * 6960 = 17_100_720 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2329);
-        assert_eq!(no_quorum, 17_100_720);
+        // (128 + 2410) * 3480 * 2 = 2538 * 6960 = 17_664_480 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2410);
+        assert_eq!(no_quorum, 17_664_480);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -16695,7 +16968,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2811);
+        assert_eq!(bytes.len(), 2892);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -16710,7 +16983,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 2811);
+        assert_eq!(bytes.len(), 2892);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -16741,18 +17014,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2819) * 3480 * 2 = 2947 * 6960 = 20_511_120 lamports.
-        assert_eq!(VAULT_SPACE, 2819);
-        assert_eq!(full, 20_511_120);
+        // (128 + 2900) * 3480 * 2 = 3028 * 6960 = 21_074_880 lamports.
+        assert_eq!(VAULT_SPACE, 2900);
+        assert_eq!(full, 21_074_880);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2329) * 3480 * 2 = 2457 * 6960 = 17_100_720 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2329);
-        assert_eq!(no_quorum, 17_100_720);
+        // (128 + 2410) * 3480 * 2 = 2538 * 6960 = 17_664_480 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2410);
+        assert_eq!(no_quorum, 17_664_480);
     }
 
     #[test]
@@ -17607,7 +17880,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 2811);
+        assert_eq!(bytes.len(), 2892);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -17782,7 +18055,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 2811, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65");
+        assert_eq!(ESCROW_BODY_LEN, 2892, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -17800,32 +18073,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 2819) * 3480 * 2 = 2947 * 6960 = 20_511_120 lamports.
+        // (128 + 2900) * 3480 * 2 = 3028 * 6960 = 21_074_880 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            20_511_120
+            21_074_880
         );
-        // (128 + 2329) * 3480 * 2 = 2457 * 6960 = 17_100_720 lamports.
+        // (128 + 2410) * 3480 * 2 = 2538 * 6960 = 17_664_480 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            17_100_720
+            17_664_480
         );
         // 1376 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 2819);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2329);
-        assert!(check_vault_rent_exempt(20_511_120, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 2900);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2410);
+        assert!(check_vault_rent_exempt(21_074_880, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -20252,9 +20525,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2811, "body 2216 + 595 (AV-65 arbiter panel)");
-        assert_eq!(VAULT_SPACE, 2819);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2329);
+        assert_eq!(bytes.len(), 2892, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule)");
+        assert_eq!(VAULT_SPACE, 2900);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2410);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -20798,7 +21071,7 @@ mod default_judgment_tests {
         // at 960, `default_judgment` at 968, `default_confirmed` at 985
         // (AV-55 body total 986). AV-56 appends `subscription` at 986,
         // `subscription_next` at 1004, `subscription_released` at 1005
-        // (body total 2811 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel appends).
+        // (body total 2892 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter(ARBITER)
@@ -20808,7 +21081,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2811);
+        assert_eq!(bytes.len(), 2892);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -21365,14 +21638,14 @@ mod subscription_tests {
     fn borsh_tail_pins_subscription_fields() {
         // Offsets: `default_confirmed` ends the AV-55 body at 986;
         // `subscription` at 986, `subscription_next` at 1004,
-        // `subscription_released` at 1005 (body total 2811 after the AV-57 + AV-59 + AV-63 + AV-64 + AV-65 appends).
+        // `subscription_released` at 1005 (body total 2892 after the AV-57 + AV-59 + AV-63 + AV-64 + AV-65 + AV-66 appends).
         let mut e = escrow()
             .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2811);
+        assert_eq!(bytes.len(), 2892);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -21624,9 +21897,12 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595);
+        assert_eq!(
+            VAULT_SPACE_NO_QUORUM,
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81
+        );
     }
 
     #[test]
@@ -21634,13 +21910,13 @@ mod event_history_tests {
         // Offsets: `subscription_released` ends the AV-56 body at 1013;
         // `event_head` at 1013, `event_total` at 1014, `event_count` at
         // 1022, `event_capacity` at 1023, `event_slots` at 1024 (body
-        // total 2811 after the AV-59 + AV-63 + AV-64 appends).
+        // total 2892 after the AV-59 + AV-63 + AV-64 appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2811);
+        assert_eq!(bytes.len(), 2892);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -21668,7 +21944,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595, "AV-65 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81, "AV-66 tail");
     }
 
     #[test]
@@ -21683,18 +21959,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2819) * 3480 * 2 = 2947 * 6960 = 20_511_120 lamports.
-        assert_eq!(VAULT_SPACE, 2819);
-        assert_eq!(full, 20_511_120);
+        // (128 + 2900) * 3480 * 2 = 3028 * 6960 = 21_074_880 lamports.
+        assert_eq!(VAULT_SPACE, 2900);
+        assert_eq!(full, 21_074_880);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2329) * 3480 * 2 = 2457 * 6960 = 17_100_720 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2329);
-        assert_eq!(no_quorum, 17_100_720);
+        // (128 + 2410) * 3480 * 2 = 2538 * 6960 = 17_664_480 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2410);
+        assert_eq!(no_quorum, 17_664_480);
     }
 
     // ----- decode -----
@@ -22378,17 +22654,17 @@ mod fee_cap_tests {
     #[test]
     fn layout_pins_include_the_fee_cap_tail() {
         // +595 over the AV-64 numbers (the AV-65 arbiter-panel region).
-        assert_eq!(ESCROW_BODY_LEN, 2811, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 2819, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2329, "no-quorum Vault account space");
+        assert_eq!(ESCROW_BODY_LEN, 2892, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 2900, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2410, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            20_511_120,
-            "(128 + 2819) * 3480 * 2 = 2947 * 6960"
+            21_074_880,
+            "(128 + 2900) * 3480 * 2 = 3028 * 6960"
         );
         assert_eq!(
             rent_exempt_minimum_lamports(
@@ -22396,8 +22672,8 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            17_100_720,
-            "(128 + 2329) * 3480 * 2 = 2457 * 6960"
+            17_664_480,
+            "(128 + 2410) * 3480 * 2 = 2538 * 6960"
         );
     }
 
@@ -22409,7 +22685,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2811);
+        assert_eq!(bytes.len(), 2892);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -22483,6 +22759,549 @@ mod fee_cap_tests {
         let plain_snap = plain.snapshot(NOW);
         assert_eq!(plain_snap.fee_cap, 0);
         assert!(plain_snap.to_json().contains("\"fee_cap\":0"));
+    }
+}
+
+// ---------- AV-66: tiered protocol-fee schedule ----------
+//
+// `with_fee_schedule` opts into amount-based fee tiers (volume pricing)
+// before funding, mutually exclusive with the flat `with_protocol_fee`
+// rate. The tiered rate is selected inside `protocol_fee_for` — the one
+// fee-computation point — so every taker-payout path (`release`,
+// `claim`, `release_milestone`, the taker's share of `resolve`,
+// `release_period`, and the panel's `submit_panel_judgment` settlement)
+// charges the tiered fee, the AV-63 cap still floors it, and the
+// keeper / batch / settlement-plan previews that call
+// `protocol_fee_for` preview the same number the chain will charge.
+#[cfg(test)]
+mod fee_schedule_tests {
+    use super::*;
+    use crate::batch::scan_batch_lifecycle;
+    use crate::discriminator::{
+        decode_vault_account, instruction_discriminator, vault_account_discriminator,
+        AccountDecodeError,
+    };
+    use crate::keeper::{scan_milestones, MilestoneActionKind, WatchedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const M1: [u8; 32] = [0xC1; 32];
+    const M2: [u8; 32] = [0xC2; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_750_000_000;
+
+    /// Volume-priced ladder: 250 bps under 100k, 100 bps from 100k,
+    /// 25 bps from 500k.
+    const TIERS: [(u64, u16); 3] = [(0, 250), (100_000, 100), (500_000, 25)];
+
+    fn scheduled_escrow() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_schedule(&TIERS)
+            .unwrap()
+    }
+
+    fn funded_scheduled_escrow() -> Escrow {
+        let mut e = scheduled_escrow();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    // ----- tier selection -----
+
+    #[test]
+    fn bps_for_picks_the_highest_matching_tier() {
+        let e = scheduled_escrow();
+        let schedule = e.fee_schedule();
+        assert_eq!(schedule.tier_count, 3);
+        assert_eq!(schedule.bps_for(0), 250);
+        assert_eq!(schedule.bps_for(99_999), 250);
+        assert_eq!(schedule.bps_for(100_000), 100);
+        assert_eq!(schedule.bps_for(499_999), 100);
+        assert_eq!(schedule.bps_for(500_000), 25);
+        assert_eq!(schedule.bps_for(1_000_000), 25);
+        assert_eq!(schedule.bps_for(u64::MAX), 25);
+    }
+
+    #[test]
+    fn bps_for_below_the_first_floor_is_zero() {
+        // A schedule whose first floor sits above zero leaves
+        // sub-floor payouts fee-free (no tier matches) — the
+        // conservative reading of "the highest tier with
+        // min_amount <= amount".
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_schedule(&[(100_000, 100)])
+            .unwrap();
+        assert_eq!(e.fee_schedule().bps_for(99_999), 0);
+        assert_eq!(e.protocol_fee_for(99_999), 0);
+        assert_eq!(e.fee_schedule().bps_for(100_000), 100);
+    }
+
+    #[test]
+    fn protocol_fee_for_uses_the_tier_rate_with_u128_math() {
+        let e = scheduled_escrow();
+        // 250 bps tier: floor(50_000 * 250 / 10_000) = 1_250.
+        assert_eq!(e.protocol_fee_for(50_000), 1_250);
+        // 100 bps tier: floor(200_000 * 100 / 10_000) = 2_000.
+        assert_eq!(e.protocol_fee_for(200_000), 2_000);
+        // 25 bps tier: floor(800_000 * 25 / 10_000) = 2_000.
+        assert_eq!(e.protocol_fee_for(800_000), 2_000);
+        // No overflow at the u64 ceiling: u64::MAX * 10_000 fits u128.
+        let full = Escrow::initialize(ALICE, BOB, u64::MAX, EXPIRES_AT)
+            .unwrap()
+            .with_fee_schedule(&[(0, 10_000)])
+            .unwrap();
+        assert_eq!(full.protocol_fee_for(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn fee_cap_still_floors_the_tiered_fee() {
+        // AV-63 applies on top of the tiered rate: min(tier fee, cap).
+        let e = scheduled_escrow().with_fee_cap(1_000).unwrap();
+        assert_eq!(e.protocol_fee_for(800_000), 1_000);
+        assert_eq!(e.protocol_fee_for(50_000), 1_000);
+        let loose = scheduled_escrow().with_fee_cap(10_000).unwrap();
+        assert_eq!(loose.protocol_fee_for(800_000), 2_000);
+    }
+
+    #[test]
+    fn no_schedule_falls_back_to_the_flat_rate() {
+        // Backward compatible: without a schedule the AV-17 flat rate
+        // drives the fee.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(250)
+            .unwrap();
+        assert_eq!(e.fee_schedule().tier_count, 0);
+        assert!(!e.fee_schedule().is_configured());
+        assert_eq!(e.protocol_fee_for(200_000), 5_000);
+    }
+
+    // ----- builder validation -----
+
+    #[test]
+    fn with_fee_schedule_rejects_bad_ladders() {
+        let base = || Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        // Empty ladder.
+        assert_eq!(
+            base().with_fee_schedule(&[]).unwrap_err(),
+            EscrowError::InvalidProtocolFee
+        );
+        // Over-long ladder (9 > 8).
+        let nine = [
+            (0, 100),
+            (1, 100),
+            (2, 100),
+            (3, 100),
+            (4, 100),
+            (5, 100),
+            (6, 100),
+            (7, 100),
+            (8, 100),
+        ];
+        assert_eq!(
+            base().with_fee_schedule(&nine).unwrap_err(),
+            EscrowError::InvalidProtocolFee
+        );
+        // A tier above 100%.
+        assert_eq!(
+            base().with_fee_schedule(&[(0, 10_001)]).unwrap_err(),
+            EscrowError::InvalidProtocolFee
+        );
+        // Equal floors are not strictly ascending.
+        assert_eq!(
+            base()
+                .with_fee_schedule(&[(0, 250), (100_000, 100), (100_000, 25)])
+                .unwrap_err(),
+            EscrowError::InvalidProtocolFee
+        );
+        // Descending floors are not strictly ascending.
+        assert_eq!(
+            base()
+                .with_fee_schedule(&[(100_000, 100), (0, 250)])
+                .unwrap_err(),
+            EscrowError::InvalidProtocolFee
+        );
+        // A failed builder leaves the escrow schedule-free.
+        let e = base();
+        assert_eq!(e.fee_schedule().tier_count, 0);
+    }
+
+    #[test]
+    fn with_fee_schedule_rejects_reconfiguration_after_uninitialized() {
+        let e = funded_scheduled_escrow();
+        assert_eq!(
+            e.with_fee_schedule(&TIERS).unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        // The failed builder leaves the pinned schedule untouched.
+        assert_eq!(e.fee_schedule().tier_count, 3);
+    }
+
+    // ----- mutual exclusion with the flat rate -----
+
+    #[test]
+    fn schedule_and_flat_rate_are_mutually_exclusive_fail_fast() {
+        // Flat rate first, then schedule: the schedule must not
+        // silently drop the configured flat rate.
+        let flat = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(100)
+            .unwrap();
+        assert_eq!(
+            flat.with_fee_schedule(&TIERS).unwrap_err(),
+            EscrowError::InvalidProtocolFee
+        );
+        // Schedule first, then flat rate (even an explicit zero): the
+        // flat-rate builder must not silently drop the schedule.
+        let scheduled = scheduled_escrow();
+        assert_eq!(
+            scheduled.with_protocol_fee(100).unwrap_err(),
+            EscrowError::InvalidProtocolFee
+        );
+        let scheduled = scheduled_escrow();
+        assert_eq!(
+            scheduled.with_protocol_fee(0).unwrap_err(),
+            EscrowError::InvalidProtocolFee
+        );
+    }
+
+    #[test]
+    fn explicit_zero_flat_rate_does_not_block_a_schedule() {
+        // `with_protocol_fee(0)` writes the default zero — it is not a
+        // configured rate, so a schedule may still be opted in
+        // afterwards. The failed/successful builders leave the
+        // surviving configuration intact.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(0)
+            .unwrap()
+            .with_fee_schedule(&TIERS)
+            .unwrap();
+        assert_eq!(e.fee_bps(), 0);
+        assert_eq!(e.fee_schedule().tier_count, 3);
+        assert_eq!(e.protocol_fee_for(200_000), 2_000);
+        // An empty schedule is invalid even after an explicit zero
+        // flat rate — fail-fast on a meaningless ladder.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(0)
+            .unwrap();
+        assert_eq!(
+            e.with_fee_schedule(&[]).unwrap_err(),
+            EscrowError::InvalidProtocolFee
+        );
+    }
+
+    // ----- the five funding paths charge the tiered fee -----
+
+    #[test]
+    fn release_charges_the_tiered_fee() {
+        let mut e = funded_scheduled_escrow();
+        let (payout, fee) = e.release(ALICE, NOW, 200_000, None, BOB).unwrap();
+        assert_eq!(fee, 2_000); // 100 bps tier.
+        assert_eq!(payout, 198_000);
+        assert_eq!(e.fees_paid(), 2_000);
+        assert_eq!(e.released_amount(), 200_000);
+    }
+
+    #[test]
+    fn claim_charges_the_tiered_fee() {
+        let schedule = VestingSchedule::new(1_700_000_000, 1_800_000_000).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_schedule(&TIERS)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        // Half vested at the midpoint of the 1.7B–1.8B window.
+        let (payout, fee) = e.claim(BOB, NOW, None, BOB).unwrap();
+        assert_eq!(payout + fee, 500_000);
+        assert_eq!(fee, 1_250); // 25 bps tier on 500_000.
+        assert_eq!(e.fees_paid(), fee);
+    }
+
+    #[test]
+    fn release_milestone_charges_the_tiered_fee() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_schedule(&TIERS)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        let (payout, fee) = e.release_milestone(ALICE, NOW, 0, None, BOB).unwrap();
+        assert_eq!(fee, 4_000); // 100 bps tier on 400_000.
+        assert_eq!(payout, 396_000);
+        assert_eq!(e.fees_paid(), 4_000);
+    }
+
+    #[test]
+    fn resolve_charges_the_tiered_fee_on_the_taker_share() {
+        let mut e = scheduled_escrow().with_arbiter(ARBITER).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.escalate(ALICE, NOW, None).unwrap();
+        let (payout, fee, refund) = e
+            .resolve(ARBITER, 600_000, None, None, BOB)
+            .unwrap();
+        assert_eq!(fee, 1_500); // 25 bps tier on 600_000.
+        assert_eq!(payout, 598_500);
+        assert_eq!(refund, 400_000);
+        assert_eq!(e.fees_paid(), 1_500);
+        assert_eq!(e.released_amount(), 600_000);
+    }
+
+    #[test]
+    fn release_period_charges_the_tiered_fee() {
+        // 4 periods of 250_000, back-scheduled from expiry; releasing
+        // at expiry keeps every period due.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_schedule(&TIERS)
+            .unwrap()
+            .with_subscription(10, 4, 250_000)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let (payout, fee) = e.release_period(ALICE, EXPIRES_AT, 0, None, BOB).unwrap();
+        assert_eq!(fee, 2_500); // 100 bps tier on 250_000.
+        assert_eq!(payout, 247_500);
+        assert_eq!(e.fees_paid(), 2_500);
+    }
+
+    #[test]
+    fn panel_settlement_charges_the_tiered_fee() {
+        // AV-65's automatic panel settlement routes through the same
+        // fee-computation point: the settling vote's taker share is
+        // fee'd by tier.
+        let mut e = scheduled_escrow().with_arbiter_panel(&[M1, M2], 2).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.escalate(ALICE, NOW, None).unwrap();
+        assert_eq!(
+            e.submit_panel_judgment(M1, 600_000, None, None, BOB),
+            Ok(None)
+        );
+        let settled = e
+            .submit_panel_judgment(M2, 600_000, None, None, BOB)
+            .unwrap();
+        let (payout, fee, refund) = settled.unwrap();
+        assert_eq!(fee, 1_500); // 25 bps tier on 600_000.
+        assert_eq!(payout, 598_500);
+        assert_eq!(refund, 400_000);
+        assert_eq!(e.fees_paid(), 1_500);
+    }
+
+    #[test]
+    fn fees_paid_never_exceeds_released_across_tiered_paths() {
+        let mut e = funded_scheduled_escrow();
+        e.release(ALICE, NOW, 200_000, None, BOB).unwrap();
+        e.release(ALICE, NOW, 800_000, None, BOB).unwrap();
+        // 2_000 + 2_000 = 4_000 in fees against 1_000_000 released.
+        assert_eq!(e.fees_paid(), 4_000);
+        assert!(e.fees_paid() <= e.released_amount());
+    }
+
+    // ----- keeper / batch previews agree with the chain -----
+
+    #[test]
+    fn keeper_milestone_preview_matches_the_tiered_chain_fee() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_schedule(&TIERS)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        let watched = [WatchedEscrow {
+            escrow_id: [0xEE; 32],
+            escrow: e,
+            reference: None,
+        }];
+        let report = scan_milestones(&watched, NOW);
+        let action = report
+            .actions
+            .iter()
+            .find(|a| a.kind == MilestoneActionKind::ReleaseMilestone)
+            .expect("release_milestone action listed");
+        assert_eq!(action.fee, e.protocol_fee_for(400_000));
+        assert_eq!(action.fee, 4_000);
+        // And the chain charges exactly the previewed fee.
+        let (_, fee) = e.release_milestone(ALICE, NOW, 0, None, BOB).unwrap();
+        assert_eq!(fee, action.fee);
+    }
+
+    #[test]
+    fn batch_release_preview_matches_the_tiered_chain_fee() {
+        let mut e = funded_scheduled_escrow();
+        let items = scan_batch_lifecycle(
+            &[crate::batch::BatchWatchItem {
+                escrow_id: [0xEE; 32],
+                escrow: Some(e),
+                initialize: crate::batch::BatchInitializeParams {
+                    initializer: ALICE,
+                    taker: BOB,
+                    amount: 1_000_000,
+                    expires_at: EXPIRES_AT,
+                },
+            }],
+            NOW,
+        );
+        let action = items
+            .items
+            .iter()
+            .find_map(|item| match &item.outcome {
+                crate::batch::BatchItemOutcome::Action(a) => Some(a),
+                _ => None,
+            })
+            .expect("release action listed");
+        let remaining = e.remaining_amount();
+        // 1_000_000 hits the 25 bps tier:
+        // floor(1_000_000 * 25 / 10_000) = 2_500.
+        assert_eq!(action.fee, e.protocol_fee_for(remaining));
+        assert_eq!(action.fee, 2_500);
+        // And the chain charges exactly the previewed fee.
+        let (_, fee) = e.release(ALICE, NOW, remaining, None, BOB).unwrap();
+        assert_eq!(fee, action.fee);
+    }
+
+    // ----- serialization -----
+
+    #[test]
+    fn fee_schedule_persists_in_serialized_layout_tail() {
+        // The schedule sits at the tail (the final 81 bytes):
+        // arbiter_panel stays the second-to-last region, so every
+        // earlier offset is unchanged.
+        let e = scheduled_escrow();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes.len(), 2892);
+        let tail = ESCROW_BODY_LEN - FEE_SCHEDULE_LEN;
+        assert_eq!(bytes[tail], 3, "tier_count at the tail");
+        assert_eq!(
+            u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
+            0,
+            "tier 0 floor"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[tail + 9..tail + 11].try_into().unwrap()),
+            250,
+            "tier 0 rate"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[tail + 11..tail + 19].try_into().unwrap()),
+            100_000,
+            "tier 1 floor"
+        );
+        // The structural decoder round-trips the schedule.
+        let mut full = vault_account_discriminator().to_vec();
+        full.extend_from_slice(&bytes);
+        let decoded = decode_vault_account(&full).unwrap();
+        assert_eq!(decoded.fee_schedule(), e.fee_schedule());
+        assert_eq!(decoded.protocol_fee_for(200_000), 2_000);
+    }
+
+    #[test]
+    fn fee_schedule_defaults_zeroed_in_serialized_layout() {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        let tail = ESCROW_BODY_LEN - FEE_SCHEDULE_LEN;
+        assert_eq!(
+            &bytes[tail..],
+            &[0u8; FEE_SCHEDULE_LEN],
+            "fee_schedule: zeroed when unconfigured"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_a_corrupt_fee_schedule() {
+        // tier_count = 9 overflows the fixed 8 slots.
+        let e = scheduled_escrow();
+        let mut bytes = super::account_space_tests::encode_escrow(&e);
+        let tail = ESCROW_BODY_LEN - FEE_SCHEDULE_LEN;
+        bytes[tail] = 9;
+        let mut full = vault_account_discriminator().to_vec();
+        full.extend_from_slice(&bytes);
+        assert_eq!(
+            decode_vault_account(&full).unwrap_err(),
+            AccountDecodeError::InvalidFeeSchedule {
+                tier_count: 9,
+                tier: 0
+            }
+        );
+        // A live tier above 100% is rejected too.
+        let mut bytes = super::account_space_tests::encode_escrow(&e);
+        bytes[tail + 9..tail + 11].copy_from_slice(&10_001u16.to_le_bytes());
+        let mut full = vault_account_discriminator().to_vec();
+        full.extend_from_slice(&bytes);
+        assert_eq!(
+            decode_vault_account(&full).unwrap_err(),
+            AccountDecodeError::InvalidFeeSchedule {
+                tier_count: 3,
+                tier: 0
+            }
+        );
+    }
+
+    // ----- IDL -----
+
+    #[test]
+    fn initialize_fee_schedule_instruction_discriminator_is_pinned() {
+        // IDL: sha256("global:initialize_fee_schedule")[..8] — the
+        // Anchor instruction discriminator, pinned here and in the
+        // generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("initialize_fee_schedule"),
+            [0x7d, 0x23, 0x3c, 0x87, 0x17, 0xc0, 0x38, 0xb9]
+        );
+    }
+
+    #[test]
+    fn idl_spec_covers_with_fee_schedule() {
+        // The INSTRUCTIONS table carries the new instruction with the
+        // right method and param, like every other with_* builder; the
+        // global every_idl_param_maps_to_exactly_one_vault_field test
+        // pins the tiers -> fee_schedule mapping.
+        let spec = crate::anchor_idl_tests::INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "initialize_fee_schedule")
+            .expect("INSTRUCTIONS covers initialize_fee_schedule");
+        assert_eq!(spec.method, "Escrow::with_fee_schedule");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "tiers");
+        assert_eq!(spec.params[0].1, "Vec<FeeTier>");
+    }
+
+    // ----- snapshot -----
+
+    #[test]
+    fn snapshot_exports_fee_schedule() {
+        let e = funded_scheduled_escrow();
+        let snap = e.snapshot(NOW);
+        let schedule = snap.fee_schedule.clone().expect("schedule exported");
+        assert_eq!(schedule.tier_count, 3);
+        assert_eq!(schedule.tiers.len(), 3);
+        assert_eq!(schedule.tiers[0].min_amount, 0);
+        assert_eq!(schedule.tiers[0].bps, 250);
+        assert_eq!(schedule.tiers[2].min_amount, 500_000);
+        assert_eq!(schedule.tiers[2].bps, 25);
+        let json = snap.to_json();
+        assert!(
+            json.contains("\"fee_schedule\":{\"tier_count\":3"),
+            "snapshot JSON exports the schedule: {json}"
+        );
+        assert!(json.contains("\"min_amount\":500000"));
+        assert!(json.contains("\"bps\":25"));
+        // Schedule-free escrows export null.
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let plain_snap = plain.snapshot(NOW);
+        assert!(plain_snap.fee_schedule.is_none());
+        assert!(plain_snap.to_json().contains("\"fee_schedule\":null"));
     }
 }
 
@@ -22737,7 +23556,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2811);
+        assert_eq!(bytes.len(), 2892);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -23277,10 +24096,11 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2811);
-        // The panel region is the last 595 bytes: 1-byte discriminant +
+        assert_eq!(bytes.len(), 2892);
+        // The panel region is the second-to-last region (the AV-66
+        // fee-schedule region trails it): 1-byte discriminant +
         // 594-byte panel.
-        let tail = &bytes[bytes.len() - 595..];
+        let tail = &bytes[bytes.len() - FEE_SCHEDULE_LEN - 595..bytes.len() - FEE_SCHEDULE_LEN];
         assert_eq!(tail[0], 1, "panel discriminant");
         assert_eq!(tail[1], 3, "n");
         assert_eq!(tail[2], 2, "threshold");
@@ -23308,10 +24128,10 @@ mod arbiter_panel_tests {
         assert_eq!(panel.votes[0].rationale_hash, Some([0x11; 32]));
         assert_eq!(panel.votes[1].taker_amount, 0);
         assert_eq!(panel.votes[1].rationale_hash, None);
-        // A panel-less escrow decodes with `None` and a zeroed tail.
+        // A panel-less escrow decodes with `None` and a zeroed region.
         let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let plain_bytes = encode_escrow(&plain);
-        assert_eq!(plain_bytes[plain_bytes.len() - 595], 0);
+        assert_eq!(plain_bytes[plain_bytes.len() - FEE_SCHEDULE_LEN - 595], 0);
         assert!(decode_vault_account(&account_bytes(&plain))
             .unwrap()
             .arbiter_panel()
@@ -23328,7 +24148,21 @@ mod arbiter_panel_tests {
         assert_eq!(panel.2, 1 + ARBITER_PANEL_LEN);
         assert_eq!(panel.2, 595);
         // Appended last: every earlier field offset stays stable.
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "arbiter_panel");
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "fee_schedule");
+    }
+
+    #[test]
+    fn field_table_carries_the_fee_schedule_region() {
+        let schedule = VAULT_FIELDS
+            .iter()
+            .find(|(name, _, _)| *name == "fee_schedule")
+            .unwrap();
+        assert_eq!(schedule.1, "FeeSchedule");
+        assert_eq!(schedule.2, FEE_SCHEDULE_LEN);
+        assert_eq!(schedule.2, 1 + MAX_FEE_TIERS * FEE_TIER_LEN);
+        assert_eq!(schedule.2, 81);
+        // Appended last: every earlier field offset stays stable.
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "fee_schedule");
     }
 
     #[test]

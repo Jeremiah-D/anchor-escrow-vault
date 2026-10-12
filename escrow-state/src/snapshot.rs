@@ -181,6 +181,27 @@ pub struct ArbiterPanelSnapshot {
     pub votes: Vec<PanelVoteSnapshot>,
 }
 
+/// Point-in-time, read-only view of one AV-66 fee tier: the payout
+/// floor it applies from and the basis-point rate for that bracket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeeTierSnapshot {
+    /// The smallest gross payout (in lamports) this tier applies to.
+    pub min_amount: u64,
+    /// The protocol-fee rate for payouts in this tier, in basis points.
+    pub bps: u16,
+}
+
+/// Point-in-time, read-only view of the AV-66 tiered protocol-fee
+/// schedule: the live tiers in slot order, so an off-chain indexer can
+/// price any gross payout with the same ladder the chain charges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeeScheduleSnapshot {
+    /// How many tiers are live (`1..=8` when the schedule is present).
+    pub tier_count: u8,
+    /// The live tiers in slot order (strictly ascending floors).
+    pub tiers: Vec<FeeTierSnapshot>,
+}
+
 /// Point-in-time, read-only view of an [`Escrow`]. Built by
 /// [`Escrow::snapshot`]; serialized by [`EscrowSnapshot::to_json`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +264,11 @@ pub struct EscrowSnapshot {
     /// was configured (AV-63): the effective fee per payout is
     /// `min(bps fee, fee_cap)` when nonzero.
     pub fee_cap: u64,
+    /// Tiered protocol-fee schedule, or `None` when no schedule is
+    /// configured (AV-66): the amount-to-rate ladder the fee uses
+    /// instead of the flat `fee_bps` rate, so an off-chain indexer can
+    /// price any payout without replaying the setup.
+    pub fee_schedule: Option<FeeScheduleSnapshot>,
     /// Milestone plan progress, or `None` when none is attached
     /// (AV-15).
     pub milestones: Option<MilestoneSnapshot>,
@@ -388,6 +414,26 @@ impl Escrow {
             fees_paid: self.fees_paid(),
             fee_recipient: self.fee_recipient(),
             fee_cap: self.fee_cap(),
+            // AV-66: the tiered fee schedule rides the export — `None`
+            // when no schedule is configured (the flat `fee_bps` rate
+            // applies), else the live tiers in slot order.
+            fee_schedule: {
+                let schedule = self.fee_schedule();
+                if schedule.is_configured() {
+                    Some(FeeScheduleSnapshot {
+                        tier_count: schedule.tier_count,
+                        tiers: schedule.tiers[..schedule.tier_count as usize]
+                            .iter()
+                            .map(|t| FeeTierSnapshot {
+                                min_amount: t.min_amount,
+                                bps: t.bps,
+                            })
+                            .collect(),
+                    })
+                } else {
+                    None
+                }
+            },
             milestones,
             skipped: self.skipped_amount(),
             evidence_hash: self.evidence_hash(),
@@ -570,6 +616,29 @@ impl EscrowSnapshot {
         write_opt_hex(&mut s, self.fee_recipient);
         s.push_str(",\"fee_cap\":");
         s.push_str(&self.fee_cap.to_string());
+        // AV-66: the tiered fee schedule — `null` when no schedule is
+        // configured, else the live-tier count and the tiers in slot
+        // order.
+        s.push_str(",\"fee_schedule\":");
+        match &self.fee_schedule {
+            Some(sched) => {
+                s.push_str("{\"tier_count\":");
+                s.push_str(&sched.tier_count.to_string());
+                s.push_str(",\"tiers\":[");
+                for (i, t) in sched.tiers.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push_str("{\"min_amount\":");
+                    s.push_str(&t.min_amount.to_string());
+                    s.push_str(",\"bps\":");
+                    s.push_str(&t.bps.to_string());
+                    s.push('}');
+                }
+                s.push_str("]}");
+            }
+            None => s.push_str("null"),
+        }
         // AV-15: milestone plan progress. (`fee_recipient` is self-
         // quoted-or-null via `write_opt_hex`, so no dangling quote to
         // close here — unlike the `display_*` fields above.)
@@ -783,7 +852,7 @@ mod snapshot_tests {
              \"quorum\":null,\
              \"vesting\":null,\"vested\":0,\"display_vested\":\"0\",\"claimable\":0,\"display_claimable\":\"0\",\
              \"arbiter\":null,\"mint\":null,\
-             \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\
+             \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
              \"milestones\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\

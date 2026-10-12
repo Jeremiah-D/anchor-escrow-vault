@@ -179,6 +179,9 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "Option<DefaultJudgment>" => IdlType::Option(Box::new(IdlType::Named("DefaultJudgment"))),
         // AV-65: opt-in arbiter panel.
         "Option<ArbiterPanel>" => IdlType::Option(Box::new(IdlType::Named("ArbiterPanel"))),
+        // AV-66: opt-in tiered protocol-fee schedule (always present,
+        // zeroed when unconfigured — `tier_count == 0`).
+        "FeeSchedule" => IdlType::Named("FeeSchedule"),
         // AV-56: periodic subscription release schedule.
         "Option<SubscriptionSchedule>" => IdlType::Option(Box::new(IdlType::Named("SubscriptionSchedule"))),
         // AV-57: the 64 fixed event-history slots.
@@ -198,6 +201,8 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         "Vec<Pubkey>" => IdlType::Vec(Box::new(IdlType::PublicKey)),
         "Vec<u64>" => IdlType::Vec(Box::new(IdlType::U64)),
         "Vec<u8>" => IdlType::Vec(Box::new(IdlType::U8)),
+        // AV-66: the tiered fee schedule's tier ladder instruction arg.
+        "Vec<FeeTier>" => IdlType::Vec(Box::new(IdlType::Named("FeeTier"))),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         other => panic!("idl_json: unmapped instruction arg type string: {other}"),
     }
@@ -283,6 +288,18 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
             ("members", IdlType::Array(ArrayElem::PublicKey, 8)),
             ("votes", IdlType::Array(ArrayElem::Defined("PanelVote"), 8)),
             ("voted", IdlType::U64),
+        ],
+        // FeeTier { min_amount: u64, bps: u16 } (AV-66: 10 bytes).
+        "FeeTier" => vec![("min_amount", IdlType::U64), ("bps", IdlType::U16)],
+        // FeeSchedule { tier_count: u8, tiers: [FeeTier; 8] } (AV-66:
+        // 81 bytes — the 1-byte live-tier count plus the 8 fixed
+        // 10-byte tier slots; always present, zeroed when unconfigured).
+        "FeeSchedule" => vec![
+            ("tier_count", IdlType::U8),
+            (
+                "tiers",
+                IdlType::Array(ArrayElem::Defined("FeeTier"), MAX_FEE_TIERS),
+            ),
         ],
         other => panic!("idl_json: unknown named type: {other}"),
     }
@@ -499,6 +516,8 @@ fn render_idl_json() -> String {
         "EventHistorySlot",
         "PanelVote",
         "ArbiterPanel",
+        "FeeTier",
+        "FeeSchedule",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -667,6 +686,12 @@ fn named_type_sizes_pin_constants() {
     // + voted bitmask.
     assert_eq!(size("ArbiterPanel"), ARBITER_PANEL_LEN);
     assert_eq!(size("ArbiterPanel"), 594);
+    // AV-66: min_amount u64 + bps u16.
+    assert_eq!(size("FeeTier"), FEE_TIER_LEN);
+    assert_eq!(size("FeeTier"), 10);
+    // AV-66: live-tier count + 8 fixed tier slots.
+    assert_eq!(size("FeeSchedule"), FEE_SCHEDULE_LEN);
+    assert_eq!(size("FeeSchedule"), 81);
 }
 
 #[test]

@@ -1401,7 +1401,10 @@ pub mod escrow_vault {
     /// `initialize_quorum`: the fee rate is fixed before funds move.
     /// The rate is in basis points (`fee_bps <= 10_000`;
     /// `InvalidProtocolFee` otherwise); `0` means no fee (the default).
-    /// After this, every taker payout (`release` / `claim` /
+    /// AV-66: mutually exclusive with the tiered fee schedule —
+    /// `initialize_protocol_fee` on an escrow with a configured
+    /// schedule is `InvalidProtocolFee` (fail-fast, never silent
+    /// last-wins). After this, every taker payout (`release` / `claim` /
     /// `release_milestone` / the taker's share of `resolve`) splits
     /// into a net payout and a protocol fee routed to the protocol fee
     /// account; the fee accumulates in `vault.fees_paid`.
@@ -2016,6 +2019,35 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to the tiered protocol-fee schedule (AV-66; mirrors
+    /// `Escrow::with_fee_schedule`): replaces the flat bps rate with a
+    /// volume-priced tier ladder — `tiers` is the amount-to-rate ladder
+    /// as `(min_amount, bps)` pairs, and the fee for a gross payout
+    /// uses the rate of the highest tier with `min_amount <= amount`
+    /// (still floored by the AV-63 `fee_cap` when one is set).
+    /// `Uninitialized` only, like every other `with_*` builder; the
+    /// ladder is fixed before funds move. Mutually exclusive with the
+    /// flat rate — fail-fast, not last-wins: a nonzero `fee_bps`
+    /// already set, an empty or over-long ladder, a tier `bps >
+    /// 10_000`, or non-strictly-ascending `min_amount` floors is
+    /// `InvalidProtocolFee` (code 114 — a rate configuration must
+    /// never silently drop another). The 81-byte `vault.fee_schedule`
+    /// region is always present (zeroed = no schedule when
+    /// `tier_count == 0`), so the opt-in writes in place — no realloc,
+    /// no rent change. Emits no event (pre-fund configuration).
+    pub fn initialize_fee_schedule(ctx: Context<InitializeFeeSchedule>, tiers: Vec<FeeTier>) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let ladder: Vec<(u64, u16)> = tiers.iter().map(|t| (t.min_amount, t.bps)).collect();
+        let escrow = escrow
+            .with_fee_schedule(&ladder)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.fee_schedule` is always present (81 bytes, zeroed = no
+        // schedule by default), so the ladder is written in place — no
+        // realloc needed in the real build.
+        Ok(())
+    }
+
     /// Extend the expiry deadline in place (AV-59; mirrors
     /// `Escrow::extend_expiry`). A unilateral initializer power:
     /// extension only lengthens the taker's window, so no
@@ -2568,6 +2600,16 @@ pub struct Vault {
     /// matches `escrow_state::VAULT_FIELDS` (appended last, after
     /// `fund_at`).
     pub arbiter_panel: Option<ArbiterPanel>,
+    /// AV-66: opt-in tiered protocol-fee schedule; mirrors
+    /// `escrow_state`'s `fee_schedule`. The account always reserves
+    /// the full 81-byte region (1-byte live-tier count + 8 fixed
+    /// 10-byte tier slots, zeroed — `tier_count == 0` — when no
+    /// schedule is configured) so `initialize_fee_schedule` writes
+    /// the ladder in place without reallocating. Mutually exclusive
+    /// with the flat rate (`fee_bps`) — fail-fast in both directions.
+    /// Layout position matches `escrow_state::VAULT_FIELDS` (appended
+    /// last, after `arbiter_panel`).
+    pub fee_schedule: FeeSchedule,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -2692,6 +2734,37 @@ pub struct ArbiterPanel {
     /// Bitmask of members who have voted; mirrors
     /// `escrow_state::ArbiterPanel::voted`.
     pub voted: u64,
+}
+
+/// AV-66: skeleton mirror of `escrow_state::FeeTier`: one tier of the
+/// opt-in protocol-fee schedule — the payout floor it applies from
+/// and the basis-point rate for that bracket. Serialized size is
+/// pinned by `escrow_state::FEE_TIER_LEN` (10 bytes: min_amount u64 +
+/// bps u16).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct FeeTier {
+    /// The smallest gross payout (in lamports) this tier applies to;
+    /// mirrors `escrow_state::FeeTier::min_amount`.
+    pub min_amount: u64,
+    /// The protocol-fee rate for payouts in this tier, in basis
+    /// points; mirrors `escrow_state::FeeTier::bps`.
+    pub bps: u16,
+}
+
+/// AV-66: skeleton mirror of `escrow_state::FeeSchedule`: the opt-in
+/// tiered protocol-fee schedule (volume pricing instead of the flat
+/// bps rate). Serialized size is pinned by
+/// `escrow_state::FEE_SCHEDULE_LEN` (81 bytes: the 1-byte live-tier
+/// count plus the 8 fixed 10-byte tier slots; zeroed — `tier_count ==
+/// 0` — when no schedule is configured).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct FeeSchedule {
+    /// How many tier slots are live (`0..=8`); `0` means no schedule;
+    /// mirrors `escrow_state::FeeSchedule::tier_count`.
+    pub tier_count: u8,
+    /// The tiers in slot order (strictly ascending floors); mirrors
+    /// `escrow_state::FeeSchedule::tiers`.
+    pub tiers: [FeeTier; 8],
 }
 
 /// AV-56: skeleton mirror of `escrow_state::SubscriptionSchedule`: the
@@ -3638,6 +3711,19 @@ pub struct InitializeFeeCap<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-66: opt in to the tiered protocol-fee schedule at initialize
+/// time (volume-priced rates instead of the flat bps rate).
+#[derive(Accounts)]
+pub struct InitializeFeeSchedule<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer sets the setup-time fee ladder; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`, and rejects a ladder that conflicts with the
+    /// flat rate or is malformed (`InvalidProtocolFee`, code 114).
+    pub initializer: Signer<'info>,
+}
+
 #[derive(Accounts)]
 pub struct ExtendExpiry<'info> {
     #[account(mut)]
@@ -4125,7 +4211,7 @@ pub enum ErrorCode {
     InvalidMint,
     #[msg("Token account mint does not match the escrow's bound mint")]
     MintMismatch,
-    #[msg("Invalid protocol fee rate: fee_bps must be 0-10000 (basis points)")]
+    #[msg("Invalid protocol fee configuration: fee_bps must be 0-10000 (basis points); a tiered fee schedule needs 1-8 tiers with bps 0-10000 and strictly ascending floors; the flat rate and the tiered schedule are mutually exclusive")]
     InvalidProtocolFee,
     #[msg("Invalid grace period: expires_at + grace_period overflows u64 (no grace on a no-timeout escrow)")]
     InvalidGracePeriod,

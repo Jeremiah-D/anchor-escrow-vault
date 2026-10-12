@@ -81,6 +81,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
 | `initialize_protocol_fee(fee_bps)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `fee_bps` in 0–10000 basis points; the fee slices every taker payout into net payout + protocol fee; the AV-63 fee cap can floor it per payout) |
 | `initialize_fee_cap(max_fee_cents)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; absolute per-payout fee ceiling in lamports — the effective fee is `min(bps fee, fee_cap)`; `0` means uncapped; no new error code) |
+| `initialize_fee_schedule(tiers)` (AV-66)     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opt-in volume-priced fee tiers as `(min_amount, bps)` pairs — the fee for a gross payout uses the rate of the highest tier with `min_amount <= amount`, still floored by the AV-63 cap; 1–8 tiers, each `bps` 0–10000, floors strictly ascending; mutually exclusive with the flat rate — fail-fast `InvalidProtocolFee`, code 114, in either direction) |
 | `initialize_fee_recipient(fee_recipient)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding; pins the destination of every fee leg — the settlement builders reject a `fee_leg` that does not equal it; zero address is `InvalidFeeRecipient`; with no pin the fee goes to the program-level fee account) |
 | `initialize_pause_authority(pause_authority)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding; binds the key allowed to engage/release the emergency pause; zero address is `InvalidPauseAuthority`) |
 | `pause()`                                     | any            | — (no state change; sets the pause flag) | the bound pause authority only (`Unauthorized` otherwise; `InvalidStateTransition` with no authority bound or when already paused); emits `Paused` |
@@ -640,7 +641,36 @@ extended) — 16 bytes, so the full vault is now **2200 bytes** and
 needs **16,202,880 lamports**. AV-63 appends the 8-byte absolute
 protocol-fee ceiling `fee_cap` (zeroed = uncapped when no ceiling is
 configured) — 8 bytes, so the full vault is now **2208 bytes** and
-needs **16,258,560 lamports**.)
+needs **16,258,560 lamports**.) AV-66 appends the 81-byte tiered
+protocol-fee schedule region (1-byte live-tier count + 8 fixed 10-byte
+tier slots), so the full vault is now **2892 bytes** and needs
+**21,074,880 lamports**.
+
+**Tiered protocol fee (AV-66).** An escrow can opt in to volume-priced
+fees at creation (`initialize_fee_schedule(tiers)`, opt-in on
+`Uninitialized`, like the flat-rate builder): `tiers` is the
+amount-to-rate ladder as `(min_amount, bps)` pairs — 1 to 8 tiers,
+each `bps` in `0`–`10_000`, the `min_amount` floors strictly ascending
+(`InvalidProtocolFee`, code 114, otherwise — the same code the flat
+rate uses, so no error code is added). The fee for a gross payout uses
+the rate of the highest tier with `min_amount <= amount`, computed as
+`floor(gross_payout × tier_bps / 10_000)` in `u128` (no overflow), then
+still floored by the AV-63 absolute ceiling when one is configured —
+so the keeper / batch / settlement-plan previews, which call the same
+`protocol_fee_for` computation point, preview exactly what the chain
+charges on every taker-payout path (`release`, `claim`,
+`release_milestone`, the taker's share of `resolve`,
+`release_period`, and the AV-65 panel's auto-settlement). The flat rate
+and the schedule are mutually exclusive — fail-fast, never silent
+last-wins: configuring a schedule with a nonzero `fee_bps` already set,
+or a later `initialize_protocol_fee` on a scheduled escrow (even with
+`fee_bps == 0`), is `InvalidProtocolFee`, because a silently dropped
+rate would misroute protocol revenue. With no schedule configured
+(`tier_count == 0`) the fee falls back to the flat rate — the
+pre-AV-66 behavior is unchanged, and the `fees_paid <= released`
+conservation invariant holds by construction (a tiered fee is always
+`<=` the gross payout). The schedule is exported in the AV-26
+snapshot JSON (`"fee_schedule"`, `null` when unconfigured).
 
 **Fee recipient pin (AV-44).** An escrow can additionally pin *where* the
 fee goes (`initialize_fee_recipient(fee_recipient)`, opt-in on
@@ -840,7 +870,10 @@ automatically. New vault fields (appended last): `max_extension_secs`
 (u64) and `fund_at` (u64) — 16 bytes, so the full vault is now 2216 bytes /
 16,369,920 lamports rent-exempt. AV-65 appends `arbiter_panel`
 (`Option<ArbiterPanel>`) — 595 bytes, so the full vault is now 2811 bytes /
-20,511,120 lamports rent-exempt.
+20,511,120 lamports rent-exempt. AV-66 appends `fee_schedule`
+(`FeeSchedule`: 1-byte live-tier count + 8 fixed 10-byte tier slots) —
+81 bytes, so the full vault is now 2892 bytes / 21,074,880 lamports
+rent-exempt.
 
 **Error codes** (stable, never renumbered; the Anchor program maps one
 program error per variant):
@@ -861,7 +894,7 @@ program error per variant):
 | `MilestoneNotConfirmed` | 111 | `release_milestone` before both parties confirmed the milestone |
 | `InvalidMint` | 112 | bad mint address (empty, non-base58, or not 32 bytes), or `with_mint` with the zero address |
 | `MintMismatch` | 113 | exit-path token mint ≠ the escrow's bound mint (`None` vs `Some` mismatches too) |
-| `InvalidProtocolFee` | 114 | `with_protocol_fee` with `fee_bps` > 10_000 (not a valid basis-point rate) |
+| `InvalidProtocolFee` | 114 | `with_protocol_fee` with `fee_bps` > 10_000 (not a valid basis-point rate); `with_fee_schedule` with an empty / over-long tier list, a tier `bps` > 10_000, or non-strictly-ascending `min_amount` floors; the flat-rate / tier-schedule mutual-exclusion conflict in either direction (AV-66) |
 | `InvalidGracePeriod` | 115 | `with_grace_period` where `expires_at + grace_period` would overflow `u64` (grace on a no-timeout escrow) |
 | `RefundAddressMismatch` | 116 | `cancel`/`cancel_expired` with a refund destination ≠ the whitelisted address (or ≠ the initializer with no whitelist), or `with_refund_address` with the zero address |
 | `InvalidPenalty` | 117 | `with_penalty_bps` with `penalty_bps` > 10_000 (not a valid basis-point rate) |
@@ -1496,7 +1529,8 @@ two-way consistency check against the IDL parameter table:
 | relative_timelock_secs | u64 | 8 |
 | fund_at | u64 | 8 |
 | arbiter_panel | Option<ArbiterPanel> | 595 |
-| **total**     |                   | **2811** |
+| fee_schedule | FeeSchedule | 81 |
+| **total**     |                   | **2892** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1563,11 +1597,14 @@ when no ceiling is configured) — and the 8-byte relative timelock duration
 (AV-64: zeroed when no relative timelock is configured) — and the 8-byte
 funding timestamp (AV-64: zeroed when the escrow was never funded) —
 and the 595-byte arbiter panel region (AV-65: 1-byte `Option`
-discriminant + 594-byte panel, zeroed when no panel is configured).
-`escrow-state` exposes `VAULT_SPACE` (2819) and
-`VAULT_SPACE_NO_QUORUM` (2329) for the Anchor `space =` constraint, plus a
+discriminant + 594-byte panel, zeroed when no panel is configured) —
+and the 81-byte tiered protocol-fee schedule region (AV-66: 1-byte
+live-tier count + 8 fixed 10-byte tier slots, zeroed when no schedule
+is configured).
+`escrow-state` exposes `VAULT_SPACE` (2900) and
+`VAULT_SPACE_NO_QUORUM` (2410) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **20,511,120 lamports** to be
+mainnet rent parameters the full vault needs **21,074,880 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)

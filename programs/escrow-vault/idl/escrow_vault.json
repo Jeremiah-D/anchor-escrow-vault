@@ -416,6 +416,14 @@
       ]
     },
     {
+      "name": "initialize_fee_schedule",
+      "discriminator": [125, 35, 60, 135, 23, 192, 56, 185],
+      "accounts": [],
+      "args": [
+        {"name": "tiers", "type": {"vec": {"defined": "FeeTier"}}}
+      ]
+    },
+    {
       "name": "extend_expiry",
       "discriminator": [216, 39, 141, 15, 230, 100, 24, 26],
       "accounts": [],
@@ -483,7 +491,8 @@
           {"name": "fee_cap", "type": "u64", "offset": 2200},
           {"name": "relative_timelock_secs", "type": "u64", "offset": 2208},
           {"name": "fund_at", "type": "u64", "offset": 2216},
-          {"name": "arbiter_panel", "type": {"option": {"defined": "ArbiterPanel"}}, "offset": 2224}
+          {"name": "arbiter_panel", "type": {"option": {"defined": "ArbiterPanel"}}, "offset": 2224},
+          {"name": "fee_schedule", "type": {"defined": "FeeSchedule"}, "offset": 2819}
         ]
       }
     }
@@ -585,6 +594,26 @@
           {"name": "members", "type": {"array": ["publicKey", 8]}, "offset": 2},
           {"name": "votes", "type": {"array": [{"defined": "PanelVote"}, 8]}, "offset": 258},
           {"name": "voted", "type": "u64", "offset": 586}
+        ]
+      }
+    },
+    {
+      "name": "FeeTier",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "min_amount", "type": "u64", "offset": 0},
+          {"name": "bps", "type": "u16", "offset": 8}
+        ]
+      }
+    },
+    {
+      "name": "FeeSchedule",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "tier_count", "type": "u8", "offset": 0},
+          {"name": "tiers", "type": {"array": [{"defined": "FeeTier"}, 8]}, "offset": 1}
         ]
       }
     }

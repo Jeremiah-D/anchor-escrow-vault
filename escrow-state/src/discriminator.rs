@@ -37,9 +37,10 @@
 
 use super::{
     sha256, ArbiterPanel, DefaultJudgment, Escrow, EscrowEventKind, EscrowState, EventHistorySlot,
-    MilestonePlan, PanelVote, PayoutAllowlist, QuorumPolicy, SubscriptionSchedule, VestingSchedule,
-    ANCHOR_DISCRIMINATOR_LEN, ARBITER_PANEL_LEN, DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN,
-    MAX_ATTESTORS, MAX_EVENT_HISTORY, MAX_MILESTONES, MAX_PANEL_MEMBERS, MAX_PAYOUT_ALLOWLIST,
+    FeeSchedule, FeeTier, MilestonePlan, PanelVote, PayoutAllowlist, QuorumPolicy,
+    SubscriptionSchedule, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN, ARBITER_PANEL_LEN,
+    DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS,
+    MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS, MAX_PAYOUT_ALLOWLIST,
     MILESTONE_PLAN_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN,
     SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
 };
@@ -115,6 +116,16 @@ pub enum AccountDecodeError {
     /// rather than decoding a value the accessors cannot safely read
     /// (AV-65; AV-32 panic-free guarantee).
     InvalidArbiterPanelLen { n: u8, threshold: u8 },
+    /// A tiered protocol-fee schedule's live-tier count is outside
+    /// `0..=8` ([`MAX_FEE_TIERS`](crate::MAX_FEE_TIERS)), a live tier's
+    /// rate is above 10_000 basis points, or the tier floors are not
+    /// strictly ascending. The count and tier bytes are part of the
+    /// field's layout — an out-of-range count would make
+    /// [`FeeSchedule::bps_for`](crate::FeeSchedule::bps_for) read past
+    /// the live slots, so the decoder rejects it rather than decoding
+    /// a value the accessors cannot safely read (AV-66; AV-32
+    /// panic-free guarantee).
+    InvalidFeeSchedule { tier_count: u8, tier: u8 },
 }
 
 /// Bounds-checked cursor over the account body. Every read is
@@ -574,6 +585,54 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(ARBITER_PANEL_LEN)?;
         None
     };
+    // AV-66: the opt-in tiered protocol-fee schedule, always reserved
+    // like the panel: the 1-byte live-tier count plus the 8 fixed
+    // 10-byte tier slots, appended last so every earlier offset above
+    // is unchanged. The count and the live tiers are validated —
+    // `tier_count in 0..=8`, each live `bps <= 10_000`, the floors
+    // strictly ascending — mirroring the AV-65 panel-count validation:
+    // an out-of-range count would make the schedule accessors read
+    // past the live slots, so the panic-free decoder rejects it.
+    let tier_count = c.u8()?;
+    if tier_count as usize > MAX_FEE_TIERS {
+        return Err(AccountDecodeError::InvalidFeeSchedule {
+            tier_count,
+            tier: 0,
+        });
+    }
+    let mut fee_tiers = [FeeTier::default(); MAX_FEE_TIERS];
+    let mut prev_floor: Option<u64> = None;
+    for (i, tier) in fee_tiers.iter_mut().enumerate() {
+        let min_amount = c.u64_le()?;
+        let bps = c.u16_le()?;
+        if (i as u8) < tier_count {
+            if bps > 10_000 {
+                return Err(AccountDecodeError::InvalidFeeSchedule {
+                    tier_count,
+                    tier: i as u8,
+                });
+            }
+            if let Some(prev) = prev_floor {
+                if min_amount <= prev {
+                    return Err(AccountDecodeError::InvalidFeeSchedule {
+                        tier_count,
+                        tier: i as u8,
+                    });
+                }
+            }
+            prev_floor = Some(min_amount);
+            *tier = FeeTier { min_amount, bps };
+        }
+    }
+    debug_assert_eq!(
+        FEE_SCHEDULE_LEN,
+        1 + MAX_FEE_TIERS * FEE_TIER_LEN,
+        "schedule region drift vs FEE_SCHEDULE_LEN"
+    );
+    let fee_schedule = FeeSchedule {
+        tier_count,
+        tiers: fee_tiers,
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -662,6 +721,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // and the panel judgments recorded, so the multisig tally
         // decides identically after a decode.
         arbiter_panel,
+        // AV-66: the tiered protocol-fee schedule is persisted — a
+        // decoded escrow carries the same rate ladder the setup
+        // recorded, so the fee charged on-chain after a decode matches
+        // the fee charged before serialization.
+        fee_schedule,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
