@@ -549,10 +549,16 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
             let next = e.subscription_next_period();
             // `subscription_next` only ever runs in order, so the scan
             // names exactly the period `release_period` accepts. The
-            // `per_period > 0` guard mirrors the builder's invariant;
-            // the schedule gates keep zero-value actions off the list.
+            // amount is the period's *live* amount (AV-73): the uniform
+            // `per_period` at setup, or the dual-signed re-split — the
+            // keeper must list what `release_period` will actually pay,
+            // never the construction-time uniform.
+            let live_amount = e.subscription_period_amount(next).unwrap_or(0);
+            // The `live_amount > 0` guard mirrors the builder's
+            // invariant; the schedule gates keep zero-value actions
+            // off the list.
             if next < schedule.periods
-                && schedule.per_period > 0
+                && live_amount > 0
                 && e.subscription_period_due_at(next)
                     .map(|due_at| now >= due_at)
                     .unwrap_or(false)
@@ -566,7 +572,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     // A period release pays the taker, not a refund: no
                     // refund destination applies.
                     refund_to: None,
-                    amount: schedule.per_period,
+                    amount: live_amount,
                     // AV-28: the report renders the amount in human
                     // units alongside the raw value.
                     decimals: e.decimals(),

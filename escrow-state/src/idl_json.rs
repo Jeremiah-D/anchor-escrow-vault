@@ -186,6 +186,10 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "Option<SubscriptionSchedule>" => IdlType::Option(Box::new(IdlType::Named("SubscriptionSchedule"))),
         // AV-57: the 64 fixed event-history slots.
         "[EventHistorySlot; 64]" => IdlType::Array(ArrayElem::Defined("EventHistorySlot"), 64),
+        // AV-73: the 64 live per-period amount slots.
+        "[u64; MAX_SUBSCRIPTION_PERIODS]" => {
+            IdlType::Array(ArrayElem::U64, MAX_SUBSCRIPTION_PERIODS as usize)
+        }
         other => panic!("idl_json: unmapped VAULT_FIELDS type string: {other}"),
     }
 }

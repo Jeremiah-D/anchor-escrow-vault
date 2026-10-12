@@ -176,7 +176,7 @@ pub use keeper::{scan_rent_health, RentHealthReport, TopUpAction, WatchedEscrowW
 // reconciling off-chain state. Purely additive and read-only.
 pub use snapshot::{
     DualSigSnapshot, EscrowSnapshot, MilestoneSnapshot, MilestoneTrancheSnapshot, QuorumSnapshot,
-    VestingSnapshot,
+    SubscriptionPeriodSnapshot, SubscriptionSnapshot, VestingSnapshot,
 };
 
 // AV-32: Anchor account discriminators + panic-free vault account
@@ -749,6 +749,21 @@ pub struct Escrow {
     /// vault account). Appended last so every earlier field offset
     /// stays stable.
     escalated_by: Option<[u8; 32]>,
+    /// AV-73: live per-period payout amounts for the AV-56 subscription
+    /// schedule — the amounts [`Escrow::release_period`] actually pays
+    /// per period, and what [`Escrow::adjust_period_amounts`] rewrites
+    /// by dual-signed governance. Fixed at [`MAX_SUBSCRIPTION_PERIODS`]
+    /// slots (one u64 per period, 512 bytes) so the crate stays
+    /// heap-free and `Copy`; slots past the schedule's `periods` are
+    /// always zero. [`Escrow::with_subscription`] seeds the first
+    /// `periods` slots with the uniform `per_period`; afterwards the
+    /// table — not `SubscriptionSchedule.per_period` — is the source of
+    /// truth for payouts (released periods keep their recorded amounts,
+    /// so history is never rewritten). Always present (zeroed when no
+    /// schedule is attached). Persisted (512 bytes in the vault
+    /// account). Appended last so every earlier field offset stays
+    /// stable.
+    subscription_amounts: [u64; MAX_SUBSCRIPTION_PERIODS as usize],
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -1649,6 +1664,11 @@ pub const MAX_SUBSCRIPTION_PERIODS: u8 = 64;
 /// length and the per-period amount) plus the one-byte period count.
 pub const SUBSCRIPTION_SCHEDULE_LEN: usize = 8 + 1 + 8;
 
+/// Serialized length of the AV-73 live per-period amount table
+/// ([`Escrow::subscription_amounts`]): one u64 per period slot, fixed
+/// at [`MAX_SUBSCRIPTION_PERIODS`] slots so the crate stays heap-free.
+pub const SUBSCRIPTION_AMOUNTS_LEN: usize = MAX_SUBSCRIPTION_PERIODS as usize * 8;
+
 /// A periodic (subscription-style) release schedule (AV-56): the
 /// locked amount is paid to the taker in `periods` equal tranches of
 /// `per_period`, one per `period_secs` seconds. A per-period
@@ -2241,6 +2261,10 @@ impl Escrow {
             subscription: None,
             subscription_next: 0,
             subscription_released: 0,
+            // AV-73: the live per-period amount table starts zeroed —
+            // `with_subscription` seeds the first `periods` slots with
+            // the uniform `per_period`.
+            subscription_amounts: [0u64; MAX_SUBSCRIPTION_PERIODS as usize],
             // AV-57: the event-history ring starts empty — no events
             // recorded yet, full 64-entry capacity by default.
             event_head: 0,
@@ -6324,6 +6348,13 @@ impl Escrow {
             periods,
             per_period,
         });
+        // AV-73: seed the live per-period amount table — the first
+        // `periods` slots carry the uniform `per_period`, the rest stay
+        // zero. From here on the table (not `per_period`) is the source
+        // of truth for what `release_period` pays.
+        for slot in self.subscription_amounts.iter_mut().take(periods as usize) {
+            *slot = per_period;
+        }
         // `subscription_next` starts 0 and `subscription_released`
         // starts 0 (the zeroed defaults) — period 0 is the first to
         // become due.
@@ -6565,16 +6596,21 @@ impl Escrow {
         if !self.is_unlock_eligible(now) {
             return Err(EscrowError::TimelockNotReached);
         }
-        let per_period = schedule.per_period;
+        // AV-73: the payout is the period's *live* amount from the
+        // per-period table — the uniform `per_period` at setup, or the
+        // dual-signed re-split from `adjust_period_amounts`. Released
+        // periods keep their recorded amounts, so the table (not the
+        // schedule's construction-time uniform) is what pays.
+        let period_amount = self.subscription_amounts[period_index as usize];
         // Each period releases at most once (the in-order counter) and
-        // the tranches sum to the locked amount: released + per_period
+        // the tranches sum to the locked amount: released + period_amount
         // <= amount always — unless a vesting `claim` already drew on
         // the shared counter (vesting composes, see
         // `with_subscription`). The checked_add and the cap are
         // backstops, paralleling `release`.
         let new_released = self
             .released
-            .checked_add(per_period)
+            .checked_add(period_amount)
             .ok_or(EscrowError::ReleaseExceedsLocked)?;
         if new_released > self.amount {
             return Err(EscrowError::ReleaseExceedsLocked);
@@ -6583,14 +6619,123 @@ impl Escrow {
         // counter keeps the gross so conservation is untouched. Charged
         // only after every gate passes — a rejected payout never
         // touches `fees_paid`.
-        let fee = self.charge_protocol_fee(per_period)?;
+        let fee = self.charge_protocol_fee(period_amount)?;
         self.released = new_released;
         self.subscription_released |= 1u64 << period_index;
         self.subscription_next += 1;
         if self.subscription_next == schedule.periods {
             self.state = EscrowState::Released;
         }
-        Ok((per_period - fee, fee))
+        Ok((period_amount - fee, fee))
+    }
+
+    /// Re-split the subscription per-period amounts by dual-signed
+    /// governance (AV-73 — Solana subscription payments / payment
+    /// fintech): the initializer and the taker may jointly re-balance
+    /// the per-period payouts (a period that grew can be front-loaded,
+    /// a shrunk one back-loaded) — including *after* some periods
+    /// already released. The released periods' amounts are locked
+    /// history and cannot be rewritten; only the not-yet-released
+    /// periods may change.
+    ///
+    /// Check order is deliberate — pause, then dual authority, then
+    /// state, then schedule configuration, then the released-period
+    /// lock, then the new amounts — mirroring
+    /// [`Escrow::adjust_milestone_amounts`]:
+    /// 1. `Paused` while paused (AV-46) — re-splitting is a config
+    ///    transition, not the pause key-loss escape hatch;
+    /// 2. both parties must sign: one party alone or a stranger pair
+    ///    is `Unauthorized` (independent `==` checks — the degenerate
+    ///    initializer == taker self-escrow authorizes with one key
+    ///    passed twice, like AV-12's activation);
+    /// 3. `Uninitialized`, `Activated` or `Funded` only: the terminal
+    ///    states have no live periods left to re-split, and
+    ///    `Disputed` is `InvalidStateTransition` (arbitration is in
+    ///    flight);
+    /// 4. a subscription schedule must be attached
+    ///    (`InvalidSubscription` otherwise);
+    /// 5. `new_amounts` must name every period (`InvalidSubscription`
+    ///    on a length mismatch);
+    /// 6. released periods are locked: `new_amounts[i]` must equal the
+    ///    recorded amount for every `i < subscription_next`
+    ///    (`InvalidSubscription` otherwise — history is not
+    ///    rewritten);
+    /// 7. the new amounts re-split, not restructure: every amount
+    ///    positive, and the exact `u128` sum must equal the locked
+    ///    amount (`InvalidSubscription` otherwise — the schedule stays
+    ///    the *complete* release schedule, paralleling
+    ///    [`Escrow::with_subscription`]).
+    ///
+    /// The rewrite is in place — the per-period table is always
+    /// reserved in `VAULT_FIELDS` — so no account realloc and no rent
+    /// change. Protocol fees (AV-17/AV-63/AV-66) are computed at
+    /// release time from the live table via
+    /// [`Escrow::protocol_fee_for`], so later period releases are
+    /// automatically fee'd on the new amounts (still floored by
+    /// `fee_cap`).
+    pub fn adjust_period_amounts(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_amounts: &[u64],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the initializer and the
+        // taker must authorize the re-split — one party alone cannot
+        // reshape the payment schedule, paralleling `update_quorum`
+        // and `adjust_milestone_amounts`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Activated | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let schedule = self.subscription.ok_or(EscrowError::InvalidSubscription)?;
+        let periods = schedule.periods as usize;
+        if new_amounts.len() != periods {
+            return Err(EscrowError::InvalidSubscription);
+        }
+        // Released periods are locked history: the caller reaffirms the
+        // recorded amounts — the re-split only touches the periods that
+        // have not paid out yet.
+        let released = self.subscription_next as usize;
+        for (i, &amount) in new_amounts.iter().enumerate().take(released) {
+            if amount != self.subscription_amounts[i] {
+                return Err(EscrowError::InvalidSubscription);
+            }
+        }
+        let mut total: u128 = 0;
+        for &amount in new_amounts {
+            // A period that pays nothing is a config error, like
+            // `with_subscription`'s `per_period == 0` rejection.
+            if amount == 0 {
+                return Err(EscrowError::InvalidSubscription);
+            }
+            total += amount as u128;
+        }
+        if total != self.amount as u128 {
+            return Err(EscrowError::InvalidSubscription);
+        }
+        for (i, &amount) in new_amounts.iter().enumerate() {
+            self.subscription_amounts[i] = amount;
+        }
+        Ok(())
+    }
+
+    /// The live per-period payout amount for subscription period
+    /// `index` (AV-73): the uniform `per_period` at setup, or the
+    /// dual-signed re-split from [`Escrow::adjust_period_amounts`].
+    /// `None` when no schedule is attached or `index` is out of range.
+    /// The keeper and the snapshot export read this — never the
+    /// schedule's construction-time uniform.
+    pub fn subscription_period_amount(&self, index: u8) -> Option<u64> {
+        let schedule = self.subscription?;
+        if index >= schedule.periods {
+            return None;
+        }
+        Some(self.subscription_amounts[index as usize])
     }
     pub fn initializer(&self) -> [u8; 32] {
         self.initializer
@@ -6966,6 +7111,19 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // `mint` / `evidence_hash`. Appended last so every earlier field
     // offset stays stable.
     ("escalated_by", "Option<Pubkey>", 1 + PUBKEY_LEN),
+    // AV-73: live per-period payout amounts for the AV-56 subscription
+    // schedule (see `Escrow::subscription_amounts`): one u64 per period
+    // slot, fixed at `MAX_SUBSCRIPTION_PERIODS` slots (512 bytes) so
+    // the table never needs a realloc. `with_subscription` seeds the
+    // first `periods` slots with the uniform `per_period`;
+    // `adjust_period_amounts` rewrites the unreleased slots in place.
+    // Always present (zeroed when no schedule is attached). Appended
+    // last so every earlier field offset stays stable.
+    (
+        "subscription_amounts",
+        "[u64; MAX_SUBSCRIPTION_PERIODS]",
+        SUBSCRIPTION_AMOUNTS_LEN,
+    ),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -7058,9 +7216,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// (AV-68) is likewise always present: 8-byte `evidence_deadline_secs`
 /// (zeroed when no deadline is configured) — and so is the escalating
 /// party (AV-68): 1-byte discriminant + 32-byte party key (zeroed when
-/// the escrow was never disputed).
+/// the escrow was never disputed). The live per-period amount table
+/// (AV-73) is likewise always present: 512 bytes (64 x u64, zeroed when
+/// no schedule is attached).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -7604,7 +7764,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 21_360_240, "from {state:?}");
+            assert_eq!(rent, 24_923_760, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -7702,9 +7862,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 21_360_240 by
+        // VAULT_SPACE — pinned at 24_923_760 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 21_360_240);
+        assert_eq!(rent, 24_923_760);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -7865,8 +8025,8 @@ mod tests {
         // then the account is closed. VAULT_SPACE stays 2941 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 2941, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 21_360_240);
+        assert_eq!(VAULT_SPACE, 3453, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 24_923_760);
     }
 
     #[test]
@@ -7885,7 +8045,7 @@ mod tests {
         // 595 (arbiter panel), and AV-68 by 41 (evidence-disclosure
         // deadline + escalating party), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 2941, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3453, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -9398,6 +9558,37 @@ pub(crate) mod anchor_idl_tests {
                             protocol_fee_for (still floored by fee_cap)",
         },
         InstructionSpec {
+            // AV-73: subscription per-period re-split by dual-signed
+            // governance (released periods locked).
+            name: "adjust_period_amounts",
+            params: &[(
+                "new_amounts",
+                "Vec<u64>",
+                "instruction param; the replacement per-period amounts \
+                 in period order — must name every period, every amount \
+                 positive, released periods must reaffirm their recorded \
+                 amounts, and the exact u128 sum must equal the locked \
+                 amount; amounts are re-split, not restructured",
+            )],
+            method: "Escrow::adjust_period_amounts",
+            input_mapping: "initializer <- accounts.initializer (signer) \
+                            AND taker <- accounts.taker (signer) — both \
+                            parties must sign, one alone (or a stranger \
+                            pair) is Unauthorized; the degenerate \
+                            initializer == taker self-escrow authorizes \
+                            with one key passed twice, like AV-12 \
+                            activation; Uninitialized / Activated / \
+                            Funded only (terminal states / Disputed are \
+                            InvalidStateTransition); new_amounts <- \
+                            param; released periods are locked — \
+                            rewriting a released period's amount is \
+                            InvalidSubscription; rewrites the live \
+                            per-period table in place — no layout / \
+                            rent change; protocol fees charge on the \
+                            new amounts at release time via \
+                            protocol_fee_for (still floored by fee_cap)",
+        },
+        InstructionSpec {
             // AV-16: SPL token mint binding.
             name: "initialize_mint",
             params: &[(
@@ -10492,6 +10683,9 @@ pub(crate) mod anchor_idl_tests {
             // AV-70: milestone tranche re-split by dual-signed
             // governance (before any settlement).
             "Escrow::adjust_milestone_amounts",
+            // AV-73: subscription per-period re-split by dual-signed
+            // governance (released periods locked).
+            "Escrow::adjust_period_amounts",
             "Escrow::with_mint",
             "Escrow::with_protocol_fee",
             "Escrow::with_grace_period",
@@ -10589,6 +10783,7 @@ pub(crate) mod anchor_idl_tests {
                 &"release_milestone",
                 &"skip_milestone",
                 &"adjust_milestone_amounts",
+                &"adjust_period_amounts",
                 &"initialize_mint",
                 &"initialize_protocol_fee",
                 &"initialize_grace_period",
@@ -12176,6 +12371,15 @@ pub(crate) mod anchor_idl_tests {
         // `milestones.amounts` (params xor one field source allows
         // several params, like `released`'s two release paths).
         ("adjust_milestone_amounts", "new_amounts", "milestones.amounts"),
+        // AV-73: the dual-signed governance adjustment rewrites the
+        // live per-period amount table in place — the second writer of
+        // a per-period amount region (`with_subscription` seeds it),
+        // paralleling the AV-70 entry above.
+        (
+            "adjust_period_amounts",
+            "new_amounts",
+            "subscription_amounts",
+        ),
         // AV-15: the index selects the milestone whose confirmation bits
         // (or skip-approval bits) are flipped in the bitmap; the bitmap
         // itself is zeroed by `initialize`.
@@ -14577,6 +14781,12 @@ mod account_space_tests {
                 out.extend_from_slice(&party);
             }
         }
+        // AV-73: live per-period payout amounts, always present (64 x
+        // u64, zeroed when no schedule is attached); appended last so
+        // every earlier offset above is unchanged.
+        for amount in e.subscription_amounts.iter() {
+            out.extend_from_slice(&amount.to_le_bytes());
+        }
         out
     }
 
@@ -14623,10 +14833,11 @@ mod account_space_tests {
         // member keys + 8 vote slots + voted bitmask) + (1 + 80)
         // (AV-66 opt-in tiered protocol-fee schedule: live-tier count
         // + 8 fixed 10-byte tier slots) + 8 (AV-68 dispute-evidence
-        // disclosure deadline) + (1 + 32) (AV-68 escalating party).
-        assert_eq!(ESCROW_BODY_LEN, 2933, "escrow payload bytes");
+        // disclosure deadline) + (1 + 32) (AV-68 escalating party)
+        // + 512 (AV-73 live per-period amount table: 64 x u64).
+        assert_eq!(ESCROW_BODY_LEN, 3445, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 2941, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3453, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -14682,13 +14893,15 @@ mod account_space_tests {
         // zeroed when no schedule is configured) + 8-byte
         // dispute-evidence disclosure deadline (AV-68, zeroed when no
         // deadline is configured) + (1 + 32)-byte escalating party
-        // (AV-68, zeroed when the escrow was never disputed).
+        // (AV-68, zeroed when the escrow was never disputed) + 512-byte
+        // live per-period amount table (AV-73, 64 x u64, zeroed when no
+        // schedule is attached).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2451);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2963);
     }
 
     #[test]
@@ -15095,16 +15308,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2941) * 3480 * 2 = 3069 * 6960 = 21_360_240 lamports.
-        assert_eq!(full, 21_360_240);
+        // (128 + 3453) * 3480 * 2 = 3581 * 6960 = 24_923_760 lamports.
+        assert_eq!(full, 24_923_760);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2451) * 3480 * 2 = 2579 * 6960 = 17_949_840 lamports.
-        assert_eq!(no_quorum, 17_949_840);
+        // (128 + 2963) * 3480 * 2 = 3091 * 6960 = 21_513_360 lamports.
+        assert_eq!(no_quorum, 21_513_360);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -15148,25 +15361,25 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(21_360_240, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(24_923_760, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(16_091_519, params.0, params.1),
+            check_vault_rent_exempt(24_923_759, params.0, params.1),
             Err(RentShortfall {
-                required: 21_360_240,
-                provided: 16_091_519,
+                required: 24_923_760,
+                provided: 24_923_759,
             })
         );
         // Generous funding: exempt.
         assert_eq!(
-            check_vault_rent_exempt(22_000_000, params.0, params.1),
+            check_vault_rent_exempt(25_000_000, params.0, params.1),
             Ok(())
         );
         // Zero lamports: the full minimum is the shortfall.
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 21_360_240,
+                required: 24_923_760,
                 provided: 0,
             })
         );
@@ -17528,6 +17741,364 @@ mod adjust_milestone_amounts_tests {
     }
 }
 
+// ---------- AV-73: dual-signed subscription per-period re-split ----------
+//
+// `adjust_period_amounts` is the subscription twin of AV-70's milestone
+// re-split: the initializer and taker jointly re-split the *live*
+// per-period payout table. Released periods lock their recorded
+// amounts — the re-split must reaffirm them, so on-chain payout
+// history is never rewritten. The new amounts must have exactly the
+// schedule's period count, be all positive, and sum to exactly the
+// locked amount. Only `Uninitialized` / `Activated` / `Funded`; a
+// paused escrow fails fast. The rewrite is in place (the 64-slot
+// table is always reserved) — no realloc, no rent change. Protocol
+// fees charge on the new amounts at release time, and the keeper's
+// `ReleasePeriod` action prices from the live table.
+#[cfg(test)]
+mod adjust_period_amounts_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const PERIOD_SECS: u64 = 86_400;
+    const PERIODS: u8 = 4;
+    const PER_PERIOD: u64 = 250_000; // 4 * 250_000 == 1_000_000
+
+    fn subscription_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    /// Period `i` is due at `expires_at - (periods - 1 - i) * period_secs`.
+    fn due(i: u8) -> u64 {
+        EXPIRES_AT - (PERIODS - 1 - i) as u64 * PERIOD_SECS
+    }
+
+    fn amounts_of(e: &Escrow) -> Vec<u64> {
+        (0..PERIODS)
+            .map(|i| e.subscription_period_amount(i).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn dual_signed_resplit_rewrites_amounts_in_place() {
+        let mut e = subscription_escrow();
+        e.adjust_period_amounts(ALICE, BOB, &[400_000, 300_000, 200_000, 100_000])
+            .unwrap();
+        assert_eq!(amounts_of(&e), vec![400_000, 300_000, 200_000, 100_000]);
+        assert_eq!(e.amount(), 1_000_000, "lockup unchanged");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.subscription_next_period(), 0);
+    }
+
+    #[test]
+    fn resplit_allowed_before_funding_and_when_activated() {
+        // Uninitialized.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        e.adjust_period_amounts(ALICE, BOB, &[400_000, 300_000, 200_000, 100_000])
+            .unwrap();
+        assert_eq!(amounts_of(&e), vec![400_000, 300_000, 200_000, 100_000]);
+        // Funding follows the new split: the first period pays the
+        // re-split amount.
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let (payout, _) = e.release_period(ALICE, due(0), 0, None, BOB).unwrap();
+        assert_eq!(payout, 400_000);
+        // Activated (dual-sig activation: both parties sign).
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Activated);
+        e.adjust_period_amounts(ALICE, BOB, &[100_000, 200_000, 300_000, 400_000])
+            .unwrap();
+        assert_eq!(amounts_of(&e), vec![100_000, 200_000, 300_000, 400_000]);
+    }
+
+    #[test]
+    fn single_party_or_stranger_is_unauthorized() {
+        let mut e = subscription_escrow();
+        assert_eq!(
+            e.adjust_period_amounts(ALICE, MALLORY, &[400_000, 300_000, 200_000, 100_000]),
+            Err(EscrowError::Unauthorized),
+            "taker alone cannot re-split"
+        );
+        assert_eq!(
+            e.adjust_period_amounts(MALLORY, BOB, &[400_000, 300_000, 200_000, 100_000]),
+            Err(EscrowError::Unauthorized),
+            "initializer alone cannot re-split"
+        );
+        assert_eq!(
+            e.adjust_period_amounts(MALLORY, [0xD0; 32], &[400_000, 300_000, 200_000, 100_000]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            amounts_of(&e),
+            vec![250_000, 250_000, 250_000, 250_000],
+            "failed calls change nothing"
+        );
+    }
+
+    #[test]
+    fn self_escrow_authorizes_with_one_key_passed_twice() {
+        let mut e = Escrow::initialize(ALICE, ALICE, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        e.adjust_period_amounts(ALICE, ALICE, &[400_000, 300_000, 200_000, 100_000])
+            .unwrap();
+        assert_eq!(amounts_of(&e), vec![400_000, 300_000, 200_000, 100_000]);
+    }
+
+    #[test]
+    fn released_periods_lock_their_recorded_amounts() {
+        let mut e = subscription_escrow();
+        e.release_period(ALICE, due(0), 0, None, BOB).unwrap();
+        // Rewriting a released period is rejected — even when the rest
+        // re-splits cleanly.
+        assert_eq!(
+            e.adjust_period_amounts(ALICE, BOB, &[300_000, 300_000, 200_000, 200_000]),
+            Err(EscrowError::InvalidSubscription),
+            "released period 0 must keep 250_000"
+        );
+        // Reaffirming the released period while re-splitting the live
+        // ones is the supported path.
+        e.adjust_period_amounts(ALICE, BOB, &[250_000, 350_000, 250_000, 150_000])
+            .unwrap();
+        assert_eq!(amounts_of(&e), vec![250_000, 350_000, 250_000, 150_000]);
+        // The released counter is conserved: period 1 pays the new
+        // amount and the cumulative released tracks it.
+        let (payout, _) = e.release_period(ALICE, due(1), 1, None, BOB).unwrap();
+        assert_eq!(payout, 350_000);
+        assert_eq!(e.released_amount(), 250_000 + 350_000);
+        assert_eq!(e.subscription_next_period(), 2);
+    }
+
+    #[test]
+    fn rejected_in_terminal_and_disputed_states() {
+        // Released: every period out.
+        let mut e = subscription_escrow();
+        for i in 0..PERIODS {
+            e.release_period(ALICE, due(i), i, None, BOB).unwrap();
+        }
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.adjust_period_amounts(ALICE, BOB, &[400_000, 300_000, 200_000, 100_000]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Cancelled.
+        let mut e = subscription_escrow();
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(
+            e.adjust_period_amounts(ALICE, BOB, &[400_000, 300_000, 200_000, 100_000]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: arbitration is in flight; the periods are part of
+        // what resolve adjudicates.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap()
+            .with_arbiter([0xA4; 32])
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1_800, None).unwrap();
+        assert_eq!(
+            e.adjust_period_amounts(ALICE, BOB, &[400_000, 300_000, 200_000, 100_000]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn bad_amount_shapes_are_invalid_subscription() {
+        let mut e = subscription_escrow();
+        // Sum mismatch.
+        assert_eq!(
+            e.adjust_period_amounts(ALICE, BOB, &[400_000, 300_000, 200_000, 50_000]),
+            Err(EscrowError::InvalidSubscription)
+        );
+        // Zero period.
+        assert_eq!(
+            e.adjust_period_amounts(ALICE, BOB, &[500_000, 250_000, 250_000, 0]),
+            Err(EscrowError::InvalidSubscription)
+        );
+        // Period count change (restructure, not re-split).
+        assert_eq!(
+            e.adjust_period_amounts(ALICE, BOB, &[500_000, 250_000, 250_000]),
+            Err(EscrowError::InvalidSubscription)
+        );
+        assert_eq!(
+            e.adjust_period_amounts(ALICE, BOB, &[200_000, 200_000, 200_000, 200_000, 200_000]),
+            Err(EscrowError::InvalidSubscription)
+        );
+        // u128 sum can never wrap into a false total.
+        assert_eq!(
+            e.adjust_period_amounts(ALICE, BOB, &[u64::MAX, u64::MAX, 1, 1]),
+            Err(EscrowError::InvalidSubscription)
+        );
+        assert_eq!(
+            amounts_of(&e),
+            vec![250_000, 250_000, 250_000, 250_000],
+            "failed validations change nothing"
+        );
+    }
+
+    #[test]
+    fn no_schedule_is_invalid_subscription() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            e.adjust_period_amounts(ALICE, BOB, &[500_000, 500_000]),
+            Err(EscrowError::InvalidSubscription)
+        );
+    }
+
+    #[test]
+    fn paused_escrow_fails_fast() {
+        // `with_pause_authority` is Uninitialized-only: attach before
+        // funding, then pause.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.pause(ALICE).unwrap();
+        assert_eq!(
+            e.adjust_period_amounts(ALICE, BOB, &[400_000, 300_000, 200_000, 100_000]),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            amounts_of(&e),
+            vec![250_000, 250_000, 250_000, 250_000]
+        );
+    }
+
+    #[test]
+    fn fees_charge_on_new_amounts_at_release() {
+        // AV-17/AV-63: protocol_fee_for reads the live period table, so
+        // a re-split automatically re-prices later period fees (still
+        // floored by fee_cap).
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap()
+            .with_protocol_fee(500) // 5%
+            .unwrap()
+            .with_fee_cap(10_000)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.adjust_period_amounts(ALICE, BOB, &[400_000, 300_000, 200_000, 100_000])
+            .unwrap();
+        let (payout, fee) = e.release_period(ALICE, due(0), 0, None, BOB).unwrap();
+        // 5% of 400_000 = 20_000, floored by fee_cap 10_000.
+        assert_eq!(fee, 10_000);
+        assert_eq!(payout, 390_000);
+        assert_eq!(e.fees_paid(), 10_000);
+    }
+
+    #[test]
+    fn noop_reaffirmation_succeeds_without_changing_state() {
+        let mut e = subscription_escrow();
+        e.adjust_period_amounts(ALICE, BOB, &[250_000, 250_000, 250_000, 250_000])
+            .unwrap();
+        assert_eq!(
+            amounts_of(&e),
+            vec![250_000, 250_000, 250_000, 250_000]
+        );
+    }
+
+    #[test]
+    fn indexed_escrow_emits_event_only_on_actual_change() {
+        const ESCROW_ID: [u8; 32] = [0xE5; 32];
+        const T0: u64 = 1_700_000_000;
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        let before = e.event_count();
+        e.adjust_period_amounts(ALICE, BOB, &[400_000, 300_000, 200_000, 100_000], T0 + 1)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "one event on change");
+        let ev = e.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::SubscriptionAmountsAdjusted);
+        assert_eq!(ev.from, EscrowState::Uninitialized);
+        assert_eq!(ev.to, EscrowState::Uninitialized);
+        // A no-op re-affirmation emits nothing.
+        let before = e.event_count();
+        e.adjust_period_amounts(ALICE, BOB, &[400_000, 300_000, 200_000, 100_000], T0 + 2)
+            .unwrap();
+        assert_eq!(e.event_count(), before, "no-op re-affirmation emits nothing");
+        // A failed call emits nothing.
+        let before = e.event_count();
+        assert_eq!(
+            e.adjust_period_amounts(ALICE, MALLORY, &[400_000, 300_000, 200_000, 100_000], T0 + 3)
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(e.event_count(), before, "failed call emits nothing");
+    }
+
+    #[test]
+    fn keeper_lists_the_adjusted_period_amount() {
+        // The keeper's `ReleasePeriod` action prices from the live
+        // per-period table, so a re-split re-prices the operator's
+        // push call.
+        let mut e = subscription_escrow();
+        e.adjust_period_amounts(ALICE, BOB, &[400_000, 300_000, 200_000, 100_000])
+            .unwrap();
+        let watched = WatchedEscrow {
+            escrow_id: [0x11; 32],
+            escrow: e,
+            reference: None,
+        };
+        let report = scan_keeper_actions(&[watched], due(0));
+        assert_eq!(report.actions.len(), 1);
+        let a = report.actions[0];
+        assert_eq!(a.kind, KeeperActionKind::ReleasePeriod);
+        assert_eq!(a.amount, 400_000, "keeper prices the live table");
+    }
+
+    #[test]
+    fn snapshot_reports_the_live_period_amounts() {
+        let mut e = subscription_escrow();
+        e.adjust_period_amounts(ALICE, BOB, &[400_000, 300_000, 200_000, 100_000])
+            .unwrap();
+        let snap = e.snapshot(due(0));
+        let sub = snap.subscription.as_ref().expect("schedule snapshots");
+        assert_eq!(sub.periods, PERIODS);
+        assert_eq!(sub.total, 1_000_000);
+        assert_eq!(sub.next, Some(0));
+        let live: Vec<u64> = sub.periods_detail.iter().map(|p| p.amount).collect();
+        assert_eq!(live, vec![400_000, 300_000, 200_000, 100_000]);
+        assert!(sub.periods_detail.iter().all(|p| !p.released));
+        // After a release the snapshot pins the released period's
+        // recorded amount and the remaining live ones.
+        e.release_period(ALICE, due(0), 0, None, BOB).unwrap();
+        let snap = e.snapshot(due(1));
+        let sub = snap.subscription.as_ref().unwrap();
+        assert_eq!(sub.next, Some(1));
+        assert!(sub.periods_detail[0].released);
+        assert_eq!(sub.periods_detail[0].amount, 400_000);
+        assert_eq!(sub.periods_detail[1].amount, 300_000);
+    }
+}
+
 // ---------- AV-21: expiry grace period tests ----------
 //
 // `cancel_expired` requires `now >= expires_at + grace_period`
@@ -18361,7 +18932,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2933, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) bytes");
+        assert_eq!(bytes.len(), 3445, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -18386,7 +18957,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 2933);
+        assert_eq!(bytes.len(), 3445);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -18408,18 +18979,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2941) * 3480 * 2 = 3069 * 6960 = 21_360_240 lamports.
-        assert_eq!(VAULT_SPACE, 2941);
-        assert_eq!(full, 21_360_240);
+        // (128 + 3453) * 3480 * 2 = 3581 * 6960 = 24_923_760 lamports.
+        assert_eq!(VAULT_SPACE, 3453);
+        assert_eq!(full, 24_923_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2451) * 3480 * 2 = 2579 * 6960 = 17_949_840 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2451);
-        assert_eq!(no_quorum, 17_949_840);
+        // (128 + 2963) * 3480 * 2 = 3091 * 6960 = 21_513_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2963);
+        assert_eq!(no_quorum, 21_513_360);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -18563,7 +19134,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2933);
+        assert_eq!(bytes.len(), 3445);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -18578,7 +19149,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 2933);
+        assert_eq!(bytes.len(), 3445);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -18609,18 +19180,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2941) * 3480 * 2 = 3069 * 6960 = 21_360_240 lamports.
-        assert_eq!(VAULT_SPACE, 2941);
-        assert_eq!(full, 21_360_240);
+        // (128 + 3453) * 3480 * 2 = 3581 * 6960 = 24_923_760 lamports.
+        assert_eq!(VAULT_SPACE, 3453);
+        assert_eq!(full, 24_923_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2451) * 3480 * 2 = 2579 * 6960 = 17_949_840 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2451);
-        assert_eq!(no_quorum, 17_949_840);
+        // (128 + 2963) * 3480 * 2 = 3091 * 6960 = 21_513_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2963);
+        assert_eq!(no_quorum, 21_513_360);
     }
 
     #[test]
@@ -19475,7 +20046,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 2933);
+        assert_eq!(bytes.len(), 3445);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -19650,7 +20221,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 2933, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68");
+        assert_eq!(ESCROW_BODY_LEN, 3445, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -19668,32 +20239,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 2941) * 3480 * 2 = 3069 * 6960 = 21_360_240 lamports.
+        // (128 + 3453) * 3480 * 2 = 3581 * 6960 = 24_923_760 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            21_360_240
+            24_923_760
         );
-        // (128 + 2451) * 3480 * 2 = 2579 * 6960 = 17_949_840 lamports.
+        // (128 + 2963) * 3480 * 2 = 3091 * 6960 = 21_513_360 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            17_949_840
+            21_513_360
         );
-        // 1376 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
+        // 1888 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 2941);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2451);
-        assert!(check_vault_rent_exempt(21_360_240, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 3453);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2963);
+        assert!(check_vault_rent_exempt(24_923_760, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -21888,6 +22459,17 @@ mod arbiter_rotation_tests {
             [240, 224, 99, 74, 41, 45, 129, 178]
         );
     }
+
+    #[test]
+    fn adjust_period_amounts_instruction_discriminator_is_pinned() {
+        // AV-73. IDL: sha256("global:adjust_period_amounts")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("adjust_period_amounts"),
+            [245, 12, 78, 243, 243, 197, 33, 156]
+        );
+    }
 }
 
 // ---------- AV-67: fee-recipient rotation (treasury key rollover) ----------
@@ -22509,9 +23091,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2933, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline)");
-        assert_eq!(VAULT_SPACE, 2941);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2451);
+        assert_eq!(bytes.len(), 3445, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table)");
+        assert_eq!(VAULT_SPACE, 3453);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2963);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -23055,7 +23637,7 @@ mod default_judgment_tests {
         // at 960, `default_judgment` at 968, `default_confirmed` at 985
         // (AV-55 body total 986). AV-56 appends `subscription` at 986,
         // `subscription_next` at 1004, `subscription_released` at 1005
-        // (body total 2933 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline appends).
+        // (body total 3445 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline + AV-73 per-period-table appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter(ARBITER)
@@ -23065,7 +23647,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2933);
+        assert_eq!(bytes.len(), 3445);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -23622,14 +24204,17 @@ mod subscription_tests {
     fn borsh_tail_pins_subscription_fields() {
         // Offsets: `default_confirmed` ends the AV-55 body at 986;
         // `subscription` at 986, `subscription_next` at 1004,
-        // `subscription_released` at 1005 (body total 2933 after the AV-57 + AV-59 + AV-63 + AV-64 + AV-65 + AV-66 + AV-68 appends).
+        // `subscription_released` at 1005; the AV-73 live per-period
+        // amount table at 2933..3445 (body total 3445 after the AV-57 +
+        // AV-59 + AV-63 + AV-64 + AV-65 + AV-66 + AV-68 + AV-73
+        // appends).
         let mut e = escrow()
             .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2933);
+        assert_eq!(bytes.len(), 3445);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -23649,6 +24234,20 @@ mod subscription_tests {
             u64::from_le_bytes(bytes[1005..1013].try_into().unwrap()),
             0,
             "subscription_released: zeroed"
+        );
+        // AV-73: the live per-period amount table seeds from the
+        // uniform `per_period`; slots past `periods` stay zero.
+        for i in 0..PERIODS as usize {
+            assert_eq!(
+                u64::from_le_bytes(bytes[2933 + i * 8..2941 + i * 8].try_into().unwrap()),
+                PER_PERIOD,
+                "subscription_amounts[{i}]: seeded from per_period"
+            );
+        }
+        assert_eq!(
+            &bytes[2933 + PERIODS as usize * 8..3445],
+            &vec![0u8; 3445 - 2933 - PERIODS as usize * 8][..],
+            "subscription_amounts: tail slots zeroed"
         );
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "tail byte is the last byte");
     }
@@ -23878,7 +24477,12 @@ mod event_history_tests {
             35,
             "AV-70: appended after PanelThresholdChanged"
         );
-        for d in 0..=35u8 {
+        assert_eq!(
+            EscrowEventKind::SubscriptionAmountsAdjusted.discriminant(),
+            36,
+            "AV-73: appended after MilestonesAdjusted"
+        );
+        for d in 0..=36u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -23889,7 +24493,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(36), None);
+        assert_eq!(EscrowEventKind::from_discriminant(37), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -23901,11 +24505,11 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512
         );
     }
 
@@ -23914,13 +24518,14 @@ mod event_history_tests {
         // Offsets: `subscription_released` ends the AV-56 body at 1013;
         // `event_head` at 1013, `event_total` at 1014, `event_count` at
         // 1022, `event_capacity` at 1023, `event_slots` at 1024 (body
-        // total 2933 after the AV-59 + AV-63 + AV-64 + AV-68 appends).
+        // total 3445 after the AV-59 + AV-63 + AV-64 + AV-68 + AV-73
+        // appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2933);
+        assert_eq!(bytes.len(), 3445);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -23948,7 +24553,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41, "AV-68 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512, "AV-73 tail");
     }
 
     #[test]
@@ -23963,18 +24568,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2941) * 3480 * 2 = 3069 * 6960 = 21_360_240 lamports.
-        assert_eq!(VAULT_SPACE, 2941);
-        assert_eq!(full, 21_360_240);
+        // (128 + 3453) * 3480 * 2 = 3581 * 6960 = 24_923_760 lamports.
+        assert_eq!(VAULT_SPACE, 3453);
+        assert_eq!(full, 24_923_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2451) * 3480 * 2 = 2579 * 6960 = 17_949_840 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2451);
-        assert_eq!(no_quorum, 17_949_840);
+        // (128 + 2963) * 3480 * 2 = 3091 * 6960 = 21_513_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2963);
+        assert_eq!(no_quorum, 21_513_360);
     }
 
     // ----- decode -----
@@ -24008,10 +24613,11 @@ mod event_history_tests {
         let kind_off = ANCHOR_DISCRIMINATOR_LEN + 1024;
         // AV-69: discriminants 30/31 are `PanelJudgment` /
         // `PanelResolved`, 32 is `FeeRecipientRotated`, 33 is
-        // `EvidenceSubmitted`, 34 is `PanelThresholdChanged`, and 35 is
-        // `MilestonesAdjusted` (AV-70); 36 is the first still-unknown
-        // byte.
-        for bad in [36u8, 42, 255] {
+        // `EvidenceSubmitted`, 34 is `PanelThresholdChanged`, 35 is
+        // `MilestonesAdjusted` (AV-70), and 36 is
+        // `SubscriptionAmountsAdjusted` (AV-73); 37 is the first
+        // still-unknown byte.
+        for bad in [37u8, 42, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -24662,16 +25268,16 @@ mod fee_cap_tests {
     fn layout_pins_include_the_fee_cap_tail() {
         // +595 over the AV-64 numbers (the AV-65 arbiter-panel region)
         // + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline).
-        assert_eq!(ESCROW_BODY_LEN, 2933, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 2941, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2451, "no-quorum Vault account space");
+        assert_eq!(ESCROW_BODY_LEN, 3445, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 3453, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2963, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            21_360_240,
+            24_923_760,
             "(128 + 2941) * 3480 * 2 = 3069 * 6960"
         );
         assert_eq!(
@@ -24680,7 +25286,7 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            17_949_840,
+            21_513_360,
             "(128 + 2451) * 3480 * 2 = 2579 * 6960"
         );
     }
@@ -24693,7 +25299,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2933);
+        assert_eq!(bytes.len(), 3445);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -25182,15 +25788,15 @@ mod fee_schedule_tests {
 
     #[test]
     fn fee_schedule_persists_in_serialized_layout_tail() {
-        // The schedule sits just before the AV-68 tail (the final 41
-        // bytes are the evidence-deadline region): arbiter_panel stays
-        // the third-to-last region, so every earlier offset is
+        // The schedule sits just before the AV-68 evidence-deadline
+        // region and the AV-73 per-period table: arbiter_panel stays
+        // the fourth-to-last region, so every earlier offset is
         // unchanged.
         let e = scheduled_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2933);
-        let tail = ESCROW_BODY_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        assert_eq!(bytes.len(), 3445);
+        let tail = ESCROW_BODY_LEN - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(bytes[tail], 3, "tier_count at the tail");
         assert_eq!(
             u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
@@ -25220,9 +25826,9 @@ mod fee_schedule_tests {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         // AV-68 appended the evidence-deadline region (8 + 33 bytes)
-        // after the fee schedule, so the schedule no longer sits at
-        // the body tail.
-        let tail = ESCROW_BODY_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        // and AV-73 the per-period table (512 bytes) after the fee
+        // schedule, so the schedule no longer sits at the body tail.
+        let tail = ESCROW_BODY_LEN - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(
             &bytes[tail..tail + FEE_SCHEDULE_LEN],
             &[0u8; FEE_SCHEDULE_LEN],
@@ -25236,9 +25842,9 @@ mod fee_schedule_tests {
         let e = scheduled_escrow();
         let mut bytes = super::account_space_tests::encode_escrow(&e);
         // AV-68 appended the evidence-deadline region (8 + 33 bytes)
-        // after the fee schedule, so the schedule no longer sits at
-        // the body tail.
-        let tail = ESCROW_BODY_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        // and AV-73 the per-period table (512 bytes) after the fee
+        // schedule, so the schedule no longer sits at the body tail.
+        let tail = ESCROW_BODY_LEN - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         bytes[tail] = 9;
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
@@ -25571,7 +26177,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2933);
+        assert_eq!(bytes.len(), 3445);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -26116,11 +26722,13 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2933);
-        // The panel region trails the AV-68 evidence-deadline region
-        // (41 bytes) and the AV-66 fee-schedule region (81 bytes):
+        assert_eq!(bytes.len(), 3445);
+        // The panel region trails the AV-73 per-period amount table
+        // (512 bytes), the AV-68 evidence-deadline region (41 bytes) and
+        // the AV-66 fee-schedule region (81 bytes):
         // 1-byte discriminant + 594-byte panel.
-        let tail = &bytes[bytes.len() - 41 - FEE_SCHEDULE_LEN - 595..bytes.len() - 41 - FEE_SCHEDULE_LEN];
+        let tail = &bytes[bytes.len() - SUBSCRIPTION_AMOUNTS_LEN - 41 - FEE_SCHEDULE_LEN - 595
+            ..bytes.len() - SUBSCRIPTION_AMOUNTS_LEN - 41 - FEE_SCHEDULE_LEN];
         assert_eq!(tail[0], 1, "panel discriminant");
         assert_eq!(tail[1], 3, "n");
         assert_eq!(tail[2], 2, "threshold");
@@ -26151,7 +26759,7 @@ mod arbiter_panel_tests {
         // A panel-less escrow decodes with `None` and a zeroed region.
         let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let plain_bytes = encode_escrow(&plain);
-        assert_eq!(plain_bytes[plain_bytes.len() - FEE_SCHEDULE_LEN - 595], 0);
+        assert_eq!(plain_bytes[plain_bytes.len() - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 595], 0);
         assert!(decode_vault_account(&account_bytes(&plain))
             .unwrap()
             .arbiter_panel()
@@ -26167,8 +26775,9 @@ mod arbiter_panel_tests {
         assert_eq!(panel.1, "Option<ArbiterPanel>");
         assert_eq!(panel.2, 1 + ARBITER_PANEL_LEN);
         assert_eq!(panel.2, 595);
-        // Appended last before AV-68: every earlier field offset stays stable.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "fee_schedule");
+        // Appended last before AV-68/AV-73: every earlier field offset
+        // stays stable.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "fee_schedule");
     }
 
     #[test]
@@ -26181,11 +26790,12 @@ mod arbiter_panel_tests {
         assert_eq!(schedule.2, FEE_SCHEDULE_LEN);
         assert_eq!(schedule.2, 1 + MAX_FEE_TIERS * FEE_TIER_LEN);
         assert_eq!(schedule.2, 81);
-        // AV-68 appended two fields after it: the deadline region and
-        // the escalating party are the new tail.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "evidence_deadline_secs");
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "escalated_by");
-        assert_eq!(VAULT_FIELDS.last().unwrap().2, 1 + 32);
+        // AV-68 appended two fields after it and AV-73 one more: the
+        // per-period amount table is the new tail.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "evidence_deadline_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "escalated_by");
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "subscription_amounts");
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, SUBSCRIPTION_AMOUNTS_LEN);
     }
 
     #[test]

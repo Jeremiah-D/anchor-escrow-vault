@@ -150,7 +150,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-70) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-70), SubscriptionAmountsAdjusted (AV-73) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | PartiallyCancelled (AV-60) | 0 | 0 | the partially-cancelled tranche, refunded to the whitelisted destination (the escrow stays `Funded`; the `released` counter is untouched) | 0 |
@@ -405,6 +405,18 @@ pub enum EscrowEventKind {
     /// amounts are zero — re-splitting moves no funds (the later
     /// tranche releases carry the new amounts with their fees).
     MilestonesAdjusted,
+    /// AV-73: the subscription per-period amounts were re-split by
+    /// dual-signed governance
+    /// ([`Escrow::adjust_period_amounts`]). `from == to ==` the
+    /// current state (a config change, not a lifecycle move — like
+    /// [`EscrowEventKind::MilestonesAdjusted`]); the new amounts are
+    /// read from the vault, the event is the ordering signal. Emitted
+    /// only on an actual change: re-affirming the current amounts is
+    /// an idempotent no-op that emits nothing (paralleling
+    /// [`EscrowEventKind::MilestonesAdjusted`]'s no-op rule). All
+    /// amounts are zero — re-splitting moves no funds (the later
+    /// period releases carry the new amounts with their fees).
+    SubscriptionAmountsAdjusted,
 }
 
 impl EscrowEventKind {
@@ -472,6 +484,10 @@ impl EscrowEventKind {
             // discriminants 0–34 stay stable for already-serialized
             // histories.
             35 => Self::MilestonesAdjusted,
+            // AV-73: appended after MilestonesAdjusted so
+            // discriminants 0–35 stay stable for already-serialized
+            // histories.
+            36 => Self::SubscriptionAmountsAdjusted,
             _ => return None,
         })
     }
@@ -516,6 +532,7 @@ impl EscrowEventKind {
             Self::EvidenceSubmitted => "evidence_submitted",
             Self::PanelThresholdChanged => "panel_threshold_changed",
             Self::MilestonesAdjusted => "milestones_adjusted",
+            Self::SubscriptionAmountsAdjusted => "subscription_amounts_adjusted",
         }
     }
 }
@@ -2187,6 +2204,47 @@ impl IndexedEscrow {
         if after != before {
             self.push_event(
                 EscrowEventKind::MilestonesAdjusted,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// Re-split the subscription per-period amounts by dual-signed
+    /// governance (mirrors [`Escrow::adjust_period_amounts`]). Emits
+    /// `SubscriptionAmountsAdjusted` when the amounts actually change
+    /// (`from == to ==` the current state — the schedule, not the
+    /// lifecycle state, is what changed); a no-op re-affirmation
+    /// emits nothing, paralleling
+    /// [`EscrowEventKind::MilestonesAdjusted`]'s no-op rule. `at` is
+    /// the caller-supplied timestamp (on-chain: the clock sysvar).
+    pub fn adjust_period_amounts(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_amounts: &[u64],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let before: Vec<u64> = (0..super::MAX_SUBSCRIPTION_PERIODS)
+            .filter_map(|i| self.inner.subscription_period_amount(i))
+            .collect();
+        self.inner
+            .adjust_period_amounts(initializer, taker, new_amounts)?;
+        let after: Vec<u64> = (0..super::MAX_SUBSCRIPTION_PERIODS)
+            .filter_map(|i| self.inner.subscription_period_amount(i))
+            .collect();
+        if after != before {
+            self.push_event(
+                EscrowEventKind::SubscriptionAmountsAdjusted,
                 from,
                 self.inner.state(),
                 EventAmounts::none(),

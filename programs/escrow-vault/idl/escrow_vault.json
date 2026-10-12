@@ -187,6 +187,14 @@
       ]
     },
     {
+      "name": "adjust_period_amounts",
+      "discriminator": [245, 12, 78, 243, 243, 197, 33, 156],
+      "accounts": [],
+      "args": [
+        {"name": "new_amounts", "type": {"vec": "u64"}}
+      ]
+    },
+    {
       "name": "initialize_mint",
       "discriminator": [209, 42, 195, 4, 129, 85, 209, 44],
       "accounts": [],
@@ -534,7 +542,8 @@
           {"name": "arbiter_panel", "type": {"option": {"defined": "ArbiterPanel"}}, "offset": 2224},
           {"name": "fee_schedule", "type": {"defined": "FeeSchedule"}, "offset": 2819},
           {"name": "evidence_deadline_secs", "type": "u64", "offset": 2900},
-          {"name": "escalated_by", "type": {"option": "publicKey"}, "offset": 2908}
+          {"name": "escalated_by", "type": {"option": "publicKey"}, "offset": 2908},
+          {"name": "subscription_amounts", "type": {"array": ["u64", 64]}, "offset": 2941}
         ]
       }
     }

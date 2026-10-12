@@ -152,6 +152,46 @@ pub struct MilestoneSnapshot {
     pub tranches: Vec<MilestoneTrancheSnapshot>,
 }
 
+/// One subscription period (AV-56/AV-73): the period's live payout
+/// amount plus its release state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionPeriodSnapshot {
+    /// Period index, in release order (0-based).
+    pub index: u8,
+    /// The period's *live* payout amount: the uniform `per_period` at
+    /// setup, or the dual-signed re-split from
+    /// [`Escrow::adjust_period_amounts`](crate::Escrow::adjust_period_amounts).
+    pub amount: u64,
+    /// The period already released (its amount is locked history).
+    pub released: bool,
+    /// Unix timestamp at which the period becomes due
+    /// (back-scheduled from `expires_at`).
+    pub due_at: u64,
+}
+
+/// Subscription schedule progress (AV-56), with the AV-73 live
+/// per-period amounts: what `release_period` will actually pay per
+/// period, never the construction-time uniform alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionSnapshot {
+    /// Number of periods.
+    pub periods: u8,
+    /// Seconds between period due dates.
+    pub period_secs: u64,
+    /// The uniform per-period amount at setup (the schedule's
+    /// construction-time parameter — informational; payouts read the
+    /// live per-period table).
+    pub per_period: u64,
+    /// Exact sum of the live per-period amounts (`u128`: never wraps)
+    /// — always the locked amount.
+    pub total: u128,
+    /// Index of the next period to release, or `None` when every
+    /// period released.
+    pub next: Option<u8>,
+    /// Per-period detail, in release order, with live amounts.
+    pub periods_detail: Vec<SubscriptionPeriodSnapshot>,
+}
+
 /// One panel member's current effective vote, as exported by the
 /// AV-65 arbiter-panel snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +312,9 @@ pub struct EscrowSnapshot {
     /// Milestone plan progress, or `None` when none is attached
     /// (AV-15).
     pub milestones: Option<MilestoneSnapshot>,
+    /// Subscription schedule progress with live per-period amounts, or
+    /// `None` when none is attached (AV-56/AV-73).
+    pub subscription: Option<SubscriptionSnapshot>,
     /// Cumulative amount skipped by mutual agreement (AV-15).
     pub skipped: u64,
     /// Dispute evidence commitment attached at `escalate`, or `None`
@@ -385,6 +428,40 @@ impl Escrow {
                 tranches,
             }
         });
+        // AV-56/AV-73: subscription schedule progress. The per-period
+        // amounts are the *live* table — what `release_period` will
+        // actually pay — never the schedule's construction-time
+        // uniform alone.
+        let subscription = self.subscription_schedule().map(|schedule| {
+            let count = schedule.periods as usize;
+            let mut periods_detail = Vec::with_capacity(count);
+            let mut total: u128 = 0;
+            for i in 0..count {
+                // `subscription_period_amount` is `Some` for `i <
+                // periods` by construction.
+                let amount = self.subscription_period_amount(i as u8).unwrap_or(0);
+                total += amount as u128;
+                periods_detail.push(SubscriptionPeriodSnapshot {
+                    index: i as u8,
+                    amount,
+                    released: self.subscription_released_periods() & (1u64 << i) != 0,
+                    due_at: self.subscription_period_due_at(i as u8).unwrap_or(0),
+                });
+            }
+            let next_idx = self.subscription_next_period();
+            SubscriptionSnapshot {
+                periods: schedule.periods,
+                period_secs: schedule.period_secs,
+                per_period: schedule.per_period,
+                total,
+                next: if next_idx < schedule.periods {
+                    Some(next_idx)
+                } else {
+                    None
+                },
+                periods_detail,
+            }
+        });
         EscrowSnapshot {
             at: now,
             initializer: self.initializer(),
@@ -443,6 +520,7 @@ impl Escrow {
                 }
             },
             milestones,
+            subscription,
             skipped: self.skipped_amount(),
             evidence_hash: self.evidence_hash(),
             // AV-68: the disclosure deadline and the escalating party
@@ -694,6 +772,46 @@ impl EscrowSnapshot {
             }
             None => s.push_str("null"),
         }
+        // AV-56/AV-73: subscription schedule progress with live
+        // per-period amounts.
+        s.push_str(",\"subscription\":");
+        match &self.subscription {
+            Some(sub) => {
+                s.push_str("{\"periods\":");
+                s.push_str(&sub.periods.to_string());
+                s.push_str(",\"period_secs\":");
+                s.push_str(&sub.period_secs.to_string());
+                s.push_str(",\"per_period\":");
+                s.push_str(&sub.per_period.to_string());
+                s.push_str(",\"total\":");
+                s.push_str(&sub.total.to_string());
+                s.push_str(",\"next\":");
+                match sub.next {
+                    Some(n) => s.push_str(&n.to_string()),
+                    None => s.push_str("null"),
+                }
+                s.push_str(",\"periods_detail\":[");
+                for (i, p) in sub.periods_detail.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push_str("{\"index\":");
+                    s.push_str(&p.index.to_string());
+                    s.push_str(",\"amount\":");
+                    s.push_str(&p.amount.to_string());
+                    // AV-28: the period amount in human units.
+                    s.push_str(",\"display_amount\":\"");
+                    s.push_str(&format_amount(p.amount, self.decimals));
+                    s.push_str("\",\"released\":");
+                    s.push_str(if p.released { "true" } else { "false" });
+                    s.push_str(",\"due_at\":");
+                    s.push_str(&p.due_at.to_string());
+                    s.push('}');
+                }
+                s.push_str("]}");
+            }
+            None => s.push_str("null"),
+        }
         s.push_str(",\"skipped\":");
         s.push_str(&self.skipped.to_string());
         s.push_str(",\"display_skipped\":\"");
@@ -874,7 +992,7 @@ mod snapshot_tests {
              \"vesting\":null,\"vested\":0,\"display_vested\":\"0\",\"claimable\":0,\"display_claimable\":\"0\",\
              \"arbiter\":null,\"mint\":null,\
              \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
-             \"milestones\":null,\
+             \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
              \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\

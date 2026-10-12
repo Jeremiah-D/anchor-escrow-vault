@@ -82,6 +82,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `release_milestone(authority, now, index)`        | `Funded`       | `Funded` (partial) / `Released` (final tranche) | initializer; milestone dual-confirmed (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise) |
 | `skip_milestone(authority, index)`           | `Funded`       | — (no state change) | initializer **or** taker, **both** must approve (dual-sig skip; skipped tranche refunded to the initializer) |
 | `adjust_milestone_amounts(initializer, taker, new_amounts)` (AV-70) | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the tranche table) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition`; rejected once any tranche settled (`released > 0` or `skipped > 0`); new amounts must have the plan's tranche count, be all positive, and sum to exactly the locked amount; per-tranche confirmations survive (they accept the deliverable, not the amount); protocol fees charge on the new amounts at release time (still floored by `fee_cap`); emits `MilestonesAdjusted` only on an actual change |
+| `adjust_period_amounts(initializer, taker, new_amounts)` (AV-73) | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the per-period table) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition`; released periods lock their recorded amounts (the re-split must reaffirm them — `InvalidSubscription` otherwise); new amounts must have the schedule's period count, be all positive, and sum to exactly the locked amount; protocol fees charge on the new amounts at release time (still floored by `fee_cap`); the keeper's `ReleasePeriod` action prices from the live table; emits `SubscriptionAmountsAdjusted` only on an actual change |
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
 | `initialize_protocol_fee(fee_bps)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `fee_bps` in 0–10000 basis points; the fee slices every taker payout into net payout + protocol fee; the AV-63 fee cap can floor it per payout) |
 | `initialize_fee_cap(max_fee_cents)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; absolute per-payout fee ceiling in lamports — the effective fee is `min(bps fee, fee_cap)`; `0` means uncapped; no new error code) |
@@ -488,7 +489,9 @@ record, and the hard enforcement is the deadline itself. The
 each disclosure. New vault fields (appended last):
 `evidence_deadline_secs` (u64) + `escalated_by`
 (`Option<Pubkey>`, 33 bytes) — 41 bytes, so the full vault is now 2941
-bytes / 21,360,240 lamports rent-exempt.
+bytes / 21,360,240 lamports rent-exempt. AV-73 appends the 512-byte
+live per-period amount table (`subscription_amounts`: 64 `u64` slots),
+so the full vault is now 3453 bytes / 24,923,760 lamports rent-exempt.
 
 **Panel threshold governance (AV-69).** The right M-of-N is not always
 obvious at setup — a 2-of-3 panel may prove too slow (one member goes
@@ -644,6 +647,28 @@ Protocol fees charge on the new amounts at release time via
 `protocol_fee_for` (still floored by `fee_cap`), and the indexer sees
 one `MilestonesAdjusted` event on an actual change.
 
+**Subscription per-period re-split (AV-73).** The subscription twin of
+the AV-70 milestone re-split: before any release, the initializer and
+taker may jointly re-balance the per-period payout amounts via
+`adjust_period_amounts(initializer, taker, new_amounts)` — e.g.
+front-load a period whose costs grew — without cancelling and
+re-creating the escrow. Both parties must sign (dual-signature
+governance, one party alone is `Unauthorized`); `Uninitialized`,
+`Activated`, or `Funded` only — the terminal states and `Disputed`
+(arbitration in flight) are `InvalidStateTransition`. Released periods
+lock their recorded amounts: the re-split must reaffirm them
+(`InvalidSubscription` otherwise), so on-chain payout history is never
+rewritten. The new amounts must have exactly the schedule's period
+count (re-split, not restructure), be all positive, and sum to *exactly*
+the locked amount (accumulated in `u128`, like `with_subscription`).
+The rewrite is in place — the 64-slot `subscription_amounts` table is
+always reserved, so no account realloc, no rent change. Protocol fees
+charge on the new amounts at release time via `protocol_fee_for`
+(still floored by `fee_cap`), the keeper's `ReleasePeriod` action
+prices from the live table, and the indexer sees one
+`SubscriptionAmountsAdjusted` event on an actual change (a no-op
+re-affirmation emits nothing).
+
 **SPL token mint binding (token-scoped escrows).** An escrow can bind one
 SPL token mint at creation (`initialize_mint(mint)`, opt-in on
 `Uninitialized`, like the quorum builder): the `mint` param is the base58
@@ -737,6 +762,8 @@ tier slots), so the full vault is now **2892 bytes** and needs
 **21,074,880 lamports**. AV-68 appends the 41-byte evidence-deadline
 region (8-byte `evidence_deadline_secs` + 33-byte `escalated_by`), so
 the full vault is now **2941 bytes** and needs **21,360,240
+lamports**. AV-73 appends the 512-byte live per-period amount table, so
+the full vault is now **3453 bytes** and needs **24,923,760
 lamports**.
 
 **Tiered protocol fee (AV-66).** An escrow can opt in to volume-priced
@@ -1032,7 +1059,7 @@ program error per variant):
 | `PayoutNotAllowlisted` | 127 | a payout transition (`release` / `claim` / `resolve` / `release_milestone` / `release_via_cpi`) naming a `payout_to` that is neither the taker nor a member of the payout allowlist |
 | `InvalidTaker` | 128 | `rotate_taker` with the zero address (a zero address can never be the legitimate payout counterparty) |
 | `DefaultJudgmentNotDue` | 129 | `trigger_default_judgment` with no default judgment configured, the taker never confirmed the split, or the arbitration deadline not yet passed; `with_arbitration_deadline` with a zero deadline |
-| `InvalidSubscription` | 130 | `with_subscription` with a zero `period_secs`, zero or over-long `periods`, a zero `per_period`, per-period amounts that do not sum to the locked amount, a `u64::MAX` expiry (back-scheduling needs a bounded lifetime), a schedule that does not fit inside the escrow's lifetime, or on a non-`Uninitialized` escrow; `with_milestones` after a subscription (mutually exclusive release schedules); any subscription operation on an escrow with no schedule attached; or plain `release` on an escrow with a subscription (the schedule owns the release path) |
+| `InvalidSubscription` | 130 | `adjust_period_amounts` on an escrow with no schedule, with a wrong-length / zero / sum-mismatched amount list, or rewriting a released period's recorded amount; `with_subscription` with a zero `period_secs`, zero or over-long `periods`, a zero `per_period`, per-period amounts that do not sum to the locked amount, a `u64::MAX` expiry (back-scheduling needs a bounded lifetime), a schedule that does not fit inside the escrow's lifetime, or on a non-`Uninitialized` escrow; `with_milestones` after a subscription (mutually exclusive release schedules); any subscription operation on an escrow with no schedule attached; or plain `release` on an escrow with a subscription (the schedule owns the release path) |
 | `PeriodNotDue` | 131 | `release_period` with a `period_index` that is not the next due period (skipping ahead or replaying a released period), or with `now` before that period's back-scheduled due timestamp; periods release strictly in order, one at a time, each only once due |
 | `InvalidEventCapacity` | 132 | `with_event_capacity` with `capacity == 0` or `capacity > 64` (the event-history ring holds 1..=64 entries) |
 | `InvalidInitializer` | 133 | `rotate_initializer` with the zero address (a zero address can never be the legitimate initializer) |
@@ -1311,7 +1338,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -1664,7 +1691,8 @@ two-way consistency check against the IDL parameter table:
 | fee_schedule | FeeSchedule | 81 |
 | evidence_deadline_secs | u64 | 8 |
 | escalated_by | Option<Pubkey> | 33 |
-| **total**     |                   | **2933** |
+| subscription_amounts | [u64; 64] | 512 |
+| **total**     |                   | **3445** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1738,10 +1766,10 @@ is configured) — and the 8-byte dispute-evidence disclosure deadline
 (AV-68: zeroed when no deadline is configured) — and the 33-byte
 escalating-party region (AV-68: 1-byte discriminant + 32-byte key,
 zeroed when the escrow was never disputed).
-`escrow-state` exposes `VAULT_SPACE` (2941) and
-`VAULT_SPACE_NO_QUORUM` (2451) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (3453) and
+`VAULT_SPACE_NO_QUORUM` (2963) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **21,360,240 lamports** to be
+mainnet rent parameters the full vault needs **24,923,760 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1762,16 +1790,17 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 2819 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
+  stays 3453 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
   weighted-quorum, AV-46 pause-switch, AV-49 payout-allowlist, AV-51
   vesting-cliff, AV-53 reference-memo, AV-55 default-judgment,
   AV-56 subscription, AV-57 event-history, AV-59 extension, AV-63
-  fee-cap, AV-64 relative-timelock, and AV-65 arbiter-panel growth is
-  accounted in the
+  fee-cap, AV-64 relative-timelock, AV-65 arbiter-panel, AV-66
+  fee-schedule, AV-68 evidence-deadline, and AV-73 per-period-table
+  growth is accounted in the
   layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**21,360,240
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**24,923,760
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the

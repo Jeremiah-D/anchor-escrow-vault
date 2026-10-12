@@ -2218,6 +2218,80 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Re-split the subscription per-period amounts by dual-signed
+    /// governance (AV-73; mirrors `Escrow::adjust_period_amounts`). Both
+    /// the *current* initializer and the *current* taker must sign —
+    /// one party alone (or a stranger pair) is `Unauthorized`; the
+    /// degenerate initializer == taker self-escrow authorizes with one
+    /// key passed twice, like AV-12 activation. Only `Uninitialized` /
+    /// `Activated` / `Funded`: the terminal states have no live periods
+    /// left to re-split, and `Disputed` is `InvalidStateTransition`
+    /// (arbitration in flight adjudicates the payouts). Released periods
+    /// lock their recorded amounts — the re-split must reaffirm them
+    /// (`InvalidSubscription` otherwise), so on-chain payout history is
+    /// never rewritten. The new amounts must have exactly the
+    /// schedule's period count, be all positive, and sum to exactly the
+    /// locked amount (`InvalidSubscription` otherwise). A paused escrow
+    /// fails fast (`Paused`). The rewrite is in place (the 64-slot
+    /// table is always reserved) — no realloc, no rent change. Protocol
+    /// fees charge on the new amounts at release time via
+    /// `protocol_fee_for` (still floored by `fee_cap`). Emits
+    /// `SubscriptionAmountsAdjusted` only on an actual change (a no-op
+    /// re-affirmation emits nothing), mirroring
+    /// `IndexedEscrow::adjust_period_amounts`.
+    pub fn adjust_period_amounts(
+        ctx: Context<AdjustPeriodAmounts>,
+        new_amounts: Vec<u64>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before: Vec<u64> = escrow
+            .subscription_schedule()
+            .map(|s| {
+                (0..s.periods)
+                    .map(|i| escrow.subscription_period_amount(i).unwrap_or(0))
+                    .collect()
+            })
+            .unwrap_or_default();
+        escrow
+            .adjust_period_amounts(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &new_amounts,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `vault.subscription_amounts` table in place (the
+        // 64-slot region is always reserved, zeroed when no schedule) —
+        // no realloc, no rent change.
+        let after: Vec<u64> = escrow
+            .subscription_schedule()
+            .map(|s| {
+                (0..s.periods)
+                    .map(|i| escrow.subscription_period_amount(i).unwrap_or(0))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if after != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::SubscriptionAmountsAdjusted,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Opt in to bounded expiry extension at setup time (AV-59;
     /// mirrors `Escrow::with_max_extension_secs`). `Uninitialized`
     /// only — the extension policy is fixed before any funds move. A
@@ -3253,6 +3327,12 @@ pub enum EscrowVaultEventKind {
     /// change. Mirrors
     /// `escrow_state::EscrowEventKind::MilestonesAdjusted`.
     MilestonesAdjusted,
+    /// AV-73: the subscription per-period amounts were re-split by
+    /// dual-signed governance (`Escrow::adjust_period_amounts`).
+    /// `from == to ==` the current state; emitted only on an actual
+    /// change. Mirrors
+    /// `escrow_state::EscrowEventKind::SubscriptionAmountsAdjusted`.
+    SubscriptionAmountsAdjusted,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -3327,6 +3407,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::MilestonesAdjusted => {
             EscrowVaultEventKind::MilestonesAdjusted
+        }
+        escrow_state::EscrowEventKind::SubscriptionAmountsAdjusted => {
+            EscrowVaultEventKind::SubscriptionAmountsAdjusted
         }
     }
 }
@@ -4027,6 +4110,23 @@ pub struct RotateFeeRecipient<'info> {
 /// AV-70: accounts for `adjust_milestone_amounts` — the dual-signed
 /// milestone tranche re-split.
 pub struct AdjustMilestoneAmounts<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's *current*
+    /// initializer. Both parties must sign — one alone (or a stranger
+    /// pair) is `Unauthorized`; the degenerate initializer == taker
+    /// self-escrow authorizes with one key passed twice, like AV-12
+    /// activation.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's *current*
+    /// taker.
+    pub taker: Signer<'info>,
+}
+
+#[derive(Accounts)]
+/// AV-73: accounts for `adjust_period_amounts` — the dual-signed
+/// subscription per-period re-split.
+pub struct AdjustPeriodAmounts<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// First governance signer: must equal the escrow's *current*

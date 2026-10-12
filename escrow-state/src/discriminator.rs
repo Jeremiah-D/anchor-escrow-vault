@@ -41,8 +41,8 @@ use super::{
     SubscriptionSchedule, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN, ARBITER_PANEL_LEN,
     DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS,
     MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS, MAX_PAYOUT_ALLOWLIST,
-    MILESTONE_PLAN_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN,
-    SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
+    MAX_SUBSCRIPTION_PERIODS, MILESTONE_PLAN_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN,
+    QUORUM_POLICY_LEN, SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
 };
 
 /// Program-side `#[account]` type names, in Anchor IDL order. The single
@@ -646,6 +646,14 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         None
     };
 
+    // AV-73: the live per-period payout amount table, always present
+    // (64 x u64, zeroed when no schedule is attached). Appended last
+    // so every earlier offset above is unchanged.
+    let mut subscription_amounts = [0u64; MAX_SUBSCRIPTION_PERIODS as usize];
+    for slot in subscription_amounts.iter_mut() {
+        *slot = c.u64_le()?;
+    }
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -746,6 +754,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // decode.
         evidence_deadline_secs,
         escalated_by,
+        // AV-73: the live per-period amount table is persisted — a
+        // decoded escrow carries the same per-period payouts the setup
+        // and `adjust_period_amounts` recorded, so `release_period`
+        // pays identically after a decode.
+        subscription_amounts,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
