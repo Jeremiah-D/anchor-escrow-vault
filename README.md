@@ -1458,6 +1458,44 @@ New vault fields (appended last): `event_head` (u8), `event_total`
 16,091,520 lamports rent-exempt (see [Account space &
 rent](#account-space--rent)).
 
+### Event CSV export (AV-74)
+
+The typed log also renders as deterministic CSV
+(`escrow-state/src/event_csv.rs`: `events_to_csv` /
+`csv_to_events`) — the data-analysis / audit-ingest complement to the
+AV-26 snapshot JSON export. One row per event, fixed column order, a
+header row, LF line endings, and hand-written RFC 4180 escaping (the
+crate stays dependency-free):
+
+```text
+kind,seq,at,actor,payout,fee,refund,penalty,rent_reclaimed
+initialized,0,1700000000,1d1d…1d,0,0,0,0,0
+released,2,1700000002,1d1d…1d,400000,4000,0,0,0
+```
+
+- `kind` is the canonical snake_case event name (`released`,
+  `milestone_confirmed`, …); `seq` / `at` / amounts are decimal
+  `u64`; `amounts` is expanded in place (`payout` = gross taker
+  amount, `fee` = AV-17 protocol fee, `refund`, `penalty`,
+  `rent_reclaimed`).
+- **Actor provenance.** `EscrowEvent` carries no dedicated actor
+  field, and the log never invents one — the only per-escrow identity
+  every event carries is `escrow_id` (32 bytes; on-chain, the vault
+  PDA public key). The `actor` column is that identity as 64 lowercase
+  hex (the snapshot serializer's convention), so the column answers
+  "which escrow did this event come from", not "who signed this
+  transition".
+- **A projection, not a full serialization.** Only the nine columns
+  round-trip. `csv_to_events` reconstructs the carried fields exactly
+  and fills the rest with documented zero-values (`from == to ==
+  Uninitialized` as the explicit "not carried" marker; `None` for
+  `evidence_hash` / `rationale_hash` / `cpi` / `caller` / `reference`;
+  `evidence_defaulted = false`). `events_to_csv(csv_to_events(csv))`
+  is byte-identical to the input for any exporter-written CSV, and
+  the parser never panics — malformed input (bad header, wrong field
+  count, unknown kind, non-decimal integer, non-hex actor,
+  unterminated quote) maps to a precise `CsvError`.
+
 ## Keeper report (AV-20)
 
 A keeper bot watches many vaults and needs the executable call list, not

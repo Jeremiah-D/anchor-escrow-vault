@@ -8,6 +8,10 @@
 mod events;
 mod keeper;
 mod snapshot;
+// AV-74: deterministic indexer-event CSV export (RFC 4180, zero
+// dependencies) — `events_to_csv` / `csv_to_events`, the
+// data-analysis / audit-ingest complement to the AV-26 snapshot JSON.
+mod event_csv;
 mod cpi;
 // AV-35: CPI-routed release — third-party program invocation modeled as
 // data, validated before settlement, with an injected executor seam and
@@ -178,6 +182,13 @@ pub use snapshot::{
     DualSigSnapshot, EscrowSnapshot, MilestoneSnapshot, MilestoneTrancheSnapshot, QuorumSnapshot,
     SubscriptionPeriodSnapshot, SubscriptionSnapshot, VestingSnapshot,
 };
+
+// AV-74: deterministic indexer-event CSV export — `events_to_csv`
+// renders an `EscrowEvent` log as RFC 4180 CSV (hand-written escaping,
+// zero dependencies) and `csv_to_events` parses it back with precise
+// errors; the data-analysis / audit-ingest complement to the AV-26
+// snapshot JSON export. Purely additive.
+pub use event_csv::{csv_to_events, events_to_csv, CsvError};
 
 // AV-32: Anchor account discriminators + panic-free vault account
 // decoding — the defensive half of reading on-chain bytes: every

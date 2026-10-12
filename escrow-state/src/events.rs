@@ -535,6 +535,53 @@ impl EscrowEventKind {
             Self::SubscriptionAmountsAdjusted => "subscription_amounts_adjusted",
         }
     }
+
+    /// Inverse of [`Self::name`]: the kind whose canonical name is
+    /// `name`, `None` for an unknown name. Used by the AV-74 CSV
+    /// importer (`csv_to_events`) so a kind column round-trips without
+    /// depending on declaration order.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "initialized" => Self::Initialized,
+            "activated" => Self::Activated,
+            "funded" => Self::Funded,
+            "released" => Self::Released,
+            "cancelled" => Self::Cancelled,
+            "expired_cancelled" => Self::ExpiredCancelled,
+            "attested" => Self::Attested,
+            "claimed" => Self::Claimed,
+            "escalated" => Self::Escalated,
+            "resolved" => Self::Resolved,
+            "milestone_confirmed" => Self::MilestoneConfirmed,
+            "milestone_released" => Self::MilestoneReleased,
+            "milestone_skipped" => Self::MilestoneSkipped,
+            "quorum_updated" => Self::QuorumUpdated,
+            "attestors_updated" => Self::AttestorsUpdated,
+            "emergency_unlock" => Self::EmergencyUnlock,
+            "vault_closed" => Self::VaultClosed,
+            "reentry_rejected" => Self::ReentryRejected,
+            "paused" => Self::Paused,
+            "unpaused" => Self::Unpaused,
+            "pause_authority_rotated" => Self::PauseAuthorityRotated,
+            "expired_cranked" => Self::ExpiredCranked,
+            "payout_allowlist_updated" => Self::PayoutAllowlistUpdated,
+            "taker_rotated" => Self::TakerRotated,
+            "default_judgment" => Self::DefaultJudgment,
+            "subscription_period_released" => Self::SubscriptionPeriodReleased,
+            "initializer_rotated" => Self::InitializerRotated,
+            "expiry_extended" => Self::ExpiryExtended,
+            "partially_cancelled" => Self::PartiallyCancelled,
+            "arbiter_rotated" => Self::ArbiterRotated,
+            "panel_judgment" => Self::PanelJudgment,
+            "panel_resolved" => Self::PanelResolved,
+            "fee_recipient_rotated" => Self::FeeRecipientRotated,
+            "evidence_submitted" => Self::EvidenceSubmitted,
+            "panel_threshold_changed" => Self::PanelThresholdChanged,
+            "milestones_adjusted" => Self::MilestonesAdjusted,
+            "subscription_amounts_adjusted" => Self::SubscriptionAmountsAdjusted,
+            _ => return None,
+        })
+    }
 }
 
 /// Fund movements carried by an [`EscrowEvent`].
