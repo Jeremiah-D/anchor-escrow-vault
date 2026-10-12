@@ -28,6 +28,12 @@ mod batch;
 // ALT tables, as deterministic multisig/CLI-ready JSON. Purely
 // additive and read-only (dry-run by construction).
 mod execution_bundle;
+// AV-71: signable transaction-message serialization — turn an execution
+// bundle's actions into real Solana legacy transaction messages
+// (discriminator + Borsh params + logical account metas, base64) that a
+// multisig/CLI can sign and submit. Off-chain and unsigned by design:
+// the relay never holds keys. Purely additive.
+mod tx_message;
 #[cfg(test)]
 mod idl_json;
 #[cfg(test)]
@@ -200,6 +206,17 @@ pub use batch::{
 // multisig/CLI-ready deterministic JSON. Purely additive and read-only.
 pub use execution_bundle::{
     bundle_execution, BundledAccount, BundledAction, ExecutionBundle,
+};
+
+// AV-71: signable transaction-message serialization for keeper
+// execution bundles — real instruction bytes (discriminator + Borsh
+// params) compiled into legacy Solana transaction messages, emitted as
+// base64 for a multisig/CLI to sign and submit. Off-chain and unsigned
+// by design; purely additive.
+pub use tx_message::{
+    compile_message, decode_base64, decode_message, encode_base64, encode_message,
+    instruction_for_action, signable_message_base64, CompiledInstruction, MessageHeader,
+    ProgramInstruction, TransactionMessage, TxMessageError,
 };
 
 /// Lifecycle states of an escrow vault.

@@ -2056,6 +2056,52 @@ consume directly.
   the keeper report's reactive exits. Same grouping, same
   discriminator rule, same deterministic hand-serialized JSON.
 
+## Signable transaction messages (AV-71)
+
+`escrow-state/src/tx_message.rs` is the last mile after the AV-61
+bundle JSON: for each bundled action it builds the **real instruction
+bytes** and assembles a Solana legacy transaction message, emitted as
+base64 for a multisig or CLI to sign and submit.
+
+- **Real instruction data**: `discriminator || Borsh params` per the
+  IDL spec — `initialize` → `amount:u64 || expires_at:u64` (24 bytes),
+  `fund` → discriminator only (the spec's `params: []`), `release` →
+  `amount:u64` (16 bytes). The discriminator is recomputed from the
+  action's IDL instruction name with the same constructor the IDL
+  pipeline pins, and the builder *refuses* when it disagrees with the
+  bundle's stamped discriminator (`DiscriminatorMismatch`) — a renamed
+  instruction or stale bundle fails loudly instead of producing signable
+  bytes for the wrong entrypoint. The taker is a program *account*, not
+  a param, so it is not in the data.
+- **Real message bytes**: canonical legacy wire format — 3-byte header,
+  compact-u16-prefixed account keys in canonical order (writable
+  signers, readonly signers, writable non-signers, readonly non-signers;
+  duplicates merge flags), the 32-byte recent blockhash, and
+  compact-u16-prefixed compiled instructions — then base64-encoded with
+  a hand-rolled codec (the crate stays dependency-free). One action
+  becomes one single-instruction message; decode rejects truncated
+  input, trailing bytes, and out-of-range account indexes.
+- **Off-chain and unsigned by design**: the relay never holds keys —
+  the output is the *to-be-signed* message. The program id and the
+  recent blockhash are caller-supplied (the skeleton's `declare_id!`
+  string is not valid base58 and is never decoded off-chain; the keeper
+  fetches a fresh blockhash from the cluster).
+- **Account completion is the submitter's job**: the message carries
+  exactly the bundle's logical accounts (`vault`/`initializer`/`mint`).
+  `fund` is complete as-is; for `initialize` the submitter appends the
+  remaining program-declared accounts (`taker` — the key is in the
+  bundle's `args` — and the system program), and for `release` it
+  appends `taker`, `payout_to`, the clock sysvar, and the vault token
+  account on the SPL path. The instruction *data* needs nothing added.
+  No address-table lookups are compiled in (legacy message); the
+  bundle's `alt_table` stays the operator's ALT material for a later v0
+  upgrade.
+- **Pinning**: the tests assert the data bytes against the
+  `INSTRUCTIONS` spec table (param name/type/order per kind), the
+  account metas 1:1 against the bundle's logical accounts, the wire
+  bytes against a golden vector, base64 against RFC 4648 vectors, and
+  bundle-JSON ↔ message agreement end to end.
+
 ## Payout destination allowlist (AV-49)
 
 A taker payout is only as safe as its destination. `release`, `claim`,
