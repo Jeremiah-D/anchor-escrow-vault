@@ -161,7 +161,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-70), SubscriptionAmountsAdjusted (AV-73), SchemaMigrated (AV-75) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), PartiallyCancelled, ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-70), SubscriptionAmountsAdjusted (AV-73), SchemaMigrated (AV-75), TemplateApplied (AV-77) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | BundlePartiallyExecuted (AV-76) | Σ gross of the executed tranches | Σ protocol fee of the executed tranches | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
@@ -182,6 +182,7 @@
 //! dependency-free.
 
 use crate::{Escrow, EscrowError, EscrowState, MilestonePlan, QuorumPolicy, VestingSchedule};
+use crate::{OverrideValue, TemplatePreset};
 use crate::cpi::CpiError;
 use crate::cpi_call::{CpiInvocation, CpiReceipt};
 
@@ -456,6 +457,21 @@ pub enum EscrowEventKind {
     /// composition, not a single authority (each tranche's own
     /// `MilestoneReleased` already names its signer).
     BundlePartiallyExecuted,
+    /// AV-77: a governance preset was applied
+    /// ([`IndexedEscrow::apply_template`]): the preset's defaults plus
+    /// the caller's per-field overrides produced the escrow's full
+    /// configuration. `from == to ==` the current state (a
+    /// configuration application, not a lifecycle move — like
+    /// [`EscrowEventKind::SchemaMigrated`]); all amounts are zero —
+    /// applying a template moves no funds. The SHA-256 of the
+    /// effective parameters
+    /// ([`EscrowTemplate::params_hash`](crate::EscrowTemplate::params_hash))
+    /// rides [`EscrowEvent::template_params_hash`], so indexers and
+    /// auditors can verify exactly which parameters took effect.
+    /// Always emitted on success: a successful application always
+    /// configures the escrow, so there is no no-op case (an empty
+    /// override list still applies the preset's defaults and emits).
+    TemplateApplied,
 }
 
 impl EscrowEventKind {
@@ -534,6 +550,10 @@ impl EscrowEventKind {
             // AV-76: appended after SchemaMigrated so discriminants
             // 0–37 stay stable for already-serialized histories.
             38 => Self::BundlePartiallyExecuted,
+            // AV-77: appended after BundlePartiallyExecuted so
+            // discriminants 0–38 stay stable for already-serialized
+            // histories.
+            39 => Self::TemplateApplied,
             _ => return None,
         })
     }
@@ -581,6 +601,7 @@ impl EscrowEventKind {
             Self::SubscriptionAmountsAdjusted => "subscription_amounts_adjusted",
             Self::SchemaMigrated => "schema_migrated",
             Self::BundlePartiallyExecuted => "bundle_partially_executed",
+            Self::TemplateApplied => "template_applied",
         }
     }
 
@@ -629,6 +650,7 @@ impl EscrowEventKind {
             "subscription_amounts_adjusted" => Self::SubscriptionAmountsAdjusted,
             "schema_migrated" => Self::SchemaMigrated,
             "bundle_partially_executed" => Self::BundlePartiallyExecuted,
+            "template_applied" => Self::TemplateApplied,
             _ => return None,
         })
     }
@@ -820,6 +842,17 @@ pub struct EscrowEvent {
     /// record. Read-only pass-through: the event never invents a
     /// reference — `None` when the escrow carries none.
     pub reference: Option<[u8; 32]>,
+    /// AV-77: SHA-256 over the canonical encoding of the effective
+    /// template parameters
+    /// ([`EscrowTemplate::params_hash`](crate::EscrowTemplate::params_hash)),
+    /// carried by the `TemplateApplied` event (`None` on every other
+    /// kind — like `rationale_hash`, which rides only `Resolved`). The
+    /// hash is computed by the template layer
+    /// ([`TemplatePreset::apply_template`](crate::TemplatePreset::apply_template)),
+    /// never invented by the wrapper: the emitter stamps it after the
+    /// push (see `push_event`), so the log records exactly the
+    /// parameters that took effect.
+    pub template_params_hash: Option<[u8; 32]>,
 }
 
 /// An event-logging adapter over [`Escrow`] (AV-18).
@@ -883,6 +916,57 @@ impl IndexedEscrow {
         Ok(indexed)
     }
 
+    /// AV-77: stand up a fully-configured escrow from a governance
+    /// preset ([`TemplatePreset`]): the preset's defaults plus the
+    /// caller's per-field overrides produce the escrow's full
+    /// configuration — or the whole application fails with
+    /// [`EscrowError`] (never a half-configured escrow).
+    ///
+    /// Override rules are the preset's: only fields in
+    /// [`TemplatePreset::overridable`](crate::TemplatePreset::overridable)
+    /// may be overridden, with the declared [`OverrideValue`] type,
+    /// each at most once — anything else is
+    /// [`EscrowError::TemplateOverrideRejected`]. The effective
+    /// parameters then run the full template invariant validation
+    /// (conservation / mutual exclusion / thresholds) before the
+    /// escrow builds.
+    ///
+    /// Emits two events: `Initialized` (seq 0 — the per-escrow
+    /// invariant that seq 0 is always `Initialized`) and
+    /// [`EscrowEventKind::TemplateApplied`] (seq 1, `from == to ==`
+    /// the current state — a configuration application, not a
+    /// lifecycle move), carrying the SHA-256 of the effective
+    /// parameters so indexers and auditors can verify exactly what
+    /// was applied. Failed applications emit nothing.
+    pub fn apply_template(
+        preset: &TemplatePreset<'_>,
+        overrides: &[(&str, OverrideValue<'_>)],
+        escrow_id: [u8; 32],
+        at: u64,
+    ) -> Result<Self, EscrowError> {
+        let applied = preset.apply_template(overrides)?;
+        let mut indexed = Self {
+            inner: applied.escrow,
+            escrow_id,
+            events: Vec::new(),
+            next_seq: 0,
+        };
+        indexed.push_event(
+            EscrowEventKind::Initialized,
+            EscrowState::Uninitialized,
+            EscrowState::Uninitialized,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(applied.template.initializer),
+        );
+        indexed.emit_template_applied(applied.params_hash, at);
+        Ok(indexed)
+    }
+
     /// Record one event, assigning the next per-escrow sequence number.
     /// `caller` (AV-48) is `Some` only for the permissionless crank
     /// ([`EscrowEventKind::ExpiredCranked`]) — every other kind passes
@@ -894,6 +978,11 @@ impl IndexedEscrow {
     /// ([`Escrow::record_history`](crate::Escrow::record_history)):
     /// dual-signed governance transitions and reentrancy rejections
     /// pass `None` (the actor is the signature pair, or unknown).
+    ///
+    /// `template_params_hash` (AV-77) is never a `push_event`
+    /// parameter: the `TemplateApplied` emitter stamps it after the
+    /// push (the hash is computed by the template layer, never by the
+    /// wrapper — the same "read at emit time" rule as `reference`).
     fn push_event(
         &mut self,
         kind: EscrowEventKind,
@@ -936,6 +1025,9 @@ impl IndexedEscrow {
             // read from the escrow at emit time (never a push_event
             // parameter), so the log always agrees with the account.
             reference: self.inner.reference(),
+            // AV-77: stamped by the TemplateApplied emitter after the
+            // push — never a push_event parameter (see above).
+            template_params_hash: None,
         };
         self.next_seq += 1;
         self.events.push(event);
@@ -2487,6 +2579,38 @@ impl IndexedEscrow {
             None,
             None,
         );
+    }
+
+    /// AV-77: emit [`EscrowEventKind::TemplateApplied`] carrying the
+    /// effective-parameter hash. `from == to ==` the current state (a
+    /// configuration application, not a lifecycle move); all amounts
+    /// are zero — applying a template moves no funds. The hash rides
+    /// [`EscrowEvent::template_params_hash`], stamped after the push:
+    /// it is computed by the template layer
+    /// ([`TemplatePreset::apply_template`](crate::TemplatePreset::apply_template)),
+    /// never invented by the wrapper — the same "read at emit time,
+    /// never a `push_event` parameter" rule as `reference` (AV-53).
+    /// The actor is `None`: applying a preset is a governance
+    /// composition, not a single authority's transition (paralleling
+    /// `emit_bundle_partially_executed`).
+    fn emit_template_applied(&mut self, params_hash: [u8; 32], at: u64) {
+        let state = self.inner.state();
+        self.push_event(
+            EscrowEventKind::TemplateApplied,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        self.events
+            .last_mut()
+            .expect("TemplateApplied event just pushed")
+            .template_params_hash = Some(params_hash);
     }
 
     /// Release a subscription period to the taker (mirrors
@@ -4245,7 +4369,23 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(39), None);
+        assert_eq!(EscrowEventKind::from_discriminant(40), None);
+    }
+
+    #[test]
+    fn template_applied_kind_round_trips() {
+        // AV-77: discriminant 39, appended after
+        // BundlePartiallyExecuted — 0–38 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::TemplateApplied;
+        assert_eq!(kind.discriminant(), 39);
+        assert_eq!(EscrowEventKind::from_discriminant(39), Some(kind));
+        assert_eq!(kind.name(), "template_applied");
+        assert_eq!(
+            EscrowEventKind::from_name("template_applied"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(40), None);
     }
 
     #[test]
@@ -4616,4 +4756,100 @@ mod event_tests {
         assert_eq!(e.event_count(), before, "failed call emits nothing");
     }
 
+    // ---------- AV-77: apply_template ----------
+
+    fn subscription_preset() -> TemplatePreset<'static> {
+        TemplatePreset::subscription(ALICE, BOB, 1_000_000, EXPIRES_AT, 100, 4, 250_000)
+    }
+
+    #[test]
+    fn apply_template_emits_initialized_then_template_applied() {
+        let preset = subscription_preset();
+        let overrides: &[(&str, OverrideValue)] =
+            &[("period_secs", OverrideValue::U64(200))];
+        let expected_hash = preset.apply_template(overrides).unwrap().params_hash;
+
+        let e = IndexedEscrow::apply_template(&preset, overrides, ESCROW_ID, T0).unwrap();
+        let events = e.events();
+        assert_eq!(events.len(), 2);
+        // seq 0 stays the Initialized event (the per-escrow invariant).
+        assert_eq!(events[0].kind, EscrowEventKind::Initialized);
+        assert_eq!(events[0].seq, 0);
+        assert_eq!(events[0].template_params_hash, None);
+        // seq 1 is the TemplateApplied event with the effective hash.
+        let applied = &events[1];
+        assert_eq!(applied.kind, EscrowEventKind::TemplateApplied);
+        assert_eq!(applied.seq, 1);
+        assert_eq!(applied.from, EscrowState::Uninitialized);
+        assert_eq!(applied.to, EscrowState::Uninitialized);
+        assert_eq!(applied.at, T0);
+        assert_eq!(applied.escrow_id, ESCROW_ID);
+        assert_eq!(applied.amounts, EventAmounts::none());
+        assert_eq!(applied.template_params_hash, Some(expected_hash));
+        // The built escrow is live: the overridden cadence took effect.
+        assert_eq!(
+            e.inner().subscription_period_due_at(0).unwrap(),
+            EXPIRES_AT - 3 * 200
+        );
+    }
+
+    #[test]
+    fn apply_template_noop_applies_preset_defaults() {
+        // An empty override list still applies (and emits): the hash
+        // is the preset defaults' own commitment.
+        let preset = subscription_preset();
+        let e = IndexedEscrow::apply_template(&preset, &[], ESCROW_ID, T0).unwrap();
+        let applied = e.events().last().expect("TemplateApplied emitted");
+        assert_eq!(applied.kind, EscrowEventKind::TemplateApplied);
+        assert_eq!(
+            applied.template_params_hash,
+            Some(preset.template.params_hash())
+        );
+        // The escrow runs the default cadence end to end.
+        let mut e = e;
+        e.fund(ALICE, EXPIRES_AT - 1_000).unwrap();
+        let due_0 = e.inner().subscription_period_due_at(0).unwrap();
+        let (payout, _) = e.release_period(ALICE, 0, None, BOB, due_0).unwrap();
+        assert_eq!(payout, 250_000);
+    }
+
+    #[test]
+    fn apply_template_rejection_fails_before_any_event() {
+        // The constructor fails: there is no IndexedEscrow and no
+        // event — the rejection happens before anything is recorded.
+        let preset = subscription_preset();
+        let err = IndexedEscrow::apply_template(
+            &preset,
+            &[("bogus_field", OverrideValue::U64(1))],
+            ESCROW_ID,
+            T0,
+        )
+        .unwrap_err();
+        assert_eq!(err, EscrowError::TemplateOverrideRejected);
+        assert_eq!(err.code(), 141);
+        // An override that breaks conservation fails the same way.
+        let err = IndexedEscrow::apply_template(
+            &preset,
+            &[("per_period", OverrideValue::U64(1))],
+            ESCROW_ID,
+            T0,
+        )
+        .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidSubscription);
+    }
+
+    #[test]
+    fn template_applied_hash_survives_further_transitions() {
+        // Later events carry no hash (None on every other kind); the
+        // TemplateApplied record keeps the commitment for the log.
+        let preset = subscription_preset();
+        let mut e = IndexedEscrow::apply_template(&preset, &[], ESCROW_ID, T0).unwrap();
+        let committed = e.events()[1].template_params_hash;
+        assert!(committed.is_some());
+        e.fund(ALICE, T0 + 1).unwrap();
+        let funded = e.events().last().expect("Funded emitted");
+        assert_eq!(funded.kind, EscrowEventKind::Funded);
+        assert_eq!(funded.template_params_hash, None);
+        assert_eq!(e.events()[1].template_params_hash, committed);
+    }
 }

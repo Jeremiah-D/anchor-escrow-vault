@@ -1343,7 +1343,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -2250,6 +2250,39 @@ the test matrix drives the full lifecycle through both gates); milestone
 tranche sums and subscription cadences are checked before any builder
 runs. Templates are client-side only: they produce a plain `Escrow`, so
 the vault layout, IDL, and Anchor program are untouched.
+
+### Governance presets with declared override surfaces (AV-77)
+
+AV-72 templates are free-form — every field is settable. A governance
+preset (`TemplatePreset`) is the stricter sibling: the four canonical
+compositions with audited default parameters plus a *declared override
+surface* — the only field names `apply_template` accepts. Each preset
+declares its surface up front (e.g. the auction preset allows `amount`,
+`expires_at`, `dual_sig`, the timelocks, `mint`, and `grace_period_secs`,
+but not `quorum` — adding attestor governance changes the preset's trust
+shape; the arbitrated-dispute preset *does* declare `quorum`, since the
+panel composition is its reviewed governance shape).
+
+`TemplatePreset::apply_template(overrides)` takes per-field overrides as
+`(name, OverrideValue)` pairs: an unknown name, a field declared by a
+different preset, a mistyped value, or a repeated field is rejected with
+`EscrowError::TemplateOverrideRejected` (code 141 — the preset's audited
+shape is never silently widened). After the overrides apply, the
+effective template re-runs the *full* AV-72 invariant validation —
+conservation (tranche sums, subscription cadence, non-zero amount),
+mutual exclusion (one clock per escrow), timelock-vs-expiry — and then
+`build`, so builder-level thresholds (quorum policy, evidence deadline)
+still gate; template rejections project onto the closest `EscrowError`.
+
+`IndexedEscrow::apply_template` is the event-emitting entry point: it
+stands up the escrow and records `Initialized` (seq 0) followed by
+`TemplateApplied` (seq 1, `from == to ==` the current state — a
+configuration application, not a lifecycle move), carrying the SHA-256 of
+the effective parameters' canonical encoding
+(`EscrowTemplate::params_hash`, golden-pinned in tests) so indexers and
+auditors can verify exactly which parameters took effect. Like the AV-72
+templates, presets are client-side composition: the vault layout and the
+Anchor program are untouched.
 
 ## Run the tests
 

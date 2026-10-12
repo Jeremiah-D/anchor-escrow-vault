@@ -203,8 +203,13 @@ pub use discriminator::{
 // AV-72: escrow configuration templates — one-call constructors for the
 // four canonical escrow compositions (auction, milestone-plan,
 // subscription, arbitrated-dispute) with template-level combination
-// validation. Client-side composition only: produces a plain `Escrow`.
-pub use templates::{EscrowTemplate, KindParams, TemplateError, TemplateKind};
+// validation. AV-77 adds governance presets with declared override
+// surfaces (`TemplatePreset::apply_template`) plus the effective-parameter
+// hash. Client-side composition only: produces a plain `Escrow`.
+pub use templates::{
+    AppliedTemplate, EscrowTemplate, KindParams, OverrideValue, TemplateError, TemplateKind,
+    TemplatePreset,
+};
 
 // AV-33: batch settlement execution plan — group a keeper report's
 // actions into independently executable atomic batches (same mint +
@@ -1127,6 +1132,14 @@ pub enum EscrowError {
     /// migrated. Parallels [`EscrowError::InvalidExpiryExtension`]
     /// (governance config error).
     InvalidSchemaMigration,
+    /// Rejected template override (AV-77): [`TemplatePreset::apply_template`](crate::TemplatePreset::apply_template)
+    /// was given an override the preset did not declare overridable —
+    /// an unknown field name, a field outside the preset's declared
+    /// surface, a value of the wrong [`OverrideValue`](crate::OverrideValue)
+    /// type for the named field, or the same field twice. The preset's
+    /// audited shape is never silently widened: the caller fixes the
+    /// override list instead.
+    TemplateOverrideRejected,
 }
 
 impl EscrowError {
@@ -1180,6 +1193,7 @@ impl EscrowError {
             EscrowError::InvalidEvidenceDeadline => 138,
             EscrowError::EvidenceDisclosureLate => 139,
             EscrowError::InvalidSchemaMigration => 140,
+            EscrowError::TemplateOverrideRejected => 141,
         }
     }
 
@@ -1227,6 +1241,7 @@ impl EscrowError {
             EscrowError::InvalidEvidenceDeadline,
             EscrowError::EvidenceDisclosureLate,
             EscrowError::InvalidSchemaMigration,
+            EscrowError::TemplateOverrideRejected,
         ]
     }
 }
@@ -13208,6 +13223,11 @@ mod error_code_tests {
             140,
             "migrate_schema by a non-initializer; on a vault already at the current schema version (one-time migration); on a vault at an unknown future version (no version skipping); or on a vault whose carried-over fields violate the conservation invariants (released <= amount, released + skipped <= amount, fees_paid <= released, milestone tranche sum == amount)",
         ),
+        (
+            EscrowError::TemplateOverrideRejected,
+            141,
+            "apply_template with an override naming a field the preset did not declare overridable (unknown name, or a field declared by a different preset's review), a value of the wrong OverrideValue type for the named field, or the same field twice",
+        ),
     ];
 
     #[test]
@@ -24875,7 +24895,12 @@ mod event_history_tests {
             38,
             "AV-76: appended after SchemaMigrated"
         );
-        for d in 0..=38u8 {
+        assert_eq!(
+            EscrowEventKind::TemplateApplied.discriminant(),
+            39,
+            "AV-77: appended after BundlePartiallyExecuted"
+        );
+        for d in 0..=39u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -24886,7 +24911,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(39), None);
+        assert_eq!(EscrowEventKind::from_discriminant(40), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -25009,10 +25034,10 @@ mod event_history_tests {
         // `EvidenceSubmitted`, 34 is `PanelThresholdChanged`, 35 is
         // `MilestonesAdjusted` (AV-70), 36 is
         // `SubscriptionAmountsAdjusted` (AV-73), 37 is
-        // `SchemaMigrated` (AV-75), and 38 is
-        // `BundlePartiallyExecuted` (AV-76); 39 is the first
-        // still-unknown byte.
-        for bad in [39u8, 42, 255] {
+        // `SchemaMigrated` (AV-75), 38 is
+        // `BundlePartiallyExecuted` (AV-76), 39 is `TemplateApplied`
+        // (AV-77); 40 is the first still-unknown byte.
+        for bad in [40u8, 42, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -26767,6 +26792,8 @@ mod arbiter_panel_tests {
         assert_eq!(EscrowError::EvidenceDisclosureLate.code(), 139);
         // AV-75: appended, never renumbered.
         assert_eq!(EscrowError::InvalidSchemaMigration.code(), 140);
+        // AV-77: appended, never renumbered.
+        assert_eq!(EscrowError::TemplateOverrideRejected.code(), 141);
         // never-renumber: the full table still pins every code, and
         // `all()` covers the new variants (the AV-46 lesson: a missing
         // variant drifts the IDL error pin).
@@ -26775,7 +26802,8 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::InvalidEvidenceDeadline));
         assert!(EscrowError::all().contains(&EscrowError::EvidenceDisclosureLate));
         assert!(EscrowError::all().contains(&EscrowError::InvalidSchemaMigration));
-        assert_eq!(EscrowError::all().len(), 41);
+        assert!(EscrowError::all().contains(&EscrowError::TemplateOverrideRejected));
+        assert_eq!(EscrowError::all().len(), 42);
     }
 
     #[test]

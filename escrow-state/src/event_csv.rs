@@ -31,13 +31,13 @@
 //! # A projection, not a full serialization
 //!
 //! The CSV carries only the nine columns above. `from` / `to`,
-//! `evidence_hash`, `rationale_hash`, `cpi`, `caller`, `reference` and
-//! `evidence_defaulted` are *not* exported. [`csv_to_events`]
-//! reconstructs the carried fields exactly and fills the rest with
-//! documented zero-values: `from == to == Uninitialized` (the explicit
-//! "not carried by this projection" marker — the event's real states
-//! are available from the typed log), `None` for every optional field,
-//! `false` for `evidence_defaulted`.
+//! `evidence_hash`, `rationale_hash`, `cpi`, `caller`, `reference`,
+//! `template_params_hash` and `evidence_defaulted` are *not* exported.
+//! [`csv_to_events`] reconstructs the carried fields exactly and fills
+//! the rest with documented zero-values: `from == to == Uninitialized`
+//! (the explicit "not carried by this projection" marker — the event's
+//! real states are available from the typed log), `None` for every
+//! optional field, `false` for `evidence_defaulted`.
 //!
 //! # Round-trip contract
 //!
@@ -202,6 +202,7 @@ pub fn csv_to_events(csv: &str) -> Result<Vec<EscrowEvent>, CsvError> {
             cpi: None,
             caller: None,
             reference: None,
+            template_params_hash: None,
         });
     }
     Ok(events)

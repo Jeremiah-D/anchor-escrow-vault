@@ -4655,7 +4655,7 @@ fn cpi_settle_resolve(
 }
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error per EscrowError variant, so on-chain failures
-    // surface the exact `escrow_state` reason (code 100–135) to clients.
+    // surface the exact `escrow_state` reason (code 100–141) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
         escrow_state::EscrowError::InvalidStateTransition => {
@@ -4732,6 +4732,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         }
         escrow_state::EscrowError::InvalidSchemaMigration => {
             error!(ErrorCode::InvalidSchemaMigration)
+        }
+        escrow_state::EscrowError::TemplateOverrideRejected => {
+            error!(ErrorCode::TemplateOverrideRejected)
         }
     }
 }
@@ -4820,4 +4823,6 @@ pub enum ErrorCode {
     EvidenceDisclosureLate,
     #[msg("Invalid schema migration (AV-75): migrate_schema by a non-initializer, on a vault already at the current schema version, on a vault at an unknown future version (no version skipping), or on a vault whose carried-over fields violate the conservation invariants")]
     InvalidSchemaMigration,
+    #[msg("Rejected template override (AV-77): apply_template was given an override the preset did not declare overridable — an unknown field name, a field outside the preset's declared surface, a mistyped value, or a repeated field; the preset's audited shape is never silently widened")]
+    TemplateOverrideRejected,
 }

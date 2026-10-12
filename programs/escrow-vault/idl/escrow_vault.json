@@ -717,7 +717,8 @@
     {"code": 137, "name": "PanelResolveDisabled"},
     {"code": 138, "name": "InvalidEvidenceDeadline"},
     {"code": 139, "name": "EvidenceDisclosureLate"},
-    {"code": 140, "name": "InvalidSchemaMigration"}
+    {"code": 140, "name": "InvalidSchemaMigration"},
+    {"code": 141, "name": "TemplateOverrideRejected"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
