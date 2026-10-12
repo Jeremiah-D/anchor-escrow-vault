@@ -654,6 +654,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         *slot = c.u64_le()?;
     }
 
+    // AV-75: the schema version of the persisted layout, always
+    // present. Appended last so every earlier offset above is
+    // unchanged.
+    let schema_version = c.u8()?;
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -759,6 +764,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // and `adjust_period_amounts` recorded, so `release_period`
         // pays identically after a decode.
         subscription_amounts,
+        // AV-75: the schema version is persisted — a decoded escrow
+        // carries the same layout version the account was written
+        // under, so `migrate_schema` sees the true pre-migration
+        // version.
+        schema_version,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

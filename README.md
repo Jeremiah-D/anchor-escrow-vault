@@ -83,6 +83,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `skip_milestone(authority, index)`           | `Funded`       | — (no state change) | initializer **or** taker, **both** must approve (dual-sig skip; skipped tranche refunded to the initializer) |
 | `adjust_milestone_amounts(initializer, taker, new_amounts)` (AV-70) | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the tranche table) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition`; rejected once any tranche settled (`released > 0` or `skipped > 0`); new amounts must have the plan's tranche count, be all positive, and sum to exactly the locked amount; per-tranche confirmations survive (they accept the deliverable, not the amount); protocol fees charge on the new amounts at release time (still floored by `fee_cap`); emits `MilestonesAdjusted` only on an actual change |
 | `adjust_period_amounts(initializer, taker, new_amounts)` (AV-73) | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the per-period table) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition`; released periods lock their recorded amounts (the re-split must reaffirm them — `InvalidSubscription` otherwise); new amounts must have the schedule's period count, be all positive, and sum to exactly the locked amount; protocol fees charge on the new amounts at release time (still floored by `fee_cap`); the keeper's `ReleasePeriod` action prices from the live table; emits `SubscriptionAmountsAdjusted` only on an actual change |
+| `migrate_schema()` (AV-75) | any | — (no state change; stamps the schema version) | initializer **only** (`Unauthorized` otherwise, checked before state validity); a paused escrow fails fast (`Paused`); only `schema_version + 1 == SCHEMA_VERSION` steps — an already-current vault refuses the second call and an unknown future version refuses loudly instead of skipping forward (`InvalidSchemaMigration`, code 140, either way); the carried-over fields are re-validated before the stamp (`released <= amount`, `released + skipped <= amount`, `fees_paid <= released`, milestone tranche sum `== amount`) — a corrupt vault is refused, never migrated; emits `SchemaMigrated` (from == to == the current state), always on success |
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
 | `initialize_protocol_fee(fee_bps)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `fee_bps` in 0–10000 basis points; the fee slices every taker payout into net payout + protocol fee; the AV-63 fee cap can floor it per payout) |
 | `initialize_fee_cap(max_fee_cents)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; absolute per-payout fee ceiling in lamports — the effective fee is `min(bps fee, fee_cap)`; `0` means uncapped; no new error code) |
@@ -492,6 +493,8 @@ each disclosure. New vault fields (appended last):
 bytes / 21,360,240 lamports rent-exempt. AV-73 appends the 512-byte
 live per-period amount table (`subscription_amounts`: 64 `u64` slots),
 so the full vault is now 3453 bytes / 24,923,760 lamports rent-exempt.
+AV-75 appends the 1-byte schema version (`schema_version`), so the full
+vault is now 3454 bytes / 24,930,720 lamports rent-exempt.
 
 **Panel threshold governance (AV-69).** The right M-of-N is not always
 obvious at setup — a 2-of-3 panel may prove too slow (one member goes
@@ -764,7 +767,8 @@ region (8-byte `evidence_deadline_secs` + 33-byte `escalated_by`), so
 the full vault is now **2941 bytes** and needs **21,360,240
 lamports**. AV-73 appends the 512-byte live per-period amount table, so
 the full vault is now **3453 bytes** and needs **24,923,760
-lamports**.
+lamports**. AV-75 appends the 1-byte schema version, so the full vault
+is now **3454 bytes** and needs **24,930,720 lamports**.
 
 **Tiered protocol fee (AV-66).** An escrow can opt in to volume-priced
 fees at creation (`initialize_fee_schedule(tiers)`, opt-in on
@@ -1069,6 +1073,7 @@ program error per variant):
 | `PanelResolveDisabled` | 137 | `resolve` called on a panel-mode escrow — the panel's multisig judgment (`submit_panel_judgment`) is the only settlement path once a panel is configured |
 | `InvalidEvidenceDeadline` | 138 | `with_evidence_deadline` with a zero deadline — a zero-second deadline would lapse the moment the dispute starts |
 | `EvidenceDisclosureLate` | 139 | `submit_evidence` at or past the disclosure deadline without evidence on record — a missed deadline locks in the judgment-time adverse inference |
+| `InvalidSchemaMigration` | 140 | `migrate_schema` by a non-initializer, on a vault already at the current schema version (one-time), on a vault at an unknown future version (no skipping), or on a vault whose carried-over fields violate the conservation invariants — a corrupt vault is refused, never migrated |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1338,7 +1343,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -1655,7 +1660,7 @@ renders the bare integer). Raw fields stay untouched, so indexers keep
 diffing numbers while operators read whole tokens.
 
 ```json
-{"at":1750000000,"initializer":"...","taker":"...","state":"funded",
+{"at":1750000000,"initializer":"...","taker":"...","state":"funded","schema_version":1,
  "amount":1000000,"decimals":6,"display_amount":"1.000000",
  "released":0,"display_released":"0.000000",
  "remaining":1000000,"display_remaining":"1.000000",
@@ -1730,7 +1735,8 @@ two-way consistency check against the IDL parameter table:
 | evidence_deadline_secs | u64 | 8 |
 | escalated_by | Option<Pubkey> | 33 |
 | subscription_amounts | [u64; 64] | 512 |
-| **total**     |                   | **3445** |
+| schema_version | u8 | 1 |
+| **total**     |                   | **3446** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1804,10 +1810,10 @@ is configured) — and the 8-byte dispute-evidence disclosure deadline
 (AV-68: zeroed when no deadline is configured) — and the 33-byte
 escalating-party region (AV-68: 1-byte discriminant + 32-byte key,
 zeroed when the escrow was never disputed).
-`escrow-state` exposes `VAULT_SPACE` (3453) and
-`VAULT_SPACE_NO_QUORUM` (2963) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (3454) and
+`VAULT_SPACE_NO_QUORUM` (2964) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **24,923,760 lamports** to be
+mainnet rent parameters the full vault needs **24,930,720 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1828,17 +1834,17 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 3453 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
+  stays 3454 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
   weighted-quorum, AV-46 pause-switch, AV-49 payout-allowlist, AV-51
   vesting-cliff, AV-53 reference-memo, AV-55 default-judgment,
   AV-56 subscription, AV-57 event-history, AV-59 extension, AV-63
   fee-cap, AV-64 relative-timelock, AV-65 arbiter-panel, AV-66
-  fee-schedule, AV-68 evidence-deadline, and AV-73 per-period-table
-  growth is accounted in the
+  fee-schedule, AV-68 evidence-deadline, AV-73 per-period-table, and
+  AV-75 schema-version growth is accounted in the
   layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**24,923,760
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**24,930,720
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the

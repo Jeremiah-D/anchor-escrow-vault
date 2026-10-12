@@ -64,6 +64,16 @@
 //! emits no events, and touches no clock. Amounts are as of the scan — a
 //! keeper executes the list, then re-scans.
 //!
+//! # Schema upgrades (AV-75)
+//!
+//! Keeper scans are schema-agnostic: a pre-AV-75 v0 account is a
+//! byte-prefix of the v1 layout (fields are only ever appended last),
+//! so the scan reads both — none of the predicates above depend on the
+//! schema version, and a vault awaiting [`Escrow::migrate_schema`]
+//! keeps its keeper actions. Operators find stale vaults through the
+//! AV-26 snapshot export: [`crate::EscrowSnapshot::schema_version`] is
+//! `0` until the initializer migrates, [`Escrow::SCHEMA_VERSION`] after.
+//!
 //! # Output
 //!
 //! [`KeeperReport::to_json`] hand-serializes the report (the crate is

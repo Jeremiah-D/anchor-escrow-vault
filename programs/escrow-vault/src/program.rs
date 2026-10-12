@@ -2414,6 +2414,47 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Migrate the vault's persisted schema one version forward (AV-75;
+    /// mirrors `Escrow::migrate_schema`). A unilateral initializer
+    /// power: on-chain, a program upgrade appends new vault fields and
+    /// the account is realloc'd with the new region zero-filled — the
+    /// initializer runs this exactly once to carry the vault onto the
+    /// new layout. Only `schema_version + 1 == SCHEMA_VERSION` steps:
+    /// an already-current vault refuses the second call, and an
+    /// unknown future version refuses loudly instead of skipping
+    /// forward (`InvalidSchemaMigration`, code 140, either way). The
+    /// carried-over fields are re-validated before the stamp
+    /// (`released <= amount`, `released + skipped <= amount`,
+    /// `fees_paid <= released`, milestone tranche sum `== amount`) — a
+    /// corrupt vault is refused, never migrated. A paused escrow fails
+    /// fast (`Paused`). Emits `SchemaMigrated` (from == to == the
+    /// current state) — always on success, since a successful
+    /// migration always steps the version.
+    pub fn migrate_schema(ctx: Context<MigrateSchema>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        escrow
+            .migrate_schema(ctx.accounts.initializer.key().to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::SchemaMigrated,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// Clear the AV-27 timelock by dual-signed emergency governance
     /// (AV-41; mirrors `Escrow::emergency_unlock`). Both the initializer
     /// and the taker must sign — one party alone is `Unauthorized`.
@@ -2931,6 +2972,14 @@ pub struct Vault {
     /// Layout position matches `escrow_state::VAULT_FIELDS` (appended
     /// last, after `arbiter_panel`).
     pub fee_schedule: FeeSchedule,
+    /// AV-75: schema version of the persisted layout; mirrors
+    /// `escrow_state`'s `schema_version`. New vaults are born at
+    /// `escrow_state::Escrow::SCHEMA_VERSION`; a vault written before
+    /// AV-75 reads `0` until the initializer runs `migrate_schema`.
+    /// Always present (1 byte). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `fee_schedule`).
+    pub schema_version: u8,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -3333,6 +3382,13 @@ pub enum EscrowVaultEventKind {
     /// change. Mirrors
     /// `escrow_state::EscrowEventKind::SubscriptionAmountsAdjusted`.
     SubscriptionAmountsAdjusted,
+    /// AV-75: the vault's persisted schema was migrated one version
+    /// forward by initializer governance
+    /// (`Escrow::migrate_schema`). `from == to ==` the current state;
+    /// always emitted on success (a successful migration always steps
+    /// the version — no no-op case). Mirrors
+    /// `escrow_state::EscrowEventKind::SchemaMigrated`.
+    SchemaMigrated,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -3410,6 +3466,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::SubscriptionAmountsAdjusted => {
             EscrowVaultEventKind::SubscriptionAmountsAdjusted
+        }
+        escrow_state::EscrowEventKind::SchemaMigrated => {
+            EscrowVaultEventKind::SchemaMigrated
         }
     }
 }
@@ -4185,6 +4244,20 @@ pub struct ExtendExpiry<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-75: accounts for `migrate_schema` — the vault plus the
+/// initializer as the single signer. The state machine rejects a
+/// non-initializer with `Unauthorized`; a constraint in the real build
+/// additionally asserts `initializer.key() == vault.initializer`.
+/// Migration is bookkeeping, not economics: one call steps the schema
+/// version exactly once (N → N+1), refusing an already-current vault
+/// and an unknown future version (`InvalidSchemaMigration`, code 140).
+#[derive(Accounts)]
+pub struct MigrateSchema<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    pub initializer: Signer<'info>,
+}
+
 #[derive(Accounts)]
 pub struct InitializePayoutAllowlist<'info> {
     #[account(mut)]
@@ -4657,6 +4730,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::EvidenceDisclosureLate => {
             error!(ErrorCode::EvidenceDisclosureLate)
         }
+        escrow_state::EscrowError::InvalidSchemaMigration => {
+            error!(ErrorCode::InvalidSchemaMigration)
+        }
     }
 }
 
@@ -4742,4 +4818,6 @@ pub enum ErrorCode {
     InvalidEvidenceDeadline,
     #[msg("Evidence disclosure arrived too late (AV-68): submit_evidence at or past the disclosure deadline without evidence on record — a missed deadline locks in the judgment-time adverse inference")]
     EvidenceDisclosureLate,
+    #[msg("Invalid schema migration (AV-75): migrate_schema by a non-initializer, on a vault already at the current schema version, on a vault at an unknown future version (no version skipping), or on a vault whose carried-over fields violate the conservation invariants")]
+    InvalidSchemaMigration,
 }

@@ -262,6 +262,11 @@ pub struct EscrowSnapshot {
     /// `0` when none is declared. Feeds the `display_*` renderings in
     /// [`EscrowSnapshot::to_json`]; the raw amount fields are untouched.
     pub decimals: u8,
+    /// Schema version of the vault's persisted layout (AV-75): the
+    /// value [`Escrow::schema_version`] stamps — `0` means the vault
+    /// was written before the field existed and has not migrated yet,
+    /// so keeper/indexer tooling finds stale vaults from one snapshot.
+    pub schema_version: u8,
     /// Cumulative amount released to the taker so far.
     pub released: u64,
     /// Amount still locked: `amount - released`. This is what `cancel` /
@@ -469,6 +474,7 @@ impl Escrow {
             state: state_name(self.state()),
             amount: self.amount(),
             decimals: self.decimals(),
+            schema_version: self.schema_version(),
             released: self.released_amount(),
             remaining: self.remaining_amount(),
             expires_at: self.expires_at(),
@@ -612,7 +618,11 @@ impl EscrowSnapshot {
         s.push_str(&hex32(&self.taker));
         s.push_str("\",\"state\":\"");
         s.push_str(self.state);
-        s.push_str("\",\"amount\":");
+        // AV-75: the persisted schema version — operators find stale
+        // (pre-migration) vaults from this field.
+        s.push_str("\",\"schema_version\":");
+        s.push_str(&self.schema_version.to_string());
+        s.push_str(",\"amount\":");
         s.push_str(&self.amount.to_string());
         // AV-28: token decimal metadata and the human-readable amount
         // renderings. The raw fields are untouched — operators and
@@ -983,6 +993,7 @@ mod snapshot_tests {
              \"at\":1750000000,\
              \"initializer\":\"{init}\",\"taker\":\"{taker}\",\
              \"state\":\"funded\",\
+             \"schema_version\":1,\
              \"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\
              \"released\":0,\"display_released\":\"0\",\
              \"remaining\":1000000,\"display_remaining\":\"1000000\",\
@@ -1004,6 +1015,24 @@ mod snapshot_tests {
             taker = hex_of(0xBB),
         );
         assert_eq!(snap.to_json(), expected);
+    }
+
+    #[test]
+    fn snapshot_carries_schema_version() {
+        // A fresh vault is born current.
+        let snap = funded(AMOUNT, NEVER).snapshot(MID);
+        assert_eq!(snap.schema_version, 1);
+        assert!(snap.to_json().contains("\"schema_version\":1"));
+        // A migrated vault's snapshot shows the new version.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER).unwrap();
+        e.schema_version = 0; // simulate a pre-AV-75 vault
+        let snap = e.snapshot(MID);
+        assert_eq!(snap.schema_version, 0);
+        assert!(snap.to_json().contains("\"schema_version\":0"));
+        e.migrate_schema(ALICE).unwrap();
+        let snap = e.snapshot(MID);
+        assert_eq!(snap.schema_version, 1);
+        assert!(snap.to_json().contains("\"schema_version\":1"));
     }
 
     #[test]

@@ -486,6 +486,12 @@
       "args": [
         {"name": "new_threshold", "type": "u8"}
       ]
+    },
+    {
+      "name": "migrate_schema",
+      "discriminator": [223, 9, 156, 218, 187, 90, 169, 85],
+      "accounts": [],
+      "args": []
     }
   ],
   "accounts": [
@@ -543,7 +549,8 @@
           {"name": "fee_schedule", "type": {"defined": "FeeSchedule"}, "offset": 2819},
           {"name": "evidence_deadline_secs", "type": "u64", "offset": 2900},
           {"name": "escalated_by", "type": {"option": "publicKey"}, "offset": 2908},
-          {"name": "subscription_amounts", "type": {"array": ["u64", 64]}, "offset": 2941}
+          {"name": "subscription_amounts", "type": {"array": ["u64", 64]}, "offset": 2941},
+          {"name": "schema_version", "type": "u8", "offset": 3453}
         ]
       }
     }
@@ -709,7 +716,8 @@
     {"code": 136, "name": "InvalidArbiterPanel"},
     {"code": 137, "name": "PanelResolveDisabled"},
     {"code": 138, "name": "InvalidEvidenceDeadline"},
-    {"code": 139, "name": "EvidenceDisclosureLate"}
+    {"code": 139, "name": "EvidenceDisclosureLate"},
+    {"code": 140, "name": "InvalidSchemaMigration"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

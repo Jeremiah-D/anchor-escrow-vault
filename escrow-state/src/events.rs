@@ -150,7 +150,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-70), SubscriptionAmountsAdjusted (AV-73) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-70), SubscriptionAmountsAdjusted (AV-73), SchemaMigrated (AV-75) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | PartiallyCancelled (AV-60) | 0 | 0 | the partially-cancelled tranche, refunded to the whitelisted destination (the escrow stays `Funded`; the `released` counter is untouched) | 0 |
@@ -417,6 +417,15 @@ pub enum EscrowEventKind {
     /// amounts are zero — re-splitting moves no funds (the later
     /// period releases carry the new amounts with their fees).
     SubscriptionAmountsAdjusted,
+    /// AV-75: the vault's persisted schema was migrated one version
+    /// forward by initializer governance
+    /// ([`Escrow::migrate_schema`]). `from == to ==` the current
+    /// state (bookkeeping, not a lifecycle move — like
+    /// [`EscrowEventKind::SubscriptionAmountsAdjusted`]). Always
+    /// emitted on success: a successful migration always steps the
+    /// version, so there is no no-op case. All amounts are zero —
+    /// migration moves no funds.
+    SchemaMigrated,
 }
 
 impl EscrowEventKind {
@@ -488,6 +497,10 @@ impl EscrowEventKind {
             // discriminants 0–35 stay stable for already-serialized
             // histories.
             36 => Self::SubscriptionAmountsAdjusted,
+            // AV-75: appended after SubscriptionAmountsAdjusted so
+            // discriminants 0–36 stay stable for already-serialized
+            // histories.
+            37 => Self::SchemaMigrated,
             _ => return None,
         })
     }
@@ -533,6 +546,7 @@ impl EscrowEventKind {
             Self::PanelThresholdChanged => "panel_threshold_changed",
             Self::MilestonesAdjusted => "milestones_adjusted",
             Self::SubscriptionAmountsAdjusted => "subscription_amounts_adjusted",
+            Self::SchemaMigrated => "schema_migrated",
         }
     }
 
@@ -579,6 +593,7 @@ impl EscrowEventKind {
             "panel_threshold_changed" => Self::PanelThresholdChanged,
             "milestones_adjusted" => Self::MilestonesAdjusted,
             "subscription_amounts_adjusted" => Self::SubscriptionAmountsAdjusted,
+            "schema_migrated" => Self::SchemaMigrated,
             _ => return None,
         })
     }
@@ -2303,6 +2318,36 @@ impl IndexedEscrow {
                 None,
             );
         }
+        Ok(())
+    }
+
+    /// Migrate the vault's persisted schema one version forward
+    /// (mirrors [`Escrow::migrate_schema`]). Emits `SchemaMigrated`
+    /// (`from == to ==` the current state — bookkeeping, not a
+    /// lifecycle move, like
+    /// [`EscrowEventKind::SubscriptionAmountsAdjusted`]); the
+    /// initializer is the single signer, so it rides the event's
+    /// `actor`. The call fails unless the version actually steps, so
+    /// the event always fires on success — there is no no-op case.
+    /// `at` is the caller-supplied timestamp (on-chain: the clock
+    /// sysvar).
+    pub fn migrate_schema(&mut self, authority: [u8; 32], at: u64) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner.migrate_schema(authority)?;
+        let state = self.inner.state();
+        debug_assert_eq!(from, state, "migration must not move lifecycle state");
+        self.push_event(
+            EscrowEventKind::SchemaMigrated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
         Ok(())
     }
 
@@ -4107,6 +4152,58 @@ mod event_tests {
         assert_eq!(kind.discriminant(), 35);
         assert_eq!(EscrowEventKind::from_discriminant(35), Some(kind));
         assert_eq!(kind.name(), "milestones_adjusted");
+    }
+
+    #[test]
+    fn schema_migrated_kind_round_trips() {
+        // discriminant 37: appended after SubscriptionAmountsAdjusted,
+        // 0–36 stable for already-serialized histories.
+        let kind = EscrowEventKind::SchemaMigrated;
+        assert_eq!(kind.discriminant(), 37);
+        assert_eq!(EscrowEventKind::from_discriminant(37), Some(kind));
+        assert_eq!(kind.name(), "schema_migrated");
+        assert_eq!(EscrowEventKind::from_name("schema_migrated"), Some(kind));
+    }
+
+    #[test]
+    fn migrate_schema_emits_event_and_records_history() {
+        // Simulate a pre-AV-75 vault: the trailing schema byte reads 0.
+        let mut e = indexed(1_000_000);
+        e.inner.schema_version = 0;
+        let before = e.event_count();
+        e.migrate_schema(ALICE, T0 + 1).unwrap();
+        assert_eq!(e.event_count(), before + 1, "one event on migration");
+        let ev = last(&e);
+        assert_eq!(ev.kind, EscrowEventKind::SchemaMigrated);
+        assert_eq!(ev.from, EscrowState::Uninitialized);
+        assert_eq!(ev.to, EscrowState::Uninitialized, "from == to == current state");
+        assert_eq!(ev.amounts, EventAmounts::none(), "moves no funds");
+        // The on-chain history ring records the same transition — the
+        // initializer is the single signer, so it rides the ring's
+        // actor slot.
+        let history = e.inner().event_history();
+        let entry = history.last().expect("ring records the migration");
+        assert_eq!(entry.kind, EscrowEventKind::SchemaMigrated);
+        assert_eq!(entry.at, T0 + 1);
+        assert_eq!(entry.actor, Some(ALICE[..8].try_into().unwrap()));
+    }
+
+    #[test]
+    fn migrate_schema_rejection_emits_nothing() {
+        let mut e = indexed(1_000_000);
+        let before = e.event_count();
+        let ring_before = e.inner().event_history().len();
+        // Already current: the inner gate refuses, so nothing emits.
+        assert_eq!(
+            e.migrate_schema(ALICE, T0 + 1).unwrap_err(),
+            EscrowError::InvalidSchemaMigration
+        );
+        assert_eq!(e.event_count(), before, "failed call emits nothing");
+        assert_eq!(
+            e.inner().event_history().len(),
+            ring_before,
+            "failed call records nothing on-chain"
+        );
     }
 
     #[test]
