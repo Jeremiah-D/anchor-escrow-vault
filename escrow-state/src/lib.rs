@@ -34,6 +34,12 @@ mod execution_bundle;
 // multisig/CLI can sign and submit. Off-chain and unsigned by design:
 // the relay never holds keys. Purely additive.
 mod tx_message;
+// AV-72: escrow configuration templates — one-call constructors for the
+// four canonical escrow compositions (auction, milestone-plan,
+// subscription, arbitrated-dispute) with template-level combination
+// validation. Client-side composition only: produces a plain `Escrow`,
+// so the vault layout, IDL, and Anchor program are untouched.
+mod templates;
 #[cfg(test)]
 mod idl_json;
 #[cfg(test)]
@@ -182,6 +188,12 @@ pub use discriminator::{
     account_discriminator, decode_vault_account, vault_account_discriminator,
     AccountDecodeError, PROGRAM_ACCOUNT_NAMES,
 };
+
+// AV-72: escrow configuration templates — one-call constructors for the
+// four canonical escrow compositions (auction, milestone-plan,
+// subscription, arbitrated-dispute) with template-level combination
+// validation. Client-side composition only: produces a plain `Escrow`.
+pub use templates::{EscrowTemplate, KindParams, TemplateError, TemplateKind};
 
 // AV-33: batch settlement execution plan — group a keeper report's
 // actions into independently executable atomic batches (same mint +

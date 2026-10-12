@@ -2120,6 +2120,37 @@ the native-SOL leg, so an allowlisted destination does not trip
 layout (1-byte discriminant + 4×32-byte addresses + 1-byte count), so the
 opt-in writes in place without reallocating.
 
+## Configuration templates (AV-72)
+
+The `with_*` builders compose freely, but freedom is also a footgun: an
+absolute timelock *and* a relative timelock together, a timelock that
+unlocks after expiry (so the initializer can always front-run the taker's
+payout with `cancel_expired`), or a milestone plan whose tranches don't
+sum to the lockup are all legal builder sequences that only fail deep in a
+transition — or worse, encode an intent the parties didn't have.
+`escrow-state/src/templates.rs` encodes the four canonical compositions as
+one-call constructors with template-level combination validation:
+
+| Template | Composition |
+|---|---|
+| `Auction` | plain escrow + optional timelock + grace period — the classic auction-deposit / simple timelocked pattern |
+| `MilestonePlan` | escrow + milestone tranches + optional dual-sig/quorum — deliverable-gated release |
+| `Subscription` | escrow + subscription cadence — clock-driven periodic payouts |
+| `ArbitratedDispute` | escrow + arbiter + optional evidence deadline — dispute-arbitrated settlement |
+
+`EscrowTemplate::validate()` is a pure dry-run; `build()` validates
+first, then composes the builders in dependency order (the arbiter binds
+before the evidence deadline, which requires a bound arbitration
+mechanism). Either a fully-configured escrow or a `TemplateError` — never
+a half-built one. Combination rules: absolute vs relative timelock are
+mutually exclusive (`ConflictingTimelocks`); a timelock unlocking at or
+after `expires_at` is rejected (`TimelockPastExpiry`); `dual_sig` and
+`quorum` *compose* (activation gates `fund`, the quorum gates `release` —
+the test matrix drives the full lifecycle through both gates); milestone
+tranche sums and subscription cadences are checked before any builder
+runs. Templates are client-side only: they produce a plain `Escrow`, so
+the vault layout, IDL, and Anchor program are untouched.
+
 ## Run the tests
 
 ```bash
