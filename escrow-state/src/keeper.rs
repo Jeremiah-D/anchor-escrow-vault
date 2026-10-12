@@ -103,8 +103,39 @@
 //! canonical caller is the initializer: AV-34 restricts `close_vault`
 //! to the initializer, checked before state validity, so it is the
 //! only key the chain will accept.
+//!
+//! # Keeper milestone bundle execution (AV-76)
+//!
+//! [`scan_milestones`] is read-only; [`execute_milestone_bundle`] is the
+//! write side — the keeper-side executor that turns a bundle of
+//! `ReleaseMilestone` actions into real tranche releases on an
+//! [`IndexedEscrow`]. It composes the existing `release_milestone`
+//! instruction (already in the `INSTRUCTIONS` spec / IDL): no new
+//! on-chain instruction exists, and the crate's IDL output is
+//! unchanged.
+//!
+//! The executor takes an optional milestone-index subset: the keeper
+//! may release just the tranches it wants settled now (e.g. the next
+//! deliverable) while the rest stay pending and the vault stays
+//! `Funded`. A subset equal to the full configured index set — or no
+//! subset at all — is a full execution and may settle the vault; any
+//! *proper* subset additionally emits
+//! [`EscrowEventKind::BundlePartiallyExecuted`](crate::EscrowEventKind::BundlePartiallyExecuted)
+//! after the per-tranche `MilestoneReleased` events, so indexers see
+//! the partial settlement as one ordered unit.
+//!
+//! Atomicity is the AV-61 bundle-atomicity shape applied to keeper
+//! execution: the subset executes all-or-nothing on a clone, in
+//! ascending index order (matching the on-chain in-order settlement
+//! gate). Any tranche failure — an unconfirmed milestone, a gate the
+//! scan misjudged — returns the error with the caller's escrow
+//! untouched: zero events leaked, state identical. Confirm/skip
+//! actions are rejected: they are dual-signed governance, not keeper
+//! execution.
 
-use crate::{format_amount, vault_close_rent_reclaimed, Escrow, EscrowState};
+use crate::{
+    format_amount, vault_close_rent_reclaimed, Escrow, EscrowError, EscrowState, IndexedEscrow,
+};
 
 /// Render 32 bytes as 64 lowercase hex characters.
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -2236,6 +2267,153 @@ pub fn scan_milestones(watched: &[WatchedEscrow], now: u64) -> MilestoneReport {
         actions,
         blocked,
     }
+}
+
+/// The outcome of [`execute_milestone_bundle`]: which tranches the
+/// bundle released and which configured tranches it left pending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MilestoneBundleExecution {
+    /// Tranche indices the bundle released, ascending. Non-empty: an
+    /// empty bundle is rejected, not executed.
+    pub executed: Vec<u8>,
+    /// Configured tranche indices the bundle did not execute,
+    /// ascending. Empty on a full execution.
+    pub remaining: Vec<u8>,
+    /// True iff the vault reached `Released` — only possible when the
+    /// bundle executed every configured tranche.
+    pub settled: bool,
+}
+
+/// Execute a keeper milestone bundle on `indexed`: release the selected
+/// tranches' payouts to the taker, in ascending index order (AV-76).
+///
+/// This is keeper-side execution, not an on-chain transition — it
+/// composes the existing `release_milestone` instruction (already in
+/// the `INSTRUCTIONS` spec), so no new instruction or IDL entry
+/// exists. `at` is both the event timestamp and the state machine's
+/// `now` (the AV-27 timelock gate), like
+/// [`IndexedEscrow::release_milestone`].
+///
+/// Validation runs first, in the crate's check-order spirit — every
+/// rejection below is [`EscrowError::InvalidMilestones`]:
+///
+/// 1. `actions` is non-empty, every action targets `escrow_id`, and
+///    every action's kind is `ReleaseMilestone` (confirm/skip are
+///    dual-signed governance, not keeper execution).
+/// 2. The escrow carries a milestone plan (mirroring
+///    [`Escrow::release_milestone`]'s own gate).
+/// 3. The subset (`Some(indices)`) is non-empty, every index is below
+///    the plan's tranche count, no index repeats, and every selected
+///    index has a bundle action — a dangling index is a caller bug,
+///    not an executable bundle. `None` executes every action's index.
+///
+/// A subset equal to the full configured index set is a *full*
+/// execution (the vault may settle); any *proper* subset leaves the
+/// unselected tranches pending, the vault stays `Funded`, and a
+/// trailing [`EscrowEventKind::BundlePartiallyExecuted`] is emitted
+/// after the per-tranche `MilestoneReleased` events (gross + fee
+/// totals in `amounts`, no actor — the bundle is a keeper composition,
+/// and each tranche's own event already names its signer).
+///
+/// Atomicity (orthogonal to AV-61's bundle atomicity, same shape):
+/// the subset executes all-or-nothing on a clone of `indexed`. On any
+/// tranche failure the error returns with the caller's escrow
+/// untouched — zero events leaked, state identical.
+pub fn execute_milestone_bundle(
+    indexed: &mut IndexedEscrow,
+    escrow_id: [u8; 32],
+    actions: &[MilestoneAction],
+    subset: Option<&[u8]>,
+    payout_to: [u8; 32],
+    at: u64,
+) -> Result<MilestoneBundleExecution, EscrowError> {
+    // 1. Bundle input first: non-empty, all for this escrow, releases
+    // only.
+    if actions.is_empty()
+        || actions
+            .iter()
+            .any(|a| a.escrow_id != escrow_id || a.kind != MilestoneActionKind::ReleaseMilestone)
+    {
+        return Err(EscrowError::InvalidMilestones);
+    }
+    // 2. The escrow must carry a milestone plan.
+    let count = indexed
+        .inner()
+        .milestone_plan()
+        .ok_or(EscrowError::InvalidMilestones)?
+        .count() as usize;
+    // 3. Subset validation. `None` executes every action's index;
+    // either way the selected indices run in ascending order.
+    let selected: Vec<u8> = match subset {
+        Some(indices) => {
+            if indices.is_empty() {
+                return Err(EscrowError::InvalidMilestones);
+            }
+            let mut sel = indices.to_vec();
+            sel.sort_unstable();
+            sel.dedup();
+            if sel.len() != indices.len() {
+                return Err(EscrowError::InvalidMilestones);
+            }
+            sel
+        }
+        None => {
+            let mut sel: Vec<u8> = actions.iter().map(|a| a.index).collect();
+            sel.sort_unstable();
+            sel.dedup();
+            sel
+        }
+    };
+    if selected.iter().any(|i| *i as usize >= count)
+        || selected
+            .iter()
+            .any(|i| !actions.iter().any(|a| a.index == *i))
+    {
+        return Err(EscrowError::InvalidMilestones);
+    }
+    let full: Vec<u8> = (0..count as u8).collect();
+    let is_partial = selected != full;
+    let remaining: Vec<u8> = full
+        .iter()
+        .filter(|i| !selected.contains(i))
+        .copied()
+        .collect();
+    // 4. All-or-nothing on a clone: any tranche failure returns the
+    // error with `indexed` untouched.
+    let mut work = indexed.clone();
+    let mut total_gross: u64 = 0;
+    let mut total_fee: u64 = 0;
+    for index in &selected {
+        let action = actions
+            .iter()
+            .find(|a| a.index == *index)
+            .expect("every selected index has a bundle action");
+        let (payout, fee) =
+            work.release_milestone(action.caller, *index, action.mint, payout_to, at)?;
+        // `payout + fee` is the tranche gross; the tranches sum to the
+        // locked amount, so the totals cannot wrap — the checked adds
+        // are backstops, paralleling `Escrow::release_milestone`.
+        total_gross = total_gross
+            .checked_add(payout + fee)
+            .ok_or(EscrowError::ReleaseExceedsLocked)?;
+        total_fee = total_fee
+            .checked_add(fee)
+            .ok_or(EscrowError::ReleaseExceedsLocked)?;
+    }
+    let settled = work.inner().state() == EscrowState::Released;
+    if is_partial {
+        // A proper subset can never settle the vault: zero-amount
+        // tranches are rejected by `MilestonePlan::new`, so
+        // `released == amount` needs every tranche released.
+        debug_assert!(!settled, "a proper subset cannot settle the vault");
+        work.emit_bundle_partially_executed(total_gross, total_fee, at);
+    }
+    *indexed = work;
+    Ok(MilestoneBundleExecution {
+        executed: selected,
+        remaining,
+        settled,
+    })
 }
 
 #[cfg(test)]

@@ -36,6 +36,17 @@
 //!   when the skip executes (both approvals present). A lone approval
 //!   emits nothing; `from == to == Funded`, and `amounts.refund` carries
 //!   the skipped tranche (the initializer's refund).
+//! - A keeper milestone bundle
+//!   ([`crate::keeper::execute_milestone_bundle`], AV-76) emits one
+//!   [`EscrowEventKind::MilestoneReleased`] per executed tranche and,
+//!   when the bundle executed a *proper subset* of the configured
+//!   tranches, a trailing
+//!   [`EscrowEventKind::BundlePartiallyExecuted`] — `from == to ==
+//!   Funded` (a proper subset can never settle the vault), the executed
+//!   tranches' totals in `amounts` (gross in `payout`, protocol fees in
+//!   `fee`, like `MilestoneReleased`), no actor (the bundle is a keeper
+//!   composition, not a single authority). A full execution emits no
+//!   partial event — only the per-tranche `MilestoneReleased` events.
 //! - `update_quorum` emits [`EscrowEventKind::QuorumUpdated`] when the
 //!   threshold actually changes (AV-25) — `from == to ==` the current
 //!   state, all amounts zero: the event is the ordering signal that the
@@ -152,6 +163,7 @@
 //! |------|----------|-------|----------|-----------|
 //! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-70), SubscriptionAmountsAdjusted (AV-73), SchemaMigrated (AV-75) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
+//! | BundlePartiallyExecuted (AV-76) | Σ gross of the executed tranches | Σ protocol fee of the executed tranches | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | PartiallyCancelled (AV-60) | 0 | 0 | the partially-cancelled tranche, refunded to the whitelisted destination (the escrow stays `Funded`; the `released` counter is untouched) | 0 |
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
@@ -426,6 +438,24 @@ pub enum EscrowEventKind {
     /// version, so there is no no-op case. All amounts are zero —
     /// migration moves no funds.
     SchemaMigrated,
+    /// AV-76: a keeper milestone bundle
+    /// ([`crate::keeper::execute_milestone_bundle`]) released a
+    /// *proper subset* of the configured tranches. `from == to ==`
+    /// the current state (a proper subset can never settle the vault —
+    /// zero-amount tranches are rejected by
+    /// [`MilestonePlan::new`](crate::MilestonePlan::new), so
+    /// `released == amount` needs every tranche released). Fired only
+    /// for proper-subset executions: a full execution emits just the
+    /// per-tranche [`EscrowEventKind::MilestoneReleased`] events. The
+    /// executed tranches' totals ride `amounts` (`payout` = Σ gross,
+    /// `fee` = Σ protocol fee, like `MilestoneReleased`); the
+    /// executed/remaining index lists live on the executor's return
+    /// value ([`crate::keeper::MilestoneBundleExecution`]), and an
+    /// indexer rebuilds them from the adjacent `MilestoneReleased`
+    /// events. The actor is `None` — the bundle is a keeper
+    /// composition, not a single authority (each tranche's own
+    /// `MilestoneReleased` already names its signer).
+    BundlePartiallyExecuted,
 }
 
 impl EscrowEventKind {
@@ -501,6 +531,9 @@ impl EscrowEventKind {
             // discriminants 0–36 stay stable for already-serialized
             // histories.
             37 => Self::SchemaMigrated,
+            // AV-76: appended after SchemaMigrated so discriminants
+            // 0–37 stay stable for already-serialized histories.
+            38 => Self::BundlePartiallyExecuted,
             _ => return None,
         })
     }
@@ -547,6 +580,7 @@ impl EscrowEventKind {
             Self::MilestonesAdjusted => "milestones_adjusted",
             Self::SubscriptionAmountsAdjusted => "subscription_amounts_adjusted",
             Self::SchemaMigrated => "schema_migrated",
+            Self::BundlePartiallyExecuted => "bundle_partially_executed",
         }
     }
 
@@ -594,6 +628,7 @@ impl EscrowEventKind {
             "milestones_adjusted" => Self::MilestonesAdjusted,
             "subscription_amounts_adjusted" => Self::SubscriptionAmountsAdjusted,
             "schema_migrated" => Self::SchemaMigrated,
+            "bundle_partially_executed" => Self::BundlePartiallyExecuted,
             _ => return None,
         })
     }
@@ -2421,6 +2456,39 @@ impl IndexedEscrow {
         Ok((payout, fee))
     }
 
+    /// Emit [`EscrowEventKind::BundlePartiallyExecuted`] for a keeper
+    /// milestone bundle that released a proper subset of the configured
+    /// tranches (AV-76 — see
+    /// [`crate::keeper::execute_milestone_bundle`]). `from == to ==` the
+    /// current state (a proper subset can never settle the vault);
+    /// `amounts` carries the executed tranches' totals — gross in
+    /// `payout`, protocol fees in `fee`, like
+    /// [`EscrowEventKind::MilestoneReleased`]. The actor is `None`: the
+    /// bundle is a keeper composition, not a single authority — each
+    /// executed tranche's own `MilestoneReleased` event already names
+    /// its signer. `at` is the caller-supplied timestamp (the same `at`
+    /// the bundle's tranche releases carried).
+    pub(crate) fn emit_bundle_partially_executed(
+        &mut self,
+        total_gross: u64,
+        total_fee: u64,
+        at: u64,
+    ) {
+        let state = self.inner.state();
+        self.push_event(
+            EscrowEventKind::BundlePartiallyExecuted,
+            state,
+            state,
+            EventAmounts::payout(total_gross, total_fee),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
     /// Release a subscription period to the taker (mirrors
     /// [`Escrow::release_period`], AV-56). Emits
     /// `SubscriptionPeriodReleased` with the gross per-period amount in
@@ -4166,6 +4234,21 @@ mod event_tests {
     }
 
     #[test]
+    fn bundle_partially_executed_kind_round_trips() {
+        // discriminant 38: appended after SchemaMigrated, 0–37 stable
+        // for already-serialized histories.
+        let kind = EscrowEventKind::BundlePartiallyExecuted;
+        assert_eq!(kind.discriminant(), 38);
+        assert_eq!(EscrowEventKind::from_discriminant(38), Some(kind));
+        assert_eq!(kind.name(), "bundle_partially_executed");
+        assert_eq!(
+            EscrowEventKind::from_name("bundle_partially_executed"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(39), None);
+    }
+
+    #[test]
     fn migrate_schema_emits_event_and_records_history() {
         // Simulate a pre-AV-75 vault: the trailing schema byte reads 0.
         let mut e = indexed(1_000_000);
@@ -4203,6 +4286,293 @@ mod event_tests {
             e.inner().event_history().len(),
             ring_before,
             "failed call records nothing on-chain"
+        );
+    }
+
+    // ----- AV-76: keeper milestone bundle execution -----
+
+    use crate::keeper::{execute_milestone_bundle, MilestoneAction, MilestoneActionKind};
+
+    /// Funded escrow with a 3-tranche plan (300k/300k/400k ==
+    /// 1_000_000), no confirmations yet.
+    fn bundle_indexed() -> IndexedEscrow {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[300_000, 300_000, 400_000]).unwrap())
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e
+    }
+
+    /// Dual-confirm the first unsettled tranche through the real API
+    /// (confirmations are strictly in-order).
+    fn confirm_next(e: &mut IndexedEscrow) {
+        let i = e.inner().next_milestone().expect("a tranche is unsettled") as u8;
+        e.confirm_milestone(ALICE, i, T0 + 2).unwrap();
+        e.confirm_milestone(BOB, i, T0 + 3).unwrap();
+        assert!(e.inner().milestone_confirmed(i as usize));
+    }
+
+    /// Dual-confirm every tranche at once. The public API confirms
+    /// strictly in-order (only the first unsettled milestone is
+    /// confirmable), so a multi-confirmed bundle fixture sets the
+    /// confirmation bitmap directly — the bitmap is the source of
+    /// truth `release_milestone` reads.
+    fn confirm_all(e: &mut IndexedEscrow, count: usize) {
+        for i in 0..count {
+            e.inner.milestone_flags |=
+                crate::Escrow::milestone_bit(i, crate::MILESTONE_CONFIRM_INIT_BIT)
+                    | crate::Escrow::milestone_bit(i, crate::MILESTONE_CONFIRM_TAKER_BIT);
+        }
+        for i in 0..count {
+            assert!(e.inner().milestone_confirmed(i));
+        }
+    }
+
+    fn release_action(index: u8, tranche: u64) -> MilestoneAction {
+        MilestoneAction {
+            escrow_id: ESCROW_ID,
+            kind: MilestoneActionKind::ReleaseMilestone,
+            index,
+            caller: ALICE,
+            caller_role: "initializer",
+            mint: None,
+            tranche,
+            fee: 0,
+            taker_payout: tranche,
+            decimals: 0,
+            reason: "confirmed",
+        }
+    }
+
+    #[test]
+    fn bundle_full_execution_releases_all_and_settles() {
+        let mut e = bundle_indexed();
+        confirm_all(&mut e, 3);
+        let actions = [
+            release_action(0, 300_000),
+            release_action(1, 300_000),
+            release_action(2, 400_000),
+        ];
+        let before = e.event_count();
+        let out =
+            execute_milestone_bundle(&mut e, ESCROW_ID, &actions, None, BOB, T0 + 10).unwrap();
+        assert_eq!(out.executed, vec![0, 1, 2]);
+        assert!(out.remaining.is_empty(), "full execution leaves nothing");
+        assert!(out.settled, "executing every tranche settles the vault");
+        assert_eq!(e.inner().state(), EscrowState::Released);
+        assert_eq!(e.inner().released_amount(), 1_000_000);
+        // Three per-tranche MilestoneReleased events, and no partial
+        // event on a full execution.
+        assert_eq!(e.event_count(), before + 3);
+        assert!(e
+            .events()
+            .iter()
+            .all(|ev| ev.kind != EscrowEventKind::BundlePartiallyExecuted));
+        assert_event(
+            &e.events()[before],
+            EscrowEventKind::MilestoneReleased,
+            before as u64,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            300_000,
+            0,
+            0,
+            T0 + 10,
+        );
+        assert_event(
+            &e.events()[before + 1],
+            EscrowEventKind::MilestoneReleased,
+            before as u64 + 1,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            300_000,
+            0,
+            0,
+            T0 + 10,
+        );
+        assert_event(
+            &e.events()[before + 2],
+            EscrowEventKind::MilestoneReleased,
+            before as u64 + 2,
+            EscrowState::Funded,
+            EscrowState::Released,
+            400_000,
+            0,
+            0,
+            T0 + 10,
+        );
+    }
+
+    #[test]
+    fn bundle_proper_subset_emits_partial_event() {
+        let mut e = bundle_indexed();
+        confirm_next(&mut e); // tranche 0 dual-confirmed via the real API
+        let actions = [release_action(0, 300_000)];
+        let before = e.event_count();
+        let out =
+            execute_milestone_bundle(&mut e, ESCROW_ID, &actions, Some(&[0]), BOB, T0 + 10)
+                .unwrap();
+        assert_eq!(out.executed, vec![0]);
+        assert_eq!(out.remaining, vec![1, 2]);
+        assert!(!out.settled, "a proper subset never settles the vault");
+        assert_eq!(e.inner().state(), EscrowState::Funded);
+        assert!(e.inner().milestone_settled(0));
+        assert!(!e.inner().milestone_settled(1), "unselected tranche stays pending");
+        assert!(!e.inner().milestone_settled(2), "unselected tranche stays pending");
+        // The per-tranche MilestoneReleased precedes the partial event.
+        assert_eq!(e.event_count(), before + 2);
+        assert_event(
+            &e.events()[before],
+            EscrowEventKind::MilestoneReleased,
+            before as u64,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            300_000,
+            0,
+            0,
+            T0 + 10,
+        );
+        assert_event(
+            &e.events()[before + 1],
+            EscrowEventKind::BundlePartiallyExecuted,
+            before as u64 + 1,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            300_000,
+            0,
+            0,
+            T0 + 10,
+        );
+        // The on-chain ring records the partial event with no actor —
+        // the bundle is a keeper composition, not a single authority.
+        let ring = e.inner().event_history();
+        let entry = ring.last().expect("ring records the bundle");
+        assert_eq!(entry.kind, EscrowEventKind::BundlePartiallyExecuted);
+        assert_eq!(entry.at, T0 + 10);
+        assert_eq!(entry.actor, None);
+    }
+
+    #[test]
+    fn bundle_full_set_subset_matches_full_execution() {
+        let mut e = bundle_indexed();
+        confirm_all(&mut e, 3);
+        let actions = [
+            release_action(0, 300_000),
+            release_action(1, 300_000),
+            release_action(2, 400_000),
+        ];
+        // Unsorted on purpose: the executor normalizes to ascending
+        // index order, and a subset equal to the full configured index
+        // set is a full execution — no partial event.
+        let out =
+            execute_milestone_bundle(&mut e, ESCROW_ID, &actions, Some(&[2, 0, 1]), BOB, T0 + 10)
+                .unwrap();
+        assert_eq!(out.executed, vec![0, 1, 2]);
+        assert!(out.remaining.is_empty());
+        assert!(out.settled);
+        assert_eq!(e.inner().state(), EscrowState::Released);
+        assert!(e
+            .events()
+            .iter()
+            .all(|ev| ev.kind != EscrowEventKind::BundlePartiallyExecuted));
+    }
+
+    #[test]
+    fn bundle_rejects_bad_input_without_side_effects() {
+        let mut e = bundle_indexed();
+        confirm_next(&mut e);
+        let actions = [release_action(0, 300_000)];
+        let before = e.event_count();
+        let ring_before = e.inner().event_history().len();
+
+        // Empty bundle.
+        assert_eq!(
+            execute_milestone_bundle(&mut e, ESCROW_ID, &[], None, BOB, T0 + 10).unwrap_err(),
+            EscrowError::InvalidMilestones
+        );
+        // Action for a different escrow.
+        let mut mixed = release_action(0, 300_000);
+        mixed.escrow_id = [0x99; 32];
+        assert_eq!(
+            execute_milestone_bundle(&mut e, ESCROW_ID, &[mixed], None, BOB, T0 + 10).unwrap_err(),
+            EscrowError::InvalidMilestones
+        );
+        // Confirm/skip are governance, not keeper execution.
+        let mut not_release = release_action(0, 300_000);
+        not_release.kind = MilestoneActionKind::ConfirmMilestone;
+        assert_eq!(
+            execute_milestone_bundle(&mut e, ESCROW_ID, &[not_release], None, BOB, T0 + 10)
+                .unwrap_err(),
+            EscrowError::InvalidMilestones
+        );
+        // Empty subset.
+        assert_eq!(
+            execute_milestone_bundle(&mut e, ESCROW_ID, &actions, Some(&[]), BOB, T0 + 10)
+                .unwrap_err(),
+            EscrowError::InvalidMilestones
+        );
+        // Out-of-range index (the backlog's "非法索引" gate reuses the
+        // existing InvalidMilestones variant, code 110).
+        assert_eq!(
+            execute_milestone_bundle(&mut e, ESCROW_ID, &actions, Some(&[3]), BOB, T0 + 10)
+                .unwrap_err(),
+            EscrowError::InvalidMilestones
+        );
+        // Duplicate indices.
+        assert_eq!(
+            execute_milestone_bundle(&mut e, ESCROW_ID, &actions, Some(&[0, 0]), BOB, T0 + 10)
+                .unwrap_err(),
+            EscrowError::InvalidMilestones
+        );
+        // Subset index with no bundle action.
+        assert_eq!(
+            execute_milestone_bundle(&mut e, ESCROW_ID, &actions, Some(&[1]), BOB, T0 + 10)
+                .unwrap_err(),
+            EscrowError::InvalidMilestones
+        );
+        // Escrow without a milestone plan.
+        let mut plain = funded(1_000_000);
+        assert_eq!(
+            execute_milestone_bundle(&mut plain, ESCROW_ID, &actions, None, BOB, T0 + 10)
+                .unwrap_err(),
+            EscrowError::InvalidMilestones
+        );
+
+        // Every rejection leaves state and the event log untouched.
+        assert_eq!(e.event_count(), before, "rejected bundle emits nothing");
+        assert_eq!(
+            e.inner().event_history().len(),
+            ring_before,
+            "rejected bundle records nothing on-chain"
+        );
+        assert_eq!(e.inner().state(), EscrowState::Funded);
+        assert!(!e.inner().milestone_settled(0));
+        assert_eq!(e.inner().released_amount(), 0);
+    }
+
+    #[test]
+    fn bundle_atomic_rollback_on_tranche_failure() {
+        let mut e = bundle_indexed();
+        confirm_next(&mut e); // only tranche 0 confirmed; tranche 1 is not
+        let actions = [release_action(0, 300_000), release_action(1, 300_000)];
+        let before = e.event_count();
+        let ring_before = e.inner().event_history().len();
+        // Tranche 0 releases, then tranche 1 fails (unconfirmed) — the
+        // whole subset rolls back.
+        assert_eq!(
+            execute_milestone_bundle(&mut e, ESCROW_ID, &actions, Some(&[0, 1]), BOB, T0 + 10)
+                .unwrap_err(),
+            EscrowError::MilestoneNotConfirmed
+        );
+        assert_eq!(e.inner().state(), EscrowState::Funded);
+        assert!(!e.inner().milestone_settled(0), "tranche 0's release rolled back");
+        assert_eq!(e.inner().released_amount(), 0);
+        assert_eq!(e.event_count(), before, "failed bundle leaks no events");
+        assert_eq!(
+            e.inner().event_history().len(),
+            ring_before,
+            "failed bundle records nothing on-chain"
         );
     }
 

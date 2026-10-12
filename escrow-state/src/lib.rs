@@ -24870,7 +24870,12 @@ mod event_history_tests {
             37,
             "AV-75: appended after SubscriptionAmountsAdjusted"
         );
-        for d in 0..=37u8 {
+        assert_eq!(
+            EscrowEventKind::BundlePartiallyExecuted.discriminant(),
+            38,
+            "AV-76: appended after SchemaMigrated"
+        );
+        for d in 0..=38u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -24881,7 +24886,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(38), None);
+        assert_eq!(EscrowEventKind::from_discriminant(39), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -25003,9 +25008,11 @@ mod event_history_tests {
         // `PanelResolved`, 32 is `FeeRecipientRotated`, 33 is
         // `EvidenceSubmitted`, 34 is `PanelThresholdChanged`, 35 is
         // `MilestonesAdjusted` (AV-70), 36 is
-        // `SubscriptionAmountsAdjusted` (AV-73), and 37 is
-        // `SchemaMigrated` (AV-75); 38 is the first still-unknown byte.
-        for bad in [38u8, 42, 255] {
+        // `SubscriptionAmountsAdjusted` (AV-73), 37 is
+        // `SchemaMigrated` (AV-75), and 38 is
+        // `BundlePartiallyExecuted` (AV-76); 39 is the first
+        // still-unknown byte.
+        for bad in [39u8, 42, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

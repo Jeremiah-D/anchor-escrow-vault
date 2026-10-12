@@ -1343,7 +1343,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -1606,6 +1606,33 @@ or fully settled contribute nothing — and `MilestoneReport::to_json()`
 emits hand-serialized JSON in the same deterministic style (AV-33
 conventions: fixed field order, 64-char lowercase hex keys, `mint` as
 hex or `null`).
+
+**Keeper milestone bundle execution (AV-76).** The scan is read-only;
+`execute_milestone_bundle(indexed, escrow_id, actions, subset,
+payout_to, at)` in `escrow-state/src/keeper.rs` is the write side —
+the keeper-side executor that turns a bundle of `ReleaseMilestone`
+actions into real tranche releases on an `IndexedEscrow`. It composes
+the existing `release_milestone` instruction (already in the
+`INSTRUCTIONS` spec / IDL), so no new on-chain instruction or IDL
+entry exists. The keeper passes an optional milestone-index subset to
+release only the tranches it wants settled now: unselected tranches
+stay pending and the vault stays `Funded`. A subset equal to the full
+configured index set — or no subset at all — is a full execution and
+may settle the vault; any *proper* subset additionally emits a
+trailing `BundlePartiallyExecuted` event (discriminant 38) after the
+per-tranche `MilestoneReleased` events, carrying the executed
+tranches' gross + fee totals (`from == to == Funded`, no actor — the
+bundle is a keeper composition, and each tranche's own event already
+names its signer). The return value reports `executed` / `remaining`
+indices and whether the vault settled. Atomicity is the AV-61 bundle
+shape applied to keeper execution: the subset runs all-or-nothing on a
+clone, in ascending index order, and any tranche failure (an
+unconfirmed milestone, a misjudged gate) returns the error with the
+caller's escrow untouched — zero events leaked, state identical.
+Invalid bundles (empty, mixed escrow ids, confirm/skip actions,
+missing plan, empty/duplicate/out-of-range/dangling subset indices)
+are `InvalidMilestones` (code 110) — the existing variant is reused,
+no new error code.
 
 ## State snapshot (AV-26)
 
