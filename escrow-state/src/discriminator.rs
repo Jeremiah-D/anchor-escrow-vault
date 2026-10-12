@@ -105,7 +105,7 @@ pub enum AccountDecodeError {
     /// safely read (AV-49; AV-32 panic-free guarantee).
     InvalidPayoutAllowlistLen(u8),
     /// An event-history slot's kind byte is not a known
-    /// [`EscrowEventKind`] discriminant (0–31). The mapping is pinned
+    /// [`EscrowEventKind`] discriminant (0–32). The mapping is pinned
     /// by test to declaration order (AV-57).
     InvalidEventKindDiscriminant(u8),
     /// A present arbiter panel's member count is outside `1..=8`

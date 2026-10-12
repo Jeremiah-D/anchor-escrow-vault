@@ -1971,6 +1971,68 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Rotate the protocol-fee recipient by dual-signed governance
+    /// (AV-67; mirrors `Escrow::rotate_fee_recipient`). Both the
+    /// *current* initializer and the *current* taker must sign — one
+    /// party alone (or a stranger pair) is `Unauthorized`; the fee
+    /// recipient itself does not sign (a lost fee-recipient key must
+    /// not block its own replacement); the degenerate initializer ==
+    /// taker self-escrow authorizes with one key passed twice, like
+    /// AV-12 activation. Only `Uninitialized` / `Activated` /
+    /// `Funded`: the terminal states have no future fee leg left to
+    /// redirect, and `Disputed` is `InvalidStateTransition` (the
+    /// dispute settlement builders pin the fee leg to the configured
+    /// recipient — it must not move mid-dispute). A paused escrow fails
+    /// fast (`Paused`) — rotation is a config transition, not the
+    /// pause key-loss escape hatch. With no fee recipient configured
+    /// there is nothing to rotate (`InvalidFeeRecipient`, code 123,
+    /// the fee-recipient-config error); the zero address is likewise
+    /// `InvalidFeeRecipient`. Rotating to the current recipient is an
+    /// idempotent no-op (the activation bitmask is untouched — it
+    /// tracks only the initializer and taker). The keeper's fee
+    /// listings and the snapshot export read the live fee_recipient
+    /// field, so both follow the rotation automatically. Emits
+    /// `FeeRecipientRotated` only on an actual change (from == to ==
+    /// the current state), mirroring
+    /// `IndexedEscrow::rotate_fee_recipient`.
+    pub fn rotate_fee_recipient(
+        ctx: Context<RotateFeeRecipient>,
+        new_recipient: Pubkey,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.fee_recipient();
+        escrow
+            .rotate_fee_recipient(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_recipient.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.fee_recipient` in place in the real build (33
+        // bytes, always present, zeroed when None) — no realloc, no
+        // rent change.
+        if escrow.fee_recipient() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::FeeRecipientRotated,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Opt in to bounded expiry extension at setup time (AV-59;
     /// mirrors `Escrow::with_max_extension_secs`). `Uninitialized`
     /// only — the extension policy is fixed before any funds move. A
@@ -3686,6 +3748,23 @@ pub struct RotateArbiter<'info> {
     /// taker. The arbiter itself does not sign: rotation is the two
     /// parties' governance, not an arbiter power — a lost arbiter key
     /// must not block its own replacement.
+    pub taker: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct RotateFeeRecipient<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's *current*
+    /// initializer. Both parties must sign — one alone (or a stranger
+    /// pair) is `Unauthorized`; the degenerate initializer == taker
+    /// self-escrow authorizes with one key passed twice, like AV-12
+    /// activation.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's *current*
+    /// taker. The fee recipient itself does not sign: rotation is the
+    /// two parties' governance, not a treasury power — a lost
+    /// fee-recipient key must not block its own replacement.
     pub taker: Signer<'info>,
 }
 

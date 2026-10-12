@@ -67,6 +67,12 @@
 //!   current state, all amounts zero; a no-op rotation emits nothing.
 //!   A rotation with no arbiter configured is rejected, so the event
 //!   can never fire on an arbiter-less escrow.
+//! - `rotate_fee_recipient` emits [`EscrowEventKind::FeeRecipientRotated`]
+//!   when the fee recipient actually changes (AV-67) — the exact
+//!   mirror of `rotate_arbiter`'s emission rule: `from == to ==` the
+//!   current state, all amounts zero; a no-op rotation emits nothing.
+//!   A rotation with no fee recipient configured is rejected, so the
+//!   event can never fire on a recipient-less escrow.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -137,7 +143,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62), FeeRecipientRotated (AV-67) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | PartiallyCancelled (AV-60) | 0 | 0 | the partially-cancelled tranche, refunded to the whitelisted destination (the escrow stays `Funded`; the `released` counter is untouched) | 0 |
@@ -348,6 +354,19 @@ pub enum EscrowEventKind {
     /// emitted together with the settling vote's `PanelJudgment` (the
     /// vote first, then the settlement).
     PanelResolved,
+    /// AV-67: the protocol-fee recipient was rotated by dual-signed
+    /// governance ([`Escrow::rotate_fee_recipient`]) — the mirror of
+    /// [`EscrowEventKind::ArbiterRotated`] for the fee-destination
+    /// role. `from == to ==` the current state (a config change, not a
+    /// lifecycle move — like [`EscrowEventKind::QuorumUpdated`]); the
+    /// new recipient is read from the vault, the event is the ordering
+    /// signal. Emitted only on an actual change: rotating to the
+    /// current recipient is an idempotent no-op that emits nothing
+    /// (paralleling [`EscrowEventKind::TakerRotated`]'s no-op rule). A
+    /// rotation with no fee recipient configured is rejected
+    /// (`InvalidFeeRecipient`), so the event can never fire on a
+    /// recipient-less escrow.
+    FeeRecipientRotated,
 }
 
 impl EscrowEventKind {
@@ -401,6 +420,9 @@ impl EscrowEventKind {
             // 0–29 stay stable for already-serialized histories.
             30 => Self::PanelJudgment,
             31 => Self::PanelResolved,
+            // AV-67: appended after PanelResolved so discriminants
+            // 0–31 stay stable for already-serialized histories.
+            32 => Self::FeeRecipientRotated,
             _ => return None,
         })
     }
@@ -441,6 +463,7 @@ impl EscrowEventKind {
             Self::ArbiterRotated => "arbiter_rotated",
             Self::PanelJudgment => "panel_judgment",
             Self::PanelResolved => "panel_resolved",
+            Self::FeeRecipientRotated => "fee_recipient_rotated",
         }
     }
 }
@@ -897,6 +920,13 @@ impl IndexedEscrow {
     /// [`Escrow::with_protocol_fee`]). Configuration: emits no event.
     pub fn with_protocol_fee(mut self, fee_bps: u16) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_protocol_fee(fee_bps)?;
+        Ok(self)
+    }
+
+    /// Pin the protocol-fee destination (mirrors
+    /// [`Escrow::with_fee_recipient`]). Configuration: emits no event.
+    pub fn with_fee_recipient(mut self, recipient: [u8; 32]) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_fee_recipient(recipient)?;
         Ok(self)
     }
 
@@ -1640,6 +1670,46 @@ impl IndexedEscrow {
             let state = self.inner.state();
             self.push_event(
             EscrowEventKind::ArbiterRotated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
+    /// Rotate the protocol-fee recipient by dual-signed governance
+    /// (mirrors [`Escrow::rotate_fee_recipient`]) — the mirror of
+    /// [`IndexedEscrow::rotate_arbiter`] for the fee-destination role.
+    /// Emits `FeeRecipientRotated` only when the recipient actually
+    /// changes; `from == to ==` the current state (a config change, not
+    /// a lifecycle move — like `QuorumUpdated`). `at` is the
+    /// caller-supplied event timestamp.
+    pub fn rotate_fee_recipient(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_recipient: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.fee_recipient();
+        self.inner
+            .rotate_fee_recipient(initializer, taker, new_recipient)?;
+        let after = self.inner.fee_recipient();
+        // The inner call rejects a stranger pair, wrong states, the
+        // zero address, and the no-recipient case, so a changed
+        // recipient here always means real governance — and a
+        // same-recipient no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+            EscrowEventKind::FeeRecipientRotated,
             state,
             state,
             EventAmounts::none(),

@@ -319,6 +319,14 @@
       ]
     },
     {
+      "name": "rotate_fee_recipient",
+      "discriminator": [184, 47, 132, 149, 242, 158, 63, 216],
+      "accounts": [],
+      "args": [
+        {"name": "new_recipient", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "initialize_arbiter_panel",
       "discriminator": [208, 8, 89, 195, 89, 157, 227, 90],
       "accounts": [],

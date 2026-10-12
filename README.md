@@ -90,6 +90,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `rotate_taker(new_taker)`                   | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the taker) | **both** the initializer and the *current* taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition` (no live counterparty left; arbitration in flight adjudicates the taker's identity); zero address is `InvalidTaker`; amount / released / attest records / milestone state all preserved; emits `TakerRotated` only on an actual change |
 | `rotate_initializer(new_initializer)`      | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the initializer) | **both** the *current* initializer and the taker must sign (dual-signature governance — the mirror of `rotate_taker`; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (arbitration in flight adjudicates the initializer's identity — the refund goes to the initializer); zero address is `InvalidInitializer`; on an actual change the initializer's activation signature bit is cleared (the new key never signed activation); the AV-23 whitelist pins the refund destination when configured, otherwise refunds resolve to the new initializer (keeper/snapshot follow automatically); emits `InitializerRotated` only on an actual change |
 | `rotate_arbiter(new_arbiter)`                | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the arbiter) | **both** the *current* initializer and the *current* taker must sign (dual-signature governance — the mirror of `rotate_initializer` for the arbitration role; the arbiter itself does not sign, so a lost arbiter key cannot block its own replacement; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (no live dispute path left to referee, and arbitration in flight must settle with the referee that heard it); a configured panel is `InvalidStateTransition` too (single-arbiter governance only — rotate the panel via `initialize_arbiter_panel`); no arbiter configured or the zero address is `InvalidArbiter`; the activation bitmask is untouched (it tracks only the initializer and taker); the keeper's `resolve` listing and the snapshot export read the live arbiter field (follow automatically); emits `ArbiterRotated` only on an actual change |
+| `rotate_fee_recipient(new_recipient)`         | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the fee recipient) | **both** the *current* initializer and the *current* taker must sign (dual-signature governance — the mirror of `rotate_arbiter` for the fee-destination role; the fee recipient itself does not sign, so a lost fee-recipient key cannot block its own replacement; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (no future fee leg left to redirect, and the dispute settlement builders pin the fee leg to the configured recipient); no fee recipient configured or the zero address is `InvalidFeeRecipient` (code 123); the activation bitmask is untouched (it tracks only the initializer and taker); the keeper's fee listings and the snapshot export read the live `fee_recipient` field (follow automatically); emits `FeeRecipientRotated` only on an actual change |
 | `initialize_quorum(attestors, weights, threshold)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_extension(max_extension_secs)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding); zero bound is `InvalidExpiryExtension`; persists the extension budget (`max_extension_secs`, `extension_count` starts 0) |
@@ -839,6 +840,35 @@ caller (so an arbiter-operated keeper bot follows the rotation
 automatically) and the snapshot export carries the new arbiter — both
 read the live field, no extra writes.
 
+**Fee-recipient rotation (AV-67).** The *current* initializer and the
+*current* taker may jointly rotate the protocol-fee recipient
+(`rotate_fee_recipient(new_recipient)`) — the mirror of arbiter
+rotation for the fee-destination role: a lost or compromised treasury
+key, a fee-collection migration to a new treasury wallet. Both parties
+must sign (one alone, or a stranger pair, is `Unauthorized`); the
+degenerate initializer == taker self-escrow authorizes with one key
+passed twice (like AV-12 activation). The fee recipient itself does not
+sign — rotation is the two parties' governance, not a treasury power, so
+a lost fee-recipient key cannot block its own replacement. Only
+`Uninitialized` / `Activated` / `Funded` — the terminal states have no
+future fee leg left to redirect, and `Disputed` is excluded because the
+dispute settlement builders pin the fee leg to the configured recipient
+(never swap the destination mid-dispute — the dispute must settle
+first). Check order is authority → state → config: with no fee recipient
+configured there is nothing to rotate, and the zero address is rejected —
+both are `InvalidFeeRecipient` (code 123, the fee-recipient-config error,
+matching `with_fee_recipient`'s zero-address rejection). Unlike
+initializer rotation there is no activation bit to clear — the bitmask
+tracks only the initializer and taker, so it is untouched on both the
+no-op and the actual change. Unlike the pause-authority rotation, this one
+*is* gated by the pause (`Paused`) — it is a config transition, not the
+key-loss escape hatch. Rotating to the current recipient is an idempotent
+no-op; an actual change emits the `FeeRecipientRotated` indexer event
+(`from == to ==` the current state). The `Option<Pubkey>` fee_recipient
+region (33 bytes) is rewritten in place — no layout or rent change. The
+keeper's fee listings and the snapshot export read the live field, so
+both follow the rotation with no extra writes.
+
 **Expiry extension (AV-59).** An escrow with a hard deadline can outlive
 its usefulness when both sides still want the deal: the initializer may
 declare, at setup, a bounded extension budget
@@ -903,7 +933,7 @@ program error per variant):
 | `InvalidCpiTarget` | 120 | `release_via_cpi` with a zero program id, an empty account list, or a zero account key (malformed third-party invocation) |
 | `CpiExecutionFailed` | 121 | `release_via_cpi` whose injected CPI executor reported failure after the gates passed (whole release rolled back) |
 | `ReentrantCall` | 122 | a fund-moving transition entered while the AV-36 reentrancy lock was held (nested entry from inside `release_via_cpi`'s executor window) |
-| `InvalidFeeRecipient` | 123 | `with_fee_recipient` with the zero address (a zero address can never be the legitimate protocol-fee destination) |
+| `InvalidFeeRecipient` | 123 | `with_fee_recipient` with the zero address (a zero address can never be the legitimate protocol-fee destination), or `rotate_fee_recipient` with no fee recipient configured / with the zero address |
 | `Paused` | 124 | any state-changing transition while the AV-46 emergency pause is engaged (`fund`/`release`/`claim`/`attest`/`resolve`/`cancel`/milestone/governance paths) |
 | `InvalidPauseAuthority` | 125 | `with_pause_authority` / `rotate_pause_authority` with the zero address (a zero address can never hold the emergency switch) |
 | `InvalidPayoutAllowlist` | 126 | `with_payout_allowlist` / `update_payout_allowlist` with an empty list, more than 4 addresses, or a zero address (the AV-49 allowlist must be 1-4 live payout destinations) |

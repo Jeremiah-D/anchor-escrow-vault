@@ -3958,6 +3958,99 @@ impl Escrow {
         Ok(())
     }
 
+    /// Rotate the protocol-fee recipient by dual-signed governance
+    /// (AV-67 — Solana governance): the mirror of
+    /// [`Escrow::rotate_taker`] / [`Escrow::rotate_initializer`] /
+    /// [`Escrow::rotate_arbiter`] for the fee-destination role.
+    /// Key-rotation for the treasury address: when the fee recipient's
+    /// key is compromised, lost, or moved to a new wallet (or the
+    /// protocol hands fee collection to a new treasury), the escrow's
+    /// fee destination can follow without cancelling and re-creating
+    /// the escrow (which would strand in-flight quorum votes,
+    /// attestations and milestone progress).
+    ///
+    /// Check order mirrors [`Escrow::rotate_taker`] (see its doc for
+    /// the rationale — authentication against the *current* key, so the
+    /// old key consents to its own replacement):
+    /// 1. the *current* initializer AND the *current* taker must both
+    ///    authorize — one party alone (or a stranger pair) is
+    ///    [`EscrowError::Unauthorized`]. The fee recipient itself does
+    ///    not sign: rotation is the two parties' governance, not a
+    ///    treasury power — a lost fee-recipient key must not block its
+    ///    own replacement (same reasoning as
+    ///    [`Escrow::rotate_arbiter`]). Independent `==` checks (not
+    ///    `||`): the degenerate initializer == taker self-escrow
+    ///    authorizes with one key passed twice (initializer == taker),
+    ///    like AV-12's activation;
+    /// 2. the escrow must be `Uninitialized`, `Activated` or `Funded` —
+    ///    the non-terminal pre-release states. The terminal states
+    ///    (`Released` / `Cancelled` / `Settled` / `Closed`) have no
+    ///    future fee leg left to redirect, and `Disputed` is excluded
+    ///    because arbitration is in flight: the dispute evidence /
+    ///    settlement builders pin the fee leg to the configured
+    ///    recipient, so rotating mid-dispute would let a party swap
+    ///    the destination under an in-flight ruling — the dispute must
+    ///    settle first ([`EscrowError::InvalidStateTransition`]);
+    /// 3. config: with no fee recipient configured there is nothing to
+    ///    rotate — [`EscrowError::InvalidFeeRecipient`] (the
+    ///    fee-recipient-config error, code 123); the zero address is
+    ///    likewise [`EscrowError::InvalidFeeRecipient`] — a zero
+    ///    address can never be the legitimate fee destination (matches
+    ///    [`Escrow::with_fee_recipient`]'s zero-address rejection).
+    ///
+    /// AV-46: a paused escrow fails fast (`Paused`) — rotation is a
+    /// config transition, not the pause key-loss escape hatch (that is
+    /// [`Escrow::rotate_pause_authority`], which deliberately works
+    /// while paused).
+    ///
+    /// Like [`Escrow::rotate_arbiter`] there is no activation bit to
+    /// clear for the fee recipient — the activation bitmask tracks
+    /// only the initializer and taker — so a same-address no-op and an
+    /// actual change alike leave the bitmask untouched.
+    ///
+    /// The keeper's fee listings and the AV-26 snapshot export read the
+    /// live `fee_recipient` field, so both follow the rotation with no
+    /// extra writes. Rotation moves no funds, so no AV-36 reentrancy
+    /// lock is needed (the lock only guards the 9 funds paths). The
+    /// `Option<Pubkey>` fee_recipient region is rewritten in place —
+    /// no layout / rent change (VAULT_FIELDS is untouched).
+    ///
+    /// Rotating to the current recipient is a no-op success
+    /// (idempotent); the `FeeRecipientRotated` indexer event fires only
+    /// on an actual change, paralleling `update_quorum`'s no-op rule.
+    pub fn rotate_fee_recipient(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_recipient: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the *current* initializer and
+        // the *current* taker must authorize — one party alone (or a
+        // stranger pair) is Unauthorized. The fee recipient itself does
+        // not sign: a lost fee-recipient key must not block its own
+        // replacement. Degenerate initializer == taker self-escrow: one
+        // key passed twice.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Activated | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // No fee recipient configured: there is nothing to rotate. The
+        // zero address can never be the legitimate fee destination.
+        if self.fee_recipient.is_none() || new_recipient == [0u8; 32] {
+            return Err(EscrowError::InvalidFeeRecipient);
+        }
+        if Some(new_recipient) == self.fee_recipient {
+            return Ok(());
+        }
+        self.fee_recipient = Some(new_recipient);
+        Ok(())
+    }
+
     /// Opt in to an expiry grace period (AV-21 — Solana operations /
     /// backend engineering): [`Escrow::cancel_expired`] then requires
     /// `now >= expires_at + grace_period` (see
@@ -9266,6 +9359,51 @@ pub(crate) mod anchor_idl_tests {
                             rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-67: rotate the protocol-fee recipient by dual-signed
+            // governance — the mirror of rotate_arbiter for the
+            // fee-destination role.
+            name: "rotate_fee_recipient",
+            params: &[(
+                "new_recipient",
+                "Pubkey",
+                "instruction param; the replacement fee recipient - the \\
+                 old address stops being the fee destination \\
+                 immediately; the keeper's fee listings and the snapshot \\
+                 export read the live field, so both follow the \\
+                 rotation automatically",
+            )],
+            method: "Escrow::rotate_fee_recipient",
+            input_mapping: "initializer <- accounts.initializer (signer) \\
+                            AND taker <- accounts.taker (signer) - both \\
+                            parties must sign, one alone (or a stranger \\
+                            pair) is Unauthorized; the fee recipient \\
+                            itself does not sign - a lost fee-recipient \\
+                            key must not block its own replacement; the \\
+                            degenerate initializer == taker self-escrow \\
+                            authorizes with one key passed twice, like \\
+                            AV-12 activation; new_recipient <- param \\
+                            (Pubkey -> [u8; 32] conversion); only \\
+                            Uninitialized / Activated / Funded - the \\
+                            terminal states have no future fee leg left \\
+                            to redirect, and Disputed is \\
+                            InvalidStateTransition (the dispute \\
+                            settlement builders pin the fee leg to the \\
+                            configured recipient - it must not move \\
+                            mid-dispute); no fee recipient configured is \\
+                            InvalidFeeRecipient (code 123, the \\
+                            fee-recipient-config error - there is \\
+                            nothing to rotate); the zero address is \\
+                            InvalidFeeRecipient (code 123); rotating to \\
+                            the current recipient is an idempotent \\
+                            no-op (the activation bitmask is untouched - \\
+                            it tracks only initializer and taker); emits \\
+                            the FeeRecipientRotated indexer event only \\
+                            on an actual change (from == to == the \\
+                            current state); the Option<Pubkey> \\
+                            fee_recipient region (33 bytes) is rewritten \\
+                            in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-65: opt in to the arbiter-panel multisig judgment at
             // initialize time (replaces the single arbiter).
             name: "initialize_arbiter_panel",
@@ -9843,6 +9981,9 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::rotate_taker",
             "Escrow::rotate_initializer",
             "Escrow::rotate_arbiter",
+            // AV-67: protocol-fee recipient rotation by dual-signed
+            // governance.
+            "Escrow::rotate_fee_recipient",
             // AV-65: arbiter-panel multisig judgment.
             "Escrow::with_arbiter_panel",
             "Escrow::submit_panel_judgment",
@@ -9886,7 +10027,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_forty_instructions_take_params() {
+    fn only_forty_one_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -9925,6 +10066,7 @@ pub(crate) mod anchor_idl_tests {
                 &"rotate_taker",
                 &"rotate_initializer",
                 &"rotate_arbiter",
+                &"rotate_fee_recipient",
                 &"initialize_arbiter_panel",
                 &"submit_panel_judgment",
                 &"initialize_payout_allowlist",
@@ -11512,6 +11654,13 @@ pub(crate) mod anchor_idl_tests {
         // same field, like `pause_authority`'s initialize/rotate pair);
         // this entry documents the rotation source.
         ("rotate_arbiter", "new_arbiter", "arbiter"),
+        // AV-67: the rotation param rewrites the fee_recipient field in
+        // place — the mirror of `rotate_arbiter` for the fee-destination
+        // role. The field's initial value comes from the
+        // `initialize_fee_recipient` builder (a separate param source
+        // for the same field, like `arbiter`'s initialize/rotate pair);
+        // this entry documents the rotation source.
+        ("rotate_fee_recipient", "new_recipient", "fee_recipient"),
         // AV-49: the allowlist param populates `payout_allowlist`; the
         // `Option` discriminant is implied (a configured list is
         // `Some`), mirroring `initialize_pause_authority`.
@@ -20271,6 +20420,384 @@ mod arbiter_rotation_tests {
             [0xf9, 0x51, 0xa1, 0x8c, 0x56, 0x3c, 0x62, 0x44]
         );
     }
+
+    #[test]
+    fn rotate_fee_recipient_instruction_discriminator_is_pinned() {
+        // AV-67. IDL: sha256("global:rotate_fee_recipient")[..8] — the
+        // Anchor instruction discriminator, pinned here and in the
+        // generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("rotate_fee_recipient"),
+            [0xb8, 0x2f, 0x84, 0x95, 0xf2, 0x9e, 0x3f, 0xd8]
+        );
+    }
+}
+
+// ---------- AV-67: fee-recipient rotation (treasury key rollover) ----------
+
+#[cfg(test)]
+mod fee_recipient_rotation_tests {
+    use super::*;
+    use crate::account_space_tests::encode_escrow;
+    use crate::events::{EscrowEventKind, IndexedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const RECIPIENT: [u8; 32] = [0xF0; 32]; // current fee recipient
+    const NEW_RECIPIENT: [u8; 32] = [0xF1; 32]; // replacement fee recipient
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const DAVE: [u8; 32] = [0xD4; 32]; // stranger
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+
+    /// Serialized offset of the fee_recipient region: the `Option`
+    /// discriminant sits at byte 730, the 32-byte key at 731..763 (see
+    /// the fee_recipient layout tests in `account_space_tests`).
+    const FEE_RECIPIENT_DISCRIMINANT_OFFSET: usize = 730;
+    const FEE_RECIPIENT_KEY_OFFSET: usize = 731;
+
+    fn pinned() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_recipient(RECIPIENT)
+            .unwrap()
+    }
+
+    fn pinned_funded() -> Escrow {
+        let mut e = pinned();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    fn pinned_activated() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_recipient(RECIPIENT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Activated);
+        e
+    }
+
+    #[test]
+    fn rotation_preserves_everything_but_fee_recipient() {
+        let mut e = pinned_funded();
+        let before = encode_escrow(&e);
+        e.rotate_fee_recipient(ALICE, BOB, NEW_RECIPIENT).unwrap();
+        assert_eq!(e.fee_recipient(), Some(NEW_RECIPIENT));
+        assert_eq!(e.initializer(), ALICE, "initializer untouched");
+        assert_eq!(e.taker(), BOB, "taker untouched");
+        assert_eq!(e.state(), EscrowState::Funded, "state untouched");
+        assert_eq!(e.amount(), 1_000_000);
+        // Byte-level: only the 32-byte fee_recipient key region (bytes
+        // 731..763) differs — the Some discriminant at 730 and every
+        // other field are bit-identical: an in-place rewrite, no layout
+        // or rent change.
+        let after = encode_escrow(&e);
+        assert_eq!(before.len(), after.len());
+        assert_eq!(
+            after[FEE_RECIPIENT_DISCRIMINANT_OFFSET], 1,
+            "Some discriminant kept"
+        );
+        assert_eq!(
+            &after[FEE_RECIPIENT_KEY_OFFSET..FEE_RECIPIENT_KEY_OFFSET + 32],
+            &NEW_RECIPIENT
+        );
+        assert_eq!(
+            &after[..FEE_RECIPIENT_DISCRIMINANT_OFFSET],
+            &before[..FEE_RECIPIENT_DISCRIMINANT_OFFSET],
+            "all fields before the fee_recipient region bit-identical"
+        );
+        assert_eq!(
+            &after[FEE_RECIPIENT_KEY_OFFSET + 32..],
+            &before[FEE_RECIPIENT_KEY_OFFSET + 32..],
+            "all fields after the fee_recipient region bit-identical"
+        );
+    }
+
+    #[test]
+    fn rotation_succeeds_in_each_allowed_state() {
+        // Uninitialized (pre-fund) rotates fine.
+        let mut e = pinned();
+        e.rotate_fee_recipient(ALICE, BOB, NEW_RECIPIENT).unwrap();
+        assert_eq!(e.fee_recipient(), Some(NEW_RECIPIENT));
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        // Activated (post dual-sig, pre-fund) rotates fine.
+        let mut e = pinned_activated();
+        e.rotate_fee_recipient(ALICE, BOB, NEW_RECIPIENT).unwrap();
+        assert_eq!(e.fee_recipient(), Some(NEW_RECIPIENT));
+        assert_eq!(e.state(), EscrowState::Activated);
+        // Funded rotates fine.
+        let mut e = pinned_funded();
+        e.rotate_fee_recipient(ALICE, BOB, NEW_RECIPIENT).unwrap();
+        assert_eq!(e.fee_recipient(), Some(NEW_RECIPIENT));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn rotation_authority_matrix() {
+        // The initializer alone cannot rotate without the taker.
+        let mut e = pinned_funded();
+        assert_eq!(
+            e.rotate_fee_recipient(ALICE, MALLORY, NEW_RECIPIENT),
+            Err(EscrowError::Unauthorized)
+        );
+        // The taker alone cannot rotate without the initializer.
+        assert_eq!(
+            e.rotate_fee_recipient(MALLORY, BOB, NEW_RECIPIENT),
+            Err(EscrowError::Unauthorized)
+        );
+        // A stranger pair cannot rotate.
+        assert_eq!(
+            e.rotate_fee_recipient(MALLORY, DAVE, NEW_RECIPIENT),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.fee_recipient(),
+            Some(RECIPIENT),
+            "failed calls change nothing"
+        );
+    }
+
+    #[test]
+    fn rotation_allows_self_escrow_single_key() {
+        // Degenerate initializer == taker self-escrow: one key passed
+        // twice authorizes, like AV-12 activation.
+        let mut e = Escrow::initialize(ALICE, ALICE, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_recipient(RECIPIENT)
+            .unwrap();
+        e.rotate_fee_recipient(ALICE, ALICE, NEW_RECIPIENT).unwrap();
+        assert_eq!(e.fee_recipient(), Some(NEW_RECIPIENT));
+    }
+
+    #[test]
+    fn rotation_rejects_zero_new_recipient() {
+        let mut e = pinned_funded();
+        let err = e.rotate_fee_recipient(ALICE, BOB, [0u8; 32]).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidFeeRecipient);
+        assert_eq!(err.code(), 123, "the fee-recipient-config error");
+        assert_eq!(
+            e.fee_recipient(),
+            Some(RECIPIENT),
+            "failed call changes nothing"
+        );
+    }
+
+    #[test]
+    fn rotation_rejects_no_recipient_configured() {
+        // With no fee recipient pinned there is nothing to rotate — the
+        // config error, not a silent initialize.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.fee_recipient(), None);
+        let err = e.rotate_fee_recipient(ALICE, BOB, NEW_RECIPIENT).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidFeeRecipient);
+        assert_eq!(err.code(), 123);
+        assert_eq!(e.fee_recipient(), None, "failed call changes nothing");
+    }
+
+    #[test]
+    fn rotation_state_gates() {
+        // Released: no future fee leg left to redirect.
+        let mut released = pinned_funded();
+        released.release(ALICE, T0, 1_000_000, None, BOB).unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        // Cancelled.
+        let mut cancelled = pinned_funded();
+        cancelled.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(cancelled.state(), EscrowState::Cancelled);
+        // Disputed: arbitration in flight pins the fee leg.
+        let mut disputed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_recipient(RECIPIENT)
+            .unwrap()
+            .with_arbiter(DAVE)
+            .unwrap();
+        disputed.fund(ALICE, T0).unwrap();
+        disputed.escalate(ALICE, T0 + 10, None).unwrap();
+        assert_eq!(disputed.state(), EscrowState::Disputed);
+        // Settled.
+        let mut settled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_recipient(RECIPIENT)
+            .unwrap()
+            .with_arbiter(DAVE)
+            .unwrap();
+        settled.fund(ALICE, T0).unwrap();
+        settled.escalate(ALICE, T0 + 10, None).unwrap();
+        settled.resolve(DAVE, 600_000, None, None, BOB).unwrap();
+        assert_eq!(settled.state(), EscrowState::Settled);
+        // Closed: cancel first (close_vault only accepts post-terminal
+        // states), then close reclaims the vault.
+        let mut closed = pinned_funded();
+        closed.cancel(ALICE, None, ALICE).unwrap();
+        closed.close_vault(ALICE).unwrap();
+        assert_eq!(closed.state(), EscrowState::Closed);
+
+        for (name, e) in [
+            ("Released", &mut released),
+            ("Cancelled", &mut cancelled),
+            ("Disputed", &mut disputed),
+            ("Settled", &mut settled),
+            ("Closed", &mut closed),
+        ] {
+            assert_eq!(
+                e.rotate_fee_recipient(ALICE, BOB, NEW_RECIPIENT),
+                Err(EscrowError::InvalidStateTransition),
+                "{name}: terminal / in-flight states cannot rotate"
+            );
+            assert_eq!(
+                e.fee_recipient(),
+                Some(RECIPIENT),
+                "{name}: recipient unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn rotation_to_current_recipient_is_an_idempotent_noop() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0x1D; 32], T0)
+            .unwrap()
+            .with_fee_recipient(RECIPIENT)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let base = e.events().len();
+        e.rotate_fee_recipient(ALICE, BOB, RECIPIENT, T0).unwrap();
+        assert_eq!(e.events().len(), base, "no-op emits nothing");
+        assert_eq!(e.inner().fee_recipient(), Some(RECIPIENT));
+        // The activation bitmask is untouched — rotation does not
+        // re-gate activation (it tracks only initializer and taker).
+        let bytes_before = encode_escrow(e.inner());
+        e.rotate_fee_recipient(ALICE, BOB, RECIPIENT, T0).unwrap();
+        assert_eq!(encode_escrow(e.inner()), bytes_before, "bit-identical");
+    }
+
+    #[test]
+    fn rotation_blocked_while_paused() {
+        // AV-46: rotation is a config transition, not the pause key-loss
+        // escape hatch — the pause guard fires before governance.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_recipient(RECIPIENT)
+            .unwrap()
+            .with_pause_authority(DAVE)
+            .unwrap();
+        e.pause(DAVE).unwrap();
+        assert_eq!(
+            e.rotate_fee_recipient(ALICE, BOB, NEW_RECIPIENT),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            e.fee_recipient(),
+            Some(RECIPIENT),
+            "paused call changes nothing"
+        );
+        e.unpause(DAVE).unwrap();
+        // Unpaused: rotation works again.
+        e.rotate_fee_recipient(ALICE, BOB, NEW_RECIPIENT).unwrap();
+        assert_eq!(e.fee_recipient(), Some(NEW_RECIPIENT));
+    }
+
+    #[test]
+    fn rotation_emits_fee_recipient_rotated_only_on_change() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0x1D; 32], T0)
+            .unwrap()
+            .with_fee_recipient(RECIPIENT)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let base = e.events().len();
+        e.rotate_fee_recipient(ALICE, BOB, NEW_RECIPIENT, T0 + 2).unwrap();
+        assert_eq!(e.events().len(), base + 1);
+        let ev = e.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::FeeRecipientRotated);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(e.inner().fee_recipient(), Some(NEW_RECIPIENT));
+        // The new event kind is appended after PanelResolved: stable
+        // discriminants for already-serialized histories.
+        assert_eq!(EscrowEventKind::FeeRecipientRotated.discriminant(), 32);
+        assert_eq!(
+            EscrowEventKind::FeeRecipientRotated.name(),
+            "fee_recipient_rotated"
+        );
+    }
+
+    #[test]
+    fn keeper_and_snapshot_follow_the_new_recipient() {
+        // The snapshot export reads the live fee_recipient field, so the
+        // rotation propagates with no extra writes.
+        let mut e = pinned_funded();
+        e.rotate_fee_recipient(ALICE, BOB, NEW_RECIPIENT).unwrap();
+        let snap = e.snapshot(EXPIRES_AT + 1);
+        assert_eq!(snap.fee_recipient, Some(NEW_RECIPIENT));
+        let json = snap.to_json();
+        assert!(
+            json.contains("fee_recipient\":"),
+            "fee_recipient rides the snapshot JSON"
+        );
+        // The fee flow still targets the pinned destination: the
+        // recipient accessor is what the settlement builders pin the
+        // fee leg to.
+        assert_eq!(e.fee_recipient(), Some(NEW_RECIPIENT));
+    }
+
+    #[test]
+    fn rotate_fee_recipient_maps_param_to_fee_recipient_field() {
+        // IDL: rotate_fee_recipient(new_recipient: Pubkey) —
+        // new_recipient <- param; initializer <- accounts.initializer
+        // (signer) AND taker <- accounts.taker (signer), enforced by the
+        // Anchor account constraints, not the state machine. The param
+        // rewrites the vault's fee_recipient field in place (33 bytes,
+        // always present, zeroed when None) — no layout change.
+        let mut e = pinned_funded();
+        e.rotate_fee_recipient(ALICE, BOB, NEW_RECIPIENT).unwrap();
+        assert_eq!(e.fee_recipient(), Some(NEW_RECIPIENT));
+        // Documented failure modes: one party alone is Unauthorized, the
+        // recipient must already be pinned, and the zero address can
+        // never be the fee destination.
+        assert_eq!(
+            e.rotate_fee_recipient(ALICE, MALLORY, DAVE),
+            Err(EscrowError::Unauthorized),
+            "initializer alone cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_fee_recipient(MALLORY, BOB, DAVE),
+            Err(EscrowError::Unauthorized),
+            "taker alone cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_fee_recipient(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::InvalidFeeRecipient)
+        );
+        assert_eq!(e.fee_recipient(), Some(NEW_RECIPIENT), "failed calls change nothing");
+    }
+
+    #[test]
+    fn rotation_does_not_change_the_account_layout() {
+        // No VAULT_FIELDS addition: the fee_recipient field already
+        // exists, so the body/space constants are untouched by AV-67.
+        let recipient_entries: Vec<&&str> = VAULT_FIELDS
+            .iter()
+            .filter(|(name, _, _)| *name == "fee_recipient")
+            .map(|(name, _, _)| name)
+            .collect();
+        assert_eq!(
+            recipient_entries,
+            [&"fee_recipient"],
+            "exactly one fee_recipient field"
+        );
+        let recipient = VAULT_FIELDS
+            .iter()
+            .find(|(name, _, _)| *name == "fee_recipient")
+            .unwrap();
+        assert_eq!(recipient.1, "Option<Pubkey>");
+        assert_eq!(recipient.2, 1 + PUBKEY_LEN, "33 bytes, as before");
+        // The rotation rewrites the 32-byte key region in place: no
+        // field growth, no space change.
+        assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
+    }
 }
 
 // ---------- AV-59: bounded expiry extension ----------
@@ -21874,7 +22401,12 @@ mod event_history_tests {
             31,
             "AV-65: appended after PanelJudgment"
         );
-        for d in 0..=31u8 {
+        assert_eq!(
+            EscrowEventKind::FeeRecipientRotated.discriminant(),
+            32,
+            "AV-67: appended after PanelResolved"
+        );
+        for d in 0..=32u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -21885,7 +22417,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(32), None);
+        assert_eq!(EscrowEventKind::from_discriminant(33), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -22002,9 +22534,10 @@ mod event_history_tests {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         // First slot's kind byte sits at body offset 1024.
         let kind_off = ANCHOR_DISCRIMINATOR_LEN + 1024;
-        // AV-65: discriminants 30/31 are now `PanelJudgment` /
-        // `PanelResolved`; 32 is the first still-unknown byte.
-        for bad in [32u8, 42, 255] {
+        // AV-67: discriminants 30/31 are `PanelJudgment` /
+        // `PanelResolved` and 32 is `FeeRecipientRotated`; 33 is the
+        // first still-unknown byte.
+        for bad in [33u8, 42, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
