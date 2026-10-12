@@ -81,6 +81,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `confirm_milestone(authority, index)`        | `Funded`       | — (no state change) | initializer **or** taker (in order; a milestone is confirmed once *both* parties confirmed) |
 | `release_milestone(authority, now, index)`        | `Funded`       | `Funded` (partial) / `Released` (final tranche) | initializer; milestone dual-confirmed (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise) |
 | `skip_milestone(authority, index)`           | `Funded`       | — (no state change) | initializer **or** taker, **both** must approve (dual-sig skip; skipped tranche refunded to the initializer) |
+| `adjust_milestone_amounts(initializer, taker, new_amounts)` (AV-70) | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the tranche table) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition`; rejected once any tranche settled (`released > 0` or `skipped > 0`); new amounts must have the plan's tranche count, be all positive, and sum to exactly the locked amount; per-tranche confirmations survive (they accept the deliverable, not the amount); protocol fees charge on the new amounts at release time (still floored by `fee_cap`); emits `MilestonesAdjusted` only on an actual change |
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
 | `initialize_protocol_fee(fee_bps)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `fee_bps` in 0–10000 basis points; the fee slices every taker payout into net payout + protocol fee; the AV-63 fee cap can floor it per payout) |
 | `initialize_fee_cap(max_fee_cents)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; absolute per-payout fee ceiling in lamports — the effective fee is `min(bps fee, fee_cap)`; `0` means uncapped; no new error code) |
@@ -621,6 +622,27 @@ and `resolve` overrides the plan by design (unsettled tranches are part
 of the split remainder), like it overrides vesting. Confirmation progress
 is persisted in a 6-bits-per-milestone bitmap in the vault account (see
 the layout table), so it survives serialization.
+
+**Milestone tranche re-split (AV-70).** Before any settlement, the
+initializer and taker may jointly re-balance the tranche amounts via
+`adjust_milestone_amounts(initializer, taker, new_amounts)` — e.g.
+front-load a deliverable that grew, or back-load one that shrank —
+without cancelling and re-creating the escrow (which would strand
+quorum votes, attestations, and activation state). Both parties must
+sign (dual-signature governance, one party alone is `Unauthorized`);
+`Uninitialized`, `Activated`, or `Funded` only — the terminal states
+and `Disputed` (arbitration in flight) are `InvalidStateTransition`.
+Once any tranche settled (`released > 0` or `skipped > 0`) the amounts
+on chain are already partially consumed and the re-split is rejected.
+The new amounts must have exactly the plan's tranche count (re-split,
+not restructure), be all positive, and sum to *exactly* the locked
+amount (accumulated in `u128`, like `with_milestones`). The rewrite is
+in place — no account realloc, no rent change. Per-tranche
+confirmations / skip approvals survive (they accept the deliverable,
+not the amount, and the adjustment itself carries both signatures).
+Protocol fees charge on the new amounts at release time via
+`protocol_fee_for` (still floored by `fee_cap`), and the indexer sees
+one `MilestonesAdjusted` event on an actual change.
 
 **SPL token mint binding (token-scoped escrows).** An escrow can bind one
 SPL token mint at creation (`initialize_mint(mint)`, opt-in on
@@ -1289,7 +1311,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |

@@ -6071,6 +6071,96 @@ impl Escrow {
             | Self::milestone_bit(index, MILESTONE_SKIPPED_BIT);
         self.milestone_flags & mask != 0
     }
+    /// Re-split the milestone tranche amounts by dual-signed governance
+    /// (AV-70 — Solana milestone payments / payment fintech): the
+    /// initializer and the taker may jointly re-balance the tranche
+    /// amounts (a deliverable that grew can be front-loaded, a shrunk
+    /// one back-loaded) before any settlement happens.
+    ///
+    /// Check order is deliberate — pause, then dual authority, then
+    /// state, then plan configuration, then settlement phase, then the
+    /// new amounts — mirroring [`Escrow::update_quorum`]:
+    /// 1. `Paused` while paused (AV-46) — re-splitting is a config
+    ///    transition, not the pause key-loss escape hatch;
+    /// 2. both parties must sign: one party alone or a stranger pair
+    ///    is `Unauthorized` (independent `==` checks — the degenerate
+    ///    initializer == taker self-escrow authorizes with one key
+    ///    passed twice, like AV-12's activation);
+    /// 3. `Uninitialized`, `Activated` or `Funded` only: the terminal
+    ///    states have no live tranches left to re-split, and
+    ///    `Disputed` is `InvalidStateTransition` (arbitration is in
+    ///    flight, and the tranches are part of what
+    ///    [`Escrow::resolve`] adjudicates);
+    /// 4. a milestone plan must be attached (`InvalidMilestones`
+    ///    otherwise);
+    /// 5. once any tranche settled (`released > 0` or `skipped > 0`)
+    ///    the amounts on chain are already partially consumed and
+    ///    cannot be re-split (`InvalidStateTransition`);
+    /// 6. the new amounts re-split, not restructure: exactly the
+    ///    plan's tranche count, every amount positive, and the exact
+    ///    `u128` sum must equal the locked amount (`InvalidMilestones`
+    ///    otherwise — the plan stays the *complete* release schedule,
+    ///    paralleling [`Escrow::with_milestones`]).
+    ///
+    /// The rewrite is in place — `VAULT_FIELDS` is untouched (the
+    /// tranche table is already reserved), so no account realloc and no
+    /// rent change. Per-tranche confirmations / skip approvals survive:
+    /// they record acceptance of the *deliverable*, not the amount, and
+    /// the adjustment itself carries both parties' signatures.
+    /// Protocol fees (AV-17/AV-63/AV-66) are computed at release time
+    /// from the live plan via [`Escrow::protocol_fee_for`], so later
+    /// tranche releases are automatically fee'd on the new amounts
+    /// (still floored by `fee_cap`).
+    pub fn adjust_milestone_amounts(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_amounts: &[u64],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the initializer and the
+        // taker must authorize the re-split — one party alone cannot
+        // reshape the payment schedule, paralleling `update_quorum`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Activated | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let plan_count = self
+            .milestones
+            .ok_or(EscrowError::InvalidMilestones)?
+            .count as usize;
+        // The plan owns the release schedule: once any tranche settled
+        // — released to the taker or skipped back to the initializer's
+        // refund — the amounts on chain are partially consumed and can
+        // no longer be re-split.
+        if self.released > 0 || self.skipped > 0 {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        if new_amounts.len() != plan_count {
+            return Err(EscrowError::InvalidMilestones);
+        }
+        let mut total: u128 = 0;
+        for &amount in new_amounts {
+            // A tranche that releases nothing is a config error, like
+            // `MilestonePlan::new`.
+            if amount == 0 {
+                return Err(EscrowError::InvalidMilestones);
+            }
+            total += amount as u128;
+        }
+        if total != self.amount as u128 {
+            return Err(EscrowError::InvalidMilestones);
+        }
+        let plan = self.milestones.as_mut().expect("plan checked above");
+        for (i, &amount) in new_amounts.iter().enumerate() {
+            plan.amounts[i] = amount;
+        }
+        Ok(())
+    }
     /// True when both parties confirmed milestone `index` for the release
     /// path (see [`Escrow::confirm_milestone`]). Out-of-range indices
     /// report `false`.
@@ -9248,6 +9338,37 @@ pub(crate) mod anchor_idl_tests {
                             skip); strictly in-order, idempotent per party",
         },
         InstructionSpec {
+            // AV-70: milestone tranche re-split by dual-signed
+            // governance (before any settlement).
+            name: "adjust_milestone_amounts",
+            params: &[(
+                "new_amounts",
+                "Vec<u64>",
+                "instruction param; the replacement tranche amounts in \
+                 release order — must have exactly the plan's tranche \
+                 count, every amount positive, and the exact u128 sum \
+                 must equal the locked amount; amounts are re-split, \
+                 not restructured",
+            )],
+            method: "Escrow::adjust_milestone_amounts",
+            input_mapping: "initializer <- accounts.initializer (signer) \
+                            AND taker <- accounts.taker (signer) — both \
+                            parties must sign, one alone (or a stranger \
+                            pair) is Unauthorized; the degenerate \
+                            initializer == taker self-escrow authorizes \
+                            with one key passed twice, like AV-12 \
+                            activation; Uninitialized / Activated / \
+                            Funded only (terminal states / Disputed are \
+                            InvalidStateTransition); new_amounts <- \
+                            param; rejected once any tranche settled \
+                            (released > 0 or skipped > 0, \
+                            InvalidStateTransition); rewrites the \
+                            milestone amount table in place — no layout \
+                            / rent change; protocol fees charge on the \
+                            new amounts at release time via \
+                            protocol_fee_for (still floored by fee_cap)",
+        },
+        InstructionSpec {
             // AV-16: SPL token mint binding.
             name: "initialize_mint",
             params: &[(
@@ -10339,6 +10460,9 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::confirm_milestone",
             "Escrow::release_milestone",
             "Escrow::skip_milestone",
+            // AV-70: milestone tranche re-split by dual-signed
+            // governance (before any settlement).
+            "Escrow::adjust_milestone_amounts",
             "Escrow::with_mint",
             "Escrow::with_protocol_fee",
             "Escrow::with_grace_period",
@@ -10409,7 +10533,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_forty_four_instructions_take_params() {
+    fn only_forty_five_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -10435,6 +10559,7 @@ pub(crate) mod anchor_idl_tests {
                 &"confirm_milestone",
                 &"release_milestone",
                 &"skip_milestone",
+                &"adjust_milestone_amounts",
                 &"initialize_mint",
                 &"initialize_protocol_fee",
                 &"initialize_grace_period",
@@ -11654,6 +11779,52 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn adjust_milestone_amounts_maps_param_to_plan_amounts() {
+        // IDL: adjust_milestone_amounts(new_amounts: Vec<u64>) —
+        // initializer <- accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer); the param rewrites the plan's amount
+        // table in place (see PARAM_FIELD_MAP) — no layout change.
+        let mut e = milestone_escrow();
+        e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 500_000])
+            .unwrap();
+        let plan = e.milestone_plan().unwrap();
+        assert_eq!(plan.amount_at(0), Some(500_000));
+        assert_eq!(plan.amount_at(1), Some(500_000));
+        assert_eq!(plan.total(), 1_000_000, "sum still covers the lockup");
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+        // The release schedule follows the new amounts: confirm both
+        // tranches and release the first one at the new size.
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        let (payout, _fee) = e
+            .release_milestone(ALICE, EXPIRES_AT - 3_600, 0, None, BOB)
+            .unwrap();
+        assert_eq!(payout, 500_000, "released at the adjusted amount");
+        // Documented failure modes: one party alone is Unauthorized,
+        // and re-splitting after settlement started is rejected.
+        let mut e = milestone_escrow();
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, MALLORY, &[500_000, 500_000]),
+            Err(EscrowError::Unauthorized)
+        );
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        e.release_milestone(ALICE, EXPIRES_AT - 3_600, 0, None, BOB)
+            .unwrap();
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 500_000]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        let plan = e.milestone_plan().unwrap();
+        assert_eq!(
+            plan.amount_at(0),
+            Some(400_000),
+            "failed call changes nothing"
+        );
+    }
+
+    #[test]
     fn initialize_dual_sig_maps_initializer_signer_to_requirement() {
         // IDL: initialize_dual_sig() — no params; authority <-
         // accounts.initializer (signer), enforced by the Anchor account
@@ -11971,6 +12142,11 @@ pub(crate) mod anchor_idl_tests {
         // is derived (see FIELD_SOURCES). The plan region is zeroed by
         // `initialize`.
         ("initialize_milestones", "milestones", "milestones.amounts"),
+        // AV-70: the dual-signed governance adjustment rewrites the same
+        // amount table in place — a second param source for
+        // `milestones.amounts` (params xor one field source allows
+        // several params, like `released`'s two release paths).
+        ("adjust_milestone_amounts", "new_amounts", "milestones.amounts"),
         // AV-15: the index selects the milestone whose confirmation bits
         // (or skip-approval bits) are flipped in the bitmap; the bitmap
         // itself is zeroed by `initialize`.
@@ -17043,6 +17219,286 @@ mod combination_matrix_tests {
     }
 }
 
+// ---------- AV-70: milestone amount re-split tests ----------
+//
+// `adjust_milestone_amounts` lets the initializer and taker jointly
+// re-balance the tranche amounts before any settlement. These tests pin
+// the dual-signature gate, the state guards, the sum/count/positivity
+// validation, the in-place rewrite (no layout change), the fee
+// recalculation on the new amounts, and the no-op/no-event semantics.
+#[cfg(test)]
+mod adjust_milestone_amounts_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn plan_3() -> MilestonePlan {
+        MilestonePlan::new(&[300_000, 300_000, 400_000]).unwrap()
+    }
+
+    fn funded_3() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_3())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    fn amounts_of(e: &Escrow) -> Vec<u64> {
+        let p = e.milestone_plan().unwrap();
+        (0..p.count()).map(|i| p.amount_at(i as usize).unwrap()).collect()
+    }
+
+    #[test]
+    fn dual_signed_resplit_rewrites_amounts_in_place() {
+        let mut e = funded_3();
+        e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 250_000, 250_000])
+            .unwrap();
+        assert_eq!(amounts_of(&e), vec![500_000, 250_000, 250_000]);
+        assert_eq!(e.amount(), 1_000_000, "lockup unchanged");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.skipped_amount(), 0);
+    }
+
+    #[test]
+    fn resplit_allowed_before_funding() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_3())
+            .unwrap();
+        e.adjust_milestone_amounts(ALICE, BOB, &[200_000, 300_000, 500_000])
+            .unwrap();
+        assert_eq!(amounts_of(&e), vec![200_000, 300_000, 500_000]);
+        // Funding and the release sequence follow the new plan.
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        let (payout, _) = e
+            .release_milestone(ALICE, EXPIRES_AT - 3_600, 0, None, BOB)
+            .unwrap();
+        assert_eq!(payout, 200_000);
+    }
+
+    #[test]
+    fn confirmations_survive_the_resplit() {
+        // Confirmations record acceptance of the deliverable, not the
+        // amount — the adjustment itself carries both signatures, so
+        // the per-tranche acceptance bits are untouched.
+        let mut e = funded_3();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 250_000, 250_000])
+            .unwrap();
+        assert!(e.milestone_confirmed(0), "confirmation preserved");
+        let (payout, _) = e
+            .release_milestone(ALICE, EXPIRES_AT - 3_600, 0, None, BOB)
+            .unwrap();
+        assert_eq!(payout, 500_000, "released at the new amount");
+    }
+
+    #[test]
+    fn single_party_or_stranger_is_unauthorized() {
+        let mut e = funded_3();
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, MALLORY, &[500_000, 250_000, 250_000]),
+            Err(EscrowError::Unauthorized),
+            "taker alone cannot re-split"
+        );
+        assert_eq!(
+            e.adjust_milestone_amounts(MALLORY, BOB, &[500_000, 250_000, 250_000]),
+            Err(EscrowError::Unauthorized),
+            "initializer alone cannot re-split"
+        );
+        assert_eq!(
+            e.adjust_milestone_amounts(MALLORY, [0xD0; 32], &[500_000, 250_000, 250_000]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            amounts_of(&e),
+            vec![300_000, 300_000, 400_000],
+            "failed calls change nothing"
+        );
+    }
+
+    #[test]
+    fn self_escrow_authorizes_with_one_key_passed_twice() {
+        let mut e = Escrow::initialize(ALICE, ALICE, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_3())
+            .unwrap();
+        e.adjust_milestone_amounts(ALICE, ALICE, &[500_000, 250_000, 250_000])
+            .unwrap();
+        assert_eq!(amounts_of(&e), vec![500_000, 250_000, 250_000]);
+    }
+
+    #[test]
+    fn rejected_once_any_tranche_settled() {
+        // Released tranche.
+        let mut e = funded_3();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        e.release_milestone(ALICE, EXPIRES_AT - 3_600, 0, None, BOB)
+            .unwrap();
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 250_000, 250_000]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Skipped tranche (dual-approved skip joins the refundable
+        // remainder — also partially consumed).
+        let mut e = funded_3();
+        e.skip_milestone(ALICE, 0).unwrap();
+        e.skip_milestone(BOB, 0).unwrap();
+        assert!(e.milestone_settled(0));
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 250_000, 250_000]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(amounts_of(&e), vec![300_000, 300_000, 400_000]);
+    }
+
+    #[test]
+    fn rejected_in_terminal_and_disputed_states() {
+        // Released: all tranches out.
+        let mut e = funded_3();
+        for i in 0..3u8 {
+            e.confirm_milestone(ALICE, i).unwrap();
+            e.confirm_milestone(BOB, i).unwrap();
+            e.release_milestone(ALICE, EXPIRES_AT - 3_600, i, None, BOB)
+                .unwrap();
+        }
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 250_000, 250_000]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Cancelled.
+        let mut e = funded_3();
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 250_000, 250_000]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: arbitration is in flight; the tranches are part of
+        // what resolve adjudicates.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_3())
+            .unwrap()
+            .with_arbiter([0xA4; 32])
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1_800, None).unwrap();
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 250_000, 250_000]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn bad_amount_shapes_are_invalid_milestones() {
+        let mut e = funded_3();
+        // Sum mismatch.
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 250_000, 200_000]),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // Zero tranche.
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 500_000, 0]),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // Tranche count change (restructure, not re-split).
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 500_000]),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, BOB, &[250_000, 250_000, 250_000, 250_000]),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // u128 sum can never wrap into a false total: two near-MAX
+        // tranches sum past u64::MAX and are rejected, not aliased.
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, BOB, &[u64::MAX, u64::MAX, 1_000_000]),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(
+            amounts_of(&e),
+            vec![300_000, 300_000, 400_000],
+            "failed validations change nothing"
+        );
+    }
+
+    #[test]
+    fn no_plan_is_invalid_milestones() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 500_000]),
+            Err(EscrowError::InvalidMilestones)
+        );
+    }
+
+    #[test]
+    fn paused_escrow_fails_fast() {
+        // `with_pause_authority` is Uninitialized-only: attach before
+        // funding, then pause.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_milestones(plan_3())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.pause(ALICE).unwrap();
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 250_000, 250_000]),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(amounts_of(&e), vec![300_000, 300_000, 400_000]);
+    }
+
+    #[test]
+    fn fees_charge_on_new_amounts_at_release() {
+        // AV-17/AV-63: protocol_fee_for reads the live plan, so a
+        // re-split automatically re-prices later tranche fees (still
+        // floored by fee_cap).
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_3())
+            .unwrap()
+            .with_protocol_fee(500) // 5%
+            .unwrap()
+            .with_fee_cap(10_000)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 250_000, 250_000])
+            .unwrap();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        let (payout, fee) = e
+            .release_milestone(ALICE, EXPIRES_AT - 3_600, 0, None, BOB)
+            .unwrap();
+        // 5% of 500_000 = 25_000, floored by fee_cap 10_000.
+        assert_eq!(fee, 10_000);
+        assert_eq!(payout, 490_000);
+        assert_eq!(e.fees_paid(), 10_000);
+    }
+
+    #[test]
+    fn noop_reaffirmation_succeeds_without_changing_state() {
+        let mut e = funded_3();
+        e.adjust_milestone_amounts(ALICE, BOB, &[300_000, 300_000, 400_000])
+            .unwrap();
+        assert_eq!(amounts_of(&e), vec![300_000, 300_000, 400_000]);
+    }
+}
+
 // ---------- AV-21: expiry grace period tests ----------
 //
 // `cancel_expired` requires `now >= expires_at + grace_period`
@@ -21392,6 +21848,17 @@ mod arbiter_rotation_tests {
             [0xb8, 0x2f, 0x84, 0x95, 0xf2, 0x9e, 0x3f, 0xd8]
         );
     }
+
+    #[test]
+    fn adjust_milestone_amounts_instruction_discriminator_is_pinned() {
+        // AV-70. IDL: sha256("global:adjust_milestone_amounts")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("adjust_milestone_amounts"),
+            [240, 224, 99, 74, 41, 45, 129, 178]
+        );
+    }
 }
 
 // ---------- AV-67: fee-recipient rotation (treasury key rollover) ----------
@@ -23377,7 +23844,12 @@ mod event_history_tests {
             34,
             "AV-69: appended after EvidenceSubmitted"
         );
-        for d in 0..=34u8 {
+        assert_eq!(
+            EscrowEventKind::MilestonesAdjusted.discriminant(),
+            35,
+            "AV-70: appended after PanelThresholdChanged"
+        );
+        for d in 0..=35u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -23388,7 +23860,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(35), None);
+        assert_eq!(EscrowEventKind::from_discriminant(36), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -23507,9 +23979,10 @@ mod event_history_tests {
         let kind_off = ANCHOR_DISCRIMINATOR_LEN + 1024;
         // AV-69: discriminants 30/31 are `PanelJudgment` /
         // `PanelResolved`, 32 is `FeeRecipientRotated`, 33 is
-        // `EvidenceSubmitted` and 34 is `PanelThresholdChanged`; 35 is
-        // the first still-unknown byte.
-        for bad in [35u8, 42, 255] {
+        // `EvidenceSubmitted`, 34 is `PanelThresholdChanged`, and 35 is
+        // `MilestonesAdjusted` (AV-70); 36 is the first still-unknown
+        // byte.
+        for bad in [36u8, 42, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

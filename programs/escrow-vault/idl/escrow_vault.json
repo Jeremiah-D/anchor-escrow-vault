@@ -179,6 +179,14 @@
       ]
     },
     {
+      "name": "adjust_milestone_amounts",
+      "discriminator": [240, 224, 99, 74, 41, 45, 129, 178],
+      "accounts": [],
+      "args": [
+        {"name": "new_amounts", "type": {"vec": "u64"}}
+      ]
+    },
+    {
       "name": "initialize_mint",
       "discriminator": [209, 42, 195, 4, 129, 85, 209, 44],
       "accounts": [],

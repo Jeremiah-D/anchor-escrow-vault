@@ -95,6 +95,13 @@
 //!   for the indexer — the exact mirror of a partial `Released` event.
 //!   `amounts.refund` carries the partially-cancelled amount; the
 //!   `released` counter is untouched.
+//! - `adjust_milestone_amounts` emits
+//!   [`EscrowEventKind::MilestonesAdjusted`] when the tranche amounts
+//!   actually change (AV-70) — `from == to ==` the current state (a
+//!   config change, not a lifecycle move, like `QuorumUpdated`), all
+//!   amounts zero; a no-op re-affirmation emits nothing. The event is
+//!   the ordering signal that the schedule moved, and the indexer
+//!   reads the new tranche amounts from the vault.
 //! - Partial `release` / `claim` calls emit [`EscrowEventKind::Released`]
 //!   / [`EscrowEventKind::Claimed`] with `from == to == Funded`: the
 //!   `EscrowState` variant does not change, but funds moved and the
@@ -143,7 +150,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-70) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | PartiallyCancelled (AV-60) | 0 | 0 | the partially-cancelled tranche, refunded to the whitelisted destination (the escrow stays `Funded`; the `released` counter is untouched) | 0 |
@@ -386,6 +393,18 @@ pub enum EscrowEventKind {
     /// rule). Cast votes are untouched by the retune — the panel's
     /// judgment history is append-only.
     PanelThresholdChanged,
+    /// AV-70: the milestone tranche amounts were re-split by
+    /// dual-signed governance
+    /// ([`Escrow::adjust_milestone_amounts`]). `from == to ==` the
+    /// current state (a config change, not a lifecycle move — like
+    /// [`EscrowEventKind::QuorumUpdated`]); the new amounts are read
+    /// from the vault, the event is the ordering signal. Emitted only
+    /// on an actual change: re-affirming the current amounts is an
+    /// idempotent no-op that emits nothing (paralleling
+    /// [`EscrowEventKind::FeeRecipientRotated`]'s no-op rule). All
+    /// amounts are zero — re-splitting moves no funds (the later
+    /// tranche releases carry the new amounts with their fees).
+    MilestonesAdjusted,
 }
 
 impl EscrowEventKind {
@@ -449,6 +468,10 @@ impl EscrowEventKind {
             // AV-69: appended after EvidenceSubmitted so discriminants
             // 0–33 stay stable for already-serialized histories.
             34 => Self::PanelThresholdChanged,
+            // AV-70: appended after PanelThresholdChanged so
+            // discriminants 0–34 stay stable for already-serialized
+            // histories.
+            35 => Self::MilestonesAdjusted,
             _ => return None,
         })
     }
@@ -492,6 +515,7 @@ impl EscrowEventKind {
             Self::FeeRecipientRotated => "fee_recipient_rotated",
             Self::EvidenceSubmitted => "evidence_submitted",
             Self::PanelThresholdChanged => "panel_threshold_changed",
+            Self::MilestonesAdjusted => "milestones_adjusted",
         }
     }
 }
@@ -2119,6 +2143,50 @@ impl IndexedEscrow {
         if threshold_before != threshold_after {
             self.push_event(
                 EscrowEventKind::PanelThresholdChanged,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// Re-split the milestone tranche amounts by dual-signed governance
+    /// (mirrors [`Escrow::adjust_milestone_amounts`]). Emits
+    /// `MilestonesAdjusted` when the amounts actually change (`from ==
+    /// to ==` the current state — the schedule, not the lifecycle
+    /// state, is what changed); a no-op re-affirmation emits nothing,
+    /// paralleling [`Escrow::update_quorum`]'s no-op rule. `at` is the
+    /// caller-supplied timestamp (on-chain: the clock sysvar).
+    pub fn adjust_milestone_amounts(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_amounts: &[u64],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let before: Vec<u64> = self
+            .inner
+            .milestone_plan()
+            .map(|p| (0..p.count()).map(|i| p.amount_at(i as usize).unwrap_or(0)).collect())
+            .unwrap_or_default();
+        self.inner
+            .adjust_milestone_amounts(initializer, taker, new_amounts)?;
+        let after: Vec<u64> = self
+            .inner
+            .milestone_plan()
+            .map(|p| (0..p.count()).map(|i| p.amount_at(i as usize).unwrap_or(0)).collect())
+            .unwrap_or_default();
+        if after != before {
+            self.push_event(
+                EscrowEventKind::MilestonesAdjusted,
                 from,
                 self.inner.state(),
                 EventAmounts::none(),
@@ -3924,6 +3992,56 @@ mod event_tests {
         assert_eq!(kind.discriminant(), 34);
         assert_eq!(EscrowEventKind::from_discriminant(34), Some(kind));
         assert_eq!(kind.name(), "panel_threshold_changed");
+    }
+
+    #[test]
+    fn milestones_adjusted_kind_round_trips() {
+        // discriminant 35: appended after PanelThresholdChanged, 0–34
+        // stable for already-serialized histories.
+        let kind = EscrowEventKind::MilestonesAdjusted;
+        assert_eq!(kind.discriminant(), 35);
+        assert_eq!(EscrowEventKind::from_discriminant(35), Some(kind));
+        assert_eq!(kind.name(), "milestones_adjusted");
+    }
+
+    #[test]
+    fn milestones_adjusted_emits_event_on_change() {
+        let mut e = milestone_indexed();
+        let before = e.event_count();
+        e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 500_000], T0 + 1)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "one event on change");
+        let ev = e.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::MilestonesAdjusted);
+        assert_eq!(ev.from, EscrowState::Uninitialized);
+        assert_eq!(ev.to, EscrowState::Uninitialized);
+        assert_eq!(ev.amounts, EventAmounts::none(), "moves no funds");
+        // The new amounts are read from the vault: the event is the
+        // ordering signal.
+        let plan = e.inner().milestone_plan().unwrap();
+        assert_eq!(plan.amount_at(0), Some(500_000));
+        assert_eq!(plan.amount_at(1), Some(500_000));
+    }
+
+    #[test]
+    fn milestones_adjusted_no_op_emits_nothing() {
+        let mut e = milestone_indexed();
+        let before = e.event_count();
+        e.adjust_milestone_amounts(ALICE, BOB, &[400_000, 600_000], T0 + 1)
+            .unwrap();
+        assert_eq!(e.event_count(), before, "no-op re-affirmation emits nothing");
+    }
+
+    #[test]
+    fn milestones_adjusted_unauthorized_emits_nothing() {
+        let mut e = milestone_indexed();
+        let before = e.event_count();
+        assert_eq!(
+            e.adjust_milestone_amounts(ALICE, MALLORY, &[500_000, 500_000], T0 + 1)
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(e.event_count(), before, "failed call emits nothing");
     }
 
 }

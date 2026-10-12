@@ -2152,6 +2152,72 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Re-split the milestone tranche amounts by dual-signed governance
+    /// (AV-70; mirrors `Escrow::adjust_milestone_amounts`). Both the
+    /// *current* initializer and the *current* taker must sign — one
+    /// party alone (or a stranger pair) is `Unauthorized`; the
+    /// degenerate initializer == taker self-escrow authorizes with one
+    /// key passed twice, like AV-12 activation. Only `Uninitialized` /
+    /// `Activated` / `Funded`: the terminal states have no live
+    /// tranches left to re-split, and `Disputed` is
+    /// `InvalidStateTransition` (arbitration in flight adjudicates the
+    /// tranches). Once any tranche settled (`released > 0` or
+    /// `skipped > 0`) the re-split is rejected — the amounts on chain
+    /// are already partially consumed. The new amounts must have
+    /// exactly the plan's tranche count, be all positive, and sum to
+    /// exactly the locked amount (`InvalidMilestones` otherwise). A
+    /// paused escrow fails fast (`Paused`). The rewrite is in place
+    /// (the tranche table is always reserved) — no realloc, no rent
+    /// change. Protocol fees charge on the new amounts at release time
+    /// via `protocol_fee_for` (still floored by `fee_cap`). Emits
+    /// `MilestonesAdjusted` only on an actual change (a no-op
+    /// re-affirmation emits nothing), mirroring
+    /// `IndexedEscrow::adjust_milestone_amounts`.
+    pub fn adjust_milestone_amounts(
+        ctx: Context<AdjustMilestoneAmounts>,
+        new_amounts: Vec<u64>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before: Vec<u64> = escrow
+            .milestone_plan()
+            .map(|p| (0..p.count()).map(|i| p.amount_at(i as usize).unwrap_or(0)).collect())
+            .unwrap_or_default();
+        escrow
+            .adjust_milestone_amounts(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &new_amounts,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `vault.milestones.amounts` table in place (the
+        // 8-slot region is always reserved, zeroed when no plan) — no
+        // realloc, no rent change.
+        let after: Vec<u64> = escrow
+            .milestone_plan()
+            .map(|p| (0..p.count()).map(|i| p.amount_at(i as usize).unwrap_or(0)).collect())
+            .unwrap_or_default();
+        if after != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::MilestonesAdjusted,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Opt in to bounded expiry extension at setup time (AV-59;
     /// mirrors `Escrow::with_max_extension_secs`). `Uninitialized`
     /// only — the extension policy is fixed before any funds move. A
@@ -3181,6 +3247,12 @@ pub enum EscrowVaultEventKind {
     /// change. Mirrors
     /// `escrow_state::EscrowEventKind::PanelThresholdChanged`.
     PanelThresholdChanged,
+    /// AV-70: the milestone tranche amounts were re-split by
+    /// dual-signed governance (`Escrow::adjust_milestone_amounts`).
+    /// `from == to ==` the current state; emitted only on an actual
+    /// change. Mirrors
+    /// `escrow_state::EscrowEventKind::MilestonesAdjusted`.
+    MilestonesAdjusted,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -3252,6 +3324,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::PanelThresholdChanged => {
             EscrowVaultEventKind::PanelThresholdChanged
+        }
+        escrow_state::EscrowEventKind::MilestonesAdjusted => {
+            EscrowVaultEventKind::MilestonesAdjusted
         }
     }
 }
@@ -3945,6 +4020,23 @@ pub struct RotateFeeRecipient<'info> {
     /// taker. The fee recipient itself does not sign: rotation is the
     /// two parties' governance, not a treasury power — a lost
     /// fee-recipient key must not block its own replacement.
+    pub taker: Signer<'info>,
+}
+
+#[derive(Accounts)]
+/// AV-70: accounts for `adjust_milestone_amounts` — the dual-signed
+/// milestone tranche re-split.
+pub struct AdjustMilestoneAmounts<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's *current*
+    /// initializer. Both parties must sign — one alone (or a stranger
+    /// pair) is `Unauthorized`; the degenerate initializer == taker
+    /// self-escrow authorizes with one key passed twice, like AV-12
+    /// activation.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's *current*
+    /// taker.
     pub taker: Signer<'info>,
 }
 
