@@ -204,6 +204,9 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         // AV-66: the tiered fee schedule's tier ladder instruction arg.
         "Vec<FeeTier>" => IdlType::Vec(Box::new(IdlType::Named("FeeTier"))),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
+        // AV-68: the dispute-evidence disclosure commitment
+        // (non-optional — disclosure always carries a hash).
+        "[u8; 32]" => IdlType::Array(ArrayElem::U8, 32),
         other => panic!("idl_json: unmapped instruction arg type string: {other}"),
     }
 }
@@ -759,7 +762,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 38, "error variant count drift");
+    assert_eq!(errors.len(), 40, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -780,6 +783,9 @@ fn idl_errors_pin_enum() {
     // AV-65: the new codes extend the table — never renumbered.
     assert_eq!(EscrowError::InvalidArbiterPanel.code(), 136);
     assert_eq!(EscrowError::PanelResolveDisabled.code(), 137);
+    // AV-68: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidEvidenceDeadline.code(), 138);
+    assert_eq!(EscrowError::EvidenceDisclosureLate.code(), 139);
 }
 
 #[test]

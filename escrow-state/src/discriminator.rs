@@ -633,6 +633,18 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         tier_count,
         tiers: fee_tiers,
     };
+    // AV-68: the dispute-evidence disclosure deadline in seconds,
+    // always present (zeroed when no deadline is configured), and the
+    // escalating party, always reserved like `evidence_hash`: the
+    // `None` discriminant followed by a zeroed 32-byte key. Appended
+    // last so every earlier offset above is unchanged.
+    let evidence_deadline_secs = c.u64_le()?;
+    let escalated_by = if c.option_present("escalated_by")? {
+        Some(c.pubkey()?)
+    } else {
+        c.skip(32)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -726,6 +738,14 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // recorded, so the fee charged on-chain after a decode matches
         // the fee charged before serialization.
         fee_schedule,
+        // AV-68: the dispute-evidence disclosure deadline and the
+        // escalating party are persisted — a decoded escrow carries the
+        // same deadline the setup recorded and the same escalator
+        // `escalate` recorded, so the disclosure gate and the
+        // judgment-time adverse inference decide identically after a
+        // decode.
+        evidence_deadline_secs,
+        escalated_by,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

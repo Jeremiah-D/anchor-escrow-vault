@@ -700,6 +700,26 @@ pub struct Escrow {
     /// so the tiers survive serialization. Appended last, so every
     /// earlier field offset stays stable.
     fee_schedule: FeeSchedule,
+    /// AV-68: dispute-evidence disclosure deadline in seconds (see
+    /// [`Escrow::with_evidence_deadline`]). `0` (the default) means no
+    /// deadline — backward compatible: the escalating party may attach
+    /// or supplement evidence at any time while `Disputed`. Set once
+    /// via [`Escrow::with_evidence_deadline`] on an `Uninitialized`
+    /// escrow, like the other `with_*` builders. Persisted (8 bytes in
+    /// the vault account) so the deadline survives serialization.
+    /// Appended last so every earlier field offset stays stable.
+    evidence_deadline_secs: u64,
+    /// AV-68: which party escalated into `Disputed` (see
+    /// [`Escrow::escalate`]) — the party the evidence-disclosure
+    /// deadline binds. `None` (the default) means the escrow was never
+    /// disputed. Recorded by [`Escrow::escalate`] and never cleared, so
+    /// the settlement keeps the audit trail of whose evidence the
+    /// deadline applied to — the adverse-inference bias at judgment
+    /// time favors the *other* party (see
+    /// [`Escrow::evidence_defaulted`]). Persisted (33 bytes in the
+    /// vault account). Appended last so every earlier field offset
+    /// stays stable.
+    escalated_by: Option<[u8; 32]>,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -1017,6 +1037,22 @@ pub enum EscrowError {
     /// arbiter, last-wins); the AV-55 default-judgment fallback is
     /// retained and still triggerable.
     PanelResolveDisabled,
+    /// Evidence-disclosure deadline misconfiguration (AV-68):
+    /// [`Escrow::with_evidence_deadline`] with a zero deadline — a
+    /// deadline of zero seconds would lapse the moment the dispute
+    /// starts, giving the escalating party no window to disclose, so
+    /// the builder rejects it. Parallels
+    /// [`EscrowError::DefaultJudgmentNotDue`]'s zero-deadline
+    /// rejection (config error).
+    InvalidEvidenceDeadline,
+    /// Evidence disclosure arrived too late (AV-68):
+    /// [`Escrow::submit_evidence`] called at or past the disclosure
+    /// deadline ([`Escrow::evidence_due_at`]) without evidence on
+    /// record — the deadline is a hard procedural bar, so a missed
+    /// deadline locks in the adverse inference at judgment time (see
+    /// [`Escrow::evidence_defaulted`]) instead of accepting a late
+    /// disclosure.
+    EvidenceDisclosureLate,
 }
 
 impl EscrowError {
@@ -1067,6 +1103,8 @@ impl EscrowError {
             EscrowError::InvalidTimelock => 135,
             EscrowError::InvalidArbiterPanel => 136,
             EscrowError::PanelResolveDisabled => 137,
+            EscrowError::InvalidEvidenceDeadline => 138,
+            EscrowError::EvidenceDisclosureLate => 139,
         }
     }
 
@@ -1111,6 +1149,8 @@ impl EscrowError {
             EscrowError::InvalidTimelock,
             EscrowError::InvalidArbiterPanel,
             EscrowError::PanelResolveDisabled,
+            EscrowError::InvalidEvidenceDeadline,
+            EscrowError::EvidenceDisclosureLate,
         ]
     }
 }
@@ -1257,6 +1297,28 @@ pub const DEFAULT_JUDGMENT_LEN: usize = 8 + 8;
 /// parties negotiate *while they still trust each other* (before
 /// funding): after `deadline_secs` seconds in `Disputed`, either party
 /// may trigger the pre-agreed split via
+/// The escalating party's evidence-disclosure status (AV-68 — see
+/// [`Escrow::evidence_status`]): whether the dispute-evidence
+/// commitment is on record relative to the disclosure deadline
+/// ([`Escrow::with_evidence_deadline`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceStatus {
+    /// An evidence commitment is on record — attached at
+    /// [`Escrow::escalate`] (AV-22) or via
+    /// [`Escrow::submit_evidence`]. The deadline is satisfied; no
+    /// adverse inference applies at judgment time.
+    Submitted,
+    /// No evidence on record and the disclosure deadline has not
+    /// lapsed (or no deadline was configured): the escalating party
+    /// may still disclose via [`Escrow::submit_evidence`].
+    Pending,
+    /// No evidence on record and the disclosure deadline has lapsed:
+    /// the judgment-time adverse inference applies — the settlement
+    /// records the default and the inference favors the non-escalating
+    /// party (see [`Escrow::evidence_defaulted`]).
+    Defaulted,
+}
+
 /// [`Escrow::trigger_default_judgment`], so a deadlocked arbitration
 /// cannot trap funds.
 ///
@@ -2181,6 +2243,11 @@ impl Escrow {
             // with `with_arbiter`, last-wins.
             arbiter_panel: None,
             fee_schedule: FeeSchedule::default(),
+            // AV-68: no evidence-disclosure deadline by default
+            // (backward compatible); the escalating party is recorded
+            // by `escalate`, never disputed means `None`.
+            evidence_deadline_secs: 0,
+            escalated_by: None,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -4296,6 +4363,11 @@ impl Escrow {
         // still settle.
         self.disputed_at = now;
         self.evidence_hash = evidence_hash;
+        // AV-68: record who escalated — the evidence-disclosure
+        // deadline (see `Escrow::with_evidence_deadline`) binds the
+        // escalating party, and the judgment-time adverse inference
+        // favors the other party when the deadline lapses undisclosed.
+        self.escalated_by = Some(authority);
         Ok(())
     }
 
@@ -4306,6 +4378,184 @@ impl Escrow {
     /// the audit trail of what the arbiter reviewed.
     pub fn evidence_hash(&self) -> Option<[u8; 32]> {
         self.evidence_hash
+    }
+
+    /// Opt in to the dispute-evidence disclosure deadline (AV-68 —
+    /// Solana arbitration discipline / payment fintech): declare the
+    /// window in seconds the escalating party gets — measured from
+    /// [`Escrow::disputed_at`] — to disclose the dispute evidence
+    /// ([`Escrow::submit_evidence`]) before the judgment-time adverse
+    /// inference kicks in (see [`Escrow::evidence_defaulted`]).
+    ///
+    /// Why: arbitration stalls when the escalating party never produces
+    /// the evidence their claim rests on — the arbiter (or panel) is
+    /// left ruling on assertions, and the counterparty cannot rebut
+    /// what was never disclosed. The deadline is a procedural bar the
+    /// parties negotiate *while they still trust each other* (before
+    /// funding): disclose within the window, or the settlement carries
+    /// a tamper-proof record that the evidence defaulted and the
+    /// adverse inference favors the *other* party.
+    ///
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// deadline is fixed before any funds move — mirroring
+    /// [`Escrow::with_arbitration_deadline`]. The arbiter must already
+    /// be configured ([`EscrowError::InvalidArbiter`] otherwise — the
+    /// deadline disciplines *arbitration* evidence, so a no-arbiter
+    /// escrow has nothing to discipline; configure the arbiter — or
+    /// the AV-65 panel — first). A zero `deadline_secs` is
+    /// [`EscrowError::InvalidEvidenceDeadline`]: a deadline of zero
+    /// seconds would lapse the moment the dispute starts, giving the
+    /// escalating party no window at all. Re-configuring a live escrow
+    /// is rejected with `InvalidStateTransition`.
+    ///
+    /// Design: the deadline counts from `disputed_at` (the moment the
+    /// escrow entered `Disputed`, recorded by [`Escrow::escalate`]) —
+    /// not from setup time — so the escalating party always gets the
+    /// full window regardless of when the dispute started. Evidence
+    /// attached at [`Escrow::escalate`] (AV-22) satisfies the deadline
+    /// immediately — the commitment *is* the disclosure.
+    pub fn with_evidence_deadline(mut self, deadline_secs: u64) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // The deadline disciplines arbitration evidence: without a
+        // configured arbiter (or panel) there is no dispute to
+        // discipline — configure the arbitration mechanism first.
+        if self.arbiter.is_none() && self.arbiter_panel.is_none() {
+            return Err(EscrowError::InvalidArbiter);
+        }
+        if deadline_secs == 0 {
+            return Err(EscrowError::InvalidEvidenceDeadline);
+        }
+        self.evidence_deadline_secs = deadline_secs;
+        Ok(self)
+    }
+
+    /// The dispute-evidence disclosure deadline in seconds (AV-68), or
+    /// `0` when no deadline was configured (backward compatible). Set
+    /// once via [`Escrow::with_evidence_deadline`].
+    pub fn evidence_deadline_secs(&self) -> u64 {
+        self.evidence_deadline_secs
+    }
+
+    /// Which party escalated into `Disputed` (AV-68) — the party the
+    /// evidence-disclosure deadline binds. `None` when the escrow was
+    /// never disputed. Recorded by [`Escrow::escalate`], never cleared.
+    pub fn escalated_by(&self) -> Option<[u8; 32]> {
+        self.escalated_by
+    }
+
+    /// The Unix timestamp by which the escalating party must disclose
+    /// the dispute evidence (AV-68): `disputed_at + evidence_deadline_secs`.
+    /// `None` when the escrow was never disputed or no deadline was
+    /// configured — there is no bar to miss.
+    pub fn evidence_due_at(&self) -> Option<u64> {
+        if self.evidence_deadline_secs == 0 || self.escalated_by.is_none() {
+            return None;
+        }
+        Some(self.disputed_at.saturating_add(self.evidence_deadline_secs))
+    }
+
+    /// The escalating party's evidence-disclosure status at `now`
+    /// (AV-68):
+    /// - [`EvidenceStatus::Submitted`] — an evidence commitment is on
+    ///   record (attached at [`Escrow::escalate`] or via
+    ///   [`Escrow::submit_evidence`]); the deadline is satisfied.
+    /// - [`EvidenceStatus::Pending`] — no evidence on record and the
+    ///   disclosure deadline has not lapsed (or no deadline was
+    ///   configured): the escalating party may still disclose.
+    /// - [`EvidenceStatus::Defaulted`] — no evidence on record and the
+    ///   deadline has lapsed: the judgment-time adverse inference
+    ///   applies (see [`Escrow::evidence_defaulted`]).
+    pub fn evidence_status(&self, now: u64) -> EvidenceStatus {
+        if self.evidence_hash.is_some() {
+            return EvidenceStatus::Submitted;
+        }
+        match self.evidence_due_at() {
+            Some(due_at) if now >= due_at => EvidenceStatus::Defaulted,
+            _ => EvidenceStatus::Pending,
+        }
+    }
+
+    /// Whether the escalating party's evidence disclosure has defaulted
+    /// at `now` (AV-68): a deadline was configured, it has lapsed, and
+    /// no evidence commitment is on record.
+    ///
+    /// This is the judgment-time adverse-inference signal: when a
+    /// dispute settles while this is true, the settlement events carry
+    /// `evidence_defaulted` (see
+    /// [`crate::EscrowEvent::evidence_defaulted`]) so the arbiter, the
+    /// panel members, and indexers apply the absent-evidence weight
+    /// *against the escalating party* — i.e. the inference favors the
+    /// other party ([`Escrow::escalated_by`]). The crate deliberately
+    /// does not invent a split for the arbiter: the bias is a
+    /// tamper-proof procedural record, and the hard enforcement is the
+    /// deadline itself — [`Escrow::submit_evidence`] rejects a
+    /// post-deadline disclosure with
+    /// [`EscrowError::EvidenceDisclosureLate`], so a missed deadline
+    /// cannot be cured at the last minute.
+    pub fn evidence_defaulted(&self, now: u64) -> bool {
+        matches!(self.evidence_status(now), EvidenceStatus::Defaulted)
+    }
+
+    /// Disclose (or replace) the dispute-evidence commitment while
+    /// `Disputed` (AV-68): the escalating party supplies the 32-byte
+    /// commitment to the off-chain evidence (same commitment shape as
+    /// the AV-22 [`Escrow::escalate`] parameter), overwriting any
+    /// previously attached hash — a within-deadline submission may
+    /// always override an earlier one.
+    ///
+    /// Why a separate call: [`Escrow::escalate`] takes the evidence
+    /// hash up front, but the escalating party may need to gather the
+    /// evidence after opening the dispute — the deadline
+    /// ([`Escrow::with_evidence_deadline`]) is exactly that gathering
+    /// window. Disclosure is the escalating party's duty: only the
+    /// party recorded by [`Escrow::escalate`] ([`Escrow::escalated_by`])
+    /// may call — a stranger or the counterparty is
+    /// [`EscrowError::Unauthorized`].
+    ///
+    /// The deadline is a hard bar: once `now >= evidence_due_at` with
+    /// no evidence on record, disclosure is rejected with
+    /// [`EscrowError::EvidenceDisclosureLate`] — the default is locked
+    /// in and the judgment-time adverse inference
+    /// ([`Escrow::evidence_defaulted`]) applies. With no deadline
+    /// configured there is no bar: disclosure is accepted at any time
+    /// while `Disputed` (backward compatible). A successful disclosure
+    /// never moves funds, so no reentrancy lock is needed.
+    ///
+    /// Check order is deliberate: pause, then authority (a stranger
+    /// learns nothing about the dispute), then state, then the
+    /// deadline — mirroring the crate's authority-first convention.
+    pub fn submit_evidence(
+        &mut self,
+        authority: [u8; 32],
+        evidence_hash: [u8; 32],
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Disclosure is the escalating party's duty: only the recorded
+        // escalator may submit. On a never-disputed escrow
+        // `escalated_by` is `None`, so every caller is unauthorized —
+        // the state check below is then unreachable, which is exactly
+        // the authority-first convention (a stranger learns nothing).
+        if self.escalated_by != Some(authority) {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Disputed => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Hard deadline bar: a lapsed deadline locks in the default —
+        // late disclosure is rejected, not accepted.
+        if let Some(due_at) = self.evidence_due_at() {
+            if now >= due_at {
+                return Err(EscrowError::EvidenceDisclosureLate);
+            }
+        }
+        self.evidence_hash = Some(evidence_hash);
+        Ok(())
     }
 
     /// The 32-byte commitment to the arbiter's off-chain rationale
@@ -6511,6 +6761,18 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // `arbiter_panel`. Appended last so every earlier field offset
     // stays stable.
     ("fee_schedule", "FeeSchedule", FEE_SCHEDULE_LEN),
+    // AV-68: dispute-evidence disclosure deadline in seconds (see
+    // `Escrow::with_evidence_deadline`): one u64, always present
+    // (zeroed when no deadline is configured). Appended last so every
+    // earlier field offset stays stable.
+    ("evidence_deadline_secs", "u64", 8),
+    // AV-68: which party escalated into `Disputed` (see
+    // `Escrow::escalate`): one discriminant byte, then the 32-byte
+    // party key. The region is always reserved (zeroed when `None`) so
+    // `escalate` writes in place — same treatment as `arbiter` /
+    // `mint` / `evidence_hash`. Appended last so every earlier field
+    // offset stays stable.
+    ("escalated_by", "Option<Pubkey>", 1 + PUBKEY_LEN),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -6599,9 +6861,13 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// panel is configured. The opt-in tiered protocol-fee schedule (AV-66)
 /// is likewise always present: the 1-byte live-tier count + 8 fixed
 /// 10-byte tier slots (81 bytes), zeroed (no schedule) when no
-/// schedule is configured.
+/// schedule is configured. The dispute-evidence disclosure deadline
+/// (AV-68) is likewise always present: 8-byte `evidence_deadline_secs`
+/// (zeroed when no deadline is configured) — and so is the escalating
+/// party (AV-68): 1-byte discriminant + 32-byte party key (zeroed when
+/// the escrow was never disputed).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -7145,7 +7411,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 21_074_880, "from {state:?}");
+            assert_eq!(rent, 21_360_240, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -7243,9 +7509,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 21_074_880 by
+        // VAULT_SPACE — pinned at 21_360_240 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 21_074_880);
+        assert_eq!(rent, 21_360_240);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -7403,11 +7669,11 @@ mod tests {
     fn release_and_close_adds_no_fields_and_keeps_space() {
         // AV-50 touches no persisted field: the release leg moves the
         // `released` / `fees_paid` counters and the state byte, and
-        // then the account is closed. VAULT_SPACE stays 2900 — re-asserted
+        // then the account is closed. VAULT_SPACE stays 2941 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 2900, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 21_074_880);
+        assert_eq!(VAULT_SPACE, 2941, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 21_360_240);
     }
 
     #[test]
@@ -7423,9 +7689,10 @@ mod tests {
         // 26 (dispute timestamp + default judgment + confirmation
         // bit), and AV-63 by 8 (absolute protocol-fee ceiling), AV-64
         // by 16 (relative timelock + funding timestamp), and AV-65 by
-        // 595 (arbiter panel), so the pin tracks the new total
+        // 595 (arbiter panel), and AV-68 by 41 (evidence-disclosure
+        // deadline + escalating party), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 2900, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 2941, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -9903,6 +10170,30 @@ pub(crate) mod anchor_idl_tests {
                             writes in place without reallocating; emits \\
                             no event (pre-fund configuration)",
         },
+        InstructionSpec {
+            // AV-68: opt in to the dispute-evidence disclosure deadline
+            // at setup time.
+            name: "initialize_evidence_deadline",
+            params: &[(
+                "deadline_secs",
+                "u64",
+                "instruction param; seconds in Disputed after which the escalating party's evidence disclosure defaults",
+            )],
+            method: "Escrow::with_evidence_deadline",
+            input_mapping: "deadline_secs <- param; authority <- accounts.initializer (signer), enforced by the Anchor account constraint, not the state machine; Uninitialized only, like initialize_quorum; the arbiter must already be configured (with_arbiter or with_arbiter_panel first - InvalidArbiter otherwise); the 8-byte region is always reserved (zeroed = no deadline when unset) so the opt-in writes in place without reallocating; emits no event (pre-fund configuration)",
+        },
+        InstructionSpec {
+            // AV-68: the escalating party discloses (or replaces) the
+            // dispute-evidence commitment while Disputed.
+            name: "submit_evidence",
+            params: &[(
+                "evidence_hash",
+                "[u8; 32]",
+                "instruction param; 32-byte commitment to the off-chain dispute evidence; overwrites any previously attached hash",
+            )],
+            method: "Escrow::submit_evidence",
+            input_mapping: "evidence_hash <- param; authority <- accounts.authority (signer: must equal the escalating party recorded by escalate - a stranger or the counterparty is Unauthorized); now <- clock sysvar (NOT an instruction param - a caller-supplied timestamp could rewind past the disclosure deadline); Disputed only (InvalidStateTransition otherwise); at or past the disclosure deadline the submission is rejected (EvidenceDisclosureLate, code 139); with no deadline configured disclosure is accepted at any time while Disputed; emits the EvidenceSubmitted indexer event",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -10004,6 +10295,9 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::with_fee_schedule",
             // AV-64: relative timelock (fund-anchored unlock).
             "Escrow::with_relative_timelock",
+            // AV-68: dispute-evidence disclosure deadline + disclosure.
+            "Escrow::with_evidence_deadline",
+            "Escrow::submit_evidence",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -10027,7 +10321,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_forty_one_instructions_take_params() {
+    fn only_forty_three_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -10080,6 +10374,8 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_fee_schedule",
                 &"extend_expiry",
                 &"initialize_relative_timelock",
+                &"initialize_evidence_deadline",
+                &"submit_evidence",
             ]
         );
     }
@@ -11716,6 +12012,19 @@ pub(crate) mod anchor_idl_tests {
         // Mutually exclusive with the absolute lock (see
         // `Escrow::with_relative_timelock`).
         ("initialize_relative_timelock", "secs", "relative_timelock_secs"),
+        // AV-68: the disclosure-deadline param populates
+        // `evidence_deadline_secs` directly (u64 — 0 is the valid "no
+        // deadline" default, mirroring `initialize_timelock`'s
+        // 0-sentinel; 0 is rejected as an opt-in value, mirroring
+        // `initialize_extension`).
+        ("initialize_evidence_deadline", "deadline_secs", "evidence_deadline_secs"),
+        // AV-68: the disclosure param overwrites `evidence_hash` in
+        // place while Disputed — a second param source for
+        // `evidence_hash`, like `released` (written by multiple
+        // transitions); the `escalated_by` source is `escalate`'s
+        // authority account (a non-param account input, documented in
+        // FIELD_SOURCES).
+        ("submit_evidence", "evidence_hash", "evidence_hash"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -11805,6 +12114,15 @@ pub(crate) mod anchor_idl_tests {
             "zeroed by initialize; set by escalate from the clock \\
              sysvar (NOT an instruction param); the pre-agreed default \\
              judgment deadline is measured from it",
+        ),
+        // AV-68: no instruction param writes this field: `escalate`
+        // takes the authority as a signer account (never an
+        // instruction param), so the escalating party is a field
+        // source, not a param mapping.
+        (
+            "escalated_by",
+            "None by initialize; set by escalate to the authority \\
+             signer (the initializer or the taker); never cleared",
         ),
         // AV-55: no instruction param writes this field:
         // `confirm_default_judgment` is a param-less instruction, so it
@@ -12179,6 +12497,16 @@ mod error_code_tests {
             EscrowError::PanelResolveDisabled,
             137,
             "resolve called on a panel-mode escrow — the panel's multisig judgment (submit_panel_judgment) is the only settlement path once a panel is configured",
+        ),
+        (
+            EscrowError::InvalidEvidenceDeadline,
+            138,
+            "with_evidence_deadline with a zero deadline — a zero-second deadline would lapse the moment the dispute starts",
+        ),
+        (
+            EscrowError::EvidenceDisclosureLate,
+            139,
+            "submit_evidence at or past the disclosure deadline without evidence on record — a missed deadline locks in the adverse inference at judgment time",
         ),
     ];
 
@@ -13894,6 +14222,25 @@ mod account_space_tests {
             out.extend_from_slice(&tier.min_amount.to_le_bytes());
             out.extend_from_slice(&tier.bps.to_le_bytes());
         }
+        // AV-68: dispute-evidence disclosure deadline in seconds,
+        // always present (zeroed when no deadline is configured);
+        // appended last so every earlier offset above is unchanged.
+        out.extend_from_slice(&e.evidence_deadline_secs.to_le_bytes());
+        // AV-68: the escalating party, always reserved like
+        // `evidence_hash`: the `None` discriminant followed by a
+        // zeroed 32-byte key, so `escalate` writes in place without
+        // reallocating; appended last so every earlier offset above is
+        // unchanged.
+        match e.escalated_by {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; 32]);
+            }
+            Some(party) => {
+                out.push(1);
+                out.extend_from_slice(&party);
+            }
+        }
         out
     }
 
@@ -13939,10 +14286,11 @@ mod account_space_tests {
         // (AV-65 opt-in arbiter panel: member count + threshold + 8
         // member keys + 8 vote slots + voted bitmask) + (1 + 80)
         // (AV-66 opt-in tiered protocol-fee schedule: live-tier count
-        // + 8 fixed 10-byte tier slots).
-        assert_eq!(ESCROW_BODY_LEN, 2892, "escrow payload bytes");
+        // + 8 fixed 10-byte tier slots) + 8 (AV-68 dispute-evidence
+        // disclosure deadline) + (1 + 32) (AV-68 escalating party).
+        assert_eq!(ESCROW_BODY_LEN, 2933, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 2900, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 2941, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -13995,13 +14343,16 @@ mod account_space_tests {
         // 594)-byte opt-in arbiter panel (AV-65, zeroed when no panel
         // is configured) + 81-byte opt-in tiered protocol-fee schedule
         // (AV-66: 1-byte live-tier count + 8 fixed 10-byte tier slots,
-        // zeroed when no schedule is configured).
+        // zeroed when no schedule is configured) + 8-byte
+        // dispute-evidence disclosure deadline (AV-68, zeroed when no
+        // deadline is configured) + (1 + 32)-byte escalating party
+        // (AV-68, zeroed when the escrow was never disputed).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2410);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2451);
     }
 
     #[test]
@@ -14408,16 +14759,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2900) * 3480 * 2 = 3028 * 6960 = 21_074_880 lamports.
-        assert_eq!(full, 21_074_880);
+        // (128 + 2941) * 3480 * 2 = 3069 * 6960 = 21_360_240 lamports.
+        assert_eq!(full, 21_360_240);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2410) * 3480 * 2 = 2538 * 6960 = 17_664_480 lamports.
-        assert_eq!(no_quorum, 17_664_480);
+        // (128 + 2451) * 3480 * 2 = 2579 * 6960 = 17_949_840 lamports.
+        assert_eq!(no_quorum, 17_949_840);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -14461,12 +14812,12 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(21_074_880, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(21_360_240, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(16_091_519, params.0, params.1),
             Err(RentShortfall {
-                required: 21_074_880,
+                required: 21_360_240,
                 provided: 16_091_519,
             })
         );
@@ -14479,7 +14830,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 21_074_880,
+                required: 21_360_240,
                 provided: 0,
             })
         );
@@ -16805,6 +17156,275 @@ mod evidence_tests {
     }
 }
 
+// ---------- AV-68: dispute-evidence disclosure deadline ----------
+//
+// The escalating party must disclose the dispute evidence within the
+// configured window (measured from `disputed_at`); a lapsed deadline
+// with no evidence on record locks in the judgment-time adverse
+// inference — the settlement events carry `evidence_defaulted`, biasing
+// the absent-evidence weight toward the non-escalating party.
+mod evidence_deadline_tests {
+    use super::*;
+    use crate::discriminator::{decode_vault_account, vault_account_discriminator};
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+    const EVIDENCE: [u8; 32] = [0xE1; 32];
+    const EVIDENCE2: [u8; 32] = [0xE2; 32];
+    const DEADLINE: u64 = 3_600;
+
+    fn arbitrated() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_evidence_deadline(DEADLINE)
+            .unwrap()
+    }
+
+    fn disputed_by(authority: [u8; 32]) -> (Escrow, u64) {
+        let mut e = arbitrated();
+        e.fund(ALICE, T0).unwrap();
+        let disputed_at = T0 + 100;
+        e.escalate(authority, disputed_at, None).unwrap();
+        (e, disputed_at)
+    }
+
+    #[test]
+    fn builder_rejects_zero_deadline() {
+        // A zero-second deadline would lapse the moment the dispute
+        // starts — the builder rejects it.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter(ARBITER)
+                .unwrap()
+                .with_evidence_deadline(0),
+            Err(EscrowError::InvalidEvidenceDeadline)
+        );
+        assert_eq!(EscrowError::InvalidEvidenceDeadline.code(), 138);
+    }
+
+    #[test]
+    fn builder_requires_an_arbitration_mechanism() {
+        // The deadline disciplines arbitration evidence — without an
+        // arbiter (or panel) there is nothing to discipline.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_evidence_deadline(DEADLINE),
+            Err(EscrowError::InvalidArbiter)
+        );
+        // Happy path: deadline stored.
+        let e = arbitrated();
+        assert_eq!(e.evidence_deadline_secs(), DEADLINE);
+        // Panel mode counts as a configured arbitration mechanism.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[ARBITER], 1)
+            .unwrap()
+            .with_evidence_deadline(DEADLINE)
+            .unwrap();
+        assert_eq!(e.evidence_deadline_secs(), DEADLINE);
+    }
+
+    #[test]
+    fn builder_uninitialized_only() {
+        // Re-configuring a live escrow is rejected — the deadline is
+        // fixed before any funds move.
+        let mut e = arbitrated();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            e.with_evidence_deadline(DEADLINE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn escalate_records_escalating_party_and_due_at() {
+        // Either party may escalate; whoever does is bound by the
+        // deadline measured from `disputed_at`.
+        for authority in [ALICE, BOB] {
+            let (e, disputed_at) = disputed_by(authority);
+            assert_eq!(e.state(), EscrowState::Disputed);
+            assert_eq!(e.escalated_by(), Some(authority));
+            assert_eq!(e.evidence_due_at(), Some(disputed_at + DEADLINE));
+            assert_eq!(e.disputed_at(), disputed_at);
+        }
+    }
+
+    #[test]
+    fn no_deadline_means_no_due_at_but_escalator_still_recorded() {
+        // Backward compatible: without the opt-in there is no bar to
+        // miss, but the escalating party is still recorded for the
+        // audit trail.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.escalate(BOB, T0 + 100, None).unwrap();
+        assert_eq!(e.evidence_deadline_secs(), 0);
+        assert_eq!(e.evidence_due_at(), None);
+        assert_eq!(e.escalated_by(), Some(BOB));
+        assert!(!e.evidence_defaulted(u64::MAX));
+    }
+
+    #[test]
+    fn submit_evidence_happy_path() {
+        let (mut e, disputed_at) = disputed_by(BOB);
+        assert_eq!(e.evidence_status(disputed_at), EvidenceStatus::Pending);
+        e.submit_evidence(BOB, EVIDENCE, disputed_at + 10).unwrap();
+        assert_eq!(e.evidence_hash(), Some(EVIDENCE));
+        assert_eq!(e.evidence_status(disputed_at + 10), EvidenceStatus::Submitted);
+        assert!(!e.evidence_defaulted(disputed_at + DEADLINE));
+    }
+
+    #[test]
+    fn submit_evidence_rejects_stranger_and_counterparty() {
+        // Disclosure is the escalating party's duty: the counterparty
+        // and a stranger are both Unauthorized (authority is checked
+        // before state, so a stranger learns nothing).
+        let (mut e, disputed_at) = disputed_by(BOB);
+        assert_eq!(
+            e.submit_evidence(ALICE, EVIDENCE, disputed_at),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.submit_evidence(MALLORY, EVIDENCE, disputed_at),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.evidence_hash(), None, "failed call stores nothing");
+    }
+
+    #[test]
+    fn submit_evidence_on_settled_escrow_is_invalid_transition() {
+        // After settlement the escalator is still the recorded party,
+        // so the authority check passes and the state check fires.
+        let (mut e, disputed_at) = disputed_by(BOB);
+        e.submit_evidence(BOB, EVIDENCE, disputed_at + 10).unwrap();
+        e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Settled);
+        assert_eq!(
+            e.submit_evidence(BOB, EVIDENCE2, disputed_at + 20),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.evidence_hash(), Some(EVIDENCE), "hash untouched");
+    }
+
+    #[test]
+    fn submit_evidence_overrides_within_deadline() {
+        // A within-deadline submission may always replace the earlier
+        // commitment — the escalator refines the evidence bundle.
+        let (mut e, disputed_at) = disputed_by(ALICE);
+        e.submit_evidence(ALICE, EVIDENCE, disputed_at + 10).unwrap();
+        e.submit_evidence(ALICE, EVIDENCE2, disputed_at + DEADLINE - 1)
+            .unwrap();
+        assert_eq!(e.evidence_hash(), Some(EVIDENCE2));
+    }
+
+    #[test]
+    fn submit_evidence_rejects_at_and_past_deadline() {
+        // The deadline is a hard bar: at `due_at` the default is
+        // already locked in — late disclosure is rejected, not
+        // accepted.
+        let (mut e, disputed_at) = disputed_by(BOB);
+        let due_at = disputed_at + DEADLINE;
+        assert_eq!(
+            e.submit_evidence(BOB, EVIDENCE, due_at),
+            Err(EscrowError::EvidenceDisclosureLate)
+        );
+        assert_eq!(
+            e.submit_evidence(BOB, EVIDENCE, due_at + 1),
+            Err(EscrowError::EvidenceDisclosureLate)
+        );
+        assert_eq!(EscrowError::EvidenceDisclosureLate.code(), 139);
+        assert_eq!(e.evidence_hash(), None, "failed call stores nothing");
+        assert_eq!(e.evidence_status(due_at), EvidenceStatus::Defaulted);
+        assert!(e.evidence_defaulted(due_at));
+    }
+
+    #[test]
+    fn submit_evidence_without_deadline_is_always_allowed() {
+        // No deadline configured: disclosure is accepted at any time
+        // while Disputed (backward compatible).
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.escalate(BOB, T0 + 100, None).unwrap();
+        e.submit_evidence(BOB, EVIDENCE, u64::MAX - 1).unwrap();
+        assert_eq!(e.evidence_hash(), Some(EVIDENCE));
+    }
+
+    #[test]
+    fn escalate_time_evidence_satisfies_the_deadline() {
+        // AV-22 attachment at escalation *is* the disclosure: the
+        // deadline is satisfied from the start.
+        let mut e = arbitrated();
+        e.fund(ALICE, T0).unwrap();
+        let disputed_at = T0 + 100;
+        e.escalate(ALICE, disputed_at, Some(EVIDENCE)).unwrap();
+        assert_eq!(e.evidence_status(disputed_at), EvidenceStatus::Submitted);
+        assert!(!e.evidence_defaulted(disputed_at + DEADLINE + 1));
+    }
+
+    #[test]
+    fn evidence_defaulted_boundary_is_inclusive() {
+        let (e, disputed_at) = disputed_by(BOB);
+        let due_at = disputed_at + DEADLINE;
+        assert!(!e.evidence_defaulted(due_at - 1));
+        assert_eq!(e.evidence_status(due_at - 1), EvidenceStatus::Pending);
+        assert!(e.evidence_defaulted(due_at));
+    }
+
+    #[test]
+    fn new_error_codes_are_pinned_never_renumbered() {
+        assert_eq!(EscrowError::InvalidEvidenceDeadline.code(), 138);
+        assert_eq!(EscrowError::EvidenceDisclosureLate.code(), 139);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidEvidenceDeadline));
+        assert!(EscrowError::all().contains(&EscrowError::EvidenceDisclosureLate));
+    }
+
+    #[test]
+    fn deadline_and_escalator_persist_in_serialized_layout_tail() {
+        // Appended last: the deadline u64 sits at 2892 and the
+        // escalating-party region (1-byte discriminant + 32-byte key)
+        // at 2900 — every earlier offset is stable.
+        let (e, _) = disputed_by(BOB);
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(
+            u64::from_le_bytes(bytes[2892..2900].try_into().unwrap()),
+            DEADLINE,
+            "evidence_deadline_secs offset"
+        );
+        assert_eq!(bytes[2900], 1, "escalated_by: Some discriminant");
+        assert_eq!(&bytes[2901..2933], &BOB, "escalated_by key");
+        // The structural decoder round-trips both fields.
+        let mut full = vault_account_discriminator().to_vec();
+        full.extend_from_slice(&bytes);
+        let decoded = decode_vault_account(&full).unwrap();
+        assert_eq!(decoded.evidence_deadline_secs(), DEADLINE);
+        assert_eq!(decoded.escalated_by(), Some(BOB));
+        assert_eq!(decoded.evidence_due_at(), e.evidence_due_at());
+    }
+
+    #[test]
+    fn unset_deadline_and_never_disputed_encode_zeroed() {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(&bytes[2892..2900], &[0u8; 8], "deadline zeroed");
+        assert_eq!(bytes[2900], 0, "escalated_by: None discriminant");
+        assert_eq!(&bytes[2901..2933], &[0u8; 32], "escalated_by zeroed");
+    }
+}
+
 // ---------- AV-38: arbiter's rationale-document hash ----------
 //
 // `resolve` takes an optional 32-byte commitment to the arbiter's
@@ -16915,7 +17535,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2892, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) bytes");
+        assert_eq!(bytes.len(), 2933, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -16940,7 +17560,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 2892);
+        assert_eq!(bytes.len(), 2933);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -16962,18 +17582,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2900) * 3480 * 2 = 3028 * 6960 = 21_074_880 lamports.
-        assert_eq!(VAULT_SPACE, 2900);
-        assert_eq!(full, 21_074_880);
+        // (128 + 2941) * 3480 * 2 = 3069 * 6960 = 21_360_240 lamports.
+        assert_eq!(VAULT_SPACE, 2941);
+        assert_eq!(full, 21_360_240);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2410) * 3480 * 2 = 2538 * 6960 = 17_664_480 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2410);
-        assert_eq!(no_quorum, 17_664_480);
+        // (128 + 2451) * 3480 * 2 = 2579 * 6960 = 17_949_840 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2451);
+        assert_eq!(no_quorum, 17_949_840);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -17117,7 +17737,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2892);
+        assert_eq!(bytes.len(), 2933);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -17132,7 +17752,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 2892);
+        assert_eq!(bytes.len(), 2933);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -17163,18 +17783,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2900) * 3480 * 2 = 3028 * 6960 = 21_074_880 lamports.
-        assert_eq!(VAULT_SPACE, 2900);
-        assert_eq!(full, 21_074_880);
+        // (128 + 2941) * 3480 * 2 = 3069 * 6960 = 21_360_240 lamports.
+        assert_eq!(VAULT_SPACE, 2941);
+        assert_eq!(full, 21_360_240);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2410) * 3480 * 2 = 2538 * 6960 = 17_664_480 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2410);
-        assert_eq!(no_quorum, 17_664_480);
+        // (128 + 2451) * 3480 * 2 = 2579 * 6960 = 17_949_840 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2451);
+        assert_eq!(no_quorum, 17_949_840);
     }
 
     #[test]
@@ -18029,7 +18649,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 2892);
+        assert_eq!(bytes.len(), 2933);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -18204,7 +18824,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 2892, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66");
+        assert_eq!(ESCROW_BODY_LEN, 2933, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -18222,32 +18842,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 2900) * 3480 * 2 = 3028 * 6960 = 21_074_880 lamports.
+        // (128 + 2941) * 3480 * 2 = 3069 * 6960 = 21_360_240 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            21_074_880
+            21_360_240
         );
-        // (128 + 2410) * 3480 * 2 = 2538 * 6960 = 17_664_480 lamports.
+        // (128 + 2451) * 3480 * 2 = 2579 * 6960 = 17_949_840 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            17_664_480
+            17_949_840
         );
         // 1376 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 2900);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2410);
-        assert!(check_vault_rent_exempt(21_074_880, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 2941);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2451);
+        assert!(check_vault_rent_exempt(21_360_240, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -21052,9 +21672,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2892, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule)");
-        assert_eq!(VAULT_SPACE, 2900);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2410);
+        assert_eq!(bytes.len(), 2933, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline)");
+        assert_eq!(VAULT_SPACE, 2941);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2451);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -21598,7 +22218,7 @@ mod default_judgment_tests {
         // at 960, `default_judgment` at 968, `default_confirmed` at 985
         // (AV-55 body total 986). AV-56 appends `subscription` at 986,
         // `subscription_next` at 1004, `subscription_released` at 1005
-        // (body total 2892 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule appends).
+        // (body total 2933 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter(ARBITER)
@@ -21608,7 +22228,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2892);
+        assert_eq!(bytes.len(), 2933);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -22165,14 +22785,14 @@ mod subscription_tests {
     fn borsh_tail_pins_subscription_fields() {
         // Offsets: `default_confirmed` ends the AV-55 body at 986;
         // `subscription` at 986, `subscription_next` at 1004,
-        // `subscription_released` at 1005 (body total 2892 after the AV-57 + AV-59 + AV-63 + AV-64 + AV-65 + AV-66 appends).
+        // `subscription_released` at 1005 (body total 2933 after the AV-57 + AV-59 + AV-63 + AV-64 + AV-65 + AV-66 + AV-68 appends).
         let mut e = escrow()
             .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2892);
+        assert_eq!(bytes.len(), 2933);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -22406,7 +23026,12 @@ mod event_history_tests {
             32,
             "AV-67: appended after PanelResolved"
         );
-        for d in 0..=32u8 {
+        assert_eq!(
+            EscrowEventKind::EvidenceSubmitted.discriminant(),
+            33,
+            "AV-68: appended after FeeRecipientRotated"
+        );
+        for d in 0..=33u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -22417,7 +23042,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(33), None);
+        assert_eq!(EscrowEventKind::from_discriminant(34), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -22429,11 +23054,11 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41
         );
     }
 
@@ -22442,13 +23067,13 @@ mod event_history_tests {
         // Offsets: `subscription_released` ends the AV-56 body at 1013;
         // `event_head` at 1013, `event_total` at 1014, `event_count` at
         // 1022, `event_capacity` at 1023, `event_slots` at 1024 (body
-        // total 2892 after the AV-59 + AV-63 + AV-64 appends).
+        // total 2933 after the AV-59 + AV-63 + AV-64 + AV-68 appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2892);
+        assert_eq!(bytes.len(), 2933);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -22476,7 +23101,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81, "AV-66 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41, "AV-68 tail");
     }
 
     #[test]
@@ -22491,18 +23116,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2900) * 3480 * 2 = 3028 * 6960 = 21_074_880 lamports.
-        assert_eq!(VAULT_SPACE, 2900);
-        assert_eq!(full, 21_074_880);
+        // (128 + 2941) * 3480 * 2 = 3069 * 6960 = 21_360_240 lamports.
+        assert_eq!(VAULT_SPACE, 2941);
+        assert_eq!(full, 21_360_240);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2410) * 3480 * 2 = 2538 * 6960 = 17_664_480 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2410);
-        assert_eq!(no_quorum, 17_664_480);
+        // (128 + 2451) * 3480 * 2 = 2579 * 6960 = 17_949_840 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2451);
+        assert_eq!(no_quorum, 17_949_840);
     }
 
     // ----- decode -----
@@ -22534,10 +23159,10 @@ mod event_history_tests {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         // First slot's kind byte sits at body offset 1024.
         let kind_off = ANCHOR_DISCRIMINATOR_LEN + 1024;
-        // AV-67: discriminants 30/31 are `PanelJudgment` /
-        // `PanelResolved` and 32 is `FeeRecipientRotated`; 33 is the
-        // first still-unknown byte.
-        for bad in [33u8, 42, 255] {
+        // AV-68: discriminants 30/31 are `PanelJudgment` /
+        // `PanelResolved`, 32 is `FeeRecipientRotated` and 33 is
+        // `EvidenceSubmitted`; 34 is the first still-unknown byte.
+        for bad in [34u8, 42, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -23186,18 +23811,19 @@ mod fee_cap_tests {
 
     #[test]
     fn layout_pins_include_the_fee_cap_tail() {
-        // +595 over the AV-64 numbers (the AV-65 arbiter-panel region).
-        assert_eq!(ESCROW_BODY_LEN, 2892, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 2900, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2410, "no-quorum Vault account space");
+        // +595 over the AV-64 numbers (the AV-65 arbiter-panel region)
+        // + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline).
+        assert_eq!(ESCROW_BODY_LEN, 2933, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 2941, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 2451, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            21_074_880,
-            "(128 + 2900) * 3480 * 2 = 3028 * 6960"
+            21_360_240,
+            "(128 + 2941) * 3480 * 2 = 3069 * 6960"
         );
         assert_eq!(
             rent_exempt_minimum_lamports(
@@ -23205,8 +23831,8 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            17_664_480,
-            "(128 + 2410) * 3480 * 2 = 2538 * 6960"
+            17_949_840,
+            "(128 + 2451) * 3480 * 2 = 2579 * 6960"
         );
     }
 
@@ -23218,7 +23844,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2892);
+        assert_eq!(bytes.len(), 2933);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -23707,14 +24333,15 @@ mod fee_schedule_tests {
 
     #[test]
     fn fee_schedule_persists_in_serialized_layout_tail() {
-        // The schedule sits at the tail (the final 81 bytes):
-        // arbiter_panel stays the second-to-last region, so every
-        // earlier offset is unchanged.
+        // The schedule sits just before the AV-68 tail (the final 41
+        // bytes are the evidence-deadline region): arbiter_panel stays
+        // the third-to-last region, so every earlier offset is
+        // unchanged.
         let e = scheduled_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2892);
-        let tail = ESCROW_BODY_LEN - FEE_SCHEDULE_LEN;
+        assert_eq!(bytes.len(), 2933);
+        let tail = ESCROW_BODY_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(bytes[tail], 3, "tier_count at the tail");
         assert_eq!(
             u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
@@ -23743,9 +24370,12 @@ mod fee_schedule_tests {
     fn fee_schedule_defaults_zeroed_in_serialized_layout() {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        let tail = ESCROW_BODY_LEN - FEE_SCHEDULE_LEN;
+        // AV-68 appended the evidence-deadline region (8 + 33 bytes)
+        // after the fee schedule, so the schedule no longer sits at
+        // the body tail.
+        let tail = ESCROW_BODY_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(
-            &bytes[tail..],
+            &bytes[tail..tail + FEE_SCHEDULE_LEN],
             &[0u8; FEE_SCHEDULE_LEN],
             "fee_schedule: zeroed when unconfigured"
         );
@@ -23756,7 +24386,10 @@ mod fee_schedule_tests {
         // tier_count = 9 overflows the fixed 8 slots.
         let e = scheduled_escrow();
         let mut bytes = super::account_space_tests::encode_escrow(&e);
-        let tail = ESCROW_BODY_LEN - FEE_SCHEDULE_LEN;
+        // AV-68 appended the evidence-deadline region (8 + 33 bytes)
+        // after the fee schedule, so the schedule no longer sits at
+        // the body tail.
+        let tail = ESCROW_BODY_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         bytes[tail] = 9;
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
@@ -24089,7 +24722,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2892);
+        assert_eq!(bytes.len(), 2933);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -24277,12 +24910,17 @@ mod arbiter_panel_tests {
     fn new_error_codes_are_pinned() {
         assert_eq!(EscrowError::InvalidArbiterPanel.code(), 136);
         assert_eq!(EscrowError::PanelResolveDisabled.code(), 137);
+        // AV-68: appended, never renumbered.
+        assert_eq!(EscrowError::InvalidEvidenceDeadline.code(), 138);
+        assert_eq!(EscrowError::EvidenceDisclosureLate.code(), 139);
         // never-renumber: the full table still pins every code, and
         // `all()` covers the new variants (the AV-46 lesson: a missing
         // variant drifts the IDL error pin).
         assert!(EscrowError::all().contains(&EscrowError::InvalidArbiterPanel));
         assert!(EscrowError::all().contains(&EscrowError::PanelResolveDisabled));
-        assert_eq!(EscrowError::all().len(), 38);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidEvidenceDeadline));
+        assert!(EscrowError::all().contains(&EscrowError::EvidenceDisclosureLate));
+        assert_eq!(EscrowError::all().len(), 40);
     }
 
     #[test]
@@ -24629,11 +25267,11 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 2892);
-        // The panel region is the second-to-last region (the AV-66
-        // fee-schedule region trails it): 1-byte discriminant +
-        // 594-byte panel.
-        let tail = &bytes[bytes.len() - FEE_SCHEDULE_LEN - 595..bytes.len() - FEE_SCHEDULE_LEN];
+        assert_eq!(bytes.len(), 2933);
+        // The panel region trails the AV-68 evidence-deadline region
+        // (41 bytes) and the AV-66 fee-schedule region (81 bytes):
+        // 1-byte discriminant + 594-byte panel.
+        let tail = &bytes[bytes.len() - 41 - FEE_SCHEDULE_LEN - 595..bytes.len() - 41 - FEE_SCHEDULE_LEN];
         assert_eq!(tail[0], 1, "panel discriminant");
         assert_eq!(tail[1], 3, "n");
         assert_eq!(tail[2], 2, "threshold");
@@ -24680,8 +25318,8 @@ mod arbiter_panel_tests {
         assert_eq!(panel.1, "Option<ArbiterPanel>");
         assert_eq!(panel.2, 1 + ARBITER_PANEL_LEN);
         assert_eq!(panel.2, 595);
-        // Appended last: every earlier field offset stays stable.
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "fee_schedule");
+        // Appended last before AV-68: every earlier field offset stays stable.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "fee_schedule");
     }
 
     #[test]
@@ -24694,8 +25332,11 @@ mod arbiter_panel_tests {
         assert_eq!(schedule.2, FEE_SCHEDULE_LEN);
         assert_eq!(schedule.2, 1 + MAX_FEE_TIERS * FEE_TIER_LEN);
         assert_eq!(schedule.2, 81);
-        // Appended last: every earlier field offset stays stable.
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "fee_schedule");
+        // AV-68 appended two fields after it: the deadline region and
+        // the escalating party are the new tail.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "evidence_deadline_secs");
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "escalated_by");
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, 1 + 32);
     }
 
     #[test]

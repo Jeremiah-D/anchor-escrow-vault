@@ -72,6 +72,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_default_judgment(deadline_secs, default_taker_amount)` (AV-55) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — and only after `initialize_arbiter`; the arbiter must be configured first); declares the fallback split applied when the arbiter never resolves: `deadline_secs` seconds in `Disputed` before the judgment becomes triggerable (must be non-zero — `DefaultJudgmentNotDue` otherwise), `default_taker_amount` the taker's share of the remainder (must be ≤ the locked amount — `ReleaseExceedsLocked` otherwise); the initializer proposes the terms, the taker must still countersign (dual-signed agreement) |
 | `confirm_default_judgment()` (AV-55) | `Uninitialized` / `Funded` | — (no state change; sets the confirmation bit) | **taker only** (`Unauthorized` for a stranger or the initializer); no judgment configured is `DefaultJudgmentNotDue`; idempotent (re-confirming is `Ok`) |
 | `trigger_default_judgment(caller, now, payout_to)` (AV-55) | `Disputed` | `Settled` | **initializer or taker** (either party — a liveness backstop, not a power grant); only once `now >= disputed_at + deadline_secs` (the judgment's due time, `DefaultJudgmentNotDue` otherwise); settles on the pre-agreed split — fee slices the taker's share like `resolve`, quorum/vesting/timelock do *not* gate (same as `resolve`); the arbiter's `resolve` is unchanged and keeps priority — after the deadline either the arbiter resolves or a party triggers, first writer wins; in AV-65 panel mode the default judgment stays available (same deadline rules) and races the panel's M-vote settlement instead; emits `DefaultJudgment` |
+| `initialize_evidence_deadline(deadline_secs)` (AV-68) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — and only after the arbiter/panel is configured, `InvalidArbiter` otherwise); declares the window the escalating party gets to disclose the dispute evidence, measured from `disputed_at`; must be non-zero (`InvalidEvidenceDeadline`, code 138, otherwise) |
+| `submit_evidence(authority, evidence_hash, now)` (AV-68) | `Disputed` | `Disputed` (commitment recorded) | **escalating party only** (the party `escalate` recorded — a stranger or the counterparty is `Unauthorized`); overwrites any previously attached hash (a within-deadline submission may always refine the bundle); at or past the disclosure deadline the submission is rejected (`EvidenceDisclosureLate`, code 139) — the deadline is a hard bar, so a missed deadline locks in the judgment-time adverse inference; with no deadline configured disclosure is accepted at any time while `Disputed`; emits `EvidenceSubmitted` |
 | `initialize_subscription(period_secs, periods, per_period)` (AV-56) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — mutually exclusive with `initialize_milestones`; declares the periodic release schedule, back-scheduled from `expires_at`: period `i` is due at `expires_at - (periods-1-i) * period_secs`; validation — `period_secs` non-zero, `periods` in 1..=64, `per_period` non-zero, `periods * per_period` == locked amount (in u128), `expires_at != u64::MAX`, and the schedule must fit the lifetime — is `InvalidSubscription` otherwise) |
 | `release_period(period_index)` (AV-56) | `Funded` | `Funded` (partial) / `Released` (last period) | initializer only (the initializer's push path); strictly in-order (`period_index` must equal the next due period — skip-ahead and replay are `PeriodNotDue`) and due-date gated (`now >= due_at(period_index)` — `PeriodNotDue` otherwise); quorum satisfied when configured (`QuorumNotReached`), the timelock gate when a lock is configured (`now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64); `TimelockNotReached` — the timelock gates every taker payout path); `MintMismatch` / `PayoutNotAllowlisted` guard the fund movement like `release`; the protocol fee slices the period (`payout + fee == per_period`); vesting claim composes (not blocked); emits `SubscriptionPeriodReleased` |
 | `initialize_milestones(milestones)`          | `Uninitialized`| `Uninitialized` | initializer (once, before funding; tranche amounts must sum to the locked amount) |
@@ -446,6 +448,46 @@ the panel (members, threshold, current votes). New vault field
 8×(u64 taker_amount + 1+32-byte rationale) votes + u64 voted bitmask)
 — the full vault is now 2811 bytes / 20,511,120 lamports rent-exempt.
 
+**Evidence-disclosure deadline (AV-68).** Arbitration stalls when the
+escalating party never produces the evidence their claim rests on —
+the arbiter (or panel) is left ruling on assertions, and the
+counterparty cannot rebut what was never disclosed. The opt-in
+deadline is a procedural bar the parties negotiate *while they still
+trust each other* (before funding):
+`with_evidence_deadline(deadline_secs)` / `initialize_evidence_deadline`
+(`Uninitialized` only, like the other `with_*` builders; the arbiter —
+or the AV-65 panel — must already be configured, `InvalidArbiter`
+otherwise; a zero deadline is `InvalidEvidenceDeadline`, code 138 — a
+deadline of zero seconds would lapse the moment the dispute starts).
+`escalate` records *who* escalated (`escalated_by`) alongside
+`disputed_at`, and the disclosure window is measured from
+`disputed_at` — the escalating party always gets the full window
+regardless of when the dispute started. Disclosure is the escalating
+party's duty: only the recorded escalator may call
+`submit_evidence(authority, evidence_hash, now)` (a stranger or the
+counterparty is `Unauthorized`) — the 32-byte commitment overwrites
+any previously attached hash, so a within-deadline submission may
+always refine the evidence bundle. Evidence attached at `escalate`
+(AV-22) satisfies the deadline immediately. The deadline is a **hard
+bar**: once `now >= disputed_at + deadline_secs` with no evidence on
+record, disclosure is rejected (`EvidenceDisclosureLate`, code 139) —
+a missed deadline locks in the adverse inference instead of accepting
+a last-minute disclosure. At judgment time the crate exposes
+`evidence_status(now)` (`Submitted` / `Pending` / `Defaulted`) and
+`evidence_defaulted(now)`; the three settlement paths (`resolve`,
+`submit_panel_judgment`'s M-th vote, `trigger_default_judgment`)
+stamp the signal onto their settlement events (`evidence_defaulted`),
+so the arbiter, the panel members, and indexers apply the
+absent-evidence weight *against the escalating party* — i.e. the
+inference favors the other party. The crate deliberately does not
+invent a split for the arbiter: the bias is a tamper-proof procedural
+record, and the hard enforcement is the deadline itself. The
+`EvidenceSubmitted` indexer event (`from == to == Disputed`) carries
+each disclosure. New vault fields (appended last):
+`evidence_deadline_secs` (u64) + `escalated_by`
+(`Option<Pubkey>`, 33 bytes) — 41 bytes, so the full vault is now 2941
+bytes / 21,360,240 lamports rent-exempt.
+
 **Subscription release (AV-56).** A subscription is the clock-driven
 counterpart to the milestone tranche plan (AV-15): the initializer may
 opt in on `Uninitialized` (`with_subscription(period_secs, periods,
@@ -645,7 +687,10 @@ configured) — 8 bytes, so the full vault is now **2208 bytes** and
 needs **16,258,560 lamports**.) AV-66 appends the 81-byte tiered
 protocol-fee schedule region (1-byte live-tier count + 8 fixed 10-byte
 tier slots), so the full vault is now **2892 bytes** and needs
-**21,074,880 lamports**.
+**21,074,880 lamports**. AV-68 appends the 41-byte evidence-deadline
+region (8-byte `evidence_deadline_secs` + 33-byte `escalated_by`), so
+the full vault is now **2941 bytes** and needs **21,360,240
+lamports**.
 
 **Tiered protocol fee (AV-66).** An escrow can opt in to volume-priced
 fees at creation (`initialize_fee_schedule(tiers)`, opt-in on
@@ -948,6 +993,8 @@ program error per variant):
 | `InvalidTimelock` | 135 | `with_timelock` with a nonzero `unlock_at` while a nonzero relative timelock is configured, or `with_relative_timelock` with a nonzero `secs` while a nonzero absolute timelock is configured (one clock per escrow) |
 | `InvalidArbiterPanel` | 136 | `with_arbiter_panel` with an empty member list, more than 8 members, a zero threshold, a threshold above the member count, a zero member key, or a duplicate member; `submit_panel_judgment` with no panel configured |
 | `PanelResolveDisabled` | 137 | `resolve` called on a panel-mode escrow — the panel's multisig judgment (`submit_panel_judgment`) is the only settlement path once a panel is configured |
+| `InvalidEvidenceDeadline` | 138 | `with_evidence_deadline` with a zero deadline — a zero-second deadline would lapse the moment the dispute starts |
+| `EvidenceDisclosureLate` | 139 | `submit_evidence` at or past the disclosure deadline without evidence on record — a missed deadline locks in the judgment-time adverse inference |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1217,13 +1264,14 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
 | `amounts` | one struct for every kind: `payout` (gross taker amount before the fee split), `fee` (AV-17 protocol fee), `refund` (initializer's refund), `penalty` (AV-24 anti-griefing penalty on a taker-initiated `cancel_expired` / taker crank), `rent_reclaimed` (AV-34 rent-exempt deposit reclaimed on `VaultClosed`); zeroed when the kind moves no such value |
 | `at` | caller-supplied Unix-seconds timestamp (`cancel_expired` / `crank_expired` / `escalate` / `claim` reuse their `now`) |
 | `caller` | AV-48: the permissionless crank caller's key, carried by `ExpiredCranked` only (`None` on every other kind) |
+| `evidence_defaulted` | AV-68: whether the escalating party's evidence disclosure had defaulted at judgment time — `true` only on the settlement kinds (`Resolved`, `DefaultJudgment`, `PanelResolved`) when a disclosure deadline was configured, it had lapsed at the event's `at` timestamp, and no evidence was on record; the judgment-time adverse-inference signal biasing the absent-evidence weight toward the non-escalating party (`false` on every other kind) |
 
 **Emission rule.** Exactly one event per *successful* call that changes
 externally-observable state; failed calls emit nothing, and neither do
@@ -1498,7 +1546,7 @@ diffing numbers while operators read whole tokens.
  "claimable":0,"display_claimable":"0.000000",
  "arbiter":null,"mint":null,"fee_bps":0,"fees_paid":0,"display_fees_paid":"0.000000","fee_recipient":null,"fee_cap":0,
  "milestones":null,"skipped":0,"display_skipped":"0.000000",
- "evidence_hash":null,"rationale_hash":null,"refund_to":null,"refund_recipient":"...",
+ "evidence_hash":null,"evidence_deadline_secs":0,"escalated_by":null,"rationale_hash":null,"refund_to":null,"refund_recipient":"...",
  "penalty_bps":0,"unlock_at":0,"unlock_eligible":true,"relative_timelock_secs":0,"fund_at":1700000000,"payout_allowlist":null,"reference":null,
  "event_history":{"capacity":64,"total":0,"count":0,"entries":[]}}
 ```
@@ -1560,7 +1608,9 @@ two-way consistency check against the IDL parameter table:
 | fund_at | u64 | 8 |
 | arbiter_panel | Option<ArbiterPanel> | 595 |
 | fee_schedule | FeeSchedule | 81 |
-| **total**     |                   | **2892** |
+| evidence_deadline_secs | u64 | 8 |
+| escalated_by | Option<Pubkey> | 33 |
+| **total**     |                   | **2933** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1630,11 +1680,14 @@ and the 595-byte arbiter panel region (AV-65: 1-byte `Option`
 discriminant + 594-byte panel, zeroed when no panel is configured) —
 and the 81-byte tiered protocol-fee schedule region (AV-66: 1-byte
 live-tier count + 8 fixed 10-byte tier slots, zeroed when no schedule
-is configured).
-`escrow-state` exposes `VAULT_SPACE` (2900) and
-`VAULT_SPACE_NO_QUORUM` (2410) for the Anchor `space =` constraint, plus a
+is configured) — and the 8-byte dispute-evidence disclosure deadline
+(AV-68: zeroed when no deadline is configured) — and the 33-byte
+escalating-party region (AV-68: 1-byte discriminant + 32-byte key,
+zeroed when the escrow was never disputed).
+`escrow-state` exposes `VAULT_SPACE` (2941) and
+`VAULT_SPACE_NO_QUORUM` (2451) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **21,074,880 lamports** to be
+mainnet rent parameters the full vault needs **21,360,240 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1664,7 +1717,7 @@ the deposit:
   layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**20,511,120
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**21,360,240
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the

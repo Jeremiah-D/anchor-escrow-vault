@@ -886,6 +886,49 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Disclose (or replace) the dispute-evidence commitment while
+    /// `Disputed` (AV-68; mirrors `Escrow::submit_evidence`): the
+    /// escalating party supplies the 32-byte commitment to the
+    /// off-chain evidence, overwriting any previously attached hash.
+    /// Only the escalating party signs (`Unauthorized` otherwise);
+    /// `Disputed` only (`InvalidStateTransition` otherwise); at or
+    /// past the disclosure deadline the submission is rejected
+    /// (`EvidenceDisclosureLate`, code 139) — the deadline is a hard
+    /// bar, so a missed deadline locks in the judgment-time adverse
+    /// inference (the settlement events carry `evidence_defaulted`).
+    pub fn submit_evidence(ctx: Context<SubmitEvidence>, evidence_hash: [u8; 32]) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        escrow
+            .submit_evidence(
+                ctx.accounts.authority.key().to_bytes(),
+                evidence_hash,
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `now` doubles as the event's `at`, mirroring
+        // `IndexedEscrow::submit_evidence`. AV-68: the EvidenceSubmitted
+        // event carries the disclosed commitment in its evidence slot.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::EvidenceSubmitted,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            Some(evidence_hash),
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// Settle a disputed escrow (AV-14; mirrors `Escrow::resolve`):
     /// `Disputed -> Settled`. Only the configured arbiter signs;
     /// `taker_amount` is the taker's share of the remaining locked funds
@@ -935,6 +978,11 @@ pub mod escrow_vault {
         // AV-38: the Resolved event carries the rationale-document
         // commitment the arbiter attached — the settlement references
         // the ruling it wrote.
+        // AV-68: the Resolved event carries `evidence_defaulted` when
+        // the disclosure deadline lapsed undisclosed — the
+        // judgment-time adverse-inference signal favoring the
+        // non-escalating party (computed by `emit_transition` from the
+        // vault's escrow at emit time).
         emit_transition(
             &ctx.accounts.vault,
             escrow_state::EscrowEventKind::Resolved,
@@ -1440,6 +1488,28 @@ pub mod escrow_vault {
         // `vault.grace_period` is always present (8 bytes, zeroed by
         // default), so the period is written in place — no realloc needed
         // in the real build.
+        Ok(())
+    }
+
+    /// Declare the dispute-evidence disclosure deadline (AV-68; mirrors
+    /// `Escrow::with_evidence_deadline`): seconds in `Disputed` after
+    /// which the escalating party's evidence disclosure defaults
+    /// (measured from `disputed_at`, recorded by `escalate`). `Uninitialized`
+    /// only; the arbiter (or panel) must already be configured
+    /// (`InvalidArbiter` otherwise); a zero deadline is
+    /// `InvalidEvidenceDeadline` (code 138).
+    pub fn initialize_evidence_deadline(
+        ctx: Context<InitializeEvidenceDeadline>,
+        deadline_secs: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_evidence_deadline(deadline_secs)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.evidence_deadline_secs` is always present (8 bytes,
+        // zeroed by default), so the deadline is written in place — no
+        // realloc needed in the real build.
         Ok(())
     }
 
@@ -2917,6 +2987,16 @@ pub struct EscrowVaultEvent {
     /// indexer learns the evidence reference from the event stream
     /// without a second account read.
     pub evidence_hash: Option<[u8; 32]>,
+    /// AV-68: whether the escalating party's evidence disclosure had
+    /// defaulted at judgment time — `true` only on the settlement
+    /// kinds (`Resolved`, `DefaultJudgment`, `PanelResolved`) when a
+    /// disclosure deadline was configured, it had lapsed at the
+    /// event's `at` timestamp, and no evidence was on record. Mirrors
+    /// `escrow_state::EscrowEvent::evidence_defaulted`: the
+    /// judgment-time adverse-inference signal, biasing the
+    /// absent-evidence weight toward the non-escalating party.
+    /// Read from the vault's escrow at emit time, like `reference`.
+    pub evidence_defaulted: bool,
     /// AV-38: the arbiter's rationale-document commitment carried by
     /// the `Resolved` event (`None` for every other kind); mirrors
     /// `escrow_state::EscrowEvent::rationale_hash`, so an off-chain
@@ -3040,6 +3120,12 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::rotate_arbiter`). Mirrors
     /// `escrow_state::EscrowEventKind::ArbiterRotated`.
     ArbiterRotated,
+    /// AV-68: the escalating party disclosed (or replaced) the
+    /// dispute-evidence commitment (`Escrow::submit_evidence`).
+    /// `from == to == Disputed`; the disclosed commitment rides the
+    /// event's evidence slot. Mirrors
+    /// `escrow_state::EscrowEventKind::EvidenceSubmitted`.
+    EvidenceSubmitted,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -3106,6 +3192,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         escrow_state::EscrowEventKind::ArbiterRotated => {
             EscrowVaultEventKind::ArbiterRotated
         }
+        escrow_state::EscrowEventKind::EvidenceSubmitted => {
+            EscrowVaultEventKind::EvidenceSubmitted
+        }
     }
 }
 
@@ -3134,7 +3223,8 @@ pub struct Initialize<'info> {
     // slots, AV-59 the 8-byte extension bound + the 8-byte extension
     // counter, AV-63 the 8-byte absolute protocol-fee ceiling, AV-64
     // the 8-byte relative timelock duration + the 8-byte funding
-    // timestamp).
+    // timestamp, AV-68 the 8-byte evidence-disclosure deadline + the
+    // 33-byte escalating-party region).
     // The payer must fund at least the rent-exempt minimum for this space
     // — `escrow_state::check_vault_rent_exempt` is the pure-logic mirror of
     // that check (on-chain: `Rent::get()?.is_exempt(...)`); with mainnet
@@ -3468,6 +3558,21 @@ pub struct Escalate<'info> {
     /// CHECK: Solana clock sysvar, read for the dispute-window check
     /// (never an instruction param — a caller-supplied timestamp could
     /// rewind past the window).
+    pub clock: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SubmitEvidence<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Must equal the escalating party recorded by `escalate`; the
+    /// state machine rejects anyone else with `Unauthorized`. A
+    /// constraint in the real build additionally asserts
+    /// `authority.key() == vault.escalated_by`.
+    pub authority: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the disclosure-deadline
+    /// check (never an instruction param — a caller-supplied timestamp
+    /// could rewind past the deadline).
     pub clock: AccountInfo<'info>,
 }
 
@@ -3899,6 +4004,17 @@ pub struct InitializeGracePeriod<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitializeEvidenceDeadline<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer configures the disclosure deadline; the
+    /// state machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`, and requires the arbiter (or panel) to be
+    /// configured first.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct CloseVault<'info> {
     /// The vault closes through Anchor's `close` constraint: the runtime
     /// transfers the account's lamports — including the rent-exempt
@@ -4012,6 +4128,16 @@ fn emit_transition(
     cpi_accounts_hash: Option<[u8; 32]>,
     caller: Option<Pubkey>,
 ) {
+    // AV-68: the judgment-time adverse-inference signal rides the
+    // settlement kinds — read from the vault's escrow at emit time
+    // (mirroring `IndexedEscrow`), so the event stream always agrees
+    // with the account.
+    let evidence_defaulted = matches!(
+        kind,
+        escrow_state::EscrowEventKind::Resolved
+            | escrow_state::EscrowEventKind::DefaultJudgment
+            | escrow_state::EscrowEventKind::PanelResolved
+    ) && read_escrow(vault).evidence_defaulted(at);
     emit!(EscrowVaultEvent {
         kind: escrow_event_kind(kind),
         vault: vault.key(),
@@ -4023,6 +4149,7 @@ fn emit_transition(
         refund,
         at,
         evidence_hash,
+        evidence_defaulted,
         rationale_hash,
         cpi_target,
         cpi_accounts_hash,
@@ -4257,6 +4384,12 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::PanelResolveDisabled => {
             error!(ErrorCode::PanelResolveDisabled)
         }
+        escrow_state::EscrowError::InvalidEvidenceDeadline => {
+            error!(ErrorCode::InvalidEvidenceDeadline)
+        }
+        escrow_state::EscrowError::EvidenceDisclosureLate => {
+            error!(ErrorCode::EvidenceDisclosureLate)
+        }
     }
 }
 
@@ -4338,4 +4471,8 @@ pub enum ErrorCode {
     InvalidArbiterPanel,
     #[msg("Single-arbiter settlement disabled (AV-65): resolve called on a panel-mode escrow — the panel's multisig judgment (submit_panel_judgment) is the only settlement path; the AV-55 default-judgment fallback is retained")]
     PanelResolveDisabled,
+    #[msg("Invalid evidence-disclosure deadline (AV-68): with_evidence_deadline with a zero deadline — a zero-second deadline would lapse the moment the dispute starts")]
+    InvalidEvidenceDeadline,
+    #[msg("Evidence disclosure arrived too late (AV-68): submit_evidence at or past the disclosure deadline without evidence on record — a missed deadline locks in the judgment-time adverse inference")]
+    EvidenceDisclosureLate,
 }

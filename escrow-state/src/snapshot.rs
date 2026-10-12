@@ -277,6 +277,14 @@ pub struct EscrowSnapshot {
     /// Dispute evidence commitment attached at `escalate`, or `None`
     /// when no evidence was supplied (AV-22).
     pub evidence_hash: Option<[u8; 32]>,
+    /// Dispute-evidence disclosure deadline in seconds, or `0` when no
+    /// deadline was configured (AV-68 — see
+    /// [`Escrow::with_evidence_deadline`]).
+    pub evidence_deadline_secs: u64,
+    /// Which party escalated into `Disputed` — the party the disclosure
+    /// deadline binds — or `None` when the escrow was never disputed
+    /// (AV-68).
+    pub escalated_by: Option<[u8; 32]>,
     /// The arbiter's rationale-document commitment attached at
     /// `resolve`, or `None` when the arbiter supplied no rationale
     /// (AV-38). Only `Some` on a `Settled` escrow — never cleared, so
@@ -437,6 +445,12 @@ impl Escrow {
             milestones,
             skipped: self.skipped_amount(),
             evidence_hash: self.evidence_hash(),
+            // AV-68: the disclosure deadline and the escalating party
+            // ride the export, so an off-chain indexer can compute the
+            // disclosure status (pending / defaulted) from one
+            // snapshot.
+            evidence_deadline_secs: self.evidence_deadline_secs(),
+            escalated_by: self.escalated_by(),
             rationale_hash: self.rationale_hash(),
             refund_to: self.refund_to(),
             refund_recipient: self.refund_recipient(),
@@ -686,6 +700,13 @@ impl EscrowSnapshot {
         s.push_str(&format_amount(self.skipped, self.decimals));
         s.push_str("\",\"evidence_hash\":");
         write_opt_hex(&mut s, self.evidence_hash);
+        // AV-68: the disclosure deadline (seconds; 0 = none configured)
+        // and the escalating party (`null` when never disputed) — an
+        // off-chain indexer derives the disclosure status from these.
+        s.push_str(",\"evidence_deadline_secs\":");
+        s.push_str(&self.evidence_deadline_secs.to_string());
+        s.push_str(",\"escalated_by\":");
+        write_opt_hex(&mut s, self.escalated_by);
         // AV-38: the arbiter's rationale-document commitment — `null`
         // until the arbiter attaches one at `resolve`.
         s.push_str(",\"rationale_hash\":");
@@ -855,7 +876,7 @@ mod snapshot_tests {
              \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
              \"milestones\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
-             \"evidence_hash\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
+             \"evidence_hash\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
              \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
@@ -1025,6 +1046,40 @@ mod snapshot_tests {
         let json = snap.to_json();
         assert!(json.contains(&format!("\"arbiter\":\"{}\"", hex_of(0xA8))));
         assert!(json.contains(&format!("\"evidence_hash\":\"{}\"", hex_of(0xE1))));
+    }
+
+    #[test]
+    fn disputed_snapshot_carries_evidence_deadline_and_escalator() {
+        // AV-68: the snapshot exports the disclosure deadline and the
+        // escalating party, so an off-chain indexer derives the
+        // disclosure status from one snapshot.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_evidence_deadline(3_600)
+            .unwrap();
+        e.fund(ALICE, VEST_START).unwrap();
+        e.escalate(BOB, MID, None).unwrap();
+        let snap = e.snapshot(MID);
+        assert_eq!(snap.evidence_deadline_secs, 3_600);
+        assert_eq!(snap.escalated_by, Some(BOB));
+        let json = snap.to_json();
+        assert!(json.contains("\"evidence_deadline_secs\":3600"));
+        assert!(json.contains(&format!("\"escalated_by\":\"{}\"", hex_of(0xBB))));
+        // No deadline configured: zero + null.
+        let mut plain = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        plain.fund(ALICE, VEST_START).unwrap();
+        plain.escalate(ALICE, MID, None).unwrap();
+        let plain_snap = plain.snapshot(MID);
+        assert_eq!(plain_snap.evidence_deadline_secs, 0);
+        assert_eq!(plain_snap.escalated_by, Some(ALICE));
+        let plain_json = plain_snap.to_json();
+        assert!(plain_json.contains("\"evidence_deadline_secs\":0"));
+        assert!(plain_json.contains(&format!("\"escalated_by\":\"{}\"", hex_of(0xAA))));
     }
 
     #[test]

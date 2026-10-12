@@ -446,6 +446,22 @@
       "args": [
         {"name": "secs", "type": "u64"}
       ]
+    },
+    {
+      "name": "initialize_evidence_deadline",
+      "discriminator": [204, 4, 240, 39, 232, 161, 251, 234],
+      "accounts": [],
+      "args": [
+        {"name": "deadline_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "submit_evidence",
+      "discriminator": [12, 169, 228, 194, 229, 31, 44, 39],
+      "accounts": [],
+      "args": [
+        {"name": "evidence_hash", "type": {"array": ["u8", 32]}}
+      ]
     }
   ],
   "accounts": [
@@ -500,7 +516,9 @@
           {"name": "relative_timelock_secs", "type": "u64", "offset": 2208},
           {"name": "fund_at", "type": "u64", "offset": 2216},
           {"name": "arbiter_panel", "type": {"option": {"defined": "ArbiterPanel"}}, "offset": 2224},
-          {"name": "fee_schedule", "type": {"defined": "FeeSchedule"}, "offset": 2819}
+          {"name": "fee_schedule", "type": {"defined": "FeeSchedule"}, "offset": 2819},
+          {"name": "evidence_deadline_secs", "type": "u64", "offset": 2900},
+          {"name": "escalated_by", "type": {"option": "publicKey"}, "offset": 2908}
         ]
       }
     }
@@ -664,7 +682,9 @@
     {"code": 134, "name": "InvalidExpiryExtension"},
     {"code": 135, "name": "InvalidTimelock"},
     {"code": 136, "name": "InvalidArbiterPanel"},
-    {"code": 137, "name": "PanelResolveDisabled"}
+    {"code": 137, "name": "PanelResolveDisabled"},
+    {"code": 138, "name": "InvalidEvidenceDeadline"},
+    {"code": 139, "name": "EvidenceDisclosureLate"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

@@ -1154,6 +1154,37 @@ mod keeper_tests {
     }
 
     #[test]
+    fn disputed_evidence_deadline_survives_keeper_scan() {
+        // AV-68 passthrough: the watched snapshot keeps the disclosure
+        // deadline and the escalating party, so operator tooling can
+        // compute the disclosure status (pending / defaulted) without
+        // a second account read.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_arbiter([0xA8; 32])
+            .unwrap()
+            .with_evidence_deadline(3_600)
+            .unwrap();
+        e.fund(ALICE, MID).unwrap();
+        e.escalate(BOB, MID, None).unwrap();
+        let watched = [watch(ID1, e)];
+        let report = scan_keeper_actions(&watched, MID);
+        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions[0].kind, KeeperActionKind::Resolve);
+        assert_eq!(watched[0].escrow.evidence_deadline_secs(), 3_600);
+        assert_eq!(watched[0].escrow.escalated_by(), Some(BOB));
+        assert_eq!(watched[0].escrow.evidence_due_at(), Some(MID + 3_600));
+        assert_eq!(
+            watched[0].escrow.evidence_status(MID + 3_599),
+            crate::EvidenceStatus::Pending
+        );
+        assert_eq!(
+            watched[0].escrow.evidence_status(MID + 3_600),
+            crate::EvidenceStatus::Defaulted
+        );
+    }
+
+    #[test]
     fn scan_is_dry_run_and_preserves_input_order() {
         let e1 = funded(AMOUNT, 0); // -> cancel_expired
         let e2 = funded_vesting(NEVER); // -> claim

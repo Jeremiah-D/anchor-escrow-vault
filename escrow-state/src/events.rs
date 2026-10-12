@@ -143,7 +143,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62), FeeRecipientRotated (AV-67) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | PartiallyCancelled (AV-60) | 0 | 0 | the partially-cancelled tranche, refunded to the whitelisted destination (the escrow stays `Funded`; the `released` counter is untouched) | 0 |
@@ -367,6 +367,14 @@ pub enum EscrowEventKind {
     /// (`InvalidFeeRecipient`), so the event can never fire on a
     /// recipient-less escrow.
     FeeRecipientRotated,
+    /// AV-68: the escalating party disclosed (or replaced) the
+    /// dispute-evidence commitment ([`Escrow::submit_evidence`]).
+    /// `from == to == Disputed` (a disclosure, not a lifecycle move —
+    /// like [`EscrowEventKind::Attested`]); the disclosed commitment
+    /// rides the event's evidence slot, so the log records exactly
+    /// what the arbiter can review. All amounts are zero — disclosure
+    /// moves no funds.
+    EvidenceSubmitted,
 }
 
 impl EscrowEventKind {
@@ -423,6 +431,10 @@ impl EscrowEventKind {
             // AV-67: appended after PanelResolved so discriminants
             // 0–31 stay stable for already-serialized histories.
             32 => Self::FeeRecipientRotated,
+            // AV-68: appended after FeeRecipientRotated so
+            // discriminants 0–32 stay stable for already-serialized
+            // histories.
+            33 => Self::EvidenceSubmitted,
             _ => return None,
         })
     }
@@ -464,6 +476,7 @@ impl EscrowEventKind {
             Self::PanelJudgment => "panel_judgment",
             Self::PanelResolved => "panel_resolved",
             Self::FeeRecipientRotated => "fee_recipient_rotated",
+            Self::EvidenceSubmitted => "evidence_submitted",
         }
     }
 }
@@ -623,6 +636,18 @@ pub struct EscrowEvent {
     pub amounts: EventAmounts,
     pub at: u64,
     pub evidence_hash: Option<[u8; 32]>,
+    /// AV-68: whether the escalating party's evidence disclosure had
+    /// defaulted at judgment time — read from the escrow at emit time
+    /// (never a `push_event` parameter), so the log always agrees with
+    /// the account. `true` only on the settlement kinds (`Resolved`,
+    /// `DefaultJudgment`, `PanelResolved`) when a disclosure deadline
+    /// was configured, it had lapsed at the event's `at` timestamp,
+    /// and no evidence commitment was on record — the judgment-time
+    /// adverse-inference signal: the absent-evidence weight favors the
+    /// non-escalating party (see
+    /// [`crate::Escrow::evidence_defaulted`]). `false` on every other
+    /// kind — the event log never invents a default.
+    pub evidence_defaulted: bool,
     /// AV-38: the arbiter's rationale-document commitment, carried by
     /// the `Resolved` event (`None` on every other kind); mirrors
     /// [`Escrow::rationale_hash`], so the settlement references the
@@ -741,6 +766,19 @@ impl IndexedEscrow {
             rationale_hash,
             cpi,
             caller,
+            // AV-68: the judgment-time adverse-inference signal rides
+            // the settlement kinds — read from the escrow at emit time
+            // (never a push_event parameter), so the log always agrees
+            // with the account. The event's `at` is the judgment-time
+            // clock: a settlement whose deadline lapsed undisclosed
+            // records the default for the arbiter, the panel members,
+            // and indexers.
+            evidence_defaulted: matches!(
+                kind,
+                EscrowEventKind::Resolved
+                    | EscrowEventKind::DefaultJudgment
+                    | EscrowEventKind::PanelResolved
+            ) && self.inner.evidence_defaulted(at),
             // AV-53: the off-chain reference memo rides every event —
             // read from the escrow at emit time (never a push_event
             // parameter), so the log always agrees with the account.
@@ -875,6 +913,16 @@ impl IndexedEscrow {
         threshold: u8,
     ) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_arbiter_panel(members, threshold)?;
+        Ok(self)
+    }
+
+    /// Opt in to the dispute-evidence disclosure deadline (mirrors
+    /// [`Escrow::with_evidence_deadline`], AV-68): declare the window
+    /// the escalating party gets to disclose the dispute evidence
+    /// before the judgment-time adverse inference kicks in.
+    /// Configuration: emits no event.
+    pub fn with_evidence_deadline(mut self, deadline_secs: u64) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_evidence_deadline(deadline_secs)?;
         Ok(self)
     }
 
@@ -1812,6 +1860,36 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Disclose (or replace) the dispute-evidence commitment while
+    /// `Disputed` (mirrors [`Escrow::submit_evidence`], AV-68). Emits
+    /// `EvidenceSubmitted` (`from == to == Disputed`) carrying the
+    /// disclosed commitment in the event's evidence slot; `now` doubles
+    /// as the event's `at`. Only the escalating party may call (the
+    /// inner method enforces it); a post-deadline disclosure is
+    /// rejected and emits nothing.
+    pub fn submit_evidence(
+        &mut self,
+        authority: [u8; 32],
+        evidence_hash: [u8; 32],
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner.submit_evidence(authority, evidence_hash, now)?;
+        self.push_event(
+            EscrowEventKind::EvidenceSubmitted,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            now,
+            Some(evidence_hash),
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(())
+    }
+
     /// Settle a disputed escrow (mirrors [`Escrow::resolve`]). Emits
     /// `Resolved` (`Disputed -> Settled`) with the gross taker share in
     /// `amounts.payout`, the protocol fee in `amounts.fee`, and the
@@ -2726,6 +2804,153 @@ mod event_tests {
                 EscrowEventKind::Escalated | EscrowEventKind::Resolved
             ))
             .all(|ev| ev.evidence_hash.is_none()));
+    }
+
+    // ---------- AV-68: evidence-disclosure deadline events ----------
+
+    const EVIDENCE_DEADLINE: u64 = 3_600;
+
+    fn disputed_with_evidence_deadline(escalator: [u8; 32], at: u64) -> IndexedEscrow {
+        let mut e = indexed(1_000_000)
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_evidence_deadline(EVIDENCE_DEADLINE)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.escalate(escalator, at, None).unwrap();
+        e
+    }
+
+    #[test]
+    fn submit_evidence_emits_evidence_submitted() {
+        // The disclosure rides the event's evidence slot; from == to ==
+        // Disputed (a disclosure, not a lifecycle move).
+        const EVIDENCE: [u8; 32] = [0xE1; 32];
+        let mut e = disputed_with_evidence_deadline(BOB, T0 + 10);
+        e.submit_evidence(BOB, EVIDENCE, T0 + 11).unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::EvidenceSubmitted);
+        assert_eq!(event.from, EscrowState::Disputed);
+        assert_eq!(event.to, EscrowState::Disputed);
+        assert_eq!(event.evidence_hash, Some(EVIDENCE));
+        assert_eq!(event.at, T0 + 11);
+        assert!(!event.evidence_defaulted, "disclosure is not a settlement");
+        // A rejected (late) disclosure emits nothing.
+        let n = e.events().len();
+        assert!(e
+            .submit_evidence(BOB, EVIDENCE, T0 + 10 + EVIDENCE_DEADLINE)
+            .is_err());
+        assert_eq!(e.events().len(), n, "failed call emits nothing");
+    }
+
+    #[test]
+    fn resolved_event_flags_evidence_default() {
+        // The deadline lapsed with no evidence on record: the
+        // settlement records the default — the adverse-inference
+        // signal favoring the non-escalating party.
+        let mut e = disputed_with_evidence_deadline(BOB, T0 + 10);
+        let settled_at = T0 + 10 + EVIDENCE_DEADLINE + 1;
+        e.resolve(ARBITER, 600_000, None, None, BOB, settled_at)
+            .unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::Resolved);
+        assert!(event.evidence_defaulted, "deadline lapsed undisclosed");
+        assert_eq!(event.evidence_hash, None);
+    }
+
+    #[test]
+    fn resolved_event_no_default_when_disclosed_in_time() {
+        // Disclosure within the window clears the inference — even
+        // when the settlement happens after the deadline.
+        const EVIDENCE: [u8; 32] = [0xE1; 32];
+        let mut e = disputed_with_evidence_deadline(BOB, T0 + 10);
+        e.submit_evidence(BOB, EVIDENCE, T0 + 11).unwrap();
+        e.resolve(ARBITER, 600_000, None, None, BOB, T0 + 10 + EVIDENCE_DEADLINE + 1)
+            .unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::Resolved);
+        assert!(!event.evidence_defaulted);
+        assert_eq!(event.evidence_hash, Some(EVIDENCE));
+    }
+
+    #[test]
+    fn resolved_event_no_default_without_deadline() {
+        // Backward compatible: no deadline configured, no default
+        // signal — even settling "late".
+        let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.escalate(BOB, T0 + 10, None).unwrap();
+        e.resolve(ARBITER, 600_000, None, None, BOB, u64::MAX - 1)
+            .unwrap();
+        assert!(!last(&e).evidence_defaulted);
+    }
+
+    #[test]
+    fn default_judgment_event_flags_evidence_default() {
+        // The AV-55 fallback settlement carries the same
+        // judgment-time signal.
+        let mut e = indexed(1_000_000)
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_evidence_deadline(EVIDENCE_DEADLINE)
+            .unwrap()
+            .with_arbitration_deadline(7_200, 400_000)
+            .unwrap()
+            .confirm_default_judgment(BOB)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.escalate(ALICE, T0 + 10, None).unwrap();
+        let trigger_at = T0 + 10 + 7_200;
+        e.trigger_default_judgment(BOB, trigger_at, None, BOB, trigger_at)
+            .unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::DefaultJudgment);
+        assert!(event.evidence_defaulted, "deadline lapsed undisclosed");
+    }
+
+    #[test]
+    fn panel_resolved_event_flags_evidence_default() {
+        // Panel mode: the multisig settlement carries the signal too.
+        const M1: [u8; 32] = [0xC1; 32];
+        const M2: [u8; 32] = [0xC2; 32];
+        let mut e = indexed(1_000_000)
+            .with_arbiter_panel(&[M1, M2], 2)
+            .unwrap()
+            .with_evidence_deadline(EVIDENCE_DEADLINE)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.escalate(BOB, T0 + 10, None).unwrap();
+        let settled_at = T0 + 10 + EVIDENCE_DEADLINE + 1;
+        e.submit_panel_judgment(M1, 600_000, None, None, BOB, settled_at)
+            .unwrap();
+        e.submit_panel_judgment(M2, 600_000, None, None, BOB, settled_at)
+            .unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::PanelResolved);
+        assert!(event.evidence_defaulted, "deadline lapsed undisclosed");
+        // The vote events themselves never carry the settlement
+        // signal.
+        assert!(e
+            .events()
+            .iter()
+            .filter(|ev| ev.kind == EscrowEventKind::PanelJudgment)
+            .all(|ev| !ev.evidence_defaulted));
+    }
+
+    #[test]
+    fn non_settlement_events_never_carry_the_default_signal() {
+        // The log never invents a default: only the three settlement
+        // kinds may carry it.
+        let mut e = disputed_with_evidence_deadline(BOB, T0 + 10);
+        assert!(e
+            .events()
+            .iter()
+            .all(|ev| !ev.evidence_defaulted));
+        e.submit_evidence(BOB, [0xE1; 32], T0 + 11).unwrap();
+        assert!(e
+            .events()
+            .iter()
+            .all(|ev| !ev.evidence_defaulted));
     }
 
     #[test]
