@@ -66,6 +66,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 |---------------------------------------------|----------------|-----------|------------------------|
 | `initialize(initializer, taker, amount, expires_at)` | — | `Uninitialized` | anyone (amount > 0) |
 | `initialize_arbiter(arbiter)`               | `Uninitialized`| `Uninitialized` | initializer (once, before funding; zero key rejected; mutually exclusive with `initialize_arbiter_panel` — last-wins in both directions) |
+| `initialize_slash_terms(penalty_account, slash_deadline)` (AV-82) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; the zero penalty account is rejected — the penalty sink must be a real identity, `SlashNotEligible` code 143) |
 | `initialize_arbiter_panel(members, threshold)` (AV-65) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opt-in multisig arbitration: 1–8 member keys, threshold 1..=N, zero/duplicate keys rejected as `InvalidArbiterPanel`, code 136; mutually exclusive with the single arbiter — last-wins in both directions; `rotate_arbiter` is `InvalidStateTransition` in panel mode) |
 | `escalate(authority, now, evidence_hash)`   | `Funded`       | `Disputed` | initializer **or** taker, only when `now < expires_at` (locks `release`/`cancel`/`cancel_expired`/`claim`); `evidence_hash` is the optional 32-byte off-chain-evidence commitment, persisted |
 | `resolve(authority, taker_amount, rationale_hash)` | `Disputed`     | `Settled` | arbiter only; atomic split of the remainder (taker payout / initializer refund); `rationale_hash` is the optional 32-byte commitment to the arbiter's off-chain rationale document, persisted in `Settled` (never cleared); **disabled in panel mode** (`PanelResolveDisabled`, code 137 — the panel's multisig judgment is the only settlement path once a panel is configured) |
@@ -84,7 +85,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `skip_milestone(authority, index)`           | `Funded`       | — (no state change) | initializer **or** taker, **both** must approve (dual-sig skip; skipped tranche refunded to the initializer) |
 | `adjust_milestone_amounts(initializer, taker, new_amounts)` (AV-70) | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the tranche table) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition`; rejected once any tranche settled (`released > 0` or `skipped > 0`); new amounts must have the plan's tranche count, be all positive, and sum to exactly the locked amount; per-tranche confirmations survive (they accept the deliverable, not the amount); protocol fees charge on the new amounts at release time (still floored by `fee_cap`); emits `MilestonesAdjusted` only on an actual change |
 | `adjust_period_amounts(initializer, taker, new_amounts)` (AV-73) | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the per-period table) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition`; released periods lock their recorded amounts (the re-split must reaffirm them — `InvalidSubscription` otherwise); new amounts must have the schedule's period count, be all positive, and sum to exactly the locked amount; protocol fees charge on the new amounts at release time (still floored by `fee_cap`); the keeper's `ReleasePeriod` action prices from the live table; emits `SubscriptionAmountsAdjusted` only on an actual change |
-| `migrate_schema()` (AV-75) | any | — (no state change; stamps the schema version) | initializer **only** (`Unauthorized` otherwise, checked before state validity); a paused escrow fails fast (`Paused`); only `schema_version + 1 == SCHEMA_VERSION` steps — an already-current vault refuses the second call and an unknown future version refuses loudly instead of skipping forward (`InvalidSchemaMigration`, code 140, either way); the carried-over fields are re-validated before the stamp (`released <= amount`, `released + skipped <= amount`, `fees_paid <= released`, milestone tranche sum `== amount`) — a corrupt vault is refused, never migrated; emits `SchemaMigrated` (from == to == the current state), always on success |
+| `migrate_schema()` (AV-75) | any | — (no state change; stamps the schema version) | initializer **only** (`Unauthorized` otherwise, checked before state validity); a paused escrow fails fast (`Paused`); the gate is a catch-up gate (AV-82: `schema_version < SCHEMA_VERSION` steps — a pre-AV-75 vault jumps straight to the current revision instead of being stranded by the old `+1` gate); an already-current vault refuses the second call and an unknown future version refuses loudly instead of skipping forward (`InvalidSchemaMigration`, code 140, either way); the carried-over fields are re-validated before the stamp (`released <= amount`, `released + skipped <= amount`, `fees_paid <= released`, milestone tranche sum `== amount`) — a corrupt vault is refused, never migrated; emits `SchemaMigrated` (from == to == the current state), always on success |
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
 | `initialize_protocol_fee(fee_bps)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `fee_bps` in 0–10000 basis points; the fee slices every taker payout into net payout + protocol fee; the AV-63 fee cap can floor it per payout) |
 | `initialize_fee_cap(max_fee_cents)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; absolute per-payout fee ceiling in lamports — the effective fee is `min(bps fee, fee_cap)`; `0` means uncapped; no new error code) |
@@ -110,6 +111,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise) |
 | `fund(authority, now)`                      | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer (`now` <- clock sysvar, recorded as `fund_at` — the origin the AV-64 relative timelock measures from) |
 | `release(authority, now, amount, payout_to)` (AV-49)                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); cumulative releases ≤ locked amount; `payout_to` must satisfy the payout policy — the taker, or a member of the payout allowlist when one is configured (`PayoutNotAllowlisted` otherwise) |
+| `slash(authority, amount)` (AV-82) | `Funded` | `Funded` (no state change — the escrow stays live, the taker can still earn the remainder) | initializer **or** the configured arbiter (the neutral enforcer — one party's griefing cannot burn the other's stake); `now` <- clock sysvar; requires the AV-82 slash terms (`Uninitialized`-time opt-in), `now >= slash_deadline`, and the amount ≤ the slashable remainder (`amount - released - penalty_paid`); **one-shot** (a second slash is `SlashNotEligible`); `Disputed` is locked (`SlashNotEligible` — arbitration owns the funds) and milestone/subscription-scheduled escrows reject slash (the schedule owns the release path); on a dual-sig escrow both activation bits must be set; the slashed amount moves to the fixed penalty account and accumulates in `penalty_paid` (never in `released` — the audit trail distinguishes a default penalty from a taker payout); emits `Slashed` (`amounts.penalty` = the slashed amount) |
 | `initialize_timelock(unlock_at)`            | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `unlock_at` is the Unix timestamp before which no taker payout may leave; `0` = no lock) |
 | `initialize_relative_timelock(secs)` (AV-64) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `secs` is the duration in seconds after *funding* before which no taker payout may leave; `0` = no lock; mutually exclusive with the AV-27 absolute timelock — both nonzero is `InvalidTimelock`, code 135) |
 | `initialize_emergency_unlock()`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opts into dual-signed emergency timelock-unlock governance) |
@@ -498,6 +500,16 @@ live per-period amount table (`subscription_amounts`: 64 `u64` slots),
 so the full vault is now 3453 bytes / 24,923,760 lamports rent-exempt.
 AV-75 appends the 1-byte schema version (`schema_version`), so the full
 vault is now 3454 bytes / 24,930,720 lamports rent-exempt.
+AV-82 appends the 41-byte opt-in slash terms (`slash_terms`: 1-byte
+`Option` discriminant + 32-byte penalty account + 8-byte slash deadline)
+and the 8-byte cumulative slashed amount (`penalty_paid`), so the full
+vault is now 3503 bytes / 25,271,760 lamports rent-exempt. Like the
+quorum region, the slash-terms region is always reserved (zeroed when
+`None`), so `initialize_slash_terms` writes the terms in place — the
+account never needs a realloc. The schema revision bumps to 2, and the
+`migrate_schema` gate becomes a catch-up gate (`schema_version <
+SCHEMA_VERSION`) so a v0 vault is never stranded by the intermediate
+v1 revision.
 
 **Panel threshold governance (AV-69).** The right M-of-N is not always
 obvious at setup — a 2-of-3 panel may prove too slow (one member goes
@@ -771,7 +783,10 @@ the full vault is now **2941 bytes** and needs **21,360,240
 lamports**. AV-73 appends the 512-byte live per-period amount table, so
 the full vault is now **3453 bytes** and needs **24,923,760
 lamports**. AV-75 appends the 1-byte schema version, so the full vault
-is now **3454 bytes** and needs **24,930,720 lamports**.
+is now **3454 bytes** and needs **24,930,720 lamports**. AV-82 appends
+the 49-byte slash region (41-byte `slash_terms` + 8-byte `penalty_paid`),
+so the full vault is now **3503 bytes** and needs **25,271,760
+lamports**.
 
 **Tiered protocol fee (AV-66).** An escrow can opt in to volume-priced
 fees at creation (`initialize_fee_schedule(tiers)`, opt-in on
@@ -1078,6 +1093,7 @@ program error per variant):
 | `EvidenceDisclosureLate` | 139 | `submit_evidence` at or past the disclosure deadline without evidence on record — a missed deadline locks in the judgment-time adverse inference |
 | `InvalidSchemaMigration` | 140 | `migrate_schema` by a non-initializer, on a vault already at the current schema version (one-time), on a vault at an unknown future version (no skipping), or on a vault whose carried-over fields violate the conservation invariants — a corrupt vault is refused, never migrated |
 | `InvalidSplit` | 142 | `split_escrow` (AV-81) with an empty amount table, more than 16 children, a zero child amount, an amount table whose `u128` sum differs from the parent's remaining lockup, or a per-child milestone-plan list whose length mismatches the amount table |
+| `SlashNotEligible` | 143 | `initialize_slash_terms` (AV-82) with the zero penalty account; `slash` (AV-82) with no slash terms configured, before the slash deadline, on an already-slashed escrow (one-shot), with an amount above the slashable remainder, on a dual-sig escrow lacking both activation bits, on a `Disputed` escrow (arbitration owns the funds), or on a milestone/subscription-scheduled escrow (the schedule owns the release path) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1329,6 +1345,50 @@ initializer    taker            escrow                 state
    |---------------------------------->| Funded→Released       |
 ```
 
+**L. Default penalty — slash the defaulting taker.** The penalty clause
+is opted in before funding: the penalty account (the sink that receives
+slashed funds) and the deadline after which the default is enforceable.
+If the deadline passes with the escrow still `Funded`, the initializer —
+or the configured arbiter as the neutral enforcer — slashes once:
+
+```
+initializer    arbiter          escrow                 state
+   |  initialize_slash_terms(penalty, t0+30d)  |       |
+   |------------------------------------------>|  (terms fixed,  |
+   |                                           |   still Uninitialized)
+   |  fund(alice)  |                          |              |
+   |------------------------------------------>| Uninitialized→Funded |
+   |  slash(alice, amount/5, t0+10d)  // before the deadline → |
+   |                                 // Err(SlashNotEligible), |
+   |                                 // penalty_paid unchanged |
+   |  slash(alice, amount/5, t0+31d)  |                       |
+   |------------------------------------------>|  penalty_paid=  |
+   |                                           |  amount/5, stays |
+   |                                           |  Funded; Escrow  |
+   |                                           |  Slashed emitted |
+   |  slash(alice, amount/5, t0+32d)  // second slash →         |
+   |                                 // Err(SlashNotEligible):  |
+   |                                 // one-shot                |
+   |               slash(carol, amount/5, t0+31d)  |            |
+   |               ----------------------------->|  (arbiter as   |
+   |                                            |   neutral      |
+   |                                            |   enforcer —   |
+   |                                            |   but already  |
+   |                                            |   slashed →    |
+   |                                            |   Err(SlashNotEligible))
+   |  release(alice, amount, bob)  // → Err(ReleaseExceedsLocked):
+   |                             // capped at amount − released − penalty_paid
+   |  release(alice, 4*amount/5, bob)  |                      |
+   |------------------------------------------>|  Funded→Released |
+```
+
+The slashed amount never touches `released` — the audit trail keeps the
+default penalty and the taker payout in separate buckets, and the
+conservation invariant becomes `amount == released + penalty_paid +
+remaining`. A `Disputed` escrow rejects slash (arbitration owns the
+funds), and milestone/subscription-scheduled escrows reject it too (the
+schedule owns the release path).
+
 Note that `attest` never changes `EscrowState` itself (it only grows the
 quorum's approval bitmask), and the failed-call invariant holds on every
 path above: any `Err(...)` return leaves the state — and `amount` and the
@@ -1347,7 +1407,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -1534,6 +1594,7 @@ returns a `KeeperReport` of immediately executable calls:
 | `resolve(arbiter, taker_amount, mint, rationale_hash)` (AV-38) | `Disputed`, arbiter configured, remainder > 0 | arbiter | remaining locked amount the arbiter's split divides (the split itself and the rationale-document commitment are the arbiter's call-time judgment) |
 | `submit_panel_judgment(member, taker_amount, mint, rationale_hash)` (AV-65) | `Disputed`, panel configured, remainder > 0 — one action **per panel member** | panel member (`caller_role: "panel_member"`) | remaining locked amount the member's voted split divides (the split and the rationale commitment are the member's call-time judgment; the panel settles itself once M votes agree) |
 | `close_vault(authority)` (AV-40) | `Cancelled` / `Released` / `Settled` / `Split` — the terminal states AV-34's `close_vault` accepts (`Split` since AV-81). `Disputed` is never listed (the arbitration is still live; the vault account is the arbiter's audit surface) and `Closed` is never listed (the rent is already reclaimed) — the scan lists only calls the chain would accept | initializer (the only key `close_vault` accepts — AV-34 checks authority before state) | `rent_reclaimed`: the mainnet rent-exempt minimum for the current `VAULT_SPACE` (via `vault_close_rent_reclaimed()`, never a hardcoded figure) |
+| `slash(authority, amount)` (AV-82) | `Funded` with slash terms configured, `now >= slash_deadline`, slashable remainder > 0, and (dual-sig escrows) both activation bits set — one action for the initializer, plus one for the configured arbiter as the neutral enforcer; never listed on `Disputed` (arbitration owns the funds), milestone/subscription-scheduled, or already-slashed escrows | initializer / arbiter (per action) | the slashable remainder (`amount - released - penalty_paid`) |
 
 Only *executable* calls are listed: a vesting claim behind an unsatisfied
 quorum is withheld (the call would fail), a claim behind a locked timelock
@@ -1548,8 +1609,8 @@ Each action
 carries the exact instruction arguments — `caller`, `mint` (the bound SPL
 mint, or `null` on the native-SOL path), and `refund_to` (the refund
 destination for `cancel_expired` — the whitelisted address when
-configured, else the initializer; `null` for `claim` and `resolve`) — so the keeper can
-build the `cancel_expired` / `claim` / `resolve` instruction directly. The scan is a pure read
+configured, else the initializer; `null` for `claim`, `resolve`, and `slash` — the penalty account is fixed in the slash terms (AV-82), not a refund destination) — so the keeper can
+build the `cancel_expired` / `claim` / `resolve` / `slash` instruction directly. The scan is a pure read
 over `&Escrow` snapshots: dry-run by construction, zero side effects,
 deterministic output in input order. `KeeperReport::to_json()` emits
 hand-serialized JSON (the crate stays dependency-free; keys are 64-char
@@ -1768,7 +1829,12 @@ hex or `null`), `reference` (AV-53; hex or `null`), `refund_to` (hex or
 `null`), `arbiter_panel` (AV-65; `null` when no panel is configured —
 otherwise `n`, `threshold`, the 64-char hex member keys, and the
 recorded `votes`: per-member `taker_amount` plus the optional hex
-`rationale_hash`)
+`rationale_hash`), `slash_terms` (AV-82; `null` when no slash clause is
+configured — otherwise the 64-char hex `penalty_account` and the
+`slash_deadline`), `penalty_paid` (AV-82; cumulative slashed amount,
+`0` = never slashed), and `slash_eligible` (AV-82; the keeper's slash
+predicate at `at` — same predicate the scan uses, so a snapshot never
+disagrees with the scan)
 and the effective `refund_recipient` (whitelist when configured, else the
 initializer) — plus the retained on-chain event history (AV-57):
 `event_history` (the valid ring window, oldest-first — `kind` /
@@ -1796,7 +1862,7 @@ renders the bare integer). Raw fields stay untouched, so indexers keep
 diffing numbers while operators read whole tokens.
 
 ```json
-{"at":1750000000,"initializer":"...","taker":"...","state":"funded","schema_version":1,
+{"at":1750000000,"initializer":"...","taker":"...","state":"funded","schema_version":2,
  "amount":1000000,"decimals":6,"display_amount":"1.000000",
  "released":0,"display_released":"0.000000",
  "remaining":1000000,"display_remaining":"1.000000",
@@ -1808,7 +1874,7 @@ diffing numbers while operators read whole tokens.
  "milestones":null,"skipped":0,"display_skipped":"0.000000",
  "evidence_hash":null,"evidence_deadline_secs":0,"escalated_by":null,"rationale_hash":null,"refund_to":null,"refund_recipient":"...",
  "penalty_bps":0,"unlock_at":0,"unlock_eligible":true,"relative_timelock_secs":0,"fund_at":1700000000,"payout_allowlist":null,"reference":null,
- "event_history":{"capacity":64,"total":0,"count":0,"entries":[]}}
+ "slash_terms":null,"penalty_paid":0,"slash_eligible":false, "event_history":{"capacity":64,"total":0,"count":0,"entries":[]}}
 ```
 
 ## Account space & rent
@@ -1872,7 +1938,9 @@ two-way consistency check against the IDL parameter table:
 | escalated_by | Option<Pubkey> | 33 |
 | subscription_amounts | [u64; 64] | 512 |
 | schema_version | u8 | 1 |
-| **total**     |                   | **3446** |
+| slash_terms | Option<SlashTerms> | 41 |
+| penalty_paid | u64 | 8 |
+| **total**     |                   | **3495** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -1946,10 +2014,10 @@ is configured) — and the 8-byte dispute-evidence disclosure deadline
 (AV-68: zeroed when no deadline is configured) — and the 33-byte
 escalating-party region (AV-68: 1-byte discriminant + 32-byte key,
 zeroed when the escrow was never disputed).
-`escrow-state` exposes `VAULT_SPACE` (3454) and
-`VAULT_SPACE_NO_QUORUM` (2964) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (3503) and
+`VAULT_SPACE_NO_QUORUM` (3013) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **24,930,720 lamports** to be
+mainnet rent parameters the full vault needs **25,271,760 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -1970,17 +2038,17 @@ the deposit:
   already-serialized vaults) — the deepest terminal: every transition,
   and a second `close_vault`, is `InvalidStateTransition` from there.
   No vault field is added or moved by the close itself (`VAULT_SPACE`
-  stays 3454 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
+  stays 3503 — the AV-38 rationale-hash, AV-44 fee-recipient, AV-45
   weighted-quorum, AV-46 pause-switch, AV-49 payout-allowlist, AV-51
   vesting-cliff, AV-53 reference-memo, AV-55 default-judgment,
   AV-56 subscription, AV-57 event-history, AV-59 extension, AV-63
   fee-cap, AV-64 relative-timelock, AV-65 arbiter-panel, AV-66
-  fee-schedule, AV-68 evidence-deadline, AV-73 per-period-table, and
-  AV-75 schema-version growth is accounted in the
+  fee-schedule, AV-68 evidence-deadline, AV-73 per-period-table, AV-75
+  schema-version, and AV-82 slash-region growth is accounted in the
   layout table above); the state
   byte simply carries the new discriminant.
 - **Rent:** the returned value is `escrow_state::vault_close_rent_reclaimed()`
-  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**24,930,720
+  — the mainnet rent-exempt minimum for `VAULT_SPACE` (**25,271,760
   lamports**, the same figure `initialize` demanded), carried in the
   `VaultClosed` indexer event's `rent_reclaimed` amount. On-chain the
   real build closes the account with Anchor's `close` constraint and the

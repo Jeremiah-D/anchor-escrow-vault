@@ -39,16 +39,26 @@
 //!   rationale-document commitment are the member's call-time
 //!   judgment, so the action carries the splittable pool (`amount`)
 //!   and the bound mint.
+//! - `slash` (AV-82): the escrow is `Funded`, slash terms are
+//!   configured, the slash deadline has passed at `now`, and the
+//!   escrow was not slashed yet (see
+//!   [`Escrow::is_slash_eligible`]). The initializer is the canonical
+//!   caller; when an arbiter is configured, the neutral enforcer path
+//!   is listed as a second action (`caller_role: "arbiter"`). The
+//!   enforcement size is the caller's decision — the action carries
+//!   the slashable remainder (`amount`), not a decided slash.
 //!
 //! Every listed action carries the exact arguments the keeper needs to
 //! build the instruction: `caller` (the signing key), `mint` (the bound
 //! SPL mint, or `null` on the native-SOL path), `refund_to` (the refund
 //! destination for `cancel_expired` — the escrow's whitelisted address
-//! when configured, else the initializer; `null` for `claim` and
-//! `resolve`), and `amount` (the refund the `cancel_expired` call would
-//! return to the initializer, the gross vested-but-unreleased amount a
-//! `claim` would move — the protocol fee slices it, `payout + fee ==
-//! amount` — or the remaining locked amount a `resolve` would split).
+//! when configured, else the initializer; `null` for `claim`,
+//! `resolve`, and `slash`), and `amount` (the refund the
+//! `cancel_expired` call would return to the initializer, the gross
+//! vested-but-unreleased amount a `claim` would move — the protocol
+//! fee slices it, `payout + fee == amount` — the remaining locked
+//! amount a `resolve` would split, or the slashable remainder a
+//! `slash` would draw from).
 //!
 //! `Disputed` escrows list exactly the `resolve` action above in
 //! single-arbiter mode — or one `submit_panel_judgment` action per
@@ -210,6 +220,17 @@ pub enum KeeperActionKind {
     /// whose next period is due at the scan time — strictly in order,
     /// one per scan.
     ReleasePeriod,
+    /// `slash(authority, amount, mint, now)` (AV-82): the
+    /// default-penalty enforcement on a `Funded` escrow whose taker
+    /// missed the slash deadline. Listed when
+    /// [`Escrow::is_slash_eligible`] holds at scan time — a listed
+    /// slash is always executable, never a `Paused` or
+    /// `SlashNotEligible` rejection. The initializer is the canonical
+    /// keeper caller; when an arbiter is configured, the neutral
+    /// enforcer path is listed as a second action. `amount` is the
+    /// slashable remainder — the enforcement size is the caller's
+    /// decision at call time; the keeper carries the pool.
+    Slash,
 }
 
 impl KeeperActionKind {
@@ -223,6 +244,7 @@ impl KeeperActionKind {
             KeeperActionKind::Resolve => "resolve",
             KeeperActionKind::PanelJudgment => "submit_panel_judgment",
             KeeperActionKind::ReleasePeriod => "release_period",
+            KeeperActionKind::Slash => "slash",
         }
     }
 }
@@ -257,7 +279,9 @@ pub struct KeeperAction {
     /// actions, which pay the taker rather than refunding — and `None`
     /// for `resolve` / `submit_panel_judgment` actions, which split
     /// the remainder between the taker and the initializer rather
-    /// than refunding to one address.
+    /// than refunding to one address — and `None` for `slash` actions
+    /// (AV-82), which pay the escrow's configured penalty account,
+    /// not a refund destination.
     pub refund_to: Option<[u8; 32]>,
     /// `cancel_expired`: the refundable remainder the call would return
     /// to the initializer. `claim`: the gross vested-but-unreleased
@@ -629,6 +653,48 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     reference: w.reference,
                     extension_count: e.extension_count(),
                     reason: "subscription_period_due",
+                });
+            }
+        }
+        // AV-82: the default-penalty enforcement path. Listed exactly
+        // when `is_slash_eligible` holds at scan time — the predicate
+        // mirrors every `slash` gate (Funded, terms configured,
+        // deadline passed, not yet slashed, not paused, no
+        // milestone/subscription schedule), so a listed slash is always
+        // executable, never a `Paused` or `SlashNotEligible` rejection.
+        // The initializer is the canonical keeper caller; when an
+        // arbiter is configured the neutral enforcer path is listed
+        // too. `amount` is the slashable remainder — the enforcement
+        // size is the caller's decision at call time.
+        if e.is_slash_eligible(now) && e.remaining_amount() > 0 {
+            actions.push(KeeperAction {
+                escrow_id: w.escrow_id,
+                kind: KeeperActionKind::Slash,
+                caller: e.initializer(),
+                caller_role: "initializer",
+                mint: e.mint(),
+                // Slash pays the escrow's configured penalty account,
+                // not a refund destination.
+                refund_to: None,
+                amount: e.remaining_amount(),
+                decimals: e.decimals(),
+                reference: w.reference,
+                extension_count: e.extension_count(),
+                reason: "slash_deadline_passed",
+            });
+            if let Some(arbiter) = e.arbiter() {
+                actions.push(KeeperAction {
+                    escrow_id: w.escrow_id,
+                    kind: KeeperActionKind::Slash,
+                    caller: arbiter,
+                    caller_role: "arbiter",
+                    mint: e.mint(),
+                    refund_to: None,
+                    amount: e.remaining_amount(),
+                    decimals: e.decimals(),
+                    reference: w.reference,
+                    extension_count: e.extension_count(),
+                    reason: "slash_deadline_passed",
                 });
             }
         }

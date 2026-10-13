@@ -504,6 +504,23 @@
         {"name": "dual_sig", "type": "bool"},
         {"name": "milestones", "type": {"option": {"vec": {"defined": "MilestonePlan"}}}}
       ]
+    },
+    {
+      "name": "initialize_slash_terms",
+      "discriminator": [192, 200, 188, 111, 132, 5, 236, 101],
+      "accounts": [],
+      "args": [
+        {"name": "penalty_account", "type": "publicKey"},
+        {"name": "slash_deadline", "type": "u64"}
+      ]
+    },
+    {
+      "name": "slash",
+      "discriminator": [204, 141, 18, 161, 8, 177, 92, 142],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"}
+      ]
     }
   ],
   "accounts": [
@@ -562,7 +579,9 @@
           {"name": "evidence_deadline_secs", "type": "u64", "offset": 2900},
           {"name": "escalated_by", "type": {"option": "publicKey"}, "offset": 2908},
           {"name": "subscription_amounts", "type": {"array": ["u64", 64]}, "offset": 2941},
-          {"name": "schema_version", "type": "u8", "offset": 3453}
+          {"name": "schema_version", "type": "u8", "offset": 3453},
+          {"name": "slash_terms", "type": {"option": {"defined": "SlashTerms"}}, "offset": 3454},
+          {"name": "penalty_paid", "type": "u64", "offset": 3495}
         ]
       }
     }
@@ -686,6 +705,16 @@
           {"name": "tiers", "type": {"array": [{"defined": "FeeTier"}, 8]}, "offset": 1}
         ]
       }
+    },
+    {
+      "name": "SlashTerms",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "penalty_account", "type": "publicKey", "offset": 0},
+          {"name": "slash_deadline", "type": "u64", "offset": 32}
+        ]
+      }
     }
   ],
   "errors": [
@@ -731,7 +760,8 @@
     {"code": 139, "name": "EvidenceDisclosureLate"},
     {"code": 140, "name": "InvalidSchemaMigration"},
     {"code": 141, "name": "TemplateOverrideRejected"},
-    {"code": 142, "name": "InvalidSplit"}
+    {"code": 142, "name": "InvalidSplit"},
+    {"code": 143, "name": "SlashNotEligible"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

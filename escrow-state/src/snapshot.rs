@@ -270,8 +270,9 @@ pub struct EscrowSnapshot {
     pub schema_version: u8,
     /// Cumulative amount released to the taker so far.
     pub released: u64,
-    /// Amount still locked: `amount - released`. This is what `cancel` /
-    /// `cancel_expired` refund (skipped milestone tranches join it).
+    /// Amount still locked: `amount - released - penalty_paid` (AV-82).
+    /// This is what `cancel` / `cancel_expired` refund (skipped
+    /// milestone tranches join it).
     pub remaining: u64,
     /// Unix seconds after which either party may cancel via
     /// `cancel_expired` (grace period applies separately).
@@ -395,6 +396,29 @@ pub struct EscrowSnapshot {
     /// vote — so an off-chain indexer can tally the live multisig
     /// judgment without replaying the vote events.
     pub arbiter_panel: Option<ArbiterPanelSnapshot>,
+    /// AV-82: the opt-in default-penalty (slash) terms, or `None` when
+    /// no slash clause is configured. Carries the penalty sink and the
+    /// slash deadline — so an off-chain indexer can watch for
+    /// slash-eligible escrows without replaying the setup events.
+    pub slash_terms: Option<SlashTermsSnapshot>,
+    /// AV-82: cumulative amount slashed to the penalty account (`0`
+    /// when never slashed). Kept separate from `released` — the audit
+    /// trail distinguishes a default penalty from a taker payout.
+    pub penalty_paid: u64,
+    /// AV-82: whether [`Escrow::slash`](crate::Escrow::slash) could
+    /// succeed at [`EscrowSnapshot::at`] — the keeper scan lists
+    /// exactly these escrows.
+    pub slash_eligible: bool,
+}
+
+/// AV-82: point-in-time, read-only view of the opt-in slash terms —
+/// the penalty sink and the default deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlashTermsSnapshot {
+    /// Where slashed funds go.
+    pub penalty_account: [u8; 32],
+    /// Unix seconds after which `slash` becomes eligible.
+    pub slash_deadline: u64,
 }
 
 impl Escrow {
@@ -587,6 +611,16 @@ impl Escrow {
             // unlock time the chain's payout gates enforce.
             relative_timelock_secs: self.relative_timelock_secs(),
             fund_at: self.fund_at(),
+            // AV-82: the slash terms ride the export — `None` when no
+            // slash clause is configured — plus the cumulative slashed
+            // amount and the at-`now` slash eligibility the keeper
+            // scan lists on.
+            slash_terms: self.slash_terms().map(|t| SlashTermsSnapshot {
+                penalty_account: t.penalty_account,
+                slash_deadline: t.slash_deadline,
+            }),
+            penalty_paid: self.penalty_paid(),
+            slash_eligible: self.is_slash_eligible(now),
         }
     }
 }
@@ -953,6 +987,25 @@ impl EscrowSnapshot {
             }
             None => s.push_str("null"),
         }
+        // AV-82: the slash terms — `null` when no slash clause is
+        // configured, else the penalty sink and the slash deadline —
+        // plus the cumulative slashed amount and the at-`now` slash
+        // eligibility flag.
+        s.push_str(",\"slash_terms\":");
+        match &self.slash_terms {
+            Some(t) => {
+                s.push_str("{\"penalty_account\":\"");
+                s.push_str(&hex32(&t.penalty_account));
+                s.push_str("\",\"slash_deadline\":");
+                s.push_str(&t.slash_deadline.to_string());
+                s.push('}');
+            }
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"penalty_paid\":");
+        s.push_str(&self.penalty_paid.to_string());
+        s.push_str(",\"slash_eligible\":");
+        s.push_str(if self.slash_eligible { "true" } else { "false" });
         s.push('}');
         s
     }
@@ -994,7 +1047,7 @@ mod snapshot_tests {
              \"at\":1750000000,\
              \"initializer\":\"{init}\",\"taker\":\"{taker}\",\
              \"state\":\"funded\",\
-             \"schema_version\":1,\
+             \"schema_version\":2,\
              \"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\
              \"released\":0,\"display_released\":\"0\",\
              \"remaining\":1000000,\"display_remaining\":\"1000000\",\
@@ -1010,7 +1063,8 @@ mod snapshot_tests {
              \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
-             \"max_extension_secs\":0,\"extension_count\":0,\"arbiter_panel\":null\
+             \"max_extension_secs\":0,\"extension_count\":0,\"arbiter_panel\":null,\
+             \"slash_terms\":null,\"penalty_paid\":0,\"slash_eligible\":false\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),
@@ -1022,8 +1076,8 @@ mod snapshot_tests {
     fn snapshot_carries_schema_version() {
         // A fresh vault is born current.
         let snap = funded(AMOUNT, NEVER).snapshot(MID);
-        assert_eq!(snap.schema_version, 1);
-        assert!(snap.to_json().contains("\"schema_version\":1"));
+        assert_eq!(snap.schema_version, 2);
+        assert!(snap.to_json().contains("\"schema_version\":2"));
         // A migrated vault's snapshot shows the new version.
         let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER).unwrap();
         e.schema_version = 0; // simulate a pre-AV-75 vault
@@ -1032,8 +1086,8 @@ mod snapshot_tests {
         assert!(snap.to_json().contains("\"schema_version\":0"));
         e.migrate_schema(ALICE).unwrap();
         let snap = e.snapshot(MID);
-        assert_eq!(snap.schema_version, 1);
-        assert!(snap.to_json().contains("\"schema_version\":1"));
+        assert_eq!(snap.schema_version, 2);
+        assert!(snap.to_json().contains("\"schema_version\":2"));
     }
 
     #[test]

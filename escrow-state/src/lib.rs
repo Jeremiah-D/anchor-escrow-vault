@@ -841,9 +841,31 @@ pub struct Escrow {
     /// [`Escrow::initialize`]); a vault written before AV-75 reads `0`
     /// and must pass through [`Escrow::migrate_schema`] once before
     /// the program treats it as current. Persisted (1 byte in the
-    /// vault account). Appended last so every earlier field offset
-    /// stays stable.
+    /// vault account). AV-82 appended `slash_terms` / `penalty_paid`
+    /// *after* this field (v2 layout) so every earlier field offset —
+    /// including this one's — stays stable; a v1 account is a
+    /// byte-prefix of the v2 account.
     schema_version: u8,
+    /// AV-82: opt-in default-penalty (slash) terms — the penalty
+    /// account that receives slashed funds and the deadline after
+    /// which the initializer (or the configured arbiter) may
+    /// [`Escrow::slash`] when the taker has not performed. Set once
+    /// via [`Escrow::with_slash_terms`] on an `Uninitialized` escrow;
+    /// `None` means the escrow carries no slash clause (backward
+    /// compatible). Persisted (1-byte discriminant + 40-byte terms in
+    /// the vault account). Appended after `schema_version` so every
+    /// earlier field offset stays stable.
+    slash_terms: Option<SlashTerms>,
+    /// AV-82: cumulative amount slashed to the penalty account via
+    /// [`Escrow::slash`] — kept separate from `released` so the audit
+    /// trail distinguishes a default penalty from a taker payout. The
+    /// conservation invariant becomes
+    /// `inflow == locked + released + refunded + penalty_paid`.
+    /// `slash` is one-shot, so this is `0` or a single slash amount;
+    /// always `<= amount`. Persisted (8 bytes, zeroed when never
+    /// slashed). Appended last so every earlier field offset stays
+    /// stable.
+    penalty_paid: u64,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -858,7 +880,7 @@ pub struct Escrow {
     /// [`Escrow::release_via_cpi`], [`Escrow::release_milestone`],
     /// [`Escrow::claim`], [`Escrow::cancel`],
     /// [`Escrow::cancel_expired`], [`Escrow::resolve`],
-    /// [`Escrow::close_vault`]) calls
+    /// [`Escrow::slash`], [`Escrow::close_vault`]) calls
     /// [`Escrow::require_not_reentrant`] first — before the authority
     /// check, like a Solidity `nonReentrant` modifier — and a nested
     /// entry fails with [`EscrowError::ReentrantCall`] regardless of
@@ -1205,6 +1227,20 @@ pub enum EscrowError {
     /// builder's own validation, reused. Parallels
     /// [`EscrowError::InvalidMilestones`] (config error).
     InvalidSplit,
+    /// Slash not eligible (AV-82): [`Escrow::slash`] or
+    /// [`Escrow::with_slash_terms`] refused. Covers the whole
+    /// eligibility family so the one new code (143) stays honest:
+    /// no slash terms configured; the zero penalty account (config
+    /// error, paralleling [`EscrowError::InvalidArbiter`]'s zero-key
+    /// rejection); `now` before the terms' `slash_deadline` (the
+    /// default has not occurred yet); a repeat slash (one-shot —
+    /// [`Escrow::penalty_paid`] is already non-zero); an amount above
+    /// the slashable remainder; a dual-sig escrow (AV-12) whose both
+    /// activation bits are not set (both parties must have consented
+    /// to the terms — including the slash clause — before funding);
+    /// or a `Disputed` escrow (slash is locked while arbitration owns
+    /// the funds — the arbiter settles via [`Escrow::resolve`]).
+    SlashNotEligible,
 }
 
 impl EscrowError {
@@ -1260,6 +1296,7 @@ impl EscrowError {
             EscrowError::InvalidSchemaMigration => 140,
             EscrowError::TemplateOverrideRejected => 141,
             EscrowError::InvalidSplit => 142,
+            EscrowError::SlashNotEligible => 143,
         }
     }
 
@@ -1309,6 +1346,7 @@ impl EscrowError {
             EscrowError::InvalidSchemaMigration,
             EscrowError::TemplateOverrideRejected,
             EscrowError::InvalidSplit,
+            EscrowError::SlashNotEligible,
         ]
     }
 }
@@ -1438,6 +1476,48 @@ impl PayoutAllowlist {
     pub fn contains(&self, addr: &[u8; 32]) -> bool {
         self.as_slice().contains(addr)
     }
+}
+
+/// Serialized length of [`SlashTerms`]: the 32-byte penalty account
+/// plus the u64 slash deadline.
+pub const SLASH_TERMS_LEN: usize = 32 + 8;
+
+/// Opt-in default-penalty (slash) terms (AV-82 — Solana payment risk /
+/// taker-default enforcement): the clause the initializer attaches at
+/// setup so a taker who never performs can be penalized without going
+/// through full dispute arbitration.
+///
+/// Why: some escrows encode a performance obligation — the taker must
+/// deliver off-chain work (or an on-chain follow-through) by a
+/// deadline, and the escrow's only leverage is the locked funds.
+/// Without a slash clause, the initializer's recourse after the
+/// deadline is `cancel_expired` (a full refund, no penalty — the
+/// defaulting taker walks away free) or `escalate` into arbitration
+/// (slow, adversarial, and overkill for a clear-cut missed deadline).
+/// The slash clause is the middle path the parties agree *while they
+/// still trust each other*: after `slash_deadline`, the initializer —
+/// or the configured arbiter as a neutral enforcer — may move a
+/// bounded amount of the locked funds to `penalty_account` in one
+/// shot. The escrow stays `Funded` (the taker can still earn the
+/// remainder by performing late), and the slashed amount is tracked in
+/// the dedicated [`Escrow::penalty_paid`] counter — never mixed into
+/// `released` — so the audit trail distinguishes a default penalty
+/// from a taker payout and the conservation invariant stays exact:
+/// `inflow == locked + released + refunded + penalty_paid`.
+///
+/// `Copy` so keeper/indexer tooling can lift the terms off a snapshot
+/// without borrowing the escrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlashTerms {
+    /// Where slashed funds go: the initializer's penalty sink (a fee
+    /// vault, a burn address, or the initializer themselves — the
+    /// parties' choice at setup, fixed before funding).
+    pub penalty_account: [u8; 32],
+    /// Unix seconds after which [`Escrow::slash`] becomes eligible.
+    /// The taker "performs" by triggering the release path before
+    /// this timestamp; afterwards the default is deemed to have
+    /// occurred.
+    pub slash_deadline: u64,
 }
 
 /// Serialized length of [`DefaultJudgment`]: two u64s (the arbitration
@@ -2353,7 +2433,12 @@ impl Escrow {
     /// step at a time via [`Escrow::migrate_schema`]. Never decreases;
     /// the Anchor program bumps it when a program upgrade adds vault
     /// fields.
-    pub const SCHEMA_VERSION: u8 = 1;
+    /// Current persisted-layout revision (see `VAULT_FIELDS`).
+    /// - `0`: vaults written before AV-75 (no `schema_version` field).
+    /// - `1`: AV-75 layout (`schema_version` appended last).
+    /// - `2`: AV-82 layout (`slash_terms` / `penalty_paid` appended
+    ///   after `schema_version`; a v1 account is a byte-prefix of v2).
+    pub const SCHEMA_VERSION: u8 = 2;
 
     /// Construct a new escrow in the `Uninitialized` state.
     ///
@@ -2504,7 +2589,14 @@ impl Escrow {
             // AV-75: a new vault is born at the current schema — only
             // pre-AV-75 accounts (written before the field existed) ever
             // read `0`, and those migrate via `migrate_schema`.
+            // AV-82: v1 accounts (schema_version == 1, no slash fields)
+            // migrate 1 -> 2 the same way — the slash region zero-fills.
             schema_version: Self::SCHEMA_VERSION,
+            // AV-82: no slash terms by default (backward compatible) —
+            // opt in via `with_slash_terms` before funding; never
+            // slashed means `penalty_paid == 0`.
+            slash_terms: None,
+            penalty_paid: 0,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -2786,12 +2878,22 @@ impl Escrow {
             .released
             .checked_add(amount)
             .ok_or(EscrowError::ReleaseExceedsLocked)?;
-        if new_released > self.amount {
+        // AV-82: slashed funds are out of the releasable pool — the
+        // cap is `amount - penalty_paid`, not `amount`. (`penalty_paid
+        // <= amount` by the crate invariant, so no underflow; `0`
+        // for every pre-AV-82 escrow, so the check is byte-identical
+        // to before when no slash happened.)
+        if new_released > self.amount - self.penalty_paid {
             return Err(EscrowError::ReleaseExceedsLocked);
         }
         let fee = self.charge_protocol_fee(amount)?;
         self.released = new_released;
-        if self.released == self.amount {
+        // AV-82: the terminal condition is "nothing left locked"
+        // (`remaining_amount() == 0`), not `released == amount` — a
+        // slashed escrow is fully drained once the taker releases the
+        // post-slash remainder. Identical to the old check when
+        // `penalty_paid == 0`.
+        if self.remaining_amount() == 0 {
             self.state = EscrowState::Released;
         }
         Ok((amount - fee, fee))
@@ -3446,20 +3548,24 @@ impl Escrow {
         // `released` only grows via `release`/`claim`, and `vested` is a
         // pure function of (amount, now): saturating keeps the counter
         // monotonic even if the initializer released ahead of the curve.
-        let claimable = vested.saturating_sub(self.released);
+        // AV-82: slashed funds are out of the claimable pool too — the
+        // taker claims against the post-slash remainder.
+        let claimable = vested.saturating_sub(self.released.saturating_add(self.penalty_paid));
         if claimable == 0 {
             // Nothing unlocked yet, or everything vested is already
             // released — parallels `release` with `amount == 0`.
             return Err(EscrowError::AmountMismatch);
         }
-        // `released + claimable <= vested <= amount`: no overflow, no cap
-        // breach — the `release` checked_add path is not needed here.
+        // `released + penalty_paid + claimable <= vested <= amount`: no
+        // overflow, no cap breach — the `release` checked_add path is
+        // not needed here.
         // AV-17: the protocol fee slices the gross claimable; the
         // `released` counter keeps the gross so conservation is
         // untouched.
         let fee = self.charge_protocol_fee(claimable)?;
         self.released += claimable;
-        if self.released == self.amount {
+        // AV-82: terminal when nothing is left locked (see `release`).
+        if self.remaining_amount() == 0 {
             self.state = EscrowState::Released;
         }
         Ok((claimable - fee, fee))
@@ -3487,6 +3593,209 @@ impl Escrow {
         self.arbiter_panel = None;
         self.arbiter = Some(arbiter);
         Ok(self)
+    }
+
+    /// Opt in to the default-penalty (slash) clause (AV-82 — Solana
+    /// payment risk / taker-default enforcement). Builder-style: only
+    /// valid on an `Uninitialized` escrow, so the penalty account and
+    /// the deadline are fixed before any funds move — mirroring
+    /// [`Escrow::with_arbiter`], [`Escrow::with_quorum`] and
+    /// [`Escrow::with_vesting`].
+    ///
+    /// Why: see [`SlashTerms`] — without the clause, a taker who never
+    /// performs leaves the initializer choosing between a penalty-free
+    /// `cancel_expired` refund and slow full arbitration. The clause is
+    /// the pre-agreed middle path: after `slash_deadline`, the
+    /// initializer (or the configured arbiter as a neutral enforcer)
+    /// may [`Escrow::slash`] a bounded amount to `penalty_account`.
+    ///
+    /// A zero `penalty_account` is [`EscrowError::SlashNotEligible`]
+    /// (config error — parallels `with_arbiter`'s zero-key rejection);
+    /// configuring after funding is
+    /// [`EscrowError::InvalidStateTransition`]. A paused escrow fails
+    /// fast ([`EscrowError::Paused`]).
+    pub fn with_slash_terms(
+        mut self,
+        penalty_account: [u8; 32],
+        slash_deadline: u64,
+    ) -> Result<Self, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast, even
+        // for pre-fund configuration.
+        self.require_not_paused()?;
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if penalty_account == [0u8; 32] {
+            return Err(EscrowError::SlashNotEligible);
+        }
+        self.slash_terms = Some(SlashTerms {
+            penalty_account,
+            slash_deadline,
+        });
+        Ok(self)
+    }
+
+    /// The slash terms attached via [`Escrow::with_slash_terms`], if
+    /// any. `None` means the escrow carries no slash clause.
+    pub fn slash_terms(&self) -> Option<SlashTerms> {
+        self.slash_terms
+    }
+
+    /// Cumulative amount slashed to the penalty account (AV-82):
+    /// `0` when never slashed. Kept separate from `released` — the
+    /// audit trail distinguishes a default penalty from a taker
+    /// payout — and part of the conservation invariant:
+    /// `inflow == locked + released + refunded + penalty_paid`.
+    pub fn penalty_paid(&self) -> u64 {
+        self.penalty_paid
+    }
+
+    /// Whether [`Escrow::slash`] could succeed right now: `Funded`,
+    /// slash terms configured, the deadline passed, not already
+    /// slashed, not paused, and no milestone / subscription schedule
+    /// attached (the schedule owns the release path — see
+    /// [`Escrow::slash`]). Pure read — the keeper scan lists exactly
+    /// the escrows this returns `true` for, so a listed slash is
+    /// always executable; the state machine re-checks every gate on
+    /// the call itself.
+    pub fn is_slash_eligible(&self, now: u64) -> bool {
+        if !matches!(self.state, EscrowState::Funded) {
+            return false;
+        }
+        if self.is_paused() {
+            return false;
+        }
+        let terms = match self.slash_terms {
+            Some(terms) => terms,
+            None => return false,
+        };
+        if now < terms.slash_deadline {
+            return false;
+        }
+        if self.penalty_paid > 0 {
+            return false;
+        }
+        self.milestones.is_none() && self.subscription.is_none()
+    }
+
+    /// Slash the defaulting taker (AV-82): move `amount` of the locked
+    /// funds to the penalty account fixed in the slash terms.
+    /// `Funded -> Funded` (the escrow stays live — the taker can still
+    /// earn the remainder by performing late); the slashed amount
+    /// accumulates in [`Escrow::penalty_paid`], never in `released`.
+    ///
+    /// Authorization (checked first — a stranger learns nothing about
+    /// the terms): the caller must be the initializer, or the
+    /// configured arbiter ("arbiter authorization" — the neutral
+    /// enforcer path); anyone else is [`EscrowError::Unauthorized`].
+    /// When the escrow required dual-signature activation (AV-12),
+    /// both activation bits must additionally be set — both parties
+    /// consented to the terms, slash clause included, before funding
+    /// ([`EscrowError::SlashNotEligible`] otherwise).
+    ///
+    /// Then state: `Funded` only — any other non-`Disputed` state is
+    /// [`EscrowError::InvalidStateTransition`], while `Disputed` is
+    /// [`EscrowError::SlashNotEligible`] (slash is locked while
+    /// arbitration owns the funds — the arbiter settles via
+    /// [`Escrow::resolve`]).
+    ///
+    /// Then eligibility ([`EscrowError::SlashNotEligible`]): slash
+    /// terms configured; `now >= slash_deadline` (the default has
+    /// occurred); one-shot — an already-slashed escrow refuses a
+    /// second slash; `amount` within the slashable remainder
+    /// ([`Escrow::remaining_amount`]). `amount == 0` is
+    /// [`EscrowError::AmountMismatch`] (parallels `release`).
+    ///
+    /// The moved tokens are the escrow's locked tokens, so the bound
+    /// mint must match ([`EscrowError::MintMismatch`], AV-16) —
+    /// `None` on the native-SOL path.
+    ///
+    /// Like every fund-moving transition: pause guard, then the AV-36
+    /// reentrancy guard, before the authority check. Returns the
+    /// slashed `amount` so the caller (and the Anchor layer) can size
+    /// the transfer to
+    /// [`SlashTerms::penalty_account`](SlashTerms::penalty_account).
+    pub fn slash(
+        &mut self,
+        authority: [u8; 32],
+        amount: u64,
+        mint: Option<[u8; 32]>,
+        now: u64,
+    ) -> Result<u64, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast,
+        // before the reentrancy guard and the authority check.
+        self.require_not_paused()?;
+        // AV-36: reentrancy guard — slash moves funds.
+        self.require_not_reentrant()?;
+        // Authority: the initializer, or the configured arbiter as the
+        // neutral enforcer. (A panel member is not a slash authority —
+        // panel mode governs dispute settlement, not default
+        // penalties.) Checked before state validity.
+        let is_initializer = authority == self.initializer;
+        let is_arbiter = self.arbiter == Some(authority);
+        if !is_initializer && !is_arbiter {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            // AV-82 / AV-14: slash is locked while arbitration owns
+            // the funds — the arbiter settles via `resolve`.
+            EscrowState::Disputed => return Err(EscrowError::SlashNotEligible),
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let terms = self.slash_terms.ok_or(EscrowError::SlashNotEligible)?;
+        // A milestone plan (AV-15) or a subscription schedule (AV-56)
+        // owns the release path: its tranches / periods sum to the
+        // locked amount, so a slash would strand the tail tranches
+        // (they could never release without breaching the cap). Slash
+        // is the blunt tool for plain escrows; scheduled escrows
+        // enforce performance through their own gates
+        // (`MilestoneNotConfirmed`, unvested `claim`s).
+        if self.milestones.is_some() || self.subscription.is_some() {
+            return Err(EscrowError::SlashNotEligible);
+        }
+        // AV-12: dual-signature activation means both parties signed
+        // off on the setup — including the slash clause — so slash
+        // requires both activation bits. (In practice a dual-sig
+        // escrow cannot reach `Funded` without both bits, so this is
+        // defense in depth, pinned by test.)
+        if self.activation & ACTIVATION_DUAL_SIG_REQUIRED_BIT != 0 {
+            let both = ACTIVATION_INITIALIZER_BIT | ACTIVATION_TAKER_BIT;
+            if self.activation & both != both {
+                return Err(EscrowError::SlashNotEligible);
+            }
+        }
+        // One-shot: a second slash is rejected — the penalty is a
+        // single enforcement action, not a drip.
+        if self.penalty_paid > 0 {
+            return Err(EscrowError::SlashNotEligible);
+        }
+        // The default has not occurred yet.
+        if now < terms.slash_deadline {
+            return Err(EscrowError::SlashNotEligible);
+        }
+        // AV-16: the slashed tokens are the escrow's locked tokens.
+        self.require_mint_match(mint)?;
+        if amount == 0 {
+            return Err(EscrowError::AmountMismatch);
+        }
+        // `penalty_paid == 0` here (one-shot gate above), so the
+        // slashable remainder is `amount - released`; checked
+        // subtraction is unnecessary — `released <= amount` is the
+        // crate invariant.
+        let slashable = self.amount - self.released;
+        if amount > slashable {
+            return Err(EscrowError::SlashNotEligible);
+        }
+        // `amount <= slashable <= amount`, so this cannot overflow;
+        // `checked_add` anyway — a wrapping counter would break the
+        // conservation invariant the same way it would for `released`.
+        self.penalty_paid = self
+            .penalty_paid
+            .checked_add(amount)
+            .ok_or(EscrowError::SlashNotEligible)?;
+        Ok(amount)
     }
 
     /// Opt in to an arbiter-panel multisig judgment (AV-65 — Solana
@@ -4567,17 +4876,26 @@ impl Escrow {
     /// invariants — a stranger learns nothing, and a mis-stepped call
     /// fails before the invariant scan runs.
     ///
-    /// Version step: only `schema_version + 1 == SCHEMA_VERSION` is
-    /// accepted. One rule enforces both one-time migration (a vault
-    /// already at the current version refuses — there is no no-op
-    /// migration) and no-skipping (a vault at an unknown future
-    /// version refuses loudly instead of jumping forward):
-    /// [`EscrowError::InvalidSchemaMigration`] either way.
+    /// Version step: only `schema_version < SCHEMA_VERSION` is
+    /// accepted — an old vault migrates straight to the current
+    /// revision in one call (prefix carry-over plus zero-fill of every
+    /// newer region; the physical account after the Anchor realloc
+    /// *is* the current layout, so the stamp reflects reality). One
+    /// rule enforces both one-time migration (a vault already at the
+    /// current version refuses — there is no no-op migration) and
+    /// no-skipping-forward (a vault at an unknown future version
+    /// refuses loudly instead of jumping): [`EscrowError::InvalidSchemaMigration`]
+    /// either way. (AV-82: the strict `schema_version + 1 ==
+    /// SCHEMA_VERSION` gate would strand pre-AV-75 vaults once the
+    /// second layout revision shipped — a v0 vault could never satisfy
+    /// `0 + 1 == 2` — so the gate is a catch-up gate, not a
+    /// single-step gate.)
     ///
     /// Invariant re-validation: every old-layout field is carried over
     /// one by one and the conservation invariants are re-checked
     /// before the version is stamped — `released <= amount`,
     /// `released + skipped <= amount` (u128 math, overflow-safe),
+    /// `released + penalty_paid <= amount` (AV-82),
     /// `fees_paid <= released`, and, when a milestone plan is present,
     /// the tranche amounts summing to exactly `amount` (u128). A
     /// vault that violates any of them is corrupt and is refused with
@@ -4585,14 +4903,16 @@ impl Escrow {
     /// launders a broken vault.
     ///
     /// Honest mechanics note: the appended-last layout convention
-    /// makes a v0 account a byte-prefix of the v1 account, so the
-    /// on-chain migration is prefix carry-over plus zero-fill of the
-    /// new region (the Anchor side does the realloc via the
+    /// makes a v0 account a byte-prefix of the v1 account — and a v1
+    /// account a byte-prefix of the v2 account (AV-82 appends
+    /// `slash_terms` / `penalty_paid` after `schema_version`) — so
+    /// the on-chain migration is prefix carry-over plus zero-fill of
+    /// the new region (the Anchor side does the realloc via the
     /// `VAULT_FIELDS` layout); the pure-logic gate is authority +
     /// version-step + invariant re-validation, and the stamp:
     /// `schema_version` becomes [`Self::SCHEMA_VERSION`]. No other
     /// field changes — migration is bookkeeping, not economics, so no
-    /// AV-36 reentrancy lock is needed (the lock only guards the 9
+    /// AV-36 reentrancy lock is needed (the lock only guards the 10
     /// funds paths).
     ///
     /// A paused escrow fails fast ([`EscrowError::Paused`]) — migration
@@ -4602,11 +4922,12 @@ impl Escrow {
         // AV-46: pause guard first — a paused escrow fails fast.
         self.require_not_paused()?;
         self.require_initializer(authority)?;
-        // One step only: already-current refuses (one-time migration),
-        // and an unknown future version refuses loudly (no skipping).
-        // `checked_add` so a hypothetical `u8::MAX` version refuses
-        // instead of panicking on overflow.
-        if self.schema_version.checked_add(1) != Some(Self::SCHEMA_VERSION) {
+        // Catch-up gate: any older revision migrates straight to
+        // current in one call; already-current refuses (one-time
+        // migration) and an unknown future version refuses loudly
+        // (no skipping forward). `>=` needs no checked arithmetic —
+        // `u8::MAX` refuses like any future version.
+        if self.schema_version >= Self::SCHEMA_VERSION {
             return Err(EscrowError::InvalidSchemaMigration);
         }
         // Carry-over invariant re-validation (u128 math, overflow-safe):
@@ -4615,6 +4936,11 @@ impl Escrow {
             return Err(EscrowError::InvalidSchemaMigration);
         }
         if (self.released as u128) + (self.skipped as u128) > self.amount as u128 {
+            return Err(EscrowError::InvalidSchemaMigration);
+        }
+        // AV-82: slashed funds left the lockup — the two outflow
+        // counters together must fit inside the locked amount.
+        if (self.released as u128) + (self.penalty_paid as u128) > self.amount as u128 {
             return Err(EscrowError::InvalidSchemaMigration);
         }
         if self.fees_paid > self.released {
@@ -5541,10 +5867,13 @@ impl Escrow {
         // trusted settler, but the destination pin still guards against
         // a compromised arbiter client swapping the payout account.
         self.require_payout_recipient(payout_to)?;
-        // `released <= amount` is the crate invariant, so `remaining`
-        // cannot underflow; `taker_amount <= remaining` keeps
-        // `released + taker_amount <= amount` without a checked add.
-        let remaining = self.amount - self.released;
+        // `released + penalty_paid <= amount` is the crate invariant, so
+        // `remaining` cannot underflow; `taker_amount <= remaining`
+        // keeps `released + taker_amount <= amount` without a checked
+        // add. AV-82: a pre-escalation slash shrinks the splittable
+        // pool — the arbiter settles the post-slash remainder, never
+        // the slashed funds.
+        let remaining = self.remaining_amount();
         if taker_amount > remaining {
             return Err(EscrowError::ReleaseExceedsLocked);
         }
@@ -5614,11 +5943,12 @@ impl Escrow {
             EscrowState::Disputed => {}
             _ => return Err(EscrowError::InvalidStateTransition),
         }
-        // `released <= amount` is the crate invariant, so `remaining`
-        // cannot underflow; `taker_amount <= remaining` keeps
-        // `released + taker_amount <= amount` without a checked add —
-        // the same conservation gate as `resolve`.
-        let remaining = self.amount - self.released;
+        // `released + penalty_paid <= amount` is the crate invariant, so
+        // `remaining` cannot underflow; `taker_amount <= remaining`
+        // keeps `released + taker_amount <= amount` without a checked
+        // add — the same conservation gate as `resolve` (AV-82: the
+        // post-slash remainder).
+        let remaining = self.remaining_amount();
         if taker_amount > remaining {
             return Err(EscrowError::ReleaseExceedsLocked);
         }
@@ -5947,10 +6277,11 @@ impl Escrow {
         // AV-49: the taker's share of the split must satisfy the payout
         // policy (`PayoutNotAllowlisted` otherwise).
         self.require_payout_recipient(payout_to)?;
-        // `released <= amount` is the crate invariant, so `remaining`
-        // cannot underflow; the setup-time check was against the full
-        // lockup, so this only trips on a stale replay.
-        let remaining = self.amount - self.released;
+        // `released + penalty_paid <= amount` is the crate invariant, so
+        // `remaining` cannot underflow; the setup-time check was against
+        // the full lockup, so this only trips on a stale replay.
+        // AV-82: the post-slash remainder.
+        let remaining = self.remaining_amount();
         let taker_amount = judgment.default_taker_amount;
         if taker_amount > remaining {
             return Err(EscrowError::ReleaseExceedsLocked);
@@ -6436,6 +6767,10 @@ impl Escrow {
         // tranches sum to the locked amount: released + tranche <= amount
         // always. The checked_add and the cap are backstops, paralleling
         // `release`.
+        // AV-82: slash is rejected on milestone-scheduled escrows (see
+        // `slash`), so `penalty_paid` is always `0` here — the cap
+        // needs no slash adjustment, stated explicitly so the
+        // conservation story stays complete.
         let new_released = self
             .released
             .checked_add(tranche)
@@ -7063,6 +7398,9 @@ impl Escrow {
         // the shared counter (vesting composes, see
         // `with_subscription`). The checked_add and the cap are
         // backstops, paralleling `release`.
+        // AV-82: slash is rejected on subscription-scheduled escrows
+        // (see `slash`), so `penalty_paid` is always `0` here — no
+        // slash adjustment needed, stated explicitly.
         let new_released = self
             .released
             .checked_add(period_amount)
@@ -7210,17 +7548,24 @@ impl Escrow {
     pub fn released_amount(&self) -> u64 {
         self.released
     }
-    /// Amount still locked: `amount() - released_amount()`. This is what
-    /// `cancel` / `cancel_expired` refund. After `cancel`, `cancel_expired`,
-    /// or `resolve` the escrow is terminal and nothing is locked anymore —
-    /// the value is then the initializer's refund, preserved for audit
-    /// (for `resolve`, the taker's share sits in `released_amount()`).
+    /// Amount still locked: `amount() - released_amount() - penalty_paid()`.
+    /// This is what `cancel` / `cancel_expired` refund. After `cancel`,
+    /// `cancel_expired`, or `resolve` the escrow is terminal and nothing
+    /// is locked anymore — the value is then the initializer's refund,
+    /// preserved for audit (for `resolve`, the taker's share sits in
+    /// `released_amount()`).
     ///
     /// AV-15: with a milestone plan, skipped tranches join this remainder
     /// — a skipped tranche is the initializer's refund, never the taker's
     /// payout (see [`Escrow::skipped_amount`]).
+    ///
+    /// AV-82: slashed funds leave the lockup the moment `slash`
+    /// succeeds, so they are subtracted here too — every consumer of
+    /// the remainder (refunds, splits, keeper scans) automatically
+    /// excludes the penalty. `released + penalty_paid <= amount` is the
+    /// crate invariant, so this cannot underflow.
     pub fn remaining_amount(&self) -> u64 {
-        self.amount - self.released
+        self.amount - self.released - self.penalty_paid
     }
     /// The vesting schedule attached via [`Escrow::with_vesting`], if any.
     pub fn vesting_schedule(&self) -> Option<VestingSchedule> {
@@ -7581,10 +7926,26 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     ),
     // AV-75: schema version of the persisted layout (see
     // `Escrow::schema_version`): one u8, always present. Appended
-    // last so every earlier field offset stays stable — a pre-AV-75
-    // v0 account is a byte-prefix of the v1 layout, so migration is
-    // prefix carry-over plus zero-fill of this trailing byte.
+    // after `subscription_amounts` so every earlier field offset stays
+    // stable — a pre-AV-75 v0 account is a byte-prefix of the v1
+    // layout, so migration is prefix carry-over plus zero-fill of this
+    // trailing byte. AV-82 appends `slash_terms` / `penalty_paid`
+    // after it (v2 layout): a v1 account is likewise a byte-prefix of
+    // v2, and the field's own offset never moves again.
     ("schema_version", "u8", 1),
+    // AV-82: opt-in default-penalty (slash) terms (see
+    // `Escrow::with_slash_terms`): one discriminant byte, then the
+    // 32-byte penalty account and the u64 slash deadline (see
+    // `SLASH_TERMS_LEN`). The region is always reserved (zeroed when
+    // `None`) so `with_slash_terms` writes in place — same treatment
+    // as `arbiter` / `mint` / `evidence_hash`. Appended after
+    // `schema_version` so every earlier field offset stays stable.
+    ("slash_terms", "Option<SlashTerms>", 1 + SLASH_TERMS_LEN),
+    // AV-82: cumulative amount slashed to the penalty account (see
+    // `Escrow::slash` / `Escrow::penalty_paid`): one u64, always
+    // present (zeroed when never slashed — `slash` is one-shot).
+    // Appended last so every earlier field offset stays stable.
+    ("penalty_paid", "u64", 8),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -7679,9 +8040,13 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// party (AV-68): 1-byte discriminant + 32-byte party key (zeroed when
 /// the escrow was never disputed). The live per-period amount table
 /// (AV-73) is likewise always present: 512 bytes (64 x u64, zeroed when
-/// no schedule is attached).
+/// no schedule is attached). The schema version (AV-75) is always
+/// present too: 1 byte. The opt-in slash terms (AV-82) are likewise
+/// always present: 1-byte discriminant + 40-byte terms (zeroed when no
+/// slash clause is configured) — and so is the cumulative slashed
+/// amount (AV-82): 8 bytes, zeroed when the escrow was never slashed.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -8235,7 +8600,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 24_930_720, "from {state:?}");
+            assert_eq!(rent, 25_271_760, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -8333,9 +8698,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 24_930_720 by
+        // VAULT_SPACE — pinned at 25_271_760 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 24_930_720);
+        assert_eq!(rent, 25_271_760);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -8496,8 +8861,8 @@ mod tests {
         // then the account is closed. VAULT_SPACE stays 2941 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 3454, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 24_930_720);
+        assert_eq!(VAULT_SPACE, 3503, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 25_271_760);
     }
 
     #[test]
@@ -8516,7 +8881,7 @@ mod tests {
         // 595 (arbiter panel), and AV-68 by 41 (evidence-disclosure
         // deadline + escalating party), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 3454, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3503, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -11107,7 +11472,7 @@ pub(crate) mod anchor_idl_tests {
             name: "migrate_schema",
             params: &[],
             method: "Escrow::migrate_schema",
-            input_mapping: "no params; authority <- accounts.initializer (signer) - initializer only (a stranger or the taker is Unauthorized, checked before state validity); a paused escrow fails fast (Paused); only schema_version + 1 == SCHEMA_VERSION steps (an already-current vault refuses the second call, and an unknown future version refuses loudly instead of skipping forward - InvalidSchemaMigration, code 140, either way); the carried-over fields are re-validated before the stamp (released <= amount, released + skipped <= amount in u128, fees_paid <= released, and the milestone tranche sum == amount when a plan is present - a corrupt vault is refused, never migrated, InvalidSchemaMigration); the stamp moves schema_version to SCHEMA_VERSION and nothing else changes (no layout / rent change beyond the AV-75 trailing byte); always emits the SchemaMigrated indexer event on success (from == to == the current state)",
+            input_mapping: "no params; authority <- accounts.initializer (signer) - initializer only (a stranger or the taker is Unauthorized, checked before state validity); a paused escrow fails fast (Paused); only schema_version < SCHEMA_VERSION steps (one-time catch-up: an old vault jumps straight to current, an already-current vault refuses the second call, and an unknown future version refuses loudly instead of skipping forward - InvalidSchemaMigration, code 140, in the latter two cases); the carried-over fields are re-validated before the stamp (released <= amount, released + skipped <= amount in u128, released + penalty_paid <= amount in u128 (AV-82), fees_paid <= released, and the milestone tranche sum == amount when a plan is present - a corrupt vault is refused, never migrated, InvalidSchemaMigration); the stamp moves schema_version to SCHEMA_VERSION and nothing else changes (no layout / rent change beyond the AV-75 trailing byte for the 0 -> 1 step, and beyond the AV-82 49-byte slash region for the 1 -> 2 step); always emits the SchemaMigrated indexer event on success (from == to == the current state)",
         },
         InstructionSpec {
             // AV-81: dual-signed funded-escrow split into N child escrows.
@@ -11143,6 +11508,40 @@ pub(crate) mod anchor_idl_tests {
             ],
             method: "Escrow::split_escrow",
             input_mapping: "initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) - both current parties must authorize (dual-signature governance: one party alone or a stranger pair is Unauthorized, checked before state validity; degenerate initializer == taker self-escrow authorizes with one key passed twice); Funded only (InvalidStateTransition otherwise - Disputed rejects the split while arbitration is in flight, terminal states reject a re-split); a paused escrow fails fast (Paused); the parent moves Funded -> Split (terminal - only close_vault retires it to Closed for the rent reclaim); each child is born Funded with the parent's initializer / taker / expires_at and the explicitly inherited config (vesting / quorum / dual_sig / per-child milestones - default: not inherited); child i's escrow identity derives as H(parent_id || i) (u64 little-endian index, SHA-256); now <- clock sysvar (NOT an instruction param - anchors each child's fund_at, the origin the AV-64 relative timelock measures from); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in Funded - no half-split); emits the EscrowSplit indexer event (from == Funded, to == Split, amounts.payout = the u128-exact child sum, the (child_id, amount) roster rides the event)",
+        },
+        InstructionSpec {
+            // AV-82: opt-in default-penalty (slash) clause.
+            // IDL: sha256("global:initialize_slash_terms")[..8] — the
+            // Anchor instruction discriminator for the
+            // initialize_slash_terms handler.
+            name: "initialize_slash_terms",
+            params: &[
+                (
+                    "penalty_account",
+                    "Pubkey",
+                    "instruction param; where slashed funds go — the penalty sink fixed at setup (a fee vault, a burn address, or the initializer); the zero address is SlashNotEligible, code 143 (config error, parallels initialize_arbiter's zero-key rejection)",
+                ),
+                (
+                    "slash_deadline",
+                    "u64",
+                    "instruction param; unix seconds after which slash becomes eligible — the taker performs by triggering the release path before this timestamp",
+                ),
+            ],
+            method: "Escrow::with_slash_terms",
+            input_mapping: "no signer beyond the initializer (Uninitialized only - InvalidStateTransition otherwise; a paused escrow fails fast (Paused)); penalty_account <- param (zero address is SlashNotEligible, code 143); slash_deadline <- param; the 41-byte slash_terms region is always reserved (zeroed when None), so the terms are written in place — no realloc; pre-fund configuration only, emits no event",
+        },
+        InstructionSpec {
+            // AV-82: default-penalty enforcement.
+            // IDL: sha256("global:slash")[..8] — the Anchor instruction
+            // discriminator for the slash handler.
+            name: "slash",
+            params: &[(
+                "amount",
+                "u64",
+                "instruction param; how much of the locked funds moves to the penalty account — 0 is AmountMismatch (code 102); above the slashable remainder (amount - released) is SlashNotEligible, code 143",
+            )],
+            method: "Escrow::slash",
+            input_mapping: "authority <- accounts.authority (signer) - the initializer, or the configured arbiter as the neutral enforcer (a stranger, the taker, or a panel member is Unauthorized, checked before state validity); Funded only (InvalidStateTransition otherwise; Disputed is SlashNotEligible, code 143 - slash is locked while arbitration owns the funds, the arbiter settles via resolve); a paused escrow fails fast (Paused); slash terms must be configured (SlashNotEligible otherwise); now <- clock sysvar (NOT an instruction param - the default must be measured on chain time); now >= slash_deadline required (SlashNotEligible otherwise - the default has not occurred yet); one-shot - an already-slashed escrow refuses a second slash (SlashNotEligible); milestone / subscription-scheduled escrows refuse the slash (SlashNotEligible - the schedule owns the release path); the slashed amount accumulates in penalty_paid (never in released), the escrow stays Funded, and the conservation invariant becomes inflow == locked + released + refunded + penalty_paid; emits the EscrowSlashed indexer event (from == to == Funded, amounts.penalty = the slashed amount)",
         },
     ];
 
@@ -11260,6 +11659,9 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::migrate_schema",
             // AV-81: dual-signed funded-escrow split into N child escrows.
             "Escrow::split_escrow",
+            // AV-82: opt-in default-penalty (slash) terms + enforcement.
+            "Escrow::with_slash_terms",
+            "Escrow::slash",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -11283,7 +11685,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_forty_six_instructions_take_params() {
+    fn only_forty_eight_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -11342,6 +11744,8 @@ pub(crate) mod anchor_idl_tests {
                 &"submit_evidence",
                 &"update_panel_threshold",
                 &"split_escrow",
+                &"initialize_slash_terms",
+                &"slash",
             ]
         );
     }
@@ -13067,6 +13471,16 @@ pub(crate) mod anchor_idl_tests {
         // threshold (a dotted sub-field path, like `quorum.threshold`
         // for AV-25's update_quorum).
         ("update_panel_threshold", "new_threshold", "arbiter_panel.threshold"),
+        // AV-82: the slash amount accumulates into `penalty_paid`
+        // (one-shot) — the accumulator pattern, like `release`'s
+        // `amount` into `released`.
+        ("slash", "amount", "penalty_paid"),
+        // AV-82: the slash-clause params populate `slash_terms`
+        // (penalty account + deadline) via `initialize_slash_terms`
+        // (Uninitialized only); the region is zeroed by `initialize`
+        // and written in place, mirroring `initialize_arbiter`.
+        ("initialize_slash_terms", "penalty_account", "slash_terms"),
+        ("initialize_slash_terms", "slash_deadline", "slash_terms"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -13264,8 +13678,15 @@ pub(crate) mod anchor_idl_tests {
             "schema_version",
             "SCHEMA_VERSION by initialize (new vaults are born current); \\
              stepped to SCHEMA_VERSION by migrate_schema (initializer \\
-             signer only, one-time N -> N+1)",
+             signer only, one-time catch-up from any older revision)",
         ),
+        // AV-82: the slash terms are populated by the
+        // `initialize_slash_terms` instruction params (see
+        // PARAM_FIELD_MAP), so they are not listed here - like
+        // `arbiter`, every field gets exactly one source kind.
+        // (`penalty_paid` is likewise param-sourced: the `slash`
+        // instruction's `amount` accumulates into it, like `release`'s
+        // `amount` into `released`.)
     ];
 
     /// Every vault field path from `VAULT_FIELDS`, with `quorum` unfolded
@@ -13612,6 +14033,11 @@ mod error_code_tests {
             EscrowError::InvalidSplit,
             142,
             "split_escrow with an empty amount table, more than MAX_SPLIT_CHILDREN children, a zero child amount, an amount table whose u128 sum differs from the parent's remaining_amount, or a per-child milestone-plan list whose length mismatches the amount table",
+        ),
+        (
+            EscrowError::SlashNotEligible,
+            143,
+            "with_slash_terms with the zero penalty account, or slash when no slash terms are configured / now is before slash_deadline / the escrow was already slashed (one-shot) / amount exceeds the slashable remainder / a dual-sig escrow lacks both activation bits / the escrow is Disputed (locked while arbitration owns the funds) / a milestone or subscription schedule is attached (the schedule owns the release path)",
         ),
     ];
 
@@ -15353,9 +15779,29 @@ mod account_space_tests {
             out.extend_from_slice(&amount.to_le_bytes());
         }
         // AV-75: schema version of the persisted layout, always present
-        // (new vaults are born at `SCHEMA_VERSION`); appended last so
-        // every earlier offset above is unchanged.
+        // (new vaults are born at `SCHEMA_VERSION`); AV-82 appends the
+        // slash fields after it (v2 layout) so its own offset never
+        // moves again.
         out.push(e.schema_version);
+        // AV-82: opt-in slash terms, always reserved like `quorum`: the
+        // `None` discriminant followed by a zeroed 40-byte region
+        // (32-byte penalty account + u64 slash deadline), so
+        // `with_slash_terms` writes in place without reallocating.
+        match e.slash_terms {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; SLASH_TERMS_LEN]);
+            }
+            Some(t) => {
+                out.push(1);
+                out.extend_from_slice(&t.penalty_account);
+                out.extend_from_slice(&t.slash_deadline.to_le_bytes());
+            }
+        }
+        // AV-82: cumulative slashed amount, always present (zeroed when
+        // never slashed). Appended last so every earlier offset above
+        // is unchanged.
+        out.extend_from_slice(&e.penalty_paid.to_le_bytes());
         out
     }
 
@@ -15403,10 +15849,14 @@ mod account_space_tests {
         // (AV-66 opt-in tiered protocol-fee schedule: live-tier count
         // + 8 fixed 10-byte tier slots) + 8 (AV-68 dispute-evidence
         // disclosure deadline) + (1 + 32) (AV-68 escalating party)
-        // + 512 (AV-73 live per-period amount table: 64 x u64).
-        assert_eq!(ESCROW_BODY_LEN, 3446, "escrow payload bytes");
+        // + 512 (AV-73 live per-period amount table: 64 x u64)
+        // + 1 (AV-75 schema version)
+        // + (1 + 40) (AV-82 opt-in slash terms: discriminant +
+        // 32-byte penalty account + u64 slash deadline)
+        // + 8 (AV-82 cumulative slashed amount).
+        assert_eq!(ESCROW_BODY_LEN, 3495, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 3454, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3503, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -15465,13 +15915,15 @@ mod account_space_tests {
         // (AV-68, zeroed when the escrow was never disputed) + 512-byte
         // live per-period amount table (AV-73, 64 x u64, zeroed when no
         // schedule is attached) + 1-byte schema version (AV-75, born
-        // at `SCHEMA_VERSION`).
+        // at `SCHEMA_VERSION`) + (1 + 40)-byte opt-in slash terms
+        // (AV-82, zeroed when no slash clause is configured) + 8-byte
+        // cumulative slashed amount (AV-82, zeroed when never slashed).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2964);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3013);
     }
 
     #[test]
@@ -15881,16 +16333,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3454) * 3480 * 2 = 3582 * 6960 = 24_930_720 lamports.
-        assert_eq!(full, 24_930_720);
+        // (128 + 3503) * 3480 * 2 = 3631 * 6960 = 25_271_760 lamports.
+        assert_eq!(full, 25_271_760);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2964) * 3480 * 2 = 3092 * 6960 = 21_520_320 lamports.
-        assert_eq!(no_quorum, 21_520_320);
+        // (128 + 3013) * 3480 * 2 = 3141 * 6960 = 21_861_360 lamports.
+        assert_eq!(no_quorum, 21_861_360);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -15934,25 +16386,25 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(24_930_720, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(25_271_760, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(24_923_759, params.0, params.1),
             Err(RentShortfall {
-                required: 24_930_720,
+                required: 25_271_760,
                 provided: 24_923_759,
             })
         );
         // Generous funding: exempt.
         assert_eq!(
-            check_vault_rent_exempt(25_000_000, params.0, params.1),
+            check_vault_rent_exempt(26_000_000, params.0, params.1),
             Ok(())
         );
         // Zero lamports: the full minimum is the shortfall.
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 24_930_720,
+                required: 25_271_760,
                 provided: 0,
             })
         );
@@ -18705,18 +19157,40 @@ mod migrate_schema_tests {
     fn initialize_stamps_current_schema_version() {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         assert_eq!(e.schema_version(), Escrow::SCHEMA_VERSION);
-        assert_eq!(Escrow::SCHEMA_VERSION, 1);
+        assert_eq!(Escrow::SCHEMA_VERSION, 2);
+    }
+
+    /// A v1-state vault: written under AV-75..AV-81 (schema byte `1`,
+    /// no slash region). In-crate tests simulate this by stamping `1`.
+    fn v1_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.schema_version = 1;
+        e
     }
 
     #[test]
-    fn migrate_schema_zero_to_one_succeeds_and_changes_nothing_else() {
+    fn migrate_schema_catches_up_from_zero_to_current() {
+        // AV-82: the gate is a catch-up gate — a pre-AV-75 vault jumps
+        // straight to the current revision in one call (it is not
+        // stranded by the intermediate v1 revision).
         let mut e = v0_escrow();
         let before = e;
         e.migrate_schema(ALICE).unwrap();
-        assert_eq!(e.schema_version(), 1);
+        assert_eq!(e.schema_version(), 2);
         // Carry-over is exact: only the stamp moved.
         let mut before_migrated = before;
-        before_migrated.schema_version = 1;
+        before_migrated.schema_version = 2;
+        assert_eq!(e, before_migrated, "migration must carry every field over untouched");
+    }
+
+    #[test]
+    fn migrate_schema_one_to_two_succeeds_and_changes_nothing_else() {
+        let mut e = v1_escrow();
+        let before = e;
+        e.migrate_schema(ALICE).unwrap();
+        assert_eq!(e.schema_version(), 2);
+        let mut before_migrated = before;
+        before_migrated.schema_version = 2;
         assert_eq!(e, before_migrated, "migration must carry every field over untouched");
     }
 
@@ -18738,14 +19212,14 @@ mod migrate_schema_tests {
     fn migrate_schema_is_one_time() {
         let mut e = v0_escrow();
         e.migrate_schema(ALICE).unwrap();
-        assert_eq!(e.schema_version(), 1);
+        assert_eq!(e.schema_version(), 2);
         // A vault already at the current schema refuses — there is no
         // no-op migration.
         assert_eq!(
             e.migrate_schema(ALICE),
             Err(EscrowError::InvalidSchemaMigration)
         );
-        assert_eq!(e.schema_version(), 1, "rejected call changes nothing");
+        assert_eq!(e.schema_version(), 2, "rejected call changes nothing");
     }
 
     #[test]
@@ -18763,12 +19237,12 @@ mod migrate_schema_tests {
         // No version skipping: a vault at an unknown future version
         // refuses loudly instead of jumping forward.
         let mut e = v0_escrow();
-        e.schema_version = 2;
+        e.schema_version = 3;
         assert_eq!(
             e.migrate_schema(ALICE),
             Err(EscrowError::InvalidSchemaMigration)
         );
-        assert_eq!(e.schema_version(), 2, "rejected call changes nothing");
+        assert_eq!(e.schema_version(), 3, "rejected call changes nothing");
         // `u8::MAX` must refuse, not panic on `version + 1` overflow.
         e.schema_version = u8::MAX;
         assert_eq!(
@@ -18805,6 +19279,17 @@ mod migrate_schema_tests {
             Err(EscrowError::InvalidSchemaMigration)
         );
         assert_eq!(e.schema_version(), 0);
+        // AV-82: released + penalty_paid > amount (u128,
+        // overflow-safe) — a vault whose outflow counters outrun the
+        // lockup is corrupt and must not migrate.
+        let mut e = v0_escrow();
+        e.released = 600_000;
+        e.penalty_paid = 400_001;
+        assert_eq!(
+            e.migrate_schema(ALICE),
+            Err(EscrowError::InvalidSchemaMigration)
+        );
+        assert_eq!(e.schema_version(), 0);
         // Milestone tranche amounts no longer sum to the lockup.
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
@@ -18835,27 +19320,34 @@ mod migrate_schema_tests {
 
     #[test]
     fn migrate_schema_moves_the_serialized_tail_byte() {
-        // The appended-last layout: the trailing byte carries the
-        // version, and every earlier offset stays stable.
+        // AV-82: the version byte sits 49 bytes before the tail now
+        // (the slash region trails it); every earlier offset stays
+        // stable, and the carry-over is still a byte-prefix copy.
+        let version_at = ESCROW_BODY_LEN - 1 - (1 + SLASH_TERMS_LEN) - 8;
         let e = v0_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes[ESCROW_BODY_LEN - 1], 0, "v0 trailing byte");
+        assert_eq!(bytes[version_at], 0, "v0 version byte");
         let mut migrated = e;
         migrated.migrate_schema(ALICE).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&migrated);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes[ESCROW_BODY_LEN - 1], 1, "v1 trailing byte");
+        assert_eq!(bytes[version_at], 2, "v2 version byte");
         assert_eq!(
-            &bytes[..ESCROW_BODY_LEN - 1],
-            &super::account_space_tests::encode_escrow(&e)[..ESCROW_BODY_LEN - 1],
+            &bytes[..version_at],
+            &super::account_space_tests::encode_escrow(&e)[..version_at],
             "carry-over is a byte-prefix copy"
+        );
+        assert_eq!(
+            &bytes[version_at + 1..],
+            &super::account_space_tests::encode_escrow(&e)[version_at + 1..],
+            "the zero-filled slash tail is untouched"
         );
         // The structural decoder round-trips the stamp.
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
         let decoded = decode_vault_account(&full).unwrap();
-        assert_eq!(decoded.schema_version(), 1);
+        assert_eq!(decoded.schema_version(), 2);
     }
 
     #[test]
@@ -18865,7 +19357,7 @@ mod migrate_schema_tests {
         let mut e = v0_escrow();
         e.fund(ALICE, T0).unwrap();
         e.migrate_schema(ALICE).unwrap();
-        assert_eq!(e.schema_version(), 1);
+        assert_eq!(e.schema_version(), 2);
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!(e.fund_at(), T0, "funding timestamp carried over");
     }
@@ -19721,7 +20213,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3446, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) bytes");
+        assert_eq!(bytes.len(), 3495, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -19746,7 +20238,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 3446);
+        assert_eq!(bytes.len(), 3495);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -19768,18 +20260,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3454) * 3480 * 2 = 3582 * 6960 = 24_930_720 lamports.
-        assert_eq!(VAULT_SPACE, 3454);
-        assert_eq!(full, 24_930_720);
+        // (128 + 3503) * 3480 * 2 = 3631 * 6960 = 25_271_760 lamports.
+        assert_eq!(VAULT_SPACE, 3503);
+        assert_eq!(full, 25_271_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2964) * 3480 * 2 = 3092 * 6960 = 21_520_320 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2964);
-        assert_eq!(no_quorum, 21_520_320);
+        // (128 + 3013) * 3480 * 2 = 3141 * 6960 = 21_861_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3013);
+        assert_eq!(no_quorum, 21_861_360);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -19923,7 +20415,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3446);
+        assert_eq!(bytes.len(), 3495);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -19938,7 +20430,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 3446);
+        assert_eq!(bytes.len(), 3495);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -19969,18 +20461,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3454) * 3480 * 2 = 3582 * 6960 = 24_930_720 lamports.
-        assert_eq!(VAULT_SPACE, 3454);
-        assert_eq!(full, 24_930_720);
+        // (128 + 3503) * 3480 * 2 = 3631 * 6960 = 25_271_760 lamports.
+        assert_eq!(VAULT_SPACE, 3503);
+        assert_eq!(full, 25_271_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2964) * 3480 * 2 = 3092 * 6960 = 21_520_320 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2964);
-        assert_eq!(no_quorum, 21_520_320);
+        // (128 + 3013) * 3480 * 2 = 3141 * 6960 = 21_861_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3013);
+        assert_eq!(no_quorum, 21_861_360);
     }
 
     #[test]
@@ -20835,7 +21327,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 3446);
+        assert_eq!(bytes.len(), 3495);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -21010,7 +21502,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 3446, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75");
+        assert_eq!(ESCROW_BODY_LEN, 3495, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -21028,32 +21520,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 3454) * 3480 * 2 = 3582 * 6960 = 24_930_720 lamports.
+        // (128 + 3503) * 3480 * 2 = 3631 * 6960 = 25_271_760 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            24_930_720
+            25_271_760
         );
-        // (128 + 2964) * 3480 * 2 = 3092 * 6960 = 21_520_320 lamports.
+        // (128 + 3013) * 3480 * 2 = 3141 * 6960 = 21_861_360 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            21_520_320
+            21_861_360
         );
         // 1888 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 3454);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2964);
-        assert!(check_vault_rent_exempt(24_930_720, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 3503);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3013);
+        assert!(check_vault_rent_exempt(25_271_760, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -23880,9 +24372,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3446, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version)");
-        assert_eq!(VAULT_SPACE, 3454);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2964);
+        assert_eq!(bytes.len(), 3495, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter)");
+        assert_eq!(VAULT_SPACE, 3503);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3013);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -24426,7 +24918,7 @@ mod default_judgment_tests {
         // at 960, `default_judgment` at 968, `default_confirmed` at 985
         // (AV-55 body total 986). AV-56 appends `subscription` at 986,
         // `subscription_next` at 1004, `subscription_released` at 1005
-        // (body total 3446 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline + AV-73 per-period-table + AV-75 schema-version appends).
+        // (body total 3495 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline + AV-73 per-period-table + AV-75 schema-version + AV-82 slash-region appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter(ARBITER)
@@ -24436,7 +24928,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3446);
+        assert_eq!(bytes.len(), 3495);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -24994,7 +25486,7 @@ mod subscription_tests {
         // Offsets: `default_confirmed` ends the AV-55 body at 986;
         // `subscription` at 986, `subscription_next` at 1004,
         // `subscription_released` at 1005; the AV-73 live per-period
-        // amount table at 2933..3446 (body total 3446 after the AV-57 +
+        // amount table at 2933..3445 (body total 3495 after the AV-57 +
         // AV-59 + AV-63 + AV-64 + AV-65 + AV-66 + AV-68 + AV-73 + AV-75
         // appends).
         let mut e = escrow()
@@ -25003,7 +25495,7 @@ mod subscription_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3446);
+        assert_eq!(bytes.len(), 3495);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -25038,8 +25530,20 @@ mod subscription_tests {
             &vec![0u8; 3445 - 2933 - PERIODS as usize * 8][..],
             "subscription_amounts: tail slots zeroed"
         );
-        // AV-75: the schema-version byte is the true tail now.
-        assert_eq!(bytes[bytes.len() - 1], 1, "schema_version: born current");
+        // AV-75: the schema-version byte sits at its long-stable offset
+        // (new vaults are born at `SCHEMA_VERSION`); AV-82 appends the
+        // slash region after it, so it is no longer the tail byte.
+        assert_eq!(bytes[3445], 2, "schema_version: born current (v2)");
+        assert_eq!(
+            &bytes[3446..3487],
+            &[0u8; 41],
+            "slash_terms: None discriminant + zeroed region"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[3487..3495].try_into().unwrap()),
+            0,
+            "penalty_paid: zero"
+        );
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "tail byte is the last byte");
     }
 
@@ -25298,7 +25802,12 @@ mod event_history_tests {
             41,
             "AV-81: appended after VaultsBatchClosed"
         );
-        for d in 0..=41u8 {
+        assert_eq!(
+            EscrowEventKind::Slashed.discriminant(),
+            42,
+            "AV-82: appended after EscrowSplit"
+        );
+        for d in 0..=42u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -25309,7 +25818,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(42), None);
+        assert_eq!(EscrowEventKind::from_discriminant(43), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -25321,11 +25830,11 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8
         );
     }
 
@@ -25334,14 +25843,14 @@ mod event_history_tests {
         // Offsets: `subscription_released` ends the AV-56 body at 1013;
         // `event_head` at 1013, `event_total` at 1014, `event_count` at
         // 1022, `event_capacity` at 1023, `event_slots` at 1024 (body
-        // total 3446 after the AV-59 + AV-63 + AV-64 + AV-68 + AV-73
-        // + AV-75 appends).
+        // total 3495 after the AV-59 + AV-63 + AV-64 + AV-68 + AV-73
+        // + AV-75 + AV-82 appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3446);
+        assert_eq!(bytes.len(), 3495);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -25369,7 +25878,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1, "AV-75 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8, "AV-82 tail");
     }
 
     #[test]
@@ -25384,18 +25893,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3454) * 3480 * 2 = 3582 * 6960 = 24_930_720 lamports.
-        assert_eq!(VAULT_SPACE, 3454);
-        assert_eq!(full, 24_930_720);
+        // (128 + 3503) * 3480 * 2 = 3631 * 6960 = 25_271_760 lamports.
+        assert_eq!(VAULT_SPACE, 3503);
+        assert_eq!(full, 25_271_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 2964) * 3480 * 2 = 3092 * 6960 = 21_520_320 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2964);
-        assert_eq!(no_quorum, 21_520_320);
+        // (128 + 3013) * 3480 * 2 = 3141 * 6960 = 21_861_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3013);
+        assert_eq!(no_quorum, 21_861_360);
     }
 
     // ----- decode -----
@@ -25435,8 +25944,9 @@ mod event_history_tests {
         // `SchemaMigrated` (AV-75), 38 is
         // `BundlePartiallyExecuted` (AV-76), 39 is `TemplateApplied`
         // (AV-77), 40 is `VaultsBatchClosed` (AV-79), 41 is
-        // `EscrowSplit` (AV-81); 42 is the first still-unknown byte.
-        for bad in [42u8, 43, 255] {
+        // `EscrowSplit` (AV-81), 42 is `Slashed` (AV-82); 43 is the
+        // first still-unknown byte.
+        for bad in [43u8, 44, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -26087,16 +26597,16 @@ mod fee_cap_tests {
     fn layout_pins_include_the_fee_cap_tail() {
         // +595 over the AV-64 numbers (the AV-65 arbiter-panel region)
         // + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline).
-        assert_eq!(ESCROW_BODY_LEN, 3446, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 3454, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 2964, "no-quorum Vault account space");
+        assert_eq!(ESCROW_BODY_LEN, 3495, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 3503, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3013, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            24_930_720,
+            25_271_760,
             "(128 + 2941) * 3480 * 2 = 3069 * 6960"
         );
         assert_eq!(
@@ -26105,7 +26615,7 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            21_520_320,
+            21_861_360,
             "(128 + 2451) * 3480 * 2 = 2579 * 6960"
         );
     }
@@ -26118,7 +26628,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3446);
+        assert_eq!(bytes.len(), 3495);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -26608,14 +27118,14 @@ mod fee_schedule_tests {
     #[test]
     fn fee_schedule_persists_in_serialized_layout_tail() {
         // The schedule sits just before the AV-68 evidence-deadline
-        // region, the AV-73 per-period table, and the AV-75
-        // schema-version byte: arbiter_panel stays the fifth-to-last
-        // region, so every earlier offset is unchanged.
+        // region, the AV-73 per-period table, the AV-75
+        // schema-version byte, and the AV-82 slash region: every
+        // earlier offset is unchanged.
         let e = scheduled_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3446);
-        let tail = ESCROW_BODY_LEN - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        assert_eq!(bytes.len(), 3495);
+        let tail = ESCROW_BODY_LEN - 1 - 8 - (1 + SLASH_TERMS_LEN) - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(bytes[tail], 3, "tier_count at the tail");
         assert_eq!(
             u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
@@ -26645,10 +27155,11 @@ mod fee_schedule_tests {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         // AV-68 appended the evidence-deadline region (8 + 33 bytes),
-        // AV-73 the per-period table (512 bytes), and AV-75 the
-        // schema-version byte (1 byte) after the fee schedule, so the
-        // schedule no longer sits at the body tail.
-        let tail = ESCROW_BODY_LEN - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        // AV-73 the per-period table (512 bytes), AV-75 the
+        // schema-version byte (1 byte), and AV-82 the slash region
+        // (41 + 8 bytes) after the fee schedule, so the schedule no
+        // longer sits at the body tail.
+        let tail = ESCROW_BODY_LEN - 1 - 8 - (1 + SLASH_TERMS_LEN) - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(
             &bytes[tail..tail + FEE_SCHEDULE_LEN],
             &[0u8; FEE_SCHEDULE_LEN],
@@ -26662,10 +27173,11 @@ mod fee_schedule_tests {
         let e = scheduled_escrow();
         let mut bytes = super::account_space_tests::encode_escrow(&e);
         // AV-68 appended the evidence-deadline region (8 + 33 bytes),
-        // AV-73 the per-period table (512 bytes), and AV-75 the
-        // schema-version byte (1 byte) after the fee schedule, so the
-        // schedule no longer sits at the body tail.
-        let tail = ESCROW_BODY_LEN - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        // AV-73 the per-period table (512 bytes), AV-75 the
+        // schema-version byte (1 byte), and AV-82 the slash region
+        // (41 + 8 bytes) after the fee schedule, so the schedule no
+        // longer sits at the body tail.
+        let tail = ESCROW_BODY_LEN - 1 - 8 - (1 + SLASH_TERMS_LEN) - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         bytes[tail] = 9;
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
@@ -26998,7 +27510,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3446);
+        assert_eq!(bytes.len(), 3495);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -27195,6 +27707,8 @@ mod arbiter_panel_tests {
         assert_eq!(EscrowError::TemplateOverrideRejected.code(), 141);
         // AV-81: appended, never renumbered.
         assert_eq!(EscrowError::InvalidSplit.code(), 142);
+        // AV-82: appended, never renumbered.
+        assert_eq!(EscrowError::SlashNotEligible.code(), 143);
         // never-renumber: the full table still pins every code, and
         // `all()` covers the new variants (the AV-46 lesson: a missing
         // variant drifts the IDL error pin).
@@ -27205,7 +27719,8 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::InvalidSchemaMigration));
         assert!(EscrowError::all().contains(&EscrowError::TemplateOverrideRejected));
         assert!(EscrowError::all().contains(&EscrowError::InvalidSplit));
-        assert_eq!(EscrowError::all().len(), 43);
+        assert!(EscrowError::all().contains(&EscrowError::SlashNotEligible));
+        assert_eq!(EscrowError::all().len(), 44);
     }
 
     #[test]
@@ -27552,16 +28067,17 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3446);
-        // AV-75: the schema-version byte is the true tail now, so the
-        // panel region ends one byte before the end of the buffer.
-        let body_end = bytes.len() - 1;
+        assert_eq!(bytes.len(), 3495);
+        // AV-82: the slash region (41-byte terms + 8-byte penalty
+        // counter) trails the schema-version byte now, so the panel
+        // region ends 49 bytes before the end of the buffer.
+        let version_end = bytes.len() - 1 - (1 + SLASH_TERMS_LEN) - 8;
         // The panel region trails the AV-73 per-period amount table
         // (512 bytes), the AV-68 evidence-deadline region (41 bytes) and
         // the AV-66 fee-schedule region (81 bytes):
         // 1-byte discriminant + 594-byte panel.
-        let tail = &bytes[body_end - SUBSCRIPTION_AMOUNTS_LEN - 41 - FEE_SCHEDULE_LEN - 595
-            ..body_end - SUBSCRIPTION_AMOUNTS_LEN - 41 - FEE_SCHEDULE_LEN];
+        let tail = &bytes[version_end - SUBSCRIPTION_AMOUNTS_LEN - 41 - FEE_SCHEDULE_LEN - 595
+            ..version_end - SUBSCRIPTION_AMOUNTS_LEN - 41 - FEE_SCHEDULE_LEN];
         assert_eq!(tail[0], 1, "panel discriminant");
         assert_eq!(tail[1], 3, "n");
         assert_eq!(tail[2], 2, "threshold");
@@ -27608,9 +28124,9 @@ mod arbiter_panel_tests {
         assert_eq!(panel.1, "Option<ArbiterPanel>");
         assert_eq!(panel.2, 1 + ARBITER_PANEL_LEN);
         assert_eq!(panel.2, 595);
-        // Appended last before AV-68/AV-73/AV-75: every earlier field
-        // offset stays stable.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "fee_schedule");
+        // Appended last before AV-68/AV-73/AV-75/AV-82: every earlier
+        // field offset stays stable.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "fee_schedule");
     }
 
     #[test]
@@ -27624,12 +28140,15 @@ mod arbiter_panel_tests {
         assert_eq!(schedule.2, 1 + MAX_FEE_TIERS * FEE_TIER_LEN);
         assert_eq!(schedule.2, 81);
         // AV-68 appended two fields after it, AV-73 one more, AV-75
-        // the trailing schema byte: schema_version is the new tail.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "evidence_deadline_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "escalated_by");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "subscription_amounts");
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "schema_version");
-        assert_eq!(VAULT_FIELDS.last().unwrap().2, 1);
+        // the schema byte, AV-82 the slash region: penalty_paid is the
+        // new tail.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "evidence_deadline_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "escalated_by");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "subscription_amounts");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "schema_version");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "slash_terms");
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "penalty_paid");
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, 8);
     }
 
     #[test]
@@ -28167,8 +28686,351 @@ mod split_tests {
             .unwrap();
         assert_eq!(e.state(), EscrowState::Split);
         assert_eq!(EscrowState::Split as u8, 8, "Split appended last");
-        assert_eq!(VAULT_SPACE, 3454, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3503, "full Vault account space");
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
+    }
+}
+
+// ---------- AV-82: opt-in default-penalty (slash) ----------
+
+#[cfg(test)]
+mod slash_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+    use crate::keeper::{scan_keeper_actions, KeeperActionKind, WatchedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const CAROL: [u8; 32] = [0xCC; 32];
+    const PENALTY: [u8; 32] = [0xDD; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+    const DEADLINE: u64 = T0 + 86_400;
+
+    fn uninitialized_with_terms() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+    }
+
+    fn slashable(amount: u64) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, amount, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn watch(id: [u8; 32], escrow: Escrow) -> WatchedEscrow {
+        WatchedEscrow {
+            escrow_id: id,
+            escrow,
+            reference: None,
+        }
+    }
+
+    #[test]
+    fn slash_terms_reject_zero_penalty_account() {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let err = e
+            .with_slash_terms([0u8; 32], DEADLINE)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::SlashNotEligible);
+        assert_eq!(EscrowError::SlashNotEligible.code(), 143);
+    }
+
+    #[test]
+    fn slash_terms_uninitialized_only() {
+        let e = uninitialized_with_terms();
+        assert_eq!(e.slash_terms().unwrap().penalty_account, PENALTY);
+        assert_eq!(e.slash_terms().unwrap().slash_deadline, DEADLINE);
+        assert_eq!(e.penalty_paid(), 0);
+        // Re-configuring on a live escrow is rejected — the deadline is
+        // fixed before funds move.
+        let live = slashable(1_000_000);
+        let err = live.with_slash_terms(PENALTY, DEADLINE + 1).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+        let _ = e;
+    }
+
+    #[test]
+    fn slash_happy_path_initializer() {
+        let mut e = slashable(1_000_000);
+        let slashed = e.slash(ALICE, 200_000, None, DEADLINE).unwrap();
+        assert_eq!(slashed, 200_000);
+        assert_eq!(e.penalty_paid(), 200_000);
+        assert_eq!(e.released_amount(), 0);
+        // The escrow stays Funded: the taker can still earn the rest.
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 800_000);
+    }
+
+    #[test]
+    fn slash_emits_indexed_event_with_penalty_amounts() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xEE; 32], T0)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let slashed = e.slash(ALICE, 200_000, None, DEADLINE).unwrap();
+        assert_eq!(slashed, 200_000);
+        let last = e.events().last().unwrap();
+        assert_eq!(last.kind, EscrowEventKind::Slashed);
+        assert_eq!(last.amounts.penalty, 200_000);
+        assert_eq!(last.amounts.payout, 0);
+        // Like `resolve`: the authority rides the history-ring actor
+        // slot, not the `caller` field.
+        assert_eq!(last.caller, None);
+        assert_eq!(last.from, EscrowState::Funded);
+        assert_eq!(last.to, EscrowState::Funded);
+    }
+
+    #[test]
+    fn slash_happy_path_arbiter() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(CAROL)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        let slashed = e.slash(CAROL, 100_000, None, DEADLINE + 60).unwrap();
+        assert_eq!(slashed, 100_000);
+        assert_eq!(e.penalty_paid(), 100_000);
+    }
+
+    #[test]
+    fn slash_rejects_stranger() {
+        let mut e = slashable(1_000_000);
+        let err = e.slash(CAROL, 100_000, None, DEADLINE).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn slash_rejects_before_deadline() {
+        let mut e = slashable(1_000_000);
+        let err = e.slash(ALICE, 100_000, None, DEADLINE - 1).unwrap_err();
+        assert_eq!(err, EscrowError::SlashNotEligible);
+        assert_eq!(e.penalty_paid(), 0);
+        assert!(!e.is_slash_eligible(DEADLINE - 1));
+        assert!(e.is_slash_eligible(DEADLINE));
+    }
+
+    #[test]
+    fn slash_rejects_without_terms() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        let err = e.slash(ALICE, 100_000, None, DEADLINE).unwrap_err();
+        assert_eq!(err, EscrowError::SlashNotEligible);
+        assert!(!e.is_slash_eligible(DEADLINE));
+    }
+
+    #[test]
+    fn slash_rejects_zero_and_excess_amount() {
+        let mut e = slashable(1_000_000);
+        let err = e.slash(ALICE, 0, None, DEADLINE).unwrap_err();
+        assert_eq!(err, EscrowError::AmountMismatch);
+        let err = e.slash(ALICE, 1_000_001, None, DEADLINE).unwrap_err();
+        assert_eq!(err, EscrowError::SlashNotEligible);
+    }
+
+    #[test]
+    fn slash_is_one_shot() {
+        let mut e = slashable(1_000_000);
+        e.slash(ALICE, 200_000, None, DEADLINE).unwrap();
+        let err = e.slash(ALICE, 100_000, None, DEADLINE + 1).unwrap_err();
+        assert_eq!(err, EscrowError::SlashNotEligible);
+        assert_eq!(e.penalty_paid(), 200_000);
+        assert!(!e.is_slash_eligible(DEADLINE + 1));
+    }
+
+    #[test]
+    fn slash_rejects_disputed_escrow() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(CAROL)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.escalate(ALICE, T0 + 1, None).unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        let err = e.slash(ALICE, 100_000, None, DEADLINE).unwrap_err();
+        assert_eq!(err, EscrowError::SlashNotEligible);
+        // Arbitration, not the penalty clause, owns disputed funds.
+        assert!(!e.is_slash_eligible(DEADLINE));
+    }
+
+    #[test]
+    fn slash_rejects_milestone_and_subscription_schedules() {
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        let err = e.slash(ALICE, 100_000, None, DEADLINE).unwrap_err();
+        assert_eq!(err, EscrowError::SlashNotEligible);
+
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_subscription(86_400, 4, 250_000)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        let err = e.slash(ALICE, 100_000, None, DEADLINE).unwrap_err();
+        assert_eq!(err, EscrowError::SlashNotEligible);
+    }
+
+    #[test]
+    fn slash_rejects_unactivated_dual_sig() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        // Only one activation bit set: not yet a funded dual-sig escrow.
+        e.activate(ALICE).unwrap();
+        let mut both = e;
+        both.activate(BOB).unwrap();
+        both.fund(ALICE, T0).unwrap();
+        // Both bits set and funded: slash is allowed.
+        both.slash(ALICE, 100_000, None, DEADLINE).unwrap();
+        // One bit only: fund never happened here, so the state check
+        // fires first (Funded required); assert the dual-sig gate
+        // independently on a funded-but-unactivated escrow is
+        // impossible — activation is a precondition of fund.
+        let err = e.slash(ALICE, 100_000, None, DEADLINE).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+    }
+
+    #[test]
+    fn conservation_four_buckets() {
+        // amount == released + penalty_paid + refundable remainder.
+        let mut e = slashable(1_000_000);
+        e.slash(ALICE, 200_000, None, DEADLINE).unwrap();
+        e.release(ALICE, T0 + 1, 300_000, None, BOB).unwrap();
+        assert_eq!(e.released_amount(), 300_000);
+        assert_eq!(e.penalty_paid(), 200_000);
+        assert_eq!(e.remaining_amount(), 500_000);
+        assert_eq!(
+            e.amount(),
+            e.released_amount() + e.penalty_paid() + e.remaining_amount()
+        );
+    }
+
+    #[test]
+    fn release_after_slash_is_capped_at_remainder() {
+        let mut e = slashable(1_000_000);
+        e.slash(ALICE, 200_000, None, DEADLINE).unwrap();
+        // 900_000 > 800_000 remainder: rejected.
+        let err = e.release(ALICE, T0 + 1, 900_000, None, BOB).unwrap_err();
+        assert_eq!(err, EscrowError::ReleaseExceedsLocked);
+        // Draining the remainder closes the escrow.
+        e.release(ALICE, T0 + 1, 800_000, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.remaining_amount(), 0);
+    }
+
+    #[test]
+    fn keeper_lists_slash_after_deadline() {
+        let e = slashable(1_000_000);
+        let report = scan_keeper_actions(&[watch([0x01; 32], e)], DEADLINE);
+        assert_eq!(report.actions.len(), 1);
+        let init = &report.actions[0];
+        assert_eq!(init.kind, KeeperActionKind::Slash);
+        assert_eq!(init.caller, ALICE);
+        assert_eq!(init.caller_role, "initializer");
+        assert_eq!(init.reason, "slash_deadline_passed");
+        assert_eq!(init.refund_to, None);
+        assert_eq!(init.amount, 1_000_000);
+        // With an arbiter configured the enforcer signs as arbiter.
+        let mut e2 = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(CAROL)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        e2.fund(ALICE, T0).unwrap();
+        let report = scan_keeper_actions(&[watch([0x02; 32], e2)], DEADLINE);
+        assert_eq!(report.actions.len(), 2);
+        assert_eq!(report.actions[0].caller_role, "initializer");
+        assert_eq!(report.actions[1].kind, KeeperActionKind::Slash);
+        assert_eq!(report.actions[1].caller, CAROL);
+        assert_eq!(report.actions[1].caller_role, "arbiter");
+        assert_eq!(report.actions[1].reason, "slash_deadline_passed");
+        assert_eq!(report.actions[1].refund_to, None);
+        // Before the deadline nothing is listed.
+        let e3 = slashable(1_000_000);
+        let report = scan_keeper_actions(&[watch([0x03; 32], e3)], DEADLINE - 1);
+        assert!(report.actions.is_empty());
+    }
+
+    #[test]
+    fn snapshot_carries_slash_fields() {
+        let mut e = slashable(1_000_000);
+        let json = e.snapshot(DEADLINE).to_json();
+        assert!(json.contains("\"slash_eligible\":true"), "{json}");
+        assert!(json.contains(&format!(
+            "\"slash_terms\":{{\"penalty_account\":\"{}\",\"slash_deadline\":{}}}",
+            "dd".repeat(32),
+            DEADLINE
+        )), "{json}");
+        e.slash(ALICE, 200_000, None, DEADLINE).unwrap();
+        let json = e.snapshot(DEADLINE).to_json();
+        assert!(json.contains("\"penalty_paid\":200000"), "{json}");
+        assert!(json.contains("\"slash_eligible\":false"), "{json}");
+    }
+
+    #[test]
+    fn slash_terms_persist_in_serialized_tail() {
+        // v2 tail: schema_version (1) + slash_terms (41) + penalty_paid (8).
+        let e = slashable(1_000_000);
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        let base = ESCROW_BODY_LEN - 8 - 41 - 1;
+        assert_eq!(bytes[base], 2, "schema_version");
+        assert_eq!(bytes[base + 1], 1, "slash_terms: Some");
+        assert_eq!(&bytes[base + 2..base + 34], &PENALTY, "penalty account");
+        assert_eq!(
+            u64::from_le_bytes(bytes[base + 34..base + 42].try_into().unwrap()),
+            DEADLINE,
+            "slash deadline"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[ESCROW_BODY_LEN - 8..].try_into().unwrap()),
+            0,
+            "penalty_paid: zeroed before any slash"
+        );
+        // Structural decode round-trips the terms.
+        let mut full = crate::discriminator::vault_account_discriminator().to_vec();
+        full.extend_from_slice(&bytes);
+        let decoded = decode_vault_account(&full).unwrap();
+        assert_eq!(decoded.slash_terms().unwrap().penalty_account, PENALTY);
+        assert_eq!(decoded.penalty_paid(), 0);
+    }
+
+    #[test]
+    fn migrate_schema_zero_fills_slash_region() {
+        // A pre-AV-82 v1 vault migrates to v2 with no slash terms
+        // configured and zero penalty paid — same struct-level
+        // simulation the AV-75 migration tests use (the byte decoder
+        // only accepts full-size accounts; the program layer pads the
+        // realloc'd account before decoding).
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.schema_version = 1;
+        e.migrate_schema(ALICE).unwrap();
+        assert_eq!(e.schema_version(), 2);
+        assert_eq!(e.slash_terms(), None);
+        assert_eq!(e.penalty_paid(), 0);
+        assert!(!e.is_slash_eligible(DEADLINE));
     }
 }

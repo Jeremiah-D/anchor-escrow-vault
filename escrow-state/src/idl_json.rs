@@ -182,6 +182,8 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         // AV-66: opt-in tiered protocol-fee schedule (always present,
         // zeroed when unconfigured — `tier_count == 0`).
         "FeeSchedule" => IdlType::Named("FeeSchedule"),
+        // AV-82: opt-in default-penalty (slash) terms.
+        "Option<SlashTerms>" => IdlType::Option(Box::new(IdlType::Named("SlashTerms"))),
         // AV-56: periodic subscription release schedule.
         "Option<SubscriptionSchedule>" => IdlType::Option(Box::new(IdlType::Named("SubscriptionSchedule"))),
         // AV-57: the 64 fixed event-history slots.
@@ -320,6 +322,13 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
                 "tiers",
                 IdlType::Array(ArrayElem::Defined("FeeTier"), MAX_FEE_TIERS),
             ),
+        ],
+        // SlashTerms { penalty_account: Pubkey, slash_deadline: u64 }
+        // (AV-82: 40 bytes — the penalty sink plus the default
+        // deadline; wrapped in `Option` on the vault).
+        "SlashTerms" => vec![
+            ("penalty_account", IdlType::PublicKey),
+            ("slash_deadline", IdlType::U64),
         ],
         other => panic!("idl_json: unknown named type: {other}"),
     }
@@ -538,6 +547,7 @@ fn render_idl_json() -> String {
         "ArbiterPanel",
         "FeeTier",
         "FeeSchedule",
+        "SlashTerms",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -712,6 +722,9 @@ fn named_type_sizes_pin_constants() {
     // AV-66: live-tier count + 8 fixed tier slots.
     assert_eq!(size("FeeSchedule"), FEE_SCHEDULE_LEN);
     assert_eq!(size("FeeSchedule"), 81);
+    // AV-82: penalty account + slash deadline.
+    assert_eq!(size("SlashTerms"), SLASH_TERMS_LEN);
+    assert_eq!(size("SlashTerms"), 40);
 }
 
 #[test]
@@ -779,7 +792,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 43, "error variant count drift");
+    assert_eq!(errors.len(), 44, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -809,6 +822,8 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::TemplateOverrideRejected.code(), 141);
     // AV-81: appended, never renumbered.
     assert_eq!(EscrowError::InvalidSplit.code(), 142);
+    // AV-82: appended, never renumbered.
+    assert_eq!(EscrowError::SlashNotEligible.code(), 143);
 }
 
 #[test]

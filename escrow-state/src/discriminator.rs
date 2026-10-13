@@ -37,12 +37,12 @@
 
 use super::{
     sha256, ArbiterPanel, DefaultJudgment, Escrow, EscrowEventKind, EscrowState, EventHistorySlot,
-    FeeSchedule, FeeTier, MilestonePlan, PanelVote, PayoutAllowlist, QuorumPolicy,
+    FeeSchedule, FeeTier, MilestonePlan, PanelVote, PayoutAllowlist, QuorumPolicy, SlashTerms,
     SubscriptionSchedule, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN, ARBITER_PANEL_LEN,
     DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS,
     MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS, MAX_PAYOUT_ALLOWLIST,
     MAX_SUBSCRIPTION_PERIODS, MILESTONE_PLAN_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN,
-    QUORUM_POLICY_LEN, SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
+    QUORUM_POLICY_LEN, SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
 };
 
 /// Program-side `#[account]` type names, in Anchor IDL order. The single
@@ -657,9 +657,30 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     }
 
     // AV-75: the schema version of the persisted layout, always
-    // present. Appended last so every earlier offset above is
-    // unchanged.
+    // present. AV-82 appends `slash_terms` / `penalty_paid` after it
+    // (v2 layout) — the field's own offset never moves again.
     let schema_version = c.u8()?;
+
+    // AV-82: the opt-in slash terms, always reserved like
+    // `escalated_by`: the `None` discriminant followed by a zeroed
+    // 40-byte region (32-byte penalty account + u64 slash deadline).
+    // Appended after `schema_version` so every earlier offset above is
+    // unchanged.
+    let slash_terms = if c.option_present("slash_terms")? {
+        let penalty_account = c.pubkey()?;
+        let slash_deadline = c.u64_le()?;
+        Some(SlashTerms {
+            penalty_account,
+            slash_deadline,
+        })
+    } else {
+        c.skip(SLASH_TERMS_LEN)?;
+        None
+    };
+    // AV-82: the cumulative slashed amount, always present (zeroed
+    // when never slashed). Appended last so every earlier offset above
+    // is unchanged.
+    let penalty_paid = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -771,6 +792,15 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // under, so `migrate_schema` sees the true pre-migration
         // version.
         schema_version,
+        // AV-82: the slash terms are persisted — a decoded escrow
+        // carries the same penalty account and deadline the setup
+        // recorded, so `slash` decides identically after a decode.
+        slash_terms,
+        // AV-82: the cumulative slashed amount is persisted — a
+        // decoded escrow carries the same one-shot penalty the
+        // enforcement recorded, so the conservation invariant holds
+        // across a decode.
+        penalty_paid,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

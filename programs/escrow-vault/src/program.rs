@@ -2455,6 +2455,87 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to the default-penalty (slash) clause (AV-82; mirrors
+    /// `Escrow::with_slash_terms`). `Uninitialized` only, like
+    /// `initialize_arbiter`: the penalty account and the deadline are
+    /// fixed before funds move. The zero penalty account is
+    /// `SlashNotEligible` (code 143) — the penalty sink must be a real
+    /// identity, since `slash` routes funds to it. The vault account
+    /// already reserves the full 41-byte slash-terms region (1-byte
+    /// discriminant + 40-byte terms, zeroed when `None`), so the terms
+    /// are written in place — no realloc needed in the real build.
+    /// Emits no event (pre-fund configuration).
+    pub fn initialize_slash_terms(
+        ctx: Context<InitializeSlashTerms>,
+        penalty_account: Pubkey,
+        slash_deadline: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_slash_terms(penalty_account.to_bytes(), slash_deadline)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
+    /// Slash the defaulting taker (AV-82; mirrors `Escrow::slash`):
+    /// `Funded -> Funded` — the escrow stays live, the taker can still
+    /// earn the remainder by performing late. The initializer or the
+    /// configured arbiter signs (`authority`); `now` comes from the
+    /// Solana clock sysvar (never an instruction param — the default
+    /// must be measured on chain time). The slashed `amount` moves to
+    /// the penalty account fixed in the slash terms — the real build
+    /// constrains `penalty_account.key()` to equal the terms' penalty
+    /// account (a phishing frontend cannot redirect the penalty by
+    /// swapping the account); the state machine accumulates the amount
+    /// in `penalty_paid`, never in `released`. Returns the slashed
+    /// amount so the real build can size the transfer. Emits
+    /// `EscrowSlashed` (from == to == `Funded`), mirroring
+    /// `IndexedEscrow::slash` — the skeleton's `emit_transition`
+    /// carries payout/fee/refund only, so the real build stamps
+    /// `amounts.penalty = slashed` on the event (see
+    /// `escrow_state::EventAmounts::slashed`).
+    pub fn slash(ctx: Context<Slash>, amount: u64) -> Result<u64> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        // Pin the penalty destination to the terms: the skeleton's
+        // state machine takes no destination param (the terms fix it),
+        // so the account constraint is enforced here, before the
+        // state machine runs.
+        let terms = escrow
+            .slash_terms()
+            .ok_or(error!(ErrorCode::SlashNotEligible))?;
+        if ctx.accounts.penalty_account.key().to_bytes() != terms.penalty_account {
+            return Err(error!(ErrorCode::SlashNotEligible));
+        }
+        let slashed = escrow
+            .slash(
+                ctx.accounts.authority.key().to_bytes(),
+                amount,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Slashed,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.authority.key()),
+        );
+        Ok(slashed)
+    }
+
     /// Clear the AV-27 timelock by dual-signed emergency governance
     /// (AV-41; mirrors `Escrow::emergency_unlock`). Both the initializer
     /// and the taker must sign — one party alone is `Unauthorized`.
@@ -2980,6 +3061,35 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `fee_schedule`).
     pub schema_version: u8,
+    /// AV-82: opt-in default-penalty (slash) terms; mirrors
+    /// `escrow_state::SlashTerms`. `None` for an escrow with no slash
+    /// clause. The account always reserves the full 41-byte region
+    /// (1-byte discriminant + 32-byte penalty account + u64 slash
+    /// deadline, zeroed when `None`) so `initialize_slash_terms`
+    /// writes the terms in place without reallocating. Layout position
+    /// matches `escrow_state::VAULT_FIELDS` (appended after
+    /// `schema_version` — v2 layout).
+    pub slash_terms: Option<SlashTerms>,
+    /// AV-82: cumulative amount slashed to the penalty account via
+    /// `slash`; mirrors `escrow_state`'s `penalty_paid`. Kept separate
+    /// from `released` — the audit trail distinguishes a default
+    /// penalty from a taker payout. Always present (8 bytes, zeroed
+    /// when never slashed). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last).
+    pub penalty_paid: u64,
+}
+
+/// Skeleton mirror of `escrow_state::SlashTerms`: the opt-in
+/// default-penalty (slash) clause (AV-82) — the penalty sink that
+/// receives slashed funds plus the Unix-seconds deadline after which
+/// `slash` becomes eligible. Serialized size is pinned by
+/// `escrow_state::SLASH_TERMS_LEN` (40 bytes: 32-byte penalty account
+/// + u64 slash deadline); on the vault it rides a 1-byte `Option`
+/// discriminant.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct SlashTerms {
+    pub penalty_account: Pubkey,
+    pub slash_deadline: u64,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -3821,6 +3931,40 @@ pub struct InitializeArbiterPanel<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-82: opt in to the default-penalty (slash) clause at initialize
+/// time.
+#[derive(Accounts)]
+pub struct InitializeSlashTerms<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer opts into the slash clause; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-82: slash the defaulting taker.
+#[derive(Accounts)]
+pub struct Slash<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The initializer, or the configured arbiter as the neutral
+    /// enforcer; the state machine enforces the either-key rule. A
+    /// constraint in the real build additionally asserts
+    /// `authority.key() == vault.initializer || Some(authority.key())
+    /// == vault.arbiter`.
+    pub authority: Signer<'info>,
+    /// CHECK: the penalty sink — the real build constrains
+    /// `penalty_account.key()` to equal the slash terms' penalty
+    /// account, so the destination cannot be swapped.
+    pub penalty_account: AccountInfo<'info>,
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build reads its `mint` for the state machine's `MintMismatch`
+    /// check; unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
+}
+
 #[derive(Accounts)]
 pub struct Escalate<'info> {
     #[account(mut)]
@@ -4655,7 +4799,7 @@ fn cpi_settle_resolve(
 }
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error per EscrowError variant, so on-chain failures
-    // surface the exact `escrow_state` reason (code 100–141) to clients.
+    // surface the exact `escrow_state` reason (code 100–143) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
         escrow_state::EscrowError::InvalidStateTransition => {
@@ -4735,6 +4879,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         }
         escrow_state::EscrowError::TemplateOverrideRejected => {
             error!(ErrorCode::TemplateOverrideRejected)
+        }
+        escrow_state::EscrowError::SlashNotEligible => {
+            error!(ErrorCode::SlashNotEligible)
         }
     }
 }
@@ -4825,4 +4972,6 @@ pub enum ErrorCode {
     InvalidSchemaMigration,
     #[msg("Rejected template override (AV-77): apply_template was given an override the preset did not declare overridable — an unknown field name, a field outside the preset's declared surface, a mistyped value, or a repeated field; the preset's audited shape is never silently widened")]
     TemplateOverrideRejected,
+    #[msg("Slash not eligible (AV-82): slash with no slash terms configured, before the slash deadline, on an already-slashed escrow (one-shot), with an amount above the slashable remainder, on a dual-sig escrow lacking both activation bits, on a Disputed escrow (locked while arbitration owns the funds), or on a milestone/subscription-scheduled escrow; with_slash_terms with the zero penalty account")]
+    SlashNotEligible,
 }

@@ -199,6 +199,7 @@
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
+//! | Slashed (AV-82) | 0 | 0 | 0 | the slashed amount, routed to the penalty account (the escrow stays `Funded`; from == to == `Funded`) |
 //!
 //! # Backward compatibility
 //!
@@ -528,6 +529,18 @@ pub enum EscrowEventKind {
     /// a successful split always re-homes funds, so there is no no-op
     /// case.
     EscrowSplit,
+    /// AV-82: the initializer (or the configured arbiter as the
+    /// neutral enforcer) slashed the defaulting taker
+    /// ([`Escrow::slash`]). `from == to == Funded` — the escrow stays
+    /// live, the taker can still earn the remainder. The slashed sum
+    /// rides [`EventAmounts::penalty`] (payout/fee/refund are zero —
+    /// the penalty is neither a taker payout nor an initializer
+    /// refund), so the conservation invariant stays checkable from the
+    /// log alone: `inflow == locked + released + refunded +
+    /// penalty_paid`. The actor is the slash caller (the initializer
+    /// or the arbiter). Always emitted on success: a successful slash
+    /// always moves funds, so there is no no-op case.
+    Slashed,
 }
 
 impl EscrowEventKind {
@@ -616,6 +629,9 @@ impl EscrowEventKind {
             // AV-81: appended after VaultsBatchClosed so discriminants
             // 0–40 stay stable for already-serialized histories.
             41 => Self::EscrowSplit,
+            // AV-82: appended after EscrowSplit so discriminants 0–41
+            // stay stable for already-serialized histories.
+            42 => Self::Slashed,
             _ => return None,
         })
     }
@@ -666,6 +682,7 @@ impl EscrowEventKind {
             Self::TemplateApplied => "template_applied",
             Self::VaultsBatchClosed => "vaults_batch_closed",
             Self::EscrowSplit => "escrow_split",
+            Self::Slashed => "escrow_slashed",
         }
     }
 
@@ -717,6 +734,7 @@ impl EscrowEventKind {
             "template_applied" => Self::TemplateApplied,
             "vaults_batch_closed" => Self::VaultsBatchClosed,
             "escrow_split" => Self::EscrowSplit,
+            "escrow_slashed" => Self::Slashed,
             _ => return None,
         })
     }
@@ -825,6 +843,19 @@ impl EventAmounts {
             fee: 0,
             refund: 0,
             penalty: 0,
+            rent_reclaimed: 0,
+        }
+    }
+
+    /// A default-penalty slash (AV-82): the slashed amount rides
+    /// `penalty` — it is neither a taker payout nor an initializer
+    /// refund. Rides the [`EscrowEventKind::Slashed`] event.
+    pub(crate) fn slashed(penalty: u64) -> Self {
+        Self {
+            payout: 0,
+            fee: 0,
+            refund: 0,
+            penalty,
             rent_reclaimed: 0,
         }
     }
@@ -1358,6 +1389,20 @@ impl IndexedEscrow {
     /// [`Escrow::with_milestones`]). Configuration: emits no event.
     pub fn with_milestones(mut self, plan: MilestonePlan) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_milestones(plan)?;
+        Ok(self)
+    }
+
+    /// Opt in to the default-penalty (slash) clause (mirrors
+    /// [`Escrow::with_slash_terms`], AV-82). Configuration: emits no
+    /// event.
+    pub fn with_slash_terms(
+        mut self,
+        penalty_account: [u8; 32],
+        slash_deadline: u64,
+    ) -> Result<Self, EscrowError> {
+        self.inner = self
+            .inner
+            .with_slash_terms(penalty_account, slash_deadline)?;
         Ok(self)
     }
 
@@ -2939,6 +2984,44 @@ impl IndexedEscrow {
             .expect("EscrowSplit event just pushed")
             .split_children = Some((roster, indexed_children.len() as u8));
         Ok(indexed_children)
+    }
+
+    /// Slash the defaulting taker (AV-82; mirrors [`Escrow::slash`]):
+    /// `Funded -> Funded` — the escrow stays live. Emits
+    /// [`EscrowEventKind::Slashed`] (from == to == `Funded`,
+    /// `amounts.penalty` = the slashed amount) with the slash caller
+    /// (the initializer or the arbiter) as the actor. On executor
+    /// failure the state machine rolls back and nothing is emitted,
+    /// like every other failed transition. Returns the slashed amount
+    /// so the caller can size the transfer to the penalty account.
+    /// `at` is both the event timestamp and the state machine's `now`.
+    ///
+    /// [`Escrow::slash`]: super::Escrow::slash
+    pub fn slash(
+        &mut self,
+        authority: [u8; 32],
+        amount: u64,
+        mint: Option<[u8; 32]>,
+        at: u64,
+    ) -> Result<u64, EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.slash(authority, amount, mint, at);
+        let slashed = self.map_reentrant(result, at)?;
+        self.push_event(
+            EscrowEventKind::Slashed,
+            from,
+            self.inner.state(),
+            EventAmounts::slashed(slashed),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(slashed)
     }
 
     /// AV-81: wrap a freshly-split child escrow in its own event log.
@@ -4672,7 +4755,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(42), None);
+        assert_eq!(EscrowEventKind::from_discriminant(43), None);
     }
 
     #[test]
@@ -4688,7 +4771,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(42), None);
+        assert_eq!(EscrowEventKind::from_discriminant(43), None);
     }
 
     #[test]
@@ -5165,7 +5248,18 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(41), Some(kind));
         assert_eq!(kind.name(), "escrow_split");
         assert_eq!(EscrowEventKind::from_name("escrow_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(42), None);
+    }
+
+    #[test]
+    fn slashed_kind_round_trips() {
+        // AV-82: discriminant 42, appended after EscrowSplit —
+        // 0–41 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::Slashed;
+        assert_eq!(kind.discriminant(), 42);
+        assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
+        assert_eq!(kind.name(), "escrow_slashed");
+        assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
+        assert_eq!(EscrowEventKind::from_discriminant(43), None);
     }
 
     #[test]
