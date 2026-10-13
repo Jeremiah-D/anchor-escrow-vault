@@ -1635,6 +1635,53 @@ are reported, never abort the batch), and the Σ rent-exempt reclaim
 comes from the same `vault_close_rent_reclaimed()` formula. Off-chain
 execution only; no new on-chain instruction.
 
+## Stale-vault rent sweep (AV-80)
+
+`scan_closeable` plans *every* terminal close; `scan_stale_vaults`
+finds the vaults nobody bothered to sweep: terminal-state vaults
+(`Cancelled` / `Released` / `Settled` — AV-34's exact close gate, paused
+vaults excluded) whose measured on-chain balance is *exactly* the
+rent-exempt minimum — the account has served its purpose and carries
+nothing but the rent deposit. `Disputed` (audit surface, the chain
+rejects the close), already-`Closed` (rent reclaimed, account gone),
+and pre-terminal states are never listed; a terminal vault holding more
+or less than the rent figure is skipped too (user funds still present,
+or the AV-43 rent-health underfunded case — the sweep never misprices a
+reclaim). Like the other scans it is a pure read over
+`&WatchedEscrowWithBalance` snapshots: dry-run by construction, zero
+side effects, no `now` (closing has no time gate).
+
+Two outputs, both per-initializer grouped (first-seen caller order,
+deterministic JSON, hand-serialized — the crate stays dependency-free):
+
+- **Dry-run preview** — `StaleVaultReport::to_json()`: per-caller
+  `total_reclaimed` Σ (accumulated with `checked_add`, the AV-79
+  convention) over the caller's close actions.
+- **To-be-signed bundle** — `stale_vault_signable_message(program_id,
+  action, blockhash)` / `StaleVaultBatch::to_bundle_json(...)`: the
+  real `close_vault` instruction bytes (the 8-byte discriminator
+  recomputed from the IDL name via the same constructor the AV-29 IDL
+  pipeline pins — the spec's `params: []`, so the data is the
+  discriminator alone) plus the program-declared account metas (`vault`
+  writable/non-signer, `initializer` writable/signer), compiled into a
+  genuine Solana legacy transaction message with the AV-71 machinery
+  and emitted as base64. `close_vault` needs the *initializer's*
+  signature, and the keeper must not sign for it — an offline signer or
+  multisig takes the bundle, signs each single-instruction message, and
+  submits. Program id and blockhash are caller-supplied (the AV-71
+  honesty labels apply).
+
+```json
+{"scanned":2,"required_lamports":6201360,"batches":[
+  {"caller":"...","total_reclaimed":6201360,"actions":[
+    {"escrow_id":"...","action":"close_vault","caller":"...",
+     "caller_role":"initializer","vault_lamports":6201360,
+     "rent_reclaimed":6201360,"expires_at":1700000000,
+     "reason":"cancelled"}
+  ]}
+]}
+```
+
 `scan_milestones(watched, now)` (AV-42) is the third keeper scan: it
 walks the same watch list and, per escrow carrying an AV-15 milestone
 plan in `Funded` state, emits the milestone tranche's executable call

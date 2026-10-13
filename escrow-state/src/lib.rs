@@ -189,6 +189,19 @@ pub use keeper::{scan_closeable, CloseAction, CloseBatch, CloseReport};
 // list as JSON. Purely additive and read-only (dry-run by construction).
 pub use keeper::{scan_rent_health, RentHealthReport, TopUpAction, WatchedEscrowWithBalance};
 
+// AV-80: stale-vault rent sweep — read-only scan for terminal vaults
+// whose measured balance is exactly the rent-exempt minimum (the only
+// thing left on the account), grouped per initializer with
+// checked-add Σ reclaim totals, plus the to-be-signed bundle builder
+// (real `close_vault` instruction bytes via the AV-71 message
+// machinery: discriminator + account metas, base64) for offline /
+// multisig signing. The keeper never signs. Purely additive and
+// read-only (dry-run by construction).
+pub use keeper::{
+    scan_stale_vaults, stale_vault_signable_message, StaleVaultAction, StaleVaultBatch,
+    StaleVaultReport,
+};
+
 // AV-26: off-chain state snapshot — a point-in-time, read-only view of
 // an `Escrow` as canonical JSON (all fields + derived remaining /
 // vested-claimable / quorum progress), for keeper bots and indexers

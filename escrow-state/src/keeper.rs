@@ -137,6 +137,11 @@ use crate::{
     aggregate::EscrowAggregateView, format_amount, vault_close_rent_reclaimed, Escrow, EscrowError,
     EscrowState, IndexedEscrow,
 };
+use super::cpi::{AccountMeta, Pubkey};
+use super::discriminator::instruction_discriminator;
+use super::tx_message::{
+    compile_message, encode_base64, encode_message, ProgramInstruction, TxMessageError,
+};
 
 /// Render 32 bytes as 64 lowercase hex characters.
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -825,6 +830,347 @@ pub fn scan_closeable(watched: &[WatchedEscrow]) -> CloseReport {    // AV-40: `
         scanned: watched.len(),
         batches,
     }
+}
+
+/// One executable stale-vault close: everything the initializer needs
+/// to sign and submit `close_vault`, nothing more. The keeper never
+/// signs — this is the *to-be-signed* payload (see
+/// [`stale_vault_signable_message`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleVaultAction {
+    /// Which escrow's vault this close targets: the caller-supplied
+    /// identity (the Anchor layer keys the vault PDA off it — the same
+    /// convention as [`WatchedEscrow::escrow_id`]).
+    pub escrow_id: [u8; 32],
+    /// The key that must sign the `close_vault` call — always the
+    /// escrow's initializer. AV-34 restricts `close_vault` to the
+    /// initializer (checked before state validity), so it is the only
+    /// key the chain will accept.
+    pub caller: [u8; 32],
+    /// Always `"initializer"` — the canonical (and only accepted)
+    /// close caller.
+    pub caller_role: &'static str,
+    /// The vault's measured lamports balance at scan time — always
+    /// exactly [`crate::vault_close_rent_reclaimed`]: only rent-only
+    /// vaults are listed (see [`scan_stale_vaults`]).
+    pub vault_lamports: u64,
+    /// The rent-exempt lamports the close returns to the initializer —
+    /// [`crate::vault_close_rent_reclaimed`], the mainnet rent-exempt
+    /// minimum for the *current* [`crate::VAULT_SPACE`], never a
+    /// hardcoded figure.
+    pub rent_reclaimed: u64,
+    /// The escrow's deadline (Unix seconds), for operator context:
+    /// most stale vaults became terminal through `cancel_expired`
+    /// after this deadline passed and were simply never closed.
+    /// `u64::MAX` = no timeout (see [`Escrow::expires_at`]).
+    pub expires_at: u64,
+    /// Machine-readable reason: the terminal state the vault sits in —
+    /// `"cancelled"`, `"released"`, or `"settled"` (the same reasons
+    /// [`scan_closeable`] stamps).
+    pub reason: &'static str,
+}
+
+/// One per-caller stale-vault sweep batch: every close action a single
+/// initializer signer must issue. One signer, one sweep, one
+/// rent-reclaim total — the dry-run preview the operator (or multisig)
+/// approves before any signature is produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleVaultBatch {
+    /// The initializer all of this batch's actions sign for.
+    pub caller: [u8; 32],
+    /// This caller's close actions, in input order.
+    pub actions: Vec<StaleVaultAction>,
+    /// Σ `rent_reclaimed` across the batch's actions, accumulated with
+    /// `checked_add` (the AV-79 convention — a defensive belt against
+    /// any future per-close variance).
+    pub total_reclaimed: u64,
+}
+
+impl StaleVaultBatch {
+    /// Render this batch's to-be-signed bundle as deterministic JSON:
+    /// one base64 legacy transaction message per action (see
+    /// [`stale_vault_signable_message`]), in input order. A multisig or
+    /// CLI signs each message with the batch's caller key and submits —
+    /// one message, one signature, one instruction (the AV-71 shape).
+    ///
+    /// ```json
+    /// {"caller":"...","messages":[
+    ///   {"escrow_id":"...","message":"<base64>"}
+    /// ]}
+    /// ```
+    pub fn to_bundle_json(
+        &self,
+        program_id: Pubkey,
+        recent_blockhash: Pubkey,
+    ) -> Result<String, TxMessageError> {
+        let mut s = String::with_capacity(64 + self.actions.len() * 320);
+        s.push_str("{\"caller\":\"");
+        s.push_str(&hex32(&self.caller));
+        s.push_str("\",\"messages\":[");
+        for (i, a) in self.actions.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"escrow_id\":\"");
+            s.push_str(&hex32(&a.escrow_id));
+            s.push_str("\",\"message\":\"");
+            s.push_str(&stale_vault_signable_message(
+                program_id,
+                a,
+                recent_blockhash,
+            )?);
+            s.push_str("\"}");
+        }
+        s.push_str("]}");
+        Ok(s)
+    }
+}
+
+/// The stale-vault sweep result: rent-only terminal vaults grouped
+/// into per-caller batches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleVaultReport {
+    /// How many vaults were scanned.
+    pub scanned: usize,
+    /// The canonical rent-exempt minimum the scan compared balances
+    /// against ([`crate::vault_close_rent_reclaimed`]).
+    pub required_lamports: u64,
+    /// Per-caller batches, in first-seen caller order, so a keeper
+    /// feeding a stable watch list gets a stable sweep list.
+    pub batches: Vec<StaleVaultBatch>,
+}
+
+impl StaleVaultReport {
+    /// True when no stale rent-only vault was found.
+    pub fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+
+    /// Hand-serialized JSON (the crate is dependency-free): the
+    /// dry-run preview — per-initializer grouped reclaimable-rent
+    /// totals. Deterministic field order; keys are 64-char lowercase
+    /// hex; lamports are plain integers — the exact unit the close
+    /// returns.
+    ///
+    /// ```json
+    /// {"scanned":2,"required_lamports":6201360,"batches":[
+    ///   {"caller":"...","total_reclaimed":6201360,"actions":[
+    ///     {"escrow_id":"...","action":"close_vault","caller":"...",
+    ///      "caller_role":"initializer","vault_lamports":6201360,
+    ///      "rent_reclaimed":6201360,"expires_at":1700000000,
+    ///      "reason":"cancelled"}
+    ///   ]}
+    /// ]}
+    /// ```
+    pub fn to_json(&self) -> String {
+        let mut s = String::with_capacity(64 + self.batches.len() * 420);
+        s.push_str("{\"scanned\":");
+        s.push_str(&self.scanned.to_string());
+        s.push_str(",\"required_lamports\":");
+        s.push_str(&self.required_lamports.to_string());
+        s.push_str(",\"batches\":[");
+        for (bi, b) in self.batches.iter().enumerate() {
+            if bi > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"caller\":\"");
+            s.push_str(&hex32(&b.caller));
+            s.push_str("\",\"total_reclaimed\":");
+            s.push_str(&b.total_reclaimed.to_string());
+            s.push_str(",\"actions\":[");
+            for (i, a) in b.actions.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str("{\"escrow_id\":\"");
+                s.push_str(&hex32(&a.escrow_id));
+                s.push_str("\",\"action\":\"close_vault\",\"caller\":\"");
+                s.push_str(&hex32(&a.caller));
+                s.push_str("\",\"caller_role\":\"");
+                s.push_str(a.caller_role);
+                s.push_str("\",\"vault_lamports\":");
+                s.push_str(&a.vault_lamports.to_string());
+                s.push_str(",\"rent_reclaimed\":");
+                s.push_str(&a.rent_reclaimed.to_string());
+                s.push_str(",\"expires_at\":");
+                s.push_str(&a.expires_at.to_string());
+                s.push_str(",\"reason\":\"");
+                s.push_str(a.reason);
+                s.push_str("\"}");
+            }
+            s.push_str("]}");
+        }
+        s.push_str("]}");
+        s
+    }
+}
+
+/// Scan `watched` for stale rent-only vaults and return every
+/// immediately executable `close_vault` call, grouped into per-caller
+/// batches. Pure read over the snapshots and the measured balances:
+/// zero side effects, deterministic output in input order.
+///
+/// A vault is *stale* when its account has served its purpose but still
+/// exists carrying only the rent-exempt deposit:
+///
+/// - the escrow is in a terminal state AV-34's `close_vault` accepts
+///   (`Cancelled` / `Released` / `Settled` — the same gate
+///   [`scan_closeable`] mirrors), and
+/// - the measured vault balance is *exactly* the canonical rent-exempt
+///   minimum ([`crate::vault_close_rent_reclaimed`]).
+///
+/// Anything else is skipped, never listed:
+///
+/// - `Disputed`: the arbitration is still live; the chain rejects the
+///   close and the vault account is the arbiter's audit surface.
+/// - `Closed`: the rent is already reclaimed and the account is gone
+///   (like [`scan_rent_health`], there is no balance left to sweep).
+/// - `Uninitialized` / `Funded` / `Activated`: their vault accounts
+///   have not served their purpose yet. An expired `Funded` vault is
+///   the AV-20 / AV-48 cancel path's job first — once cancelled it
+///   surfaces here on the next scan.
+/// - a paused vault: `close_vault` fails it with `Paused` (AV-46), so
+///   the call is not executable.
+/// - a terminal vault whose balance is *above* the rent minimum still
+///   holds user funds (or fee dust): the sweep must not touch it
+///   without the operator's fund review. A balance *below* the minimum
+///   is the AV-43 rent-health scan's underfunded case — the sweep's
+///   reclaim estimate is the canonical figure, so it never lists a
+///   vault it would misprice.
+///
+/// "Closed/expired" in the AV-80 backlog item maps to this: the escrow
+/// is closed for business (terminal) — most stale vaults became
+/// terminal through `cancel_expired` after their deadline passed and
+/// were simply never closed; [`StaleVaultAction::expires_at`] carries
+/// that deadline for operator context.
+///
+/// The scan carries no `now`: closing has no time gate, so the list is
+/// valid until the vaults are closed and re-scanned.
+///
+/// Unlike [`scan_closeable`] (which *plans* every terminal close), the
+/// sweep stops at the signature boundary: `close_vault` needs the
+/// *initializer's* signature, and the keeper must not sign for it — so
+/// the scan emits the to-be-signed bundle
+/// ([`stale_vault_signable_message`] /
+/// [`StaleVaultBatch::to_bundle_json`]) and the dry-run preview
+/// ([`StaleVaultReport::to_json`]) for an offline signer or multisig.
+pub fn scan_stale_vaults(watched: &[WatchedEscrowWithBalance]) -> StaleVaultReport {
+    // AV-80: the canonical figure is the main formula — the same number
+    // `initialize` funds and `close_vault` promises.
+    let rent = vault_close_rent_reclaimed();
+    let mut batches: Vec<StaleVaultBatch> = Vec::new();
+    for w in watched {
+        let e = &w.escrow;
+        // Mirror AV-34's terminal-state gate exactly: only the three
+        // states `close_vault` accepts contribute an action. A paused
+        // vault fails `close_vault` with `Paused` (AV-46), so it is not
+        // executable and is skipped too.
+        if e.is_paused() {
+            continue;
+        }
+        let reason = match e.state() {
+            EscrowState::Cancelled => "cancelled",
+            EscrowState::Released => "released",
+            EscrowState::Settled => "settled",
+            _ => continue,
+        };
+        // Rent-only: the balance is exactly the canonical rent-exempt
+        // minimum — nothing but the deposit is left to reclaim.
+        if w.vault_lamports != rent {
+            continue;
+        }
+        let caller = e.initializer();
+        let action = StaleVaultAction {
+            escrow_id: w.escrow_id,
+            // AV-34 restricts `close_vault` to the initializer —
+            // authority is checked before state validity — so the
+            // initializer is the canonical caller *and* the only key
+            // the chain accepts.
+            caller,
+            caller_role: "initializer",
+            vault_lamports: w.vault_lamports,
+            rent_reclaimed: rent,
+            expires_at: e.expires_at(),
+            reason,
+        };
+        // Group per caller, batches in first-seen caller order; the Σ
+        // accumulates with `checked_add` (the AV-79 convention).
+        match batches.iter_mut().find(|b| b.caller == caller) {
+            Some(batch) => {
+                batch.actions.push(action);
+                batch.total_reclaimed = batch
+                    .total_reclaimed
+                    .checked_add(rent)
+                    .expect("AV-80: total rent overflowed u64");
+            }
+            None => batches.push(StaleVaultBatch {
+                caller,
+                actions: vec![action],
+                total_reclaimed: rent,
+            }),
+        }
+    }
+    StaleVaultReport {
+        scanned: watched.len(),
+        required_lamports: rent,
+        batches,
+    }
+}
+
+/// Build the to-be-signed legacy transaction message for one
+/// stale-vault close action: the real `close_vault` instruction bytes —
+/// the 8-byte discriminator recomputed from the IDL instruction name
+/// via [`instruction_discriminator`] (the same single source of truth
+/// the AV-29 IDL pipeline pins; the spec's `params: []` means the data
+/// is the discriminator alone) — plus the program-declared account
+/// metas, compiled into a genuine Solana legacy transaction message
+/// with the AV-71 machinery and returned as base64 for an offline
+/// signer or multisig to sign and submit.
+///
+/// The keeper never signs: this is the *unsigned* bundle the sweep
+/// outputs — the message carries exactly what `close_vault` needs (the
+/// vault account is the target, the initializer is the sole signer)
+/// and nothing the keeper must not decide. Program id and recent
+/// blockhash are caller-supplied (the AV-71 honesty labels apply: the
+/// keeper fetches a fresh blockhash from the cluster; the skeleton's
+/// `declare_id!` string is not valid base58 and is never decoded
+/// off-chain).
+///
+/// Account metas mirror the program's `CloseVault` accounts struct in
+/// declared order: `vault` — writable, non-signer (Anchor's
+/// `close = initializer` constraint closes it and pays the
+/// initializer); `initializer` — writable, signer (it receives the
+/// closed lamports). A multisig proposal signs one message per
+/// instruction; no address-table lookups are compiled in (legacy
+/// message).
+pub fn stale_vault_signable_message(
+    program_id: Pubkey,
+    action: &StaleVaultAction,
+    recent_blockhash: Pubkey,
+) -> Result<String, TxMessageError> {
+    // The discriminator is recomputed from the IDL name on every call —
+    // a renamed instruction or a drifted spec changes the bytes, never
+    // silently signs the wrong entrypoint.
+    let mut data = Vec::with_capacity(8);
+    data.extend_from_slice(&instruction_discriminator("close_vault"));
+    let ix = ProgramInstruction {
+        program_id,
+        accounts: vec![
+            AccountMeta {
+                pubkey: action.escrow_id,
+                is_signer: false,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: action.caller,
+                is_signer: true,
+                is_writable: true,
+            },
+        ],
+        data,
+    };
+    let msg = compile_message(&ix, recent_blockhash);
+    Ok(encode_base64(&encode_message(&msg)))
 }
 
 #[cfg(test)]
@@ -3251,6 +3597,281 @@ mod rent_health_tests {
                     provided: *balance,
                 }),
                 "listed balance must fail the main rent formula: {balance}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod stale_sweep_tests {
+    use super::*;
+    use crate::anchor_idl_tests::INSTRUCTIONS;
+    use crate::tx_message::{decode_base64, decode_message, encode_message};
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const CAROL: [u8; 32] = [0xCC; 32]; // second initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const ID1: [u8; 32] = [0x01; 32];
+    const ID2: [u8; 32] = [0x02; 32];
+    const ID3: [u8; 32] = [0x03; 32];
+    const ID4: [u8; 32] = [0x04; 32];
+    const ID5: [u8; 32] = [0x05; 32];
+    const ID6: [u8; 32] = [0x06; 32];
+    const ID7: [u8; 32] = [0x07; 32];
+    const PROGRAM_ID: [u8; 32] = [0x07; 32];
+    const BLOCKHASH: [u8; 32] = [0xBB; 32];
+    const NOW: u64 = 1_750_000_000;
+    const EXPIRED: u64 = 1_700_000_000;
+    const FUTURE: u64 = 1_800_000_000; // dispute paths need now < expires_at
+
+    fn rent() -> u64 {
+        vault_close_rent_reclaimed()
+    }
+
+    fn watch(id: [u8; 32], escrow: Escrow, vault_lamports: u64) -> WatchedEscrowWithBalance {
+        WatchedEscrowWithBalance {
+            escrow_id: id,
+            escrow,
+            vault_lamports,
+        }
+    }
+
+    fn cancelled(initializer: [u8; 32], expires_at: u64) -> Escrow {
+        let mut e = Escrow::initialize(initializer, BOB, 1_000_000, expires_at).unwrap();
+        e.fund(initializer, NOW).unwrap();
+        e.cancel(initializer, None, initializer).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        e
+    }
+
+    fn released(initializer: [u8; 32]) -> Escrow {
+        let mut e = Escrow::initialize(initializer, BOB, 1_000_000, EXPIRED).unwrap();
+        e.fund(initializer, NOW).unwrap();
+        e.release(initializer, NOW, 1_000_000, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        e
+    }
+
+    fn settled(initializer: [u8; 32]) -> Escrow {
+        let mut e = Escrow::initialize(initializer, BOB, 1_000_000, FUTURE)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(initializer, NOW).unwrap();
+        e.escalate(initializer, NOW, None).unwrap();
+        e.resolve(ARBITER, 400_000, None, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Settled);
+        e
+    }
+
+    fn funded(initializer: [u8; 32]) -> Escrow {
+        let mut e = Escrow::initialize(initializer, BOB, 1_000_000, EXPIRED).unwrap();
+        e.fund(initializer, NOW).unwrap();
+        e
+    }
+
+    fn hex_of(byte: u8) -> String {
+        format!("{:02x}", byte).repeat(32)
+    }
+
+    #[test]
+    fn empty_input_scans_to_empty_report() {
+        let report = scan_stale_vaults(&[]);
+        assert!(report.is_empty());
+        assert_eq!(report.scanned, 0);
+        assert_eq!(report.required_lamports, rent());
+        let expected = format!(
+            "{{\"scanned\":0,\"required_lamports\":{},\"batches\":[]}}",
+            rent()
+        );
+        assert_eq!(report.to_json(), expected);
+    }
+
+    #[test]
+    fn lists_only_rent_only_terminal_vaults() {
+        let r = rent();
+        let watched = [
+            watch(ID1, cancelled(ALICE, EXPIRED), r), // listed: cancelled, rent-only
+            watch(ID2, released(ALICE), r),           // listed: released, rent-only
+            watch(ID3, settled(ALICE), r),            // listed: settled, rent-only
+            watch(ID4, funded(ALICE), r),             // Funded: not terminal
+            watch(ID5, cancelled(ALICE, EXPIRED), r + 1), // user funds left: not rent-only
+            watch(ID6, cancelled(ALICE, EXPIRED), r - 1), // underfunded: rent-health's job
+            watch(ID7, released(CAROL), r),           // listed: other initializer
+        ];
+        let report = scan_stale_vaults(&watched);
+        assert_eq!(report.scanned, 7);
+        assert_eq!(report.batches.len(), 2, "two initializers: {report:?}");
+        let alice = &report.batches[0];
+        assert_eq!(alice.caller, ALICE);
+        assert_eq!(alice.actions.len(), 3);
+        assert_eq!(alice.total_reclaimed, 3 * r);
+        assert_eq!(alice.actions[0].escrow_id, ID1);
+        assert_eq!(alice.actions[0].caller, ALICE);
+        assert_eq!(alice.actions[0].caller_role, "initializer");
+        assert_eq!(alice.actions[0].vault_lamports, r);
+        assert_eq!(alice.actions[0].rent_reclaimed, r);
+        assert_eq!(alice.actions[0].expires_at, EXPIRED);
+        assert_eq!(alice.actions[0].reason, "cancelled");
+        assert_eq!(alice.actions[1].reason, "released");
+        assert_eq!(alice.actions[2].reason, "settled");
+        let carol = &report.batches[1];
+        assert_eq!(carol.caller, CAROL);
+        assert_eq!(carol.actions.len(), 1);
+        assert_eq!(carol.total_reclaimed, r);
+    }
+
+    #[test]
+    fn disputed_closed_and_paused_vaults_are_never_listed() {
+        let r = rent();
+        // Disputed: arbitration live, the chain rejects the close.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, FUTURE)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        d.fund(ALICE, NOW).unwrap();
+        d.escalate(ALICE, NOW, None).unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        // Closed: the rent is already reclaimed.
+        let mut c = cancelled(ALICE, EXPIRED);
+        c.close_vault(ALICE).unwrap();
+        assert_eq!(c.state(), EscrowState::Closed);
+        // Paused terminal vault: `close_vault` would fail `Paused`.
+        let mut p = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRED)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap();
+        p.fund(ALICE, NOW).unwrap();
+        p.cancel(ALICE, None, ALICE).unwrap();
+        p.pause(ALICE).unwrap();
+        assert!(p.is_paused());
+        let watched = [
+            watch(ID1, d, r),
+            watch(ID2, c, 0),
+            watch(ID3, p, r),
+        ];
+        let report = scan_stale_vaults(&watched);
+        assert!(report.is_empty(), "nothing listed: {report:?}");
+        assert_eq!(report.scanned, 3);
+    }
+
+    #[test]
+    fn dry_run_leaves_everything_untouched() {
+        let r = rent();
+        let watched = [
+            watch(ID1, cancelled(ALICE, EXPIRED), r),
+            watch(ID2, funded(ALICE), r),
+            watch(ID3, settled(CAROL), r),
+        ];
+        let before = watched;
+        let report = scan_stale_vaults(&watched);
+        assert_eq!(watched, before, "the scan must not mutate its input");
+        // Deterministic: the same watch list always renders the same
+        // preview.
+        assert_eq!(report.to_json(), scan_stale_vaults(&watched).to_json());
+        // The listed escrows are unchanged too (Copy snapshots compare).
+        for (w, b) in watched.iter().zip(before.iter()) {
+            assert_eq!(w.escrow.state(), b.escrow.state());
+        }
+    }
+
+    #[test]
+    fn report_json_shape_is_deterministic() {
+        let r = rent();
+        let watched = [watch(ID1, cancelled(ALICE, EXPIRED), r)];
+        let json = scan_stale_vaults(&watched).to_json();
+        let expected = format!(
+            "{{\"scanned\":1,\"required_lamports\":{r},\"batches\":[{{\"caller\":\"{}\",\"total_reclaimed\":{r},\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"close_vault\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"vault_lamports\":{r},\"rent_reclaimed\":{r},\"expires_at\":{EXPIRED},\"reason\":\"cancelled\"}}]}}]}}",
+            hex_of(0xAA),
+            hex_of(0x01),
+            hex_of(0xAA),
+        );
+        assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn signable_message_carries_real_close_vault_bytes() {
+        // The byte-exact core: data == the close_vault discriminator
+        // (the IDL name rule, the shared constructor, and the bundle's
+        // recomputed bytes all agree), pinned against the INSTRUCTIONS
+        // spec table — `close_vault` takes no params.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "close_vault")
+            .expect("INSTRUCTIONS missing close_vault");
+        assert_eq!(spec.params.len(), 0, "close_vault(params: [])");
+        assert_eq!(spec.method, "Escrow::close_vault");
+
+        let r = rent();
+        let report = scan_stale_vaults(&[watch(ID1, cancelled(ALICE, EXPIRED), r)]);
+        let action = report.batches[0].actions[0];
+        let b64 = stale_vault_signable_message(PROGRAM_ID, &action, BLOCKHASH).unwrap();
+        let bytes = decode_base64(&b64).unwrap();
+        let msg = decode_message(&bytes).unwrap();
+        assert_eq!(msg.instructions.len(), 1, "one instruction per message");
+        let cix = &msg.instructions[0];
+        // Discriminator pinned three ways.
+        let mut expected_disc = [0u8; 8];
+        expected_disc
+            .copy_from_slice(&crate::sha256(format!("global:close_vault").as_bytes())[..8]);
+        assert_eq!(&cix.data[..8], &expected_disc);
+        assert_eq!(&cix.data[..8], &instruction_discriminator("close_vault"));
+        assert_eq!(cix.data.len(), 8, "discriminator only — no params");
+        // Account metas in program-declared order: vault (writable,
+        // non-signer), initializer (writable, signer). Compiled
+        // canonical order: writable signers, writable non-signers,
+        // then the readonly program id.
+        assert_eq!(
+            msg.account_keys,
+            vec![ALICE, ID1, PROGRAM_ID],
+            "initializer, vault, program id"
+        );
+        assert_eq!(cix.program_id_index, 2);
+        assert_eq!(cix.accounts, vec![1, 0], "vault, initializer");
+        assert_eq!(msg.recent_blockhash, BLOCKHASH);
+        assert_eq!(msg.header.num_required_signatures, 1);
+        assert_eq!(msg.header.num_readonly_signed_accounts, 0);
+        assert_eq!(msg.header.num_readonly_unsigned_accounts, 1);
+        // Re-encoding the decoded message reproduces the exact bytes —
+        // the base64 is a faithful serialization (the AV-71 dry-run
+        // property: building the bundle never touches the action).
+        let before = action;
+        assert_eq!(encode_base64(&encode_message(&msg)), b64);
+        assert_eq!(action, before);
+    }
+
+    #[test]
+    fn bundle_json_lists_one_message_per_action() {
+        let r = rent();
+        let report = scan_stale_vaults(&[
+            watch(ID1, cancelled(ALICE, EXPIRED), r),
+            watch(ID2, released(ALICE), r),
+        ]);
+        let batch = &report.batches[0];
+        let json = batch.to_bundle_json(PROGRAM_ID, BLOCKHASH).unwrap();
+        assert!(
+            json.contains(&format!("\"caller\":\"{}\"", hex_of(0xAA))),
+            "bundle names the caller: {json}"
+        );
+        for a in &batch.actions {
+            let expected = stale_vault_signable_message(PROGRAM_ID, a, BLOCKHASH).unwrap();
+            let escrow_hex = a
+                .escrow_id
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            assert!(
+                json.contains(&format!("\"escrow_id\":\"{escrow_hex}\",\"message\":\"{expected}\"")),
+                "bundle carries the exact message for {escrow_hex}"
+            );
+            // Every message decodes back to a well-formed legacy
+            // message targeting close_vault.
+            let msg = decode_message(&decode_base64(&expected).unwrap()).unwrap();
+            assert_eq!(msg.instructions.len(), 1);
+            assert_eq!(
+                &msg.instructions[0].data[..8],
+                &instruction_discriminator("close_vault")
             );
         }
     }
