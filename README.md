@@ -51,6 +51,7 @@ No unverified claims are made about deployments, audits, or performance.
 escrow-state/               # pure-Rust state machine, zero dependencies
   src/lib.rs                # Escrow, EscrowState, EscrowError + unit tests
   src/events.rs             # AV-18: IndexedEscrow event-logging wrapper + EscrowEvent types + event_tests
+  src/batch_close.rs        # AV-79: batch vault close — dual-party bound, filtered, failure-isolated (off-chain execution; no new on-chain instruction)
 programs/escrow-vault/      # Anchor program skeleton (on-chain part not in cargo build)
   src/program.rs            # instructions wrapping escrow-state (needs anchor-lang)
   Cargo.toml                # `escrow-vault` package: local-validator test stubs only
@@ -122,6 +123,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `update_payout_allowlist(initializer, taker, allowlist)` (AV-49) | `Uninitialized` / `Funded` | same (no state change) | dual-signature governance — both initializer and taker on a dual-sig escrow, initializer alone on a plain escrow (`Unauthorized` otherwise); empty clears the allowlist (back to taker-only payouts); emits `PayoutAllowlistUpdated` only on an actual change |
 | `initialize_reference(reference)` (AV-53) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the 32-byte off-chain correlation id — order id / invoice hash; any 32 bytes accepted — read-only pass-through: never read by a check gate, never cleared, never affects amount conservation) |
 | `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it) |
+| `close_vaults(escrows, initializer, taker, filter)` (AV-79) | `Cancelled` / `Released` / `Settled` (per vault) | `Closed` (per closed vault) | **off-chain batch** — no new on-chain instruction (each close is one `close_vault` instruction the initializer submits; the Anchor skeleton is unchanged). Every vault must name the same initializer **and** taker (dual-party binding; a mismatch fails that item with `Unauthorized`); `CloseVaultsFilter` selects by state / `expires_at` cutoff / amount range (non-matching vaults are *skipped*, reported — not failed); per-vault failure isolation — one vault's rejection never aborts the batch, and a paused vault fails with `Paused` (AV-46, per-vault gate inherited from `close_vault`); the rent-exempt deposit is summed across the batch via `vault_close_rent_reclaimed()` (never hardcoded); the indexed variant emits one `VaultClosed` per closed vault plus a single `VaultsBatchClosed` summary on the first closed vault's log |
 | `release_and_close(authority, now, payout_to)` (AV-50) | `Funded` | `Closed` (via `Released`) | initializer; releases the **full remaining lockup** to the taker and closes the vault in the **same instruction** — one signature instead of two; the payout policy, quorum, timelock and mint gates all apply as on `release`; either leg failing aborts the whole instruction (state/counters/events roll back); emits `Released` then `VaultClosed` in that order; returns `(taker_payout, fee, rent_reclaimed)` |
 
 Rules: the initializer drives `fund`/`release`/`cancel`; any other caller
@@ -1399,6 +1401,12 @@ successful calls that change nothing observable:
   escrow was in (`Cancelled` / `Released` / `Settled`) and `to ==
   Closed`; `amounts.rent_reclaimed` carries the reclaimed rent-exempt
   deposit (AV-34), every other amount is zero.
+- `close_indexed_vaults` (AV-79) emits one `VaultClosed` per vault it
+  actually closes (exactly the AV-34 emission), then a single
+  `VaultsBatchClosed` summary on the first closed vault's log (`from ==
+  to == Closed` — a composition summary, not a lifecycle move;
+  `amounts.rent_reclaimed` is the Σ rent-exempt lamports the batch
+  reclaimed). A batch that closes nothing emits no summary event.
 - `release_and_close` (AV-50) emits `Released` (`from == Funded`,
   `to == Released`, gross payout + fee) and then `VaultClosed`
   (`from == Released`, `to == Closed`, `rent_reclaimed`) in that fixed
@@ -1616,6 +1624,16 @@ order; batches in first-seen caller order, actions in input order):
   ]}
 ]}
 ```
+
+`scan_closeable` *plans* the sweep; `close_vaults` (AV-79, in
+`escrow-state/src/batch_close.rs`) *executes* it: the operator feeds
+the same watch list through a `CloseVaultsFilter` (state / expiry /
+amount range) and the batch runs the exact AV-34 `close_vault` gates
+per vault — initializer **and** taker must match (dual-party binding),
+failures are isolated per vault (paused / disputed / stranger vaults
+are reported, never abort the batch), and the Σ rent-exempt reclaim
+comes from the same `vault_close_rent_reclaimed()` formula. Off-chain
+execution only; no new on-chain instruction.
 
 `scan_milestones(watched, now)` (AV-42) is the third keeper scan: it
 walks the same watch list and, per escrow carrying an AV-15 milestone

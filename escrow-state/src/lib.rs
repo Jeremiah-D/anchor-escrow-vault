@@ -26,6 +26,13 @@ mod execution_plan;
 // `initialize -> fund -> release` call list for many escrows, ALT
 // support, and per-item failure isolation (fleet bring-up / sweep).
 mod batch;
+// AV-79: batch vault close — dual-party bound, filtered,
+// failure-isolated `close_vaults` over many vaults (AV-34 gates per
+// vault) with a per-item report and Σ rent-exempt reclaim via the
+// `vault_close_rent_reclaimed` main formula; the indexed variant emits
+// one `VaultClosed` per closed vault plus a single `VaultsBatchClosed`
+// summary. Off-chain execution only — no new on-chain instruction.
+mod batch_close;
 // AV-61: keeper execution bundles — pack the batch lifecycle scan's
 // (AV-37) executable actions into `(mint, caller)` signing-session
 // bundles with real instruction discriminators, logical accounts, and
@@ -234,6 +241,16 @@ pub use execution_plan::{
 pub use batch::{
     scan_batch_lifecycle, BatchAccount, BatchActionKind, BatchInitializeParams, BatchItem,
     BatchItemOutcome, BatchLifecycleAction, BatchReport, BatchWatchItem,
+};
+
+// AV-79: batch vault close — dual-party bound, filtered,
+// failure-isolated execution of AV-34 `close_vault` over many vaults,
+// with a per-item deterministic-JSON report and the Σ rent-exempt
+// reclaim via the `vault_close_rent_reclaimed` main formula. Off-chain
+// only; the Anchor skeleton gains no new instruction.
+pub use batch_close::{
+    close_indexed_vaults, close_vaults, CloseVaultsFilter, CloseVaultsReport, VaultClosedItem,
+    VaultFailedItem, VaultSkippedItem,
 };
 
 // AV-61: keeper execution bundles over the batch lifecycle scan —
@@ -24913,7 +24930,12 @@ mod event_history_tests {
             39,
             "AV-77: appended after BundlePartiallyExecuted"
         );
-        for d in 0..=39u8 {
+        assert_eq!(
+            EscrowEventKind::VaultsBatchClosed.discriminant(),
+            40,
+            "AV-79: appended after TemplateApplied"
+        );
+        for d in 0..=40u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -24924,7 +24946,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(40), None);
+        assert_eq!(EscrowEventKind::from_discriminant(41), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -25049,8 +25071,9 @@ mod event_history_tests {
         // `SubscriptionAmountsAdjusted` (AV-73), 37 is
         // `SchemaMigrated` (AV-75), 38 is
         // `BundlePartiallyExecuted` (AV-76), 39 is `TemplateApplied`
-        // (AV-77); 40 is the first still-unknown byte.
-        for bad in [40u8, 42, 255] {
+        // (AV-77), 40 is `VaultsBatchClosed` (AV-79); 41 is the first
+        // still-unknown byte.
+        for bad in [41u8, 42, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

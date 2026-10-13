@@ -127,6 +127,15 @@
 //!   `VaultClosed` in that fixed order: the payout first
 //!   (`from == Funded`, `to == Released`, gross payout + fee), then the
 //!   close (`from == Released`, `to == Closed`, `rent_reclaimed`).
+//! - `close_indexed_vaults` (AV-79) emits one
+//!   [`EscrowEventKind::VaultClosed`] per vault it actually closes
+//!   (exactly the AV-34 emission, via `IndexedEscrow::close_vault`),
+//!   then a single [`EscrowEventKind::VaultsBatchClosed`] summary on
+//!   the first closed vault's log (`from == to == Closed`, a
+//!   composition summary — not a lifecycle move — and
+//!   `amounts.rent_reclaimed` is the Σ rent-exempt lamports the batch
+//!   reclaimed). A batch that closes nothing emits no summary event
+//!   (paralleling the no-op rules on `QuorumUpdated` et al).
 //! - A rejected reentrant entry (AV-36) emits
 //!   [`EscrowEventKind::ReentryRejected`] — the deliberate exception to
 //!   the "failed calls emit nothing" rule. A blocked reentry is a
@@ -174,6 +183,7 @@
 //! | PanelJudgment (AV-65) | the voted split (`taker_amount`) | 0 | 0 | 0 |
 //! | MilestoneSkipped | 0 | 0 | skipped tranche (the initializer's refund) | 0 |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
+//! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //!
 //! # Backward compatibility
 //!
@@ -472,6 +482,20 @@ pub enum EscrowEventKind {
     /// configures the escrow, so there is no no-op case (an empty
     /// override list still applies the preset's defaults and emits).
     TemplateApplied,
+    /// AV-79: a batch vault close
+    /// ([`crate::close_indexed_vaults`]) closed one or more vaults.
+    /// `from == to == Closed` — a composition summary, not a
+    /// lifecycle move (like
+    /// [`EscrowEventKind::BundlePartiallyExecuted`]): the per-vault
+    /// [`EscrowEventKind::VaultClosed`] events already record each
+    /// close, and the closed vaults' indexes ride the batch report
+    /// ([`crate::CloseVaultsReport`]). [`EventAmounts::rent_reclaimed`]
+    /// carries the Σ rent-exempt lamports the batch reclaimed, every
+    /// other amount zero. The summary rides the first closed vault's
+    /// log (in `seq` order, after its `VaultClosed`); a batch that
+    /// closes nothing emits no summary event (paralleling the no-op
+    /// rules on [`EscrowEventKind::QuorumUpdated`] et al).
+    VaultsBatchClosed,
 }
 
 impl EscrowEventKind {
@@ -554,6 +578,9 @@ impl EscrowEventKind {
             // discriminants 0–38 stay stable for already-serialized
             // histories.
             39 => Self::TemplateApplied,
+            // AV-79: appended after TemplateApplied so discriminants
+            // 0–39 stay stable for already-serialized histories.
+            40 => Self::VaultsBatchClosed,
             _ => return None,
         })
     }
@@ -602,6 +629,7 @@ impl EscrowEventKind {
             Self::SchemaMigrated => "schema_migrated",
             Self::BundlePartiallyExecuted => "bundle_partially_executed",
             Self::TemplateApplied => "template_applied",
+            Self::VaultsBatchClosed => "vaults_batch_closed",
         }
     }
 
@@ -651,6 +679,7 @@ impl EscrowEventKind {
             "schema_migrated" => Self::SchemaMigrated,
             "bundle_partially_executed" => Self::BundlePartiallyExecuted,
             "template_applied" => Self::TemplateApplied,
+            "vaults_batch_closed" => Self::VaultsBatchClosed,
             _ => return None,
         })
     }
@@ -736,6 +765,14 @@ impl EventAmounts {
             penalty: 0,
             rent_reclaimed: rent,
         }
+    }
+
+    /// A batch vault close (AV-79): the Σ rent-exempt deposits the
+    /// batch reclaimed, in `rent_reclaimed` — the same shape as
+    /// [`Self::close`], aggregated across the closed vaults. Rides the
+    /// [`EscrowEventKind::VaultsBatchClosed`] summary event.
+    pub(crate) fn batch_close(total_rent: u64) -> Self {
+        Self::close(total_rent)
     }
 }
 
@@ -2727,6 +2764,34 @@ impl IndexedEscrow {
         Ok(rent)
     }
 
+    /// AV-79: record the [`EscrowEventKind::VaultsBatchClosed`] summary
+    /// event on this escrow's log. Called by
+    /// [`crate::close_indexed_vaults`] on the *first* vault the batch
+    /// actually closed, after that vault's own `VaultClosed` event —
+    /// so the summary sits in `seq` order on a participating vault's
+    /// log, with `from == to == Closed` (a composition summary, not a
+    /// lifecycle move — like
+    /// [`EscrowEventKind::BundlePartiallyExecuted`]). `total_rent` is
+    /// the Σ rent-exempt lamports the batch reclaimed (in
+    /// `amounts.rent_reclaimed`, every other amount zero); `at` is the
+    /// batch's timestamp and `actor` the initializer that ran it.
+    /// Callers emit no summary when the batch closed nothing — the
+    /// no-op rule lives in [`crate::close_indexed_vaults`], not here.
+    pub fn record_vaults_batch_closed(&mut self, total_rent: u64, at: u64, actor: [u8; 32]) {
+        self.push_event(
+            EscrowEventKind::VaultsBatchClosed,
+            EscrowState::Closed,
+            EscrowState::Closed,
+            EventAmounts::batch_close(total_rent),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(actor),
+        );
+    }
+
     /// Release the full remaining lockup to the taker and close the
     /// vault account in one atomic instruction (mirrors
     /// [`Escrow::release_and_close`], AV-50). Emits `Released`
@@ -4369,7 +4434,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(40), None);
+        assert_eq!(EscrowEventKind::from_discriminant(41), None);
     }
 
     #[test]
@@ -4385,7 +4450,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(40), None);
+        assert_eq!(EscrowEventKind::from_discriminant(41), None);
     }
 
     #[test]
