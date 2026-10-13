@@ -234,6 +234,12 @@ pub mod escrow_vault {
                 // before its authority check — the outer release is
                 // unaffected and the rejection emits a `ReentryRejected`
                 // indexer event.
+                // AV-83: when the escrow carries a CPI target allowlist,
+                // the state machine's fail-closed allowlist check runs
+                // after shape validation and before the invocation — an
+                // off-list target is rejected with `InvalidCpiTarget`
+                // (code 120) with full rollback, exactly as a failed
+                // invoke aborts the transaction.
                 |inv| cpi_invoke_target(&ctx, inv),
             )
             .map_err(|e| escrow_error(e))?;
@@ -1830,6 +1836,78 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Initialize the opt-in CPI target-program allowlist (AV-83;
+    /// mirrors `Escrow::with_cpi_allowlist`): the only programs
+    /// `release_via_cpi` may invoke when the list is configured. An
+    /// empty list leaves the allowlist unset (any target allowed —
+    /// the default). `Uninitialized` only, like
+    /// `initialize_payout_allowlist`: the CPI policy is fixed before
+    /// funds move. Over-long / zero-address input is
+    /// `InvalidCpiAllowlist` (code 144). The vault account already
+    /// reserves the full 258-byte region (1-byte count + 8 32-byte
+    /// program ids, zeroed when `None`), so the list is written in
+    /// place — no realloc needed in the real build. Emits no event
+    /// (pre-fund configuration).
+    pub fn initialize_cpi_allowlist(
+        ctx: Context<InitializeCpiAllowlist>,
+        allowlist: Vec<Pubkey>,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let addrs: Vec<[u8; 32]> = allowlist.iter().map(|k| k.to_bytes()).collect();
+        let escrow = escrow
+            .with_cpi_allowlist(&addrs)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
+    /// Update the CPI target-program allowlist (AV-83; mirrors
+    /// `Escrow::update_cpi_allowlist`). Unlike the payout allowlist,
+    /// this update is always dual-signed — both initializer and taker
+    /// sign even on a plain escrow, since the allowlist guards a
+    /// privileged execution path (a stricter rule than AV-49 by
+    /// design). `Uninitialized` / `Funded` only; an empty list clears
+    /// the allowlist (back to any-target-allowed). `InvalidCpiAllowlist`
+    /// (code 144) on over-long / zero-address input. Emits
+    /// `CpiAllowlistUpdated` (from == to == the current state).
+    pub fn update_cpi_allowlist(
+        ctx: Context<UpdateCpiAllowlist>,
+        allowlist: Vec<Pubkey>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.cpi_allowlist();
+        let addrs: Vec<[u8; 32]> = allowlist.iter().map(|k| k.to_bytes()).collect();
+        escrow
+            .update_cpi_allowlist(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &addrs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Emits only on an actual change; a same-list no-op stays
+        // silent (mirrors `update_payout_allowlist`).
+        if escrow.cpi_allowlist() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::CpiAllowlistUpdated,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Bind the opt-in 32-byte off-chain reference memo (AV-53; mirrors
     /// `Escrow::with_reference`): an order id, invoice hash, or any
     /// other 32-byte correlation id from the operator's off-chain
@@ -3077,6 +3155,19 @@ pub struct Vault {
     /// when never slashed). Layout position matches
     /// `escrow_state::VAULT_FIELDS` (appended last).
     pub penalty_paid: u64,
+    /// AV-83: opt-in CPI target-program allowlist; mirrors
+    /// `escrow_state`'s `cpi_allowlist`. `None` for an escrow that
+    /// allows any target program in `release_via_cpi`. The account
+    /// always reserves the full 258-byte region (1-byte count + 8
+    /// 32-byte program ids, zeroed when `None`) so
+    /// `initialize_cpi_allowlist` writes it in place without
+    /// reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `penalty_paid`). Fail-closed: `release_via_cpi` rejects a
+    /// target program not on the list with `InvalidCpiTarget` (code
+    /// 120), with full rollback — a phishing frontend cannot steer
+    /// the payout through a hostile program by swapping the target.
+    pub cpi_allowlist: Option<CpiAllowlist>,
 }
 
 /// Skeleton mirror of `escrow_state::SlashTerms`: the opt-in
@@ -3152,6 +3243,16 @@ pub struct MilestonePlan {
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
 pub struct PayoutAllowlist {
     pub addrs: [Pubkey; 4],
+    pub len: u8,
+}
+
+/// AV-83: skeleton mirror of `escrow_state::CpiAllowlist`: up to 8
+/// allowed target-program ids in slot order plus the live count.
+/// Serialized size is pinned by `escrow_state::CPI_ALLOWLIST_LEN`
+/// (258 bytes: 8×32-byte program ids + 1-byte count).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct CpiAllowlist {
+    pub addrs: [Pubkey; 8],
     pub len: u8,
 }
 
@@ -4425,6 +4526,29 @@ pub struct UpdatePayoutAllowlist<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitializeCpiAllowlist<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer sets the funding-time CPI policy; the
+    /// state machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`, and rejects empty / over-long / zero-address
+    /// input (`InvalidCpiAllowlist`, code 144).
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateCpiAllowlist<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Always dual-signed: both initializer and taker sign even on a
+    /// plain escrow — the CPI allowlist guards a privileged execution
+    /// path, so it carries a stricter rule than AV-49 by design (the
+    /// state machine enforces this — a stranger is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitializeReference<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
@@ -4883,6 +5007,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::SlashNotEligible => {
             error!(ErrorCode::SlashNotEligible)
         }
+        escrow_state::EscrowError::InvalidCpiAllowlist => {
+            error!(ErrorCode::InvalidCpiAllowlist)
+        }
     }
 }
 
@@ -4974,4 +5101,6 @@ pub enum ErrorCode {
     TemplateOverrideRejected,
     #[msg("Slash not eligible (AV-82): slash with no slash terms configured, before the slash deadline, on an already-slashed escrow (one-shot), with an amount above the slashable remainder, on a dual-sig escrow lacking both activation bits, on a Disputed escrow (locked while arbitration owns the funds), or on a milestone/subscription-scheduled escrow; with_slash_terms with the zero penalty account")]
     SlashNotEligible,
+    #[msg("Invalid CPI target-program allowlist (AV-83): with_cpi_allowlist / update_cpi_allowlist with more than 8 program ids or a zero address; update_cpi_allowlist by a non-dual signature, on a paused escrow, on a Released/Cancelled/Expired vault, or with no allowlist configured")]
+    InvalidCpiAllowlist,
 }

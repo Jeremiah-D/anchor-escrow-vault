@@ -367,6 +367,10 @@ pub struct EscrowSnapshot {
     /// configured (AV-49). When `Some`, every fund-moving transition
     /// requires its `payout_to` to be a member.
     pub payout_allowlist: Option<Vec<[u8; 32]>>,
+    /// CPI target-program allowlist, or `None` when no allowlist is
+    /// configured (AV-83). When `Some`, a `release_via_cpi` whose
+    /// target program is outside the list is rejected.
+    pub cpi_allowlist: Option<Vec<[u8; 32]>>,
     /// Opt-in 32-byte off-chain reference memo (e.g. order id / invoice
     /// hash) bound at setup via [`Escrow::with_reference`], or `None`
     /// when no reference was attached (AV-53). Read-only pass-through
@@ -566,6 +570,11 @@ impl Escrow {
             payout_allowlist: self
                 .payout_allowlist()
                 .map(|list| list.as_slice().to_vec()),
+            // AV-83: the CPI target allowlist rides the export for
+            // reconciliation — read-only, enforced by
+            // `release_via_cpi`, never rewritten by a transition
+            // except `update_cpi_allowlist`.
+            cpi_allowlist: self.cpi_allowlist().map(|list| list.as_slice().to_vec()),
             // AV-53: the off-chain reference memo rides the export for
             // reconciliation — read-only, never a gate input.
             reference: self.reference(),
@@ -909,6 +918,24 @@ impl EscrowSnapshot {
             }
             None => s.push_str("null"),
         }
+        // AV-83: CPI target-program allowlist — `null` when none is
+        // configured, else the allowlisted program ids as hex strings.
+        s.push_str(",\"cpi_allowlist\":");
+        match &self.cpi_allowlist {
+            Some(addrs) => {
+                s.push('[');
+                for (i, a) in addrs.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push('"');
+                    s.push_str(&hex32(a));
+                    s.push('"');
+                }
+                s.push(']');
+            }
+            None => s.push_str("null"),
+        }
         // AV-53: the off-chain reference memo — 64-char lowercase hex
         // or `null` — for off-chain reconciliation.
         s.push_str(",\"reference\":");
@@ -1060,7 +1087,7 @@ mod snapshot_tests {
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
-             \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\
+             \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\"cpi_allowlist\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
              \"max_extension_secs\":0,\"extension_count\":0,\"arbiter_panel\":null,\

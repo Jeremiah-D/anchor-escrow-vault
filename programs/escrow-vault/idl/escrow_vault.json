@@ -377,6 +377,22 @@
       ]
     },
     {
+      "name": "initialize_cpi_allowlist",
+      "discriminator": [156, 187, 23, 210, 103, 8, 231, 39],
+      "accounts": [],
+      "args": [
+        {"name": "program_ids", "type": {"vec": "publicKey"}}
+      ]
+    },
+    {
+      "name": "update_cpi_allowlist",
+      "discriminator": [180, 248, 58, 41, 108, 201, 10, 92],
+      "accounts": [],
+      "args": [
+        {"name": "program_ids", "type": {"vec": "publicKey"}}
+      ]
+    },
+    {
       "name": "initialize_reference",
       "discriminator": [199, 226, 9, 15, 40, 9, 131, 223],
       "accounts": [],
@@ -581,7 +597,8 @@
           {"name": "subscription_amounts", "type": {"array": ["u64", 64]}, "offset": 2941},
           {"name": "schema_version", "type": "u8", "offset": 3453},
           {"name": "slash_terms", "type": {"option": {"defined": "SlashTerms"}}, "offset": 3454},
-          {"name": "penalty_paid", "type": "u64", "offset": 3495}
+          {"name": "penalty_paid", "type": "u64", "offset": 3495},
+          {"name": "cpi_allowlist", "type": {"option": {"defined": "CpiAllowlist"}}, "offset": 3503}
         ]
       }
     }
@@ -715,6 +732,16 @@
           {"name": "slash_deadline", "type": "u64", "offset": 32}
         ]
       }
+    },
+    {
+      "name": "CpiAllowlist",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "addrs", "type": {"array": ["publicKey", 8]}, "offset": 0},
+          {"name": "len", "type": "u8", "offset": 256}
+        ]
+      }
     }
   ],
   "errors": [
@@ -761,7 +788,8 @@
     {"code": 140, "name": "InvalidSchemaMigration"},
     {"code": 141, "name": "TemplateOverrideRejected"},
     {"code": 142, "name": "InvalidSplit"},
-    {"code": 143, "name": "SlashNotEligible"}
+    {"code": 143, "name": "SlashNotEligible"},
+    {"code": 144, "name": "InvalidCpiAllowlist"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

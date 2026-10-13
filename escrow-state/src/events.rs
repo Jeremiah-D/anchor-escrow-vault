@@ -541,6 +541,15 @@ pub enum EscrowEventKind {
     /// or the arbiter). Always emitted on success: a successful slash
     /// always moves funds, so there is no no-op case.
     Slashed,
+    /// AV-83: the CPI target-program allowlist was changed by
+    /// dual-party governance ([`Escrow::update_cpi_allowlist`]).
+    /// `from == to ==` the current state (a config change, not a
+    /// lifecycle move — like [`EscrowEventKind::PayoutAllowlistUpdated`]);
+    /// the new list is read from the vault, the event is the ordering
+    /// signal. Amounts are zero. (The initialize-time builder
+    /// [`Escrow::with_cpi_allowlist`] emits no event — pre-fund
+    /// configuration, like [`Escrow::with_payout_allowlist`].)
+    CpiAllowlistUpdated,
 }
 
 impl EscrowEventKind {
@@ -632,6 +641,9 @@ impl EscrowEventKind {
             // AV-82: appended after EscrowSplit so discriminants 0–41
             // stay stable for already-serialized histories.
             42 => Self::Slashed,
+            // AV-83: appended after Slashed so discriminants 0–42
+            // stay stable for already-serialized histories.
+            43 => Self::CpiAllowlistUpdated,
             _ => return None,
         })
     }
@@ -683,6 +695,7 @@ impl EscrowEventKind {
             Self::VaultsBatchClosed => "vaults_batch_closed",
             Self::EscrowSplit => "escrow_split",
             Self::Slashed => "escrow_slashed",
+            Self::CpiAllowlistUpdated => "cpi_allowlist_updated",
         }
     }
 
@@ -735,6 +748,7 @@ impl EscrowEventKind {
             "vaults_batch_closed" => Self::VaultsBatchClosed,
             "escrow_split" => Self::EscrowSplit,
             "escrow_slashed" => Self::Slashed,
+            "cpi_allowlist_updated" => Self::CpiAllowlistUpdated,
             _ => return None,
         })
     }
@@ -2017,6 +2031,42 @@ impl IndexedEscrow {
             let state = self.inner.state();
             self.push_event(
             EscrowEventKind::PayoutAllowlistUpdated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
+    /// Update the CPI target-program allowlist (mirrors
+    /// [`Escrow::update_cpi_allowlist`]). Emits `CpiAllowlistUpdated`
+    /// only when the list actually changes; `from == to ==` the current
+    /// state. `at` is the caller-supplied event timestamp.
+    pub fn update_cpi_allowlist(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        program_ids: &[[u8; 32]],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.cpi_allowlist();
+        self.inner
+            .update_cpi_allowlist(initializer, taker, program_ids)?;
+        let after = self.inner.cpi_allowlist();
+        // The inner call rejects bad input, strangers, and wrong states,
+        // so a changed list here always means real governance — and a
+        // same-list no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+            EscrowEventKind::CpiAllowlistUpdated,
             state,
             state,
             EventAmounts::none(),
@@ -4755,7 +4805,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(43), None);
+        assert_eq!(EscrowEventKind::from_discriminant(44), None);
     }
 
     #[test]
@@ -4771,7 +4821,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(43), None);
+        assert_eq!(EscrowEventKind::from_discriminant(44), None);
     }
 
     #[test]
@@ -5259,7 +5309,22 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(43), None);
+        assert_eq!(EscrowEventKind::from_discriminant(44), None);
+    }
+
+    #[test]
+    fn cpi_allowlist_updated_kind_round_trips() {
+        // AV-83: discriminant 43, appended after Slashed —
+        // 0–42 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::CpiAllowlistUpdated;
+        assert_eq!(kind.discriminant(), 43);
+        assert_eq!(EscrowEventKind::from_discriminant(43), Some(kind));
+        assert_eq!(kind.name(), "cpi_allowlist_updated");
+        assert_eq!(
+            EscrowEventKind::from_name("cpi_allowlist_updated"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(44), None);
     }
 
     #[test]

@@ -1243,6 +1243,41 @@ pub fn stale_vault_signable_message(
     Ok(encode_base64(&encode_message(&msg)))
 }
 
+/// Assemble a third-party CPI invocation for a watched escrow
+/// (AV-83): validates the invocation shape *and* the escrow's CPI
+/// target allowlist ([`Escrow::cpi_target_allowed`]) before returning
+/// the invocation, so a keeper bundle never carries a doomed target.
+///
+/// Why fail at assembly: the state machine's
+/// [`Escrow::release_via_cpi`] would roll the release back anyway with
+/// [`EscrowError::InvalidCpiTarget`], but a keeper that assembles
+/// first and checks never would list phantom executable actions in
+/// its report and burn a signature round-trip on a rejection it could
+/// have predicted. The check order mirrors the state machine — shape
+/// first, then the allowlist — so assembly and execution agree on
+/// every input.
+///
+/// [`Escrow::release_via_cpi`]: crate::Escrow::release_via_cpi
+/// [`EscrowError::InvalidCpiTarget`]: crate::EscrowError::InvalidCpiTarget
+pub fn assemble_cpi_invocation(
+    watched: &WatchedEscrow,
+    program_id: Pubkey,
+    accounts: Vec<AccountMeta>,
+    data: Vec<u8>,
+) -> Result<crate::cpi_call::CpiInvocation, EscrowError> {
+    let inv = crate::cpi_call::CpiInvocation {
+        program_id,
+        accounts,
+        data,
+    };
+    // Same order as `release_via_cpi`: shape, then the allowlist.
+    crate::cpi_call::validate_cpi_invocation(&inv)?;
+    if !watched.escrow.cpi_target_allowed(&program_id) {
+        return Err(EscrowError::InvalidCpiTarget);
+    }
+    Ok(inv)
+}
+
 #[cfg(test)]
 mod keeper_tests {
     use super::*;

@@ -36,13 +36,14 @@
 //! the result.
 
 use super::{
-    sha256, ArbiterPanel, DefaultJudgment, Escrow, EscrowEventKind, EscrowState, EventHistorySlot,
-    FeeSchedule, FeeTier, MilestonePlan, PanelVote, PayoutAllowlist, QuorumPolicy, SlashTerms,
-    SubscriptionSchedule, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN, ARBITER_PANEL_LEN,
-    DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS,
-    MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS, MAX_PAYOUT_ALLOWLIST,
-    MAX_SUBSCRIPTION_PERIODS, MILESTONE_PLAN_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN,
-    QUORUM_POLICY_LEN, SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
+    sha256, ArbiterPanel, CpiAllowlist, DefaultJudgment, Escrow, EscrowEventKind, EscrowState,
+    EventHistorySlot, FeeSchedule, FeeTier, MilestonePlan, PanelVote, PayoutAllowlist, QuorumPolicy,
+    SlashTerms, SubscriptionSchedule, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN, ARBITER_PANEL_LEN,
+    CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN,
+    MAX_ATTESTORS, MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES,
+    MAX_PANEL_MEMBERS, MAX_PAYOUT_ALLOWLIST, MAX_SUBSCRIPTION_PERIODS, MILESTONE_PLAN_LEN,
+    PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_TERMS_LEN,
+    SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
 };
 
 /// Program-side `#[account]` type names, in Anchor IDL order. The single
@@ -104,6 +105,14 @@ pub enum AccountDecodeError {
     /// rejects it rather than decoding a value the accessors cannot
     /// safely read (AV-49; AV-32 panic-free guarantee).
     InvalidPayoutAllowlistLen(u8),
+    /// A present CPI target allowlist's entry count is outside `1..=8`
+    /// ([`MAX_CPI_ALLOWLIST`](crate::MAX_CPI_ALLOWLIST)). The count
+    /// byte is part of the field's layout — an out-of-range count
+    /// would make [`CpiAllowlist::as_slice`](crate::CpiAllowlist::as_slice)
+    /// panic, so the decoder rejects it rather than decoding a value
+    /// the accessors cannot safely read (AV-83; AV-32 panic-free
+    /// guarantee).
+    InvalidCpiAllowlistLen(u8),
     /// An event-history slot's kind byte is not a known
     /// [`EscrowEventKind`] discriminant (0–32). The mapping is pinned
     /// by test to declaration order (AV-57).
@@ -682,6 +691,33 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // is unchanged.
     let penalty_paid = c.u64_le()?;
 
+    // AV-83: the opt-in CPI target allowlist, always reserved like
+    // `payout_allowlist`: the `None` discriminant followed by a zeroed
+    // 257-byte region (eight 32-byte program ids + count byte),
+    // appended last so every earlier offset above is unchanged. The
+    // count is validated `1..=8` — an out-of-range count would make
+    // `CpiAllowlist::as_slice` panic, so the panic-free decoder
+    // rejects it (see `InvalidCpiAllowlistLen`).
+    let cpi_allowlist = if c.option_present("cpi_allowlist")? {
+        let mut addrs = [[0u8; 32]; MAX_CPI_ALLOWLIST];
+        for a in addrs.iter_mut() {
+            *a = c.pubkey()?;
+        }
+        let len = c.u8()?;
+        if len == 0 || len as usize > MAX_CPI_ALLOWLIST {
+            return Err(AccountDecodeError::InvalidCpiAllowlistLen(len));
+        }
+        debug_assert_eq!(
+            CPI_ALLOWLIST_LEN,
+            8 * 32 + 1,
+            "allowlist region drift vs CPI_ALLOWLIST_LEN"
+        );
+        Some(CpiAllowlist { addrs, len })
+    } else {
+        c.skip(CPI_ALLOWLIST_LEN)?;
+        None
+    };
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -801,6 +837,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // enforcement recorded, so the conservation invariant holds
         // across a decode.
         penalty_paid,
+        // AV-83: the CPI target allowlist is persisted — a decoded
+        // escrow enforces the same target pin as the live one.
+        cpi_allowlist,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

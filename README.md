@@ -123,6 +123,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `crank_expired(caller, now)` (AV-48) | `Funded` | `Cancelled` | **anyone** — permissionless crank (Solana crank pattern), only when `now >= expires_at + grace_period`; no counterparty signature needed, so a keeper bot that is party to nothing can sweep timed-out vaults; the refund follows the same pinned refund policy (whitelisted address, or the initializer) — the cranker receives nothing (anti-MEV); a taker cranker still pays the anti-griefing penalty; rejected with `Paused` while the escrow is paused |
 | `initialize_payout_allowlist(allowlist)` (AV-49) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–4 live payout-destination addresses; empty / over-long / zero-address input is `InvalidPayoutAllowlist`); the payout policy gates every fund-moving transition's `payout_to` |
 | `update_payout_allowlist(initializer, taker, allowlist)` (AV-49) | `Uninitialized` / `Funded` | same (no state change) | dual-signature governance — both initializer and taker on a dual-sig escrow, initializer alone on a plain escrow (`Unauthorized` otherwise); empty clears the allowlist (back to taker-only payouts); emits `PayoutAllowlistUpdated` only on an actual change |
+| `initialize_cpi_allowlist(allowlist)` (AV-83) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–8 live target-program ids; empty list leaves the allowlist unset — any target allowed; over-long / zero-address input is `InvalidCpiAllowlist`); when configured, `release_via_cpi` may only invoke a listed target program — `InvalidCpiTarget` (code 120) with full rollback otherwise |
+| `update_cpi_allowlist(initializer, taker, allowlist)` (AV-83) | `Uninitialized` / `Funded` | same (no state change) | **always dual-signed** — both initializer and taker even on a plain escrow (stricter than AV-49 by design: the allowlist guards a privileged execution path); `Uninitialized`/`Funded` only; empty list clears the allowlist (back to any-target-allowed); emits `CpiAllowlistUpdated` only on an actual change |
 | `initialize_reference(reference)` (AV-53) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the 32-byte off-chain correlation id — order id / invoice hash; any 32 bytes accepted — read-only pass-through: never read by a check gate, never cleared, never affects amount conservation) |
 | `split_escrow(initializer, taker, amounts, vesting, quorum, dual_sig, milestones)` (AV-81) | `Funded` | `Split` (new terminal state) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`; degenerate initializer == taker self-escrow authorizes with one key passed twice); `Disputed` is `InvalidStateTransition` (arbitration in flight adjudicates the locked funds) and every terminal state rejects a re-split; the amount table must be non-empty, hold at most 16 entries, contain no zero entry, and sum in `u128` to exactly the parent's remaining lockup (`InvalidSplit`, code 142, otherwise — a partial release before the split shrinks the splittable pool); each child is born `Funded` with the parent's initializer / taker / `expires_at` and the explicitly inherited config — vesting / quorum / dual-sig / per-child milestones are *not* inherited unless named (default-inert, anti-misconfiguration); child *i*'s escrow ID derives as `H(parent_id \|\| i)` (SHA-256, `u64` little-endian index); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in `Funded` — no half-split); emits `EscrowSplit` (`Funded -> Split`, `amounts.payout` = Σ child amounts, the `(child_id, amount)` roster rides the event) |
 | `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` / `Split` (AV-81) | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it); a split parent's funds were re-homed into the children, so its vault carries nothing but the rent deposit — closeable like the other terminals |
@@ -1071,7 +1073,7 @@ program error per variant):
 | `InvalidPenalty` | 117 | `with_penalty_bps` with `penalty_bps` > 10_000 (not a valid basis-point rate) |
 | `TimelockNotReached` | 118 | `release`/`claim`/`release_milestone` while `now < unlock_at` (AV-27 absolute timelock) or `now < fund_at + secs` (AV-64 relative timelock); `cancel`/`cancel_expired`/`resolve` are never gated |
 | `InvalidDecimals` | 119 | `with_decimals` with `decimals` > 18 (not a valid token precision) |
-| `InvalidCpiTarget` | 120 | `release_via_cpi` with a zero program id, an empty account list, or a zero account key (malformed third-party invocation) |
+| `InvalidCpiTarget` | 120 | `release_via_cpi` with a zero program id, an empty account list, or a zero account key (malformed third-party invocation); since AV-83, also a target program not on the configured CPI allowlist (fail-closed, full rollback) |
 | `CpiExecutionFailed` | 121 | `release_via_cpi` whose injected CPI executor reported failure after the gates passed (whole release rolled back) |
 | `ReentrantCall` | 122 | a fund-moving transition entered while the AV-36 reentrancy lock was held (nested entry from inside `release_via_cpi`'s executor window) |
 | `InvalidFeeRecipient` | 123 | `with_fee_recipient` with the zero address (a zero address can never be the legitimate protocol-fee destination), or `rotate_fee_recipient` with no fee recipient configured / with the zero address |
@@ -1094,6 +1096,7 @@ program error per variant):
 | `InvalidSchemaMigration` | 140 | `migrate_schema` by a non-initializer, on a vault already at the current schema version (one-time), on a vault at an unknown future version (no skipping), or on a vault whose carried-over fields violate the conservation invariants — a corrupt vault is refused, never migrated |
 | `InvalidSplit` | 142 | `split_escrow` (AV-81) with an empty amount table, more than 16 children, a zero child amount, an amount table whose `u128` sum differs from the parent's remaining lockup, or a per-child milestone-plan list whose length mismatches the amount table |
 | `SlashNotEligible` | 143 | `initialize_slash_terms` (AV-82) with the zero penalty account; `slash` (AV-82) with no slash terms configured, before the slash deadline, on an already-slashed escrow (one-shot), with an amount above the slashable remainder, on a dual-sig escrow lacking both activation bits, on a `Disputed` escrow (arbitration owns the funds), or on a milestone/subscription-scheduled escrow (the schedule owns the release path) |
+| `InvalidCpiAllowlist` | 144 | `with_cpi_allowlist` / `update_cpi_allowlist` (AV-83) with more than 8 program ids or a zero program id; `update_cpi_allowlist` without both signatures, on a paused escrow, on a `Released`/`Cancelled`/`Expired` vault, or with no allowlist configured |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1940,7 +1943,8 @@ two-way consistency check against the IDL parameter table:
 | schema_version | u8 | 1 |
 | slash_terms | Option<SlashTerms> | 41 |
 | penalty_paid | u64 | 8 |
-| **total**     |                   | **3495** |
+| cpi_allowlist | Option<CpiAllowlist> | 258 |
+| **total**     |                   | **3753** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2013,11 +2017,13 @@ live-tier count + 8 fixed 10-byte tier slots, zeroed when no schedule
 is configured) — and the 8-byte dispute-evidence disclosure deadline
 (AV-68: zeroed when no deadline is configured) — and the 33-byte
 escalating-party region (AV-68: 1-byte discriminant + 32-byte key,
-zeroed when the escrow was never disputed).
-`escrow-state` exposes `VAULT_SPACE` (3503) and
-`VAULT_SPACE_NO_QUORUM` (3013) for the Anchor `space =` constraint, plus a
+zeroed when the escrow was never disputed) — and the 258-byte CPI
+target-program allowlist region (AV-83: 1-byte live-program count + 8
+32-byte program ids, zeroed when no allowlist is configured).
+`escrow-state` exposes `VAULT_SPACE` (3761) and
+`VAULT_SPACE_NO_QUORUM` (3271) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **25,271,760 lamports** to be
+mainnet rent parameters the full vault needs **27,067,440 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -2166,7 +2172,10 @@ becomes a leg of a larger composed transaction:
   exact `release` gates (authority, state, mint, milestone plan,
   quorum, timelock, amount — a CPI-routed release is a release, not a
   bypass), then validates the invocation shape (`InvalidCpiTarget`,
-  code 120: zero program id, empty account list, or zero account key).
+  code 120: zero program id, empty account list, or zero account key),
+  then the AV-83 fail-closed target-program allowlist check (an
+  off-list target is `InvalidCpiTarget` with full rollback when an
+  allowlist is configured).
 - **Atomicity**: the state machine hands the validated invocation to an
   injected executor (the seam where the Anchor layer plugs the real
   `invoke`). If the executor reports failure, the whole release rolls
@@ -2396,6 +2405,25 @@ the native-SOL leg, so an allowlisted destination does not trip
 `RecipientMismatch`. The 130-byte region is always reserved in the vault
 layout (1-byte discriminant + 4×32-byte addresses + 1-byte count), so the
 opt-in writes in place without reallocating.
+
+## CPI target-program allowlist (AV-83)
+
+A payout *path* is as attackable as its destination. `release_via_cpi`
+invokes an arbitrary third-party program, so a compromised frontend could
+steer the release through a hostile program even when the *destination* is
+pinned by AV-49. The CPI allowlist closes that hole: configured via
+`with_cpi_allowlist` (1–8 program ids, set at initialize time) or
+`update_cpi_allowlist` once funded, it restricts `release_via_cpi` to the
+listed target programs. The check is fail-closed — it runs after shape
+validation and before the invocation, and an off-list target is rejected
+with `InvalidCpiTarget` (code 120) with full rollback, exactly as if the
+invoke had failed. Unlike the payout allowlist, updates are *always*
+dual-signed (both parties even on a plain escrow): the allowlist guards a
+privileged execution path, so it carries the strictest governance in the
+vault. An empty update clears the list (back to any-target-allowed), and
+`CpiAllowlistUpdated` (event kind 43) is emitted only on an actual change.
+The 258-byte region is always reserved in the vault layout (1-byte count +
+8×32-byte program ids), so the opt-in writes in place without reallocating.
 
 ## Configuration templates (AV-72)
 
