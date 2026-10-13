@@ -460,7 +460,11 @@ pub enum EscrowEventKind {
     /// forward by initializer governance
     /// ([`Escrow::migrate_schema`]). `from == to ==` the current
     /// state (bookkeeping, not a lifecycle move — like
-    /// [`EscrowEventKind::SubscriptionAmountsAdjusted`]). Always
+    /// [`EscrowEventKind::SubscriptionAmountsAdjusted`]). AV-85: the
+    /// migration is an N → M step chain, and the wrapper emits one
+    /// `SchemaMigrated` per applied step — the event chain records
+    /// every `from → to` version pair (see
+    /// [`EscrowEvent::schema_versions`]) in `seq` order. Always
     /// emitted on success: a successful migration always steps the
     /// version, so there is no no-op case. All amounts are zero —
     /// migration moves no funds.
@@ -1007,6 +1011,15 @@ pub struct EscrowEvent {
     /// parameter. Fixed-size ([`MAX_SPLIT_CHILDREN`](crate::MAX_SPLIT_CHILDREN))
     /// so the event stays `Copy`.
     pub split_children: Option<([SplitChild; crate::MAX_SPLIT_CHILDREN], u8)>,
+    /// AV-85: the schema versions one migration step moved across,
+    /// carried by [`EscrowEventKind::SchemaMigrated`] — one event per
+    /// applied step, so the chain records every `from → to` pair in
+    /// `seq` order (`None` on every other kind — like
+    /// `template_params_hash`, which rides only `TemplateApplied`).
+    /// The emitter stamps it after the push (see `push_event`),
+    /// mirroring the `template_params_hash` precedent — never a
+    /// `push_event` parameter. `(u8, u8)` keeps the event `Copy`.
+    pub schema_versions: Option<(u8, u8)>,
 }
 
 /// One split child on an [`EscrowEventKind::EscrowSplit`] event's
@@ -1197,6 +1210,9 @@ impl IndexedEscrow {
             // AV-81: stamped by the EscrowSplit emitter after the push
             // — never a push_event parameter (see above).
             split_children: None,
+            // AV-85: stamped by the SchemaMigrated emitter after the
+            // push — never a push_event parameter (see above).
+            schema_versions: None,
         };
         self.next_seq += 1;
         self.events.push(event);
@@ -2667,34 +2683,59 @@ impl IndexedEscrow {
         Ok(())
     }
 
-    /// Migrate the vault's persisted schema one version forward
-    /// (mirrors [`Escrow::migrate_schema`]). Emits `SchemaMigrated`
-    /// (`from == to ==` the current state — bookkeeping, not a
-    /// lifecycle move, like
-    /// [`EscrowEventKind::SubscriptionAmountsAdjusted`]); the
-    /// initializer is the single signer, so it rides the event's
-    /// `actor`. The call fails unless the version actually steps, so
-    /// the event always fires on success — there is no no-op case.
-    /// `at` is the caller-supplied timestamp (on-chain: the clock
-    /// sysvar).
+    /// Migrate the vault's persisted schema to the current revision
+    /// (mirrors [`Escrow::migrate_schema`], AV-85: the N → M step
+    /// chain). Emits one `SchemaMigrated` per applied step (`from ==
+    /// to ==` the current state — bookkeeping, not a lifecycle move,
+    /// like [`EscrowEventKind::SubscriptionAmountsAdjusted`]); each
+    /// event carries its step's `from → to` versions on
+    /// [`EscrowEvent::schema_versions`], so the chain is recorded in
+    /// `seq` order. The initializer is the single signer, so it rides
+    /// the event's `actor`. A failed migration emits nothing — the
+    /// inner chain rolls back to the pre-chain snapshot, so there is
+    /// no partial state to record. `at` is the caller-supplied
+    /// timestamp (on-chain: the clock sysvar).
     pub fn migrate_schema(&mut self, authority: [u8; 32], at: u64) -> Result<(), EscrowError> {
         let from = self.inner.state();
-        self.inner.migrate_schema(authority)?;
+        let steps = self.inner.migrate_schema_steps(authority)?;
         let state = self.inner.state();
         debug_assert_eq!(from, state, "migration must not move lifecycle state");
-        self.push_event(
-            EscrowEventKind::SchemaMigrated,
-            state,
-            state,
-            EventAmounts::none(),
-            at,
-            None,
-            None,
-            None,
-            None,
-            Some(authority),
-        );
+        for step in steps {
+            self.push_event(
+                EscrowEventKind::SchemaMigrated,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                Some(authority),
+            );
+            // Stamp the step's versions after the push (the AV-77
+            // `template_params_hash` precedent): the event chain
+            // records every from → to pair.
+            self.events
+                .last_mut()
+                .expect("SchemaMigrated event just pushed")
+                .schema_versions = Some((step.from, step.to));
+        }
         Ok(())
+    }
+
+    /// Dry-run the schema migration chain (mirrors
+    /// [`Escrow::migrate_dry_run`], AV-85): return the
+    /// [`MigrationPlan`](crate::MigrationPlan) the real
+    /// [`IndexedEscrow::migrate_schema`] call would apply — every step
+    /// in order with the fields each step appends. Pure read: emits no
+    /// events and mutates nothing, so operators can preview the chain
+    /// before the initializer signs.
+    pub fn migrate_schema_dry_run(
+        &self,
+        authority: [u8; 32],
+    ) -> Result<crate::MigrationPlan, EscrowError> {
+        self.inner.migrate_dry_run(authority)
     }
 
     /// Confirm a milestone for the release path (mirrors
@@ -4831,20 +4872,66 @@ mod event_tests {
         e.inner.schema_version = 0;
         let before = e.event_count();
         e.migrate_schema(ALICE, T0 + 1).unwrap();
-        assert_eq!(e.event_count(), before + 1, "one event on migration");
-        let ev = last(&e);
-        assert_eq!(ev.kind, EscrowEventKind::SchemaMigrated);
-        assert_eq!(ev.from, EscrowState::Uninitialized);
-        assert_eq!(ev.to, EscrowState::Uninitialized, "from == to == current state");
-        assert_eq!(ev.amounts, EventAmounts::none(), "moves no funds");
-        // The on-chain history ring records the same transition — the
+        // AV-85: one SchemaMigrated per applied step — the event chain
+        // records every from → to version pair in seq order.
+        assert_eq!(e.event_count(), before + 2, "one event per chain step");
+        let events = e.events();
+        let first = &events[before];
+        let second = &events[before + 1];
+        for ev in [first, second] {
+            assert_eq!(ev.kind, EscrowEventKind::SchemaMigrated);
+            assert_eq!(ev.from, EscrowState::Uninitialized);
+            assert_eq!(ev.to, EscrowState::Uninitialized, "from == to == current state");
+            assert_eq!(ev.amounts, EventAmounts::none(), "moves no funds");
+        }
+        assert_eq!(first.schema_versions, Some((0, 1)));
+        assert_eq!(second.schema_versions, Some((1, 2)));
+        assert_eq!(second.seq, first.seq + 1, "chain order in seq");
+        // The on-chain history ring records the same transitions — the
         // initializer is the single signer, so it rides the ring's
-        // actor slot.
+        // actor slot. (The ring already holds the `Initialized` entry
+        // from construction.)
         let history = e.inner().event_history();
+        assert_eq!(history.len(), 3, "ring records each chain step");
         let entry = history.last().expect("ring records the migration");
         assert_eq!(entry.kind, EscrowEventKind::SchemaMigrated);
         assert_eq!(entry.at, T0 + 1);
         assert_eq!(entry.actor, Some(ALICE[..8].try_into().unwrap()));
+    }
+
+    #[test]
+    fn migrate_schema_chain_emits_single_event_for_single_step() {
+        // A v1 vault runs just its own step: exactly one event, stamped
+        // (1, 2).
+        let mut e = indexed(1_000_000);
+        e.inner.schema_version = 1;
+        let before = e.event_count();
+        e.migrate_schema(ALICE, T0 + 1).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = last(&e);
+        assert_eq!(ev.kind, EscrowEventKind::SchemaMigrated);
+        assert_eq!(ev.schema_versions, Some((1, 2)));
+    }
+
+    #[test]
+    fn migrate_schema_dry_run_emits_nothing_and_mutates_nothing() {
+        let mut e = indexed(1_000_000);
+        e.inner.schema_version = 0; // simulate a pre-AV-75 vault
+        let before_events = e.event_count();
+        let plan = e.migrate_schema_dry_run(ALICE).unwrap();
+        assert_eq!(plan.from, 0);
+        assert_eq!(plan.to, 2);
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(e.event_count(), before_events, "dry-run emits nothing");
+        assert_eq!(e.inner.schema_version(), 0, "dry-run mutates nothing");
+        // A refused dry-run also emits nothing.
+        let current = indexed(1_000_000);
+        let current_before = current.event_count();
+        assert_eq!(
+            current.migrate_schema_dry_run(ALICE).unwrap_err(),
+            EscrowError::InvalidSchemaMigration
+        );
+        assert_eq!(current.event_count(), current_before);
     }
 
     #[test]

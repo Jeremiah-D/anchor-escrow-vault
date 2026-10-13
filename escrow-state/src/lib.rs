@@ -215,6 +215,17 @@ pub use keeper::{
     StaleVaultReport,
 };
 
+// AV-85: schema-migration keeper scan — walk watched vaults, dry-run
+// the N → M migration chain (`Escrow::migrate_dry_run`) for every
+// vault below `SCHEMA_VERSION`, and report each vault's version path,
+// changed-fields list, and readiness (`ready` entries are executable
+// `migrate_schema` calls for the initializer to sign; blocked entries
+// name the reason: `"paused"` / `"corrupt"`). Purely additive and
+// read-only (dry-run by construction).
+pub use keeper::{
+    scan_schema_migrations, SchemaMigrationAction, SchemaMigrationReport,
+};
+
 // AV-26: off-chain state snapshot — a point-in-time, read-only view of
 // an `Escrow` as canonical JSON (all fields + derived remaining /
 // vested-claimable / quorum progress), for keeper bots and indexers
@@ -2539,6 +2550,149 @@ pub fn derive_split_child_id(parent_id: &[u8; 32], index: u64) -> [u8; 32] {
     preimage[32..].copy_from_slice(&index.to_le_bytes());
     sha256(&preimage)
 }
+
+/// One field a schema step appends to the persisted vault layout
+/// (AV-85): the dry-run report ([`Escrow::migrate_dry_run`]) lists
+/// these per step, in step order, so an operator sees exactly which
+/// fields each version bump introduces before signing
+/// `migrate_schema`. `bytes` is the field's serialized width —
+/// indexers use it to size the realloc the on-chain migration
+/// needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaFieldDelta {
+    /// Field name as it appears in `VAULT_FIELDS`.
+    pub name: &'static str,
+    /// The field's type, as it appears in `VAULT_FIELDS`.
+    pub ty: &'static str,
+    /// Serialized width in bytes.
+    pub bytes: u64,
+}
+
+/// One applied schema step (AV-85): the vault moved from `from` to
+/// `to`, always `to == from + 1` — the migration chain
+/// ([`Escrow::migrate_schema`]) applies every step in order and
+/// returns the applied steps so the event layer can record the
+/// `SchemaMigrated` chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaMigrationStep {
+    /// Schema version the step starts from.
+    pub from: u8,
+    /// Schema version the step lands on (`from + 1`).
+    pub to: u8,
+}
+
+/// One planned schema step in a dry-run report (AV-85): the step plus
+/// the fields it appends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationStepPlan {
+    /// Schema version the step starts from.
+    pub from: u8,
+    /// Schema version the step lands on (`from + 1`).
+    pub to: u8,
+    /// Fields this step appends to the persisted layout, in layout
+    /// order (see [`Escrow::schema_step_fields`]).
+    pub new_fields: &'static [SchemaFieldDelta],
+}
+
+/// The read-only migration pre-flight report from
+/// [`Escrow::migrate_dry_run`] (AV-85): every step the chain would
+/// apply, with the fields each step appends. Pure data — building it
+/// writes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationPlan {
+    /// The vault's schema version at dry-run time.
+    pub from: u8,
+    /// The version the chain would land on — always
+    /// [`Escrow::SCHEMA_VERSION`].
+    pub to: u8,
+    /// The steps the chain would apply, in order.
+    pub steps: Vec<MigrationStepPlan>,
+}
+
+impl MigrationPlan {
+    /// Hand-serialized canonical JSON (the crate is dependency-free):
+    /// deterministic field order, so operators can diff or archive
+    /// dry-run reports directly.
+///
+    /// ```json
+    /// {"from":0,"to":2,"steps":[
+    ///   {"from":0,"to":1,"new_fields":[
+    ///     {"name":"schema_version","type":"u8","bytes":1}]},
+    ///   {"from":1,"to":2,"new_fields":[
+    ///     {"name":"slash_terms","type":"Option<SlashTerms>","bytes":41},
+    ///     {"name":"penalty_paid","type":"u64","bytes":8}]}]}
+    /// ```
+    pub fn to_json(&self) -> String {
+        let mut s = String::with_capacity(256);
+        s.push_str("{\"from\":");
+        s.push_str(&self.from.to_string());
+        s.push_str(",\"to\":");
+        s.push_str(&self.to.to_string());
+        s.push_str(",\"steps\":[");
+        for (i, step) in self.steps.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"from\":");
+            s.push_str(&step.from.to_string());
+            s.push_str(",\"to\":");
+            s.push_str(&step.to.to_string());
+            s.push_str(",\"new_fields\":[");
+            for (j, field) in step.new_fields.iter().enumerate() {
+                if j > 0 {
+                    s.push(',');
+                }
+                s.push_str("{\"name\":\"");
+                s.push_str(field.name);
+                s.push_str("\",\"type\":\"");
+                s.push_str(field.ty);
+                s.push_str("\",\"bytes\":");
+                s.push_str(&field.bytes.to_string());
+                s.push('}');
+            }
+            s.push_str("]}");
+        }
+        s.push_str("]}");
+        s
+    }
+}
+
+/// Per-step field deltas of the schema migration chain (AV-85),
+/// keyed by the step's `from` version: the fields that version bump
+/// appends to the persisted layout (see `VAULT_FIELDS`). The table is
+/// the single source of truth the dry-run report
+/// ([`Escrow::migrate_dry_run`]) and the keeper migration scan
+/// ([`crate::keeper::scan_schema_migrations`]) render — a step with
+/// no entry is unknown and the chain refuses it instead of guessing.
+///
+/// - `0 → 1` (AV-75): the trailing `schema_version` byte itself.
+/// - `1 → 2` (AV-82): the 49-byte slash region — `slash_terms`
+///   (1-byte discriminant + 40-byte terms) and `penalty_paid` (u64).
+const SCHEMA_STEP_DELTAS: &[(u8, &[SchemaFieldDelta])] = &[
+    (
+        0,
+        &[SchemaFieldDelta {
+            name: "schema_version",
+            ty: "u8",
+            bytes: 1,
+        }],
+    ),
+    (
+        1,
+        &[
+            SchemaFieldDelta {
+                name: "slash_terms",
+                ty: "Option<SlashTerms>",
+                bytes: 1 + SLASH_TERMS_LEN as u64,
+            },
+            SchemaFieldDelta {
+                name: "penalty_paid",
+                ty: "u64",
+                bytes: 8,
+            },
+        ],
+    ),
+];
 
 impl Escrow {
     /// AV-75: the current schema version of the persisted vault layout
@@ -5056,20 +5210,161 @@ impl Escrow {
     /// A paused escrow fails fast ([`EscrowError::Paused`]) — migration
     /// is a state-changing config transition, not the pause key-loss
     /// escape hatch.
+    /// Migrate this vault's persisted schema to the current revision
+    /// (AV-75 — Solana upgradability; AV-85: the one-shot catch-up is
+    /// now an explicit N → M step chain): on-chain, a program upgrade
+    /// appends new vault fields (see `VAULT_FIELDS`); old accounts are
+    /// realloc'd with the new region zero-filled, and the initializer
+    /// runs this exactly once to carry the vault onto the new layout.
+    ///
+    /// Check order is the initializer-governance convention: pause,
+    /// then authority, then the version gate — a stranger learns
+    /// nothing, and a mis-stepped call fails before the chain runs.
+    ///
+    /// Version gate: only `schema_version < SCHEMA_VERSION` is
+    /// accepted — an old vault migrates to the current revision in one
+    /// call, stepping through every intermediate version in order
+    /// (the chain, not a jump: `0 → 1 → 2`). One rule enforces both
+    /// one-time migration (a vault already at the current version
+    /// refuses — there is no no-op migration) and no-skipping-forward
+    /// (a vault at an unknown future version refuses loudly instead of
+    /// jumping): [`EscrowError::InvalidSchemaMigration`] either way.
+    /// (AV-82: the strict `schema_version + 1 == SCHEMA_VERSION` gate
+    /// would strand pre-AV-75 vaults once the second layout revision
+    /// shipped — a v0 vault could never satisfy `0 + 1 == 2` — so the
+    /// gate is a catch-up gate, and the chain walks the versions the
+    /// gate admits.)
+    ///
+    /// Per-step application: each step re-validates the conservation
+    /// invariants over the field set that step carries, then stamps
+    /// the version — `released <= amount`, `released + skipped <=
+    /// amount` (u128 math, overflow-safe), `fees_paid <= released`,
+    /// and, when a milestone plan is present, the tranche amounts
+    /// summing to exactly `amount` (u128). The slash-region check
+    /// (`released + penalty_paid <= amount`, u128) applies from the
+    /// `1 → 2` step on — the slash fields only exist from v2 (AV-82),
+    /// so judging the `0 → 1` step by them would be anachronistic; a
+    /// true v0 account has no slash region at all. A vault that
+    /// violates any applicable invariant is corrupt and is refused
+    /// with [`EscrowError::InvalidSchemaMigration`] — migration never
+    /// launders a broken vault.
+    ///
+    /// Atomicity: the chain snapshots the vault before the first step;
+    /// if any step fails, the pre-chain snapshot is restored — a
+    /// migration never leaves a half-migrated vault behind (zero
+    /// partial migration). The failed step's error is returned
+    /// unchanged.
+    ///
+    /// Honest mechanics note: the appended-last layout convention
+    /// makes a v0 account a byte-prefix of the v1 account — and a v1
+    /// account a byte-prefix of the v2 account (AV-82 appends
+    /// `slash_terms` / `penalty_paid` after `schema_version`) — so
+    /// the on-chain migration is prefix carry-over plus zero-fill of
+    /// the new region (the Anchor side does the realloc via the
+    /// `VAULT_FIELDS` layout); the pure-logic gate is authority +
+    /// version-gate + per-step invariant re-validation, and the stamp:
+    /// `schema_version` becomes [`Self::SCHEMA_VERSION`]. No other
+    /// field changes — migration is bookkeeping, not economics, so no
+    /// AV-36 reentrancy lock is needed (the lock only guards the 10
+    /// funds paths).
+    ///
+    /// A paused escrow fails fast ([`EscrowError::Paused`]) — migration
+    /// is a state-changing config transition, not the pause key-loss
+    /// escape hatch.
+    ///
+    /// See [`Escrow::migrate_schema_steps`] for the step-returning
+    /// variant (the event layer uses it to record the `SchemaMigrated`
+    /// chain) and [`Escrow::migrate_dry_run`] for the read-only
+    /// pre-flight.
     pub fn migrate_schema(&mut self, authority: [u8; 32]) -> Result<(), EscrowError> {
+        self.migrate_schema_steps(authority).map(|_| ())
+    }
+
+    /// Run the schema migration chain and return the applied steps
+    /// (AV-85): same pre-flight and per-step semantics as
+    /// [`Escrow::migrate_schema`], but the applied
+    /// [`SchemaMigrationStep`]s are returned so callers — the event
+    /// layer ([`crate::IndexedEscrow::migrate_schema`]), indexers, CLIs
+    /// — can record or display the exact version path the vault took.
+    /// The chain is atomic: any failing step restores the pre-chain
+    /// snapshot (zero partial migration) and its error is returned.
+    pub fn migrate_schema_steps(
+        &mut self,
+        authority: [u8; 32],
+    ) -> Result<Vec<SchemaMigrationStep>, EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
         self.require_not_paused()?;
         self.require_initializer(authority)?;
-        // Catch-up gate: any older revision migrates straight to
-        // current in one call; already-current refuses (one-time
-        // migration) and an unknown future version refuses loudly
-        // (no skipping forward). `>=` needs no checked arithmetic —
-        // `u8::MAX` refuses like any future version.
+        // Catch-up gate: any older revision migrates to current in one
+        // call, stepping through every intermediate version in order;
+        // already-current refuses (one-time migration) and an unknown
+        // future version refuses loudly (no skipping forward). `>=`
+        // needs no checked arithmetic — `u8::MAX` refuses like any
+        // future version.
         if self.schema_version >= Self::SCHEMA_VERSION {
             return Err(EscrowError::InvalidSchemaMigration);
         }
-        // Carry-over invariant re-validation (u128 math, overflow-safe):
-        // refuse to migrate a corrupt vault.
+        // Atomic chain: snapshot before the first step; any failing
+        // step restores the pre-chain state (`Escrow` is `Copy`, so the
+        // snapshot is exact) — a migration never leaves a
+        // half-migrated vault behind.
+        let snapshot = *self;
+        let mut applied = Vec::new();
+        let mut from = self.schema_version;
+        while from < Self::SCHEMA_VERSION {
+            // `from < SCHEMA_VERSION <= u8::MAX`: cannot overflow.
+            let to = from + 1;
+            if let Err(e) = self.apply_migration_step(from, to) {
+                *self = snapshot;
+                return Err(e);
+            }
+            applied.push(SchemaMigrationStep { from, to });
+            from = to;
+        }
+        Ok(applied)
+    }
+
+    /// Apply exactly one schema step, `from → to` (AV-85): the chain's
+    /// unit of work. Defensive ordering — a step only applies to the
+    /// version it starts from, moves exactly one version forward, and
+    /// must be a known step ([`Escrow::schema_step_fields`]) landing at
+    /// or before [`Escrow::SCHEMA_VERSION`] — then the step's
+    /// carry-over invariants are re-validated and the version is
+    /// stamped. Nothing else changes. `pub(crate)` so the migration
+    /// tests can drive individual steps.
+    pub(crate) fn apply_migration_step(&mut self, from: u8, to: u8) -> Result<(), EscrowError> {
+        // Steps apply in order: `from` must be the vault's current
+        // version, and `to` exactly one version forward (`checked_add`
+        // — `u8::MAX` can never step).
+        if from != self.schema_version {
+            return Err(EscrowError::InvalidSchemaMigration);
+        }
+        let expected_to = from.checked_add(1).ok_or(EscrowError::InvalidSchemaMigration)?;
+        if to != expected_to || to > Self::SCHEMA_VERSION {
+            return Err(EscrowError::InvalidSchemaMigration);
+        }
+        // Unknown step: refuse instead of guessing what the bump means.
+        if Self::schema_step_fields(from).is_none() {
+            return Err(EscrowError::InvalidSchemaMigration);
+        }
+        self.validate_migration_carry_over(from)?;
+        self.schema_version = to;
+        Ok(())
+    }
+
+    /// Re-validate the conservation invariants over the field set the
+    /// `from → from + 1` step carries (AV-85): u128 math,
+    /// overflow-safe. The base set — `released <= amount`,
+    /// `released + skipped <= amount`, `fees_paid <= released`, and
+    /// the milestone tranche sum `== amount` when a plan is present —
+    /// applies to every step. The slash-region check (`released +
+    /// penalty_paid <= amount`) applies from the `1 → 2` step on: the
+    /// slash fields only exist from v2 (AV-82), so the `0 → 1` step is
+    /// judged on the pre-slash field set — a true v0 account has no
+    /// slash region to judge. A violation is
+    /// [`EscrowError::InvalidSchemaMigration`]: the vault is corrupt
+    /// and must not migrate.
+    fn validate_migration_carry_over(&self, from: u8) -> Result<(), EscrowError> {
         if self.released > self.amount {
             return Err(EscrowError::InvalidSchemaMigration);
         }
@@ -5077,8 +5372,9 @@ impl Escrow {
             return Err(EscrowError::InvalidSchemaMigration);
         }
         // AV-82: slashed funds left the lockup — the two outflow
-        // counters together must fit inside the locked amount.
-        if (self.released as u128) + (self.penalty_paid as u128) > self.amount as u128 {
+        // counters together must fit inside the locked amount. Only
+        // from the step that introduces the slash region (`1 → 2`).
+        if from >= 1 && (self.released as u128) + (self.penalty_paid as u128) > self.amount as u128 {
             return Err(EscrowError::InvalidSchemaMigration);
         }
         if self.fees_paid > self.released {
@@ -5089,12 +5385,58 @@ impl Escrow {
                 return Err(EscrowError::InvalidSchemaMigration);
             }
         }
-        let migrated = Self {
-            schema_version: Self::SCHEMA_VERSION,
-            ..*self
-        };
-        *self = migrated;
         Ok(())
+    }
+
+    /// Dry-run the schema migration chain (AV-85): run the full
+    /// pre-flight — pause guard, initializer authority, the version
+    /// gate, and the per-step carry-over invariant validation — and
+    /// return the [`MigrationPlan`] the real chain would apply: every
+    /// step in order with the fields each step appends (see
+    /// [`Escrow::schema_step_fields`]).
+    ///
+    /// Pure read: takes `&self`, so the borrow checker — not a
+    /// comment — guarantees zero write impact. Fails with the same
+    /// errors the real migration would (`Paused`, `Unauthorized`,
+    /// `InvalidSchemaMigration` for an already-current / unknown-
+    /// future / corrupt vault), so a successful dry-run means the real
+    /// call would succeed — the operator signs with the plan in hand.
+    pub fn migrate_dry_run(&self, authority: [u8; 32]) -> Result<MigrationPlan, EscrowError> {
+        // Same pre-flight as the real chain, in the same order.
+        self.require_not_paused()?;
+        self.require_initializer(authority)?;
+        if self.schema_version >= Self::SCHEMA_VERSION {
+            return Err(EscrowError::InvalidSchemaMigration);
+        }
+        let mut steps = Vec::new();
+        let mut from = self.schema_version;
+        while from < Self::SCHEMA_VERSION {
+            // `from < SCHEMA_VERSION <= u8::MAX`: cannot overflow.
+            let to = from + 1;
+            let new_fields = Self::schema_step_fields(from).ok_or(EscrowError::InvalidSchemaMigration)?;
+            // The same per-step validation the chain applies — on
+            // `&self`, so nothing is written.
+            self.validate_migration_carry_over(from)?;
+            steps.push(MigrationStepPlan { from, to, new_fields });
+            from = to;
+        }
+        Ok(MigrationPlan {
+            from: self.schema_version,
+            to: Self::SCHEMA_VERSION,
+            steps,
+        })
+    }
+
+    /// The fields the `from → from + 1` schema step appends to the
+    /// persisted vault layout (AV-85), in layout order — `None` for an
+    /// unknown step. Backed by the private `SCHEMA_STEP_DELTAS` table;
+    /// the dry-run report and the keeper migration scan render this
+    /// table.
+    pub fn schema_step_fields(from: u8) -> Option<&'static [SchemaFieldDelta]> {
+        SCHEMA_STEP_DELTAS
+            .iter()
+            .find(|(step_from, _)| *step_from == from)
+            .map(|(_, fields)| *fields)
     }
 
     /// The schema version of this vault's persisted layout (AV-75):
@@ -11824,11 +12166,14 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "new_threshold <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) - both current parties must authorize (a stranger pair or one party alone is Unauthorized); Uninitialized only (InvalidStateTransition otherwise - the threshold must be settled before the dispute, so an in-flight arbitration tallies under stable rules); a panel must be configured (InvalidArbiterPanel otherwise); new_threshold must satisfy 1 <= M <= N (InvalidArbiterPanel otherwise - the builder's validation, reused); the update rewrites only threshold - cast votes and the voted bitmask survive, counting continues under the new M; retuning to the current threshold is an idempotent no-op; emits the PanelThresholdChanged indexer event only on an actual change",
         },
         InstructionSpec {
-            // AV-75: one-step schema migration by initializer governance.
+            // AV-75: schema migration by initializer governance; AV-85:
+            // the one-shot catch-up is now an explicit N -> M step chain
+            // with per-step validation, atomic rollback, and a
+            // read-only dry-run.
             name: "migrate_schema",
             params: &[],
             method: "Escrow::migrate_schema",
-            input_mapping: "no params; authority <- accounts.initializer (signer) - initializer only (a stranger or the taker is Unauthorized, checked before state validity); a paused escrow fails fast (Paused); only schema_version < SCHEMA_VERSION steps (one-time catch-up: an old vault jumps straight to current, an already-current vault refuses the second call, and an unknown future version refuses loudly instead of skipping forward - InvalidSchemaMigration, code 140, in the latter two cases); the carried-over fields are re-validated before the stamp (released <= amount, released + skipped <= amount in u128, released + penalty_paid <= amount in u128 (AV-82), fees_paid <= released, and the milestone tranche sum == amount when a plan is present - a corrupt vault is refused, never migrated, InvalidSchemaMigration); the stamp moves schema_version to SCHEMA_VERSION and nothing else changes (no layout / rent change beyond the AV-75 trailing byte for the 0 -> 1 step, and beyond the AV-82 49-byte slash region for the 1 -> 2 step); always emits the SchemaMigrated indexer event on success (from == to == the current state)",
+            input_mapping: "no params; authority <- accounts.initializer (signer) - initializer only (a stranger or the taker is Unauthorized, checked before state validity); a paused escrow fails fast (Paused); only schema_version < SCHEMA_VERSION runs (one-time catch-up: an old vault walks every intermediate version in order - 0 -> 1 -> 2 - an already-current vault refuses the second call, and an unknown future version refuses loudly instead of skipping forward - InvalidSchemaMigration, code 140, in the latter two cases); each step re-validates the conservation invariants over the field set it carries (released <= amount, released + skipped <= amount in u128, fees_paid <= released, the milestone tranche sum == amount when a plan is present, plus released + penalty_paid <= amount in u128 from the 1 -> 2 step on (AV-82) - a corrupt vault is refused, never migrated, InvalidSchemaMigration); the chain is atomic - any failing step restores the pre-chain snapshot, zero partial migration; the stamp moves schema_version to SCHEMA_VERSION and nothing else changes (no layout / rent change beyond the AV-75 trailing byte for the 0 -> 1 step, and beyond the AV-82 49-byte slash region for the 1 -> 2 step); emits one SchemaMigrated indexer event per applied step (from == to == the current state, each carrying its from -> to versions), always on success; the read-only dry-run (Escrow::migrate_dry_run, off-chain) reports the step/field plan with zero write impact",
         },
         InstructionSpec {
             // AV-81: dual-signed funded-escrow split into N child escrows.
@@ -19804,6 +20149,213 @@ mod migrate_schema_tests {
         let err = e.migrate_schema(ALICE).unwrap_err();
         assert_eq!(err, EscrowError::InvalidSchemaMigration);
         assert_eq!(err.code(), 140);
+    }
+
+    // ---------- AV-85: migration chain, atomic rollback, dry-run ----------
+
+    #[test]
+    fn migration_chain_applies_each_step_in_order() {
+        let mut e = v0_escrow();
+        let before = e;
+        let steps = e.migrate_schema_steps(ALICE).unwrap();
+        // The chain walks every intermediate version in order — not a
+        // jump.
+        assert_eq!(
+            steps,
+            vec![
+                SchemaMigrationStep { from: 0, to: 1 },
+                SchemaMigrationStep { from: 1, to: 2 },
+            ]
+        );
+        assert_eq!(e.schema_version(), 2);
+        // Carry-over is exact: only the stamp moved.
+        let mut before_migrated = before;
+        before_migrated.schema_version = 2;
+        assert_eq!(e, before_migrated, "the chain must carry every field over untouched");
+        // A v1 vault runs just its own step.
+        let mut e = v1_escrow();
+        let steps = e.migrate_schema_steps(ALICE).unwrap();
+        assert_eq!(steps, vec![SchemaMigrationStep { from: 1, to: 2 }]);
+        assert_eq!(e.schema_version(), 2);
+    }
+
+    #[test]
+    fn migration_chain_is_atomic_on_mid_chain_failure() {
+        // Step-scoped invariants (AV-85): the 0 → 1 step is judged on
+        // the pre-slash field set, so this simulated-v0 vault — whose
+        // slash-region imbalance only the 1 → 2 step sees — passes
+        // 0 → 1 and fails 1 → 2. The chain must roll back to the
+        // pre-chain snapshot (schema_version 0), never the
+        // half-migrated 0 → 1 state.
+        let mut e = v0_escrow();
+        e.released = 1_000_000;
+        e.penalty_paid = 1; // released + penalty_paid > amount
+        let pristine = e;
+        assert_eq!(
+            e.migrate_schema(ALICE),
+            Err(EscrowError::InvalidSchemaMigration)
+        );
+        assert_eq!(
+            e, pristine,
+            "a mid-chain failure must roll back every applied step: zero partial migration"
+        );
+        assert_eq!(e.schema_version(), 0);
+    }
+
+    #[test]
+    fn failed_chain_leaves_vault_bit_identical() {
+        // A vault corrupt at the first step fails the chain with
+        // nothing applied — the pre-chain snapshot is restored.
+        let mut e = v0_escrow();
+        e.released = 1_000_001; // released > amount: fails the 0 → 1 step
+        let pristine = e;
+        assert_eq!(
+            e.migrate_schema_steps(ALICE),
+            Err(EscrowError::InvalidSchemaMigration)
+        );
+        assert_eq!(e, pristine, "a failed chain must change nothing");
+    }
+
+    #[test]
+    fn apply_migration_step_rejects_out_of_order_steps() {
+        let mut e = v0_escrow();
+        // A step only applies to the version it starts from.
+        assert_eq!(
+            e.apply_migration_step(1, 2),
+            Err(EscrowError::InvalidSchemaMigration)
+        );
+        // A step moves exactly one version forward.
+        assert_eq!(
+            e.apply_migration_step(0, 2),
+            Err(EscrowError::InvalidSchemaMigration)
+        );
+        assert_eq!(e.schema_version(), 0, "rejected steps change nothing");
+        // The unknown-step guard: no table entry, no migration.
+        assert!(Escrow::schema_step_fields(2).is_none());
+        assert!(Escrow::schema_step_fields(u8::MAX).is_none());
+        // Well-formed steps apply.
+        e.apply_migration_step(0, 1).unwrap();
+        assert_eq!(e.schema_version(), 1);
+        e.apply_migration_step(1, 2).unwrap();
+        assert_eq!(e.schema_version(), 2);
+    }
+
+    #[test]
+    fn schema_step_fields_table_matches_vault_fields() {
+        // 0 → 1 (AV-75): the trailing schema_version byte itself.
+        assert_eq!(
+            Escrow::schema_step_fields(0).unwrap(),
+            &[SchemaFieldDelta {
+                name: "schema_version",
+                ty: "u8",
+                bytes: 1,
+            }]
+        );
+        // 1 → 2 (AV-82): the 49-byte slash region.
+        let deltas = Escrow::schema_step_fields(1).unwrap();
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].name, "slash_terms");
+        assert_eq!(deltas[0].bytes, 1 + SLASH_TERMS_LEN as u64);
+        assert_eq!(deltas[1].name, "penalty_paid");
+        assert_eq!(deltas[1].bytes, 8);
+        assert_eq!(deltas[0].bytes + deltas[1].bytes, 49);
+    }
+
+    #[test]
+    fn dry_run_reports_the_changed_fields_without_mutating() {
+        let e = v0_escrow();
+        let before = e;
+        let plan = e.migrate_dry_run(ALICE).unwrap();
+        assert_eq!(plan.from, 0);
+        assert_eq!(plan.to, Escrow::SCHEMA_VERSION);
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].from, 0);
+        assert_eq!(plan.steps[0].to, 1);
+        assert_eq!(plan.steps[0].new_fields.len(), 1);
+        assert_eq!(plan.steps[0].new_fields[0].name, "schema_version");
+        assert_eq!(plan.steps[1].from, 1);
+        assert_eq!(plan.steps[1].to, 2);
+        assert_eq!(plan.steps[1].new_fields.len(), 2);
+        assert_eq!(plan.steps[1].new_fields[0].name, "slash_terms");
+        assert_eq!(plan.steps[1].new_fields[1].name, "penalty_paid");
+        // The report serializes deterministically.
+        assert_eq!(
+            plan.to_json(),
+            "{\"from\":0,\"to\":2,\"steps\":[\
+             {\"from\":0,\"to\":1,\"new_fields\":[\
+             {\"name\":\"schema_version\",\"type\":\"u8\",\"bytes\":1}]},\
+             {\"from\":1,\"to\":2,\"new_fields\":[\
+             {\"name\":\"slash_terms\",\"type\":\"Option<SlashTerms>\",\"bytes\":41},\
+             {\"name\":\"penalty_paid\",\"type\":\"u64\",\"bytes\":8}]}]}"
+        );
+        // Zero write impact: the borrow checker guarantees `&self`,
+        // and the vault is bit-identical afterwards.
+        assert_eq!(e, before, "dry-run must not mutate the vault");
+        // A v1 vault's plan is just its own step.
+        let e = v1_escrow();
+        let plan = e.migrate_dry_run(ALICE).unwrap();
+        assert_eq!(plan.from, 1);
+        assert_eq!(plan.steps.len(), 1);
+    }
+
+    #[test]
+    fn dry_run_matches_the_real_migration() {
+        // A successful dry-run means the real call would succeed with
+        // the same steps.
+        let e = v0_escrow();
+        let plan = e.migrate_dry_run(ALICE).unwrap();
+        let mut e2 = e;
+        let applied = e2.migrate_schema_steps(ALICE).unwrap();
+        assert_eq!(applied.len(), plan.steps.len());
+        for (step, applied_step) in plan.steps.iter().zip(applied.iter()) {
+            assert_eq!(step.from, applied_step.from);
+            assert_eq!(step.to, applied_step.to);
+        }
+    }
+
+    #[test]
+    fn dry_run_refuses_like_the_real_migration() {
+        // Already current: no-op migration is refused.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            e.migrate_dry_run(ALICE),
+            Err(EscrowError::InvalidSchemaMigration)
+        );
+        // Unknown future version: refuses loudly.
+        let mut e = v0_escrow();
+        e.schema_version = u8::MAX;
+        assert_eq!(
+            e.migrate_dry_run(ALICE),
+            Err(EscrowError::InvalidSchemaMigration)
+        );
+        // Corrupt vault: refused, never migrated.
+        let mut e = v0_escrow();
+        e.released = 1_000_001;
+        let before = e;
+        assert_eq!(
+            e.migrate_dry_run(ALICE),
+            Err(EscrowError::InvalidSchemaMigration)
+        );
+        assert_eq!(e, before, "a refused dry-run changes nothing");
+        // Non-initializer: unauthorized, checked before state validity.
+        let e = v0_escrow();
+        assert_eq!(
+            e.migrate_dry_run(MALLORY),
+            Err(EscrowError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn dry_run_honors_pause() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSE_AUTH)
+            .unwrap();
+        e.schema_version = 0;
+        e.pause(PAUSE_AUTH).unwrap();
+        // The pause guard fires before the authority check, like the
+        // real migration.
+        assert_eq!(e.migrate_dry_run(ALICE), Err(EscrowError::Paused));
     }
 }
 

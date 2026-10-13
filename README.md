@@ -85,7 +85,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `skip_milestone(authority, index)`           | `Funded`       | — (no state change) | initializer **or** taker, **both** must approve (dual-sig skip; skipped tranche refunded to the initializer) |
 | `adjust_milestone_amounts(initializer, taker, new_amounts)` (AV-70) | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the tranche table) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition`; rejected once any tranche settled (`released > 0` or `skipped > 0`); new amounts must have the plan's tranche count, be all positive, and sum to exactly the locked amount; per-tranche confirmations survive (they accept the deliverable, not the amount); protocol fees charge on the new amounts at release time (still floored by `fee_cap`); emits `MilestonesAdjusted` only on an actual change |
 | `adjust_period_amounts(initializer, taker, new_amounts)` (AV-73) | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the per-period table) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition`; released periods lock their recorded amounts (the re-split must reaffirm them — `InvalidSubscription` otherwise); new amounts must have the schedule's period count, be all positive, and sum to exactly the locked amount; protocol fees charge on the new amounts at release time (still floored by `fee_cap`); the keeper's `ReleasePeriod` action prices from the live table; emits `SubscriptionAmountsAdjusted` only on an actual change |
-| `migrate_schema()` (AV-75) | any | — (no state change; stamps the schema version) | initializer **only** (`Unauthorized` otherwise, checked before state validity); a paused escrow fails fast (`Paused`); the gate is a catch-up gate (AV-82: `schema_version < SCHEMA_VERSION` steps — a pre-AV-75 vault jumps straight to the current revision instead of being stranded by the old `+1` gate); an already-current vault refuses the second call and an unknown future version refuses loudly instead of skipping forward (`InvalidSchemaMigration`, code 140, either way); the carried-over fields are re-validated before the stamp (`released <= amount`, `released + skipped <= amount`, `fees_paid <= released`, milestone tranche sum `== amount`) — a corrupt vault is refused, never migrated; emits `SchemaMigrated` (from == to == the current state), always on success |
+| `migrate_schema()` (AV-75; AV-85: chain) | any | — (no state change; stamps the schema version) | initializer **only** (`Unauthorized` otherwise, checked before state validity); a paused escrow fails fast (`Paused`); the gate is a catch-up gate (AV-82: `schema_version < SCHEMA_VERSION` runs — an already-current vault refuses the second call and an unknown future version refuses loudly instead of skipping forward, `InvalidSchemaMigration`, code 140, either way); AV-85: the catch-up is now an explicit N → M step chain — each step re-validates the conservation invariants over the field set it carries (`released <= amount`, `released + skipped <= amount`, `fees_paid <= released`, milestone tranche sum `== amount`, plus `released + penalty_paid <= amount` from the 1 → 2 step on) and any failing step rolls the chain back to the pre-chain snapshot (zero partial migration) — a corrupt vault is refused, never migrated; emits one `SchemaMigrated` per applied step (from == to == the current state, each carrying its from → to versions), always on success; the read-only `migrate_dry_run` previews the step/field plan with zero write impact |
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
 | `initialize_protocol_fee(fee_bps)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `fee_bps` in 0–10000 basis points; the fee slices every taker payout into net payout + protocol fee; the AV-63 fee cap can floor it per payout) |
 | `initialize_fee_cap(max_fee_cents)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; absolute per-payout fee ceiling in lamports — the effective fee is `min(bps fee, fee_cap)`; `0` means uncapped; no new error code) |
@@ -513,6 +513,23 @@ account never needs a realloc. The schema revision bumps to 2, and the
 `migrate_schema` gate becomes a catch-up gate (`schema_version <
 SCHEMA_VERSION`) so a v0 vault is never stranded by the intermediate
 v1 revision.
+
+**Migration chain, dry-run, atomic rollback (AV-85).** The catch-up is
+now an explicit N → M step chain: a v0 vault walks `0 → 1 → 2`, each
+step re-validating the conservation invariants over the field set it
+carries (the slash-region check applies from the `1 → 2` step on — a
+true v0 account has no slash region to judge). Any failing step rolls
+the chain back to the pre-chain snapshot: a migration never leaves a
+half-migrated vault behind. One `SchemaMigrated` event is emitted per
+applied step, each carrying its `from → to` versions, so the event
+history records the whole chain. `migrate_dry_run` runs the full
+pre-flight read-only and returns the step/field plan (which fields
+each bump appends, with byte widths) — zero write impact, so the
+operator signs with the plan in hand. The keeper's
+`scan_schema_migrations` dry-runs the chain across a watch list and
+reports each stale vault's version path, changed fields, and
+readiness (`"paused"` / `"corrupt"` when blocked); the snapshot's
+`migration_pending` flag surfaces the same signal per vault.
 
 **Panel threshold governance (AV-69).** The right M-of-N is not always
 obvious at setup — a 2-of-3 panel may prove too slow (one member goes
@@ -1809,6 +1826,35 @@ missing plan, empty/duplicate/out-of-range/dangling subset indices)
 are `InvalidMilestones` (code 110) — the existing variant is reused,
 no new error code.
 
+## Schema-migration keeper scan (AV-85)
+
+`scan_schema_migrations(watched)` is the migration-awareness keeper
+scan: it walks the watch list and dry-runs the AV-85 migration chain
+(`Escrow::migrate_dry_run`) for every vault below `SCHEMA_VERSION`.
+Each `SchemaMigrationAction` names the initializer as the canonical
+caller (the only key the chain accepts), the `from → to` version path,
+the changed-fields list flattened in step order (name / type / bytes
+per field), and the dry-run verdict: `ready` actions are executable
+`migrate_schema` calls for the initializer to sign; blocked actions
+name the machine-readable reason — `"paused"` (a paused escrow fails
+fast) or `"corrupt"` (a carried-over field violates the conservation
+invariants — the vault needs repair, never a migration signature).
+Current vaults are skipped: there is no no-op migration to list.
+Dry-run by construction — a pure read over `&Escrow` snapshots, zero
+side effects, no `now`. `SchemaMigrationReport::to_json()` emits the
+dry-run preview in the same deterministic hand-serialized style:
+
+```json
+{"scanned":2,"actions":[
+  {"escrow_id":"...","action":"migrate_schema","caller":"...",
+   "caller_role":"initializer","from_version":0,"to_version":2,
+   "new_fields":[{"name":"schema_version","type":"u8","bytes":1},
+                 {"name":"slash_terms","type":"Option<SlashTerms>","bytes":41},
+                 {"name":"penalty_paid","type":"u64","bytes":8}],
+   "ready":true,"block_reason":null,"reference":null}
+]}
+```
+
 ## State snapshot (AV-26)
 
 Keeper bots and indexers need one more primitive than the call list: *"what
@@ -1867,7 +1913,7 @@ renders the bare integer). Raw fields stay untouched, so indexers keep
 diffing numbers while operators read whole tokens.
 
 ```json
-{"at":1750000000,"initializer":"...","taker":"...","state":"funded","schema_version":2,
+{"at":1750000000,"initializer":"...","taker":"...","state":"funded","schema_version":2,"migration_pending":false,
  "amount":1000000,"decimals":6,"display_amount":"1.000000",
  "released":0,"display_released":"0.000000",
  "remaining":1000000,"display_remaining":"1.000000",

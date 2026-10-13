@@ -2527,44 +2527,60 @@ pub mod escrow_vault {
         Ok(())
     }
 
-    /// Migrate the vault's persisted schema one version forward (AV-75;
-    /// mirrors `Escrow::migrate_schema`). A unilateral initializer
-    /// power: on-chain, a program upgrade appends new vault fields and
-    /// the account is realloc'd with the new region zero-filled — the
-    /// initializer runs this exactly once to carry the vault onto the
-    /// new layout. Only `schema_version + 1 == SCHEMA_VERSION` steps:
-    /// an already-current vault refuses the second call, and an
-    /// unknown future version refuses loudly instead of skipping
-    /// forward (`InvalidSchemaMigration`, code 140, either way). The
-    /// carried-over fields are re-validated before the stamp
-    /// (`released <= amount`, `released + skipped <= amount`,
-    /// `fees_paid <= released`, milestone tranche sum `== amount`) — a
-    /// corrupt vault is refused, never migrated. A paused escrow fails
-    /// fast (`Paused`). Emits `SchemaMigrated` (from == to == the
-    /// current state) — always on success, since a successful
-    /// migration always steps the version.
+    /// Migrate the vault's persisted schema to the current revision
+    /// (AV-75; AV-85: the one-shot catch-up is now the explicit N → M
+    /// step chain — mirrors `Escrow::migrate_schema`). A unilateral
+    /// initializer power: on-chain, a program upgrade appends new vault
+    /// fields and the account is realloc'd with the new region
+    /// zero-filled — the initializer runs this exactly once to carry
+    /// the vault onto the new layout, stepping through every
+    /// intermediate version in order. Only `schema_version <
+    /// SCHEMA_VERSION` runs: an already-current vault refuses the
+    /// second call, and an unknown future version refuses loudly
+    /// instead of skipping forward (`InvalidSchemaMigration`, code 140,
+    /// either way). Each step re-validates the conservation invariants
+    /// over the field set it carries (`released <= amount`, `released
+    /// + skipped <= amount`, `fees_paid <= released`, milestone tranche
+    /// sum `== amount`, plus `released + penalty_paid <= amount` from
+    /// the 1 → 2 step on) — a corrupt vault is refused, never migrated;
+    /// any failing step rolls the chain back to the pre-chain snapshot
+    /// (zero partial migration). A paused escrow fails fast (`Paused`).
+    /// Emits one `SchemaMigrated` per applied step (from == to == the
+    /// current state) — always on success, since a successful migration
+    /// always steps the version; the real build stamps each event with
+    /// its step's from → to versions (mirroring
+    /// `escrow_state::EscrowEvent::schema_versions`).
     pub fn migrate_schema(ctx: Context<MigrateSchema>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let state = escrow.state() as u8;
-        escrow
-            .migrate_schema(ctx.accounts.initializer.key().to_bytes())
+        // AV-85: run the N → M step chain and emit one SchemaMigrated
+        // per applied step, so the on-chain event stream records every
+        // from → to version pair — mirroring
+        // `IndexedEscrow::migrate_schema`. (The skeleton's
+        // `emit_transition` carries no per-step versions; the real
+        // build stamps them like `EscrowEvent::schema_versions`.)
+        let steps = escrow
+            .migrate_schema_steps(ctx.accounts.initializer.key().to_bytes())
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
-        emit_transition(
-            &ctx.accounts.vault,
-            escrow_state::EscrowEventKind::SchemaMigrated,
-            state,
-            state,
-            0,
-            0,
-            0,
-            Clock::get()?.unix_timestamp as u64,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let at = Clock::get()?.unix_timestamp as u64;
+        for _step in steps {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::SchemaMigrated,
+                state,
+                state,
+                0,
+                0,
+                0,
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
         Ok(())
     }
 
@@ -3654,11 +3670,13 @@ pub enum EscrowVaultEventKind {
     /// change. Mirrors
     /// `escrow_state::EscrowEventKind::SubscriptionAmountsAdjusted`.
     SubscriptionAmountsAdjusted,
-    /// AV-75: the vault's persisted schema was migrated one version
-    /// forward by initializer governance
-    /// (`Escrow::migrate_schema`). `from == to ==` the current state;
-    /// always emitted on success (a successful migration always steps
-    /// the version — no no-op case). Mirrors
+    /// AV-75: the vault's persisted schema was migrated by initializer
+    /// governance (`Escrow::migrate_schema`). `from == to ==` the
+    /// current state; always emitted on success (a successful migration
+    /// always steps the version — no no-op case). AV-85: the migration
+    /// is an N → M step chain and the program emits one event per
+    /// applied step, so the stream records every from → to version
+    /// pair. Mirrors
     /// `escrow_state::EscrowEventKind::SchemaMigrated`.
     SchemaMigrated,
 }

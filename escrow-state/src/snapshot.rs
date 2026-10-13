@@ -268,6 +268,12 @@ pub struct EscrowSnapshot {
     /// was written before the field existed and has not migrated yet,
     /// so keeper/indexer tooling finds stale vaults from one snapshot.
     pub schema_version: u8,
+    /// Whether the vault has a pending schema migration (AV-85):
+    /// `schema_version < SCHEMA_VERSION` — the direct operator signal
+    /// that the initializer should run `migrate_schema` (see
+    /// [`crate::keeper::scan_schema_migrations`] for the dry-run
+    /// verdict). `false` on a current vault.
+    pub migration_pending: bool,
     /// Cumulative amount released to the taker so far.
     pub released: u64,
     /// Amount still locked: `amount - released - penalty_paid` (AV-82).
@@ -509,6 +515,9 @@ impl Escrow {
             amount: self.amount(),
             decimals: self.decimals(),
             schema_version: self.schema_version(),
+            // AV-85: the direct pending-migration signal — the snapshot
+            // is how operators find stale vaults.
+            migration_pending: self.schema_version() < Self::SCHEMA_VERSION,
             released: self.released_amount(),
             remaining: self.remaining_amount(),
             expires_at: self.expires_at(),
@@ -675,6 +684,10 @@ impl EscrowSnapshot {
         // (pre-migration) vaults from this field.
         s.push_str("\",\"schema_version\":");
         s.push_str(&self.schema_version.to_string());
+        // AV-85: the direct pending-migration flag, next to the
+        // version it derives from.
+        s.push_str(",\"migration_pending\":");
+        s.push_str(if self.migration_pending { "true" } else { "false" });
         s.push_str(",\"amount\":");
         s.push_str(&self.amount.to_string());
         // AV-28: token decimal metadata and the human-readable amount
@@ -1099,7 +1112,7 @@ mod snapshot_tests {
              \"at\":1750000000,\
              \"initializer\":\"{init}\",\"taker\":\"{taker}\",\
              \"state\":\"funded\",\
-             \"schema_version\":2,\
+             \"schema_version\":2,\"migration_pending\":false,\
              \"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\
              \"released\":0,\"display_released\":\"0\",\
              \"remaining\":1000000,\"display_remaining\":\"1000000\",\
@@ -1129,17 +1142,24 @@ mod snapshot_tests {
         // A fresh vault is born current.
         let snap = funded(AMOUNT, NEVER).snapshot(MID);
         assert_eq!(snap.schema_version, 2);
+        assert!(!snap.migration_pending);
         assert!(snap.to_json().contains("\"schema_version\":2"));
+        assert!(snap.to_json().contains("\"migration_pending\":false"));
         // A migrated vault's snapshot shows the new version.
         let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER).unwrap();
         e.schema_version = 0; // simulate a pre-AV-75 vault
         let snap = e.snapshot(MID);
         assert_eq!(snap.schema_version, 0);
+        // AV-85: the snapshot flags the pending migration outright.
+        assert!(snap.migration_pending);
         assert!(snap.to_json().contains("\"schema_version\":0"));
+        assert!(snap.to_json().contains("\"migration_pending\":true"));
         e.migrate_schema(ALICE).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.schema_version, 2);
+        assert!(!snap.migration_pending);
         assert!(snap.to_json().contains("\"schema_version\":2"));
+        assert!(snap.to_json().contains("\"migration_pending\":false"));
     }
 
     #[test]

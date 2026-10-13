@@ -207,6 +207,10 @@ pub fn csv_to_events(csv: &str) -> Result<Vec<EscrowEvent>, CsvError> {
             // projection — like the other non-carried fields it takes
             // its documented zero-value on import.
             split_children: None,
+            // AV-85: the migration step's versions are not carried by
+            // the CSV projection either — `None` on import, like the
+            // other kind-specific extras.
+            schema_versions: None,
         });
     }
     Ok(events)

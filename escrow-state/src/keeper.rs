@@ -74,7 +74,7 @@
 //! emits no events, and touches no clock. Amounts are as of the scan — a
 //! keeper executes the list, then re-scans.
 //!
-//! # Schema upgrades (AV-75)
+//! # Schema upgrades (AV-75, AV-85)
 //!
 //! Keeper scans are schema-agnostic: a pre-AV-75 v0 account is a
 //! byte-prefix of the v1 layout (fields are only ever appended last),
@@ -82,7 +82,18 @@
 //! schema version, and a vault awaiting [`Escrow::migrate_schema`]
 //! keeps its keeper actions. Operators find stale vaults through the
 //! AV-26 snapshot export: [`crate::EscrowSnapshot::schema_version`] is
-//! `0` until the initializer migrates, [`Escrow::SCHEMA_VERSION`] after.
+//! `0` until the initializer migrates, [`Escrow::SCHEMA_VERSION`] after
+//! (and [`crate::EscrowSnapshot::migration_pending`] flags the pending
+//! migration outright).
+//!
+//! [`scan_schema_migrations`] is the migration-awareness scan: it
+//! walks the watch list, dry-runs the AV-85 N → M migration chain
+//! ([`Escrow::migrate_dry_run`]) for every vault below
+//! [`Escrow::SCHEMA_VERSION`], and reports each vault's version path,
+//! changed-fields list, and readiness — `ready` entries are executable
+//! `migrate_schema` calls for the initializer to sign, blocked entries
+//! name the reason (`"paused"` / `"corrupt"`). Dry-run by construction,
+//! like every other scan here.
 //!
 //! # Output
 //!
@@ -145,7 +156,7 @@
 
 use crate::{
     aggregate::EscrowAggregateView, format_amount, vault_close_rent_reclaimed, Escrow, EscrowError,
-    EscrowState, IndexedEscrow, MultisigAuthority,
+    EscrowState, IndexedEscrow, MultisigAuthority, SchemaFieldDelta,
 };
 use super::cpi::{AccountMeta, Pubkey};
 use super::discriminator::instruction_discriminator;
@@ -3453,6 +3464,335 @@ pub fn scan_rent_health(
         required_lamports: required,
         critical_threshold_pct: pct,
         top_ups,
+    }
+}
+
+/// One vault with a pending schema migration (AV-85): the dry-run
+/// verdict for `migrate_schema` on this vault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaMigrationAction {
+    /// Which escrow this migration targets: the caller-supplied
+    /// identity (the Anchor layer keys the vault PDA off it — the same
+    /// convention as [`WatchedEscrow::escrow_id`]).
+    pub escrow_id: [u8; 32],
+    /// The key that must sign the `migrate_schema` call — always the
+    /// escrow's initializer. The state machine checks the initializer
+    /// before state validity, so it is the only key the chain will
+    /// accept.
+    pub caller: [u8; 32],
+    /// Always `"initializer"` — the canonical (and only accepted)
+    /// migration caller.
+    pub caller_role: &'static str,
+    /// The vault's schema version at scan time.
+    pub from_version: u8,
+    /// The version the chain would land on — always
+    /// [`Escrow::SCHEMA_VERSION`].
+    pub to_version: u8,
+    /// The fields each step would append, in step order (see
+    /// [`Escrow::schema_step_fields`]) — the dry-run's changed-fields
+    /// list, flattened across the chain's steps. Empty when the
+    /// migration is blocked.
+    pub new_fields: Vec<SchemaFieldDelta>,
+    /// Whether the dry-run passed: the real `migrate_schema` call
+    /// would succeed, so this action is an executable
+    /// `migrate_schema` call for the initializer to sign.
+    pub ready: bool,
+    /// Machine-readable reason the migration is blocked: `"paused"`
+    /// (a paused escrow fails fast — migration is not the pause
+    /// key-loss escape hatch) or `"corrupt"` (a carried-over field
+    /// violates the conservation invariants — the vault needs repair,
+    /// never a migration signature). `None` when `ready`.
+    pub block_reason: Option<&'static str>,
+    /// The escrow's opt-in 32-byte off-chain reference memo (AV-53),
+    /// copied from the [`WatchedEscrow`] entry at scan time — the
+    /// operator's order id / invoice hash for off-chain reconciliation.
+    /// Carried for correlation only: it is never an instruction input
+    /// and never affects which actions are listed.
+    pub reference: Option<[u8; 32]>,
+}
+
+/// The schema-migration scan result: every watched vault with a
+/// pending migration, in input order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaMigrationReport {
+    /// How many vaults were scanned.
+    pub scanned: usize,
+    /// The pending-migration actions, in input order, so a keeper
+    /// feeding a stable watch list gets a stable migration list.
+    pub actions: Vec<SchemaMigrationAction>,
+}
+
+impl SchemaMigrationReport {
+    /// True when no watched vault has a pending migration.
+    pub fn is_empty(&self) -> bool {
+        self.actions.is_empty()
+    }
+
+    /// Hand-serialized JSON (the crate is dependency-free): the
+    /// dry-run preview — per-vault version path, changed-fields list,
+    /// and readiness. Deterministic field order; keys are 64-char
+    /// lowercase hex.
+    ///
+    /// ```json
+    /// {"scanned":2,"actions":[
+    ///   {"escrow_id":"...","action":"migrate_schema","caller":"...",
+    ///    "caller_role":"initializer","from_version":0,"to_version":2,
+    ///    "new_fields":[{"name":"schema_version","type":"u8","bytes":1},
+    ///                 {"name":"slash_terms","type":"Option<SlashTerms>","bytes":41},
+    ///                 {"name":"penalty_paid","type":"u64","bytes":8}],
+    ///    "ready":true,"block_reason":null,"reference":null}
+    /// ]}
+    /// ```
+    pub fn to_json(&self) -> String {
+        let mut s = String::with_capacity(64 + self.actions.len() * 420);
+        s.push_str("{\"scanned\":");
+        s.push_str(&self.scanned.to_string());
+        s.push_str(",\"actions\":[");
+        for (i, a) in self.actions.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"escrow_id\":\"");
+            s.push_str(&hex32(&a.escrow_id));
+            s.push_str("\",\"action\":\"migrate_schema\",\"caller\":\"");
+            s.push_str(&hex32(&a.caller));
+            s.push_str("\",\"caller_role\":\"");
+            s.push_str(a.caller_role);
+            s.push_str("\",\"from_version\":");
+            s.push_str(&a.from_version.to_string());
+            s.push_str(",\"to_version\":");
+            s.push_str(&a.to_version.to_string());
+            s.push_str(",\"new_fields\":[");
+            for (j, f) in a.new_fields.iter().enumerate() {
+                if j > 0 {
+                    s.push(',');
+                }
+                s.push_str("{\"name\":\"");
+                s.push_str(f.name);
+                s.push_str("\",\"type\":\"");
+                s.push_str(f.ty);
+                s.push_str("\",\"bytes\":");
+                s.push_str(&f.bytes.to_string());
+                s.push('}');
+            }
+            s.push_str("],\"ready\":");
+            s.push_str(if a.ready { "true" } else { "false" });
+            s.push_str(",\"block_reason\":");
+            match a.block_reason {
+                Some(r) => {
+                    s.push('"');
+                    s.push_str(r);
+                    s.push('"');
+                }
+                None => s.push_str("null"),
+            }
+            s.push_str(",\"reference\":");
+            match a.reference {
+                Some(r) => {
+                    s.push('"');
+                    s.push_str(&hex32(&r));
+                    s.push('"');
+                }
+                None => s.push_str("null"),
+            }
+            s.push('}');
+        }
+        s.push_str("]}");
+        s
+    }
+}
+
+/// Map a migration dry-run failure onto the report's machine-readable
+/// `block_reason`: `Paused` → `"paused"`, `Unauthorized` →
+/// `"unauthorized"` (defensive — the scan always passes the vault's
+/// own initializer), anything else → `"corrupt"` (a carried-over field
+/// violates the conservation invariants, or the step table has no
+/// entry for the vault's version).
+fn migration_block_reason(err: EscrowError) -> &'static str {
+    match err {
+        EscrowError::Paused => "paused",
+        EscrowError::Unauthorized => "unauthorized",
+        _ => "corrupt",
+    }
+}
+
+/// Scan `watched` and return every vault with a pending schema
+/// migration, each with the dry-run verdict for `migrate_schema`
+/// (AV-85).
+///
+/// Read-only by construction — the scan only runs
+/// [`Escrow::migrate_dry_run`] over the snapshots: it cannot mutate
+/// anything, emits no events, and touches no clock. A vault is listed
+/// when `schema_version < SCHEMA_VERSION`; current vaults are skipped
+/// (there is no no-op migration to list).
+///
+/// Each action carries the dry-run's changed-fields list
+/// (`new_fields`, flattened in step order) so the operator sees what
+/// the migration would append before the initializer signs. `ready`
+/// actions are executable `migrate_schema` calls; blocked actions name
+/// the reason (`"paused"` / `"corrupt"`) so the operator knows the
+/// vault needs attention rather than a migration signature.
+pub fn scan_schema_migrations(watched: &[WatchedEscrow]) -> SchemaMigrationReport {
+    let mut actions = Vec::new();
+    for w in watched {
+        let e = &w.escrow;
+        if e.schema_version() >= Escrow::SCHEMA_VERSION {
+            continue;
+        }
+        // The initializer is the only accepted migration signer — the
+        // dry-run checks it like the real call would.
+        let initializer = e.initializer();
+        match e.migrate_dry_run(initializer) {
+            Ok(plan) => {
+                let new_fields: Vec<SchemaFieldDelta> = plan
+                    .steps
+                    .iter()
+                    .flat_map(|step| step.new_fields.iter().copied())
+                    .collect();
+                actions.push(SchemaMigrationAction {
+                    escrow_id: w.escrow_id,
+                    caller: initializer,
+                    caller_role: "initializer",
+                    from_version: plan.from,
+                    to_version: plan.to,
+                    new_fields,
+                    ready: true,
+                    block_reason: None,
+                    reference: w.reference,
+                });
+            }
+            Err(err) => actions.push(SchemaMigrationAction {
+                escrow_id: w.escrow_id,
+                caller: initializer,
+                caller_role: "initializer",
+                from_version: e.schema_version(),
+                to_version: Escrow::SCHEMA_VERSION,
+                new_fields: Vec::new(),
+                ready: false,
+                block_reason: Some(migration_block_reason(err)),
+                reference: w.reference,
+            }),
+        }
+    }
+    SchemaMigrationReport {
+        scanned: watched.len(),
+        actions,
+    }
+}
+
+#[cfg(test)]
+mod schema_migration_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const ID1: [u8; 32] = [0x01; 32];
+    const ID2: [u8; 32] = [0x02; 32];
+    const ID3: [u8; 32] = [0x03; 32];
+    const PAUSE_AUTH: [u8; 32] = [0xA9; 32];
+    const NEVER: u64 = u64::MAX; // no timeout
+
+    fn watch(id: [u8; 32], escrow: Escrow) -> WatchedEscrow {
+        let reference = escrow.reference();
+        WatchedEscrow {
+            escrow_id: id,
+            escrow,
+            reference,
+        }
+    }
+
+    /// A v0-state vault: written before AV-75 existed, so the trailing
+    /// schema byte reads `0`.
+    fn v0_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, NEVER).unwrap();
+        e.schema_version = 0;
+        e
+    }
+
+    #[test]
+    fn lists_pending_vaults_with_dry_run_verdict() {
+        let mut v1 = Escrow::initialize(ALICE, BOB, 1_000_000, NEVER).unwrap();
+        v1.schema_version = 1;
+        let watched = vec![
+            watch(ID1, v0_escrow()),
+            watch(ID2, v1),
+            // A current vault is skipped: no no-op migration to list.
+            watch(ID3, Escrow::initialize(ALICE, BOB, 1_000_000, NEVER).unwrap()),
+        ];
+        let report = scan_schema_migrations(&watched);
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.actions.len(), 2, "only stale vaults are listed");
+        // Input order is preserved.
+        let first = &report.actions[0];
+        assert_eq!(first.escrow_id, ID1);
+        assert_eq!(first.caller, ALICE);
+        assert_eq!(first.caller_role, "initializer");
+        assert_eq!(first.from_version, 0);
+        assert_eq!(first.to_version, Escrow::SCHEMA_VERSION);
+        assert!(first.ready);
+        assert_eq!(first.block_reason, None);
+        // The dry-run's changed-fields list, flattened in step order.
+        let names: Vec<&str> = first.new_fields.iter().map(|f| f.name).collect();
+        assert_eq!(names, vec!["schema_version", "slash_terms", "penalty_paid"]);
+        let second = &report.actions[1];
+        assert_eq!(second.escrow_id, ID2);
+        assert_eq!(second.from_version, 1);
+        assert!(second.ready);
+        let names: Vec<&str> = second.new_fields.iter().map(|f| f.name).collect();
+        assert_eq!(names, vec!["slash_terms", "penalty_paid"]);
+    }
+
+    #[test]
+    fn blocked_vaults_name_the_reason() {
+        // Paused: the dry-run fails fast, like the real migration.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, NEVER)
+            .unwrap()
+            .with_pause_authority(PAUSE_AUTH)
+            .unwrap();
+        paused.schema_version = 0;
+        paused.pause(PAUSE_AUTH).unwrap();
+        // Corrupt: a carried-over field violates the conservation
+        // invariants — repair, never migrate.
+        let mut corrupt = v0_escrow();
+        corrupt.released = 1_000_001;
+        let watched = vec![watch(ID1, paused), watch(ID2, corrupt)];
+        let report = scan_schema_migrations(&watched);
+        assert_eq!(report.actions.len(), 2);
+        assert!(!report.actions[0].ready);
+        assert_eq!(report.actions[0].block_reason, Some("paused"));
+        assert!(report.actions[0].new_fields.is_empty());
+        assert!(!report.actions[1].ready);
+        assert_eq!(report.actions[1].block_reason, Some("corrupt"));
+        assert!(!report.is_empty());
+    }
+
+    #[test]
+    fn empty_watch_list_reports_empty() {
+        let report = scan_schema_migrations(&[]);
+        assert!(report.is_empty());
+        assert_eq!(report.to_json(), "{\"scanned\":0,\"actions\":[]}");
+    }
+
+    #[test]
+    fn report_json_is_deterministic() {
+        let watched = vec![watch(ID1, v0_escrow())];
+        let a = scan_schema_migrations(&watched).to_json();
+        let b = scan_schema_migrations(&watched).to_json();
+        assert_eq!(a, b);
+        assert!(a.contains("\"action\":\"migrate_schema\""));
+        assert!(a.contains("\"from_version\":0,\"to_version\":2"));
+        assert!(a.contains("\"name\":\"slash_terms\",\"type\":\"Option<SlashTerms>\",\"bytes\":41"));
+        assert!(a.contains("\"ready\":true,\"block_reason\":null"));
+    }
+
+    #[test]
+    fn scan_is_read_only() {
+        let e = v0_escrow();
+        let before = e;
+        let watched = vec![watch(ID1, e)];
+        let report = scan_schema_migrations(&watched);
+        assert_eq!(report.actions.len(), 1);
+        assert_eq!(watched[0].escrow, before, "the scan must not mutate snapshots");
     }
 }
 
