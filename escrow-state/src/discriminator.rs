@@ -220,6 +220,8 @@ fn state_from_discriminant(d: u8) -> Result<EscrowState, AccountDecodeError> {
         5 => Ok(EscrowState::Disputed),
         6 => Ok(EscrowState::Settled),
         7 => Ok(EscrowState::Closed),
+        // AV-81: appended after Closed — discriminants 0–7 stay stable.
+        8 => Ok(EscrowState::Split),
         other => Err(AccountDecodeError::InvalidStateDiscriminant(other)),
     }
 }
@@ -821,6 +823,10 @@ mod discriminator_tests {
         // AV-34: appended after Settled so discriminants 0–6 stay
         // stable for already-serialized vaults.
         assert_eq!(EscrowState::Closed as u8, 7);
+        // AV-81: appended after Closed so discriminants 0–7 stay
+        // stable for already-serialized vaults.
+        assert_eq!(EscrowState::Split as u8, 8);
+        assert_eq!(state_from_discriminant(8).unwrap(), EscrowState::Split);
     }
 
     #[test]
@@ -1003,9 +1009,10 @@ mod discriminator_tests {
         let base = account_bytes(&funded(1_000_000, EXPIRES_AT));
         // `state` sits at offset 8 + 32 + 32 + 8 + 8 + 8 = 96.
         let state_off = ANCHOR_DISCRIMINATOR_LEN + 32 + 32 + 8 + 8 + 8;
-        // AV-34: discriminant 7 is now valid (`Closed`); the first
-        // invalid byte is 8.
-        for bad in [8u8, 42, 255] {
+        // AV-34: discriminant 7 is now valid (`Closed`); AV-81:
+        // discriminant 8 is now valid (`Split`); the first invalid
+        // byte is 9.
+        for bad in [9u8, 42, 255] {
             let mut b = base.clone();
             b[state_off] = bad;
             assert_eq!(
@@ -1020,6 +1027,13 @@ mod discriminator_tests {
         assert_eq!(
             decode_vault_account(&closed).unwrap().state(),
             EscrowState::Closed
+        );
+        // AV-81: discriminant 8 decodes to the split terminal state.
+        let mut split = base.clone();
+        split[state_off] = 8;
+        assert_eq!(
+            decode_vault_account(&split).unwrap().state(),
+            EscrowState::Split
         );
         // `quorum` Option discriminant follows `state`: offset 97.
         let quorum_disc_off = state_off + 1;

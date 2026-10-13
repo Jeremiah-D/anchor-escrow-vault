@@ -492,6 +492,18 @@
       "discriminator": [223, 9, 156, 218, 187, 90, 169, 85],
       "accounts": [],
       "args": []
+    },
+    {
+      "name": "split_escrow",
+      "discriminator": [103, 146, 190, 211, 86, 42, 207, 91],
+      "accounts": [],
+      "args": [
+        {"name": "amounts", "type": {"vec": "u64"}},
+        {"name": "vesting", "type": {"option": {"defined": "VestingSchedule"}}},
+        {"name": "quorum", "type": {"option": {"defined": "QuorumPolicy"}}},
+        {"name": "dual_sig", "type": "bool"},
+        {"name": "milestones", "type": {"option": {"vec": {"defined": "MilestonePlan"}}}}
+      ]
     }
   ],
   "accounts": [
@@ -718,7 +730,8 @@
     {"code": 138, "name": "InvalidEvidenceDeadline"},
     {"code": 139, "name": "EvidenceDisclosureLate"},
     {"code": 140, "name": "InvalidSchemaMigration"},
-    {"code": 141, "name": "TemplateOverrideRejected"}
+    {"code": 141, "name": "TemplateOverrideRejected"},
+    {"code": 142, "name": "InvalidSplit"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

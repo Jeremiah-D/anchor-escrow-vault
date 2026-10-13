@@ -79,6 +79,7 @@ pub(crate) fn state_name(state: EscrowState) -> &'static str {
         EscrowState::Disputed => "disputed",
         EscrowState::Settled => "settled",
         EscrowState::Closed => "closed",
+        EscrowState::Split => "split",
     }
 }
 
@@ -1316,6 +1317,28 @@ mod snapshot_tests {
         assert_eq!(snap.released, AMOUNT);
         assert_eq!(snap.remaining, 0);
         assert_eq!(snap.claimable, 0);
+    }
+
+    #[test]
+    fn split_parent_snapshots_honestly() {
+        // AV-81: a split parent snapshots as "split" — the funds were
+        // re-homed into the children, so the parent's remaining is its
+        // pre-split remainder (preserved for audit, like the other
+        // terminals).
+        let mut e = funded(AMOUNT, NEVER);
+        e.split_escrow(
+            ALICE,
+            BOB,
+            &[600_000, 400_000],
+            crate::SplitConfig::default(),
+            MID,
+        )
+        .unwrap();
+        assert_eq!(e.state(), EscrowState::Split);
+        let snap = e.snapshot(MID);
+        assert_eq!(snap.state, "split");
+        assert_eq!(snap.remaining, AMOUNT);
+        assert!(snap.to_json().contains("\"state\":\"split\""));
     }
 
     #[test]

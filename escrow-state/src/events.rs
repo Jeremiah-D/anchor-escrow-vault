@@ -136,6 +136,20 @@
 //!   `amounts.rent_reclaimed` is the Σ rent-exempt lamports the batch
 //!   reclaimed). A batch that closes nothing emits no summary event
 //!   (paralleling the no-op rules on `QuorumUpdated` et al).
+//! - `split_escrow` (AV-81) emits [`EscrowEventKind::EscrowSplit`]
+//!   with `from == Funded`, `to == Split` — the parent's lifecycle move
+//!   into the new terminal state. `amounts.payout` carries the Σ child
+//!   amounts (the gross re-locked into the children, equal to the
+//!   parent's pre-split remaining lockup); every other amount is zero.
+//!   The `(child_id, amount)` roster rides the event's `split_children`
+//!   field, so the whole split family is re-derivable from the one
+//!   event; the actor is `None` (dual-signed governance, like
+//!   `TakerRotated`). Each child escrow gets its own log —
+//!   `Initialized`, then `Funded` (and `Activated` between them when
+//!   the children inherit dual-signature activation) — under its
+//!   derived escrow ID, so every child's lifecycle is independently
+//!   indexable. A failed split emits nothing: the parent stays
+//!   `Funded` and no child exists.
 //! - A rejected reentrant entry (AV-36) emits
 //!   [`EscrowEventKind::ReentryRejected`] — the deliberate exception to
 //!   the "failed calls emit nothing" rule. A blocked reentry is a
@@ -184,6 +198,7 @@
 //! | MilestoneSkipped | 0 | 0 | skipped tranche (the initializer's refund) | 0 |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
+//! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
 //!
 //! # Backward compatibility
 //!
@@ -191,7 +206,7 @@
 //! additive, and [`Escrow`] itself is untouched. The crate stays
 //! dependency-free.
 
-use crate::{Escrow, EscrowError, EscrowState, MilestonePlan, QuorumPolicy, VestingSchedule};
+use crate::{Escrow, EscrowError, EscrowState, MilestonePlan, QuorumPolicy, SplitConfig, VestingSchedule};
 use crate::{OverrideValue, TemplatePreset};
 use crate::cpi::CpiError;
 use crate::cpi_call::{CpiInvocation, CpiReceipt};
@@ -496,6 +511,23 @@ pub enum EscrowEventKind {
     /// closes nothing emits no summary event (paralleling the no-op
     /// rules on [`EscrowEventKind::QuorumUpdated`] et al).
     VaultsBatchClosed,
+    /// AV-81: a funded escrow was split into N child escrows by
+    /// dual-signed governance ([`Escrow::split_escrow`]). `from ==
+    /// Funded`, `to == Split` — the parent's lifecycle move into the
+    /// new terminal state. [`EventAmounts::payout`] carries the Σ child
+    /// amounts (the gross re-locked into the child escrows — equal to
+    /// the parent's pre-split [`Escrow::remaining_amount`], so the
+    /// conservation invariant is checkable from the log alone); every
+    /// other amount is zero. The `(child_id, amount)` roster rides
+    /// [`EscrowEvent::split_children`] — the parent is the event's own
+    /// `escrow_id`, and each child's ID is the deterministic
+    /// [`crate::derive_split_child_id`] derivation, so the whole
+    /// family is re-derivable. The actor is `None` — the split is
+    /// dual-signed governance, not a single-actor call (like
+    /// [`EscrowEventKind::TakerRotated`]). Always emitted on success:
+    /// a successful split always re-homes funds, so there is no no-op
+    /// case.
+    EscrowSplit,
 }
 
 impl EscrowEventKind {
@@ -581,6 +613,9 @@ impl EscrowEventKind {
             // AV-79: appended after TemplateApplied so discriminants
             // 0–39 stay stable for already-serialized histories.
             40 => Self::VaultsBatchClosed,
+            // AV-81: appended after VaultsBatchClosed so discriminants
+            // 0–40 stay stable for already-serialized histories.
+            41 => Self::EscrowSplit,
             _ => return None,
         })
     }
@@ -630,6 +665,7 @@ impl EscrowEventKind {
             Self::BundlePartiallyExecuted => "bundle_partially_executed",
             Self::TemplateApplied => "template_applied",
             Self::VaultsBatchClosed => "vaults_batch_closed",
+            Self::EscrowSplit => "escrow_split",
         }
     }
 
@@ -680,6 +716,7 @@ impl EscrowEventKind {
             "bundle_partially_executed" => Self::BundlePartiallyExecuted,
             "template_applied" => Self::TemplateApplied,
             "vaults_batch_closed" => Self::VaultsBatchClosed,
+            "escrow_split" => Self::EscrowSplit,
             _ => return None,
         })
     }
@@ -774,6 +811,23 @@ impl EventAmounts {
     pub(crate) fn batch_close(total_rent: u64) -> Self {
         Self::close(total_rent)
     }
+
+    /// An escrow split (AV-81): the Σ child amounts re-locked into the
+    /// child escrows, in `payout` — the gross the parent's remaining
+    /// lockup became. Every other field is zero: no taker payout, no
+    /// fee slice, no refund, no penalty, no rent reclaim — the funds
+    /// moved sideways into the children, not out of escrow. Rides the
+    /// [`EscrowEventKind::EscrowSplit`] event; the per-child amounts
+    /// ride the event's `split_children` roster.
+    pub(crate) fn split(total: u64) -> Self {
+        Self {
+            payout: total,
+            fee: 0,
+            refund: 0,
+            penalty: 0,
+            rent_reclaimed: 0,
+        }
+    }
 }
 
 /// CPI-routing audit for a [`EscrowEvent`]: which third-party program a
@@ -834,6 +888,11 @@ pub struct CpiRouteAudit {
 /// the log always agrees with the account. It is `None` when the
 /// escrow carries no reference — the event log never invents one.
 ///
+/// `split_children` (AV-81) carries the child-escrow roster on the
+/// `EscrowSplit` event: `(child_id, amount)` pairs in split-table
+/// order, `len` of them valid. It is `None` on every other kind —
+/// the event log never invents children.
+///
 /// [`IndexedEscrow::release_via_cpi`]: IndexedEscrow::release_via_cpi
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EscrowEvent {
@@ -890,6 +949,31 @@ pub struct EscrowEvent {
     /// push (see `push_event`), so the log records exactly the
     /// parameters that took effect.
     pub template_params_hash: Option<[u8; 32]>,
+    /// AV-81: the child-escrow roster for the `EscrowSplit` event —
+    /// `(child_id, amount)` pairs in split order, `len` of them valid.
+    /// Carried only by [`EscrowEventKind::EscrowSplit`] (`None` on every
+    /// other kind — like `template_params_hash`, which rides only
+    /// `TemplateApplied`). The parent is the event's own `escrow_id`;
+    /// each `child_id` is the deterministic
+    /// [`crate::derive_split_child_id`] derivation, so an indexer
+    /// re-derives the whole split family from this one event. The
+    /// emitter stamps it after the push (see `push_event`), mirroring
+    /// the `template_params_hash` precedent — never a `push_event`
+    /// parameter. Fixed-size ([`MAX_SPLIT_CHILDREN`](crate::MAX_SPLIT_CHILDREN))
+    /// so the event stays `Copy`.
+    pub split_children: Option<([SplitChild; crate::MAX_SPLIT_CHILDREN], u8)>,
+}
+
+/// One split child on an [`EscrowEventKind::EscrowSplit`] event's
+/// roster (AV-81): the derived child identity and its locked amount,
+/// in split-table order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitChild {
+    /// The derived child escrow identity:
+    /// [`crate::derive_split_child_id`]`(parent_id, index)`.
+    pub escrow_id: [u8; 32],
+    /// The child's locked amount — the split-table entry.
+    pub amount: u64,
 }
 
 /// An event-logging adapter over [`Escrow`] (AV-18).
@@ -1065,6 +1149,9 @@ impl IndexedEscrow {
             // AV-77: stamped by the TemplateApplied emitter after the
             // push — never a push_event parameter (see above).
             template_params_hash: None,
+            // AV-81: stamped by the EscrowSplit emitter after the push
+            // — never a push_event parameter (see above).
+            split_children: None,
         };
         self.next_seq += 1;
         self.events.push(event);
@@ -2764,6 +2851,158 @@ impl IndexedEscrow {
         Ok(rent)
     }
 
+    /// Split a funded escrow into N child escrows by dual-signed
+    /// governance (mirrors [`Escrow::split_escrow`](crate::Escrow::split_escrow),
+    /// AV-81). Returns the child escrows as [`IndexedEscrow`]s — each
+    /// under its derived escrow ID
+    /// ([`crate::derive_split_child_id`]`(parent_id, index)`), each
+    /// with its own event log.
+    ///
+    /// Emits [`EscrowEventKind::EscrowSplit`] on the *parent's* log
+    /// (`from == Funded`, `to == Split`; `amounts.payout` is the Σ
+    /// child amounts — the gross re-locked into the children — and the
+    /// `(child_id, amount)` roster is stamped on the event's
+    /// `split_children` field, so the whole split family is
+    /// re-derivable from the one event). The actor is `None` — the
+    /// split is dual-signed governance, not a single-actor call (like
+    /// `TakerRotated`).
+    ///
+    /// Each child's log opens with `Initialized` (seq 0 — the
+    /// per-escrow invariant), then `Activated` when the children
+    /// inherit dual-signature activation (the split is dual-signed by
+    /// construction, so both parties' activation is implied — actor
+    /// `None`, like the parent's split event), then `Funded`: the exact
+    /// lifecycle the inner state machine ran, replayed in `seq` order,
+    /// so every child's lifecycle is independently indexable under its
+    /// derived ID. `at` is both the event timestamp and the state
+    /// machine's `now` (so each child's AV-64 `fund_at` sees the same
+    /// clock the event log records).
+    ///
+    /// Atomicity mirrors the inner call: a failed split pushes no event
+    /// and returns no children — the parent stays `Funded` (the AV-36
+    /// `ReentryRejected` exception aside — see `map_reentrant`).
+    pub fn split_escrow(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        amounts: &[u64],
+        config: SplitConfig<'_>,
+        at: u64,
+    ) -> Result<Vec<IndexedEscrow>, EscrowError> {
+        let parent_id = self.escrow_id;
+        // AV-36: a rejected reentrant entry emits `ReentryRejected`
+        // (the deliberate exception to the no-events-on-failure rule).
+        // (The inner result is bound first so its `&mut` borrow ends
+        // before `map_reentrant` reborrows `self`.) `at` doubles as the
+        // inner `now`: each child's fund_at sees the same clock the
+        // event log records.
+        let result = self
+            .inner
+            .split_escrow(initializer, taker, amounts, config, at);
+        let children = self.map_reentrant(result, at)?;
+        // The inner call validated the table and built every child, so
+        // the roster below cannot overflow: `amounts.len() <=
+        // MAX_SPLIT_CHILDREN` was checked before any child existed, and
+        // the Σ child amounts equal the parent's pre-split remaining
+        // lockup (a `u64`), so the total cannot wrap either.
+        let mut roster =
+            [SplitChild { escrow_id: [0u8; 32], amount: 0 }; crate::MAX_SPLIT_CHILDREN];
+        let mut indexed_children = Vec::with_capacity(children.len());
+        let mut total: u64 = 0;
+        for (i, child) in children.into_iter().enumerate() {
+            let child_id = crate::derive_split_child_id(&parent_id, i as u64);
+            roster[i] = SplitChild {
+                escrow_id: child_id,
+                amount: child.amount(),
+            };
+            total += child.amount();
+            indexed_children.push(Self::wrap_split_child(child, child_id, at));
+        }
+        self.push_event(
+            EscrowEventKind::EscrowSplit,
+            EscrowState::Funded,
+            EscrowState::Split,
+            EventAmounts::split(total),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        // Stamp the roster after the push (the AV-77
+        // `template_params_hash` precedent): the event carries
+        // parent/children/amounts — the parent is the event's own
+        // `escrow_id`, the children ride here.
+        self.events
+            .last_mut()
+            .expect("EscrowSplit event just pushed")
+            .split_children = Some((roster, indexed_children.len() as u8));
+        Ok(indexed_children)
+    }
+
+    /// AV-81: wrap a freshly-split child escrow in its own event log.
+    /// Replays the exact lifecycle the inner state machine ran —
+    /// `Initialized` (seq 0, the per-escrow invariant), then
+    /// `Activated` when the child inherited dual-signature activation,
+    /// then `Funded` — in `seq` order, so the child's lifecycle is
+    /// independently indexable under its derived escrow ID.
+    fn wrap_split_child(inner: Escrow, escrow_id: [u8; 32], at: u64) -> Self {
+        let mut wrapped = Self {
+            inner,
+            escrow_id,
+            events: Vec::new(),
+            next_seq: 0,
+        };
+        // The child's `Initialized` names its initializer as the actor
+        // — like every other `Initialized` event — while the
+        // `Activated` / `Funded` legs carry no single actor: they are
+        // effects of the dual-signed parent split, not single-actor
+        // calls.
+        let initializer = wrapped.inner.initializer();
+        wrapped.push_event(
+            EscrowEventKind::Initialized,
+            EscrowState::Uninitialized,
+            EscrowState::Uninitialized,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(initializer),
+        );
+        let mut from = EscrowState::Uninitialized;
+        if wrapped.inner.dual_sig_required() {
+            wrapped.push_event(
+                EscrowEventKind::Activated,
+                from,
+                EscrowState::Activated,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            from = EscrowState::Activated;
+        }
+        wrapped.push_event(
+            EscrowEventKind::Funded,
+            from,
+            EscrowState::Funded,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        wrapped
+    }
+
     /// AV-79: record the [`EscrowEventKind::VaultsBatchClosed`] summary
     /// event on this escrow's log. Called by
     /// [`crate::close_indexed_vaults`] on the *first* vault the batch
@@ -2777,8 +3016,7 @@ impl IndexedEscrow {
     /// batch's timestamp and `actor` the initializer that ran it.
     /// Callers emit no summary when the batch closed nothing — the
     /// no-op rule lives in [`crate::close_indexed_vaults`], not here.
-    pub fn record_vaults_batch_closed(&mut self, total_rent: u64, at: u64, actor: [u8; 32]) {
-        self.push_event(
+    pub fn record_vaults_batch_closed(&mut self, total_rent: u64, at: u64, actor: [u8; 32]) {        self.push_event(
             EscrowEventKind::VaultsBatchClosed,
             EscrowState::Closed,
             EscrowState::Closed,
@@ -4434,7 +4672,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(41), None);
+        assert_eq!(EscrowEventKind::from_discriminant(42), None);
     }
 
     #[test]
@@ -4450,7 +4688,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(41), None);
+        assert_eq!(EscrowEventKind::from_discriminant(42), None);
     }
 
     #[test]
@@ -4916,5 +5154,143 @@ mod event_tests {
         assert_eq!(funded.kind, EscrowEventKind::Funded);
         assert_eq!(funded.template_params_hash, None);
         assert_eq!(e.events()[1].template_params_hash, committed);
+    }
+
+    #[test]
+    fn escrow_split_kind_round_trips() {
+        // AV-81: discriminant 41, appended after VaultsBatchClosed —
+        // 0–40 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::EscrowSplit;
+        assert_eq!(kind.discriminant(), 41);
+        assert_eq!(EscrowEventKind::from_discriminant(41), Some(kind));
+        assert_eq!(kind.name(), "escrow_split");
+        assert_eq!(EscrowEventKind::from_name("escrow_split"), Some(kind));
+        assert_eq!(EscrowEventKind::from_discriminant(42), None);
+    }
+
+    #[test]
+    fn split_escrow_emits_event_with_roster_and_child_logs() {
+        let mut e = funded(1_000_000);
+        let before = e.event_count();
+        let children = e
+            .split_escrow(ALICE, BOB, &[600_000, 400_000], SplitConfig::default(), T0 + 2)
+            .unwrap();
+        assert_eq!(children.len(), 2);
+        // The parent's EscrowSplit event: parent/children/amounts.
+        assert_eq!(e.event_count(), before + 1);
+        let ev = last(&e);
+        assert_eq!(ev.kind, EscrowEventKind::EscrowSplit);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Split));
+        assert_eq!(ev.escrow_id, ESCROW_ID, "the parent rides escrow_id");
+        assert_eq!(ev.amounts.payout, 1_000_000, "Σ children == pre-split remaining");
+        assert_eq!(ev.amounts.fee, 0);
+        assert_eq!(ev.amounts.refund, 0);
+        assert_eq!(ev.amounts.penalty, 0);
+        assert_eq!(ev.amounts.rent_reclaimed, 0);
+        let (roster, len) = ev.split_children.expect("roster stamped");
+        assert_eq!(len, 2);
+        for i in 0..2 {
+            let expected_id = crate::derive_split_child_id(&ESCROW_ID, i as u64);
+            assert_eq!(roster[i as usize].escrow_id, expected_id);
+            assert_eq!(children[i as usize].escrow_id(), expected_id);
+        }
+        assert_eq!(roster[0].amount, 600_000);
+        assert_eq!(roster[1].amount, 400_000);
+        // Every other event kind carries no roster.
+        assert!(e.events()[0].split_children.is_none());
+        // Each child's own log: Initialized (seq 0) then Funded, under
+        // the derived ID — independently indexable.
+        for (i, child) in children.iter().enumerate() {
+            let kinds: Vec<EscrowEventKind> =
+                child.events().iter().map(|ev| ev.kind).collect();
+            assert_eq!(
+                kinds,
+                vec![EscrowEventKind::Initialized, EscrowEventKind::Funded],
+                "child {i}"
+            );
+            assert_eq!(child.events()[0].seq, 0, "seq 0 is always Initialized");
+            assert_eq!(child.next_seq(), 2);
+            assert!(child.events().iter().all(|ev| ev.split_children.is_none()));
+            assert_eq!(child.inner().state(), EscrowState::Funded);
+            assert_eq!(child.inner().amount(), [600_000, 400_000][i]);
+        }
+        // The parent's on-chain history ring recorded the split too.
+        let history = e.event_history();
+        assert_eq!(
+            history.last().map(|h| h.kind),
+            Some(EscrowEventKind::EscrowSplit)
+        );
+    }
+
+    #[test]
+    fn split_escrow_dual_sig_children_log_activation() {
+        let mut e = funded(1_000_000);
+        let config = SplitConfig {
+            dual_sig: true,
+            ..SplitConfig::default()
+        };
+        let children = e
+            .split_escrow(ALICE, BOB, &[500_000, 500_000], config, T0 + 2)
+            .unwrap();
+        assert_eq!(children.len(), 2);
+        for child in &children {
+            let kinds: Vec<EscrowEventKind> =
+                child.events().iter().map(|ev| ev.kind).collect();
+            // The implied dual-signed activation is visible in the
+            // child's log: Uninitialized -> Activated -> Funded.
+            assert_eq!(
+                kinds,
+                vec![
+                    EscrowEventKind::Initialized,
+                    EscrowEventKind::Activated,
+                    EscrowEventKind::Funded
+                ]
+            );
+            let funded_ev = &child.events()[2];
+            assert_eq!(
+                (funded_ev.from, funded_ev.to),
+                (EscrowState::Activated, EscrowState::Funded)
+            );
+        }
+        // The parent's split event is unchanged in shape.
+        let ev = last(&e);
+        assert_eq!(ev.kind, EscrowEventKind::EscrowSplit);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Split));
+    }
+
+    #[test]
+    fn split_escrow_failed_call_emits_nothing() {
+        let mut e = funded(1_000_000);
+        let before = e.event_count();
+        let err = e
+            .split_escrow(ALICE, BOB, &[600_000], SplitConfig::default(), T0 + 2)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidSplit, "under-covering table");
+        assert_eq!(e.event_count(), before, "failed call emits nothing");
+        assert_eq!(e.inner().state(), EscrowState::Funded);
+        // Unauthorized is also silent.
+        let err = e
+            .split_escrow(MALLORY, BOB, &[1_000_000], SplitConfig::default(), T0 + 2)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(e.event_count(), before, "failed call emits nothing");
+    }
+
+    #[test]
+    fn split_escrow_event_survives_csv_projection_as_none() {
+        // The CSV projection does not carry the roster: the round-trip
+        // documents the None zero-value, like the other non-carried
+        // fields.
+        let mut e = funded(1_000_000);
+        e.split_escrow(ALICE, BOB, &[1_000_000], SplitConfig::default(), T0 + 2)
+            .unwrap();
+        let csv = crate::events_to_csv(e.events());
+        let back = crate::csv_to_events(&csv).unwrap();
+        let split = back
+            .iter()
+            .find(|ev| ev.kind == EscrowEventKind::EscrowSplit)
+            .expect("EscrowSplit round-trips by kind name");
+        assert_eq!(split.split_children, None);
+        assert_eq!(split.amounts.payout, 1_000_000);
     }
 }

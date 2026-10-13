@@ -579,11 +579,14 @@ fn scan_one(item: &BatchWatchItem, now: u64) -> BatchItemOutcome {
         EscrowState::Disputed => BatchItemOutcome::Blocked {
             reason: "disputed",
         },
-        // Terminal states: nothing to do.
+        // Terminal states: nothing to do. AV-81: a split parent's funds
+        // were re-homed into the child escrows — the parent's lifecycle
+        // is finished, so it is `Done`, not `Blocked`.
         EscrowState::Released
         | EscrowState::Cancelled
         | EscrowState::Settled
-        | EscrowState::Closed => BatchItemOutcome::Done,
+        | EscrowState::Closed
+        | EscrowState::Split => BatchItemOutcome::Done,
     }
 }
 

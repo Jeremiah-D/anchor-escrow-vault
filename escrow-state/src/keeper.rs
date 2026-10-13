@@ -793,12 +793,15 @@ pub fn scan_closeable(watched: &[WatchedEscrow]) -> CloseReport {    // AV-40: `
     let mut batches: Vec<CloseBatch> = Vec::new();
     for w in watched {
         let e = &w.escrow;
-        // Mirror AV-34's terminal-state gate exactly: only the three
-        // states `close_vault` accepts contribute an action.
+        // Mirror AV-34's terminal-state gate exactly: only the four
+        // states `close_vault` accepts contribute an action (Split since
+        // AV-81 — a split parent's funds were re-homed, so its vault
+        // carries nothing but the rent deposit).
         let reason = match e.state() {
             EscrowState::Cancelled => "cancelled",
             EscrowState::Released => "released",
             EscrowState::Settled => "settled",
+            EscrowState::Split => "split",
             _ => continue,
         };
         let caller = e.initializer();
@@ -1061,10 +1064,10 @@ pub fn scan_stale_vaults(watched: &[WatchedEscrowWithBalance]) -> StaleVaultRepo
     let mut batches: Vec<StaleVaultBatch> = Vec::new();
     for w in watched {
         let e = &w.escrow;
-        // Mirror AV-34's terminal-state gate exactly: only the three
-        // states `close_vault` accepts contribute an action. A paused
-        // vault fails `close_vault` with `Paused` (AV-46), so it is not
-        // executable and is skipped too.
+        // Mirror AV-34's terminal-state gate exactly: only the four
+        // states `close_vault` accepts contribute an action (Split since
+        // AV-81). A paused vault fails `close_vault` with `Paused`
+        // (AV-46), so it is not executable and is skipped too.
         if e.is_paused() {
             continue;
         }
@@ -1072,6 +1075,7 @@ pub fn scan_stale_vaults(watched: &[WatchedEscrowWithBalance]) -> StaleVaultRepo
             EscrowState::Cancelled => "cancelled",
             EscrowState::Released => "released",
             EscrowState::Settled => "settled",
+            EscrowState::Split => "split",
             _ => continue,
         };
         // Rent-only: the balance is exactly the canonical rent-exempt
@@ -1977,24 +1981,43 @@ mod close_keeper_tests {
         e
     }
 
+    fn split() -> Escrow {
+        // AV-81: a split parent — the funds were re-homed into the
+        // children, so the parent vault is closeable like the other
+        // terminals.
+        let mut e = funded(ALICE);
+        e.split_escrow(
+            ALICE,
+            BOB,
+            &[600_000, 400_000],
+            crate::SplitConfig::default(),
+            MID,
+        )
+        .unwrap();
+        assert_eq!(e.state(), EscrowState::Split);
+        e
+    }
+
     fn hex_of(byte: u8) -> String {
         format!("{:02x}", byte).repeat(32)
     }
 
     #[test]
-    fn terminal_states_cancelled_released_settled_are_all_listed() {
+    fn terminal_states_cancelled_released_settled_split_are_all_listed() {
         // AV-34's terminal states are exactly the ones `close_vault`
-        // accepts — each contributes one closeable action.
+        // accepts — each contributes one closeable action (Split since
+        // AV-81).
         let watched = [
             watch(ID1, cancelled()),
             watch(ID2, released()),
             watch(ID3, settled()),
+            watch([0x04; 32], split()),
         ];
         let report = scan_closeable(&watched);
-        assert_eq!(report.scanned, 3);
+        assert_eq!(report.scanned, 4);
         assert_eq!(report.batches.len(), 1, "one caller: one batch");
         let batch = &report.batches[0];
-        assert_eq!(batch.actions.len(), 3);
+        assert_eq!(batch.actions.len(), 4);
         // Input order preserved.
         assert_eq!(batch.actions[0].escrow_id, ID1);
         assert_eq!(batch.actions[0].reason, "cancelled");
@@ -2002,6 +2025,8 @@ mod close_keeper_tests {
         assert_eq!(batch.actions[1].reason, "released");
         assert_eq!(batch.actions[2].escrow_id, ID3);
         assert_eq!(batch.actions[2].reason, "settled");
+        assert_eq!(batch.actions[3].escrow_id, [0x04; 32]);
+        assert_eq!(batch.actions[3].reason, "split");
     }
 
     #[test]
@@ -3228,6 +3253,7 @@ fn rent_health_state_name(state: EscrowState) -> &'static str {
         EscrowState::Disputed => "disputed",
         EscrowState::Settled => "settled",
         EscrowState::Closed => "closed",
+        EscrowState::Split => "split",
     }
 }
 
@@ -3619,6 +3645,7 @@ mod stale_sweep_tests {
     const ID5: [u8; 32] = [0x05; 32];
     const ID6: [u8; 32] = [0x06; 32];
     const ID7: [u8; 32] = [0x07; 32];
+    const ID8: [u8; 32] = [0x08; 32];
     const PROGRAM_ID: [u8; 32] = [0x07; 32];
     const BLOCKHASH: [u8; 32] = [0xBB; 32];
     const NOW: u64 = 1_750_000_000;
@@ -3671,6 +3698,23 @@ mod stale_sweep_tests {
         e
     }
 
+    fn split(initializer: [u8; 32]) -> Escrow {
+        // AV-81: a split parent — the funds were re-homed into the
+        // children, so the parent vault carries nothing but the rent
+        // deposit: stale-sweep eligible like the other terminals.
+        let mut e = funded(initializer);
+        e.split_escrow(
+            initializer,
+            BOB,
+            &[600_000, 400_000],
+            crate::SplitConfig::default(),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(e.state(), EscrowState::Split);
+        e
+    }
+
     fn hex_of(byte: u8) -> String {
         format!("{:02x}", byte).repeat(32)
     }
@@ -3699,14 +3743,15 @@ mod stale_sweep_tests {
             watch(ID5, cancelled(ALICE, EXPIRED), r + 1), // user funds left: not rent-only
             watch(ID6, cancelled(ALICE, EXPIRED), r - 1), // underfunded: rent-health's job
             watch(ID7, released(CAROL), r),           // listed: other initializer
+            watch(ID8, split(ALICE), r),             // listed: split, rent-only (AV-81)
         ];
         let report = scan_stale_vaults(&watched);
-        assert_eq!(report.scanned, 7);
+        assert_eq!(report.scanned, 8);
         assert_eq!(report.batches.len(), 2, "two initializers: {report:?}");
         let alice = &report.batches[0];
         assert_eq!(alice.caller, ALICE);
-        assert_eq!(alice.actions.len(), 3);
-        assert_eq!(alice.total_reclaimed, 3 * r);
+        assert_eq!(alice.actions.len(), 4);
+        assert_eq!(alice.total_reclaimed, 4 * r);
         assert_eq!(alice.actions[0].escrow_id, ID1);
         assert_eq!(alice.actions[0].caller, ALICE);
         assert_eq!(alice.actions[0].caller_role, "initializer");
@@ -3716,6 +3761,8 @@ mod stale_sweep_tests {
         assert_eq!(alice.actions[0].reason, "cancelled");
         assert_eq!(alice.actions[1].reason, "released");
         assert_eq!(alice.actions[2].reason, "settled");
+        assert_eq!(alice.actions[3].reason, "split");
+        assert_eq!(alice.actions[3].escrow_id, ID8);
         let carol = &report.batches[1];
         assert_eq!(carol.caller, CAROL);
         assert_eq!(carol.actions.len(), 1);

@@ -70,12 +70,15 @@ const AMOUNT_BUCKETS: [(&str, u64, Option<u64>); 8] = [
 
 /// States in which an escrow's fund movement is finished: the duration
 /// from creation to the terminal event is a completed measurement.
+/// AV-81: a split parent's funds were re-homed into the child escrows —
+/// its own fund movement is finished, so `Split` counts as terminal.
 fn is_terminal(state: EscrowState) -> bool {
     matches!(
         state,
         EscrowState::Released
             | EscrowState::Cancelled
             | EscrowState::Settled
+            | EscrowState::Split
             | EscrowState::Closed
     )
 }
@@ -87,7 +90,7 @@ fn is_funded_open(state: EscrowState) -> bool {
 
 /// All lifecycle states in declaration order — the fixed row order of
 /// `state_counts`.
-const ALL_STATES: [EscrowState; 8] = [
+const ALL_STATES: [EscrowState; 9] = [
     EscrowState::Uninitialized,
     EscrowState::Funded,
     EscrowState::Released,
@@ -96,6 +99,7 @@ const ALL_STATES: [EscrowState; 8] = [
     EscrowState::Disputed,
     EscrowState::Settled,
     EscrowState::Closed,
+    EscrowState::Split,
 ];
 
 /// Read-only aggregate statistics over a fleet of watched escrows.
@@ -103,8 +107,8 @@ const ALL_STATES: [EscrowState; 8] = [
 pub struct EscrowAggregateView {
     /// Number of escrows scanned.
     pub escrow_count: usize,
-    /// Per-state counts, all eight states in declaration order.
-    pub state_counts: [StateCount; 8],
+    /// Per-state counts, all nine states in declaration order.
+    pub state_counts: [StateCount; 9],
     /// Amount histogram over escrow `amount` (gross locked at setup).
     pub amount_histogram: [AmountBucket; 8],
     /// Average completed escrow duration in seconds: first event to
@@ -337,7 +341,7 @@ mod aggregate_tests {
     fn state_counts_cover_all_states_in_order() {
         let view = EscrowAggregateView::from_watched(&[], 1_000_000);
         assert_eq!(view.escrow_count, 0);
-        assert_eq!(view.state_counts.len(), 8);
+        assert_eq!(view.state_counts.len(), 9);
         let names: Vec<&str> = view
             .state_counts
             .iter()
@@ -353,7 +357,8 @@ mod aggregate_tests {
                 "activated",
                 "disputed",
                 "settled",
-                "closed"
+                "closed",
+                "split"
             ]
         );
         assert!(view.state_counts.iter().all(|r| r.count == 0));
@@ -443,6 +448,38 @@ mod aggregate_tests {
             .find(|r| r.state == EscrowState::Disputed)
             .unwrap();
         assert_eq!(disputed.count, 1);
+    }
+
+    #[test]
+    fn split_parent_counts_as_terminal_with_completed_duration() {
+        // AV-81: a split parent is terminal — its fund movement is
+        // finished (re-homed into the children), so the creation ->
+        // EscrowSplit duration is a completed measurement.
+        let mut ix =
+            IndexedEscrow::initialize(key(1), key(2), 1_000_000, u64::MAX, [9; 32], 100)
+                .expect("initialize");
+        ix.fund(key(1), 200).expect("fund");
+        ix.split_escrow(
+            key(1),
+            key(2),
+            &[600_000, 400_000],
+            crate::SplitConfig::default(),
+            1100,
+        )
+        .expect("split");
+        let view = EscrowAggregateView::from_indexed(&[ix], 2_000);
+        assert_eq!(view.escrow_count, 1);
+        let split = view
+            .state_counts
+            .iter()
+            .find(|r| r.state == EscrowState::Split)
+            .unwrap();
+        assert_eq!(split.count, 1);
+        assert_eq!(view.completed_durations_sampled, 1);
+        assert_eq!(view.avg_completed_duration_secs, Some(1000));
+        assert_eq!(view.open_durations_sampled, 0);
+        // The parent's remainder is preserved for audit.
+        assert_eq!(view.total_locked, 1_000_000);
     }
 
     #[test]

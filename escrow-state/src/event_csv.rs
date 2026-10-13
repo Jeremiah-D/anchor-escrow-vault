@@ -203,6 +203,10 @@ pub fn csv_to_events(csv: &str) -> Result<Vec<EscrowEvent>, CsvError> {
             caller: None,
             reference: None,
             template_params_hash: None,
+            // AV-81: the split roster is not carried by the CSV
+            // projection — like the other non-carried fields it takes
+            // its documented zero-value on import.
+            split_children: None,
         });
     }
     Ok(events)

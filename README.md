@@ -122,8 +122,9 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_payout_allowlist(allowlist)` (AV-49) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–4 live payout-destination addresses; empty / over-long / zero-address input is `InvalidPayoutAllowlist`); the payout policy gates every fund-moving transition's `payout_to` |
 | `update_payout_allowlist(initializer, taker, allowlist)` (AV-49) | `Uninitialized` / `Funded` | same (no state change) | dual-signature governance — both initializer and taker on a dual-sig escrow, initializer alone on a plain escrow (`Unauthorized` otherwise); empty clears the allowlist (back to taker-only payouts); emits `PayoutAllowlistUpdated` only on an actual change |
 | `initialize_reference(reference)` (AV-53) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the 32-byte off-chain correlation id — order id / invoice hash; any 32 bytes accepted — read-only pass-through: never read by a check gate, never cleared, never affects amount conservation) |
-| `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it) |
-| `close_vaults(escrows, initializer, taker, filter)` (AV-79) | `Cancelled` / `Released` / `Settled` (per vault) | `Closed` (per closed vault) | **off-chain batch** — no new on-chain instruction (each close is one `close_vault` instruction the initializer submits; the Anchor skeleton is unchanged). Every vault must name the same initializer **and** taker (dual-party binding; a mismatch fails that item with `Unauthorized`); `CloseVaultsFilter` selects by state / `expires_at` cutoff / amount range (non-matching vaults are *skipped*, reported — not failed); per-vault failure isolation — one vault's rejection never aborts the batch, and a paused vault fails with `Paused` (AV-46, per-vault gate inherited from `close_vault`); the rent-exempt deposit is summed across the batch via `vault_close_rent_reclaimed()` (never hardcoded); the indexed variant emits one `VaultClosed` per closed vault plus a single `VaultsBatchClosed` summary on the first closed vault's log |
+| `split_escrow(initializer, taker, amounts, vesting, quorum, dual_sig, milestones)` (AV-81) | `Funded` | `Split` (new terminal state) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`; degenerate initializer == taker self-escrow authorizes with one key passed twice); `Disputed` is `InvalidStateTransition` (arbitration in flight adjudicates the locked funds) and every terminal state rejects a re-split; the amount table must be non-empty, hold at most 16 entries, contain no zero entry, and sum in `u128` to exactly the parent's remaining lockup (`InvalidSplit`, code 142, otherwise — a partial release before the split shrinks the splittable pool); each child is born `Funded` with the parent's initializer / taker / `expires_at` and the explicitly inherited config — vesting / quorum / dual-sig / per-child milestones are *not* inherited unless named (default-inert, anti-misconfiguration); child *i*'s escrow ID derives as `H(parent_id \|\| i)` (SHA-256, `u64` little-endian index); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in `Funded` — no half-split); emits `EscrowSplit` (`Funded -> Split`, `amounts.payout` = Σ child amounts, the `(child_id, amount)` roster rides the event) |
+| `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` / `Split` (AV-81) | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it); a split parent's funds were re-homed into the children, so its vault carries nothing but the rent deposit — closeable like the other terminals |
+| `close_vaults(escrows, initializer, taker, filter)` (AV-79) | `Cancelled` / `Released` / `Settled` / `Split` (per vault) | `Closed` (per closed vault) | **off-chain batch** — no new on-chain instruction (each close is one `close_vault` instruction the initializer submits; the Anchor skeleton is unchanged). Every vault must name the same initializer **and** taker (dual-party binding; a mismatch fails that item with `Unauthorized`); `CloseVaultsFilter` selects by state / `expires_at` cutoff / amount range (non-matching vaults are *skipped*, reported — not failed); per-vault failure isolation — one vault's rejection never aborts the batch, and a paused vault fails with `Paused` (AV-46, per-vault gate inherited from `close_vault`); the rent-exempt deposit is summed across the batch via `vault_close_rent_reclaimed()` (never hardcoded); the indexed variant emits one `VaultClosed` per closed vault plus a single `VaultsBatchClosed` summary on the first closed vault's log |
 | `release_and_close(authority, now, payout_to)` (AV-50) | `Funded` | `Closed` (via `Released`) | initializer; releases the **full remaining lockup** to the taker and closes the vault in the **same instruction** — one signature instead of two; the payout policy, quorum, timelock and mint gates all apply as on `release`; either leg failing aborts the whole instruction (state/counters/events roll back); emits `Released` then `VaultClosed` in that order; returns `(taker_payout, fee, rent_reclaimed)` |
 
 Rules: the initializer drives `fund`/`release`/`cancel`; any other caller
@@ -1076,6 +1077,7 @@ program error per variant):
 | `InvalidEvidenceDeadline` | 138 | `with_evidence_deadline` with a zero deadline — a zero-second deadline would lapse the moment the dispute starts |
 | `EvidenceDisclosureLate` | 139 | `submit_evidence` at or past the disclosure deadline without evidence on record — a missed deadline locks in the judgment-time adverse inference |
 | `InvalidSchemaMigration` | 140 | `migrate_schema` by a non-initializer, on a vault already at the current schema version (one-time), on a vault at an unknown future version (no skipping), or on a vault whose carried-over fields violate the conservation invariants — a corrupt vault is refused, never migrated |
+| `InvalidSplit` | 142 | `split_escrow` (AV-81) with an empty amount table, more than 16 children, a zero child amount, an amount table whose `u128` sum differs from the parent's remaining lockup, or a per-child milestone-plan list whose length mismatches the amount table |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1345,7 +1347,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -1398,9 +1400,17 @@ successful calls that change nothing observable:
   `from == to == Funded` and `amounts.refund` carrying the refunded
   tranche — the refund stream's mirror of a partial `Released` event.
 - `close_vault` emits `VaultClosed` with `from` the terminal state the
-  escrow was in (`Cancelled` / `Released` / `Settled`) and `to ==
-  Closed`; `amounts.rent_reclaimed` carries the reclaimed rent-exempt
-  deposit (AV-34), every other amount is zero.
+  escrow was in (`Cancelled` / `Released` / `Settled` / `Split` — AV-81)
+  and `to == Closed`; `amounts.rent_reclaimed` carries the reclaimed
+  rent-exempt deposit (AV-34), every other amount is zero.
+- `split_escrow` (AV-81) emits `EscrowSplit` on the parent's log
+  (`from == Funded`, `to == Split`; `amounts.payout` is the Σ child
+  amounts — the gross re-locked into the children — every other amount
+  zero; the `(child_id, amount)` roster rides the event's
+  `split_children` field, so the whole split family is re-derivable
+  from the one event). Each child gets its own log — `Initialized`,
+  then `Funded` (and `Activated` between them when the children inherit
+  dual-signature activation) — under its derived escrow ID.
 - `close_indexed_vaults` (AV-79) emits one `VaultClosed` per vault it
   actually closes (exactly the AV-34 emission), then a single
   `VaultsBatchClosed` summary on the first closed vault's log (`from ==
@@ -1523,7 +1533,7 @@ returns a `KeeperReport` of immediately executable calls:
 | `claim(taker, now, mint)` | `Funded`, vesting attached, no milestone plan, vested − released > 0, quorum satisfied if configured, timelock unlocked (`now >= unlock_at` (AV-27) / `now >= fund_at + secs` (AV-64)) | taker | gross vested-but-unreleased (`payout + fee == amount`) |
 | `resolve(arbiter, taker_amount, mint, rationale_hash)` (AV-38) | `Disputed`, arbiter configured, remainder > 0 | arbiter | remaining locked amount the arbiter's split divides (the split itself and the rationale-document commitment are the arbiter's call-time judgment) |
 | `submit_panel_judgment(member, taker_amount, mint, rationale_hash)` (AV-65) | `Disputed`, panel configured, remainder > 0 — one action **per panel member** | panel member (`caller_role: "panel_member"`) | remaining locked amount the member's voted split divides (the split and the rationale commitment are the member's call-time judgment; the panel settles itself once M votes agree) |
-| `close_vault(authority)` (AV-40) | `Cancelled` / `Released` / `Settled` — the terminal states AV-34's `close_vault` accepts. `Disputed` is never listed (the arbitration is still live; the vault account is the arbiter's audit surface) and `Closed` is never listed (the rent is already reclaimed) — the scan lists only calls the chain would accept | initializer (the only key `close_vault` accepts — AV-34 checks authority before state) | `rent_reclaimed`: the mainnet rent-exempt minimum for the current `VAULT_SPACE` (via `vault_close_rent_reclaimed()`, never a hardcoded figure) |
+| `close_vault(authority)` (AV-40) | `Cancelled` / `Released` / `Settled` / `Split` — the terminal states AV-34's `close_vault` accepts (`Split` since AV-81). `Disputed` is never listed (the arbitration is still live; the vault account is the arbiter's audit surface) and `Closed` is never listed (the rent is already reclaimed) — the scan lists only calls the chain would accept | initializer (the only key `close_vault` accepts — AV-34 checks authority before state) | `rent_reclaimed`: the mainnet rent-exempt minimum for the current `VAULT_SPACE` (via `vault_close_rent_reclaimed()`, never a hardcoded figure) |
 
 Only *executable* calls are listed: a vesting claim behind an unsatisfied
 quorum is withheld (the call would fail), a claim behind a locked timelock
@@ -1592,7 +1602,7 @@ the per-escrow snapshots.
 
 ## Close sweep (AV-40)
 
-Terminal-state vaults (`Cancelled` / `Released` / `Settled`) have
+Terminal-state vaults (`Cancelled` / `Released` / `Settled` / `Split` — AV-81) have
 served their purpose, but their rent-exempt deposits stay locked until
 the vault account is closed — stranding them forever if nobody sweeps.
 `scan_closeable(watched)` is the second keeper scan: it walks the same
@@ -1639,7 +1649,7 @@ execution only; no new on-chain instruction.
 
 `scan_closeable` plans *every* terminal close; `scan_stale_vaults`
 finds the vaults nobody bothered to sweep: terminal-state vaults
-(`Cancelled` / `Released` / `Settled` — AV-34's exact close gate, paused
+(`Cancelled` / `Released` / `Settled` / `Split` — AV-34's exact close gate, paused
 vaults excluded) whose measured on-chain balance is *exactly* the
 rent-exempt minimum — the account has served its purpose and carries
 nothing but the rent deposit. `Disputed` (audit surface, the chain

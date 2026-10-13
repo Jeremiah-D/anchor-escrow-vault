@@ -200,6 +200,7 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         "u64" => IdlType::U64,
         "u8" => IdlType::U8,
         "u16" => IdlType::U16,
+        "bool" => IdlType::Bool,
         "Pubkey" => IdlType::PublicKey,
         "String" => IdlType::Str,
         "Vec<Pubkey>" => IdlType::Vec(Box::new(IdlType::PublicKey)),
@@ -211,6 +212,18 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         // AV-68: the dispute-evidence disclosure commitment
         // (non-optional — disclosure always carries a hash).
         "[u8; 32]" => IdlType::Array(ArrayElem::U8, 32),
+        // AV-81: the split_escrow instruction's explicit-inheritance
+        // params — optional configs, so `Option<...>`; the per-child
+        // milestone plans are one optional plan list.
+        "Option<VestingSchedule>" => {
+            IdlType::Option(Box::new(IdlType::Named("VestingSchedule")))
+        }
+        "Option<QuorumPolicy>" => {
+            IdlType::Option(Box::new(IdlType::Named("QuorumPolicy")))
+        }
+        "Option<Vec<MilestonePlan>>" => IdlType::Option(Box::new(IdlType::Vec(Box::new(
+            IdlType::Named("MilestonePlan"),
+        )))),
         other => panic!("idl_json: unmapped instruction arg type string: {other}"),
     }
 }
@@ -766,7 +779,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 42, "error variant count drift");
+    assert_eq!(errors.len(), 43, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -792,6 +805,10 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::EvidenceDisclosureLate.code(), 139);
     // AV-75: appended, never renumbered.
     assert_eq!(EscrowError::InvalidSchemaMigration.code(), 140);
+    // AV-77: appended, never renumbered.
+    assert_eq!(EscrowError::TemplateOverrideRejected.code(), 141);
+    // AV-81: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidSplit.code(), 142);
 }
 
 #[test]

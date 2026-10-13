@@ -161,7 +161,9 @@ pub use cpi_call::{cpi_accounts_hash, CpiInvocation, CpiReceipt};
 // AV-18: typed indexer events — an event-logging adapter over `Escrow`
 // plus the `EscrowEvent` / `EscrowEventKind` / `EventAmounts` record
 // types. Purely additive: no existing signature changed.
-pub use events::{CpiRouteAudit, EscrowEvent, EscrowEventKind, EventAmounts, IndexedEscrow};
+pub use events::{
+    CpiRouteAudit, EscrowEvent, EscrowEventKind, EventAmounts, IndexedEscrow, SplitChild,
+};
 
 // AV-20: off-chain keeper report — scan a batch of escrows for executable
 // `cancel_expired` / `claim` calls and serialize the call list as JSON.
@@ -324,13 +326,23 @@ pub enum EscrowState {
     /// AV-34: the vault account was closed and its rent-exempt deposit
     /// reclaimed by the initializer (via [`Escrow::close_vault`).
     /// Reachable only from the terminal states (`Cancelled`,
-    /// `Released`, `Settled`) — never from `Disputed`, where the
-    /// arbitration is still live. The deepest terminal: no transition
+    /// `Released`, `Settled`, and — since AV-81 — `Split`) — never from
+    /// `Disputed`, where the arbitration is still live. The deepest terminal: no transition
     /// leaves `Closed`, and every existing transition's state match
     /// rejects it with `InvalidStateTransition`. Appended last, so the
     /// existing Borsh discriminants (0–6) stay stable for
     /// already-serialized vaults.
     Closed,
+    /// AV-81: the escrow was split into child escrows by dual-signed
+    /// governance (via [`Escrow::split_escrow`]). The parent's remaining
+    /// locked funds were re-homed — one fresh `Funded` child escrow per
+    /// entry of the explicit amount table — so no fund-moving transition
+    /// leaves `Split`: it is terminal, like `Released` / `Cancelled` /
+    /// `Settled`. Only [`Escrow::close_vault`] (AV-34) retires the vault
+    /// account itself into [`EscrowState::Closed`] to reclaim the
+    /// rent-exempt deposit. Appended last, so the existing Borsh
+    /// discriminants (0–7) stay stable for already-serialized vaults.
+    Split,
 }
 
 /// An escrow vault. Public keys are `[u8; 32]` so this crate stays
@@ -1183,6 +1195,16 @@ pub enum EscrowError {
     /// audited shape is never silently widened: the caller fixes the
     /// override list instead.
     TemplateOverrideRejected,
+    /// Invalid escrow split (AV-81): [`Escrow::split_escrow`] with an
+    /// empty amount table, more than [`MAX_SPLIT_CHILDREN`] children, a
+    /// zero child amount, an amount table whose `u128` sum differs from
+    /// the parent's [`Escrow::remaining_amount`], or a per-child
+    /// milestone-plan list whose length mismatches the amount table. A
+    /// per-child plan whose tranches do not sum to its child's amount
+    /// surfaces as [`EscrowError::InvalidMilestones`] instead — the
+    /// builder's own validation, reused. Parallels
+    /// [`EscrowError::InvalidMilestones`] (config error).
+    InvalidSplit,
 }
 
 impl EscrowError {
@@ -1237,6 +1259,7 @@ impl EscrowError {
             EscrowError::EvidenceDisclosureLate => 139,
             EscrowError::InvalidSchemaMigration => 140,
             EscrowError::TemplateOverrideRejected => 141,
+            EscrowError::InvalidSplit => 142,
         }
     }
 
@@ -1285,6 +1308,7 @@ impl EscrowError {
             EscrowError::EvidenceDisclosureLate,
             EscrowError::InvalidSchemaMigration,
             EscrowError::TemplateOverrideRejected,
+            EscrowError::InvalidSplit,
         ]
     }
 }
@@ -2094,6 +2118,15 @@ impl VestingSchedule {
 /// bloating the vault account (the plan reserves 65 bytes).
 pub const MAX_MILESTONES: usize = 8;
 
+/// Maximum children one [`Escrow::split_escrow`] call may create
+/// (AV-81). Sixteen is the batching ceiling for one dual-signed
+/// governance decision: fanning out further belongs in a second split
+/// of one of the children — whose IDs derive deterministically via
+/// [`derive_split_child_id`], so the family tree stays auditable.
+/// Fixed-size so the [`EscrowEvent`](crate::EscrowEvent) split roster
+/// stays `Copy`.
+pub const MAX_SPLIT_CHILDREN: usize = 16;
+
 /// Bit offsets inside [`Escrow::milestone_flags`]: six bits per milestone
 /// (48 bits for [`MAX_MILESTONES`] milestones fit in a `u64`). Bit
 /// `index * 6 + offset`:
@@ -2242,6 +2275,75 @@ pub fn parse_mint_address(s: &str) -> Result<[u8; 32], EscrowError> {
         }
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// AV-81: dual-signed escrow split — configuration inheritance and child
+// identity derivation.
+// ---------------------------------------------------------------------------
+
+/// Per-child governance inheritance for [`Escrow::split_escrow`]
+/// (AV-81): which of the parent's release-gating configurations the
+/// caller explicitly opts into copying onto every child escrow.
+///
+/// Default-inert by design — every field's zero value means "do not
+/// inherit". A split never silently copies the parent's milestone
+/// plan, vesting curve, quorum, or dual-signature activation onto
+/// children whose amounts and payout schedules differ; the caller
+/// names each inherited config explicitly. (A parent milestone plan
+/// could not be copied verbatim anyway: its tranches sum to the
+/// parent's lockup, never to a child's — the child's own builder
+/// validation would reject it.)
+///
+/// [`SplitConfig::default()`] (all `None` / `false`) is the plain
+/// split: children are born as plain two-party escrows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SplitConfig<'a> {
+    /// Linear vesting schedule copied onto every child
+    /// ([`Escrow::with_vesting`]). Amount-agnostic — [`VestingSchedule`]
+    /// measures time, not tokens — so one schedule fits every child.
+    /// `None` (default): children carry no vesting; the taker cannot
+    /// `claim` on them.
+    pub vesting: Option<VestingSchedule>,
+    /// Weighted attestor quorum copied onto every child
+    /// ([`Escrow::with_quorum`]). `None` (default): plain two-party
+    /// children, no attestor gate on their releases.
+    pub quorum: Option<QuorumPolicy>,
+    /// When `true`, every child is a dual-signature escrow
+    /// ([`Escrow::with_dual_sig`]): both parties' activation is
+    /// recorded as part of the split itself — the split is dual-signed
+    /// by construction, so the activation both parties would otherwise
+    /// supply in a separate round-trip is implied. `false` (default):
+    /// plain children that fund without activation.
+    pub dual_sig: bool,
+    /// Per-child milestone plans, in amount-table order
+    /// ([`Escrow::with_milestones`]). `None` (default): no milestone
+    /// plans. `Some` must hold exactly one plan per child amount — a
+    /// length mismatch is [`EscrowError::InvalidSplit`] — and each
+    /// plan's tranches must sum to its child's amount
+    /// ([`EscrowError::InvalidMilestones`] otherwise, from the
+    /// builder's own validation).
+    pub milestones: Option<&'a [MilestonePlan]>,
+}
+
+/// Derive a split child's escrow identity (AV-81): `H(parent_id ||
+/// index)`, the index as little-endian `u64`.
+///
+/// Deterministic and collision-free: the 32-byte parent identity
+/// prefixes every derivation and the 8-byte index suffix separates
+/// siblings — two children of one split can never collide, and
+/// children of different parents can never collide either. Indexers
+/// re-derive every child ID from the parent's
+/// [`EscrowEventKind::EscrowSplit`](crate::EscrowEventKind::EscrowSplit)
+/// event, which carries the parent ID (the event's `escrow_id`) and
+/// the child count (the roster length). Uses the crate's hand-rolled
+/// SHA-256 ([`sha256`]), the same primitive as the Anchor
+/// discriminator constructors.
+pub fn derive_split_child_id(parent_id: &[u8; 32], index: u64) -> [u8; 32] {
+    let mut preimage = [0u8; 40];
+    preimage[..32].copy_from_slice(parent_id);
+    preimage[32..].copy_from_slice(&index.to_le_bytes());
+    sha256(&preimage)
 }
 
 impl Escrow {
@@ -5863,7 +5965,8 @@ impl Escrow {
     }
 
     /// Close the vault account and reclaim the rent-exempt deposit:
-    /// `Cancelled | Released | Settled -> Closed` (AV-34). Only the
+    /// `Cancelled | Released | Settled | Split -> Closed` (AV-34;
+    /// `Split` since AV-81). Only the
     /// initializer may call this — [`EscrowError::Unauthorized`]
     /// otherwise, checked before state validity (so strangers learn
     /// nothing about state, mirroring every other transition), then the
@@ -5878,6 +5981,12 @@ impl Escrow {
     /// Closing from `Disputed` is deliberately rejected: the
     /// arbitration is still live, and the vault account is the audit
     /// surface the arbiter works from.
+    ///
+    /// AV-81: a split parent (`Split`) is closeable like the other
+    /// terminals — the split re-homed the locked funds into the child
+    /// escrows, so the parent vault carries nothing but the rent
+    /// deposit, and without a close path that deposit would be stranded
+    /// forever.
     ///
     /// `Closed` is the deepest terminal: no transition leaves it —
     /// every existing transition's state match rejects it with
@@ -5901,7 +6010,10 @@ impl Escrow {
         self.require_not_reentrant()?;
         self.require_initializer(authority)?;
         match self.state {
-            EscrowState::Cancelled | EscrowState::Released | EscrowState::Settled => {}
+            EscrowState::Cancelled
+            | EscrowState::Released
+            | EscrowState::Settled
+            | EscrowState::Split => {}
             _ => return Err(EscrowError::InvalidStateTransition),
         }
         self.state = EscrowState::Closed;
@@ -5993,6 +6105,161 @@ impl Escrow {
                 Err(e)
             }
         }
+    }
+
+    /// Split a funded escrow into N child escrows by dual-signed
+    /// governance (AV-81 — Solana/支付分期结算): the initializer and
+    /// the taker jointly re-home the parent's remaining locked funds —
+    /// one fresh `Funded` child escrow per entry of the explicit amount
+    /// table — and the parent moves `Funded -> Split`, a new terminal
+    /// state.
+    ///
+    /// Why: a single lockup often needs to fan out — an invoice paid in
+    /// tranches to different contractors, a payroll stream split across
+    /// wallets, a milestone payout divided by cost center. A split
+    /// re-homes the lockup without releasing it: every child is born
+    /// `Funded` under the same parties and deadline, and each child
+    /// then runs the full release lifecycle independently.
+    ///
+    /// Conservation: the amount table must sum — accumulated in `u128`,
+    /// so the sum can never wrap — to exactly the parent's
+    /// [`Escrow::remaining_amount`]. A partial release before the split
+    /// shrinks the splittable pool; the split divides what is left:
+    /// Σ(children) + `released` == `amount` always. The parent's
+    /// `amount` / `released` counters are preserved untouched as the
+    /// audit trail of what the lockup was.
+    ///
+    /// Child identity: child `i`'s escrow ID is
+    /// [`derive_split_child_id`]`(parent_id, i)` — `H(parent_id ||
+    /// index)` — so siblings can never collide and indexers re-derive
+    /// the whole family from the parent's `EscrowSplit` event.
+    ///
+    /// Config inheritance is explicit-only ([`SplitConfig`]): milestone
+    /// plans, vesting, quorum, and dual-signature activation are *not*
+    /// inherited unless the caller names them — the default is plain
+    /// two-party children (anti-misconfiguration). Identity fields
+    /// always carry over: initializer, taker, and `expires_at` — the
+    /// deal deadline does not move with the split.
+    ///
+    /// Check order is pause → reentrancy → authority → state → amounts,
+    /// matching [`Escrow::close_vault`]:
+    /// 1. a paused escrow fails fast ([`EscrowError::Paused`] — AV-46);
+    /// 2. a reentrant entry fails ([`EscrowError::ReentrantCall`] —
+    ///    AV-36: the split re-homes locked funds, so the reentrancy
+    ///    guard applies like any fund-moving transition);
+    /// 3. the initializer AND the taker must both authorize — one party
+    ///    alone (or a stranger pair) is [`EscrowError::Unauthorized`].
+    ///    Independent `==` checks (not `||`): the degenerate
+    ///    initializer == taker self-escrow authorizes with one key
+    ///    passed twice, like AV-12's activation;
+    /// 4. the escrow must be `Funded`
+    ///    ([`EscrowError::InvalidStateTransition`] otherwise) —
+    ///    `Disputed` is rejected: arbitration in flight adjudicates the
+    ///    locked funds, so neither party may re-home them mid-dispute
+    ///    (paralleling `rotate_taker`'s dispute exclusion); every
+    ///    terminal state is rejected too — a split parent cannot be
+    ///    split again;
+    /// 5. the amount table is validated
+    ///    ([`EscrowError::InvalidSplit`]): non-empty, at most
+    ///    [`MAX_SPLIT_CHILDREN`] entries, no zero entry, and the `u128`
+    ///    sum equals [`Escrow::remaining_amount`]; a per-child
+    ///    milestone-plan list must name exactly one plan per child.
+    ///
+    /// Atomicity: every gate and every child construction runs before
+    /// the parent's state flips — a failed child build (e.g. a
+    /// per-child milestone plan whose tranches do not sum to the
+    /// child's amount, [`EscrowError::InvalidMilestones`] from the
+    /// builder's own validation) leaves the parent untouched in
+    /// `Funded`: no half-split parent, no orphan children.
+    ///
+    /// Returns the child escrows in amount-table order, each already
+    /// `Funded`. (See
+    /// [`IndexedEscrow::split_escrow`](crate::IndexedEscrow::split_escrow)
+    /// for the event-logged variant, which derives the child IDs and
+    /// emits [`EscrowEventKind::EscrowSplit`](crate::EscrowEventKind::EscrowSplit).)
+    pub fn split_escrow(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        amounts: &[u64],
+        config: SplitConfig<'_>,
+        now: u64,
+    ) -> Result<Vec<Escrow>, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // AV-36: the split re-homes locked funds — a fund-moving
+        // transition, so the reentrancy guard applies.
+        self.require_not_reentrant()?;
+        // Dual-signature governance: the initializer AND the taker must
+        // both authorize — one party alone (or a stranger pair) is
+        // Unauthorized. Independent `==` checks: the degenerate
+        // initializer == taker self-escrow authorizes with one key
+        // passed twice, like AV-12's activation.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Amount-table validation before any construction: the table
+        // must name the whole remaining lockup — nothing more, nothing
+        // less, nothing zero.
+        if amounts.is_empty() || amounts.len() > MAX_SPLIT_CHILDREN {
+            return Err(EscrowError::InvalidSplit);
+        }
+        let remaining = self.remaining_amount();
+        let mut total: u128 = 0;
+        for &a in amounts {
+            if a == 0 {
+                return Err(EscrowError::InvalidSplit);
+            }
+            total += a as u128;
+        }
+        if total != remaining as u128 {
+            return Err(EscrowError::InvalidSplit);
+        }
+        if let Some(plans) = config.milestones {
+            if plans.len() != amounts.len() {
+                return Err(EscrowError::InvalidSplit);
+            }
+        }
+        // Build every child before flipping the parent: a failed child
+        // build leaves the parent untouched in `Funded` — no half-split
+        // parent, no orphan children.
+        let mut children = Vec::with_capacity(amounts.len());
+        for (i, &amount) in amounts.iter().enumerate() {
+            let mut child =
+                Escrow::initialize(self.initializer, self.taker, amount, self.expires_at)?;
+            if let Some(schedule) = config.vesting {
+                child = child.with_vesting(schedule)?;
+            }
+            if let Some(policy) = config.quorum {
+                child = child.with_quorum(policy)?;
+            }
+            if let Some(plans) = config.milestones {
+                // The builder re-validates: the plan's tranches must sum
+                // to this child's amount (InvalidMilestones otherwise) —
+                // a parent plan can never be copied verbatim.
+                child = child.with_milestones(plans[i])?;
+            }
+            if config.dual_sig {
+                // The split is dual-signed by construction, so both
+                // parties' activation is recorded as part of the split —
+                // no separate activation round-trip. The degenerate
+                // self-escrow activates with one call (both bits at
+                // once); the second call would be InvalidStateTransition.
+                child = child.with_dual_sig()?;
+                child.activate(self.initializer)?;
+                if self.taker != self.initializer {
+                    child.activate(self.taker)?;
+                }
+            }
+            child.fund(self.initializer, now)?;
+            children.push(child);
+        }
+        self.state = EscrowState::Split;
+        Ok(children)
     }
 
     /// Attach a milestone tranche plan (AV-15). Builder-style: only valid
@@ -7926,8 +8193,9 @@ mod tests {
 
     // ---------- AV-34: terminal-state vault close with rent reclamation ----------
 
-    /// A terminal escrow in each of the three closeable states.
-    fn terminal_escrows() -> [(EscrowState, Escrow); 3] {
+    /// A terminal escrow in each of the four closeable states
+    /// (Split since AV-81).
+    fn terminal_escrows() -> [(EscrowState, Escrow); 4] {
         const ARBITER: [u8; 32] = [0xA8; 32];
         // Cancelled: unilateral refund path.
         let mut cancelled = funded_escrow();
@@ -7943,10 +8211,19 @@ mod tests {
         settled.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         settled.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
         settled.resolve(ARBITER, 0, None, None, BOB).unwrap();
+        // Split (AV-81): dual-signed split path — the parent's funds
+        // were re-homed into children; the parent vault carries nothing
+        // but the rent deposit, so it is closeable like the other
+        // terminals.
+        let mut split = funded_escrow();
+        split
+            .split_escrow(ALICE, BOB, &[600_000, 400_000], SplitConfig::default(), EXPIRES_AT)
+            .unwrap();
         [
             (EscrowState::Cancelled, cancelled),
             (EscrowState::Released, released),
             (EscrowState::Settled, settled),
+            (EscrowState::Split, split),
         ]
     }
 
@@ -8273,7 +8550,7 @@ mod permission_tests {
     const ZERO_KEY: [u8; 32] = [0x00; 32];
     const EXPIRES_AT: u64 = 1_800_000_000;
 
-    const ALL_STATES: [EscrowState; 8] = [
+    const ALL_STATES: [EscrowState; 9] = [
         EscrowState::Uninitialized,
         EscrowState::Activated,
         EscrowState::Funded,
@@ -8284,6 +8561,9 @@ mod permission_tests {
         // AV-34: the closed vault is the deepest terminal — every
         // transition must fail from here.
         EscrowState::Closed,
+        // AV-81: the split parent is terminal — every fund-moving
+        // transition must fail from here (only close_vault retires it).
+        EscrowState::Split,
     ];
 
     /// Arbiter key used to build the disputed / settled states.
@@ -8330,6 +8610,13 @@ mod permission_tests {
                 e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
                 e.cancel(ALICE, None, ALICE).unwrap();
                 e.close_vault(ALICE).unwrap();
+            }
+            EscrowState::Split => {
+                // AV-81: the parent was split into two children by
+                // dual-signed governance — terminal, funds re-homed.
+                e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+                e.split_escrow(ALICE, BOB, &[600_000, 400_000], SplitConfig::default(), EXPIRES_AT)
+                    .unwrap();
             }
         }
         assert_eq!(e.state(), state);
@@ -10000,7 +10287,7 @@ pub(crate) mod anchor_idl_tests {
             params: &[],
             method: "Escrow::close_vault",
             input_mapping: "authority <- accounts.initializer (signer); \\
-                            Cancelled | Released | Settled -> Closed — the \\
+                            Cancelled | Released | Settled | Split -> Closed (Split since AV-81) — the \\
                             state machine checks authority first \\
                             (Unauthorized otherwise, before state \\
                             validity), then the terminal-state gate \\
@@ -10822,6 +11109,41 @@ pub(crate) mod anchor_idl_tests {
             method: "Escrow::migrate_schema",
             input_mapping: "no params; authority <- accounts.initializer (signer) - initializer only (a stranger or the taker is Unauthorized, checked before state validity); a paused escrow fails fast (Paused); only schema_version + 1 == SCHEMA_VERSION steps (an already-current vault refuses the second call, and an unknown future version refuses loudly instead of skipping forward - InvalidSchemaMigration, code 140, either way); the carried-over fields are re-validated before the stamp (released <= amount, released + skipped <= amount in u128, fees_paid <= released, and the milestone tranche sum == amount when a plan is present - a corrupt vault is refused, never migrated, InvalidSchemaMigration); the stamp moves schema_version to SCHEMA_VERSION and nothing else changes (no layout / rent change beyond the AV-75 trailing byte); always emits the SchemaMigrated indexer event on success (from == to == the current state)",
         },
+        InstructionSpec {
+            // AV-81: dual-signed funded-escrow split into N child escrows.
+            // IDL: sha256("global:split_escrow")[..8] — the Anchor
+            // instruction discriminator for the split_escrow handler.
+            name: "split_escrow",
+            params: &[
+                (
+                    "amounts",
+                    "Vec<u64>",
+                    "instruction param; the explicit per-child amount table - non-empty, at most 16 entries (MAX_SPLIT_CHILDREN), no zero entry, and the u128 sum must equal the parent's remaining_amount (a partial release before the split shrinks the splittable pool); InvalidSplit, code 142, otherwise",
+                ),
+                (
+                    "vesting",
+                    "Option<VestingSchedule>",
+                    "instruction param; explicit opt-in vesting inheritance for every child (None = not inherited - the default)",
+                ),
+                (
+                    "quorum",
+                    "Option<QuorumPolicy>",
+                    "instruction param; explicit opt-in quorum inheritance for every child (None = not inherited - the default)",
+                ),
+                (
+                    "dual_sig",
+                    "bool",
+                    "instruction param; explicit opt-in dual-signature activation for every child (false = plain children - the default)",
+                ),
+                (
+                    "milestones",
+                    "Option<Vec<MilestonePlan>>",
+                    "instruction param; explicit opt-in per-child milestone plans - exactly one plan per amount-table entry (InvalidSplit otherwise), each plan's tranches summing to its child's amount (InvalidMilestones otherwise); None = not inherited - the default",
+                ),
+            ],
+            method: "Escrow::split_escrow",
+            input_mapping: "initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) - both current parties must authorize (dual-signature governance: one party alone or a stranger pair is Unauthorized, checked before state validity; degenerate initializer == taker self-escrow authorizes with one key passed twice); Funded only (InvalidStateTransition otherwise - Disputed rejects the split while arbitration is in flight, terminal states reject a re-split); a paused escrow fails fast (Paused); the parent moves Funded -> Split (terminal - only close_vault retires it to Closed for the rent reclaim); each child is born Funded with the parent's initializer / taker / expires_at and the explicitly inherited config (vesting / quorum / dual_sig / per-child milestones - default: not inherited); child i's escrow identity derives as H(parent_id || i) (u64 little-endian index, SHA-256); now <- clock sysvar (NOT an instruction param - anchors each child's fund_at, the origin the AV-64 relative timelock measures from); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in Funded - no half-split); emits the EscrowSplit indexer event (from == Funded, to == Split, amounts.payout = the u128-exact child sum, the (child_id, amount) roster rides the event)",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -10936,6 +11258,8 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::update_panel_threshold",
             // AV-75: one-step schema migration by initializer governance.
             "Escrow::migrate_schema",
+            // AV-81: dual-signed funded-escrow split into N child escrows.
+            "Escrow::split_escrow",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -10959,7 +11283,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_forty_five_instructions_take_params() {
+    fn only_forty_six_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -11017,6 +11341,7 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_evidence_deadline",
                 &"submit_evidence",
                 &"update_panel_threshold",
+                &"split_escrow",
             ]
         );
     }
@@ -12509,6 +12834,18 @@ pub(crate) mod anchor_idl_tests {
         // transaction and authorizes nothing persistent — the `Released`
         // event's CPI audit (not the vault) is where it is recorded.
         ("release_via_cpi", "cpi_data"),
+        // AV-81: the split params birth *child* vaults — each entry
+        // persists as a field of a new child vault account (`amount`,
+        // `vesting`, `quorum`, the activation bit, `milestones`), never
+        // as a field of the parent vault. The parent's own fields are
+        // untouched by the split (only its state byte moves), so the
+        // params are transient with respect to the parent vault this
+        // table pins.
+        ("split_escrow", "amounts"),
+        ("split_escrow", "vesting"),
+        ("split_escrow", "quorum"),
+        ("split_escrow", "dual_sig"),
+        ("split_escrow", "milestones"),
     ];
     const PARAM_FIELD_MAP: &[(&str, &str, &str)] = &[
         ("initialize", "amount", "amount"),
@@ -13270,6 +13607,11 @@ mod error_code_tests {
             EscrowError::TemplateOverrideRejected,
             141,
             "apply_template with an override naming a field the preset did not declare overridable (unknown name, or a field declared by a different preset's review), a value of the wrong OverrideValue type for the named field, or the same field twice",
+        ),
+        (
+            EscrowError::InvalidSplit,
+            142,
+            "split_escrow with an empty amount table, more than MAX_SPLIT_CHILDREN children, a zero child amount, an amount table whose u128 sum differs from the parent's remaining_amount, or a per-child milestone-plan list whose length mismatches the amount table",
         ),
     ];
 
@@ -15159,6 +15501,9 @@ mod account_space_tests {
         // AV-34: appended after Settled so discriminants 0–6 stay
         // stable for already-serialized vaults.
         assert_eq!(EscrowState::Closed as u8, 7);
+        // AV-81: appended after Closed so discriminants 0–7 stay
+        // stable for already-serialized vaults.
+        assert_eq!(EscrowState::Split as u8, 8);
     }
 
     #[test]
@@ -24948,7 +25293,12 @@ mod event_history_tests {
             40,
             "AV-79: appended after TemplateApplied"
         );
-        for d in 0..=40u8 {
+        assert_eq!(
+            EscrowEventKind::EscrowSplit.discriminant(),
+            41,
+            "AV-81: appended after VaultsBatchClosed"
+        );
+        for d in 0..=41u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -24959,7 +25309,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(41), None);
+        assert_eq!(EscrowEventKind::from_discriminant(42), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -25084,9 +25434,9 @@ mod event_history_tests {
         // `SubscriptionAmountsAdjusted` (AV-73), 37 is
         // `SchemaMigrated` (AV-75), 38 is
         // `BundlePartiallyExecuted` (AV-76), 39 is `TemplateApplied`
-        // (AV-77), 40 is `VaultsBatchClosed` (AV-79); 41 is the first
-        // still-unknown byte.
-        for bad in [41u8, 42, 255] {
+        // (AV-77), 40 is `VaultsBatchClosed` (AV-79), 41 is
+        // `EscrowSplit` (AV-81); 42 is the first still-unknown byte.
+        for bad in [42u8, 43, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -26843,6 +27193,8 @@ mod arbiter_panel_tests {
         assert_eq!(EscrowError::InvalidSchemaMigration.code(), 140);
         // AV-77: appended, never renumbered.
         assert_eq!(EscrowError::TemplateOverrideRejected.code(), 141);
+        // AV-81: appended, never renumbered.
+        assert_eq!(EscrowError::InvalidSplit.code(), 142);
         // never-renumber: the full table still pins every code, and
         // `all()` covers the new variants (the AV-46 lesson: a missing
         // variant drifts the IDL error pin).
@@ -26852,7 +27204,8 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::EvidenceDisclosureLate));
         assert!(EscrowError::all().contains(&EscrowError::InvalidSchemaMigration));
         assert!(EscrowError::all().contains(&EscrowError::TemplateOverrideRejected));
-        assert_eq!(EscrowError::all().len(), 42);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidSplit));
+        assert_eq!(EscrowError::all().len(), 43);
     }
 
     #[test]
@@ -27425,5 +27778,397 @@ mod arbiter_panel_tests {
             .collect();
         assert!(names.contains(&&"initialize_arbiter_panel"));
         assert!(names.contains(&&"submit_panel_judgment"));
+    }
+}
+
+// ---------- AV-81: dual-signed escrow split ----------
+//
+// `split_escrow` re-homes a funded escrow's remaining lockup into N
+// fresh `Funded` child escrows by dual-signed governance, moving the
+// parent `Funded -> Split` (terminal).
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+    use crate::account_space_tests::encode_escrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const A1: [u8; 32] = [0xA1; 32];
+    const A2: [u8; 32] = [0xA2; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+
+    fn funded_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn split_moves_funded_escrow_to_split_and_births_funded_children() {
+        let mut e = funded_escrow();
+        let children = e
+            .split_escrow(
+                ALICE,
+                BOB,
+                &[600_000, 400_000],
+                SplitConfig::default(),
+                EXPIRES_AT,
+            )
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Split);
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].amount(), 600_000);
+        assert_eq!(children[1].amount(), 400_000);
+        for c in &children {
+            assert_eq!(c.state(), EscrowState::Funded);
+            assert_eq!(c.initializer(), ALICE);
+            assert_eq!(c.taker(), BOB);
+            assert_eq!(c.expires_at(), EXPIRES_AT, "the deal deadline does not move");
+            assert_eq!(c.released_amount(), 0, "children are born whole");
+            assert_eq!(c.remaining_amount(), c.amount());
+        }
+        // Conservation, pinned: Σ(children) == pre-split remaining, and
+        // the parent's audit counters are preserved untouched.
+        let total: u64 = children.iter().map(|c| c.amount()).sum();
+        assert_eq!(total, 1_000_000);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn split_after_partial_release_divides_the_remaining() {
+        let mut e = funded_escrow();
+        e.release(ALICE, EXPIRES_AT, 200_000, None, BOB).unwrap();
+        assert_eq!(e.remaining_amount(), 800_000);
+        let children = e
+            .split_escrow(
+                ALICE,
+                BOB,
+                &[500_000, 300_000],
+                SplitConfig::default(),
+                EXPIRES_AT,
+            )
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Split);
+        // The pinned conservation invariant: Σ(children) + released ==
+        // amount — the split divides what is left, never the original.
+        let total: u128 = children.iter().map(|c| c.amount() as u128).sum();
+        assert_eq!(total, 800_000);
+        assert_eq!(total + e.released_amount() as u128, e.amount() as u128);
+    }
+
+    #[test]
+    fn split_rejects_single_party_and_strangers() {
+        // One party alone, or a stranger pair, is Unauthorized — and the
+        // parent stays Funded.
+        for (init, taker) in [
+            (MALLORY, MALLORY),
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (BOB, BOB),
+        ] {
+            let mut e = funded_escrow();
+            assert_eq!(
+                e.split_escrow(init, taker, &[1_000_000], SplitConfig::default(), EXPIRES_AT),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+            assert_eq!(e.state(), EscrowState::Funded, "state must be unchanged");
+        }
+    }
+
+    #[test]
+    fn split_rejects_disputed_and_terminal_states() {
+        // Disputed: arbitration in flight adjudicates the locked funds.
+        let mut disputed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        disputed.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        assert_eq!(
+            disputed.split_escrow(ALICE, BOB, &[1_000_000], SplitConfig::default(), EXPIRES_AT),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(disputed.state(), EscrowState::Disputed);
+        // Terminal states: a split parent cannot be split again, and
+        // settled / released / cancelled / closed vaults have no live
+        // lockup to divide.
+        for state in [
+            EscrowState::Released,
+            EscrowState::Cancelled,
+            EscrowState::Settled,
+            EscrowState::Closed,
+        ] {
+            let mut e = funded_escrow();
+            match state {
+                EscrowState::Released => {
+                    e.release(ALICE, EXPIRES_AT, 1_000_000, None, BOB).unwrap();
+                }
+                EscrowState::Cancelled => e.cancel(ALICE, None, ALICE).unwrap(),
+                EscrowState::Settled => {
+                    let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                        .unwrap()
+                        .with_arbiter(ARBITER)
+                        .unwrap();
+                    d.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+                    d.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+                    d.resolve(ARBITER, 0, None, None, BOB).unwrap();
+                    e = d;
+                }
+                _ => {
+                    e.cancel(ALICE, None, ALICE).unwrap();
+                    e.close_vault(ALICE).unwrap();
+                }
+            }
+            assert_eq!(e.state(), state);
+            assert_eq!(
+                e.split_escrow(ALICE, BOB, &[e.remaining_amount()], SplitConfig::default(), EXPIRES_AT),
+                Err(EscrowError::InvalidStateTransition),
+                "from {state:?}"
+            );
+        }
+        // A split parent cannot be split again.
+        let mut e = funded_escrow();
+        e.split_escrow(ALICE, BOB, &[1_000_000], SplitConfig::default(), EXPIRES_AT)
+            .unwrap();
+        assert_eq!(
+            e.split_escrow(ALICE, BOB, &[1_000_000], SplitConfig::default(), EXPIRES_AT),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn split_rejects_bad_amount_tables() {
+        // Empty table.
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.split_escrow(ALICE, BOB, &[], SplitConfig::default(), EXPIRES_AT),
+            Err(EscrowError::InvalidSplit)
+        );
+        // Zero entry.
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.split_escrow(ALICE, BOB, &[0, 1_000_000], SplitConfig::default(), EXPIRES_AT),
+            Err(EscrowError::InvalidSplit)
+        );
+        // Under-covering the remaining lockup.
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.split_escrow(ALICE, BOB, &[600_000, 300_000], SplitConfig::default(), EXPIRES_AT),
+            Err(EscrowError::InvalidSplit)
+        );
+        // Over-covering the remaining lockup.
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.split_escrow(ALICE, BOB, &[600_000, 500_000], SplitConfig::default(), EXPIRES_AT),
+            Err(EscrowError::InvalidSplit)
+        );
+        // More children than the batching ceiling.
+        let mut e = funded_escrow();
+        let too_many = [62_500u64; MAX_SPLIT_CHILDREN + 1];
+        assert_eq!(
+            e.split_escrow(ALICE, BOB, &too_many, SplitConfig::default(), EXPIRES_AT),
+            Err(EscrowError::InvalidSplit)
+        );
+        // A failed split never moves the parent.
+        assert_eq!(e.state(), EscrowState::Funded);
+        // The ceiling itself is usable: 16 children covering the lockup.
+        let mut e = funded_escrow();
+        let maxed = [62_500u64; MAX_SPLIT_CHILDREN];
+        let children = e
+            .split_escrow(ALICE, BOB, &maxed, SplitConfig::default(), EXPIRES_AT)
+            .unwrap();
+        assert_eq!(children.len(), MAX_SPLIT_CHILDREN);
+        assert_eq!(e.state(), EscrowState::Split);
+        // The degenerate single-child split is valid: Σ == remaining.
+        let mut e = funded_escrow();
+        let children = e
+            .split_escrow(ALICE, BOB, &[1_000_000], SplitConfig::default(), EXPIRES_AT)
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(e.state(), EscrowState::Split);
+    }
+
+    #[test]
+    fn invalid_split_error_code_is_142() {
+        let mut e = funded_escrow();
+        let err = e
+            .split_escrow(ALICE, BOB, &[1], SplitConfig::default(), EXPIRES_AT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidSplit);
+        assert_eq!(err.code(), 142);
+    }
+
+    #[test]
+    fn split_child_ids_derive_deterministically() {
+        let parent = [0x11; 32];
+        let a = derive_split_child_id(&parent, 0);
+        let b = derive_split_child_id(&parent, 0);
+        assert_eq!(a, b, "derivation is deterministic");
+        // The exact preimage: H(parent_id || index_le).
+        let mut preimage = [0u8; 40];
+        preimage[..32].copy_from_slice(&parent);
+        preimage[32..].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(a, sha256(&preimage), "preimage pinned byte-exact");
+        // Siblings never collide; different parents never collide.
+        assert_ne!(a, derive_split_child_id(&parent, 1));
+        assert_ne!(a, derive_split_child_id(&[0x22; 32], 0));
+        assert_ne!(
+            derive_split_child_id(&parent, 1),
+            derive_split_child_id(&parent, 2)
+        );
+    }
+
+    #[test]
+    fn split_default_config_inherits_nothing() {
+        // A fully-configured parent, split with the default (inert)
+        // config: children are born plain — no silent inheritance.
+        let policy = QuorumPolicy::new(&[A1, A2], &[1, 1], 2).unwrap();
+        let schedule = VestingSchedule::new(T0, T0 + 1_000).unwrap();
+        let plan = MilestonePlan::new(&[600_000, 400_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let children = e
+            .split_escrow(ALICE, BOB, &[600_000, 400_000], SplitConfig::default(), EXPIRES_AT)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Split);
+        for c in &children {
+            assert_eq!(c.state(), EscrowState::Funded);
+            assert_eq!(c.quorum(), None, "quorum not inherited by default");
+            assert_eq!(c.vesting_schedule(), None, "vesting not inherited by default");
+            assert_eq!(c.milestone_plan(), None, "milestones not inherited by default");
+            assert!(!c.dual_sig_required(), "dual_sig not inherited by default");
+        }
+    }
+
+    #[test]
+    fn split_explicit_config_inherits_onto_every_child() {
+        let policy = QuorumPolicy::new(&[A1, A2], &[1, 1], 2).unwrap();
+        let schedule = VestingSchedule::new(T0, T0 + 1_000).unwrap();
+        // Per-child plans, each summing to its child's amount — a
+        // parent-sized plan could never be copied verbatim.
+        let plan0 = MilestonePlan::new(&[400_000, 200_000]).unwrap();
+        let plan1 = MilestonePlan::new(&[400_000]).unwrap();
+        let plans = [plan0, plan1];
+        let config = SplitConfig {
+            vesting: Some(schedule),
+            quorum: Some(policy),
+            dual_sig: true,
+            milestones: Some(&plans),
+        };
+        let mut e = funded_escrow();
+        let children = e
+            .split_escrow(ALICE, BOB, &[600_000, 400_000], config, EXPIRES_AT)
+            .unwrap();
+        assert_eq!(children.len(), 2);
+        for c in &children {
+            assert_eq!(c.vesting_schedule(), Some(schedule));
+            assert_eq!(c.quorum(), Some(policy));
+            assert!(c.dual_sig_required());
+            assert!(c.initializer_activated() && c.taker_activated());
+            assert_eq!(c.state(), EscrowState::Funded);
+        }
+        assert_eq!(children[0].milestone_plan(), Some(plan0));
+        assert_eq!(children[1].milestone_plan(), Some(plan1));
+    }
+
+    #[test]
+    fn split_rejects_milestone_plan_length_mismatch() {
+        let plan = MilestonePlan::new(&[600_000, 400_000]).unwrap();
+        let plans = [plan];
+        let config = SplitConfig {
+            milestones: Some(&plans),
+            ..SplitConfig::default()
+        };
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.split_escrow(ALICE, BOB, &[600_000, 400_000], config, EXPIRES_AT),
+            Err(EscrowError::InvalidSplit),
+            "one plan for two children"
+        );
+        assert_eq!(e.state(), EscrowState::Funded, "parent untouched");
+    }
+
+    #[test]
+    fn split_child_milestone_plan_must_sum_to_child_amount() {
+        // A parent-sized plan on a 600k child: the builder's own
+        // validation rejects it (InvalidMilestones), and the parent is
+        // left untouched — no half-split.
+        let plan = MilestonePlan::new(&[600_000, 400_000]).unwrap();
+        let plans = [plan, plan];
+        let config = SplitConfig {
+            milestones: Some(&plans),
+            ..SplitConfig::default()
+        };
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.split_escrow(ALICE, BOB, &[600_000, 400_000], config, EXPIRES_AT),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(
+            e.state(),
+            EscrowState::Funded,
+            "failed child build must not half-split the parent"
+        );
+    }
+
+    #[test]
+    fn split_self_escrow_authorizes_with_one_key() {
+        // Degenerate initializer == taker: one key passed twice, like
+        // AV-12's activation.
+        let mut e = Escrow::initialize(ALICE, ALICE, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let children = e
+            .split_escrow(ALICE, ALICE, &[500_000, 500_000], SplitConfig::default(), EXPIRES_AT)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Split);
+        assert_eq!(children.len(), 2);
+    }
+
+    #[test]
+    fn split_rejects_paused_escrow() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.pause(ALICE).unwrap();
+        assert_eq!(
+            e.split_escrow(ALICE, BOB, &[1_000_000], SplitConfig::default(), EXPIRES_AT),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn split_adds_no_fields_and_keeps_space() {
+        // AV-81 touches no persisted field: the state byte simply
+        // carries discriminant 8. Re-asserted here so this feature
+        // cannot silently grow the account (every byte of VAULT_SPACE
+        // is rent the initializer paid for).
+        let mut e = funded_escrow();
+        e.split_escrow(ALICE, BOB, &[1_000_000], SplitConfig::default(), EXPIRES_AT)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Split);
+        assert_eq!(EscrowState::Split as u8, 8, "Split appended last");
+        assert_eq!(VAULT_SPACE, 3454, "full Vault account space");
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
 }
