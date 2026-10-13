@@ -912,6 +912,35 @@ pub struct Escrow {
     /// serialization. Appended last so every earlier field offset
     /// stays stable.
     multisig_authority: Option<MultisigAuthority>,
+    /// AV-86: opt-in slash-appeal window in seconds (see
+    /// [`Escrow::with_appeal_window`]): after [`Escrow::slash`]
+    /// executes, the taker may [`Escrow::file_appeal`] within this many
+    /// seconds of the slash. `0` (the default) means no appeal window
+    /// is configured — a slash is then final, backward compatible.
+    /// Set once via [`Escrow::with_appeal_window`] on an
+    /// `Uninitialized` escrow. Persisted (8 bytes, zeroed when no
+    /// window is configured). Appended last so every earlier field
+    /// offset stays stable.
+    appeal_window_secs: u64,
+    /// AV-86: the Unix timestamp at which the appeal window closes —
+    /// computed by [`Escrow::slash`] as `slash_now + appeal_window_secs`
+    /// (a [`EscrowError::InvalidAppealWindow`] when the addition would
+    /// overflow). `0` when no slash was executed under a configured
+    /// window. Persisted (8 bytes). Appended last so every earlier
+    /// field offset stays stable.
+    appeal_deadline: u64,
+    /// AV-86: the slash appeal's lifecycle state (see [`AppealState`]):
+    /// `None` until the taker files, then `Filed` while the arbiter
+    /// panel reviews, terminally `Upheld` or `Overturned`. Persisted
+    /// (1-byte discriminant, zeroed = `None`). Appended last so every
+    /// earlier field offset stays stable.
+    appeal_state: AppealState,
+    /// AV-86: the arbiter panel's running ballot on the filed appeal
+    /// (see [`AppealBallot`]): one vote slot per panel member, tallied
+    /// by [`Escrow::review_appeal`]. Persisted (1-byte voter bitmask +
+    /// 8 vote bytes, zeroed when no appeal is filed). Appended last so
+    /// every earlier field offset stays stable.
+    appeal_ballot: AppealBallot,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -1310,6 +1339,20 @@ pub enum EscrowError {
     /// program owns the vote) — it is read-only metadata for keepers
     /// and indexers.
     InvalidMultisigAuthority,
+    /// Invalid slash-appeal window (AV-86):
+    /// [`Escrow::with_appeal_window`] with a zero window (a zero-second
+    /// window would lapse the instant the slash lands, giving the taker
+    /// no chance to appeal — parallels
+    /// [`EscrowError::InvalidEvidenceDeadline`]'s zero-deadline
+    /// rejection); [`Escrow::slash`] when the configured window would
+    /// overflow the appeal deadline (`slash_at + window_secs` must fit
+    /// in a `u64`); or [`Escrow::file_appeal`] with no slash executed
+    /// yet, no appeal window configured, an already-filed or
+    /// already-resolved appeal (one appeal per slash — a repeat filing
+    /// is rejected), or after the window lapsed. Parallels
+    /// [`EscrowError::SlashNotEligible`] (the appeal's own eligibility
+    /// family, so the one new code (146) stays honest).
+    InvalidAppealWindow,
 }
 
 impl EscrowError {
@@ -1368,6 +1411,7 @@ impl EscrowError {
             EscrowError::SlashNotEligible => 143,
             EscrowError::InvalidCpiAllowlist => 144,
             EscrowError::InvalidMultisigAuthority => 145,
+            EscrowError::InvalidAppealWindow => 146,
         }
     }
 
@@ -1420,6 +1464,7 @@ impl EscrowError {
             EscrowError::SlashNotEligible,
             EscrowError::InvalidCpiAllowlist,
             EscrowError::InvalidMultisigAuthority,
+            EscrowError::InvalidAppealWindow,
         ]
     }
 }
@@ -1643,6 +1688,118 @@ pub struct SlashTerms {
     /// this timestamp; afterwards the default is deemed to have
     /// occurred.
     pub slash_deadline: u64,
+}
+
+/// Lifecycle of a slash appeal (AV-86 — Solana payment fintech /
+/// taker-default due process): after [`Escrow::slash`] executes, the
+/// taker may appeal the penalty inside the opt-in window
+/// ([`Escrow::with_appeal_window`]), and the configured arbiter panel
+/// reviews it. Serialized as a single `u8` discriminant in the vault
+/// account (0–3, in declaration order — never reordered, paralleling
+/// [`EscrowState`]).
+///
+/// - `None` — no appeal filed (the default; also the state when no
+///   slash ever happened or no window was configured).
+/// - `Filed` — the taker filed inside the window; the panel's review
+///   votes are being collected ([`Escrow::review_appeal`]).
+/// - `Upheld` — the panel reached threshold for uphold: the penalty
+///   stands, terminal.
+/// - `Overturned` — the panel reached threshold for overturn: the
+///   penalty was refunded to the taker, terminal.
+///
+/// One appeal per slash — a `Filed`/`Upheld`/`Overturned` escrow
+/// rejects a second [`Escrow::file_appeal`] with
+/// [`EscrowError::InvalidAppealWindow`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppealState {
+    /// No appeal filed.
+    #[default]
+    None,
+    /// Filed by the taker inside the window; under panel review.
+    Filed,
+    /// Panel upheld the slash; the penalty stands.
+    Upheld,
+    /// Panel overturned the slash; the penalty was refunded to the
+    /// taker.
+    Overturned,
+}
+
+/// The panel's verdict on a slash appeal (AV-86): the outcome the
+/// M-th matching [`Escrow::review_appeal`] vote settles on. Carried by
+/// the [`EscrowEventKind::AppealResolved`](crate::EscrowEventKind::AppealResolved)
+/// event so indexers read the verdict without replaying the votes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppealOutcome {
+    /// The slash stands — the penalty stays with the penalty account.
+    Upheld,
+    /// The slash is reversed — the penalty is refunded to the taker.
+    Overturned,
+}
+
+/// A panel member's vote on the slash appeal (AV-86): `0` = no vote
+/// recorded, [`APPEAL_VOTE_UPHOLD`] = uphold the slash,
+/// [`APPEAL_VOTE_OVERTURN`] = overturn it. A `u8` (not a bool) so the
+/// "not voted" state is representable in the fixed ballot region —
+/// the AV-65 panel's `voted` bitmask precedent.
+pub const APPEAL_VOTE_UPHOLD: u8 = 1;
+/// A panel member's overturn vote on the slash appeal (AV-86); see
+/// [`APPEAL_VOTE_UPHOLD`].
+pub const APPEAL_VOTE_OVERTURN: u8 = 2;
+
+/// Serialized length of [`AppealBallot`]: the 1-byte voter bitmask
+/// plus the 8 fixed vote slots (one `u8` per panel member, in slot
+/// order — the AV-65 8-member ceiling).
+pub const APPEAL_BALLOT_LEN: usize = 1 + 8;
+
+/// Serialized length of the whole AV-86 slash-appeal region in
+/// `VAULT_FIELDS`: the u64 window, the u64 deadline, the u8 appeal
+/// state and the [`APPEAL_BALLOT_LEN`]-byte ballot.
+pub const APPEAL_REGION_LEN: usize = 8 + 8 + 1 + APPEAL_BALLOT_LEN;
+
+/// The arbiter panel's running ballot on a filed slash appeal (AV-86):
+/// one vote per panel member, tallied by
+/// [`Escrow::review_appeal`]. Fixed-size so the vault layout stays
+/// static — the region is always reserved (zeroed when no appeal is
+/// filed), paralleling the AV-65 panel's own vote storage.
+///
+/// `Copy` so keeper/indexer tooling can lift the ballot off a
+/// snapshot without borrowing the escrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppealBallot {
+    /// Bitmask of panel members who have voted — bit `i` set once
+    /// member `i` submitted a review vote (re-votes keep the bit set,
+    /// paralleling [`ArbiterPanel`]'s `voted` mask; 8 members fit in
+    /// the `u8`).
+    pub voted: u8,
+    /// The current effective vote per member, in slot order; only
+    /// `votes[..n]` are meaningful, and only slots in the `voted`
+    /// mask carry a real vote ([`APPEAL_VOTE_UPHOLD`] /
+    /// [`APPEAL_VOTE_OVERTURN`]).
+    pub votes: [u8; 8],
+}
+
+impl AppealBallot {
+    /// The empty ballot: no votes recorded.
+    pub fn empty() -> Self {
+        Self {
+            voted: 0,
+            votes: [0u8; 8],
+        }
+    }
+
+    /// How many members' *current effective* votes equal `vote`.
+    /// Only members in the `voted` mask are tallied — a zeroed slot
+    /// never matches, so an unset vote can never manufacture a
+    /// threshold (the AV-65 `matching_votes` precedent).
+    fn matching_votes(&self, vote: u8, n: u8) -> usize {
+        let mut count = 0;
+        for i in 0..n as usize {
+            if self.voted & (1 << i) != 0 && self.votes[i] == vote {
+                count += 1;
+            }
+        }
+        count
+    }
 }
 
 /// Serialized length of [`DefaultJudgment`]: two u64s (the arbitration
@@ -2668,6 +2825,10 @@ impl MigrationPlan {
 /// - `0 → 1` (AV-75): the trailing `schema_version` byte itself.
 /// - `1 → 2` (AV-82): the 49-byte slash region — `slash_terms`
 ///   (1-byte discriminant + 40-byte terms) and `penalty_paid` (u64).
+/// - `2 → 3` (AV-86): the 26-byte slash-appeal region —
+///   `appeal_window_secs` (u64), `appeal_deadline` (u64),
+///   `appeal_state` (u8 discriminant) and `appeal_ballot` (1-byte
+///   voter bitmask + 8 vote bytes, see `APPEAL_BALLOT_LEN`).
 const SCHEMA_STEP_DELTAS: &[(u8, &[SchemaFieldDelta])] = &[
     (
         0,
@@ -2692,6 +2853,31 @@ const SCHEMA_STEP_DELTAS: &[(u8, &[SchemaFieldDelta])] = &[
             },
         ],
     ),
+    (
+        2,
+        &[
+            SchemaFieldDelta {
+                name: "appeal_window_secs",
+                ty: "u64",
+                bytes: 8,
+            },
+            SchemaFieldDelta {
+                name: "appeal_deadline",
+                ty: "u64",
+                bytes: 8,
+            },
+            SchemaFieldDelta {
+                name: "appeal_state",
+                ty: "u8 (enum discriminant)",
+                bytes: 1,
+            },
+            SchemaFieldDelta {
+                name: "appeal_ballot",
+                ty: "AppealBallot",
+                bytes: APPEAL_BALLOT_LEN as u64,
+            },
+        ],
+    ),
 ];
 
 impl Escrow {
@@ -2706,7 +2892,10 @@ impl Escrow {
     /// - `1`: AV-75 layout (`schema_version` appended last).
     /// - `2`: AV-82 layout (`slash_terms` / `penalty_paid` appended
     ///   after `schema_version`; a v1 account is a byte-prefix of v2).
-    pub const SCHEMA_VERSION: u8 = 2;
+    /// - `3`: AV-86 layout (`appeal_window_secs` / `appeal_deadline` /
+    ///   `appeal_state` / `appeal_ballot` appended after
+    ///   `multisig_authority`; a v2 account is a byte-prefix of v3).
+    pub const SCHEMA_VERSION: u8 = 3;
 
     /// Construct a new escrow in the `Uninitialized` state.
     ///
@@ -2873,6 +3062,14 @@ impl Escrow {
             // compatible) — parties are plain keys until bound. Opt in
             // via `with_multisig_authority` before funding.
             multisig_authority: None,
+            // AV-86: no slash-appeal window by default (backward
+            // compatible) — a slash is final unless the parties opt in
+            // via `with_appeal_window` before funding; the deadline,
+            // appeal state and ballot start zeroed.
+            appeal_window_secs: 0,
+            appeal_deadline: 0,
+            appeal_state: AppealState::None,
+            appeal_ballot: AppealBallot::empty(),
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -4080,6 +4277,23 @@ impl Escrow {
         if amount > slashable {
             return Err(EscrowError::SlashNotEligible);
         }
+        // AV-86: when the parties opted into an appeal window, the
+        // slash starts the taker's clock — the deadline is stamped now,
+        // from the same `now` the eligibility gate used, so the window
+        // cannot be stretched by skewing the two. The addition must fit
+        // in a `u64` ([`EscrowError::InvalidAppealWindow`] otherwise —
+        // a window that overflows against a real timestamp is a
+        // misconfiguration, and the slash is refused rather than
+        // silently granting an unbounded appeal). Computed BEFORE any
+        // state mutation so a refused slash changes nothing.
+        let appeal_deadline = if self.appeal_window_secs > 0 {
+            Some(
+                now.checked_add(self.appeal_window_secs)
+                    .ok_or(EscrowError::InvalidAppealWindow)?,
+            )
+        } else {
+            None
+        };
         // `amount <= slashable <= amount`, so this cannot overflow;
         // `checked_add` anyway — a wrapping counter would break the
         // conservation invariant the same way it would for `released`.
@@ -4087,7 +4301,301 @@ impl Escrow {
             .penalty_paid
             .checked_add(amount)
             .ok_or(EscrowError::SlashNotEligible)?;
+        if let Some(deadline) = appeal_deadline {
+            self.appeal_deadline = deadline;
+        }
         Ok(amount)
+    }
+
+    /// Opt in to the slash-appeal window (AV-86 — Solana payment
+    /// fintech / taker-default due process): after [`Escrow::slash`]
+    /// executes, the taker may [`Escrow::file_appeal`] within
+    /// `window_secs` seconds of the slash, and the configured arbiter
+    /// panel reviews the appeal ([`Escrow::review_appeal`]).
+    ///
+    /// Why: a slash is a unilateral penalty — the initializer (or the
+    /// arbiter as neutral enforcer) moves funds on a claimed default,
+    /// and the taker may genuinely have performed (late delivery, an
+    /// off-chain dispute about the deadline, a misconfigured
+    /// `slash_deadline`). Without an appeal path, the taker's only
+    /// recourse is a full dispute escalation after the fact. The window
+    /// is the pre-agreed due-process backstop: short enough that the
+    /// penalty is still meaningful leverage, long enough for the taker
+    /// to contest a wrongful slash before the panel.
+    ///
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// window is fixed before any funds move — mirroring
+    /// [`Escrow::with_slash_terms`]. A zero window is
+    /// [`EscrowError::InvalidAppealWindow`] (a zero-second window would
+    /// lapse the instant the slash lands, giving the taker no chance to
+    /// appeal — parallels `with_evidence_deadline`'s zero-deadline
+    /// rejection). Configuring after funding is
+    /// [`EscrowError::InvalidStateTransition`]. A paused escrow fails
+    /// fast ([`EscrowError::Paused`]).
+    ///
+    /// The window alone does not enable review: the appeal is decided
+    /// by the opt-in arbiter panel ([`Escrow::with_arbiter_panel`]) —
+    /// [`Escrow::file_appeal`] requires a configured panel
+    /// ([`EscrowError::InvalidArbiterPanel`] otherwise), so a filed
+    /// appeal is always resolvable.
+    pub fn with_appeal_window(mut self, window_secs: u64) -> Result<Self, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast, even
+        // for pre-fund configuration.
+        self.require_not_paused()?;
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if window_secs == 0 {
+            return Err(EscrowError::InvalidAppealWindow);
+        }
+        self.appeal_window_secs = window_secs;
+        Ok(self)
+    }
+
+    /// The opt-in slash-appeal window in seconds (AV-86), or `0` when
+    /// no window was configured via [`Escrow::with_appeal_window`].
+    pub fn appeal_window_secs(&self) -> u64 {
+        self.appeal_window_secs
+    }
+
+    /// The Unix timestamp at which the taker's appeal window closes
+    /// (AV-86): stamped by [`Escrow::slash`] as `slash_now +
+    /// appeal_window_secs`. `0` when no slash was executed under a
+    /// configured window.
+    pub fn appeal_deadline(&self) -> u64 {
+        self.appeal_deadline
+    }
+
+    /// The slash appeal's lifecycle state (AV-86): `None` until the
+    /// taker files, `Filed` while the arbiter panel reviews, terminally
+    /// `Upheld` or `Overturned`.
+    pub fn appeal_state(&self) -> AppealState {
+        self.appeal_state
+    }
+
+    /// The arbiter panel's running ballot on the filed appeal (AV-86):
+    /// the voter bitmask and each member's current effective vote.
+    pub fn appeal_ballot(&self) -> AppealBallot {
+        self.appeal_ballot
+    }
+
+    /// Whether [`Escrow::file_appeal`] could succeed right now: a slash
+    /// was executed (`penalty_paid > 0`), an appeal window is
+    /// configured, no appeal was filed or resolved yet, the window is
+    /// still open at `now`, the escrow is `Funded`, not paused, and an
+    /// arbiter panel is configured to review it. Pure read — the keeper
+    /// scan lists exactly the escrows this returns `true` for, so a
+    /// listed appeal filing is always executable; the state machine
+    /// re-checks every gate on the call itself.
+    pub fn is_appeal_eligible(&self, now: u64) -> bool {
+        if !matches!(self.state, EscrowState::Funded) {
+            return false;
+        }
+        if self.is_paused() {
+            return false;
+        }
+        if self.penalty_paid == 0 {
+            return false;
+        }
+        if self.appeal_window_secs == 0 {
+            return false;
+        }
+        if !matches!(self.appeal_state, AppealState::None) {
+            return false;
+        }
+        if now > self.appeal_deadline {
+            return false;
+        }
+        self.arbiter_panel.is_some()
+    }
+
+    /// Whether a slash appeal is currently under panel review (AV-86):
+    /// filed by the taker and not yet resolved. The keeper scan lists
+    /// one `review_appeal` action per panel member who has not voted
+    /// yet on exactly these escrows.
+    pub fn is_appeal_under_review(&self) -> bool {
+        matches!(self.state, EscrowState::Funded)
+            && !self.is_paused()
+            && matches!(self.appeal_state, AppealState::Filed)
+            && self.arbiter_panel.is_some()
+    }
+
+    /// File an appeal against the executed slash (AV-86): the taker
+    /// contests the penalty inside the opt-in window, opening the
+    /// arbiter panel's review. `Funded -> Funded` — filing moves no
+    /// funds, it only records the challenge; the panel's
+    /// [`Escrow::review_appeal`] votes then decide it.
+    ///
+    /// Authorization (checked first — a stranger learns nothing about
+    /// the slash): the caller must be the taker
+    /// ([`EscrowError::Unauthorized`] otherwise).
+    ///
+    /// Then configuration ([`EscrowError::InvalidArbiterPanel`]): an
+    /// arbiter panel must be configured — the panel is the only review
+    /// mechanism, so an appeal with no panel to decide it is refused
+    /// rather than stranded.
+    ///
+    /// Then state: `Funded` only ([`EscrowError::InvalidStateTransition`]
+    /// otherwise — the appeal is filed against the live post-slash
+    /// escrow).
+    ///
+    /// Then appeal eligibility ([`EscrowError::InvalidAppealWindow`]):
+    /// a slash must have been executed (`penalty_paid > 0`); an appeal
+    /// window must be configured; no appeal may already be filed or
+    /// resolved (one appeal per slash); and `now` must be within the
+    /// window (`now <= appeal_deadline` — a lapsed window rejects the
+    /// filing).
+    ///
+    /// Emits nothing by itself — the
+    /// [`EscrowEventKind::AppealFiled`](crate::EscrowEventKind::AppealFiled)
+    /// indexer event is emitted by the `IndexedEscrow` wrapper (and the
+    /// Anchor layer), paralleling `slash`'s `Slashed` event.
+    pub fn file_appeal(&mut self, taker: [u8; 32], now: u64) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Authority: only the taker may appeal their own slash.
+        // Checked before state validity.
+        if taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        // The panel is the only review mechanism — a filed appeal must
+        // be resolvable, so the panel is required up front (parallels
+        // `submit_panel_judgment`'s no-panel rejection).
+        if self.arbiter_panel.is_none() {
+            return Err(EscrowError::InvalidArbiterPanel);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Nothing to appeal when no slash was executed.
+        if self.penalty_paid == 0 {
+            return Err(EscrowError::InvalidAppealWindow);
+        }
+        // No window configured — slashes are final (backward
+        // compatible).
+        if self.appeal_window_secs == 0 {
+            return Err(EscrowError::InvalidAppealWindow);
+        }
+        // One appeal per slash: a filed or already-resolved appeal
+        // rejects a repeat filing.
+        if !matches!(self.appeal_state, AppealState::None) {
+            return Err(EscrowError::InvalidAppealWindow);
+        }
+        // The window is a hard procedural bar.
+        if now > self.appeal_deadline {
+            return Err(EscrowError::InvalidAppealWindow);
+        }
+        self.appeal_state = AppealState::Filed;
+        Ok(())
+    }
+
+    /// Cast a panel member's review vote on the filed slash appeal
+    /// (AV-86): `uphold == true` keeps the penalty,
+    /// `uphold == false` overturns it. Each member has one effective
+    /// vote — a re-vote overwrites the member's previous vote
+    /// (paralleling [`Escrow::submit_panel_judgment`]).
+    ///
+    /// The first side (uphold or overturn) to collect `threshold`
+    /// matching votes resolves the appeal:
+    /// - uphold: [`AppealState::Upheld`] — the penalty stands;
+    /// - overturn: [`AppealState::Overturned`] — the penalty is
+    ///   refunded to the taker: `penalty_paid` returns to `0` and the
+    ///   amount accumulates in `released` (the restitution is a taker
+    ///   payout, so the conservation invariant `inflow == locked +
+    ///   released + refunded + penalty_paid` stays exact and the audit
+    ///   trail keeps the reversal visible).
+    ///
+    /// Check order is deliberate (pause, reentrancy, authority, config,
+    /// state, appeal — the crate convention): a stranger learns nothing
+    /// about the ballot. The overturn moves funds, so the AV-36
+    /// reentrancy guard applies.
+    ///
+    /// Returns `Ok(None)` when the vote did not reach the threshold
+    /// (the appeal stays `Filed`), or `Ok(Some((outcome, refunded)))`
+    /// when this vote was the M-th match — `refunded` is the penalty
+    /// returned to the taker (`0` on uphold) so the caller (and the
+    /// Anchor layer) can size the transfer. No panel configured is
+    /// [`EscrowError::InvalidArbiterPanel`]; a non-member caller is
+    /// [`EscrowError::Unauthorized`]; voting when no appeal is filed
+    /// (or the appeal already resolved) is
+    /// [`EscrowError::InvalidAppealWindow`].
+    ///
+    /// The resolution emits
+    /// [`EscrowEventKind::AppealResolved`](crate::EscrowEventKind::AppealResolved)
+    /// via the `IndexedEscrow` wrapper (and the Anchor layer) —
+    /// `from == to == Funded`, with the refunded penalty riding
+    /// `amounts.payout` on overturn (a taker restitution, no fee). The
+    /// wrapper supplies the event timestamp; the review itself is not
+    /// time-gated — the window gates the filing.
+    pub fn review_appeal(
+        &mut self,
+        member: [u8; 32],
+        uphold: bool,
+    ) -> Result<Option<(AppealOutcome, u64)>, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // AV-36: reentrancy guard — an overturn moves funds.
+        self.require_not_reentrant()?;
+        let panel = self.arbiter_panel.ok_or(EscrowError::InvalidArbiterPanel)?;
+        let slot = panel
+            .member_index(&member)
+            .ok_or(EscrowError::Unauthorized)?;
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Only a filed appeal is under review — voting on a never-filed
+        // or already-resolved appeal is rejected.
+        if !matches!(self.appeal_state, AppealState::Filed) {
+            return Err(EscrowError::InvalidAppealWindow);
+        }
+        // Record the vote (overwriting any previous vote by this
+        // member), then tally the member's *current effective* vote —
+        // the AV-65 panel tally precedent.
+        let vote = if uphold {
+            APPEAL_VOTE_UPHOLD
+        } else {
+            APPEAL_VOTE_OVERTURN
+        };
+        let mut ballot = self.appeal_ballot;
+        ballot.votes[slot] = vote;
+        ballot.voted |= 1 << slot;
+        self.appeal_ballot = ballot;
+        if ballot.matching_votes(vote, panel.n) < panel.threshold as usize {
+            return Ok(None);
+        }
+        // The M-th matching vote resolves the appeal.
+        let outcome = if uphold {
+            AppealOutcome::Upheld
+        } else {
+            AppealOutcome::Overturned
+        };
+        let refunded = if uphold {
+            0
+        } else {
+            // Overturn: the penalty returns to the taker. `penalty_paid`
+            // is the one-shot slash amount; moving it into `released`
+            // keeps `released + penalty_paid <= amount` — checked_add
+            // anyway, paralleling `slash`'s counter discipline.
+            let refunded = self.penalty_paid;
+            self.penalty_paid = 0;
+            self.released = self
+                .released
+                .checked_add(refunded)
+                .ok_or(EscrowError::InvalidAppealWindow)?;
+            refunded
+        };
+        self.appeal_state = if uphold {
+            AppealState::Upheld
+        } else {
+            AppealState::Overturned
+        };
+        // The ballot is terminal — a resolved appeal rejects further
+        // votes via the `Filed` gate above, so the recorded votes stay
+        // as the audit trail of how the panel decided.
+        Ok(Some((outcome, refunded)))
     }
 
     /// Opt in to an arbiter-panel multisig judgment (AV-65 — Solana
@@ -8593,6 +9101,30 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // treatment as `payout_allowlist` / `cpi_allowlist`. Appended last
     // so every earlier field offset stays stable.
     ("multisig_authority", "Option<MultisigAuthority>", 1 + MULTISIG_AUTHORITY_LEN),
+    // AV-86: opt-in slash-appeal window in seconds (see
+    // `Escrow::with_appeal_window`): one u64, always present (zeroed
+    // when no window is configured — a slash is then final, backward
+    // compatible). Appended last so every earlier field offset stays
+    // stable.
+    ("appeal_window_secs", "u64", 8),
+    // AV-86: the appeal deadline, stamped by `Escrow::slash` as
+    // `slash_now + appeal_window_secs` (see `Escrow::appeal_deadline`):
+    // one u64, always present (zeroed when no slash was executed under
+    // a configured window). Appended last so every earlier field
+    // offset stays stable.
+    ("appeal_deadline", "u64", 8),
+    // AV-86: the slash appeal's lifecycle state (see `AppealState`):
+    // one u8 discriminant (0 = None, 1 = Filed, 2 = Upheld,
+    // 3 = Overturned), always present. Appended last so every earlier
+    // field offset stays stable.
+    ("appeal_state", "u8 (enum discriminant)", 1),
+    // AV-86: the arbiter panel's running ballot on the filed appeal
+    // (see `Escrow::review_appeal`): the 1-byte voter bitmask plus the
+    // 8 fixed vote slots (one u8 per panel member — see
+    // `APPEAL_BALLOT_LEN`). The region is always reserved (zeroed when
+    // no appeal is filed). Appended last so every earlier field offset
+    // stays stable.
+    ("appeal_ballot", "AppealBallot", APPEAL_BALLOT_LEN),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -8693,7 +9225,7 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// slash clause is configured) — and so is the cumulative slashed
 /// amount (AV-82): 8 bytes, zeroed when the escrow was never slashed.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -9247,7 +9779,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 27_533_760, "from {state:?}");
+            assert_eq!(rent, 27_714_720, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -9345,9 +9877,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 27_533_760 by
+        // VAULT_SPACE — pinned at 27_714_720 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 27_533_760);
+        assert_eq!(rent, 27_714_720);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -9508,8 +10040,8 @@ mod tests {
         // then the account is closed. VAULT_SPACE stays 2941 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 3828, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 27_533_760);
+        assert_eq!(VAULT_SPACE, 3854, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 27_714_720);
     }
 
     #[test]
@@ -9528,7 +10060,7 @@ mod tests {
         // 595 (arbiter panel), and AV-68 by 41 (evidence-disclosure
         // deadline + escalating party), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 3828, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3854, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -12242,7 +12774,43 @@ pub(crate) mod anchor_idl_tests {
                 "instruction param; how much of the locked funds moves to the penalty account — 0 is AmountMismatch (code 102); above the slashable remainder (amount - released) is SlashNotEligible, code 143",
             )],
             method: "Escrow::slash",
-            input_mapping: "authority <- accounts.authority (signer) - the initializer, or the configured arbiter as the neutral enforcer (a stranger, the taker, or a panel member is Unauthorized, checked before state validity); Funded only (InvalidStateTransition otherwise; Disputed is SlashNotEligible, code 143 - slash is locked while arbitration owns the funds, the arbiter settles via resolve); a paused escrow fails fast (Paused); slash terms must be configured (SlashNotEligible otherwise); now <- clock sysvar (NOT an instruction param - the default must be measured on chain time); now >= slash_deadline required (SlashNotEligible otherwise - the default has not occurred yet); one-shot - an already-slashed escrow refuses a second slash (SlashNotEligible); milestone / subscription-scheduled escrows refuse the slash (SlashNotEligible - the schedule owns the release path); the slashed amount accumulates in penalty_paid (never in released), the escrow stays Funded, and the conservation invariant becomes inflow == locked + released + refunded + penalty_paid; emits the EscrowSlashed indexer event (from == to == Funded, amounts.penalty = the slashed amount)",
+            input_mapping: "authority <- accounts.authority (signer) - the initializer, or the configured arbiter as the neutral enforcer (a stranger, the taker, or a panel member is Unauthorized, checked before state validity); Funded only (InvalidStateTransition otherwise; Disputed is SlashNotEligible, code 143 - slash is locked while arbitration owns the funds, the arbiter settles via resolve); a paused escrow fails fast (Paused); slash terms must be configured (SlashNotEligible otherwise); now <- clock sysvar (NOT an instruction param - the default must be measured on chain time); now >= slash_deadline required (SlashNotEligible otherwise - the default has not occurred yet); one-shot - an already-slashed escrow refuses a second slash (SlashNotEligible); milestone / subscription-scheduled escrows refuse the slash (SlashNotEligible - the schedule owns the release path); the slashed amount accumulates in penalty_paid (never in released), the escrow stays Funded, and the conservation invariant becomes inflow == locked + released + refunded + penalty_paid; when an appeal window is configured the slash stamps appeal_deadline = now + window_secs (InvalidAppealWindow, code 146, when the addition would overflow); emits the EscrowSlashed indexer event (from == to == Funded, amounts.penalty = the slashed amount)",
+        },
+        InstructionSpec {
+            // AV-86: opt-in slash-appeal window.
+            // IDL: sha256("global:initialize_appeal_window")[..8] — the
+            // Anchor instruction discriminator for the
+            // initialize_appeal_window handler.
+            name: "initialize_appeal_window",
+            params: &[(
+                "window_secs",
+                "u64",
+                "instruction param; seconds after a slash during which the taker may file an appeal — 0 is InvalidAppealWindow, code 146 (a zero-second window would lapse the instant the slash lands)",
+            )],
+            method: "Escrow::with_appeal_window",
+            input_mapping: "no signer beyond the initializer (Uninitialized only - InvalidStateTransition otherwise; a paused escrow fails fast (Paused)); window_secs <- param (0 is InvalidAppealWindow, code 146); the 8-byte appeal_window_secs region is always reserved (zeroed when unconfigured), so the window is written in place — no realloc; pre-fund configuration only, emits no event",
+        },
+        InstructionSpec {
+            // AV-86: taker's appeal against the executed slash.
+            // IDL: sha256("global:file_appeal")[..8] — the Anchor
+            // instruction discriminator for the file_appeal handler.
+            name: "file_appeal",
+            params: &[],
+            method: "Escrow::file_appeal",
+            input_mapping: "taker <- accounts.taker (signer) - only the taker may appeal their own slash (a stranger or the initializer is Unauthorized, checked before state validity); a paused escrow fails fast (Paused); an arbiter panel must be configured (InvalidArbiterPanel, code 136 - the panel is the only review mechanism, so an appeal with no panel to decide it is refused rather than stranded); Funded only (InvalidStateTransition otherwise); a slash must have been executed, an appeal window must be configured, no appeal filed or resolved yet, and now <- clock sysvar (NOT an instruction param) must be within the window (InvalidAppealWindow, code 146, otherwise - the window is a hard procedural bar); filing moves no funds - the escrow stays Funded and the panel's review_appeal votes decide the appeal; emits the AppealFiled indexer event (from == to == Funded, amounts zero, actor = the taker)",
+        },
+        InstructionSpec {
+            // AV-86: arbiter-panel review vote on the filed slash appeal.
+            // IDL: sha256("global:review_appeal")[..8] — the Anchor
+            // instruction discriminator for the review_appeal handler.
+            name: "review_appeal",
+            params: &[(
+                "uphold",
+                "bool",
+                "instruction param; true = uphold the slash (the penalty stands), false = overturn it (the penalty is refunded to the taker)",
+            )],
+            method: "Escrow::review_appeal",
+            input_mapping: "member <- accounts.member (signer) - must be a panel member (a non-member is Unauthorized, checked before state validity); a paused escrow fails fast (Paused); a panel must be configured (InvalidArbiterPanel, code 136 otherwise); Funded only (InvalidStateTransition otherwise); the appeal must be Filed (InvalidAppealWindow, code 146, when never filed or already resolved); each member has one effective vote (a re-vote overwrites); the first side (uphold or overturn) to collect threshold matching votes resolves the appeal - uphold keeps the penalty, overturn zeroes penalty_paid and accumulates the refund in released (the restitution is a taker payout, conservation stays exact); returns (outcome, refunded) - the refunded penalty (0 on uphold) so the real build can size the transfer from the penalty account to the taker; the event timestamp comes from the clock sysvar (NOT an instruction param); emits the AppealResolved indexer event (from == to == Funded, amounts.payout = the refunded penalty on overturn, 0 on uphold, actor = the voting member)",
         },
     ];
 
@@ -12366,6 +12934,11 @@ pub(crate) mod anchor_idl_tests {
             // AV-82: opt-in default-penalty (slash) terms + enforcement.
             "Escrow::with_slash_terms",
             "Escrow::slash",
+            // AV-86: opt-in slash-appeal window + taker filing + panel
+            // review.
+            "Escrow::with_appeal_window",
+            "Escrow::file_appeal",
+            "Escrow::review_appeal",
             // AV-84: opt-in multisig authority binding.
             "Escrow::with_multisig_authority",
         ];
@@ -12455,6 +13028,8 @@ pub(crate) mod anchor_idl_tests {
                 &"split_escrow",
                 &"initialize_slash_terms",
                 &"slash",
+                &"initialize_appeal_window",
+                &"review_appeal",
             ]
         );
     }
@@ -14203,6 +14778,16 @@ pub(crate) mod anchor_idl_tests {
         // and written in place, mirroring `initialize_arbiter`.
         ("initialize_slash_terms", "penalty_account", "slash_terms"),
         ("initialize_slash_terms", "slash_deadline", "slash_terms"),
+        // AV-86: the appeal-window param populates `appeal_window_secs`
+        // via `initialize_appeal_window` (Uninitialized only); the
+        // region is zeroed by `initialize` and written in place,
+        // mirroring `initialize_slash_terms`.
+        ("initialize_appeal_window", "window_secs", "appeal_window_secs"),
+        // AV-86: a panel member's review vote populates their slot of
+        // the appeal ballot; on the M-th overturn vote the refunded
+        // penalty additionally accumulates into `released` (a second
+        // param source for the field is allowed — see `released`).
+        ("review_appeal", "uphold", "appeal_ballot"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -14409,6 +14994,23 @@ pub(crate) mod anchor_idl_tests {
         // (`penalty_paid` is likewise param-sourced: the `slash`
         // instruction's `amount` accumulates into it, like `release`'s
         // `amount` into `released`.)
+        // AV-86: no instruction param writes these fields — `slash`
+        // stamps the deadline from the clock sysvar (NOT an instruction
+        // param) plus the configured window, and the lifecycle state
+        // moves on `file_appeal` / `review_appeal` (whose params map to
+        // `appeal_window_secs` / `appeal_ballot` instead), so both are
+        // field sources, not param mappings.
+        (
+            "appeal_deadline",
+            "zeroed by initialize; stamped once by slash as \
+             slash_now + appeal_window_secs (InvalidAppealWindow when \
+             the addition would overflow)",
+        ),
+        (
+            "appeal_state",
+            "zeroed (None) by initialize; Filed by file_appeal, \
+             terminally Upheld/Overturned by review_appeal",
+        ),
     ];
 
     /// Every vault field path from `VAULT_FIELDS`, with `quorum` unfolded
@@ -14770,6 +15372,11 @@ mod error_code_tests {
             EscrowError::InvalidMultisigAuthority,
             145,
             "with_multisig_authority with a zero multisig program id, a zero authority PDA, or a zero threshold; validate_multisig_escrow_call on a proposed instruction that does not carry the bound authority PDA as a signer",
+        ),
+        (
+            EscrowError::InvalidAppealWindow,
+            146,
+            "with_appeal_window with a zero window; slash when the window would overflow the appeal deadline; file_appeal with no slash executed / no window configured / an already-filed or already-resolved appeal (one appeal per slash) / after the window lapsed",
         ),
     ];
 
@@ -16570,6 +17177,26 @@ mod account_space_tests {
                 out.extend_from_slice(&bound.threshold.to_le_bytes());
             }
         }
+        // AV-86: opt-in slash-appeal window in seconds, always present
+        // (zeroed when no window is configured); appended last so every
+        // earlier offset above is unchanged.
+        out.extend_from_slice(&e.appeal_window_secs.to_le_bytes());
+        // AV-86: the appeal deadline stamped by `slash`, always present
+        // (zeroed when no slash was executed under a configured window);
+        // appended last so every earlier offset above is unchanged.
+        out.extend_from_slice(&e.appeal_deadline.to_le_bytes());
+        // AV-86: the appeal lifecycle discriminant, always present
+        // (zeroed = `AppealState::None`); appended last so every
+        // earlier offset above is unchanged.
+        out.push(e.appeal_state as u8);
+        // AV-86: the panel's running appeal ballot, always present: the
+        // 1-byte voter bitmask followed by the 8 fixed vote slots
+        // (zeroed when no appeal is filed); appended last so every
+        // earlier offset above is unchanged.
+        out.push(e.appeal_ballot.voted);
+        for vote in e.appeal_ballot.votes.iter() {
+            out.push(*vote);
+        }
         out
     }
 
@@ -16626,10 +17253,13 @@ mod account_space_tests {
         // + eight 32-byte program ids + count byte)
         // + (1 + 66) (AV-84 opt-in multisig authority: discriminant +
         // 32-byte multisig program id + 32-byte authority PDA + u16
-        // threshold).
-        assert_eq!(ESCROW_BODY_LEN, 3820, "escrow payload bytes");
+        // threshold)
+        // + 26 (AV-86 opt-in slash-appeal window region: 8-byte window
+        // + 8-byte appeal deadline + 1-byte appeal state + 9-byte appeal
+        // ballot).
+        assert_eq!(ESCROW_BODY_LEN, 3846, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 3828, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3854, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -16690,13 +17320,19 @@ mod account_space_tests {
         // schedule is attached) + 1-byte schema version (AV-75, born
         // at `SCHEMA_VERSION`) + (1 + 40)-byte opt-in slash terms
         // (AV-82, zeroed when no slash clause is configured) + 8-byte
-        // cumulative slashed amount (AV-82, zeroed when never slashed).
+        // cumulative slashed amount (AV-82, zeroed when never slashed) +
+        // 8-byte opt-in slash-appeal window (AV-86, zeroed when no
+        // window is configured) + 8-byte appeal deadline (AV-86, zeroed
+        // when no slash was executed under a configured window) +
+        // 1-byte appeal lifecycle state (AV-86, zeroed = no appeal
+        // filed) + 9-byte panel appeal ballot (AV-86, 1-byte voter
+        // bitmask + 8 vote slots, zeroed when no appeal is filed).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3338);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3364);
     }
 
     #[test]
@@ -17106,16 +17742,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3828) * 3480 * 2 = 3956 * 6960 = 27_533_760 lamports.
-        assert_eq!(full, 27_533_760);
+        // (128 + 3854) * 3480 * 2 = 3982 * 6960 = 27_714_720 lamports.
+        assert_eq!(full, 27_714_720);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3338) * 3480 * 2 = 3466 * 6960 = 24_123_360 lamports.
-        assert_eq!(no_quorum, 24_123_360);
+        // (128 + 3364) * 3480 * 2 = 3492 * 6960 = 24_304_320 lamports.
+        assert_eq!(no_quorum, 24_304_320);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -17159,12 +17795,12 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(27_533_760, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(27_714_720, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(27_533_759, params.0, params.1),
             Err(RentShortfall {
-                required: 27_533_760,
+                required: 27_714_720,
                 provided: 27_533_759,
             })
         );
@@ -17177,7 +17813,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 27_533_760,
+                required: 27_714_720,
                 provided: 0,
             })
         );
@@ -19930,7 +20566,7 @@ mod migrate_schema_tests {
     fn initialize_stamps_current_schema_version() {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         assert_eq!(e.schema_version(), Escrow::SCHEMA_VERSION);
-        assert_eq!(Escrow::SCHEMA_VERSION, 2);
+        assert_eq!(Escrow::SCHEMA_VERSION, 3);
     }
 
     /// A v1-state vault: written under AV-75..AV-81 (schema byte `1`,
@@ -19949,10 +20585,10 @@ mod migrate_schema_tests {
         let mut e = v0_escrow();
         let before = e;
         e.migrate_schema(ALICE).unwrap();
-        assert_eq!(e.schema_version(), 2);
+        assert_eq!(e.schema_version(), 3);
         // Carry-over is exact: only the stamp moved.
         let mut before_migrated = before;
-        before_migrated.schema_version = 2;
+        before_migrated.schema_version = 3;
         assert_eq!(e, before_migrated, "migration must carry every field over untouched");
     }
 
@@ -19961,9 +20597,9 @@ mod migrate_schema_tests {
         let mut e = v1_escrow();
         let before = e;
         e.migrate_schema(ALICE).unwrap();
-        assert_eq!(e.schema_version(), 2);
+        assert_eq!(e.schema_version(), 3);
         let mut before_migrated = before;
-        before_migrated.schema_version = 2;
+        before_migrated.schema_version = 3;
         assert_eq!(e, before_migrated, "migration must carry every field over untouched");
     }
 
@@ -19985,14 +20621,14 @@ mod migrate_schema_tests {
     fn migrate_schema_is_one_time() {
         let mut e = v0_escrow();
         e.migrate_schema(ALICE).unwrap();
-        assert_eq!(e.schema_version(), 2);
+        assert_eq!(e.schema_version(), 3);
         // A vault already at the current schema refuses — there is no
         // no-op migration.
         assert_eq!(
             e.migrate_schema(ALICE),
             Err(EscrowError::InvalidSchemaMigration)
         );
-        assert_eq!(e.schema_version(), 2, "rejected call changes nothing");
+        assert_eq!(e.schema_version(), 3, "rejected call changes nothing");
     }
 
     #[test]
@@ -20093,11 +20729,11 @@ mod migrate_schema_tests {
 
     #[test]
     fn migrate_schema_moves_the_serialized_tail_byte() {
-        // AV-83: the version byte sits 49 + 258 bytes before the tail
-        // now (the slash region and the CPI allowlist trail it); every
-        // earlier offset stays stable, and the carry-over is still a
-        // byte-prefix copy.
-        let version_at = ESCROW_BODY_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        // AV-86: the version byte sits 26 + 49 + 258 bytes before the
+        // tail now (the appeal region, the slash region and the CPI
+        // allowlist trail it); every earlier offset stays stable, and
+        // the carry-over is still a byte-prefix copy.
+        let version_at = ESCROW_BODY_LEN - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         let e = v0_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
@@ -20106,7 +20742,7 @@ mod migrate_schema_tests {
         migrated.migrate_schema(ALICE).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&migrated);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes[version_at], 2, "v2 version byte");
+        assert_eq!(bytes[version_at], 3, "v3 version byte");
         assert_eq!(
             &bytes[..version_at],
             &super::account_space_tests::encode_escrow(&e)[..version_at],
@@ -20121,7 +20757,7 @@ mod migrate_schema_tests {
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
         let decoded = decode_vault_account(&full).unwrap();
-        assert_eq!(decoded.schema_version(), 2);
+        assert_eq!(decoded.schema_version(), 3);
     }
 
     #[test]
@@ -20131,7 +20767,7 @@ mod migrate_schema_tests {
         let mut e = v0_escrow();
         e.fund(ALICE, T0).unwrap();
         e.migrate_schema(ALICE).unwrap();
-        assert_eq!(e.schema_version(), 2);
+        assert_eq!(e.schema_version(), 3);
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!(e.fund_at(), T0, "funding timestamp carried over");
     }
@@ -20165,18 +20801,25 @@ mod migrate_schema_tests {
             vec![
                 SchemaMigrationStep { from: 0, to: 1 },
                 SchemaMigrationStep { from: 1, to: 2 },
+                SchemaMigrationStep { from: 2, to: 3 },
             ]
         );
-        assert_eq!(e.schema_version(), 2);
+        assert_eq!(e.schema_version(), 3);
         // Carry-over is exact: only the stamp moved.
         let mut before_migrated = before;
-        before_migrated.schema_version = 2;
+        before_migrated.schema_version = 3;
         assert_eq!(e, before_migrated, "the chain must carry every field over untouched");
-        // A v1 vault runs just its own step.
+        // A v1 vault runs just its own steps.
         let mut e = v1_escrow();
         let steps = e.migrate_schema_steps(ALICE).unwrap();
-        assert_eq!(steps, vec![SchemaMigrationStep { from: 1, to: 2 }]);
-        assert_eq!(e.schema_version(), 2);
+        assert_eq!(
+            steps,
+            vec![
+                SchemaMigrationStep { from: 1, to: 2 },
+                SchemaMigrationStep { from: 2, to: 3 },
+            ]
+        );
+        assert_eq!(e.schema_version(), 3);
     }
 
     #[test]
@@ -20231,13 +20874,15 @@ mod migrate_schema_tests {
         );
         assert_eq!(e.schema_version(), 0, "rejected steps change nothing");
         // The unknown-step guard: no table entry, no migration.
-        assert!(Escrow::schema_step_fields(2).is_none());
+        assert!(Escrow::schema_step_fields(3).is_none());
         assert!(Escrow::schema_step_fields(u8::MAX).is_none());
         // Well-formed steps apply.
         e.apply_migration_step(0, 1).unwrap();
         assert_eq!(e.schema_version(), 1);
         e.apply_migration_step(1, 2).unwrap();
         assert_eq!(e.schema_version(), 2);
+        e.apply_migration_step(2, 3).unwrap();
+        assert_eq!(e.schema_version(), 3);
     }
 
     #[test]
@@ -20259,6 +20904,21 @@ mod migrate_schema_tests {
         assert_eq!(deltas[1].name, "penalty_paid");
         assert_eq!(deltas[1].bytes, 8);
         assert_eq!(deltas[0].bytes + deltas[1].bytes, 49);
+        // 2 → 3 (AV-86): the 26-byte slash-appeal region.
+        let deltas = Escrow::schema_step_fields(2).unwrap();
+        assert_eq!(deltas.len(), 4);
+        assert_eq!(deltas[0].name, "appeal_window_secs");
+        assert_eq!(deltas[0].bytes, 8);
+        assert_eq!(deltas[1].name, "appeal_deadline");
+        assert_eq!(deltas[1].bytes, 8);
+        assert_eq!(deltas[2].name, "appeal_state");
+        assert_eq!(deltas[2].bytes, 1);
+        assert_eq!(deltas[3].name, "appeal_ballot");
+        assert_eq!(deltas[3].bytes, APPEAL_BALLOT_LEN as u64);
+        assert_eq!(
+            deltas[0].bytes + deltas[1].bytes + deltas[2].bytes + deltas[3].bytes,
+            26
+        );
     }
 
     #[test]
@@ -20268,7 +20928,7 @@ mod migrate_schema_tests {
         let plan = e.migrate_dry_run(ALICE).unwrap();
         assert_eq!(plan.from, 0);
         assert_eq!(plan.to, Escrow::SCHEMA_VERSION);
-        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps.len(), 3);
         assert_eq!(plan.steps[0].from, 0);
         assert_eq!(plan.steps[0].to, 1);
         assert_eq!(plan.steps[0].new_fields.len(), 1);
@@ -20278,24 +20938,36 @@ mod migrate_schema_tests {
         assert_eq!(plan.steps[1].new_fields.len(), 2);
         assert_eq!(plan.steps[1].new_fields[0].name, "slash_terms");
         assert_eq!(plan.steps[1].new_fields[1].name, "penalty_paid");
+        assert_eq!(plan.steps[2].from, 2);
+        assert_eq!(plan.steps[2].to, 3);
+        assert_eq!(plan.steps[2].new_fields.len(), 4);
+        assert_eq!(plan.steps[2].new_fields[0].name, "appeal_window_secs");
+        assert_eq!(plan.steps[2].new_fields[1].name, "appeal_deadline");
+        assert_eq!(plan.steps[2].new_fields[2].name, "appeal_state");
+        assert_eq!(plan.steps[2].new_fields[3].name, "appeal_ballot");
         // The report serializes deterministically.
         assert_eq!(
             plan.to_json(),
-            "{\"from\":0,\"to\":2,\"steps\":[\
+            "{\"from\":0,\"to\":3,\"steps\":[\
              {\"from\":0,\"to\":1,\"new_fields\":[\
              {\"name\":\"schema_version\",\"type\":\"u8\",\"bytes\":1}]},\
              {\"from\":1,\"to\":2,\"new_fields\":[\
              {\"name\":\"slash_terms\",\"type\":\"Option<SlashTerms>\",\"bytes\":41},\
-             {\"name\":\"penalty_paid\",\"type\":\"u64\",\"bytes\":8}]}]}"
+             {\"name\":\"penalty_paid\",\"type\":\"u64\",\"bytes\":8}]},\
+             {\"from\":2,\"to\":3,\"new_fields\":[\
+             {\"name\":\"appeal_window_secs\",\"type\":\"u64\",\"bytes\":8},\
+             {\"name\":\"appeal_deadline\",\"type\":\"u64\",\"bytes\":8},\
+             {\"name\":\"appeal_state\",\"type\":\"u8 (enum discriminant)\",\"bytes\":1},\
+             {\"name\":\"appeal_ballot\",\"type\":\"AppealBallot\",\"bytes\":9}]}]}"
         );
         // Zero write impact: the borrow checker guarantees `&self`,
         // and the vault is bit-identical afterwards.
         assert_eq!(e, before, "dry-run must not mutate the vault");
-        // A v1 vault's plan is just its own step.
+        // A v1 vault's plan is its own two steps.
         let e = v1_escrow();
         let plan = e.migrate_dry_run(ALICE).unwrap();
         assert_eq!(plan.from, 1);
-        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps.len(), 2);
     }
 
     #[test]
@@ -21194,7 +21866,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3820, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) bytes");
+        assert_eq!(bytes.len(), 3846, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -21219,7 +21891,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 3820);
+        assert_eq!(bytes.len(), 3846);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -21241,18 +21913,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3828) * 3480 * 2 = 3956 * 6960 = 27_533_760 lamports.
-        assert_eq!(VAULT_SPACE, 3828);
-        assert_eq!(full, 27_533_760);
+        // (128 + 3854) * 3480 * 2 = 3982 * 6960 = 27_714_720 lamports.
+        assert_eq!(VAULT_SPACE, 3854);
+        assert_eq!(full, 27_714_720);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3338) * 3480 * 2 = 3466 * 6960 = 24_123_360 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3338);
-        assert_eq!(no_quorum, 24_123_360);
+        // (128 + 3364) * 3480 * 2 = 3492 * 6960 = 24_304_320 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3364);
+        assert_eq!(no_quorum, 24_304_320);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -21396,7 +22068,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3820);
+        assert_eq!(bytes.len(), 3846);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -21411,7 +22083,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 3820);
+        assert_eq!(bytes.len(), 3846);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -21442,18 +22114,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3828) * 3480 * 2 = 3956 * 6960 = 27_533_760 lamports.
-        assert_eq!(VAULT_SPACE, 3828);
-        assert_eq!(full, 27_533_760);
+        // (128 + 3854) * 3480 * 2 = 3982 * 6960 = 27_714_720 lamports.
+        assert_eq!(VAULT_SPACE, 3854);
+        assert_eq!(full, 27_714_720);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3338) * 3480 * 2 = 3466 * 6960 = 24_123_360 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3338);
-        assert_eq!(no_quorum, 24_123_360);
+        // (128 + 3364) * 3480 * 2 = 3492 * 6960 = 24_304_320 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3364);
+        assert_eq!(no_quorum, 24_304_320);
     }
 
     #[test]
@@ -22308,7 +22980,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 3820);
+        assert_eq!(bytes.len(), 3846);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -22483,7 +23155,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 3820, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority");
+        assert_eq!(ESCROW_BODY_LEN, 3846, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -22501,32 +23173,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 3828) * 3480 * 2 = 3956 * 6960 = 27_533_760 lamports.
+        // (128 + 3854) * 3480 * 2 = 3982 * 6960 = 27_714_720 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            27_533_760
+            27_714_720
         );
-        // (128 + 3338) * 3480 * 2 = 3466 * 6960 = 24_123_360 lamports.
+        // (128 + 3364) * 3480 * 2 = 3492 * 6960 = 24_304_320 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            24_123_360
+            24_304_320
         );
         // 1888 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 3828);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3338);
-        assert!(check_vault_rent_exempt(27_533_760, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 3854);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3364);
+        assert!(check_vault_rent_exempt(27_714_720, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -25353,9 +26025,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3820, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority)");
-        assert_eq!(VAULT_SPACE, 3828);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3338);
+        assert_eq!(bytes.len(), 3846, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region)");
+        assert_eq!(VAULT_SPACE, 3854);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3364);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -25899,7 +26571,7 @@ mod default_judgment_tests {
         // at 960, `default_judgment` at 968, `default_confirmed` at 985
         // (AV-55 body total 986). AV-56 appends `subscription` at 986,
         // `subscription_next` at 1004, `subscription_released` at 1005
-        // (body total 3820 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline + AV-73 per-period-table + AV-75 schema-version + AV-82 slash-region appends).
+        // (body total 3846 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline + AV-73 per-period-table + AV-75 schema-version + AV-82 slash-region + AV-86 appeal-window appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter(ARBITER)
@@ -25909,7 +26581,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3820);
+        assert_eq!(bytes.len(), 3846);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -26467,7 +27139,7 @@ mod subscription_tests {
         // Offsets: `default_confirmed` ends the AV-55 body at 986;
         // `subscription` at 986, `subscription_next` at 1004,
         // `subscription_released` at 1005; the AV-73 live per-period
-        // amount table at 2933..3445 (body total 3820 after the AV-57 +
+        // amount table at 2933..3445 (body total 3846 after the AV-57 +
         // AV-59 + AV-63 + AV-64 + AV-65 + AV-66 + AV-68 + AV-73 + AV-75
         // appends).
         let mut e = escrow()
@@ -26476,7 +27148,7 @@ mod subscription_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3820);
+        assert_eq!(bytes.len(), 3846);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -26514,7 +27186,7 @@ mod subscription_tests {
         // AV-75: the schema-version byte sits at its long-stable offset
         // (new vaults are born at `SCHEMA_VERSION`); AV-82 appends the
         // slash region after it, so it is no longer the tail byte.
-        assert_eq!(bytes[3445], 2, "schema_version: born current (v2)");
+        assert_eq!(bytes[3445], 3, "schema_version: born current (v3)");
         assert_eq!(
             &bytes[3446..3487],
             &[0u8; 41],
@@ -26788,7 +27460,22 @@ mod event_history_tests {
             42,
             "AV-82: appended after EscrowSplit"
         );
-        for d in 0..=42u8 {
+        assert_eq!(
+            EscrowEventKind::CpiAllowlistUpdated.discriminant(),
+            43,
+            "AV-83: appended after Slashed"
+        );
+        assert_eq!(
+            EscrowEventKind::AppealFiled.discriminant(),
+            44,
+            "AV-86: appended after CpiAllowlistUpdated"
+        );
+        assert_eq!(
+            EscrowEventKind::AppealResolved.discriminant(),
+            45,
+            "AV-86: appended after AppealFiled"
+        );
+        for d in 0..=45u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -26799,7 +27486,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(44), None);
+        assert_eq!(EscrowEventKind::from_discriminant(46), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -26811,11 +27498,11 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26
         );
     }
 
@@ -26824,14 +27511,14 @@ mod event_history_tests {
         // Offsets: `subscription_released` ends the AV-56 body at 1013;
         // `event_head` at 1013, `event_total` at 1014, `event_count` at
         // 1022, `event_capacity` at 1023, `event_slots` at 1024 (body
-        // total 3820 after the AV-59 + AV-63 + AV-64 + AV-68 + AV-73
+        // total 3846 after the AV-59 + AV-63 + AV-64 + AV-68 + AV-73
         // + AV-75 + AV-82 + AV-83 appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3820);
+        assert_eq!(bytes.len(), 3846);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -26859,7 +27546,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67, "AV-82/AV-83/AV-84 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26, "AV-82/AV-83/AV-84/AV-86 tail");
     }
 
     #[test]
@@ -26874,18 +27561,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3828) * 3480 * 2 = 3956 * 6960 = 27_533_760 lamports.
-        assert_eq!(VAULT_SPACE, 3828);
-        assert_eq!(full, 27_533_760);
+        // (128 + 3854) * 3480 * 2 = 3982 * 6960 = 27_714_720 lamports.
+        assert_eq!(VAULT_SPACE, 3854);
+        assert_eq!(full, 27_714_720);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3338) * 3480 * 2 = 3466 * 6960 = 24_123_360 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3338);
-        assert_eq!(no_quorum, 24_123_360);
+        // (128 + 3364) * 3480 * 2 = 3492 * 6960 = 24_304_320 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3364);
+        assert_eq!(no_quorum, 24_304_320);
     }
 
     // ----- decode -----
@@ -26926,9 +27613,10 @@ mod event_history_tests {
         // `BundlePartiallyExecuted` (AV-76), 39 is `TemplateApplied`
         // (AV-77), 40 is `VaultsBatchClosed` (AV-79), 41 is
         // `EscrowSplit` (AV-81), 42 is `Slashed` (AV-82), 43 is
-        // `CpiAllowlistUpdated` (AV-83); 44 is the first
+        // `CpiAllowlistUpdated` (AV-83), 44 is `AppealFiled` (AV-86),
+        // 45 is `AppealResolved` (AV-86); 46 is the first
         // still-unknown byte.
-        for bad in [44u8, 45, 255] {
+        for bad in [46u8, 47, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -27581,17 +28269,17 @@ mod fee_cap_tests {
         // + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline)
         // + 258 (AV-83 CPI target allowlist) + 67 (AV-84 multisig
         // authority).
-        assert_eq!(ESCROW_BODY_LEN, 3820, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 3828, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3338, "no-quorum Vault account space");
+        assert_eq!(ESCROW_BODY_LEN, 3846, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 3854, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3364, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            27_533_760,
-            "(128 + 3828) * 3480 * 2 = 3956 * 6960"
+            27_714_720,
+            "(128 + 3854) * 3480 * 2 = 3982 * 6960"
         );
         assert_eq!(
             rent_exempt_minimum_lamports(
@@ -27599,8 +28287,8 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            24_123_360,
-            "(128 + 3338) * 3480 * 2 = 3466 * 6960"
+            24_304_320,
+            "(128 + 3364) * 3480 * 2 = 3492 * 6960"
         );
     }
 
@@ -27612,7 +28300,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3820);
+        assert_eq!(bytes.len(), 3846);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -28108,8 +28796,8 @@ mod fee_schedule_tests {
         let e = scheduled_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3820);
-        let tail = ESCROW_BODY_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        assert_eq!(bytes.len(), 3846);
+        let tail = ESCROW_BODY_LEN - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(bytes[tail], 3, "tier_count at the tail");
         assert_eq!(
             u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
@@ -28144,7 +28832,7 @@ mod fee_schedule_tests {
         // (41 + 8 bytes), and AV-83 the CPI allowlist region (258
         // bytes) after the fee schedule, so the schedule no longer
         // sits at the body tail.
-        let tail = ESCROW_BODY_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(
             &bytes[tail..tail + FEE_SCHEDULE_LEN],
             &[0u8; FEE_SCHEDULE_LEN],
@@ -28163,7 +28851,7 @@ mod fee_schedule_tests {
         // (41 + 8 bytes), and AV-83 the CPI allowlist region (258
         // bytes) after the fee schedule, so the schedule no longer
         // sits at the body tail.
-        let tail = ESCROW_BODY_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         bytes[tail] = 9;
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
@@ -28496,7 +29184,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3820);
+        assert_eq!(bytes.len(), 3846);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -28711,7 +29399,8 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::SlashNotEligible));
         assert!(EscrowError::all().contains(&EscrowError::InvalidCpiAllowlist));
         assert!(EscrowError::all().contains(&EscrowError::InvalidMultisigAuthority));
-        assert_eq!(EscrowError::all().len(), 46);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidAppealWindow));
+        assert_eq!(EscrowError::all().len(), 47);
     }
 
     #[test]
@@ -29058,12 +29747,12 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3820);
+        assert_eq!(bytes.len(), 3846);
         // AV-83: the CPI allowlist region (258 bytes) trails the
         // AV-82 slash region (41-byte terms + 8-byte penalty counter),
         // which trails the schema-version byte — so the panel region
         // ends 258 + 49 + 1 bytes before the end of the buffer.
-        let version_end = bytes.len() - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        let version_end = bytes.len() - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         // The panel region trails the AV-73 per-period amount table
         // (512 bytes), the AV-68 evidence-deadline region (41 bytes) and
         // the AV-66 fee-schedule region (81 bytes):
@@ -29116,9 +29805,9 @@ mod arbiter_panel_tests {
         assert_eq!(panel.1, "Option<ArbiterPanel>");
         assert_eq!(panel.2, 1 + ARBITER_PANEL_LEN);
         assert_eq!(panel.2, 595);
-        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84: every
-        // earlier field offset stays stable.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "fee_schedule");
+        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86:
+        // every earlier field offset stays stable.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "fee_schedule");
     }
 
     #[test]
@@ -29133,18 +29822,23 @@ mod arbiter_panel_tests {
         assert_eq!(schedule.2, 81);
         // AV-68 appended two fields after it, AV-73 one more, AV-75
         // the schema byte, AV-82 the slash region, AV-83 the CPI
-        // allowlist, AV-84 the multisig authority: multisig_authority
-        // is the new tail.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "evidence_deadline_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "escalated_by");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "subscription_amounts");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "schema_version");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "slash_terms");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "penalty_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 1 + CPI_ALLOWLIST_LEN);
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS.last().unwrap().2, 1 + MULTISIG_AUTHORITY_LEN);
+        // allowlist, AV-84 the multisig authority, AV-86 the appeal
+        // window region: appeal_ballot is the new tail.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "evidence_deadline_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "escalated_by");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "subscription_amounts");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "schema_version");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "slash_terms");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "penalty_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 1 + CPI_ALLOWLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 1 + MULTISIG_AUTHORITY_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "appeal_window_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "appeal_deadline");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "appeal_state");
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "appeal_ballot");
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, APPEAL_BALLOT_LEN);
     }
 
     #[test]
@@ -29682,7 +30376,7 @@ mod split_tests {
             .unwrap();
         assert_eq!(e.state(), EscrowState::Split);
         assert_eq!(EscrowState::Split as u8, 8, "Split appended last");
-        assert_eq!(VAULT_SPACE, 3828, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3854, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -29988,13 +30682,14 @@ mod slash_tests {
 
     #[test]
     fn slash_terms_persist_in_serialized_tail() {
-        // v2 tail: schema_version (1) + slash_terms (41) + penalty_paid (8)
-        // + cpi_allowlist (258).
+        // v3 tail: schema_version (1) + slash_terms (41) + penalty_paid (8)
+        // + cpi_allowlist (258) + multisig_authority (67) + the 26-byte
+        // appeal region.
         let e = slashable(1_000_000);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let base = ESCROW_BODY_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
-        assert_eq!(bytes[base], 2, "schema_version");
+        let base = ESCROW_BODY_LEN - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
+        assert_eq!(bytes[base], 3, "schema_version");
         assert_eq!(bytes[base + 1], 1, "slash_terms: Some");
         assert_eq!(&bytes[base + 2..base + 34], &PENALTY, "penalty account");
         assert_eq!(
@@ -30004,8 +30699,8 @@ mod slash_tests {
         );
         assert_eq!(
             u64::from_le_bytes(
-                bytes[ESCROW_BODY_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
-                    ..ESCROW_BODY_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
+                bytes[ESCROW_BODY_LEN - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
+                    ..ESCROW_BODY_LEN - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
                     .try_into()
                     .unwrap()
             ),
@@ -30030,12 +30725,439 @@ mod slash_tests {
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.schema_version = 1;
         e.migrate_schema(ALICE).unwrap();
-        assert_eq!(e.schema_version(), 2);
+        assert_eq!(e.schema_version(), 3);
         assert_eq!(e.slash_terms(), None);
         assert_eq!(e.penalty_paid(), 0);
         assert!(!e.is_slash_eligible(DEADLINE));
     }
 }
+// ---------------------------------------------------------------------------
+// AV-86: slash-penalty appeal window tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod appeal_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+    use crate::keeper::{scan_keeper_actions, KeeperActionKind, WatchedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const PENALTY: [u8; 32] = [0xDD; 32];
+    const M1: [u8; 32] = [0x11; 32];
+    const M2: [u8; 32] = [0x22; 32];
+    const M3: [u8; 32] = [0x33; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+    const DEADLINE: u64 = T0 + 86_400;
+    const WINDOW: u64 = 7 * 86_400; // 7 days.
+
+    fn windowed_uninitialized() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap()
+    }
+
+    fn windowed_slashed() -> Escrow {
+        let mut e = windowed_uninitialized()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, 200_000, None, DEADLINE).unwrap();
+        e
+    }
+
+    fn watch(id: [u8; 32], escrow: Escrow) -> WatchedEscrow {
+        WatchedEscrow {
+            escrow_id: id,
+            escrow,
+            reference: None,
+        }
+    }
+
+    #[test]
+    fn appeal_window_builder_stores_the_window() {
+        let e = windowed_uninitialized();
+        assert_eq!(e.appeal_window_secs(), WINDOW);
+        assert_eq!(e.appeal_deadline(), 0, "deadline is stamped by slash");
+        assert_eq!(e.appeal_state(), AppealState::None);
+        assert!(!e.is_appeal_under_review());
+    }
+
+    #[test]
+    fn appeal_window_rejects_zero_window() {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let err = e.with_appeal_window(0).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidAppealWindow);
+        assert_eq!(EscrowError::InvalidAppealWindow.code(), 146);
+    }
+
+    #[test]
+    fn appeal_window_is_uninitialized_only() {
+        let live = windowed_slashed();
+        let err = live.with_appeal_window(3600).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+    }
+
+    #[test]
+    fn appeal_window_still_needs_an_unpaused_vault() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.pause(ALICE).unwrap();
+        // The pause guard fires before the Uninitialized-state gate.
+        let err = e.with_appeal_window(WINDOW).unwrap_err();
+        assert_eq!(err, EscrowError::Paused);
+    }
+
+    #[test]
+    fn slash_stamps_the_appeal_deadline() {
+        let e = windowed_slashed();
+        assert_eq!(e.appeal_deadline(), DEADLINE + WINDOW);
+        assert!(e.is_appeal_eligible(DEADLINE));
+        assert!(e.is_appeal_eligible(DEADLINE + WINDOW), "window is inclusive");
+        assert!(!e.is_appeal_eligible(DEADLINE + WINDOW + 1));
+        assert_eq!(e.appeal_state(), AppealState::None);
+    }
+
+    #[test]
+    fn slash_without_a_window_leaves_appeals_off() {
+        // A vault that never opted in has no appeal deadline at all.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, 200_000, None, DEADLINE).unwrap();
+        assert_eq!(e.appeal_deadline(), 0);
+        assert!(!e.is_appeal_eligible(DEADLINE));
+        assert_eq!(
+            e.file_appeal(BOB, DEADLINE),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+    }
+
+    #[test]
+    fn slash_rejects_a_window_that_would_overflow_the_deadline() {
+        // now + window_secs must fit in u64.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, u64::MAX)
+            .unwrap()
+            .with_appeal_window(3600)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            e.slash(ALICE, 200_000, None, u64::MAX),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+        assert_eq!(e.appeal_deadline(), 0, "failed slash changes nothing");
+        assert_eq!(e.penalty_paid(), 0);
+    }
+
+    #[test]
+    fn file_appeal_rejects_a_stranger() {
+        let mut e = windowed_slashed();
+        let err = e.file_appeal(M1, DEADLINE + 1).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(e.appeal_state(), AppealState::None);
+    }
+
+    #[test]
+    fn file_appeal_requires_a_resolvable_panel() {
+        // No panel means a filed appeal could never be reviewed —
+        // reject the filing outright.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, 200_000, None, DEADLINE).unwrap();
+        let err = e.file_appeal(BOB, DEADLINE + 1).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidArbiterPanel);
+        assert_eq!(e.appeal_state(), AppealState::None);
+    }
+
+    #[test]
+    fn file_appeal_needs_a_slash_and_an_open_window() {
+        // Nothing slashed yet: no appeal.
+        let mut e = windowed_uninitialized()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        let err = e.file_appeal(BOB, T0).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidAppealWindow);
+        // Past the window: too late.
+        let mut e = windowed_slashed();
+        let err = e.file_appeal(BOB, DEADLINE + WINDOW + 1).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidAppealWindow);
+        assert_eq!(e.appeal_state(), AppealState::None);
+        // Exactly on the boundary still files (inclusive).
+        let mut e = windowed_slashed();
+        e.file_appeal(BOB, DEADLINE + WINDOW).unwrap();
+        assert_eq!(e.appeal_state(), AppealState::Filed);
+        assert!(e.is_appeal_under_review());
+    }
+
+    #[test]
+    fn file_appeal_is_one_shot() {
+        let mut e = windowed_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        let err = e.file_appeal(BOB, DEADLINE + 2).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidAppealWindow);
+        assert_eq!(e.appeal_state(), AppealState::Filed);
+        // So is the resolved state — a decided appeal stays decided.
+        e.review_appeal(M1, true).unwrap();
+        e.review_appeal(M2, true).unwrap();
+        assert_eq!(e.appeal_state(), AppealState::Upheld);
+        let err = e.file_appeal(BOB, DEADLINE + 3).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidAppealWindow);
+    }
+
+    #[test]
+    fn review_appeal_rejects_a_non_member() {
+        let mut e = windowed_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        let err = e.review_appeal(ALICE, true).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(e.appeal_state(), AppealState::Filed);
+    }
+
+    #[test]
+    fn review_appeal_rejects_a_missing_filing() {
+        let mut e = windowed_slashed();
+        let err = e.review_appeal(M1, true).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidAppealWindow);
+    }
+
+    #[test]
+    fn first_votes_do_not_resolve_the_appeal() {
+        let mut e = windowed_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        assert_eq!(e.review_appeal(M1, false).unwrap(), None);
+        assert_eq!(e.appeal_state(), AppealState::Filed);
+        assert!(e.is_appeal_under_review());
+        let ballot = e.appeal_ballot();
+        assert_eq!(ballot.voted, 1);
+        assert_eq!(ballot.votes[M1[0] as usize % 8], 0, "packed slot is zeroed");
+    }
+
+    #[test]
+    fn uphold_wins_on_threshold_and_keeps_the_penalty() {
+        let mut e = windowed_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        e.review_appeal(M1, true).unwrap();
+        let (outcome, refunded) = e.review_appeal(M2, true).unwrap().unwrap();
+        assert_eq!(outcome, AppealOutcome::Upheld);
+        assert_eq!(refunded, 0);
+        assert_eq!(e.appeal_state(), AppealState::Upheld);
+        assert!(!e.is_appeal_under_review());
+        assert!(!e.is_appeal_eligible(DEADLINE + 1), "decided appeal is closed");
+        assert_eq!(e.penalty_paid(), 200_000, "uphold keeps the penalty");
+        assert_eq!(e.released_amount(), 0);
+        // The terminal ballot rejects late votes.
+        let err = e.review_appeal(M3, false).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidAppealWindow);
+    }
+
+    #[test]
+    fn overturn_refunds_the_penalty_to_the_taker() {
+        let mut e = windowed_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        e.review_appeal(M1, false).unwrap();
+        let (outcome, refunded) = e.review_appeal(M2, false).unwrap().unwrap();
+        assert_eq!(outcome, AppealOutcome::Overturned);
+        assert_eq!(refunded, 200_000);
+        assert_eq!(e.appeal_state(), AppealState::Overturned);
+        assert_eq!(e.penalty_paid(), 0, "overturn clears the penalty ledger");
+        assert_eq!(e.released_amount(), 200_000, "refund routes to the taker");
+        // Conservation stays exact: escrow value is fully accounted.
+        let total = e.released_amount() + e.penalty_paid();
+        assert_eq!(total, 200_000, "no lamports created or destroyed");
+    }
+
+    #[test]
+    fn revote_moves_the_ballot_and_mixed_votes_block_early_resolution() {
+        let mut e = windowed_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        e.review_appeal(M1, true).unwrap();
+        // A member can overwrite their own vote before the tally closes.
+        e.review_appeal(M1, false).unwrap();
+        assert_eq!(e.appeal_state(), AppealState::Filed, "1 overturn < 2");
+        e.review_appeal(M2, true).unwrap();
+        assert_eq!(e.appeal_state(), AppealState::Filed, "split vote stalls");
+        // The second overturner finally reaches threshold.
+        let (outcome, refunded) = e.review_appeal(M3, false).unwrap().unwrap();
+        assert_eq!(outcome, AppealOutcome::Overturned);
+        assert_eq!(refunded, 200_000);
+    }
+
+    #[test]
+    fn appeal_events_follow_the_indexed_escrow_convention() {
+        // Build the configuration through the indexed wrapper so the
+        // appeal events ride the ring.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xF1; 32], T0)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, 200_000, None, DEADLINE).unwrap();
+        let before = e.event_count();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        // A non-resolving vote emits nothing — only the filing and the
+        // resolution ride the ring.
+        e.review_appeal(M1, false, DEADLINE + 2).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let (outcome, refunded) = e.review_appeal(M2, false, DEADLINE + 3).unwrap().unwrap();
+        assert_eq!(outcome, AppealOutcome::Overturned);
+        assert_eq!(e.event_count(), before + 2);
+        let events = e.events();
+        let filed = &events[before];
+        let resolved = &events[before + 1];
+        assert_eq!(filed.kind, EscrowEventKind::AppealFiled);
+        assert_eq!(filed.from, EscrowState::Funded);
+        assert_eq!(filed.to, EscrowState::Funded, "appeals never move funds");
+        assert_eq!(filed.amounts.payout, 0, "filing moves no funds");
+        assert_eq!(filed.amounts.fee, 0);
+        assert_eq!(resolved.kind, EscrowEventKind::AppealResolved);
+        assert_eq!(resolved.appeal_outcome, Some(AppealOutcome::Overturned));
+        assert_eq!(resolved.amounts.payout, refunded);
+        assert_eq!(resolved.amounts.fee, 0, "restitution carries no fee");
+    }
+
+    #[test]
+    fn appeal_csv_export_round_trips() {
+        use crate::event_csv::{csv_to_events, events_to_csv};
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xF1; 32], T0)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, 200_000, None, DEADLINE).unwrap();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        e.review_appeal(M1, true, DEADLINE + 2).unwrap();
+        e.review_appeal(M2, true, DEADLINE + 3).unwrap();
+        let csv = events_to_csv(e.events());
+        assert!(csv.contains("appeal_filed"));
+        assert!(csv.contains("appeal_resolved"));
+        // Round-trips byte-identically (the appeal verdict itself is an
+        // in-ring annotation — the importer stamps `appeal_outcome: None`
+        // by the schema_versions precedent, and the CSV carries it).
+        assert_eq!(events_to_csv(&csv_to_events(&csv).unwrap()), csv);
+    }
+
+    #[test]
+    fn keeper_surfaces_the_file_appeal_action_for_the_taker() {
+        let id = [0xF1; 32];
+        let escrow = windowed_slashed();
+        assert!(escrow.is_appeal_eligible(DEADLINE + 1));
+        let report = scan_keeper_actions(&[watch(id, escrow)], DEADLINE + 1);
+        let file = report
+            .actions
+            .iter()
+            .find(|a| matches!(a.kind, KeeperActionKind::FileAppeal))
+            .expect("taker can file an appeal inside the window");
+        assert_eq!(file.escrow_id, id);
+        assert_eq!(file.caller, BOB);
+        assert_eq!(file.caller_role, "taker");
+        assert_eq!(file.reason, "appeal_window_open");
+    }
+
+    #[test]
+    fn keeper_surfaces_a_review_action_per_unvoted_member() {
+        let id = [0xF1; 32];
+        let mut escrow = windowed_slashed();
+        escrow.file_appeal(BOB, DEADLINE + 1).unwrap();
+        escrow.review_appeal(M1, true).unwrap();
+        let report = scan_keeper_actions(&[watch(id, escrow)], DEADLINE + 2);
+        let mut members: Vec<[u8; 32]> = report
+            .actions
+            .iter()
+            .filter(|a| matches!(a.kind, KeeperActionKind::ReviewAppeal))
+            .map(|a| a.caller)
+            .collect();
+        members.sort();
+        assert_eq!(members, vec![M2, M3], "only unvoted members are nudged");
+        let review = report
+            .actions
+            .iter()
+            .find(|a| matches!(a.kind, KeeperActionKind::ReviewAppeal))
+            .unwrap();
+        assert_eq!(review.reason, "appeal_filed");
+    }
+
+    #[test]
+    fn appeal_fields_round_trip_through_the_serialized_tail() {
+        let mut e = windowed_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        e.review_appeal(M1, true).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes.len(), 3846);
+        // Appeal region: [3820..3846] — window (8), deadline (8), state
+        // (1), ballot (9).
+        assert_eq!(
+            u64::from_le_bytes(bytes[3820..3828].try_into().unwrap()),
+            WINDOW
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[3828..3836].try_into().unwrap()),
+            DEADLINE + WINDOW
+        );
+        assert_eq!(bytes[3836], 1, "AppealState::Filed == 1");
+        assert_eq!(bytes[3837], 1, "one vote cast");
+        // Full-state decode (AV-75 decoder path) preserves the region —
+        // the decoder expects the 8-byte discriminator + body.
+        let mut full = crate::discriminator::vault_account_discriminator().to_vec();
+        full.extend_from_slice(&bytes);
+        let decoded = crate::discriminator::decode_vault_account(&full).unwrap();
+        assert_eq!(decoded.appeal_window_secs, WINDOW);
+        assert_eq!(decoded.appeal_deadline, DEADLINE + WINDOW);
+        assert_eq!(decoded.appeal_state, AppealState::Filed);
+        assert_eq!(decoded.appeal_ballot.voted, 1);
+        // A vault that never opted in zero-fills the region.
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&plain);
+        assert_eq!(&bytes[3820..3846], &[0u8; 26]);
+        // Unknown appeal-state discriminants are rejected by the decoder.
+        let mut bad = full.clone();
+        bad[8 + 3836] = 7;
+        assert!(crate::discriminator::decode_vault_account(&bad).is_err());
+    }
+
+    #[test]
+    fn snapshot_carries_the_appeal_state() {
+        let mut e = windowed_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        let snap = e.snapshot(DEADLINE + 2);
+        let json = snap.to_json();
+        assert!(json.contains(&format!("\"appeal_window_secs\":{}", WINDOW)));
+        assert!(json.contains(&format!(
+            "\"appeal_deadline\":{}",
+            DEADLINE + WINDOW
+        )));
+        assert!(json.contains("\"appeal_state\":\"filed\""));
+        assert!(json.contains("\"appeal_eligible\":false"));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AV-83: CPI target-program allowlist tests.
 // ---------------------------------------------------------------------------
@@ -30323,7 +31445,7 @@ mod cpi_allowlist_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3820);
+        assert_eq!(bytes.len(), 3846);
         assert_eq!(bytes[3495], 1, "Some discriminant");
         assert_eq!(&bytes[3496..3496 + 32], &DEX);
         assert_eq!(&bytes[3496 + 32..3496 + 64], &LENDING);
@@ -30334,10 +31456,11 @@ mod cpi_allowlist_tests {
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes[3495], 0, "None discriminant");
         assert_eq!(&bytes[3496..3496 + 257], &[0u8; 257]);
-        // The field name is the second-to-last VAULT_FIELDS entry
-        // (AV-84 appended the multisig region after it).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 1 + CPI_ALLOWLIST_LEN);
+        // The field name is the sixth-from-last VAULT_FIELDS entry
+        // (AV-84 appended the multisig region after it, AV-86 the
+        // 4-field appeal region after that).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 1 + CPI_ALLOWLIST_LEN);
     }
 }
 
@@ -30509,13 +31632,15 @@ mod multisig_tests {
 
     #[test]
     fn binding_persists_in_the_serialized_tail() {
-        // The multisig region is the new tail: discriminant at offset
-        // 3753 (3820 - 67), then the 32-byte program id, the 32-byte
-        // authority PDA, and the u16 threshold.
+        // The multisig region keeps its offset (appended-last fields
+        // never move earlier offsets): discriminant at offset 3753
+        // (3846 - 26 - 67), then the 32-byte program id, the 32-byte
+        // authority PDA, and the u16 threshold — the 26-byte AV-86
+        // appeal region is the new tail after it.
         let e = bound_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3820);
+        assert_eq!(bytes.len(), 3846);
         assert_eq!(bytes[3753], 1, "Some discriminant");
         assert_eq!(&bytes[3754..3754 + 32], &SQUADS_V4_PROGRAM_ID);
         assert_eq!(&bytes[3754 + 32..3754 + 64], &VAULT_PDA);
@@ -30529,9 +31654,10 @@ mod multisig_tests {
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes[3753], 0, "None discriminant");
         assert_eq!(&bytes[3754..3820], &[0u8; 66]);
-        // The field name is the last VAULT_FIELDS entry.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].2, 1 + MULTISIG_AUTHORITY_LEN);
+        // The field name is the fifth-from-last VAULT_FIELDS entry
+        // (AV-86 appended the 4-field appeal region after it).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 1 + MULTISIG_AUTHORITY_LEN);
         assert_eq!(MULTISIG_AUTHORITY_LEN, 66);
     }
 

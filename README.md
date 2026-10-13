@@ -126,6 +126,9 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_cpi_allowlist(allowlist)` (AV-83) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–8 live target-program ids; empty list leaves the allowlist unset — any target allowed; over-long / zero-address input is `InvalidCpiAllowlist`); when configured, `release_via_cpi` may only invoke a listed target program — `InvalidCpiTarget` (code 120) with full rollback otherwise |
 | `update_cpi_allowlist(initializer, taker, allowlist)` (AV-83) | `Uninitialized` / `Funded` | same (no state change) | **always dual-signed** — both initializer and taker even on a plain escrow (stricter than AV-49 by design: the allowlist guards a privileged execution path); `Uninitialized`/`Funded` only; empty list clears the allowlist (back to any-target-allowed); emits `CpiAllowlistUpdated` only on an actual change |
 | `initialize_multisig_authority(multisig_authority)` (AV-84) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; binds the external multisig program id, the vault PDA that must sign, and the u16 threshold metadata; zero program id / zero authority / zero threshold is `InvalidMultisigAuthority`); immutable once set — the binding is load-bearing for every later authority check; read-only pass-through, never a check gate (zero-trust) |
+| `initialize_appeal_window(window_secs)` (AV-86) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the opt-in slash-appeal window in seconds; `0` is rejected — a zero-second window would give the taker no chance to appeal, `InvalidAppealWindow` code 146); no window configured means slashes are final (backward compatible); emits no event (pre-fund configuration) |
+| `file_appeal(taker)` (AV-86) | `Funded` | `Funded` (no state change — filing moves no funds, it only records the challenge) | taker **only** (`Unauthorized` otherwise, checked before state validity); requires an executed slash (`penalty_paid > 0`), a configured window, no appeal filed or resolved yet (one appeal per slash), `now <= appeal_deadline` (a lapsed window is a hard procedural bar), and a configured arbiter panel to review it — any missing gate is `InvalidAppealWindow` (or `InvalidArbiterPanel` for the missing panel); `now` <- clock sysvar; emits `AppealFiled` (amounts zero) |
+| `review_appeal(member, uphold)` (AV-86) | `Funded` | `Funded` (no state change) | panel member **only** (`Unauthorized` otherwise); one effective vote per member (a re-vote overwrites); the first side to reach the panel threshold resolves — `uphold` keeps the penalty (`Upheld`), `overturn` refunds it to the taker (`penalty_paid` → `0`, accumulated in `released` so the conservation invariant stays exact); a non-resolving vote emits nothing; the resolving vote emits `AppealResolved` (the refunded penalty rides `payout` on overturn, zero on uphold); returns `(outcome, refunded)` — `0` == upheld, `1` == overturned — so the restitution transfer can be sized |
 | `initialize_reference(reference)` (AV-53) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the 32-byte off-chain correlation id — order id / invoice hash; any 32 bytes accepted — read-only pass-through: never read by a check gate, never cleared, never affects amount conservation) |
 | `split_escrow(initializer, taker, amounts, vesting, quorum, dual_sig, milestones)` (AV-81) | `Funded` | `Split` (new terminal state) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`; degenerate initializer == taker self-escrow authorizes with one key passed twice); `Disputed` is `InvalidStateTransition` (arbitration in flight adjudicates the locked funds) and every terminal state rejects a re-split; the amount table must be non-empty, hold at most 16 entries, contain no zero entry, and sum in `u128` to exactly the parent's remaining lockup (`InvalidSplit`, code 142, otherwise — a partial release before the split shrinks the splittable pool); each child is born `Funded` with the parent's initializer / taker / `expires_at` and the explicitly inherited config — vesting / quorum / dual-sig / per-child milestones are *not* inherited unless named (default-inert, anti-misconfiguration); child *i*'s escrow ID derives as `H(parent_id \|\| i)` (SHA-256, `u64` little-endian index); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in `Funded` — no half-split); emits `EscrowSplit` (`Funded -> Split`, `amounts.payout` = Σ child amounts, the `(child_id, amount)` roster rides the event) |
 | `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` / `Split` (AV-81) | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it); a split parent's funds were re-homed into the children, so its vault carries nothing but the rent deposit — closeable like the other terminals |
@@ -1116,6 +1119,7 @@ program error per variant):
 | `SlashNotEligible` | 143 | `initialize_slash_terms` (AV-82) with the zero penalty account; `slash` (AV-82) with no slash terms configured, before the slash deadline, on an already-slashed escrow (one-shot), with an amount above the slashable remainder, on a dual-sig escrow lacking both activation bits, on a `Disputed` escrow (arbitration owns the funds), or on a milestone/subscription-scheduled escrow (the schedule owns the release path) |
 | `InvalidCpiAllowlist` | 144 | `with_cpi_allowlist` / `update_cpi_allowlist` (AV-83) with more than 8 program ids or a zero program id; `update_cpi_allowlist` without both signatures, on a paused escrow, on a `Released`/`Cancelled`/`Expired` vault, or with no allowlist configured |
 | `InvalidMultisigAuthority` | 145 | `with_multisig_authority` (AV-84) with a zero multisig program id, a zero authority PDA, or a zero threshold; `validate_multisig_escrow_call` on a proposed vault-transaction instruction that does not carry the bound authority PDA as a signer |
+| `InvalidAppealWindow` | 146 | `with_appeal_window` (AV-86) with a zero window; `file_appeal` (AV-86) with no slash executed, no window configured, an already-filed or already-resolved appeal, or a lapsed window; `review_appeal` (AV-86) voting on a never-filed or already-resolved appeal |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1416,6 +1420,59 @@ quorum's approval bitmask), and the failed-call invariant holds on every
 path above: any `Err(...)` return leaves the state — and `amount` and the
 `released` counter — exactly untouched (pinned by the
 permission/fuzz/property tests).
+
+**M. Slash appeal window — the taker contests the penalty.** The appeal
+clause is opted in before funding alongside the slash terms: the window
+in seconds during which the taker may appeal an executed slash. Without
+a window, slashes are final (backward compatible). When the initializer
+or arbiter slashes, the window's deadline is stamped as
+`slash_now + window_secs`; inside it, the taker files one appeal and
+the arbiter panel reviews it — uphold keeps the penalty, overturn
+refunds it to the taker (a restitution, no fee):
+
+```
+initializer      taker           panel member      escrow
+   |  initialize_appeal_window(7d)  |                |       |
+   |------------------------------------------>|  (window fixed, |
+   |                                           |   still Uninitialized)
+   |  initialize_slash_terms(penalty, t0+30d)  |       |
+   |------------------------------------------>|               |
+   |  fund(alice)  |                          |              |
+   |------------------------------------------>| Uninitialized→Funded |
+   |  slash(alice, amount/5, t0+31d)  |                       |
+   |------------------------------------------>|  penalty_paid=  |
+   |                                           |  amount/5, stays |
+   |                                           |  Funded; appeal  |
+   |                                           |  deadline =      |
+   |                                           |  slash_now + 7d  |
+   |               file_appeal(bob)  |                       |
+   |               ---------------------------->|  appeal filed;   |
+   |                                            |  AppealFiled     |
+   |                                            |  emitted         |
+   |                                review_appeal(carol, false)    |
+   |                                ---------------------------->|
+   |                                            |  vote recorded;|
+   |                                            |  ballot open — |
+   |                                            |  no event yet  |
+   |                                review_appeal(dave, false)     |
+   |                                ---------------------------->|
+   |                                            |  threshold met:|
+   |                                            |  Overturned;   |
+   |                                            |  penalty_paid  |
+   |                                            |  → 0, released |
+   |                                            |  += amount/5;  |
+   |                                            |  AppealResolved|
+   |                                            |  emitted       |
+   |               file_appeal(bob)  // second filing →          |
+   |                                 // Err(InvalidAppealWindow):|
+   |                                 // one appeal per slash    |
+```
+
+The appeal is a procedural safeguard, not a second negotiation: the
+window gates the *filing* (a lapsed window is a hard bar), the panel's
+threshold gates the *resolution*, and the ballot is terminal — a
+resolved appeal rejects further votes, so the recorded votes stay as
+the audit trail of how the panel decided.
 
 ## Indexer events (AV-18)
 

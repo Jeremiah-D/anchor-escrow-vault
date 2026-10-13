@@ -47,6 +47,15 @@
 //!   is listed as a second action (`caller_role: "arbiter"`). The
 //!   enforcement size is the caller's decision — the action carries
 //!   the slashable remainder (`amount`), not a decided slash.
+//! - `file_appeal` (AV-86): the taker appeals the executed slash inside
+//!   the opt-in window (see [`Escrow::is_appeal_eligible`]) — the taker
+//!   is the caller (`caller_role: "taker"`). Filing moves no funds; it
+//!   opens the panel's review.
+//! - `review_appeal` (AV-86): a filed slash appeal awaits panel review
+//!   (see [`Escrow::is_appeal_under_review`]) — one action per panel
+//!   member who has not voted yet (`caller_role: "panel_member"`), so
+//!   a member-operated keeper bot learns which appeals await its vote;
+//!   the uphold/overturn judgment is the member's call-time decision.
 //!
 //! Every listed action carries the exact arguments the keeper needs to
 //! build the instruction: `caller` (the signing key), `mint` (the bound
@@ -242,6 +251,25 @@ pub enum KeeperActionKind {
     /// slashable remainder — the enforcement size is the caller's
     /// decision at call time; the keeper carries the pool.
     Slash,
+    /// `file_appeal(taker, now)` (AV-86): the taker's appeal against
+    /// the executed slash, inside the opt-in window. Listed when
+    /// [`Escrow::is_appeal_eligible`] holds at scan time — a listed
+    /// filing is always executable, never a `Paused` or
+    /// `InvalidAppealWindow` rejection. The taker is the caller
+    /// (`caller_role: "taker"`); filing moves no funds, it opens the
+    /// panel's review. `amount` is the slashed penalty under appeal —
+    /// informational, so the operator sees the stake, not a decided
+    /// outcome.
+    FileAppeal,
+    /// `review_appeal(member, uphold, now)` (AV-86): one panel member's
+    /// review vote on a filed slash appeal. Listed once per panel
+    /// member who has not voted yet when
+    /// [`Escrow::is_appeal_under_review`] holds at scan time, so a
+    /// member-operated keeper bot learns which appeals await its vote;
+    /// the uphold/overturn judgment is the member's call-time decision,
+    /// not a keeper input. `amount` is the slashed penalty the ballot
+    /// decides over.
+    ReviewAppeal,
 }
 
 impl KeeperActionKind {
@@ -256,6 +284,8 @@ impl KeeperActionKind {
             KeeperActionKind::PanelJudgment => "submit_panel_judgment",
             KeeperActionKind::ReleasePeriod => "release_period",
             KeeperActionKind::Slash => "slash",
+            KeeperActionKind::FileAppeal => "file_appeal",
+            KeeperActionKind::ReviewAppeal => "review_appeal",
         }
     }
 }
@@ -739,6 +769,65 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     multisig_authority: e.multisig_authority,
                     reason: "slash_deadline_passed",
                 });
+            }
+        }
+        // AV-86: the slash-appeal paths. A taker whose slash is under a
+        // live appeal window is listed for `file_appeal` — the
+        // predicate mirrors every `file_appeal` gate (Funded, slashed,
+        // window configured and open, no appeal filed or resolved, not
+        // paused, panel configured), so a listed filing is always
+        // executable. A filed appeal lists one `review_appeal` per panel
+        // member who has not voted yet — members who already voted
+        // (their vote stands unless they re-vote) are not re-listed.
+        if e.is_appeal_eligible(now) {
+            actions.push(KeeperAction {
+                escrow_id: w.escrow_id,
+                kind: KeeperActionKind::FileAppeal,
+                caller: e.taker(),
+                caller_role: "taker",
+                mint: e.mint(),
+                // Filing moves no funds — there is no refund
+                // destination; `amount` is the slashed penalty under
+                // appeal, informational.
+                refund_to: None,
+                amount: e.penalty_paid(),
+                decimals: e.decimals(),
+                reference: w.reference,
+                extension_count: e.extension_count(),
+                multisig_authority: e.multisig_authority,
+                reason: "appeal_window_open",
+            });
+        }
+        if e.is_appeal_under_review() {
+            if let Some(panel) = e.arbiter_panel() {
+                let ballot = e.appeal_ballot();
+                for (i, member) in panel.members[..panel.n as usize].iter().enumerate() {
+                    // Skip members whose effective vote is already on
+                    // record — the ballot is still open (a re-vote is
+                    // always allowed), but the keeper only nudges
+                    // members who have not voted yet.
+                    if ballot.voted & (1 << i) != 0 {
+                        continue;
+                    }
+                    actions.push(KeeperAction {
+                        escrow_id: w.escrow_id,
+                        kind: KeeperActionKind::ReviewAppeal,
+                        caller: *member,
+                        caller_role: "panel_member",
+                        mint: e.mint(),
+                        // The review moves the penalty only on overturn
+                        // — the judgment is the member's call-time
+                        // decision; `amount` is the slashed penalty the
+                        // ballot decides over.
+                        refund_to: None,
+                        amount: e.penalty_paid(),
+                        decimals: e.decimals(),
+                        reference: w.reference,
+                        extension_count: e.extension_count(),
+                        multisig_authority: e.multisig_authority,
+                        reason: "appeal_filed",
+                    });
+                }
             }
         }
     }
@@ -3733,13 +3822,34 @@ mod schema_migration_tests {
         assert_eq!(first.block_reason, None);
         // The dry-run's changed-fields list, flattened in step order.
         let names: Vec<&str> = first.new_fields.iter().map(|f| f.name).collect();
-        assert_eq!(names, vec!["schema_version", "slash_terms", "penalty_paid"]);
+        assert_eq!(
+            names,
+            vec![
+                "schema_version",
+                "slash_terms",
+                "penalty_paid",
+                "appeal_window_secs",
+                "appeal_deadline",
+                "appeal_state",
+                "appeal_ballot"
+            ]
+        );
         let second = &report.actions[1];
         assert_eq!(second.escrow_id, ID2);
         assert_eq!(second.from_version, 1);
         assert!(second.ready);
         let names: Vec<&str> = second.new_fields.iter().map(|f| f.name).collect();
-        assert_eq!(names, vec!["slash_terms", "penalty_paid"]);
+        assert_eq!(
+            names,
+            vec![
+                "slash_terms",
+                "penalty_paid",
+                "appeal_window_secs",
+                "appeal_deadline",
+                "appeal_state",
+                "appeal_ballot"
+            ]
+        );
     }
 
     #[test]
@@ -3780,8 +3890,9 @@ mod schema_migration_tests {
         let b = scan_schema_migrations(&watched).to_json();
         assert_eq!(a, b);
         assert!(a.contains("\"action\":\"migrate_schema\""));
-        assert!(a.contains("\"from_version\":0,\"to_version\":2"));
+        assert!(a.contains("\"from_version\":0,\"to_version\":3"));
         assert!(a.contains("\"name\":\"slash_terms\",\"type\":\"Option<SlashTerms>\",\"bytes\":41"));
+        assert!(a.contains("\"name\":\"appeal_ballot\",\"type\":\"AppealBallot\",\"bytes\":9"));
         assert!(a.contains("\"ready\":true,\"block_reason\":null"));
     }
 

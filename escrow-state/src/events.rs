@@ -200,6 +200,8 @@
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
 //! | Slashed (AV-82) | 0 | 0 | 0 | the slashed amount, routed to the penalty account (the escrow stays `Funded`; from == to == `Funded`) |
+//! | AppealFiled (AV-86) | 0 | 0 | 0 | 0 — the taker filed the appeal inside the window; no funds move (from == to == `Funded`) |
+//! | AppealResolved (AV-86) | the penalty refunded to the taker on overturn — a restitution, no fee (0 on uphold; from == to == `Funded`) | 0 | 0 | 0 |
 //!
 //! # Backward compatibility
 //!
@@ -208,7 +210,7 @@
 //! dependency-free.
 
 use crate::{Escrow, EscrowError, EscrowState, MilestonePlan, QuorumPolicy, SplitConfig, VestingSchedule};
-use crate::{OverrideValue, TemplatePreset};
+use crate::{AppealOutcome, OverrideValue, TemplatePreset};
 use crate::cpi::CpiError;
 use crate::cpi_call::{CpiInvocation, CpiReceipt};
 
@@ -554,6 +556,24 @@ pub enum EscrowEventKind {
     /// [`Escrow::with_cpi_allowlist`] emits no event — pre-fund
     /// configuration, like [`Escrow::with_payout_allowlist`].)
     CpiAllowlistUpdated,
+    /// AV-86: the taker filed an appeal against the executed slash
+    /// ([`Escrow::file_appeal`]). `from == to == Funded` — filing moves
+    /// no funds, it only records the challenge and opens the arbiter
+    /// panel's review. Amounts are zero; the actor is the taker. Always
+    /// emitted on success: a successful filing always opens a review,
+    /// so there is no no-op case.
+    AppealFiled,
+    /// AV-86: the arbiter panel resolved the filed slash appeal
+    /// ([`Escrow::review_appeal`]) — the first side (uphold or overturn)
+    /// to collect `threshold` matching votes. `from == to == Funded`.
+    /// On overturn the refunded penalty rides [`EventAmounts::payout`]
+    /// (a taker restitution, no fee — the penalty is neither a fresh
+    /// payout nor an initializer refund); on uphold all amounts are
+    /// zero. The verdict rides the event's `appeal_outcome` field (see
+    /// [`EscrowEvent::appeal_outcome`]), and the actor is the member
+    /// whose vote was the M-th match. Always emitted on resolution: a
+    /// non-resolving vote emits nothing (the ballot is still open).
+    AppealResolved,
 }
 
 impl EscrowEventKind {
@@ -648,6 +668,13 @@ impl EscrowEventKind {
             // AV-83: appended after Slashed so discriminants 0–42
             // stay stable for already-serialized histories.
             43 => Self::CpiAllowlistUpdated,
+            // AV-86: appended after CpiAllowlistUpdated so
+            // discriminants 0–43 stay stable for already-serialized
+            // histories.
+            44 => Self::AppealFiled,
+            // AV-86: appended after AppealFiled so discriminants 0–44
+            // stay stable for already-serialized histories.
+            45 => Self::AppealResolved,
             _ => return None,
         })
     }
@@ -700,6 +727,8 @@ impl EscrowEventKind {
             Self::EscrowSplit => "escrow_split",
             Self::Slashed => "escrow_slashed",
             Self::CpiAllowlistUpdated => "cpi_allowlist_updated",
+            Self::AppealFiled => "appeal_filed",
+            Self::AppealResolved => "appeal_resolved",
         }
     }
 
@@ -753,6 +782,8 @@ impl EscrowEventKind {
             "escrow_split" => Self::EscrowSplit,
             "escrow_slashed" => Self::Slashed,
             "cpi_allowlist_updated" => Self::CpiAllowlistUpdated,
+            "appeal_filed" => Self::AppealFiled,
+            "appeal_resolved" => Self::AppealResolved,
             _ => return None,
         })
     }
@@ -874,6 +905,21 @@ impl EventAmounts {
             fee: 0,
             refund: 0,
             penalty,
+            rent_reclaimed: 0,
+        }
+    }
+
+    /// A slash-appeal overturn (AV-86): the refunded penalty rides
+    /// `payout` — it is a taker restitution (no fee sliced), neither a
+    /// fresh payout for work nor an initializer refund. Rides the
+    /// [`EscrowEventKind::AppealResolved`] event; an upheld appeal
+    /// resolves with [`EventAmounts::none`].
+    pub(crate) fn appeal_overturn(refunded: u64) -> Self {
+        Self {
+            payout: refunded,
+            fee: 0,
+            refund: 0,
+            penalty: 0,
             rent_reclaimed: 0,
         }
     }
@@ -1020,6 +1066,15 @@ pub struct EscrowEvent {
     /// mirroring the `template_params_hash` precedent — never a
     /// `push_event` parameter. `(u8, u8)` keeps the event `Copy`.
     pub schema_versions: Option<(u8, u8)>,
+    /// AV-86: the panel's verdict on the filed slash appeal, carried by
+    /// [`EscrowEventKind::AppealResolved`] (`None` on every other kind —
+    /// like `template_params_hash`, which rides only `TemplateApplied`).
+    /// The emitter stamps it after the push (see `push_event`),
+    /// mirroring the `template_params_hash` precedent — never a
+    /// `push_event` parameter — so the log records exactly the verdict
+    /// the M-th vote settled, and indexers read the outcome without
+    /// replaying the ballot.
+    pub appeal_outcome: Option<AppealOutcome>,
 }
 
 /// One split child on an [`EscrowEventKind::EscrowSplit`] event's
@@ -1213,6 +1268,9 @@ impl IndexedEscrow {
             // AV-85: stamped by the SchemaMigrated emitter after the
             // push — never a push_event parameter (see above).
             schema_versions: None,
+            // AV-86: stamped by the AppealResolved emitter after the
+            // push — never a push_event parameter (see above).
+            appeal_outcome: None,
         };
         self.next_seq += 1;
         self.events.push(event);
@@ -3115,6 +3173,99 @@ impl IndexedEscrow {
         Ok(slashed)
     }
 
+    /// Opt in to the slash-appeal window (mirrors
+    /// [`Escrow::with_appeal_window`], AV-86). Configuration: emits no
+    /// event.
+    pub fn with_appeal_window(mut self, window_secs: u64) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_appeal_window(window_secs)?;
+        Ok(self)
+    }
+
+    /// File an appeal against the executed slash (AV-86; mirrors
+    /// [`Escrow::file_appeal`]): `Funded -> Funded` — the taker contests
+    /// the penalty inside the opt-in window, opening the arbiter
+    /// panel's review. Emits [`EscrowEventKind::AppealFiled`] (from ==
+    /// to == `Funded`, amounts zero) with the taker as the actor. On
+    /// executor failure the state machine rolls back and nothing is
+    /// emitted, like every other failed transition. `at` is both the
+    /// event timestamp and the state machine's `now`.
+    ///
+    /// [`Escrow::file_appeal`]: super::Escrow::file_appeal
+    pub fn file_appeal(&mut self, taker: [u8; 32], at: u64) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner.file_appeal(taker, at)?;
+        self.push_event(
+            EscrowEventKind::AppealFiled,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(taker),
+        );
+        Ok(())
+    }
+
+    /// Cast a panel member's review vote on the filed slash appeal
+    /// (AV-86; mirrors [`Escrow::review_appeal`]). A non-resolving vote
+    /// emits nothing — the ballot is still open, so there is no
+    /// no-op-case event. The M-th matching vote resolves the appeal and
+    /// emits [`EscrowEventKind::AppealResolved`] (from == to ==
+    /// `Funded`; on overturn `amounts.payout` is the penalty refunded
+    /// to the taker, zero on uphold) with the voting member as the
+    /// actor, and the verdict is stamped on the event's `appeal_outcome`
+    /// field. Returns `Ok(None)` while the ballot is open, or
+    /// `Ok(Some((outcome, refunded)))` on resolution — `refunded` is the
+    /// penalty returned to the taker (`0` on uphold) so the caller can
+    /// size the transfer. `at` is the event timestamp; the state
+    /// machine itself is not time-gated here (the window gates the
+    /// filing, not the review).
+    ///
+    /// [`Escrow::review_appeal`]: super::Escrow::review_appeal
+    pub fn review_appeal(
+        &mut self,
+        member: [u8; 32],
+        uphold: bool,
+        at: u64,
+    ) -> Result<Option<(AppealOutcome, u64)>, EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.review_appeal(member, uphold);
+        let resolved = self.map_reentrant(result, at)?;
+        if let Some((outcome, refunded)) = resolved {
+            let amounts = if refunded > 0 {
+                EventAmounts::appeal_overturn(refunded)
+            } else {
+                EventAmounts::none()
+            };
+            self.push_event(
+                EscrowEventKind::AppealResolved,
+                from,
+                self.inner.state(),
+                amounts,
+                at,
+                None,
+                None,
+                None,
+                None,
+                Some(member),
+            );
+            // Stamp the verdict after the push (the AV-77
+            // `template_params_hash` precedent): the event carries the
+            // outcome the M-th vote settled, never a `push_event`
+            // parameter.
+            self.events
+                .last_mut()
+                .expect("AppealResolved event just pushed")
+                .appeal_outcome = Some(outcome);
+        }
+        Ok(resolved)
+    }
+
     /// AV-81: wrap a freshly-split child escrow in its own event log.
     /// Replays the exact lifecycle the inner state machine ran —
     /// `Initialized` (seq 0, the per-escrow invariant), then
@@ -4846,7 +4997,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(44), None);
+        assert_eq!(EscrowEventKind::from_discriminant(46), None);
     }
 
     #[test]
@@ -4862,7 +5013,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(44), None);
+        assert_eq!(EscrowEventKind::from_discriminant(46), None);
     }
 
     #[test]
@@ -4874,11 +5025,12 @@ mod event_tests {
         e.migrate_schema(ALICE, T0 + 1).unwrap();
         // AV-85: one SchemaMigrated per applied step — the event chain
         // records every from → to version pair in seq order.
-        assert_eq!(e.event_count(), before + 2, "one event per chain step");
+        assert_eq!(e.event_count(), before + 3, "one event per chain step");
         let events = e.events();
         let first = &events[before];
         let second = &events[before + 1];
-        for ev in [first, second] {
+        let third = &events[before + 2];
+        for ev in [first, second, third] {
             assert_eq!(ev.kind, EscrowEventKind::SchemaMigrated);
             assert_eq!(ev.from, EscrowState::Uninitialized);
             assert_eq!(ev.to, EscrowState::Uninitialized, "from == to == current state");
@@ -4886,13 +5038,15 @@ mod event_tests {
         }
         assert_eq!(first.schema_versions, Some((0, 1)));
         assert_eq!(second.schema_versions, Some((1, 2)));
+        assert_eq!(third.schema_versions, Some((2, 3)));
         assert_eq!(second.seq, first.seq + 1, "chain order in seq");
+        assert_eq!(third.seq, second.seq + 1, "chain order in seq");
         // The on-chain history ring records the same transitions — the
         // initializer is the single signer, so it rides the ring's
         // actor slot. (The ring already holds the `Initialized` entry
         // from construction.)
         let history = e.inner().event_history();
-        assert_eq!(history.len(), 3, "ring records each chain step");
+        assert_eq!(history.len(), 4, "ring records each chain step");
         let entry = history.last().expect("ring records the migration");
         assert_eq!(entry.kind, EscrowEventKind::SchemaMigrated);
         assert_eq!(entry.at, T0 + 1);
@@ -4901,16 +5055,16 @@ mod event_tests {
 
     #[test]
     fn migrate_schema_chain_emits_single_event_for_single_step() {
-        // A v1 vault runs just its own step: exactly one event, stamped
-        // (1, 2).
+        // A v2 vault runs just its own step: exactly one event, stamped
+        // (2, 3).
         let mut e = indexed(1_000_000);
-        e.inner.schema_version = 1;
+        e.inner.schema_version = 2;
         let before = e.event_count();
         e.migrate_schema(ALICE, T0 + 1).unwrap();
         assert_eq!(e.event_count(), before + 1);
         let ev = last(&e);
         assert_eq!(ev.kind, EscrowEventKind::SchemaMigrated);
-        assert_eq!(ev.schema_versions, Some((1, 2)));
+        assert_eq!(ev.schema_versions, Some((2, 3)));
     }
 
     #[test]
@@ -4920,8 +5074,8 @@ mod event_tests {
         let before_events = e.event_count();
         let plan = e.migrate_schema_dry_run(ALICE).unwrap();
         assert_eq!(plan.from, 0);
-        assert_eq!(plan.to, 2);
-        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.to, 3);
+        assert_eq!(plan.steps.len(), 3);
         assert_eq!(e.event_count(), before_events, "dry-run emits nothing");
         assert_eq!(e.inner.schema_version(), 0, "dry-run mutates nothing");
         // A refused dry-run also emits nothing.
@@ -5396,7 +5550,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(44), None);
+        assert_eq!(EscrowEventKind::from_discriminant(46), None);
     }
 
     #[test]
@@ -5411,7 +5565,31 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(44), None);
+        assert_eq!(EscrowEventKind::from_discriminant(46), None);
+    }
+
+    #[test]
+    fn appeal_filed_kind_round_trips() {
+        // AV-86: discriminant 44, appended after CpiAllowlistUpdated —
+        // 0–43 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::AppealFiled;
+        assert_eq!(kind.discriminant(), 44);
+        assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
+        assert_eq!(kind.name(), "appeal_filed");
+        assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
+        assert_eq!(EscrowEventKind::from_discriminant(46), None);
+    }
+
+    #[test]
+    fn appeal_resolved_kind_round_trips() {
+        // AV-86: discriminant 45, appended after AppealFiled —
+        // 0–44 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::AppealResolved;
+        assert_eq!(kind.discriminant(), 45);
+        assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
+        assert_eq!(kind.name(), "appeal_resolved");
+        assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
+        assert_eq!(EscrowEventKind::from_discriminant(46), None);
     }
 
     #[test]

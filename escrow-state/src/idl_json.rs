@@ -180,6 +180,9 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "Option<CpiAllowlist>" => IdlType::Option(Box::new(IdlType::Named("CpiAllowlist"))),
         // AV-84: opt-in multisig authority binding.
         "Option<MultisigAuthority>" => IdlType::Option(Box::new(IdlType::Named("MultisigAuthority"))),
+        // AV-86: the panel's running ballot on a filed slash appeal
+        // (always present, zeroed when no appeal is filed).
+        "AppealBallot" => IdlType::Named("AppealBallot"),
         "Option<DefaultJudgment>" => IdlType::Option(Box::new(IdlType::Named("DefaultJudgment"))),
         // AV-65: opt-in arbiter panel.
         "Option<ArbiterPanel>" => IdlType::Option(Box::new(IdlType::Named("ArbiterPanel"))),
@@ -348,6 +351,13 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
         "SlashTerms" => vec![
             ("penalty_account", IdlType::PublicKey),
             ("slash_deadline", IdlType::U64),
+        ],
+        // AppealBallot { voted: u8, votes: [u8; 8] } (AV-86: 9 bytes —
+        // the voter bitmask plus the 8 fixed vote slots; always
+        // present on the vault, zeroed when no appeal is filed).
+        "AppealBallot" => vec![
+            ("voted", IdlType::U8),
+            ("votes", IdlType::Array(ArrayElem::U8, 8)),
         ],
         other => panic!("idl_json: unknown named type: {other}"),
     }
@@ -569,6 +579,7 @@ fn render_idl_json() -> String {
         "SlashTerms",
         "CpiAllowlist",
         "MultisigAuthority",
+        "AppealBallot",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -751,6 +762,9 @@ fn named_type_sizes_pin_constants() {
     // AV-82: penalty account + slash deadline.
     assert_eq!(size("SlashTerms"), SLASH_TERMS_LEN);
     assert_eq!(size("SlashTerms"), 40);
+    // AV-86: voter bitmask + 8 vote slots.
+    assert_eq!(size("AppealBallot"), APPEAL_BALLOT_LEN);
+    assert_eq!(size("AppealBallot"), 9);
 }
 
 #[test]
@@ -818,7 +832,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 46, "error variant count drift");
+    assert_eq!(errors.len(), 47, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -853,6 +867,8 @@ fn idl_errors_pin_enum() {
     // AV-83: appended, never renumbered.
     assert_eq!(EscrowError::InvalidCpiAllowlist.code(), 144);
     assert_eq!(EscrowError::InvalidMultisigAuthority.code(), 145);
+    // AV-86: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidAppealWindow.code(), 146);
 }
 
 #[test]

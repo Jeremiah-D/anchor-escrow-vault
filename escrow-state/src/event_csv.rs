@@ -211,6 +211,10 @@ pub fn csv_to_events(csv: &str) -> Result<Vec<EscrowEvent>, CsvError> {
             // the CSV projection either — `None` on import, like the
             // other kind-specific extras.
             schema_versions: None,
+            // AV-86: the appeal verdict is not carried by the CSV
+            // projection either — `None` on import, like the other
+            // kind-specific extras.
+            appeal_outcome: None,
         });
     }
     Ok(events)

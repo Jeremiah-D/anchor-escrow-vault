@@ -2665,6 +2665,105 @@ pub mod escrow_vault {
         Ok(slashed)
     }
 
+    /// Opt in to the slash-appeal window (AV-86; mirrors
+    /// `Escrow::with_appeal_window`). `Uninitialized` only, like
+    /// `initialize_slash_terms`: the window is fixed before funds move.
+    /// A zero window is `InvalidAppealWindow` (code 146) — a
+    /// zero-second window would give the taker no chance to appeal.
+    /// Emits no event (pre-fund configuration).
+    pub fn initialize_appeal_window(
+        ctx: Context<InitializeAppealWindow>,
+        window_secs: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_appeal_window(window_secs)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
+    /// File an appeal against the executed slash (AV-86; mirrors
+    /// `Escrow::file_appeal`): `Funded -> Funded` — filing moves no
+    /// funds, it only records the taker's challenge and opens the
+    /// arbiter panel's review. The taker signs — only the slashed party
+    /// may contest the penalty.
+    /// `now` comes from the Solana clock sysvar (never an instruction
+    /// param — a caller-supplied timestamp could rewind back inside
+    /// the window). The state machine enforces the full eligibility
+    /// gate (taker-only, panel configured, slash executed, window
+    /// configured and open, one appeal per slash). Emits `AppealFiled`
+    /// (from == to == `Funded`, amounts zero), mirroring
+    /// `IndexedEscrow::file_appeal`.
+    pub fn file_appeal(ctx: Context<FileAppeal>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        escrow
+            .file_appeal(ctx.accounts.taker.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::AppealFiled,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.taker.key()),
+        );
+        Ok(())
+    }
+
+    /// Cast a panel member's review vote on the filed slash appeal
+    /// (AV-86; mirrors `Escrow::review_appeal`): `uphold == true`
+    /// keeps the penalty, `uphold == false` overturns it and refunds
+    /// the penalty to the taker. The member signs; the state machine
+    /// enforces one-effective-vote-per-member and resolves when either
+    /// side reaches the panel threshold (the AV-65 tally precedent).
+    /// A non-resolving vote emits nothing (the ballot is still open);
+    /// the M-th matching vote emits `AppealResolved` (from == to ==
+    /// `Funded`; the refunded penalty rides `payout` on overturn, zero
+    /// on uphold), mirroring `IndexedEscrow::review_appeal`. Returns
+    /// the resolution as `(outcome, refunded)` — `outcome` 0 ==
+    /// upheld, 1 == overturned — so the real build can size the
+    /// restitution transfer; `None` while the ballot is open.
+    pub fn review_appeal(ctx: Context<ReviewAppeal>, uphold: bool) -> Result<Option<(u8, u64)>> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        let resolved = escrow
+            .review_appeal(ctx.accounts.member.key().to_bytes(), uphold)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        if let Some((outcome, refunded)) = resolved {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::AppealResolved,
+                from,
+                escrow.state() as u8,
+                refunded,
+                0,
+                0,
+                now,
+                None,
+                None,
+                None,
+                None,
+                Some(ctx.accounts.member.key()),
+            );
+            Ok(Some((outcome as u8, refunded)))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Clear the AV-27 timelock by dual-signed emergency governance
     /// (AV-41; mirrors `Escrow::emergency_unlock`). Both the initializer
     /// and the taker must sign — one party alone is `Unauthorized`.
@@ -4145,6 +4244,45 @@ pub struct Slash<'info> {
     pub vault_token_account: AccountInfo<'info>,
 }
 
+/// AV-86: opt into the slash-appeal window (pre-fund configuration).
+#[derive(Accounts)]
+pub struct InitializeAppealWindow<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer fixes the appeal window; the state machine
+    /// rejects re-configuration once the escrow leaves `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-86: the taker files an appeal against the executed slash.
+#[derive(Accounts)]
+pub struct FileAppeal<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Must equal the escrow's taker; the state machine rejects anyone
+    /// else with `Unauthorized` (checked before state validity, so a
+    /// stranger learns nothing about the slash). A constraint in the
+    /// real build additionally asserts `taker.key() == vault.taker`.
+    pub taker: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the appeal-window check
+    /// (never an instruction param — a caller-supplied timestamp could
+    /// rewind back inside the window).
+    pub clock: AccountInfo<'info>,
+}
+
+/// AV-86: one panel member casts their review vote on the filed appeal.
+#[derive(Accounts)]
+pub struct ReviewAppeal<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Must be one of the panel's member keys; the state machine
+    /// rejects anyone else with `Unauthorized`. A constraint in the
+    /// real build additionally asserts the key is a panel member.
+    pub member: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the event's `at` timestamp.
+    pub clock: AccountInfo<'info>,
+}
+
 #[derive(Accounts)]
 pub struct Escalate<'info> {
     #[account(mut)]
@@ -5103,6 +5241,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidMultisigAuthority => {
             error!(ErrorCode::InvalidMultisigAuthority)
         }
+        escrow_state::EscrowError::InvalidAppealWindow => {
+            error!(ErrorCode::InvalidAppealWindow)
+        }
     }
 }
 
@@ -5196,4 +5337,6 @@ pub enum ErrorCode {
     SlashNotEligible,
     #[msg("Invalid CPI target-program allowlist (AV-83): with_cpi_allowlist / update_cpi_allowlist with more than 8 program ids or a zero address; update_cpi_allowlist by a non-dual signature, on a paused escrow, on a Released/Cancelled/Expired vault, or with no allowlist configured")]
     InvalidCpiAllowlist,
+    #[msg("Invalid slash-appeal window (AV-86): with_appeal_window with a zero window — a zero-second window would give the taker no chance to appeal; file_appeal with no slash executed, no window configured, an already-filed or already-resolved appeal, or a lapsed window")]
+    InvalidAppealWindow,
 }

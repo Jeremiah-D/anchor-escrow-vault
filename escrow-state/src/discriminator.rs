@@ -36,15 +36,15 @@
 //! the result.
 
 use super::{
-    sha256, ArbiterPanel, CpiAllowlist, DefaultJudgment, Escrow, EscrowEventKind, EscrowState,
-    EventHistorySlot, FeeSchedule, FeeTier, MilestonePlan, MultisigAuthority, PanelVote,
-    PayoutAllowlist, QuorumPolicy, SlashTerms, SubscriptionSchedule, VestingSchedule,
-    ANCHOR_DISCRIMINATOR_LEN, ARBITER_PANEL_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
-    ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_CPI_ALLOWLIST,
-    MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS, MAX_PAYOUT_ALLOWLIST,
-    MAX_SUBSCRIPTION_PERIODS, MILESTONE_PLAN_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN,
-    PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_TERMS_LEN,
-    SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
+    sha256, AppealBallot, AppealState, ArbiterPanel, CpiAllowlist, DefaultJudgment, Escrow,
+    EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier, MilestonePlan,
+    MultisigAuthority, PanelVote, PayoutAllowlist, QuorumPolicy, SlashTerms, SubscriptionSchedule,
+    VestingSchedule, ANCHOR_DISCRIMINATOR_LEN, APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN,
+    CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN,
+    MAX_ATTESTORS, MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES,
+    MAX_PANEL_MEMBERS, MAX_PAYOUT_ALLOWLIST, MAX_SUBSCRIPTION_PERIODS, MILESTONE_PLAN_LEN,
+    MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN,
+    SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
 };
 
 /// Program-side `#[account]` type names, in Anchor IDL order. The single
@@ -136,6 +136,11 @@ pub enum AccountDecodeError {
     /// a value the accessors cannot safely read (AV-66; AV-32
     /// panic-free guarantee).
     InvalidFeeSchedule { tier_count: u8, tier: u8 },
+    /// The appeal lifecycle byte is not a known
+    /// [`AppealState`](crate::AppealState) discriminant (0–3). The
+    /// mapping is pinned to declaration order (AV-86; AV-32 panic-free
+    /// guarantee).
+    InvalidAppealStateDiscriminant(u8),
 }
 
 /// Bounds-checked cursor over the account body. Every read is
@@ -743,6 +748,45 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         None
     };
 
+    // AV-86: the opt-in slash-appeal window in seconds, always present
+    // (zeroed when no window is configured). Appended last so every
+    // earlier offset above is unchanged.
+    let appeal_window_secs = c.u64_le()?;
+    // AV-86: the appeal deadline stamped by `slash`, always present
+    // (zeroed when no slash was executed under a configured window).
+    // Appended last so every earlier offset above is unchanged.
+    let appeal_deadline = c.u64_le()?;
+    // AV-86: the appeal lifecycle discriminant, always present. The
+    // discriminant is validated 0–3 — an out-of-range value would
+    // decode to a state the accessors cannot name, so the panic-free
+    // decoder rejects it (see `InvalidAppealStateDiscriminant`).
+    let appeal_state = match c.u8()? {
+        0 => AppealState::None,
+        1 => AppealState::Filed,
+        2 => AppealState::Upheld,
+        3 => AppealState::Overturned,
+        other => return Err(AccountDecodeError::InvalidAppealStateDiscriminant(other)),
+    };
+    // AV-86: the panel's running appeal ballot, always present: the
+    // 1-byte voter bitmask followed by the 8 fixed vote slots.
+    // Appended last so every earlier offset above is unchanged. The
+    // vote bytes are plain u8s — no range validation needed; only
+    // slots in the `voted` mask carry a real vote.
+    let appeal_voted = c.u8()?;
+    let mut appeal_votes = [0u8; 8];
+    for slot in appeal_votes.iter_mut() {
+        *slot = c.u8()?;
+    }
+    let appeal_ballot = AppealBallot {
+        voted: appeal_voted,
+        votes: appeal_votes,
+    };
+    debug_assert_eq!(
+        APPEAL_BALLOT_LEN,
+        1 + 8,
+        "appeal ballot region drift vs APPEAL_BALLOT_LEN"
+    );
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -869,6 +913,15 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // decoded escrow carries the same program id / authority PDA /
         // threshold metadata the setup recorded.
         multisig_authority,
+        // AV-86: the slash-appeal window, deadline, lifecycle state and
+        // panel ballot are persisted — a decoded escrow carries the
+        // same appeal terms the setup recorded and the same appeal
+        // progress `file_appeal` / `review_appeal` recorded, so the
+        // appeal gates decide identically after a decode.
+        appeal_window_secs,
+        appeal_deadline,
+        appeal_state,
+        appeal_ballot,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

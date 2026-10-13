@@ -42,7 +42,7 @@
 //! The snapshot is a pure read: it borrows the escrow, emits no events,
 //! and advances no state — a dry run by construction.
 
-use crate::{format_amount, Escrow, EscrowState, EventHistoryEntry, MultisigAuthority};
+use crate::{format_amount, AppealState, Escrow, EscrowState, EventHistoryEntry, MultisigAuthority};
 
 /// Render 32 bytes as 64 lowercase hex characters (same convention as
 /// [`crate::keeper`]'s serializer).
@@ -424,6 +424,20 @@ pub struct EscrowSnapshot {
     /// succeed at [`EscrowSnapshot::at`] — the keeper scan lists
     /// exactly these escrows.
     pub slash_eligible: bool,
+    /// AV-86: the opt-in slash-appeal window in seconds (`0` = no
+    /// window configured — a slash is then final).
+    pub appeal_window_secs: u64,
+    /// AV-86: the Unix timestamp at which the taker's appeal window
+    /// closes (`0` = no slash executed under a configured window).
+    pub appeal_deadline: u64,
+    /// AV-86: the slash appeal's lifecycle state — `None` until the
+    /// taker files, `Filed` while the arbiter panel reviews, terminally
+    /// `Upheld` or `Overturned`.
+    pub appeal_state: AppealState,
+    /// AV-86: whether [`Escrow::file_appeal`](crate::Escrow::file_appeal)
+    /// could succeed at [`EscrowSnapshot::at`] — the keeper scan lists
+    /// exactly these escrows for `file_appeal`.
+    pub appeal_eligible: bool,
 }
 
 /// AV-82: point-in-time, read-only view of the opt-in slash terms —
@@ -648,6 +662,15 @@ impl Escrow {
             }),
             penalty_paid: self.penalty_paid(),
             slash_eligible: self.is_slash_eligible(now),
+            // AV-86: the appeal window, its deadline, the lifecycle
+            // state and the at-`now` filing eligibility ride the export
+            // — so an off-chain indexer can watch for appealable
+            // slashes and live ballots without replaying the appeal
+            // events.
+            appeal_window_secs: self.appeal_window_secs(),
+            appeal_deadline: self.appeal_deadline(),
+            appeal_state: self.appeal_state(),
+            appeal_eligible: self.is_appeal_eligible(now),
         }
     }
 }
@@ -1071,6 +1094,22 @@ impl EscrowSnapshot {
         s.push_str(&self.penalty_paid.to_string());
         s.push_str(",\"slash_eligible\":");
         s.push_str(if self.slash_eligible { "true" } else { "false" });
+        // AV-86: the appeal window, deadline, lifecycle state and
+        // filing eligibility — `appeal_state` renders as its canonical
+        // snake_case name (the `EscrowEventKind::name` precedent).
+        s.push_str(",\"appeal_window_secs\":");
+        s.push_str(&self.appeal_window_secs.to_string());
+        s.push_str(",\"appeal_deadline\":");
+        s.push_str(&self.appeal_deadline.to_string());
+        s.push_str(",\"appeal_state\":\"");
+        s.push_str(match self.appeal_state {
+            AppealState::None => "none",
+            AppealState::Filed => "filed",
+            AppealState::Upheld => "upheld",
+            AppealState::Overturned => "overturned",
+        });
+        s.push_str("\",\"appeal_eligible\":");
+        s.push_str(if self.appeal_eligible { "true" } else { "false" });
         s.push('}');
         s
     }
@@ -1112,7 +1151,7 @@ mod snapshot_tests {
              \"at\":1750000000,\
              \"initializer\":\"{init}\",\"taker\":\"{taker}\",\
              \"state\":\"funded\",\
-             \"schema_version\":2,\"migration_pending\":false,\
+             \"schema_version\":3,\"migration_pending\":false,\
              \"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\
              \"released\":0,\"display_released\":\"0\",\
              \"remaining\":1000000,\"display_remaining\":\"1000000\",\
@@ -1129,7 +1168,8 @@ mod snapshot_tests {
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
              \"max_extension_secs\":0,\"extension_count\":0,\"arbiter_panel\":null,\
-             \"slash_terms\":null,\"penalty_paid\":0,\"slash_eligible\":false\
+             \"slash_terms\":null,\"penalty_paid\":0,\"slash_eligible\":false,\
+             \"appeal_window_secs\":0,\"appeal_deadline\":0,\"appeal_state\":\"none\",\"appeal_eligible\":false\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),
@@ -1141,9 +1181,9 @@ mod snapshot_tests {
     fn snapshot_carries_schema_version() {
         // A fresh vault is born current.
         let snap = funded(AMOUNT, NEVER).snapshot(MID);
-        assert_eq!(snap.schema_version, 2);
+        assert_eq!(snap.schema_version, 3);
         assert!(!snap.migration_pending);
-        assert!(snap.to_json().contains("\"schema_version\":2"));
+        assert!(snap.to_json().contains("\"schema_version\":3"));
         assert!(snap.to_json().contains("\"migration_pending\":false"));
         // A migrated vault's snapshot shows the new version.
         let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER).unwrap();
@@ -1156,9 +1196,9 @@ mod snapshot_tests {
         assert!(snap.to_json().contains("\"migration_pending\":true"));
         e.migrate_schema(ALICE).unwrap();
         let snap = e.snapshot(MID);
-        assert_eq!(snap.schema_version, 2);
+        assert_eq!(snap.schema_version, 3);
         assert!(!snap.migration_pending);
-        assert!(snap.to_json().contains("\"schema_version\":2"));
+        assert!(snap.to_json().contains("\"schema_version\":3"));
         assert!(snap.to_json().contains("\"migration_pending\":false"));
     }
 

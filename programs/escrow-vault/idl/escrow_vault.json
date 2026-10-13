@@ -545,6 +545,28 @@
       "args": [
         {"name": "amount", "type": "u64"}
       ]
+    },
+    {
+      "name": "initialize_appeal_window",
+      "discriminator": [2, 177, 162, 186, 74, 115, 177, 120],
+      "accounts": [],
+      "args": [
+        {"name": "window_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "file_appeal",
+      "discriminator": [254, 237, 206, 155, 40, 232, 240, 211],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "review_appeal",
+      "discriminator": [205, 51, 73, 250, 74, 104, 0, 169],
+      "accounts": [],
+      "args": [
+        {"name": "uphold", "type": "bool"}
+      ]
     }
   ],
   "accounts": [
@@ -607,7 +629,11 @@
           {"name": "slash_terms", "type": {"option": {"defined": "SlashTerms"}}, "offset": 3454},
           {"name": "penalty_paid", "type": "u64", "offset": 3495},
           {"name": "cpi_allowlist", "type": {"option": {"defined": "CpiAllowlist"}}, "offset": 3503},
-          {"name": "multisig_authority", "type": {"option": {"defined": "MultisigAuthority"}}, "offset": 3761}
+          {"name": "multisig_authority", "type": {"option": {"defined": "MultisigAuthority"}}, "offset": 3761},
+          {"name": "appeal_window_secs", "type": "u64", "offset": 3828},
+          {"name": "appeal_deadline", "type": "u64", "offset": 3836},
+          {"name": "appeal_state", "type": "u8", "offset": 3844},
+          {"name": "appeal_ballot", "type": {"defined": "AppealBallot"}, "offset": 3845}
         ]
       }
     }
@@ -762,6 +788,16 @@
           {"name": "threshold", "type": "u16", "offset": 64}
         ]
       }
+    },
+    {
+      "name": "AppealBallot",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "voted", "type": "u8", "offset": 0},
+          {"name": "votes", "type": {"array": ["u8", 8]}, "offset": 1}
+        ]
+      }
     }
   ],
   "errors": [
@@ -810,7 +846,8 @@
     {"code": 142, "name": "InvalidSplit"},
     {"code": 143, "name": "SlashNotEligible"},
     {"code": 144, "name": "InvalidCpiAllowlist"},
-    {"code": 145, "name": "InvalidMultisigAuthority"}
+    {"code": 145, "name": "InvalidMultisigAuthority"},
+    {"code": 146, "name": "InvalidAppealWindow"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
