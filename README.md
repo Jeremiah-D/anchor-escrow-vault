@@ -1548,6 +1548,40 @@ same `amount` rendered in human units (`500000` at 6 decimals →
 ]}
 ```
 
+## Aggregate statistics view (AV-78)
+
+`escrow-state/src/aggregate.rs` rolls a watched fleet up into one
+read-only report for keeper/operator dashboards — per-state counts
+(all eight lifecycle states, fixed shape), an amount histogram (eight
+fixed power-of-ten buckets in the smallest unit), average escrow
+durations, and total locked value. Pure reads: no chain writes, no
+state mutation, no events emitted.
+
+```rust
+let view = scan_aggregate_view(&watched, now); // keeper query over &[WatchedEscrow]
+let view = EscrowAggregateView::from_indexed(&indexed, now); // full fidelity over &[IndexedEscrow]
+let json = view.to_json(); // deterministic hand-serialized JSON
+```
+
+Two duration metrics, each honest about its data source:
+
+- `avg_completed_duration_secs` — first event (`Initialized`) to the
+  terminal event, averaged over escrows in a terminal state
+  (`Released`/`Cancelled`/`Settled`/`Closed`). Only the
+  `from_indexed` path can measure it: `IndexedEscrow` carries the full
+  event history. On the keeper `WatchedEscrow` path the field stays
+  `null` — plain snapshots have no event timestamps, and the view
+  never fabricates one.
+- `avg_open_duration_secs` — `now - fund_at` averaged over escrows
+  currently holding funds (`Funded`/`Disputed`); `fund_at` is always
+  recorded by `fund()`.
+
+`total_locked` sums `remaining_amount()` over the fleet as a `u128`
+(serialized as a decimal string — a fleet sum can exceed JSON-safe
+integer range). `EscrowAggregateView::to_json()` follows the crate's
+deterministic JSON convention, so the aggregate result exports next to
+the per-escrow snapshots.
+
 ## Close sweep (AV-40)
 
 Terminal-state vaults (`Cancelled` / `Released` / `Settled`) have

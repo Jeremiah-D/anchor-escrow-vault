@@ -44,6 +44,10 @@ mod tx_message;
 // validation. Client-side composition only: produces a plain `Escrow`,
 // so the vault layout, IDL, and Anchor program are untouched.
 mod templates;
+// AV-78: escrow aggregate statistics view — read-only fleet rollup
+// (per-state counts, amount histogram, escrow durations, locked totals)
+// for keeper/operator dashboards, with deterministic JSON export.
+mod aggregate;
 #[cfg(test)]
 mod idl_json;
 #[cfg(test)]
@@ -158,6 +162,10 @@ pub use events::{CpiRouteAudit, EscrowEvent, EscrowEventKind, EventAmounts, Inde
 pub use keeper::{
     scan_keeper_actions, KeeperAction, KeeperActionKind, KeeperReport, WatchedEscrow,
 };
+// AV-78: escrow aggregate statistics view — read-only fleet rollup
+// (per-state counts, amount histogram, durations, locked totals) with
+// deterministic JSON export. Purely additive.
+pub use keeper::scan_aggregate_view;
 
 // AV-40: terminal-vault close sweep — scan a batch of escrows for
 // closeable (`Cancelled` / `Released` / `Settled`) vaults, group the
@@ -246,6 +254,11 @@ pub use tx_message::{
     instruction_for_action, signable_message_base64, CompiledInstruction, MessageHeader,
     ProgramInstruction, TransactionMessage, TxMessageError,
 };
+
+// AV-78: escrow aggregate statistics view — read-only fleet rollup
+// (per-state counts, amount histogram, escrow durations, locked totals)
+// with deterministic JSON export. Purely additive.
+pub use aggregate::{AmountBucket, EscrowAggregateView, StateCount};
 
 /// Lifecycle states of an escrow vault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

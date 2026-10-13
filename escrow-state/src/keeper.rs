@@ -134,7 +134,8 @@
 //! execution.
 
 use crate::{
-    format_amount, vault_close_rent_reclaimed, Escrow, EscrowError, EscrowState, IndexedEscrow,
+    aggregate::EscrowAggregateView, format_amount, vault_close_rent_reclaimed, Escrow, EscrowError,
+    EscrowState, IndexedEscrow,
 };
 
 /// Render 32 bytes as 64 lowercase hex characters.
@@ -762,10 +763,25 @@ impl CloseReport {
 ///   accounts have not served their purpose yet, and the close would
 ///   fail the terminal-state gate.
 ///
+/// AV-78: keeper aggregate statistics view. A read-only rollup over the
+/// watched fleet — per-state counts (all eight lifecycle states),
+/// amount histogram, average open escrow duration (`now - fund_at` over
+/// `Funded`/`Disputed`), and total locked value — for operator
+/// dashboards. Pure reads: no chain writes, no state mutation, no events
+/// emitted.
+///
+/// Completed escrow durations are unavailable on this path: plain watch
+/// snapshots carry no event history, so
+/// [`EscrowAggregateView::avg_completed_duration_secs`] stays `None`
+/// (never fabricated); use
+/// [`EscrowAggregateView::from_indexed`] for the full-fidelity view.
+pub fn scan_aggregate_view(watched: &[WatchedEscrow], now: u64) -> EscrowAggregateView {
+    EscrowAggregateView::from_watched(watched, now)
+}
+
 /// The scan carries no `now`: closing has no time gate, so the list is
 /// valid until the vaults are closed and re-scanned.
-pub fn scan_closeable(watched: &[WatchedEscrow]) -> CloseReport {
-    // AV-40: `rent_reclaimed` is computed from the current
+pub fn scan_closeable(watched: &[WatchedEscrow]) -> CloseReport {    // AV-40: `rent_reclaimed` is computed from the current
     // `VAULT_SPACE` formula (via `vault_close_rent_reclaimed`), never
     // hardcoded — the same figure `close_vault` returns on success.
     let rent = vault_close_rent_reclaimed();

@@ -69,7 +69,7 @@ fn hex8(bytes: &[u8; 8]) -> String {
 }
 
 /// Canonical name for a lifecycle state in snapshot JSON.
-fn state_name(state: EscrowState) -> &'static str {
+pub(crate) fn state_name(state: EscrowState) -> &'static str {
     match state {
         EscrowState::Uninitialized => "uninitialized",
         EscrowState::Funded => "funded",
