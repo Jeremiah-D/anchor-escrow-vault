@@ -393,6 +393,14 @@
       ]
     },
     {
+      "name": "initialize_multisig_authority",
+      "discriminator": [237, 121, 3, 75, 41, 195, 244, 196],
+      "accounts": [],
+      "args": [
+        {"name": "multisig_authority", "type": {"defined": "MultisigAuthority"}}
+      ]
+    },
+    {
       "name": "initialize_reference",
       "discriminator": [199, 226, 9, 15, 40, 9, 131, 223],
       "accounts": [],
@@ -598,7 +606,8 @@
           {"name": "schema_version", "type": "u8", "offset": 3453},
           {"name": "slash_terms", "type": {"option": {"defined": "SlashTerms"}}, "offset": 3454},
           {"name": "penalty_paid", "type": "u64", "offset": 3495},
-          {"name": "cpi_allowlist", "type": {"option": {"defined": "CpiAllowlist"}}, "offset": 3503}
+          {"name": "cpi_allowlist", "type": {"option": {"defined": "CpiAllowlist"}}, "offset": 3503},
+          {"name": "multisig_authority", "type": {"option": {"defined": "MultisigAuthority"}}, "offset": 3761}
         ]
       }
     }
@@ -742,6 +751,17 @@
           {"name": "len", "type": "u8", "offset": 256}
         ]
       }
+    },
+    {
+      "name": "MultisigAuthority",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "program_id", "type": "publicKey", "offset": 0},
+          {"name": "authority", "type": "publicKey", "offset": 32},
+          {"name": "threshold", "type": "u16", "offset": 64}
+        ]
+      }
     }
   ],
   "errors": [
@@ -789,7 +809,8 @@
     {"code": 141, "name": "TemplateOverrideRejected"},
     {"code": 142, "name": "InvalidSplit"},
     {"code": 143, "name": "SlashNotEligible"},
-    {"code": 144, "name": "InvalidCpiAllowlist"}
+    {"code": 144, "name": "InvalidCpiAllowlist"},
+    {"code": 145, "name": "InvalidMultisigAuthority"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

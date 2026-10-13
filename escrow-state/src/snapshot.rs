@@ -42,7 +42,7 @@
 //! The snapshot is a pure read: it borrows the escrow, emits no events,
 //! and advances no state — a dry run by construction.
 
-use crate::{format_amount, Escrow, EscrowState, EventHistoryEntry};
+use crate::{format_amount, Escrow, EscrowState, EventHistoryEntry, MultisigAuthority};
 
 /// Render 32 bytes as 64 lowercase hex characters (same convention as
 /// [`crate::keeper`]'s serializer).
@@ -371,6 +371,11 @@ pub struct EscrowSnapshot {
     /// configured (AV-83). When `Some`, a `release_via_cpi` whose
     /// target program is outside the list is rejected.
     pub cpi_allowlist: Option<Vec<[u8; 32]>>,
+    /// Bound multisig authority, or `None` when no multisig binding is
+    /// configured (AV-84). The multisig program id, the vault PDA that
+    /// must sign, and the threshold metadata — read-only pass-through
+    /// for keepers and indexers, never a check gate.
+    pub multisig_authority: Option<MultisigAuthority>,
     /// Opt-in 32-byte off-chain reference memo (e.g. order id / invoice
     /// hash) bound at setup via [`Escrow::with_reference`], or `None`
     /// when no reference was attached (AV-53). Read-only pass-through
@@ -575,6 +580,10 @@ impl Escrow {
             // `release_via_cpi`, never rewritten by a transition
             // except `update_cpi_allowlist`.
             cpi_allowlist: self.cpi_allowlist().map(|list| list.as_slice().to_vec()),
+            // AV-84: the multisig authority binding rides the export
+            // for reconciliation — read-only, immutable once set
+            // (Uninitialized-only builder).
+            multisig_authority: self.multisig_authority(),
             // AV-53: the off-chain reference memo rides the export for
             // reconciliation — read-only, never a gate input.
             reference: self.reference(),
@@ -936,6 +945,22 @@ impl EscrowSnapshot {
             }
             None => s.push_str("null"),
         }
+        // AV-84: the bound multisig authority — `null` when no
+        // multisig binding is configured, else the program id, the
+        // authority PDA, and the threshold metadata.
+        s.push_str(",\"multisig_authority\":");
+        match &self.multisig_authority {
+            Some(bound) => {
+                s.push_str("{\"program_id\":\"");
+                s.push_str(&hex32(&bound.program_id));
+                s.push_str("\",\"authority\":\"");
+                s.push_str(&hex32(&bound.authority));
+                s.push_str("\",\"threshold\":");
+                s.push_str(&bound.threshold.to_string());
+                s.push('}');
+            }
+            None => s.push_str("null"),
+        }
         // AV-53: the off-chain reference memo — 64-char lowercase hex
         // or `null` — for off-chain reconciliation.
         s.push_str(",\"reference\":");
@@ -1087,7 +1112,7 @@ mod snapshot_tests {
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
-             \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\"cpi_allowlist\":null,\
+             \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\"cpi_allowlist\":null,\"multisig_authority\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
              \"max_extension_secs\":0,\"extension_count\":0,\"arbiter_panel\":null,\

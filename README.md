@@ -125,6 +125,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `update_payout_allowlist(initializer, taker, allowlist)` (AV-49) | `Uninitialized` / `Funded` | same (no state change) | dual-signature governance — both initializer and taker on a dual-sig escrow, initializer alone on a plain escrow (`Unauthorized` otherwise); empty clears the allowlist (back to taker-only payouts); emits `PayoutAllowlistUpdated` only on an actual change |
 | `initialize_cpi_allowlist(allowlist)` (AV-83) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–8 live target-program ids; empty list leaves the allowlist unset — any target allowed; over-long / zero-address input is `InvalidCpiAllowlist`); when configured, `release_via_cpi` may only invoke a listed target program — `InvalidCpiTarget` (code 120) with full rollback otherwise |
 | `update_cpi_allowlist(initializer, taker, allowlist)` (AV-83) | `Uninitialized` / `Funded` | same (no state change) | **always dual-signed** — both initializer and taker even on a plain escrow (stricter than AV-49 by design: the allowlist guards a privileged execution path); `Uninitialized`/`Funded` only; empty list clears the allowlist (back to any-target-allowed); emits `CpiAllowlistUpdated` only on an actual change |
+| `initialize_multisig_authority(multisig_authority)` (AV-84) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; binds the external multisig program id, the vault PDA that must sign, and the u16 threshold metadata; zero program id / zero authority / zero threshold is `InvalidMultisigAuthority`); immutable once set — the binding is load-bearing for every later authority check; read-only pass-through, never a check gate (zero-trust) |
 | `initialize_reference(reference)` (AV-53) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the 32-byte off-chain correlation id — order id / invoice hash; any 32 bytes accepted — read-only pass-through: never read by a check gate, never cleared, never affects amount conservation) |
 | `split_escrow(initializer, taker, amounts, vesting, quorum, dual_sig, milestones)` (AV-81) | `Funded` | `Split` (new terminal state) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`; degenerate initializer == taker self-escrow authorizes with one key passed twice); `Disputed` is `InvalidStateTransition` (arbitration in flight adjudicates the locked funds) and every terminal state rejects a re-split; the amount table must be non-empty, hold at most 16 entries, contain no zero entry, and sum in `u128` to exactly the parent's remaining lockup (`InvalidSplit`, code 142, otherwise — a partial release before the split shrinks the splittable pool); each child is born `Funded` with the parent's initializer / taker / `expires_at` and the explicitly inherited config — vesting / quorum / dual-sig / per-child milestones are *not* inherited unless named (default-inert, anti-misconfiguration); child *i*'s escrow ID derives as `H(parent_id \|\| i)` (SHA-256, `u64` little-endian index); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in `Funded` — no half-split); emits `EscrowSplit` (`Funded -> Split`, `amounts.payout` = Σ child amounts, the `(child_id, amount)` roster rides the event) |
 | `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` / `Split` (AV-81) | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it); a split parent's funds were re-homed into the children, so its vault carries nothing but the rent deposit — closeable like the other terminals |
@@ -1097,6 +1098,7 @@ program error per variant):
 | `InvalidSplit` | 142 | `split_escrow` (AV-81) with an empty amount table, more than 16 children, a zero child amount, an amount table whose `u128` sum differs from the parent's remaining lockup, or a per-child milestone-plan list whose length mismatches the amount table |
 | `SlashNotEligible` | 143 | `initialize_slash_terms` (AV-82) with the zero penalty account; `slash` (AV-82) with no slash terms configured, before the slash deadline, on an already-slashed escrow (one-shot), with an amount above the slashable remainder, on a dual-sig escrow lacking both activation bits, on a `Disputed` escrow (arbitration owns the funds), or on a milestone/subscription-scheduled escrow (the schedule owns the release path) |
 | `InvalidCpiAllowlist` | 144 | `with_cpi_allowlist` / `update_cpi_allowlist` (AV-83) with more than 8 program ids or a zero program id; `update_cpi_allowlist` without both signatures, on a paused escrow, on a `Released`/`Cancelled`/`Expired` vault, or with no allowlist configured |
+| `InvalidMultisigAuthority` | 145 | `with_multisig_authority` (AV-84) with a zero multisig program id, a zero authority PDA, or a zero threshold; `validate_multisig_escrow_call` on a proposed vault-transaction instruction that does not carry the bound authority PDA as a signer |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1944,7 +1946,8 @@ two-way consistency check against the IDL parameter table:
 | slash_terms | Option<SlashTerms> | 41 |
 | penalty_paid | u64 | 8 |
 | cpi_allowlist | Option<CpiAllowlist> | 258 |
-| **total**     |                   | **3753** |
+| multisig_authority | Option<MultisigAuthority> | 67 |
+| **total**     |                   | **3820** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2019,11 +2022,14 @@ is configured) — and the 8-byte dispute-evidence disclosure deadline
 escalating-party region (AV-68: 1-byte discriminant + 32-byte key,
 zeroed when the escrow was never disputed) — and the 258-byte CPI
 target-program allowlist region (AV-83: 1-byte live-program count + 8
-32-byte program ids, zeroed when no allowlist is configured).
-`escrow-state` exposes `VAULT_SPACE` (3761) and
-`VAULT_SPACE_NO_QUORUM` (3271) for the Anchor `space =` constraint, plus a
+32-byte program ids, zeroed when no allowlist is configured) — and the
+67-byte multisig authority region (AV-84: 1-byte discriminant + 32-byte
+multisig program id + 32-byte authority PDA + u16 threshold, zeroed when
+no multisig binding is configured).
+`escrow-state` exposes `VAULT_SPACE` (3828) and
+`VAULT_SPACE_NO_QUORUM` (3338) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **27,067,440 lamports** to be
+mainnet rent parameters the full vault needs **27,533,760 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)

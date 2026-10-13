@@ -354,6 +354,8 @@ mod execution_plan_tests {
             reference: None,
             // AV-59: test actions carry no extension history.
             extension_count: 0,
+            // AV-84: test actions carry no multisig binding.
+            multisig_authority: None,
             reason: "test",
         }
     }

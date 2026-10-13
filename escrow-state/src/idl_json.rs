@@ -178,6 +178,8 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "Option<PayoutAllowlist>" => IdlType::Option(Box::new(IdlType::Named("PayoutAllowlist"))),
         // AV-83: opt-in CPI target-program allowlist.
         "Option<CpiAllowlist>" => IdlType::Option(Box::new(IdlType::Named("CpiAllowlist"))),
+        // AV-84: opt-in multisig authority binding.
+        "Option<MultisigAuthority>" => IdlType::Option(Box::new(IdlType::Named("MultisigAuthority"))),
         "Option<DefaultJudgment>" => IdlType::Option(Box::new(IdlType::Named("DefaultJudgment"))),
         // AV-65: opt-in arbiter panel.
         "Option<ArbiterPanel>" => IdlType::Option(Box::new(IdlType::Named("ArbiterPanel"))),
@@ -219,6 +221,8 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         // AV-81: the split_escrow instruction's explicit-inheritance
         // params — optional configs, so `Option<...>`; the per-child
         // milestone plans are one optional plan list.
+        // AV-84: the multisig authority binding instruction arg.
+        "MultisigAuthority" => IdlType::Named("MultisigAuthority"),
         "Option<VestingSchedule>" => {
             IdlType::Option(Box::new(IdlType::Named("VestingSchedule")))
         }
@@ -275,6 +279,13 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
         "CpiAllowlist" => vec![
             ("addrs", IdlType::Array(ArrayElem::PublicKey, 8)),
             ("len", IdlType::U8),
+        ],
+        // MultisigAuthority { program_id: Pubkey, authority: Pubkey,
+        // threshold: u16 } (AV-84).
+        "MultisigAuthority" => vec![
+            ("program_id", IdlType::PublicKey),
+            ("authority", IdlType::PublicKey),
+            ("threshold", IdlType::U16),
         ],
         // DefaultJudgment { deadline_secs: u64, default_taker_amount: u64 }
         // (AV-55: 16 bytes).
@@ -557,6 +568,7 @@ fn render_idl_json() -> String {
         "FeeSchedule",
         "SlashTerms",
         "CpiAllowlist",
+        "MultisigAuthority",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -710,6 +722,9 @@ fn named_type_sizes_pin_constants() {
     assert_eq!(size("PayoutAllowlist"), PAYOUT_ALLOWLIST_LEN);
     // AV-83: eight 32-byte program ids + count byte.
     assert_eq!(size("CpiAllowlist"), CPI_ALLOWLIST_LEN);
+    // AV-84: 32-byte multisig program id + 32-byte authority PDA + u16
+    // threshold.
+    assert_eq!(size("MultisigAuthority"), MULTISIG_AUTHORITY_LEN);
     // AV-55: deadline + taker share.
     assert_eq!(size("DefaultJudgment"), DEFAULT_JUDGMENT_LEN);
     assert_eq!(size("DefaultJudgment"), 16);
@@ -803,7 +818,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 45, "error variant count drift");
+    assert_eq!(errors.len(), 46, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -837,6 +852,7 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::SlashNotEligible.code(), 143);
     // AV-83: appended, never renumbered.
     assert_eq!(EscrowError::InvalidCpiAllowlist.code(), 144);
+    assert_eq!(EscrowError::InvalidMultisigAuthority.code(), 145);
 }
 
 #[test]

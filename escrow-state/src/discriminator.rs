@@ -37,12 +37,13 @@
 
 use super::{
     sha256, ArbiterPanel, CpiAllowlist, DefaultJudgment, Escrow, EscrowEventKind, EscrowState,
-    EventHistorySlot, FeeSchedule, FeeTier, MilestonePlan, PanelVote, PayoutAllowlist, QuorumPolicy,
-    SlashTerms, SubscriptionSchedule, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN, ARBITER_PANEL_LEN,
-    CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN,
-    MAX_ATTESTORS, MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES,
-    MAX_PANEL_MEMBERS, MAX_PAYOUT_ALLOWLIST, MAX_SUBSCRIPTION_PERIODS, MILESTONE_PLAN_LEN,
-    PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_TERMS_LEN,
+    EventHistorySlot, FeeSchedule, FeeTier, MilestonePlan, MultisigAuthority, PanelVote,
+    PayoutAllowlist, QuorumPolicy, SlashTerms, SubscriptionSchedule, VestingSchedule,
+    ANCHOR_DISCRIMINATOR_LEN, ARBITER_PANEL_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
+    ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_CPI_ALLOWLIST,
+    MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS, MAX_PAYOUT_ALLOWLIST,
+    MAX_SUBSCRIPTION_PERIODS, MILESTONE_PLAN_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN,
+    PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_TERMS_LEN,
     SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
 };
 
@@ -717,6 +718,30 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(CPI_ALLOWLIST_LEN)?;
         None
     };
+    // AV-84: `multisig_authority`: the `None` discriminant followed by
+    // a zeroed 66-byte region (32-byte multisig program id + 32-byte
+    // authority PDA + u16 threshold), appended last so every earlier
+    // offset above is unchanged. The threshold is a plain u16 — no
+    // range validation needed; the discriminant itself is validated
+    // by `option_present` (see `InvalidOptionDiscriminant`).
+    let multisig_authority = if c.option_present("multisig_authority")? {
+        let program_id = c.pubkey()?;
+        let authority = c.pubkey()?;
+        let threshold = c.u16_le()?;
+        debug_assert_eq!(
+            MULTISIG_AUTHORITY_LEN,
+            32 + 32 + 2,
+            "multisig region drift vs MULTISIG_AUTHORITY_LEN"
+        );
+        Some(MultisigAuthority {
+            program_id,
+            authority,
+            threshold,
+        })
+    } else {
+        c.skip(MULTISIG_AUTHORITY_LEN)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -840,6 +865,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-83: the CPI target allowlist is persisted — a decoded
         // escrow enforces the same target pin as the live one.
         cpi_allowlist,
+        // AV-84: the multisig authority binding is persisted — a
+        // decoded escrow carries the same program id / authority PDA /
+        // threshold metadata the setup recorded.
+        multisig_authority,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

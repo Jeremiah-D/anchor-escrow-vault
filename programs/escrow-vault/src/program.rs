@@ -1908,6 +1908,41 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Bind an external multisig as an escrow authority (AV-84; mirrors
+    /// `Escrow::with_multisig_authority`): records the multisig program
+    /// id, the vault PDA that must sign, and the threshold metadata.
+    /// `Uninitialized` only, like `initialize_cpi_allowlist` — the
+    /// binding is immutable once set. A zero multisig program id, a
+    /// zero authority PDA, or a zero threshold is
+    /// `InvalidMultisigAuthority` (code 145). The vault account
+    /// already reserves the full 67-byte region (1-byte discriminant +
+    /// 66-byte record, zeroed when `None`), so the binding is written
+    /// in place — no realloc needed in the real build. Emits no event
+    /// (pre-fund configuration).
+    ///
+    /// Zero-trust: the escrow program never calls into the multisig
+    /// program and never enforces the threshold — the external program
+    /// owns the vote. The escrow's authority checks keep comparing
+    /// signer keys exactly as for an EOA; when the initializer *is*
+    /// the vault PDA, the PDA's signature authorizes it. The threshold
+    /// is read-only metadata for keepers (see
+    /// `escrow_state::KeeperAction::multisig_authority`) and indexers.
+    pub fn initialize_multisig_authority(
+        ctx: Context<InitializeMultisigAuthority>,
+        multisig_authority: MultisigAuthority,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_multisig_authority(
+                multisig_authority.program_id.to_bytes(),
+                multisig_authority.authority.to_bytes(),
+                multisig_authority.threshold,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
     /// Bind the opt-in 32-byte off-chain reference memo (AV-53; mirrors
     /// `Escrow::with_reference`): an order id, invoice hash, or any
     /// other 32-byte correlation id from the operator's off-chain
@@ -3168,6 +3203,19 @@ pub struct Vault {
     /// 120), with full rollback — a phishing frontend cannot steer
     /// the payout through a hostile program by swapping the target.
     pub cpi_allowlist: Option<CpiAllowlist>,
+    /// AV-84: opt-in multisig authority binding; mirrors
+    /// `escrow_state`'s `multisig_authority`. `None` for an escrow
+    /// with no multisig binding. The account always reserves the full
+    /// 67-byte region (1-byte discriminant + 32-byte multisig program
+    /// id + 32-byte authority PDA + u16 threshold, zeroed when `None`)
+    /// so `initialize_multisig_authority` writes it in place without
+    /// reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `cpi_allowlist`). Read-only pass-through: no check gate reads
+    /// it — the escrow's authority checks compare signer keys exactly
+    /// as for an EOA, and the external multisig program guarantees the
+    /// PDA only signs once its threshold voted (zero-trust).
+    pub multisig_authority: Option<MultisigAuthority>,
 }
 
 /// Skeleton mirror of `escrow_state::SlashTerms`: the opt-in
@@ -3254,6 +3302,19 @@ pub struct PayoutAllowlist {
 pub struct CpiAllowlist {
     pub addrs: [Pubkey; 8],
     pub len: u8,
+}
+
+/// AV-84: skeleton mirror of `escrow_state::MultisigAuthority`: the
+/// external multisig program id, the vault PDA that must sign, and the
+/// u16 threshold metadata (informational only — enforced by the
+/// multisig program, never by the escrow). Serialized size is pinned
+/// by `escrow_state::MULTISIG_AUTHORITY_LEN` (66 bytes: 32-byte program
+/// id + 32-byte authority + u16 threshold).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct MultisigAuthority {
+    pub program_id: Pubkey,
+    pub authority: Pubkey,
+    pub threshold: u16,
 }
 
 /// AV-55: skeleton mirror of `escrow_state::DefaultJudgment`: the
@@ -4549,6 +4610,17 @@ pub struct UpdateCpiAllowlist<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitializeMultisigAuthority<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer binds the multisig authority; the state
+    /// machine rejects binding once the escrow leaves `Uninitialized`,
+    /// and rejects a zero multisig program id, a zero authority PDA,
+    /// or a zero threshold (`InvalidMultisigAuthority`, code 145).
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitializeReference<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
@@ -5009,6 +5081,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         }
         escrow_state::EscrowError::InvalidCpiAllowlist => {
             error!(ErrorCode::InvalidCpiAllowlist)
+        }
+        escrow_state::EscrowError::InvalidMultisigAuthority => {
+            error!(ErrorCode::InvalidMultisigAuthority)
         }
     }
 }

@@ -59,6 +59,7 @@ mod aggregate;
 mod idl_json;
 #[cfg(test)]
 mod sim;
+mod multisig;
 
 // ---------------------------------------------------------------------------
 // SHA-256 (hand-rolled, zero dependencies).
@@ -157,6 +158,16 @@ pub use cpi::{
 // SHA-256 accounts-hash audit commitment, and the success receipt.
 // Purely additive: no existing signature changed.
 pub use cpi_call::{cpi_accounts_hash, CpiInvocation, CpiReceipt};
+
+// AV-84: Squads multisig authority adapter — the bound multisig
+// authority record, the Squads v4 PDA seed assembly, the vault-transaction
+// instruction assembly, and the pre-vote shape validation. Purely
+// additive: no existing signature changed.
+pub use multisig::{
+    assemble_multisig_escrow_call, squads_v4_multisig_seeds, squads_v4_vault_seeds,
+    validate_multisig_escrow_call, MultisigAuthority, MULTISIG_AUTHORITY_LEN,
+    SQUADS_V4_PROGRAM_ID,
+};
 
 // AV-18: typed indexer events — an event-logging adapter over `Escrow`
 // plus the `EscrowEvent` / `EscrowEventKind` / `EventAmounts` record
@@ -878,6 +889,18 @@ pub struct Escrow {
     /// zeroed when `None`) so the policy survives serialization.
     /// Appended last so every earlier field offset stays stable.
     cpi_allowlist: Option<CpiAllowlist>,
+    /// AV-84: opt-in multisig authority binding (see
+    /// [`Escrow::with_multisig_authority`]): the external multisig
+    /// program id, the vault PDA that must sign, and the threshold
+    /// metadata. Read-only pass-through — no check gate reads it; the
+    /// escrow's authority checks compare signer keys exactly as for an
+    /// EOA, and the multisig program guarantees the PDA only signs
+    /// once its threshold voted (zero-trust). `None` (the default)
+    /// means no multisig binding. Persisted (1-byte discriminant +
+    /// 66-byte record, zeroed when `None`) so the binding survives
+    /// serialization. Appended last so every earlier field offset
+    /// stays stable.
+    multisig_authority: Option<MultisigAuthority>,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -1266,6 +1289,16 @@ pub enum EscrowError {
     /// 120), so on-chain clients keep matching one code for every
     /// invocation-shape/target rejection.
     InvalidCpiAllowlist,
+    /// AV-84: bad multisig authority binding —
+    /// [`Escrow::with_multisig_authority`] with a zero multisig program
+    /// id, a zero authority PDA, or a zero threshold (none of which can
+    /// ever authorize); or [`validate_multisig_escrow_call`] on a
+    /// proposed vault-transaction instruction that does not carry the
+    /// bound authority PDA as a signer. The threshold itself is never
+    /// enforced by the escrow (zero-trust: the external multisig
+    /// program owns the vote) — it is read-only metadata for keepers
+    /// and indexers.
+    InvalidMultisigAuthority,
 }
 
 impl EscrowError {
@@ -1323,6 +1356,7 @@ impl EscrowError {
             EscrowError::InvalidSplit => 142,
             EscrowError::SlashNotEligible => 143,
             EscrowError::InvalidCpiAllowlist => 144,
+            EscrowError::InvalidMultisigAuthority => 145,
         }
     }
 
@@ -1374,6 +1408,7 @@ impl EscrowError {
             EscrowError::InvalidSplit,
             EscrowError::SlashNotEligible,
             EscrowError::InvalidCpiAllowlist,
+            EscrowError::InvalidMultisigAuthority,
         ]
     }
 }
@@ -2680,6 +2715,10 @@ impl Escrow {
             // compatible) — any well-formed target program is accepted.
             // Opt in via `with_cpi_allowlist` before funding.
             cpi_allowlist: None,
+            // AV-84: no multisig authority binding by default (backward
+            // compatible) — parties are plain keys until bound. Opt in
+            // via `with_multisig_authority` before funding.
+            multisig_authority: None,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -5638,6 +5677,47 @@ impl Escrow {
         }
     }
 
+    /// Bind an external multisig as an escrow authority (AV-84; see
+    /// the [`multisig`](crate::multisig) module): records the multisig
+    /// program id, the vault PDA that must sign, and the threshold
+    /// metadata.
+    ///
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// binding is fixed before any funds move — mirroring
+    /// [`Escrow::with_cpi_allowlist`]. Re-configuring a live escrow is
+    /// rejected with `InvalidStateTransition` (the binding is
+    /// load-bearing for every later authority check, so it is
+    /// immutable once set). A zero multisig program id, a zero
+    /// authority PDA, or a zero threshold is
+    /// [`EscrowError::InvalidMultisigAuthority`].
+    ///
+    /// Zero-trust note: the escrow never calls into the multisig
+    /// program and never enforces the threshold — the external program
+    /// owns the vote, and the escrow's authority checks keep comparing
+    /// signer keys exactly as for an EOA. The threshold here is
+    /// read-only metadata for keepers and indexers.
+    ///
+    /// [`Escrow::with_cpi_allowlist`]: Self::with_cpi_allowlist
+    pub fn with_multisig_authority(
+        mut self,
+        program_id: [u8; 32],
+        authority: [u8; 32],
+        threshold: u16,
+    ) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        self.multisig_authority = Some(MultisigAuthority::new(program_id, authority, threshold)?);
+        Ok(self)
+    }
+
+    /// The bound multisig authority (AV-84), `None` when no multisig
+    /// binding is configured.
+    pub fn multisig_authority(&self) -> Option<MultisigAuthority> {
+        self.multisig_authority
+    }
+
     /// Opt in to an anti-griefing penalty on taker-initiated expiry
     /// cancellation (AV-24 — Solana escrow / payment fintech): when the
     /// *taker* calls [`Escrow::cancel_expired`], a slice of the remainder
@@ -8162,6 +8242,15 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // `payout_allowlist` / `arbiter` / `mint`. Appended last so every
     // earlier field offset stays stable.
     ("cpi_allowlist", "Option<CpiAllowlist>", 1 + CPI_ALLOWLIST_LEN),
+    // AV-84: opt-in multisig authority binding (see
+    // `Escrow::with_multisig_authority`): one discriminant byte, then
+    // the fixed `MULTISIG_AUTHORITY_LEN`-byte record (32-byte multisig
+    // program id + 32-byte authority PDA + u16 threshold — see
+    // `MultisigAuthority`). The region is always reserved (zeroed when
+    // `None`) so `with_multisig_authority` writes in place — same
+    // treatment as `payout_allowlist` / `cpi_allowlist`. Appended last
+    // so every earlier field offset stays stable.
+    ("multisig_authority", "Option<MultisigAuthority>", 1 + MULTISIG_AUTHORITY_LEN),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -8262,7 +8351,7 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// slash clause is configured) — and so is the cumulative slashed
 /// amount (AV-82): 8 bytes, zeroed when the escrow was never slashed.
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -8816,7 +8905,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 27_067_440, "from {state:?}");
+            assert_eq!(rent, 27_533_760, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -8914,9 +9003,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 27_067_440 by
+        // VAULT_SPACE — pinned at 27_533_760 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 27_067_440);
+        assert_eq!(rent, 27_533_760);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -9077,8 +9166,8 @@ mod tests {
         // then the account is closed. VAULT_SPACE stays 2941 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 3761, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 27_067_440);
+        assert_eq!(VAULT_SPACE, 3828, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 27_533_760);
     }
 
     #[test]
@@ -9097,7 +9186,7 @@ mod tests {
         // 595 (arbiter panel), and AV-68 by 41 (evidence-disclosure
         // deadline + escalating party), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 3761, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3828, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -11313,6 +11402,33 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "program_ids <- param (Vec<Pubkey> -> Vec<[u8; \\\n                            32]> conversion); authority <- \\\n                            accounts.initializer + accounts.taker \\\n                            (signers), always - enforced by the state \\\n                            machine (stricter than update_payout_allowlist: \\\n                            neither party alone may reshape the CPI \\\n                            target set); a stranger is Unauthorized; \\\n                            Uninitialized / Funded only; pause gate \\\n                            first (AV-46); over-long / zero-program-id \\\n                            input is InvalidCpiAllowlist (code 144); \\\n                            empty clears to None (no restriction); emits \\\n                            the CpiAllowlistUpdated indexer event only on \\\n                            an actual change (from == to == the current \\\n                            state); the 258-byte region is rewritten in \\\n                            place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-84: bind an external multisig as an escrow authority
+            // at initialize time.
+            name: "initialize_multisig_authority",
+            params: &[(
+                "multisig_authority",
+                "MultisigAuthority",
+                "instruction param; the multisig program id, the vault \\\
+                 PDA that must sign, and the u16 threshold metadata",
+            )],
+            method: "Escrow::with_multisig_authority",
+            input_mapping: "program_id <- param (Pubkey -> [u8; 32] \\\
+                            conversion); authority <- param (the vault \\\
+                            PDA); threshold <- param (u16, informational \\\
+                            only - enforced by the multisig program, \\\
+                            never by the escrow); signer <- \\\
+                            accounts.initializer, enforced by the Anchor \\\
+                            account constraint, not the state machine; \\\
+                            Uninitialized only, like \\\
+                            initialize_cpi_allowlist; zero program id / \\\
+                            zero authority / zero threshold is \\\
+                            InvalidMultisigAuthority (code 145); the \\\
+                            67-byte region is always reserved (zeroed \\\
+                            when None) so the opt-in writes in place \\\
+                            without reallocating; emits no event \\\
+                            (pre-fund configuration)",
+        },
+        InstructionSpec {
             // AV-53: bind the opt-in 32-byte off-chain reference memo
             // (e.g. order id / invoice hash) at initialize time.
             name: "initialize_reference",
@@ -11905,6 +12021,8 @@ pub(crate) mod anchor_idl_tests {
             // AV-82: opt-in default-penalty (slash) terms + enforcement.
             "Escrow::with_slash_terms",
             "Escrow::slash",
+            // AV-84: opt-in multisig authority binding.
+            "Escrow::with_multisig_authority",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -11928,7 +12046,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_forty_eight_instructions_take_params() {
+    fn only_forty_nine_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -11976,6 +12094,7 @@ pub(crate) mod anchor_idl_tests {
                 &"update_payout_allowlist",
                 &"initialize_cpi_allowlist",
                 &"update_cpi_allowlist",
+                &"initialize_multisig_authority",
                 &"initialize_reference",
                 &"initialize_default_judgment",
                 &"initialize_subscription",
@@ -13660,6 +13779,11 @@ pub(crate) mod anchor_idl_tests {
         // second param source for `cpi_allowlist`, like
         // `update_payout_allowlist`.
         ("update_cpi_allowlist", "program_ids", "cpi_allowlist"),
+        // AV-84: the multisig binding param populates
+        // `multisig_authority`; the `Option` discriminant is implied
+        // (a bound authority is `Some`), mirroring
+        // `initialize_pause_authority`.
+        ("initialize_multisig_authority", "multisig_authority", "multisig_authority"),
         // AV-53: the reference param populates `reference`; the `Option`
         // discriminant is implied (an attached memo is `Some`),
         // mirroring `initialize_pause_authority`.
@@ -14296,6 +14420,11 @@ mod error_code_tests {
             EscrowError::InvalidCpiAllowlist,
             144,
             "with_cpi_allowlist / update_cpi_allowlist with an empty program-id list (on the builder), more than MAX_CPI_ALLOWLIST program ids, or a zero program id",
+        ),
+        (
+            EscrowError::InvalidMultisigAuthority,
+            145,
+            "with_multisig_authority with a zero multisig program id, a zero authority PDA, or a zero threshold; validate_multisig_escrow_call on a proposed instruction that does not carry the bound authority PDA as a signer",
         ),
     ];
 
@@ -15189,7 +15318,7 @@ mod base58_tests {
     /// Test-only base58 encoder (Solana alphabet): the inverse of
     /// `parse_mint_address`, used only to generate round-trip vectors.
     /// Little-endian base-58 digits, leading zero bytes as `'1'`s.
-    fn base58_encode(bytes: &[u8; 32]) -> String {
+    pub(crate) fn base58_encode(bytes: &[u8; 32]) -> String {
         let mut digits: Vec<u8> = vec![0];
         for &b in bytes {
             let mut carry = b as u32;
@@ -16079,6 +16208,23 @@ mod account_space_tests {
                 out.push(list.len);
             }
         }
+        // AV-84: multisig authority binding, always reserved like
+        // `cpi_allowlist`: the `None` discriminant followed by the
+        // zeroed 66-byte record, so `with_multisig_authority` writes in
+        // place without reallocating; appended last so every earlier
+        // offset above is unchanged.
+        match e.multisig_authority {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; MULTISIG_AUTHORITY_LEN]);
+            }
+            Some(bound) => {
+                out.push(1);
+                out.extend_from_slice(&bound.program_id);
+                out.extend_from_slice(&bound.authority);
+                out.extend_from_slice(&bound.threshold.to_le_bytes());
+            }
+        }
         out
     }
 
@@ -16132,10 +16278,13 @@ mod account_space_tests {
         // 32-byte penalty account + u64 slash deadline)
         // + 8 (AV-82 cumulative slashed amount)
         // + (1 + 257) (AV-83 opt-in CPI target allowlist: discriminant
-        // + eight 32-byte program ids + count byte).
-        assert_eq!(ESCROW_BODY_LEN, 3753, "escrow payload bytes");
+        // + eight 32-byte program ids + count byte)
+        // + (1 + 66) (AV-84 opt-in multisig authority: discriminant +
+        // 32-byte multisig program id + 32-byte authority PDA + u16
+        // threshold).
+        assert_eq!(ESCROW_BODY_LEN, 3820, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 3761, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3828, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -16199,10 +16348,10 @@ mod account_space_tests {
         // cumulative slashed amount (AV-82, zeroed when never slashed).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3271);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3338);
     }
 
     #[test]
@@ -16612,16 +16761,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3761) * 3480 * 2 = 3889 * 6960 = 27_067_440 lamports.
-        assert_eq!(full, 27_067_440);
+        // (128 + 3828) * 3480 * 2 = 3956 * 6960 = 27_533_760 lamports.
+        assert_eq!(full, 27_533_760);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3271) * 3480 * 2 = 3399 * 6960 = 23_657_040 lamports.
-        assert_eq!(no_quorum, 23_657_040);
+        // (128 + 3338) * 3480 * 2 = 3466 * 6960 = 24_123_360 lamports.
+        assert_eq!(no_quorum, 24_123_360);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -16665,13 +16814,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(27_067_440, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(27_533_760, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(27_067_439, params.0, params.1),
+            check_vault_rent_exempt(27_533_759, params.0, params.1),
             Err(RentShortfall {
-                required: 27_067_440,
-                provided: 27_067_439,
+                required: 27_533_760,
+                provided: 27_533_759,
             })
         );
         // Generous funding: exempt.
@@ -16683,7 +16832,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 27_067_440,
+                required: 27_533_760,
                 provided: 0,
             })
         );
@@ -19603,7 +19752,7 @@ mod migrate_schema_tests {
         // now (the slash region and the CPI allowlist trail it); every
         // earlier offset stays stable, and the carry-over is still a
         // byte-prefix copy.
-        let version_at = ESCROW_BODY_LEN - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        let version_at = ESCROW_BODY_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         let e = v0_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
@@ -20493,7 +20642,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3753, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) bytes");
+        assert_eq!(bytes.len(), 3820, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -20518,7 +20667,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 3753);
+        assert_eq!(bytes.len(), 3820);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -20540,18 +20689,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3761) * 3480 * 2 = 3889 * 6960 = 27_067_440 lamports.
-        assert_eq!(VAULT_SPACE, 3761);
-        assert_eq!(full, 27_067_440);
+        // (128 + 3828) * 3480 * 2 = 3956 * 6960 = 27_533_760 lamports.
+        assert_eq!(VAULT_SPACE, 3828);
+        assert_eq!(full, 27_533_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3271) * 3480 * 2 = 3399 * 6960 = 23_657_040 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3271);
-        assert_eq!(no_quorum, 23_657_040);
+        // (128 + 3338) * 3480 * 2 = 3466 * 6960 = 24_123_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3338);
+        assert_eq!(no_quorum, 24_123_360);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -20695,7 +20844,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3753);
+        assert_eq!(bytes.len(), 3820);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -20710,7 +20859,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 3753);
+        assert_eq!(bytes.len(), 3820);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -20741,18 +20890,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3761) * 3480 * 2 = 3889 * 6960 = 27_067_440 lamports.
-        assert_eq!(VAULT_SPACE, 3761);
-        assert_eq!(full, 27_067_440);
+        // (128 + 3828) * 3480 * 2 = 3956 * 6960 = 27_533_760 lamports.
+        assert_eq!(VAULT_SPACE, 3828);
+        assert_eq!(full, 27_533_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3271) * 3480 * 2 = 3399 * 6960 = 23_657_040 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3271);
-        assert_eq!(no_quorum, 23_657_040);
+        // (128 + 3338) * 3480 * 2 = 3466 * 6960 = 24_123_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3338);
+        assert_eq!(no_quorum, 24_123_360);
     }
 
     #[test]
@@ -21607,7 +21756,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 3753);
+        assert_eq!(bytes.len(), 3820);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -21782,7 +21931,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 3753, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist");
+        assert_eq!(ESCROW_BODY_LEN, 3820, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -21800,32 +21949,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 3761) * 3480 * 2 = 3889 * 6960 = 27_067_440 lamports.
+        // (128 + 3828) * 3480 * 2 = 3956 * 6960 = 27_533_760 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            27_067_440
+            27_533_760
         );
-        // (128 + 3271) * 3480 * 2 = 3399 * 6960 = 23_657_040 lamports.
+        // (128 + 3338) * 3480 * 2 = 3466 * 6960 = 24_123_360 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            23_657_040
+            24_123_360
         );
         // 1888 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 3761);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3271);
-        assert!(check_vault_rent_exempt(27_067_440, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 3828);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3338);
+        assert!(check_vault_rent_exempt(27_533_760, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -24652,9 +24801,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3753, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter)");
-        assert_eq!(VAULT_SPACE, 3761);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3271);
+        assert_eq!(bytes.len(), 3820, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority)");
+        assert_eq!(VAULT_SPACE, 3828);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3338);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -25198,7 +25347,7 @@ mod default_judgment_tests {
         // at 960, `default_judgment` at 968, `default_confirmed` at 985
         // (AV-55 body total 986). AV-56 appends `subscription` at 986,
         // `subscription_next` at 1004, `subscription_released` at 1005
-        // (body total 3753 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline + AV-73 per-period-table + AV-75 schema-version + AV-82 slash-region appends).
+        // (body total 3820 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline + AV-73 per-period-table + AV-75 schema-version + AV-82 slash-region appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter(ARBITER)
@@ -25208,7 +25357,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3753);
+        assert_eq!(bytes.len(), 3820);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -25766,7 +25915,7 @@ mod subscription_tests {
         // Offsets: `default_confirmed` ends the AV-55 body at 986;
         // `subscription` at 986, `subscription_next` at 1004,
         // `subscription_released` at 1005; the AV-73 live per-period
-        // amount table at 2933..3445 (body total 3753 after the AV-57 +
+        // amount table at 2933..3445 (body total 3820 after the AV-57 +
         // AV-59 + AV-63 + AV-64 + AV-65 + AV-66 + AV-68 + AV-73 + AV-75
         // appends).
         let mut e = escrow()
@@ -25775,7 +25924,7 @@ mod subscription_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3753);
+        assert_eq!(bytes.len(), 3820);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -26110,11 +26259,11 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67
         );
     }
 
@@ -26123,14 +26272,14 @@ mod event_history_tests {
         // Offsets: `subscription_released` ends the AV-56 body at 1013;
         // `event_head` at 1013, `event_total` at 1014, `event_count` at
         // 1022, `event_capacity` at 1023, `event_slots` at 1024 (body
-        // total 3753 after the AV-59 + AV-63 + AV-64 + AV-68 + AV-73
+        // total 3820 after the AV-59 + AV-63 + AV-64 + AV-68 + AV-73
         // + AV-75 + AV-82 + AV-83 appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3753);
+        assert_eq!(bytes.len(), 3820);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -26158,7 +26307,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258, "AV-82/AV-83 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67, "AV-82/AV-83/AV-84 tail");
     }
 
     #[test]
@@ -26173,18 +26322,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3761) * 3480 * 2 = 3889 * 6960 = 27_067_440 lamports.
-        assert_eq!(VAULT_SPACE, 3761);
-        assert_eq!(full, 27_067_440);
+        // (128 + 3828) * 3480 * 2 = 3956 * 6960 = 27_533_760 lamports.
+        assert_eq!(VAULT_SPACE, 3828);
+        assert_eq!(full, 27_533_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3271) * 3480 * 2 = 3399 * 6960 = 23_657_040 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3271);
-        assert_eq!(no_quorum, 23_657_040);
+        // (128 + 3338) * 3480 * 2 = 3466 * 6960 = 24_123_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3338);
+        assert_eq!(no_quorum, 24_123_360);
     }
 
     // ----- decode -----
@@ -26878,18 +27027,19 @@ mod fee_cap_tests {
     fn layout_pins_include_the_fee_cap_tail() {
         // +595 over the AV-64 numbers (the AV-65 arbiter-panel region)
         // + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline)
-        // + 258 (AV-83 CPI target allowlist).
-        assert_eq!(ESCROW_BODY_LEN, 3753, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 3761, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3271, "no-quorum Vault account space");
+        // + 258 (AV-83 CPI target allowlist) + 67 (AV-84 multisig
+        // authority).
+        assert_eq!(ESCROW_BODY_LEN, 3820, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 3828, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3338, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            27_067_440,
-            "(128 + 3761) * 3480 * 2 = 3889 * 6960"
+            27_533_760,
+            "(128 + 3828) * 3480 * 2 = 3956 * 6960"
         );
         assert_eq!(
             rent_exempt_minimum_lamports(
@@ -26897,8 +27047,8 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            23_657_040,
-            "(128 + 3271) * 3480 * 2 = 3399 * 6960"
+            24_123_360,
+            "(128 + 3338) * 3480 * 2 = 3466 * 6960"
         );
     }
 
@@ -26910,7 +27060,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3753);
+        assert_eq!(bytes.len(), 3820);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -27406,8 +27556,8 @@ mod fee_schedule_tests {
         let e = scheduled_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3753);
-        let tail = ESCROW_BODY_LEN - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        assert_eq!(bytes.len(), 3820);
+        let tail = ESCROW_BODY_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(bytes[tail], 3, "tier_count at the tail");
         assert_eq!(
             u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
@@ -27442,7 +27592,7 @@ mod fee_schedule_tests {
         // (41 + 8 bytes), and AV-83 the CPI allowlist region (258
         // bytes) after the fee schedule, so the schedule no longer
         // sits at the body tail.
-        let tail = ESCROW_BODY_LEN - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(
             &bytes[tail..tail + FEE_SCHEDULE_LEN],
             &[0u8; FEE_SCHEDULE_LEN],
@@ -27461,7 +27611,7 @@ mod fee_schedule_tests {
         // (41 + 8 bytes), and AV-83 the CPI allowlist region (258
         // bytes) after the fee schedule, so the schedule no longer
         // sits at the body tail.
-        let tail = ESCROW_BODY_LEN - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         bytes[tail] = 9;
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
@@ -27794,7 +27944,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3753);
+        assert_eq!(bytes.len(), 3820);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -28007,7 +28157,9 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::TemplateOverrideRejected));
         assert!(EscrowError::all().contains(&EscrowError::InvalidSplit));
         assert!(EscrowError::all().contains(&EscrowError::SlashNotEligible));
-        assert_eq!(EscrowError::all().len(), 45);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidCpiAllowlist));
+        assert!(EscrowError::all().contains(&EscrowError::InvalidMultisigAuthority));
+        assert_eq!(EscrowError::all().len(), 46);
     }
 
     #[test]
@@ -28354,12 +28506,12 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3753);
+        assert_eq!(bytes.len(), 3820);
         // AV-83: the CPI allowlist region (258 bytes) trails the
         // AV-82 slash region (41-byte terms + 8-byte penalty counter),
         // which trails the schema-version byte — so the panel region
         // ends 258 + 49 + 1 bytes before the end of the buffer.
-        let version_end = bytes.len() - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        let version_end = bytes.len() - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         // The panel region trails the AV-73 per-period amount table
         // (512 bytes), the AV-68 evidence-deadline region (41 bytes) and
         // the AV-66 fee-schedule region (81 bytes):
@@ -28412,9 +28564,9 @@ mod arbiter_panel_tests {
         assert_eq!(panel.1, "Option<ArbiterPanel>");
         assert_eq!(panel.2, 1 + ARBITER_PANEL_LEN);
         assert_eq!(panel.2, 595);
-        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83: every earlier
-        // field offset stays stable.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "fee_schedule");
+        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84: every
+        // earlier field offset stays stable.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "fee_schedule");
     }
 
     #[test]
@@ -28429,15 +28581,18 @@ mod arbiter_panel_tests {
         assert_eq!(schedule.2, 81);
         // AV-68 appended two fields after it, AV-73 one more, AV-75
         // the schema byte, AV-82 the slash region, AV-83 the CPI
-        // allowlist: cpi_allowlist is the new tail.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "evidence_deadline_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "escalated_by");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "subscription_amounts");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "schema_version");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "slash_terms");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "penalty_paid");
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS.last().unwrap().2, 1 + CPI_ALLOWLIST_LEN);
+        // allowlist, AV-84 the multisig authority: multisig_authority
+        // is the new tail.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "evidence_deadline_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "escalated_by");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "subscription_amounts");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "schema_version");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "slash_terms");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "penalty_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 1 + CPI_ALLOWLIST_LEN);
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, 1 + MULTISIG_AUTHORITY_LEN);
     }
 
     #[test]
@@ -28975,7 +29130,7 @@ mod split_tests {
             .unwrap();
         assert_eq!(e.state(), EscrowState::Split);
         assert_eq!(EscrowState::Split as u8, 8, "Split appended last");
-        assert_eq!(VAULT_SPACE, 3761, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3828, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -29286,7 +29441,7 @@ mod slash_tests {
         let e = slashable(1_000_000);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let base = ESCROW_BODY_LEN - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
+        let base = ESCROW_BODY_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
         assert_eq!(bytes[base], 2, "schema_version");
         assert_eq!(bytes[base + 1], 1, "slash_terms: Some");
         assert_eq!(&bytes[base + 2..base + 34], &PENALTY, "penalty account");
@@ -29297,8 +29452,8 @@ mod slash_tests {
         );
         assert_eq!(
             u64::from_le_bytes(
-                bytes[ESCROW_BODY_LEN - (1 + CPI_ALLOWLIST_LEN) - 8
-                    ..ESCROW_BODY_LEN - (1 + CPI_ALLOWLIST_LEN)]
+                bytes[ESCROW_BODY_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
+                    ..ESCROW_BODY_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
                     .try_into()
                     .unwrap()
             ),
@@ -29607,8 +29762,8 @@ mod cpi_allowlist_tests {
 
     #[test]
     fn allowlist_persists_in_the_serialized_tail() {
-        // The allowlist is the last field: discriminant at offset 3753
-        // (body was 3495 before AV-83), then eight 32-byte slots and
+        // The allowlist sits just before the AV-84 multisig region:
+        // discriminant at offset 3495, then eight 32-byte slots and
         // the count byte.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
@@ -29616,7 +29771,7 @@ mod cpi_allowlist_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3753);
+        assert_eq!(bytes.len(), 3820);
         assert_eq!(bytes[3495], 1, "Some discriminant");
         assert_eq!(&bytes[3496..3496 + 32], &DEX);
         assert_eq!(&bytes[3496 + 32..3496 + 64], &LENDING);
@@ -29626,9 +29781,255 @@ mod cpi_allowlist_tests {
         let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes[3495], 0, "None discriminant");
-        assert_eq!(&bytes[3496..3753], &[0u8; 257]);
+        assert_eq!(&bytes[3496..3496 + 257], &[0u8; 257]);
+        // The field name is the second-to-last VAULT_FIELDS entry
+        // (AV-84 appended the multisig region after it).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 1 + CPI_ALLOWLIST_LEN);
+    }
+}
+
+// ---------- AV-84: Squads multisig authority adapter ----------
+mod multisig_tests {
+    use super::*;
+    use crate::discriminator::{decode_vault_account, vault_account_discriminator};
+    use crate::keeper::{scan_keeper_actions, WatchedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const VAULT_PDA: [u8; 32] = [0x5A; 32];
+    const CREATE_KEY: [u8; 32] = [0xC4; 32];
+    const ESCROW_PROGRAM: [u8; 32] = [0xE9; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn bound() -> MultisigAuthority {
+        MultisigAuthority::new(SQUADS_V4_PROGRAM_ID, VAULT_PDA, 2).unwrap()
+    }
+
+    fn bound_escrow() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_multisig_authority(SQUADS_V4_PROGRAM_ID, VAULT_PDA, 2)
+            .unwrap()
+    }
+
+    #[test]
+    fn builder_binds_program_id_authority_and_threshold() {
+        let e = bound_escrow();
+        let b = e.multisig_authority().unwrap();
+        assert_eq!(b.program_id, SQUADS_V4_PROGRAM_ID);
+        assert_eq!(b.authority, VAULT_PDA);
+        assert_eq!(b.threshold, 2);
+        // Default: no binding.
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(plain.multisig_authority(), None);
+    }
+
+    #[test]
+    fn builder_rejects_zero_inputs() {
+        let base = || Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            base().with_multisig_authority([0u8; 32], VAULT_PDA, 2).unwrap_err(),
+            EscrowError::InvalidMultisigAuthority
+        );
+        assert_eq!(
+            base()
+                .with_multisig_authority(SQUADS_V4_PROGRAM_ID, [0u8; 32], 2)
+                .unwrap_err(),
+            EscrowError::InvalidMultisigAuthority
+        );
+        assert_eq!(
+            base()
+                .with_multisig_authority(SQUADS_V4_PROGRAM_ID, VAULT_PDA, 0)
+                .unwrap_err(),
+            EscrowError::InvalidMultisigAuthority
+        );
+    }
+
+    #[test]
+    fn builder_is_uninitialized_only() {
+        let mut e = bound_escrow();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            e.with_multisig_authority(SQUADS_V4_PROGRAM_ID, VAULT_PDA, 2)
+                .unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+    }
+
+    #[test]
+    fn error_code_is_145_and_stable() {
+        assert_eq!(EscrowError::InvalidMultisigAuthority.code(), 145);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidMultisigAuthority));
+    }
+
+    #[test]
+    fn squads_v4_program_id_matches_base58() {
+        // The hardcoded bytes decode to the documented mainnet program
+        // id (via the test-only base58 encoder).
+        assert_eq!(
+            super::base58_tests::base58_encode(&SQUADS_V4_PROGRAM_ID),
+            "SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf"
+        );
+    }
+
+    #[test]
+    fn squads_v4_seed_assembly_matches_documented_derivation() {
+        // Multisig PDA: ["multisig", create_key].
+        assert_eq!(
+            squads_v4_multisig_seeds(&CREATE_KEY),
+            vec![b"multisig".to_vec(), CREATE_KEY.to_vec()]
+        );
+        // Vault PDA: ["multisig", multisig, "vault", vault_index].
+        assert_eq!(
+            squads_v4_vault_seeds(&VAULT_PDA, 0),
+            vec![
+                b"multisig".to_vec(),
+                VAULT_PDA.to_vec(),
+                b"vault".to_vec(),
+                vec![0u8],
+            ]
+        );
+        assert_eq!(
+            squads_v4_vault_seeds(&VAULT_PDA, 3)[3],
+            vec![3u8],
+            "vault index is the u8 seed tail"
+        );
+    }
+
+    #[test]
+    fn assemble_and_validate_multisig_escrow_call() {
+        let rest = vec![AccountMeta {
+            pubkey: [0x11; 32],
+            is_signer: false,
+            is_writable: true,
+        }];
+        let inv = assemble_multisig_escrow_call(ESCROW_PROGRAM, VAULT_PDA, rest, vec![1, 2, 3]);
+        // The authority PDA leads as a signer.
+        assert_eq!(inv.program_id, ESCROW_PROGRAM);
+        assert_eq!(inv.accounts[0].pubkey, VAULT_PDA);
+        assert!(inv.accounts[0].is_signer);
+        assert_eq!(inv.accounts.len(), 2);
+        // Well-formed: validates.
+        validate_multisig_escrow_call(&inv, &ESCROW_PROGRAM, &bound()).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_mistargeted_or_unsigned_proposals() {
+        let rest = vec![AccountMeta {
+            pubkey: [0x11; 32],
+            is_signer: false,
+            is_writable: true,
+        }];
+        let inv = assemble_multisig_escrow_call(ESCROW_PROGRAM, VAULT_PDA, rest, vec![]);
+        // Wrong escrow program: the proposal would execute elsewhere
+        // after votes are cast.
+        assert_eq!(
+            validate_multisig_escrow_call(&inv, &[0x99; 32], &bound()).unwrap_err(),
+            EscrowError::InvalidCpiTarget
+        );
+        // Authority not a signer: the multisig could not authorize the
+        // escrow transition.
+        let no_sig = CpiInvocation {
+            program_id: ESCROW_PROGRAM,
+            accounts: vec![
+                AccountMeta { pubkey: VAULT_PDA, is_signer: false, is_writable: true },
+                AccountMeta { pubkey: [0x11; 32], is_signer: true, is_writable: false },
+            ],
+            data: vec![],
+        };
+        assert_eq!(
+            validate_multisig_escrow_call(&no_sig, &ESCROW_PROGRAM, &bound()).unwrap_err(),
+            EscrowError::InvalidMultisigAuthority
+        );
+        // Malformed shape still fails as InvalidCpiTarget.
+        let empty = CpiInvocation {
+            program_id: ESCROW_PROGRAM,
+            accounts: vec![],
+            data: vec![],
+        };
+        assert_eq!(
+            validate_multisig_escrow_call(&empty, &ESCROW_PROGRAM, &bound()).unwrap_err(),
+            EscrowError::InvalidCpiTarget
+        );
+    }
+
+    #[test]
+    fn binding_persists_in_the_serialized_tail() {
+        // The multisig region is the new tail: discriminant at offset
+        // 3753 (3820 - 67), then the 32-byte program id, the 32-byte
+        // authority PDA, and the u16 threshold.
+        let e = bound_escrow();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes.len(), 3820);
+        assert_eq!(bytes[3753], 1, "Some discriminant");
+        assert_eq!(&bytes[3754..3754 + 32], &SQUADS_V4_PROGRAM_ID);
+        assert_eq!(&bytes[3754 + 32..3754 + 64], &VAULT_PDA);
+        assert_eq!(
+            u16::from_le_bytes(bytes[3754 + 64..3754 + 66].try_into().unwrap()),
+            2,
+            "threshold"
+        );
+        // A vault without the binding zero-fills the region.
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&plain);
+        assert_eq!(bytes[3753], 0, "None discriminant");
+        assert_eq!(&bytes[3754..3820], &[0u8; 66]);
         // The field name is the last VAULT_FIELDS entry.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].2, 1 + CPI_ALLOWLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].2, 1 + MULTISIG_AUTHORITY_LEN);
+        assert_eq!(MULTISIG_AUTHORITY_LEN, 66);
+    }
+
+    #[test]
+    fn decode_round_trips_the_binding() {
+        let e = bound_escrow();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        let mut full = vault_account_discriminator().to_vec();
+        full.extend_from_slice(&bytes);
+        let decoded = decode_vault_account(&full).unwrap();
+        assert_eq!(decoded.multisig_authority(), Some(bound()));
+        // A bad option discriminant is rejected, not misread.
+        let mut bad = full.clone();
+        bad[8 + 3753] = 7;
+        assert!(decode_vault_account(&bad).is_err());
+    }
+
+    #[test]
+    fn snapshot_and_keeper_carry_the_binding() {
+        let mut e = bound_escrow();
+        e.fund(ALICE, NOW).unwrap();
+        let snap = e.snapshot(NOW);
+        assert_eq!(snap.multisig_authority, Some(bound()));
+        let json = snap.to_json();
+        assert!(json.contains("\"multisig_authority\":{\"program_id\":\""));
+        assert!(json.contains("\"threshold\":2}"));
+        // Keeper actions surface the binding so the keeper routes the
+        // call through the multisig program.
+        let watched = WatchedEscrow {
+            escrow_id: [0x1D; 32],
+            escrow: e,
+            reference: None,
+        };
+        let report = scan_keeper_actions(&[watched], EXPIRES_AT + 100);
+        assert!(!report.actions.is_empty());
+        assert_eq!(report.actions[0].multisig_authority, Some(bound()));
+        assert!(report.to_json().contains("\"multisig_authority\":{\"program_id\":\""));
+    }
+
+    #[test]
+    fn zero_trust_authority_check_is_key_equality() {
+        // The escrow never calls the multisig program: when the
+        // initializer IS the vault PDA, the normal key-equality check
+        // authorizes it — the threshold vote happened off-band inside
+        // Squads.
+        let mut e = Escrow::initialize(VAULT_PDA, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_multisig_authority(SQUADS_V4_PROGRAM_ID, VAULT_PDA, 2)
+            .unwrap();
+        e.fund(VAULT_PDA, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
     }
 }
