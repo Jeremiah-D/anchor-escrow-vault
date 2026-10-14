@@ -217,6 +217,9 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         "Vec<Pubkey>" => IdlType::Vec(Box::new(IdlType::PublicKey)),
         "Vec<u64>" => IdlType::Vec(Box::new(IdlType::U64)),
         "Vec<u8>" => IdlType::Vec(Box::new(IdlType::U8)),
+        // AV-93: the release_split instruction's per-recipient
+        // basis-point weight table.
+        "Vec<u16>" => IdlType::Vec(Box::new(IdlType::U16)),
         // AV-66: the tiered fee schedule's tier ladder instruction arg.
         "Vec<FeeTier>" => IdlType::Vec(Box::new(IdlType::Named("FeeTier"))),
         // AV-90: the non-linear vesting curve's tier table instruction arg.
@@ -860,7 +863,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 50, "error variant count drift");
+    assert_eq!(errors.len(), 51, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -903,6 +906,8 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::InvalidEvidenceProof.code(), 148);
     // AV-92: appended, never renumbered.
     assert_eq!(EscrowError::InvalidVaultSeeds.code(), 149);
+    // AV-93: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidReleaseSplit.code(), 150);
 }
 
 #[test]

@@ -184,6 +184,92 @@ pub mod escrow_vault {
         Ok((payout, fee))
     }
 
+    /// Release `amount` split across several recipients by basis-point
+    /// weights (AV-93 — Solana / payment fintech: the initializer's
+    /// multi-party payout — a revenue share, a creator royalty split,
+    /// a payroll run — settled in one transition instead of N partial
+    /// `release` calls). The state machine
+    /// (`escrow_state::Escrow::release_split`) runs the exact `release`
+    /// gates, validates the share table (`InvalidReleaseSplit`, code
+    /// 150 — empty / over-long / zero address / zero weight / weight
+    /// sum != 10_000), pins every recipient against the AV-49 payout
+    /// policy (`PayoutNotAllowlisted` otherwise), charges the AV-17
+    /// protocol fee on the gross amount first, then splits the net —
+    /// each leg is `floor(net * bps / 10_000)` with the dust landing on
+    /// the first recipient, so the legs sum to the net exactly.
+    /// `released` accumulates the gross amount, so the conservation
+    /// invariant is untouched by the split.
+    /// `recipients` / `bps` are parallel instruction params (in payout
+    /// order); the real build transfers leg `i` to
+    /// `ctx.remaining_accounts[i]` — asserted here to key-match the
+    /// params' recipients order (the state machine validated the set,
+    /// the skeleton pins the account wiring). Returns `(legs, fee)`:
+    /// the per-recipient `(recipient, net_share)` legs in table order
+    /// so the real build can size each transfer, plus the protocol fee
+    /// (to the fee account). Emits `ReleasedSplit` with the gross
+    /// amount and the fee; the real build stamps the legs on the event
+    /// (mirroring `IndexedEscrow::release_split`'s roster stamp), so
+    /// indexers read the exact transfer sizes from the log.
+    pub fn release_split(
+        ctx: Context<ReleaseSplit>,
+        amount: u64,
+        recipients: Vec<Pubkey>,
+        bps: Vec<u16>,
+    ) -> Result<(Vec<([u8; 32], u64)>, u64)> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        // AV-27: the timelock gate reads the Solana clock sysvar — never
+        // an instruction param.
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        // The legs travel as remaining_accounts in recipients order —
+        // the real build's transfer sizing; pin the wiring against the
+        // validated params (a swapped recipient account fails closed).
+        require!(
+            recipients.len() == bps.len(),
+            ErrorCode::InvalidReleaseSplit
+        );
+        require!(
+            ctx.remaining_accounts.len() == recipients.len(),
+            ErrorCode::InvalidReleaseSplit
+        );
+        for (account, recipient) in ctx.remaining_accounts.iter().zip(recipients.iter()) {
+            require_keys_eq!(account.key(), *recipient, ErrorCode::InvalidReleaseSplit);
+        }
+        let shares: Vec<([u8; 32], u16)> = recipients
+            .iter()
+            .zip(bps.iter())
+            .map(|(r, b)| (r.to_bytes(), *b))
+            .collect();
+        let (legs, fee) = escrow
+            .release_split(
+                ctx.accounts.initializer.key().to_bytes(),
+                now,
+                amount,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+                &shares,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `payout` (the gross `amount`) + `fee`; partial splits
+        // carry from == to == Funded, the closing one to == Released.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::ReleasedSplit,
+            from,
+            escrow.state() as u8,
+            amount,
+            fee,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok((legs, fee))
+    }
+
     /// Release `amount` routed through a third-party program via CPI
     /// (AV-35): the taker's payout flows into the target program's
     /// instruction — a DEX swap, a lending-protocol deposit — instead of
@@ -3934,6 +4020,15 @@ pub enum EscrowVaultEventKind {
     /// pair. Mirrors
     /// `escrow_state::EscrowEventKind::SchemaMigrated`.
     SchemaMigrated,
+    /// AV-93: the locked funds were released split across several
+    /// recipients by basis-point weights (`Escrow::release_split`).
+    /// `from == Funded`, `to == Funded` on a partial split, `to ==
+    /// Released` on the closing one. Amounts follow the `Released`
+    /// shape (gross amount, AV-17 protocol fee); the per-recipient
+    /// `(recipient, net_share)` legs ride the event's `release_split`
+    /// field in table order — the first leg carries the bps-floor dust.
+    /// Mirrors `escrow_state::EscrowEventKind::ReleasedSplit`.
+    ReleasedSplit,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -4014,6 +4109,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::SchemaMigrated => {
             EscrowVaultEventKind::SchemaMigrated
+        }
+        escrow_state::EscrowEventKind::ReleasedSplit => {
+            EscrowVaultEventKind::ReleasedSplit
         }
     }
 }
@@ -4113,6 +4211,34 @@ pub struct Release<'info> {
     /// bound `vault.mint` (`MintMismatch` otherwise). Unused on the
     /// native-SOL path — the state machine then requires `None`.
     pub vault_token_account: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ReleaseSplit<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    pub initializer: Signer<'info>,
+    /// CHECK: beneficiary of the release on the plain path (kept as a
+    /// named account so the IDL stays explicit about who the release is
+    /// for, like `Release`).
+    pub taker: AccountInfo<'info>,
+    /// CHECK: Solana clock sysvar, read for the AV-27 timelock gate
+    /// (never an instruction param — a caller-supplied timestamp would
+    /// let the initializer fast-forward the lock).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account. The real build reads this
+    /// account's `mint` and the state machine requires it to equal the
+    /// bound `vault.mint` (`MintMismatch` otherwise). Unused on the
+    /// native-SOL path — the state machine then requires `None`.
+    pub vault_token_account: AccountInfo<'info>,
+    // The per-recipient payout destinations travel as
+    // `remaining_accounts` in the `recipients` param order: leg `i`
+    // transfers to `remaining_accounts[i]`. The handler asserts the
+    // account keys match the validated params (a swapped recipient
+    // account fails closed with `InvalidReleaseSplit`), and the state
+    // machine pins every recipient against the AV-49 payout policy —
+    // the taker, or a member of the payout allowlist when one is
+    // configured (`PayoutNotAllowlisted`, code 127, otherwise).
 }
 
 #[derive(Accounts)]
@@ -5361,7 +5487,7 @@ fn cpi_settle_resolve(
 }
 
 fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error per EscrowError variant, so on-chain failures
-    // surface the exact `escrow_state` reason (code 100–143) to clients.
+    // surface the exact `escrow_state` reason (code 100–150) to clients.
     match e {
         escrow_state::EscrowError::Unauthorized => error!(ErrorCode::Unauthorized),
         escrow_state::EscrowError::InvalidStateTransition => {
@@ -5459,6 +5585,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         }
         escrow_state::EscrowError::InvalidEvidenceProof => {
             error!(ErrorCode::InvalidEvidenceProof)
+        }
+        escrow_state::EscrowError::InvalidReleaseSplit => {
+            error!(ErrorCode::InvalidReleaseSplit)
         }
     }
 }
@@ -5559,4 +5688,6 @@ pub enum ErrorCode {
     InvalidVestingCurve,
     #[msg("Invalid dispute-evidence Merkle commitment or proof (AV-91): escalate with a leaf count that does not describe the root (None root with nonzero leaves, Some root with zero or more than 64 leaves); file_evidence with no committed root, a leaf index past the committed leaves, a proof whose length does not match the tree shape, or a proof that does not verify against the committed root")]
     InvalidEvidenceProof,
+    #[msg("Invalid release split (AV-93): release_split with an empty share table, more than 8 recipients, a zero recipient address, a zero bps weight, or a weight table whose sum differs from 10_000 bps; a per-recipient payout-policy violation is PayoutNotAllowlisted, not this code")]
+    InvalidReleaseSplit,
 }

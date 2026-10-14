@@ -112,6 +112,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise) |
 | `fund(authority, now)`                      | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer (`now` <- clock sysvar, recorded as `fund_at` — the origin the AV-64 relative timelock measures from) |
 | `release(authority, now, amount, payout_to)` (AV-49)                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); cumulative releases ≤ locked amount; `payout_to` must satisfy the payout policy — the taker, or a member of the payout allowlist when one is configured (`PayoutNotAllowlisted` otherwise) |
+| `release_split(authority, now, amount, recipients, bps)` (AV-93) | `Funded` | `Funded` (partial) / `Released` (cumulative full) | initializer; the check order mirrors `release` — authority → state → mint → the share-table shape (non-empty, ≤ 8 recipients, no zero address, no zero weight, weights summing to exactly 10_000 bps — `InvalidReleaseSplit`, code 150, otherwise) → every recipient pinned against the AV-49 payout policy (`PayoutNotAllowlisted` otherwise; with no allowlist only the taker passes, so a multi-recipient split is the allowlist's declared distribution set) → milestones / subscription / quorum / timelock gates → amount math (`AmountMismatch` on 0, `ReleaseExceedsLocked` past the remainder); the AV-17 protocol fee is charged on the gross amount first, then the net splits — each leg `floor(net * bps / 10_000)`, the dust landing on the first recipient, so the legs sum to the net exactly; `released` accumulates the gross, so the conservation invariant is untouched; returns the `(recipient, net_share)` legs (sizing the program's transfers) plus the fee; emits `ReleasedSplit` with the legs stamped on the event |
 | `slash(authority, amount)` (AV-82) | `Funded` | `Funded` (no state change — the escrow stays live, the taker can still earn the remainder) | initializer **or** the configured arbiter (the neutral enforcer — one party's griefing cannot burn the other's stake); `now` <- clock sysvar; requires the AV-82 slash terms (`Uninitialized`-time opt-in), `now >= slash_deadline`, and the amount ≤ the slashable remainder (`amount - released - penalty_paid`); **one-shot** (a second slash is `SlashNotEligible`); `Disputed` is locked (`SlashNotEligible` — arbitration owns the funds) and milestone/subscription-scheduled escrows reject slash (the schedule owns the release path); on a dual-sig escrow both activation bits must be set; the slashed amount moves to the fixed penalty account and accumulates in `penalty_paid` (never in `released` — the audit trail distinguishes a default penalty from a taker payout); emits `Slashed` (`amounts.penalty` = the slashed amount) |
 | `initialize_timelock(unlock_at)`            | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `unlock_at` is the Unix timestamp before which no taker payout may leave; `0` = no lock) |
 | `initialize_relative_timelock(secs)` (AV-64) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `secs` is the duration in seconds after *funding* before which no taker payout may leave; `0` = no lock; mutually exclusive with the AV-27 absolute timelock — both nonzero is `InvalidTimelock`, code 135) |
@@ -1171,7 +1172,7 @@ program error per variant):
 | `Paused` | 124 | any state-changing transition while the AV-46 emergency pause is engaged (`fund`/`release`/`claim`/`attest`/`resolve`/`cancel`/milestone/governance paths) |
 | `InvalidPauseAuthority` | 125 | `with_pause_authority` / `rotate_pause_authority` with the zero address (a zero address can never hold the emergency switch) |
 | `InvalidPayoutAllowlist` | 126 | `with_payout_allowlist` / `update_payout_allowlist` with an empty list, more than 4 addresses, or a zero address (the AV-49 allowlist must be 1-4 live payout destinations) |
-| `PayoutNotAllowlisted` | 127 | a payout transition (`release` / `claim` / `resolve` / `release_milestone` / `release_via_cpi`) naming a `payout_to` that is neither the taker nor a member of the payout allowlist |
+| `PayoutNotAllowlisted` | 127 | a payout transition (`release` / `claim` / `resolve` / `release_milestone` / `release_via_cpi` / `release_split` — AV-93 checks every recipient) naming a `payout_to` that is neither the taker nor a member of the payout allowlist |
 | `InvalidTaker` | 128 | `rotate_taker` with the zero address (a zero address can never be the legitimate payout counterparty) |
 | `DefaultJudgmentNotDue` | 129 | `trigger_default_judgment` with no default judgment configured, the taker never confirmed the split, or the arbitration deadline not yet passed; `with_arbitration_deadline` with a zero deadline |
 | `InvalidSubscription` | 130 | `adjust_period_amounts` on an escrow with no schedule, with a wrong-length / zero / sum-mismatched amount list, or rewriting a released period's recorded amount; `with_subscription` with a zero `period_secs`, zero or over-long `periods`, a zero `per_period`, per-period amounts that do not sum to the locked amount, a `u64::MAX` expiry (back-scheduling needs a bounded lifetime), a schedule that does not fit inside the escrow's lifetime, or on a non-`Uninitialized` escrow; `with_milestones` after a subscription (mutually exclusive release schedules); any subscription operation on an escrow with no schedule attached; or plain `release` on an escrow with a subscription (the schedule owns the release path) |
@@ -1194,6 +1195,7 @@ program error per variant):
 | `InvalidVestingCurve` | 147 | `VestingCurve::stepped` (AV-90) with an empty/oversized tier table, a tier outside `[start, end]`, non-monotone timestamps or unlock fractions, bps above 10_000, or a final tier below full unlock; `VestingCurve::exponential` with zero/too many steps, a non-positive or overflowing growth ratio, or a window shorter than the step count; `with_vesting_curve` with a curve whose tier window does not match the schedule |
 | `InvalidEvidenceProof` | 148 | `escalate` (AV-91) with a leaf count that does not describe the committed root (`None` root with nonzero leaves, `Some` root with zero or more than 64 leaves); `file_evidence` (AV-91) with no committed root, a leaf index past the committed leaves, a proof whose length does not match the tree shape, or a proof that does not verify against the committed root |
 | `InvalidVaultSeeds` | 149 | `VaultSeeds::new` / `derive_vault_address` (AV-92) with more than 16 seeds or a seed longer than 32 bytes (the Solana `create_program_address` limits) |
+| `InvalidReleaseSplit` | 150 | `release_split` (AV-93) with an empty share table, more than 8 recipients, a zero recipient address, a zero bps weight, or a weight table whose sum differs from 10_000 bps (a per-recipient payout-policy violation is `PayoutNotAllowlisted`, not this code) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1560,7 +1562,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82), `CpiAllowlistUpdated` (AV-83), `AppealFiled` (AV-86), `AppealResolved` (AV-86), `EvidenceFiled` (AV-91) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82), `CpiAllowlistUpdated` (AV-83), `AppealFiled` (AV-86), `AppealResolved` (AV-86), `EvidenceFiled` (AV-91), `ReleasedSplit` (AV-93) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -1634,6 +1636,14 @@ successful calls that change nothing observable:
   `to == Released`, gross payout + fee) and then `VaultClosed`
   (`from == Released`, `to == Closed`, `rent_reclaimed`) in that fixed
   order — one payout-then-close pair per instruction.
+- `release_split` (AV-93) emits `ReleasedSplit` (`from == Funded`,
+  `to == Funded` on a partial split, `to == Released` on the closing
+  one — the same lifecycle shape as `Released`; `amounts.payout` is the
+  gross amount, `amounts.fee` the AV-17 protocol fee charged on the
+  gross before the split; the per-recipient `(recipient, net_share)`
+  legs ride the event's `release_split` field in table order — the first
+  leg carries the bps-floor dust, so an indexer re-derives the exact
+  transfer sizes from the one event).
 - `submit_panel_judgment` (AV-65) emits `PanelJudgment` for every
   recorded vote (`from == to == Disputed`, zeroed amounts — a vote is
   a judgment, not a payout); the vote that reaches the M-vote
@@ -2722,7 +2732,10 @@ a compromised frontend cannot redirect a payout to an attacker address
 when the escrow pins its destinations on-chain. The settlement-plan
 builders (`cpi::payout_plan` / `resolve_plan`) enforce the same policy on
 the native-SOL leg, so an allowlisted destination does not trip
-`RecipientMismatch`. The 130-byte region is always reserved in the vault
+`RecipientMismatch`. AV-93's `release_split` checks *every* recipient
+against the same policy (in table order): with no allowlist configured
+only the taker passes, so a multi-recipient split is the allowlist's
+declared distribution set. The 130-byte region is always reserved in the vault
 layout (1-byte discriminant + 4×32-byte addresses + 1-byte count), so the
 opt-in writes in place without reallocating.
 

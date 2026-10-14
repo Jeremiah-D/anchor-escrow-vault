@@ -26,6 +26,16 @@
       ]
     },
     {
+      "name": "release_split",
+      "discriminator": [51, 139, 250, 190, 137, 198, 127, 246],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"},
+        {"name": "recipients", "type": {"vec": "publicKey"}},
+        {"name": "bps", "type": {"vec": "u16"}}
+      ]
+    },
+    {
       "name": "release_via_cpi",
       "discriminator": [25, 119, 163, 178, 107, 93, 139, 68],
       "accounts": [],
@@ -877,7 +887,8 @@
     {"code": 146, "name": "InvalidAppealWindow"},
     {"code": 147, "name": "InvalidVestingCurve"},
     {"code": 148, "name": "InvalidEvidenceProof"},
-    {"code": 149, "name": "InvalidVaultSeeds"}
+    {"code": 149, "name": "InvalidVaultSeeds"},
+    {"code": 150, "name": "InvalidReleaseSplit"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

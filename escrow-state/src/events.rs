@@ -186,6 +186,7 @@
 //! |------|----------|-------|----------|-----------|
 //! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), PartiallyCancelled, ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-70), SubscriptionAmountsAdjusted (AV-73), SchemaMigrated (AV-75), TemplateApplied (AV-77) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
+//! | ReleasedSplit (AV-93) | gross taker amount (Σ net legs + fee) | protocol fee (AV-17, charged on the gross before the split) | 0 | 0 — the per-recipient `(recipient, net_share)` legs ride the event's `release_split` field |
 //! | BundlePartiallyExecuted (AV-76) | Σ gross of the executed tranches | Σ protocol fee of the executed tranches | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | PartiallyCancelled (AV-60) | 0 | 0 | the partially-cancelled tranche, refunded to the whitelisted destination (the escrow stays `Funded`; the `released` counter is untouched) | 0 |
@@ -584,6 +585,23 @@ pub enum EscrowEventKind {
     /// already-disclosed document is an idempotent no-op that emits
     /// nothing.
     EvidenceFiled,
+    /// AV-93: the locked funds were released split across several
+    /// recipients by basis-point weights
+    /// ([`Escrow::release_split`]) — the initializer's multi-party
+    /// payout (a revenue share, a creator royalty split, a payroll
+    /// run) settled in one transition. `from == Funded`, `to ==
+    /// Funded` on a partial split, `to == Released` on the closing
+    /// one — the same lifecycle shape as
+    /// [`EscrowEventKind::Released`]. Amounts follow the `Released`
+    /// shape (`payout` = the gross amount = Σ net legs + fee, `fee` =
+    /// the AV-17 protocol fee charged on the gross before the split);
+    /// the per-recipient `(recipient, net_share)` legs ride
+    /// [`EscrowEvent::release_split`] in table order — the first leg
+    /// carries the bps-floor dust, so an indexer re-derives the
+    /// Anchor layer's exact transfer sizes. The actor is the
+    /// initializer. Always emitted on success: a successful split
+    /// release always moves funds, so there is no no-op case.
+    ReleasedSplit,
 }
 
 impl EscrowEventKind {
@@ -688,6 +706,9 @@ impl EscrowEventKind {
             // AV-91: appended after AppealResolved so discriminants
             // 0–45 stay stable for already-serialized histories.
             46 => Self::EvidenceFiled,
+            // AV-93: appended after EvidenceFiled so discriminants
+            // 0–46 stay stable for already-serialized histories.
+            47 => Self::ReleasedSplit,
             _ => return None,
         })
     }
@@ -743,6 +764,7 @@ impl EscrowEventKind {
             Self::AppealFiled => "appeal_filed",
             Self::AppealResolved => "appeal_resolved",
             Self::EvidenceFiled => "evidence_filed",
+            Self::ReleasedSplit => "released_split",
         }
     }
 
@@ -799,6 +821,7 @@ impl EscrowEventKind {
             "appeal_filed" => Self::AppealFiled,
             "appeal_resolved" => Self::AppealResolved,
             "evidence_filed" => Self::EvidenceFiled,
+            "released_split" => Self::ReleasedSplit,
             _ => return None,
         })
     }
@@ -1003,6 +1026,12 @@ pub struct CpiRouteAudit {
 /// order, `len` of them valid. It is `None` on every other kind —
 /// the event log never invents children.
 ///
+/// `release_split` (AV-93) carries the per-recipient payout legs on
+/// the `ReleasedSplit` event: `(recipient, net_share)` pairs in
+/// split-table order, `len` of them valid — the first leg carries the
+/// bps-floor dust, so the legs sum to the net payout exactly. It is
+/// `None` on every other kind — the event log never invents legs.
+///
 /// [`IndexedEscrow::release_via_cpi`]: IndexedEscrow::release_via_cpi
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EscrowEvent {
@@ -1072,6 +1101,17 @@ pub struct EscrowEvent {
     /// parameter. Fixed-size ([`MAX_SPLIT_CHILDREN`](crate::MAX_SPLIT_CHILDREN))
     /// so the event stays `Copy`.
     pub split_children: Option<([SplitChild; crate::MAX_SPLIT_CHILDREN], u8)>,
+    /// AV-93: the per-recipient payout legs for the `ReleasedSplit`
+    /// event — `(recipient, net_share)` pairs in split-table order,
+    /// `len` of them valid. Carried only by
+    /// [`EscrowEventKind::ReleasedSplit`] (`None` on every other kind —
+    /// like `split_children`, which rides only `EscrowSplit`). The
+    /// emitter stamps it after the push (see `push_event`), mirroring
+    /// the `split_children` precedent — never a `push_event`
+    /// parameter. Fixed-size
+    /// ([`MAX_RELEASE_SPLIT_RECIPIENTS`](crate::MAX_RELEASE_SPLIT_RECIPIENTS))
+    /// so the event stays `Copy`.
+    pub release_split: Option<([ReleaseShare; crate::MAX_RELEASE_SPLIT_RECIPIENTS], u8)>,
     /// AV-85: the schema versions one migration step moved across,
     /// carried by [`EscrowEventKind::SchemaMigrated`] — one event per
     /// applied step, so the chain records every `from → to` pair in
@@ -1122,6 +1162,22 @@ pub struct SplitChild {
     pub escrow_id: [u8; 32],
     /// The child's locked amount — the split-table entry.
     pub amount: u64,
+}
+
+/// One payout leg on an [`EscrowEventKind::ReleasedSplit`] event's
+/// roster (AV-93): the recipient and its net share, in split-table
+/// order. The first leg carries the bps-floor dust, so the legs sum to
+/// the event's `amounts.payout - amounts.fee` exactly — an indexer
+/// re-derives the Anchor layer's transfer sizes from this roster
+/// alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseShare {
+    /// The leg's payout destination — one of the AV-49-pinned
+    /// recipients the instruction named.
+    pub recipient: [u8; 32],
+    /// The recipient's net share (`floor(net * bps / 10_000)`, plus
+    /// the dust on the first leg).
+    pub net_share: u64,
 }
 
 /// An event-logging adapter over [`Escrow`] (AV-18).
@@ -1300,6 +1356,9 @@ impl IndexedEscrow {
             // AV-81: stamped by the EscrowSplit emitter after the push
             // — never a push_event parameter (see above).
             split_children: None,
+            // AV-93: stamped by the ReleasedSplit emitter after the
+            // push — never a push_event parameter (see above).
+            release_split: None,
             // AV-85: stamped by the SchemaMigrated emitter after the
             // push — never a push_event parameter (see above).
             schema_versions: None,
@@ -1763,6 +1822,74 @@ impl IndexedEscrow {
             Some(authority),
         );
         Ok((payout, fee, receipt))
+    }
+
+    /// Release `amount` split across several recipients by
+    /// basis-point weights (mirrors [`Escrow::release_split`], AV-93).
+    /// Emits `ReleasedSplit` on every successful call — partial splits
+    /// carry `from == to == Funded`, the closing one `to == Released`
+    /// — so the payout stream is complete in `seq` order. Amounts
+    /// follow the `Released` shape (`payout` = the gross amount,
+    /// `fee` = the AV-17 protocol fee charged on the gross before the
+    /// split), and the per-recipient `(recipient, net_share)` legs are
+    /// stamped on the event's `release_split` field (mirroring the
+    /// `EscrowSplit` roster stamp), so indexers and the AV-94 fold read
+    /// the Anchor layer's exact transfer sizes from the log. Returns
+    /// `(legs, fee)` like the inner method. `at` is both the event
+    /// timestamp and the state machine's `now` (so the AV-27 timelock
+    /// gate sees the same clock the event log records).
+    ///
+    /// [`Escrow::release_split`]: super::Escrow::release_split
+    pub fn release_split(
+        &mut self,
+        authority: [u8; 32],
+        amount: u64,
+        mint: Option<[u8; 32]>,
+        shares: &[([u8; 32], u16)],
+        at: u64,
+    ) -> Result<(Vec<([u8; 32], u64)>, u64), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        // (The inner result is bound first so its `&mut` borrow ends
+        // before `map_reentrant` reborrows `self`.)
+        let result = self
+            .inner
+            .release_split(authority, at, amount, mint, shares);
+        let (legs, fee) = self.map_reentrant(result, at)?;
+        // `amount` is the gross payout by construction
+        // (Σ legs + fee == amount); it cannot overflow u64 addition.
+        self.push_event(
+            EscrowEventKind::ReleasedSplit,
+            from,
+            self.inner.state(),
+            EventAmounts::payout(amount, fee),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        // Stamp the legs after the push (the AV-81 `split_children`
+        // precedent): the roster cannot overflow — the inner call
+        // validated `shares.len() <= MAX_RELEASE_SPLIT_RECIPIENTS`
+        // before any leg existed, and the legs are in table order.
+        let mut roster = [ReleaseShare {
+            recipient: [0u8; 32],
+            net_share: 0,
+        }; crate::MAX_RELEASE_SPLIT_RECIPIENTS];
+        for (i, (recipient, net_share)) in legs.iter().enumerate() {
+            roster[i] = ReleaseShare {
+                recipient: *recipient,
+                net_share: *net_share,
+            };
+        }
+        self.events
+            .last_mut()
+            .expect("ReleasedSplit event just pushed")
+            .release_split = Some((roster, legs.len() as u8));
+        Ok((legs, fee))
     }
 
     /// Cancel the escrow and return funds (mirrors [`Escrow::cancel`]).
@@ -5155,7 +5282,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(47), None);
+        assert_eq!(EscrowEventKind::from_discriminant(48), None);
     }
 
     #[test]
@@ -5171,7 +5298,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(47), None);
+        assert_eq!(EscrowEventKind::from_discriminant(48), None);
     }
 
     #[test]
@@ -5708,7 +5835,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(47), None);
+        assert_eq!(EscrowEventKind::from_discriminant(48), None);
     }
 
     #[test]
@@ -5723,7 +5850,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(47), None);
+        assert_eq!(EscrowEventKind::from_discriminant(48), None);
     }
 
     #[test]
@@ -5735,7 +5862,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(47), None);
+        assert_eq!(EscrowEventKind::from_discriminant(48), None);
     }
 
     #[test]
@@ -5747,7 +5874,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(47), None);
+        assert_eq!(EscrowEventKind::from_discriminant(48), None);
     }
 
     #[test]
@@ -5759,7 +5886,19 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(47), None);
+        assert_eq!(EscrowEventKind::from_discriminant(48), None);
+    }
+
+    #[test]
+    fn released_split_kind_round_trips() {
+        // AV-93: discriminant 47, appended after EvidenceFiled —
+        // 0–46 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::ReleasedSplit;
+        assert_eq!(kind.discriminant(), 47);
+        assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
+        assert_eq!(kind.name(), "released_split");
+        assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
+        assert_eq!(EscrowEventKind::from_discriminant(48), None);
     }
 
     #[test]

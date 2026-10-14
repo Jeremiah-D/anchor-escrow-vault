@@ -1471,6 +1471,19 @@ pub enum EscrowError {
     /// `create_program_address` limits, enforced off-chain before any
     /// derivation is attempted.
     InvalidVaultSeeds,
+    /// Invalid release split (AV-93): [`Escrow::release_split`] with an
+    /// empty share table, more than
+    /// [`MAX_RELEASE_SPLIT_RECIPIENTS`] recipients, a zero recipient
+    /// address, a zero bps weight, or a weight table whose sum differs
+    /// from 10_000 bps (100%). One code (150) for the whole family —
+    /// paralleling [`EscrowError::InvalidSplit`] (code 142, AV-81), but
+    /// a different transition: `InvalidSplit` is the dual-signed
+    /// escrow-into-children split, `InvalidReleaseSplit` is the
+    /// initializer's multi-recipient payout split. A recipient outside
+    /// the AV-49 payout policy is *not* this code — it is
+    /// [`EscrowError::PayoutNotAllowlisted`], so on-chain clients keep
+    /// matching one code for every allowlist rejection.
+    InvalidReleaseSplit,
 }
 
 impl EscrowError {
@@ -1533,6 +1546,7 @@ impl EscrowError {
             EscrowError::InvalidVestingCurve => 147,
             EscrowError::InvalidEvidenceProof => 148,
             EscrowError::InvalidVaultSeeds => 149,
+            EscrowError::InvalidReleaseSplit => 150,
         }
     }
 
@@ -1589,6 +1603,7 @@ impl EscrowError {
             EscrowError::InvalidVestingCurve,
             EscrowError::InvalidEvidenceProof,
             EscrowError::InvalidVaultSeeds,
+            EscrowError::InvalidReleaseSplit,
         ]
     }
 }
@@ -2972,6 +2987,17 @@ pub const MAX_MILESTONES: usize = 8;
 /// stays `Copy`.
 pub const MAX_SPLIT_CHILDREN: usize = 16;
 
+/// Maximum payout destinations one [`Escrow::release_split`] call may
+/// split across (AV-93). Eight legs is the per-instruction transfer
+/// ceiling the Anchor layer sizes: every leg is one system/token
+/// transfer the program must account for, so the bound caps both the
+/// instruction's compute and the
+/// [`EscrowEvent`](crate::EscrowEvent) split roster (which stays `Copy`
+/// at this size). The AV-49 payout allowlist's own cap
+/// ([`MAX_PAYOUT_ALLOWLIST`]) bounds the *policy* set; this bounds the
+/// *instruction* set.
+pub const MAX_RELEASE_SPLIT_RECIPIENTS: usize = 8;
+
 /// Bit offsets inside [`Escrow::milestone_flags`]: six bits per milestone
 /// (48 bits for [`MAX_MILESTONES`] milestones fit in a `u64`). Bit
 /// `index * 6 + offset`:
@@ -3994,6 +4020,159 @@ impl Escrow {
                 Err(EscrowError::CpiExecutionFailed)
             }
         }
+    }
+
+    /// Release `amount` split across several recipients by basis-point
+    /// weights (AV-93 — Solana / payment fintech: the initializer's
+    /// multi-party payout — a revenue share, a creator royalty split,
+    /// a payroll run — settled in one transition instead of N partial
+    /// `release` calls).
+    ///
+    /// The check order mirrors [`Escrow::release`] exactly: pause guard
+    /// (AV-46), reentrancy guard (AV-36), authority, `Funded` state, the
+    /// mint binding (AV-16), the per-recipient AV-49 payout-policy pin,
+    /// then the milestone (AV-15) / subscription (AV-56) / quorum /
+    /// timelock (AV-27/AV-64) gates, then the amount math.
+    ///
+    /// `shares` is the `(recipient, bps)` table in payout order: the
+    /// first entry receives the bps-floor dust remainder (see below).
+    /// Table validity is one code — [`EscrowError::InvalidReleaseSplit`]
+    /// (150): an empty table, more than
+    /// [`MAX_RELEASE_SPLIT_RECIPIENTS`] recipients, a zero recipient
+    /// address, a zero bps weight, or a weight sum that is not exactly
+    /// 10_000 bps (100%) — under and over both rejected, so the taker
+    /// can neither be shorted nor overpaid. Checked right after the
+    /// mint binding (with the other input-shape checks), before any
+    /// fund movement.
+    ///
+    /// AV-49: every recipient must satisfy the escrow's payout policy
+    /// ([`Escrow::require_payout_recipient`]) — with no allowlist
+    /// configured only the taker passes, so a multi-recipient split is
+    /// the allowlist's declared distribution set (a phishing frontend
+    /// cannot add a recipient the initializer never approved —
+    /// [`EscrowError::PayoutNotAllowlisted`]).
+    ///
+    /// AV-17: the protocol fee is charged on the *gross* amount first —
+    /// after every gate passes, like `release` — and only the net
+    /// (`amount - fee`) is split. Each leg is
+    /// `floor(net * bps / 10_000)` (u128 math, like
+    /// [`Escrow::protocol_fee_for`]); the dust from flooring — at most
+    /// `recipients - 1` lamports — lands on the first recipient, so
+    /// `Σ legs == net` exactly and the Anchor layer's transfer legs
+    /// always add up to the payout it sizes.
+    ///
+    /// Conservation: `self.released` accumulates the *gross* amount,
+    /// exactly like `release` — the invariant
+    /// `inflow == locked + released + refunded` (plus `penalty_paid`
+    /// under AV-82) is untouched by the split.
+    ///
+    /// Returns `(legs, fee)`: the per-recipient `(recipient, net_share)`
+    /// legs in table order (sized for the Anchor layer's transfers) and
+    /// the protocol fee. The state machine touches no new persisted
+    /// field — `release_split` is instruction logic, and the vault
+    /// account layout (`VAULT_SPACE`) is unchanged.
+    pub fn release_split(
+        &mut self,
+        authority: [u8; 32],
+        now: u64,
+        amount: u64,
+        mint: Option<[u8; 32]>,
+        shares: &[([u8; 32], u16)],
+    ) -> Result<(Vec<([u8; 32], u64)>, u64), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        self.require_not_paused()?;
+        self.require_not_reentrant()?;
+        self.require_initializer(authority)?;
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // AV-16: the tokens being released must be the tokens this
+        // escrow locks — like `release`.
+        self.require_mint_match(mint)?;
+        // AV-93: the share table's shape — empty, oversized, zero
+        // recipient, zero weight, or a weight sum off 10_000 — is one
+        // code (150), paralleling AV-81's `InvalidSplit` family. The
+        // u32 accumulator cannot overflow: 8 entries × 65_535 <
+        // u32::MAX.
+        if shares.is_empty() || shares.len() > MAX_RELEASE_SPLIT_RECIPIENTS {
+            return Err(EscrowError::InvalidReleaseSplit);
+        }
+        let mut total_bps: u32 = 0;
+        for (recipient, bps) in shares {
+            if *recipient == [0u8; 32] || *bps == 0 {
+                return Err(EscrowError::InvalidReleaseSplit);
+            }
+            total_bps += u32::from(*bps);
+        }
+        if total_bps != 10_000 {
+            return Err(EscrowError::InvalidReleaseSplit);
+        }
+        // AV-49: every recipient satisfies the escrow's payout policy —
+        // the allowlist when configured, otherwise the taker
+        // (`PayoutNotAllowlisted` otherwise). Checked in table order so
+        // the first off-policy recipient is the reported one.
+        for (recipient, _) in shares {
+            self.require_payout_recipient(*recipient)?;
+        }
+        // AV-15 / AV-56: a milestone plan or a subscription schedule
+        // owns the release path — plain and split `release` are both
+        // config errors once a schedule is attached.
+        if self.milestones.is_some() {
+            return Err(EscrowError::InvalidMilestones);
+        }
+        if self.subscription.is_some() {
+            return Err(EscrowError::InvalidSubscription);
+        }
+        if let Some(policy) = &self.quorum {
+            if !policy.is_satisfied() {
+                return Err(EscrowError::QuorumNotReached);
+            }
+        }
+        // AV-27 / AV-64: the timelock gates every taker payout path —
+        // like `release`, checked after the config gates and before the
+        // amount math.
+        if !self.is_unlock_eligible(now) {
+            return Err(EscrowError::TimelockNotReached);
+        }
+        if amount == 0 {
+            return Err(EscrowError::AmountMismatch);
+        }
+        // Gross accounting, identical to `release`: `released` keeps
+        // the gross amount so the conservation invariant is untouched.
+        let new_released = self
+            .released
+            .checked_add(amount)
+            .ok_or(EscrowError::ReleaseExceedsLocked)?;
+        // AV-82: slashed funds are out of the releasable pool.
+        if new_released > self.amount - self.penalty_paid {
+            return Err(EscrowError::ReleaseExceedsLocked);
+        }
+        // AV-17: charge the protocol fee on the gross amount first —
+        // after every gate passes — then split the net.
+        let fee = self.charge_protocol_fee(amount)?;
+        self.released = new_released;
+        let net = amount - fee;
+        let mut legs = Vec::with_capacity(shares.len());
+        let mut floored_total: u64 = 0;
+        for (recipient, bps) in shares {
+            // u128: `net * bps` cannot overflow (u64::MAX * 10_000 <
+            // u128::MAX); the floored quotient is `<= net`, so the
+            // downcast is exact and `floored_total` cannot wrap.
+            let leg = ((net as u128 * u128::from(*bps)) / 10_000u128) as u64;
+            floored_total += leg;
+            legs.push((*recipient, leg));
+        }
+        // The bps-floor dust — at most one lamport per non-first
+        // recipient — lands on the first recipient, so Σ legs == net
+        // exactly.
+        let dust = net - floored_total;
+        legs[0].1 += dust;
+        if self.remaining_amount() == 0 {
+            self.state = EscrowState::Released;
+        }
+        Ok((legs, fee))
     }
 
     /// Cancel the escrow and return funds. `Funded -> Cancelled`.
@@ -11918,6 +12097,66 @@ pub(crate) mod anchor_idl_tests {
                             (TimelockNotReached while now < unlock_at)",
         },
         InstructionSpec {
+            // AV-93: the taker payout split across several recipients
+            // by basis-point weights (Solana / payment fintech:
+            // revenue-share / royalty / payroll legs in one
+            // transition). IDL: sha256("global:release_split")[..8] —
+            // the Anchor instruction discriminator for the
+            // release_split handler.
+            name: "release_split",
+            params: &[
+                ("amount", "u64", "instruction param"),
+                (
+                    "recipients",
+                    "Vec<Pubkey>",
+                    "instruction param; the split recipients in payout order — non-empty, at most 8 entries (MAX_RELEASE_SPLIT_RECIPIENTS), no zero address; the first entry receives the bps-floor dust remainder (InvalidReleaseSplit, code 150, otherwise)",
+                ),
+                (
+                    "bps",
+                    "Vec<u16>",
+                    "instruction param; per-recipient basis-point weights in recipients order — same length as recipients, no zero weight, and the sum must equal exactly 10_000 (100%); under and over both rejected (InvalidReleaseSplit, code 150)",
+                ),
+            ],
+            method: "Escrow::release_split",
+            input_mapping: "authority <- accounts.initializer (signer); \
+                            amount <- param; recipients, bps <- params (Pubkey -> \
+                            [u8; 32] conversion); now <- clock sysvar (NOT an \
+                            instruction param — see module docs); the check \
+                            order mirrors `release`: authority -> state \
+                            (Funded-only) -> mint -> the share-table shape \
+                            (empty / oversized / zero address / zero weight / \
+                            weight sum != 10_000 is InvalidReleaseSplit, code \
+                            150) -> every recipient pinned against the AV-49 \
+                            payout policy (the taker, or a member of the \
+                            payout allowlist when one is configured — \
+                            PayoutNotAllowlisted otherwise; with no allowlist \
+                            only the taker passes, so a multi-recipient split \
+                            is the allowlist's declared distribution set) -> \
+                            milestones / subscription / quorum / timelock \
+                            gates -> amount (0 is AmountMismatch; cumulative \
+                            releases above the locked remainder are \
+                            ReleaseExceedsLocked); AV-17: the protocol fee is \
+                            charged on the gross amount first (after every \
+                            gate, like `release`), then the net (amount - fee) \
+                            is split — each leg is floor(net * bps / 10_000) \
+                            and the dust lands on the first recipient, so the \
+                            legs sum to the net exactly; `released` accumulates \
+                            the gross amount, so the conservation invariant \
+                            inflow == locked + released + refunded is untouched \
+                            by the split; partial splits carry from == to == \
+                            Funded, the closing one to == Released; the real \
+                            build transfers leg i to accounts.remaining_accounts[i] \
+                            (must key-match the params' recipients order); \
+                            returns (legs, fee) — the per-recipient \
+                            (recipient, net_share) legs in table order so the \
+                            real build can size each transfer, plus the fee; \
+                            emits the ReleasedSplit indexer event (from == \
+                            Funded, to == Funded/Released; amounts follow the \
+                            Released shape — payout = gross amount, fee = the \
+                            protocol fee — and the (recipient, net_share) legs \
+                            ride the event's release_split field)",
+        },
+        InstructionSpec {
             name: "release_via_cpi",
             params: &[
                 ("amount", "u64", "instruction param"),
@@ -13692,6 +13931,7 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::initialize",
             "Escrow::fund",
             "Escrow::release",
+            "Escrow::release_split",
             "Escrow::release_via_cpi",
             "Escrow::cancel",
             "Escrow::cancel_expired",
@@ -13810,7 +14050,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_forty_nine_instructions_take_params() {
+    fn only_fifty_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -13823,6 +14063,7 @@ pub(crate) mod anchor_idl_tests {
             vec![
                 &"initialize",
                 &"release",
+                &"release_split",
                 &"release_via_cpi",
                 &"cancel_partial",
                 &"initialize_quorum",
@@ -15382,6 +15623,12 @@ pub(crate) mod anchor_idl_tests {
         ("split_escrow", "quorum"),
         ("split_escrow", "dual_sig"),
         ("split_escrow", "milestones"),
+        // AV-93: the split legs are computed at call time and never
+        // persisted — the `(recipient, net_share)` roster rides the
+        // `ReleasedSplit` event (the AV-81 split_escrow precedent: its
+        // params birth child vaults, these legs ride an event).
+        ("release_split", "recipients"),
+        ("release_split", "bps"),
     ];
     const PARAM_FIELD_MAP: &[(&str, &str, &str)] = &[
         ("initialize", "amount", "amount"),
@@ -15395,6 +15642,10 @@ pub(crate) mod anchor_idl_tests {
         // `released` counter — a second param source for the field (see
         // the direction-2 note above).
         ("release_via_cpi", "amount", "released"),
+        // AV-93: the split release's gross amount accumulates into the
+        // same `released` counter — like `release`, the split is gross
+        // accounting, so the conservation invariant is untouched.
+        ("release_split", "amount", "released"),
         ("initialize_quorum", "attestors", "quorum.attestors"),
         ("initialize_quorum", "weights", "quorum.weights"),
         ("initialize_quorum", "threshold", "quorum.threshold"),
@@ -16260,6 +16511,11 @@ mod error_code_tests {
             EscrowError::InvalidVaultSeeds,
             149,
             "VaultSeeds::new / derive_vault_address with more than 16 seeds or a seed longer than 32 bytes (the Solana create_program_address limits)",
+        ),
+        (
+            EscrowError::InvalidReleaseSplit,
+            150,
+            "release_split with an empty share table, more than 8 recipients, a zero recipient address, a zero bps weight, or a weight table whose sum differs from 10_000 bps (a per-recipient payout-policy violation is PayoutNotAllowlisted, not this code)",
         ),
     ];
 
@@ -22062,6 +22318,19 @@ mod migrate_schema_tests {
         let err = VaultSeeds::new(&refs).unwrap_err();
         assert_eq!(err, EscrowError::InvalidVaultSeeds);
         assert_eq!(err.code(), 149);
+    }
+
+    #[test]
+    fn invalid_release_split_triggered_by_bad_weight_sum() {
+        // AV-93: the weight table must sum to exactly 10_000 bps — a
+        // short sum is a config error with the new code 150.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let err = e
+            .release_split(ALICE, EXPIRES_AT - 3_600, 100_000, None, &[(BOB, 9999)])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidReleaseSplit);
+        assert_eq!(err.code(), 150);
     }
 
     // ---------- AV-85: migration chain, atomic rollback, dry-run ----------
@@ -29197,7 +29466,12 @@ mod event_history_tests {
             46,
             "AV-91: appended after AppealResolved"
         );
-        for d in 0..=46u8 {
+        assert_eq!(
+            EscrowEventKind::ReleasedSplit.discriminant(),
+            47,
+            "AV-93: appended after EvidenceFiled"
+        );
+        for d in 0..=47u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -29208,7 +29482,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(47), None);
+        assert_eq!(EscrowEventKind::from_discriminant(48), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -29337,8 +29611,9 @@ mod event_history_tests {
         // `EscrowSplit` (AV-81), 42 is `Slashed` (AV-82), 43 is
         // `CpiAllowlistUpdated` (AV-83), 44 is `AppealFiled` (AV-86),
         // 45 is `AppealResolved` (AV-86), 46 is `EvidenceFiled`
-        // (AV-91); 47 is the first still-unknown byte.
-        for bad in [47u8, 48, 255] {
+        // (AV-91), 47 is `ReleasedSplit` (AV-93); 48 is the first
+        // still-unknown byte.
+        for bad in [48u8, 49, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -31118,6 +31393,8 @@ mod arbiter_panel_tests {
         assert_eq!(EscrowError::SlashNotEligible.code(), 143);
         // AV-83: appended, never renumbered.
         assert_eq!(EscrowError::InvalidCpiAllowlist.code(), 144);
+        // AV-93: appended, never renumbered.
+        assert_eq!(EscrowError::InvalidReleaseSplit.code(), 150);
         // never-renumber: the full table still pins every code, and
         // `all()` covers the new variants (the AV-46 lesson: a missing
         // variant drifts the IDL error pin).
@@ -31136,7 +31413,8 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::InvalidVestingCurve));
         assert!(EscrowError::all().contains(&EscrowError::InvalidEvidenceProof));
         assert!(EscrowError::all().contains(&EscrowError::InvalidVaultSeeds));
-        assert_eq!(EscrowError::all().len(), 50);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidReleaseSplit));
+        assert_eq!(EscrowError::all().len(), 51);
     }
 
     #[test]
@@ -32133,6 +32411,276 @@ mod split_tests {
             .unwrap();
         assert_eq!(e.state(), EscrowState::Split);
         assert_eq!(EscrowState::Split as u8, 8, "Split appended last");
+        assert_eq!(VAULT_SPACE, 3978, "full Vault account space");
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
+    }
+}
+
+// ---------- AV-93: multi-recipient release split ----------
+
+#[cfg(test)]
+mod release_split_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const CAROL: [u8; 32] = [0xCC; 32];
+    const DAVE: [u8; 32] = [0xDD; 32];
+    const MALLORY: [u8; 32] = [0xEE; 32]; // stranger
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_750_000_000;
+
+    fn funded_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    fn funded_allowlisted_escrow() -> Escrow {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(250) // 2.5%
+            .unwrap()
+            .with_payout_allowlist(&[BOB, CAROL, DAVE])
+            .unwrap();
+        let mut e = e;
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn split_happy_path_splits_net_after_fee() {
+        let mut e = funded_allowlisted_escrow();
+        let (legs, fee) = e
+            .release_split(ALICE, NOW, 400_000, None, &[(BOB, 5000), (CAROL, 5000)])
+            .unwrap();
+        // AV-17: fee charged on the gross first: floor(400_000 * 250 /
+        // 10_000) = 10_000; the net 390_000 splits evenly.
+        assert_eq!(fee, 10_000);
+        assert_eq!(legs, vec![(BOB, 195_000), (CAROL, 195_000)]);
+        assert_eq!(e.fees_paid(), 10_000);
+        // Conservation: `released` keeps the gross, like `release`.
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.remaining_amount(), 600_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn split_dust_lands_on_first_recipient() {
+        // A fee-less allowlisted escrow for exact dust math.
+        let base = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_payout_allowlist(&[BOB, CAROL, DAVE])
+            .unwrap();
+        let mut e = base;
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let (legs, fee) = e
+            .release_split(ALICE, NOW, 1000, None, &[(BOB, 3333), (CAROL, 3333), (DAVE, 3334)])
+            .unwrap();
+        assert_eq!(fee, 0);
+        // floor(1000 * 3333 / 10_000) = 333 each; the 1-lamport dust
+        // from flooring lands on the first recipient.
+        assert_eq!(legs, vec![(BOB, 334), (CAROL, 333), (DAVE, 333)]);
+        let total: u64 = legs.iter().map(|(_, s)| s).sum();
+        assert_eq!(total, 1000, "legs sum to the net exactly");
+    }
+
+    #[test]
+    fn split_closing_split_moves_to_released() {
+        let mut e = funded_allowlisted_escrow();
+        let (legs, fee) = e
+            .release_split(ALICE, NOW, 1_000_000, None, &[(BOB, 7000), (CAROL, 3000)])
+            .unwrap();
+        // floor(1_000_000 * 250 / 10_000) = 25_000 fee; net 975_000.
+        assert_eq!(fee, 25_000);
+        assert_eq!(legs, vec![(BOB, 682_500), (CAROL, 292_500)]);
+        assert_eq!(e.released_amount(), 1_000_000, "gross, like release");
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn split_rejects_bad_share_tables() {
+        let mut e = funded_allowlisted_escrow();
+        // Empty table.
+        let err = e
+            .release_split(ALICE, NOW, 100_000, None, &[])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidReleaseSplit);
+        assert_eq!(err.code(), 150);
+        // Zero bps weight.
+        let err = e
+            .release_split(ALICE, NOW, 100_000, None, &[(BOB, 10_000), (CAROL, 0)])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidReleaseSplit);
+        assert_eq!(err.code(), 150);
+        // Zero recipient address.
+        let err = e
+            .release_split(ALICE, NOW, 100_000, None, &[([0u8; 32], 10_000)])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidReleaseSplit);
+        // Weight sum under 10_000.
+        let err = e
+            .release_split(ALICE, NOW, 100_000, None, &[(BOB, 5000), (CAROL, 4999)])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidReleaseSplit);
+        // Weight sum over 10_000.
+        let err = e
+            .release_split(ALICE, NOW, 100_000, None, &[(BOB, 5000), (CAROL, 5001)])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidReleaseSplit);
+        // Too many recipients.
+        let many: Vec<([u8; 32], u16)> = (0..9u8).map(|i| ([i; 32], 1111)).collect();
+        let err = e.release_split(ALICE, NOW, 100_000, None, &many).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidReleaseSplit);
+        // Nothing moved on any rejection.
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.fees_paid(), 0);
+    }
+
+    #[test]
+    fn split_enforces_the_payout_allowlist_per_recipient() {
+        // Default policy (no allowlist): only the taker passes.
+        let mut e = funded_escrow();
+        let (legs, _) = e
+            .release_split(ALICE, NOW, 100_000, None, &[(BOB, 10_000)])
+            .unwrap();
+        assert_eq!(legs, vec![(BOB, 100_000)]);
+        let err = e
+            .release_split(ALICE, NOW, 100_000, None, &[(CAROL, 10_000)])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::PayoutNotAllowlisted);
+        // With an allowlist: every recipient must be a member.
+        let mut e = funded_allowlisted_escrow();
+        e.release_split(ALICE, NOW, 100_000, None, &[(BOB, 5000), (CAROL, 5000)])
+            .unwrap();
+        let err = e
+            .release_split(ALICE, NOW, 100_000, None, &[(BOB, 5000), (MALLORY, 5000)])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::PayoutNotAllowlisted);
+        assert_eq!(err.code(), 127);
+        // The allowlist pin runs before the amount math: an off-policy
+        // recipient with amount 0 reports the policy violation, not
+        // AmountMismatch.
+        let err = e
+            .release_split(ALICE, NOW, 0, None, &[(MALLORY, 10_000)])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::PayoutNotAllowlisted);
+    }
+
+    #[test]
+    fn split_check_order_mirrors_release() {
+        let shares = [(BOB, 10_000)];
+        // Authority first — a stranger learns nothing, even with a bad
+        // table.
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.release_split(MALLORY, NOW, 100_000, None, &[]),
+            Err(EscrowError::Unauthorized)
+        );
+        // State before input shape.
+        let e2 = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let mut e2 = e2;
+        assert_eq!(
+            e2.release_split(ALICE, NOW, 100_000, None, &[]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Table shape before the gates.
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.release_split(ALICE, NOW, 100_000, None, &[]),
+            Err(EscrowError::InvalidReleaseSplit)
+        );
+        // Milestones own the release path.
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            e.release_split(ALICE, NOW, 100_000, None, &shares),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // Amount math last: zero amount, then over-release.
+        let mut e = funded_escrow();
+        assert_eq!(
+            e.release_split(ALICE, NOW, 0, None, &shares),
+            Err(EscrowError::AmountMismatch)
+        );
+        assert_eq!(
+            e.release_split(ALICE, NOW, 1_000_001, None, &shares),
+            Err(EscrowError::ReleaseExceedsLocked)
+        );
+    }
+
+    #[test]
+    fn split_honors_quorum_and_timelock_gates() {
+        // Quorum not satisfied.
+        let policy = QuorumPolicy::new(&[CAROL, DAVE], &[1, 1], 2).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            e.release_split(ALICE, NOW, 100_000, None, &[(BOB, 10_000)]),
+            Err(EscrowError::QuorumNotReached)
+        );
+        // Timelock not reached.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(NOW + 3_600)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            e.release_split(ALICE, NOW, 100_000, None, &[(BOB, 10_000)]),
+            Err(EscrowError::TimelockNotReached)
+        );
+    }
+
+    #[test]
+    fn split_emits_indexed_event_with_stamped_legs() {
+        // The adapter's builder surface carries no payout-allowlist
+        // passthrough, so this exercises the taker-only default policy
+        // with a single-leg split — the stamp path is identical for N
+        // legs (the multi-leg stamp math is covered on the state
+        // machine above).
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0x1D; 32], NOW - 10)
+            .unwrap()
+            .with_protocol_fee(250)
+            .unwrap();
+        e.fund(ALICE, NOW - 5).unwrap();
+        let before = e.event_count();
+        let (legs, fee) = e
+            .release_split(ALICE, 400_000, None, &[(BOB, 10_000)], NOW)
+            .unwrap();
+        assert_eq!(fee, 10_000);
+        assert_eq!(legs, vec![(BOB, 390_000)]);
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::ReleasedSplit);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 400_000, "gross, like Released");
+        assert_eq!(ev.amounts.fee, 10_000);
+        let (roster, len) = ev.release_split.expect("legs stamped");
+        assert_eq!(len, 1);
+        assert_eq!(roster[0].recipient, BOB);
+        assert_eq!(roster[0].net_share, 390_000);
+        // Every other event kind carries no roster.
+        assert!(e.events()[0].release_split.is_none());
+    }
+
+    #[test]
+    fn split_adds_no_fields_and_keeps_space() {
+        // AV-93 is instruction logic: no new persisted field — the
+        // vault account layout (VAULT_SPACE) is rent-critical and must
+        // not move.
+        let mut e = funded_escrow();
+        e.release_split(ALICE, NOW, 1_000_000, None, &[(BOB, 10_000)])
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(VAULT_SPACE, 3978, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");

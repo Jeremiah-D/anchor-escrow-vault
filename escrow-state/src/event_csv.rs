@@ -220,6 +220,10 @@ pub fn csv_to_events(csv: &str) -> Result<Vec<EscrowEvent>, CsvError> {
             // on import, like the other kind-specific extras.
             evidence_root: None,
             evidence_disclosure: None,
+            // AV-93: the split legs are not carried by the CSV
+            // projection either — `None` on import, like the other
+            // kind-specific extras.
+            release_split: None,
         });
     }
     Ok(events)
