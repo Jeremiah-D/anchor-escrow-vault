@@ -49,11 +49,18 @@
 //!   system program), and for `release` it appends `taker`, `payout_to`,
 //!   the clock sysvar, and the vault token account on the SPL path, per
 //!   the IDL's account list. The instruction *data* needs nothing added.
-//! - **Legacy message, one instruction each.** No address-table lookups
-//!   are compiled in (the bundle's `alt_table` is for the operator's
-//!   ALT, which a v0 upgrade can reference later); each action becomes
-//!   its own single-instruction message, so one multisig proposal signs
-//!   one instruction.
+//! - **Legacy message, one instruction each** — via [`compile_message`] /
+//!   [`signable_message_base64`]. No address-table lookups are compiled
+//!   in; each action becomes its own single-instruction message, so one
+//!   multisig proposal signs one instruction.
+//! - **v0 message with address-table lookups** (AV-87) — via
+//!   [`compile_action_message_v0`] / [`signable_message_v0_base64`] /
+//!   [`bundle_action_message_v0_base64`]. ALT-eligible accounts (the
+//!   bundle's stamped `alt_index`) resolve statically against the
+//!   caller's snapshot of the on-chain table: signers stay static (the
+//!   runtime forbids signer lookups), everything else shrinks the
+//!   static key list. The legacy path is byte-identical with or without
+//!   the v0 code present.
 //!
 //! # Anti-drift
 //!
@@ -70,7 +77,7 @@
 use super::batch::BatchActionKind;
 use super::cpi::{AccountMeta, Pubkey};
 use super::discriminator::instruction_discriminator;
-use super::execution_bundle::BundledAction;
+use super::execution_bundle::{BundledAction, ExecutionBundle};
 
 /// Errors from message construction, encoding, and decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +98,22 @@ pub enum TxMessageError {
     AccountIndexOutOfBounds,
     /// More than 255 account keys: instruction indexes are single bytes.
     TooManyAccountKeys,
+    /// v0 compile: a bundled account's stamped `alt_index` points beyond
+    /// the caller-supplied lookup-table snapshot.
+    AltIndexOutOfBounds,
+    /// v0 compile: the snapshot's address at the stamped `alt_index` is
+    /// not the account's pubkey — the snapshot is stale or for a
+    /// different table.
+    AltTableKeyMismatch,
+    /// v0 compile: no account resolved through the lookup table, so the
+    /// message would carry an empty lookup list — use the legacy path
+    /// instead.
+    NoAltResolved,
+    /// v0 decode: a lookup entry lists the same table index twice, or
+    /// in both the writable and readonly lists.
+    InvalidAddressTableLookup,
+    /// v0 decode: the first byte is not the `0x80` v0 version prefix.
+    NotV0Message,
 }
 
 /// One program instruction ready to compile into a message: the target
@@ -392,6 +415,384 @@ pub fn decode_message(bytes: &[u8]) -> Result<TransactionMessage, TxMessageError
         recent_blockhash,
         instructions,
     })
+}
+
+// ---------------------------------------------------------------------------
+// v0 messages with address-table lookups (AV-87).
+// ---------------------------------------------------------------------------
+
+/// One address-table lookup of a v0 message: the on-chain lookup
+/// table's key plus the table indexes resolved into it, split by
+/// writability. At runtime the two lists become the loaded addresses —
+/// writable first, then readonly — appended after the static keys in
+/// the instruction's index space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressTableLookup {
+    /// The on-chain address lookup table's key.
+    pub address_table_key: [u8; 32],
+    /// Indexes into the table's address list, writable at runtime.
+    pub writable_indexes: Vec<u8>,
+    /// Indexes into the table's address list, readonly at runtime.
+    pub readonly_indexes: Vec<u8>,
+}
+
+/// A Solana v0 transaction message: the legacy shape plus address-table
+/// lookups. Wire bytes are the legacy layout prefixed with the `0x80`
+/// version byte, with the compact-u16-prefixed lookup list appended
+/// after the instructions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V0TransactionMessage {
+    pub header: MessageHeader,
+    /// Keys embedded in the message: signers, the program id, and every
+    /// account not resolved through a lookup table. The header counts
+    /// cover exactly these keys — never the loaded addresses.
+    pub static_account_keys: Vec<Pubkey>,
+    pub recent_blockhash: Pubkey,
+    /// Account indexes address the concatenated space `static keys ++
+    /// writable loaded ++ readonly loaded`, in that order — the Solana
+    /// loaded-address convention.
+    pub instructions: Vec<CompiledInstruction>,
+    pub address_table_lookups: Vec<AddressTableLookup>,
+}
+
+impl V0TransactionMessage {
+    /// Table-resolved (loaded) addresses across all lookups.
+    pub fn loaded_account_count(&self) -> usize {
+        self.address_table_lookups
+            .iter()
+            .map(|l| l.writable_indexes.len() + l.readonly_indexes.len())
+            .sum()
+    }
+
+    /// Total addressable accounts: static keys plus loaded addresses.
+    pub fn total_account_count(&self) -> usize {
+        self.static_account_keys.len() + self.loaded_account_count()
+    }
+}
+
+/// Compile a bundled action into a v0 message, resolving ALT-eligible
+/// accounts against the caller's snapshot of the on-chain lookup table
+/// at `address_table_key`.
+///
+/// Resolution rules (static — no chain access):
+/// - Signers never resolve through a lookup table (the runtime forbids
+///   signer lookups); they stay static even if an `alt_index` was
+///   stamped.
+/// - A non-signer with `alt_index: Some(i)` resolves to table index `i`
+///   when `address_table[i]` is its pubkey; otherwise the build fails
+///   ([`TxMessageError::AltIndexOutOfBounds`] / `AltTableKeyMismatch`)
+///   instead of signing bytes against a stale table.
+/// - A non-signer with `alt_index: None` stays static.
+///
+/// The legacy path is untouched: same action, no table snapshot, still
+/// builds the identical legacy message as before.
+pub fn compile_action_message_v0(
+    program_id: Pubkey,
+    action: &BundledAction,
+    recent_blockhash: Pubkey,
+    address_table_key: [u8; 32],
+    address_table: &[[u8; 32]],
+) -> Result<V0TransactionMessage, TxMessageError> {
+    let ix = instruction_for_action(program_id, action)?;
+
+    // Static-key interning, same OR-merge rule as the legacy path.
+    // Loaded accounts never enter the static list.
+    let mut uniq: Vec<(Pubkey, bool, bool)> = Vec::new();
+    let mut intern = |key: Pubkey, signer: bool, writable: bool| -> usize {
+        if let Some(i) = uniq.iter().position(|(k, _, _)| *k == key) {
+            uniq[i].1 |= signer;
+            uniq[i].2 |= writable;
+            i
+        } else {
+            uniq.push((key, signer, writable));
+            uniq.len() - 1
+        }
+    };
+
+    // Per account, in program-declared order: a static intern slot, or a
+    // resolved table index plus its writability.
+    enum Slot {
+        Static(usize),
+        Loaded(bool, u8),
+    }
+    let mut slots: Vec<Slot> = Vec::with_capacity(action.accounts.len());
+    let mut writable_loaded: Vec<u8> = Vec::new();
+    let mut readonly_loaded: Vec<u8> = Vec::new();
+    for a in &action.accounts {
+        match (a.signer, a.alt_index) {
+            (true, _) | (false, None) => {
+                slots.push(Slot::Static(intern(a.pubkey, a.signer, a.writable)));
+            }
+            (false, Some(table_idx)) => {
+                let table_idx = table_idx as usize;
+                let addr = address_table
+                    .get(table_idx)
+                    .ok_or(TxMessageError::AltIndexOutOfBounds)?;
+                if *addr != a.pubkey {
+                    return Err(TxMessageError::AltTableKeyMismatch);
+                }
+                let list = if a.writable {
+                    &mut writable_loaded
+                } else {
+                    &mut readonly_loaded
+                };
+                if !list.contains(&(table_idx as u8)) {
+                    list.push(table_idx as u8);
+                }
+                slots.push(Slot::Loaded(a.writable, table_idx as u8));
+            }
+        }
+    }
+    if writable_loaded.is_empty() && readonly_loaded.is_empty() {
+        return Err(TxMessageError::NoAltResolved);
+    }
+    let program_idx = intern(program_id, false, false);
+
+    // Canonical static order, stable within each class — the legacy rule.
+    let mut order: Vec<usize> = (0..uniq.len()).collect();
+    order.sort_by_key(|&i| {
+        let (_, signer, writable) = uniq[i];
+        match (signer, writable) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, true) => 2,
+            (false, false) => 3,
+        }
+    });
+    let mut new_index = vec![0usize; uniq.len()];
+    for (new, &old) in order.iter().enumerate() {
+        new_index[old] = new;
+    }
+    let static_account_keys: Vec<Pubkey> = order.iter().map(|&i| uniq[i].0).collect();
+    let static_len = static_account_keys.len();
+
+    let num_required_signatures = uniq.iter().filter(|(_, s, _)| *s).count() as u8;
+    let num_readonly_signed_accounts =
+        uniq.iter().filter(|(_, s, w)| *s && !*w).count() as u8;
+    let num_readonly_unsigned_accounts =
+        uniq.iter().filter(|(_, s, w)| !*s && !*w).count() as u8;
+
+    let loaded_total = writable_loaded.len() + readonly_loaded.len();
+    if static_len + loaded_total > 255 {
+        return Err(TxMessageError::TooManyAccountKeys);
+    }
+    // Instruction indexes address static keys, then writable loaded,
+    // then readonly loaded.
+    let loaded_position = |table_idx: u8, writable: bool| -> u8 {
+        let (list, base) = if writable {
+            (&writable_loaded, 0)
+        } else {
+            (&readonly_loaded, writable_loaded.len())
+        };
+        let pos = list
+            .iter()
+            .position(|&x| x == table_idx)
+            .expect("v0 compile: resolved index missing from loaded list");
+        (static_len + base + pos) as u8
+    };
+    let accounts: Vec<u8> = slots
+        .iter()
+        .map(|s| match s {
+            Slot::Static(intern_slot) => new_index[*intern_slot] as u8,
+            Slot::Loaded(writable, table_idx) => loaded_position(*table_idx, *writable),
+        })
+        .collect();
+
+    Ok(V0TransactionMessage {
+        header: MessageHeader {
+            num_required_signatures,
+            num_readonly_signed_accounts,
+            num_readonly_unsigned_accounts,
+        },
+        static_account_keys,
+        recent_blockhash,
+        instructions: vec![CompiledInstruction {
+            program_id_index: new_index[program_idx] as u8,
+            accounts,
+            data: ix.data.clone(),
+        }],
+        address_table_lookups: vec![AddressTableLookup {
+            address_table_key,
+            writable_indexes: writable_loaded,
+            readonly_indexes: readonly_loaded,
+        }],
+    })
+}
+
+/// Serialize a v0 message to its canonical wire bytes: the `0x80`
+/// version prefix, then the legacy layout, then the compact-u16-prefixed
+/// address-table lookup list.
+pub fn encode_v0_message(msg: &V0TransactionMessage) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(0x80); // versioned-message prefix, version 0
+    out.push(msg.header.num_required_signatures);
+    out.push(msg.header.num_readonly_signed_accounts);
+    out.push(msg.header.num_readonly_unsigned_accounts);
+    encode_compact_u16(msg.static_account_keys.len() as u16, &mut out);
+    for key in &msg.static_account_keys {
+        out.extend_from_slice(key);
+    }
+    out.extend_from_slice(&msg.recent_blockhash);
+    encode_compact_u16(msg.instructions.len() as u16, &mut out);
+    for ix in &msg.instructions {
+        out.push(ix.program_id_index);
+        encode_compact_u16(ix.accounts.len() as u16, &mut out);
+        out.extend_from_slice(&ix.accounts);
+        encode_compact_u16(ix.data.len() as u16, &mut out);
+        out.extend_from_slice(&ix.data);
+    }
+    encode_compact_u16(msg.address_table_lookups.len() as u16, &mut out);
+    for l in &msg.address_table_lookups {
+        out.extend_from_slice(&l.address_table_key);
+        encode_compact_u16(l.writable_indexes.len() as u16, &mut out);
+        out.extend_from_slice(&l.writable_indexes);
+        encode_compact_u16(l.readonly_indexes.len() as u16, &mut out);
+        out.extend_from_slice(&l.readonly_indexes);
+    }
+    out
+}
+
+/// Parse canonical v0 wire bytes back into a message. Rejects a missing
+/// version prefix, truncated input, trailing bytes, out-of-range account
+/// indexes, and malformed lookup entries (a table index listed twice, or
+/// in both the writable and readonly lists) — decode is the
+/// untrusted-input path.
+pub fn decode_v0_message(bytes: &[u8]) -> Result<V0TransactionMessage, TxMessageError> {
+    let mut pos = 0usize;
+    if take_bytes(bytes, &mut pos, 1)?[0] != 0x80 {
+        return Err(TxMessageError::NotV0Message);
+    }
+    let num_required_signatures = take_bytes(bytes, &mut pos, 1)?[0];
+    let num_readonly_signed_accounts = take_bytes(bytes, &mut pos, 1)?[0];
+    let num_readonly_unsigned_accounts = take_bytes(bytes, &mut pos, 1)?[0];
+
+    let key_count = decode_compact_u16(bytes, &mut pos)? as usize;
+    if key_count > 255 {
+        return Err(TxMessageError::TooManyAccountKeys);
+    }
+    let mut static_account_keys = Vec::with_capacity(key_count);
+    for _ in 0..key_count {
+        let k: [u8; 32] = take_bytes(bytes, &mut pos, 32)?
+            .try_into()
+            .map_err(|_| TxMessageError::TruncatedMessage)?;
+        static_account_keys.push(k);
+    }
+    let recent_blockhash: [u8; 32] = take_bytes(bytes, &mut pos, 32)?
+        .try_into()
+        .map_err(|_| TxMessageError::TruncatedMessage)?;
+
+    // Indexes are validated after the lookups parse, against the full
+    // static + loaded address space.
+    let ix_count = decode_compact_u16(bytes, &mut pos)? as usize;
+    let mut raw_instructions = Vec::with_capacity(ix_count);
+    for _ in 0..ix_count {
+        let program_id_index = take_bytes(bytes, &mut pos, 1)?[0];
+        let acct_count = decode_compact_u16(bytes, &mut pos)? as usize;
+        let accounts = take_bytes(bytes, &mut pos, acct_count)?.to_vec();
+        let data_len = decode_compact_u16(bytes, &mut pos)? as usize;
+        let data = take_bytes(bytes, &mut pos, data_len)?.to_vec();
+        raw_instructions.push((program_id_index, accounts, data));
+    }
+
+    let lookup_count = decode_compact_u16(bytes, &mut pos)? as usize;
+    let mut address_table_lookups = Vec::with_capacity(lookup_count);
+    let mut loaded_total = 0usize;
+    for _ in 0..lookup_count {
+        let address_table_key: [u8; 32] = take_bytes(bytes, &mut pos, 32)?
+            .try_into()
+            .map_err(|_| TxMessageError::TruncatedMessage)?;
+        let w_len = decode_compact_u16(bytes, &mut pos)? as usize;
+        let writable_indexes = take_bytes(bytes, &mut pos, w_len)?.to_vec();
+        let r_len = decode_compact_u16(bytes, &mut pos)? as usize;
+        let readonly_indexes = take_bytes(bytes, &mut pos, r_len)?.to_vec();
+        // Each table index may appear at most once across both lists.
+        let mut seen = [false; 256];
+        for &i in writable_indexes.iter().chain(readonly_indexes.iter()) {
+            if seen[i as usize] {
+                return Err(TxMessageError::InvalidAddressTableLookup);
+            }
+            seen[i as usize] = true;
+        }
+        loaded_total += writable_indexes.len() + readonly_indexes.len();
+        address_table_lookups.push(AddressTableLookup {
+            address_table_key,
+            writable_indexes,
+            readonly_indexes,
+        });
+    }
+    if pos != bytes.len() {
+        return Err(TxMessageError::TrailingBytes);
+    }
+
+    let addressable = key_count + loaded_total;
+    let mut instructions = Vec::with_capacity(raw_instructions.len());
+    for (program_id_index, accounts, data) in raw_instructions {
+        if program_id_index as usize >= addressable {
+            return Err(TxMessageError::AccountIndexOutOfBounds);
+        }
+        for &a in &accounts {
+            if a as usize >= addressable {
+                return Err(TxMessageError::AccountIndexOutOfBounds);
+            }
+        }
+        instructions.push(CompiledInstruction {
+            program_id_index,
+            accounts,
+            data,
+        });
+    }
+    Ok(V0TransactionMessage {
+        header: MessageHeader {
+            num_required_signatures,
+            num_readonly_signed_accounts,
+            num_readonly_unsigned_accounts,
+        },
+        static_account_keys,
+        recent_blockhash,
+        instructions,
+        address_table_lookups,
+    })
+}
+
+/// Build the v0 message for a bundled action and return the
+/// base64-encoded to-be-signed bytes: the AV-87 counterpart of
+/// [`signable_message_base64`].
+pub fn signable_message_v0_base64(
+    program_id: Pubkey,
+    action: &BundledAction,
+    recent_blockhash: Pubkey,
+    address_table_key: [u8; 32],
+    address_table: &[[u8; 32]],
+) -> Result<String, TxMessageError> {
+    let msg = compile_action_message_v0(
+        program_id,
+        action,
+        recent_blockhash,
+        address_table_key,
+        address_table,
+    )?;
+    Ok(encode_base64(&encode_v0_message(&msg)))
+}
+
+/// Keeper large-account-set route: compile one of the bundle's actions
+/// into a v0 message, resolving its ALT-eligible accounts against the
+/// bundle's own `alt_table` snapshot. A bundle whose static account set
+/// would bloat every message ships fewer static keys per message — the
+/// table is extended once on-chain, then referenced by index.
+pub fn bundle_action_message_v0_base64(
+    program_id: Pubkey,
+    bundle: &ExecutionBundle,
+    action: &BundledAction,
+    recent_blockhash: Pubkey,
+    address_table_key: [u8; 32],
+) -> Result<String, TxMessageError> {
+    signable_message_v0_base64(
+        program_id,
+        action,
+        recent_blockhash,
+        address_table_key,
+        &bundle.alt_table,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -908,5 +1309,353 @@ mod tx_message_tests {
             assert!(!b64.is_empty());
         }
         assert_eq!(actions, before);
+    }
+
+    // ------------------------------------------------------------------
+    // AV-87: v0 messages with address-table lookups.
+    // ------------------------------------------------------------------
+
+    use crate::execution_bundle::BundledAccount;
+
+    const TABLE_KEY: [u8; 32] = [0xA1; 32];
+
+    /// Rebuild a per-action table snapshot from the scan-stamped
+    /// `alt_index` values: `table[i]` is the pubkey stamped with index
+    /// `i` — the shape a fresh on-chain table read would have.
+    fn snapshot_for(action: &BundledAction) -> Vec<[u8; 32]> {
+        let max = action
+            .accounts
+            .iter()
+            .filter_map(|a| a.alt_index)
+            .map(|i| i as usize)
+            .max();
+        let mut table = vec![[0u8; 32]; max.map_or(0, |m| m + 1)];
+        for a in &action.accounts {
+            if let Some(i) = a.alt_index {
+                table[i as usize] = a.pubkey;
+            }
+        }
+        table
+    }
+
+    /// Hand-built `fund` action: one signer plus `n` non-signer
+    /// accounts with stamped `alt_index` values, and the matching
+    /// table snapshot. Alternating writability exercises the
+    /// writable/readonly split.
+    fn wide_action(n: usize) -> (BundledAction, Vec<[u8; 32]>) {
+        let mut accounts = vec![BundledAccount {
+            pubkey: ALICE,
+            role: "initializer",
+            signer: true,
+            writable: true,
+            alt_index: None,
+        }];
+        let mut table = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut k = [0xE0u8; 32];
+            k[0] = (i & 0xff) as u8;
+            k[1] = ((i >> 8) & 0xff) as u8;
+            k[30] = 0xE1;
+            k[31] = 0xE2;
+            table.push(k);
+            accounts.push(BundledAccount {
+                pubkey: k,
+                role: "extra",
+                signer: false,
+                writable: i % 2 == 0,
+                alt_index: Some(i as u8),
+            });
+        }
+        let action = BundledAction {
+            escrow_id: ID1,
+            kind: BatchActionKind::Fund,
+            instruction: "fund",
+            discriminator: instruction_discriminator("fund"),
+            caller_role: "initializer",
+            taker: None,
+            expires_at: 0,
+            amount: AMOUNT,
+            payout: 0,
+            fee: 0,
+            accounts,
+            reason: "test",
+        };
+        (action, table)
+    }
+
+    #[test]
+    fn v0_round_trip_for_every_kind() {
+        for a in three_actions() {
+            let table = snapshot_for(&a);
+            let msg =
+                compile_action_message_v0(PROGRAM_ID, &a, BLOCKHASH, TABLE_KEY, &table).unwrap();
+            // The v0 route is defined by a non-empty lookup list.
+            assert!(!msg.address_table_lookups.is_empty());
+            let bytes = encode_v0_message(&msg);
+            assert_eq!(bytes[0], 0x80, "v0 version prefix");
+            let decoded = decode_v0_message(&bytes).unwrap();
+            assert_eq!(decoded, msg);
+            assert_eq!(encode_v0_message(&decoded), bytes);
+            // The base64 convenience agrees byte for byte.
+            let b64 =
+                signable_message_v0_base64(PROGRAM_ID, &a, BLOCKHASH, TABLE_KEY, &table).unwrap();
+            assert_eq!(decode_base64(&b64).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn v0_static_resolution_splits_signers_and_lookups() {
+        let actions = three_actions();
+        let fund = &actions[1];
+        let table = snapshot_for(fund);
+        let msg =
+            compile_action_message_v0(PROGRAM_ID, fund, BLOCKHASH, TABLE_KEY, &table).unwrap();
+        // The signer and the program id stay static; the vault resolves
+        // through the table. Header counts cover static keys only.
+        assert_eq!(msg.static_account_keys, vec![ALICE, PROGRAM_ID]);
+        assert_eq!(
+            msg.header,
+            MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            }
+        );
+        assert_eq!(msg.address_table_lookups.len(), 1);
+        let l = &msg.address_table_lookups[0];
+        assert_eq!(l.address_table_key, TABLE_KEY);
+        // fund's vault is writable and non-signer: writable list.
+        let vault_idx = fund
+            .accounts
+            .iter()
+            .find(|a| !a.signer)
+            .unwrap()
+            .alt_index
+            .unwrap();
+        assert_eq!(l.writable_indexes, vec![vault_idx]);
+        assert!(l.readonly_indexes.is_empty());
+        // Instruction indexes: program-declared order is
+        // [vault, initializer] → [loaded, static].
+        let cix = &msg.instructions[0];
+        assert_eq!(cix.program_id_index, 1);
+        assert_eq!(cix.accounts, vec![2, 0]);
+        assert_eq!(msg.loaded_account_count(), 1);
+        assert_eq!(msg.total_account_count(), 3);
+    }
+
+    #[test]
+    fn v0_large_account_set_reduces_static_keys() {
+        let (action, table) = wide_action(60);
+        let msg =
+            compile_action_message_v0(PROGRAM_ID, &action, BLOCKHASH, TABLE_KEY, &table).unwrap();
+        // Static: the signer plus the program id. Everything else loads
+        // through the table.
+        assert_eq!(msg.static_account_keys, vec![ALICE, PROGRAM_ID]);
+        let l = &msg.address_table_lookups[0];
+        let expect_w: Vec<u8> = (0..60u8).step_by(2).collect();
+        let expect_r: Vec<u8> = (1..60u8).step_by(2).collect();
+        assert_eq!(l.writable_indexes, expect_w);
+        assert_eq!(l.readonly_indexes, expect_r);
+        assert_eq!(msg.loaded_account_count(), 60);
+        // The legacy compile of the same instruction carries all 62
+        // keys statically — the v0 route is what shrinks the message.
+        let legacy = compile_message(
+            &instruction_for_action(PROGRAM_ID, &action).unwrap(),
+            BLOCKHASH,
+        );
+        assert_eq!(legacy.account_keys.len(), 62);
+        assert!(msg.static_account_keys.len() < legacy.account_keys.len());
+        // Spot-check the loaded index space: static ++ writable ++
+        // readonly. accounts[0] is the signer (static 0); then the 60
+        // vaults in program-declared order.
+        let cix = &msg.instructions[0];
+        assert_eq!(cix.accounts.len(), 61);
+        assert_eq!(cix.accounts[0], 0);
+        assert_eq!(cix.accounts[1], 2); // vault 0: first writable loaded
+        assert_eq!(cix.accounts[2], 32); // vault 1: first readonly loaded (2 + 30)
+        assert_eq!(cix.accounts[3], 3); // vault 2: second writable loaded
+        for &a in &cix.accounts {
+            assert!((a as usize) < msg.total_account_count());
+        }
+        // Round trip.
+        let bytes = encode_v0_message(&msg);
+        assert_eq!(decode_v0_message(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn v0_rejects_bad_lookup_indexes() {
+        let (action, table) = wide_action(3);
+        // Stamped index beyond the snapshot: the table does not cover
+        // the account.
+        assert_eq!(
+            compile_action_message_v0(PROGRAM_ID, &action, BLOCKHASH, TABLE_KEY, &table[..2]),
+            Err(TxMessageError::AltIndexOutOfBounds)
+        );
+        // Snapshot disagrees at a stamped index: stale table.
+        let mut stale = table.clone();
+        stale[1] = [0xFF; 32];
+        assert_eq!(
+            compile_action_message_v0(PROGRAM_ID, &action, BLOCKHASH, TABLE_KEY, &stale),
+            Err(TxMessageError::AltTableKeyMismatch)
+        );
+    }
+
+    #[test]
+    fn v0_requires_alt_resolution() {
+        // No ALT-eligible account: the v0 route refuses — the message
+        // would carry an empty lookup list — while the legacy path
+        // stays the right call.
+        let (mut action, table) = wide_action(2);
+        for a in &mut action.accounts {
+            a.alt_index = None;
+        }
+        assert_eq!(
+            compile_action_message_v0(PROGRAM_ID, &action, BLOCKHASH, TABLE_KEY, &table),
+            Err(TxMessageError::NoAltResolved)
+        );
+        assert!(signable_message_base64(PROGRAM_ID, &action, BLOCKHASH).is_ok());
+    }
+
+    #[test]
+    fn v0_signers_never_resolve_via_lookup() {
+        // A hand-built action stamping alt_index on a signer: the signer
+        // stays static — the runtime forbids signer lookups, so static
+        // is the only valid resolution.
+        let mut k = [0xE0u8; 32];
+        k[30] = 0xE1;
+        let action = BundledAction {
+            escrow_id: ID1,
+            kind: BatchActionKind::Fund,
+            instruction: "fund",
+            discriminator: instruction_discriminator("fund"),
+            caller_role: "initializer",
+            taker: None,
+            expires_at: 0,
+            amount: AMOUNT,
+            payout: 0,
+            fee: 0,
+            accounts: vec![
+                BundledAccount {
+                    pubkey: ALICE,
+                    role: "initializer",
+                    signer: true,
+                    writable: true,
+                    alt_index: Some(0),
+                },
+                BundledAccount {
+                    pubkey: k,
+                    role: "vault",
+                    signer: false,
+                    writable: true,
+                    alt_index: Some(1),
+                },
+            ],
+            reason: "test",
+        };
+        let table = vec![ALICE, k];
+        let msg =
+            compile_action_message_v0(PROGRAM_ID, &action, BLOCKHASH, TABLE_KEY, &table).unwrap();
+        assert_eq!(msg.static_account_keys, vec![ALICE, PROGRAM_ID]);
+        assert_eq!(msg.address_table_lookups[0].writable_indexes, vec![1u8]);
+    }
+
+    #[test]
+    fn v0_decode_rejects_malformed_lookups() {
+        let (action, table) = wide_action(2);
+        let msg =
+            compile_action_message_v0(PROGRAM_ID, &action, BLOCKHASH, TABLE_KEY, &table).unwrap();
+        let bytes = encode_v0_message(&msg);
+        // Not a v0 message: legacy bytes and other prefixes fail.
+        let legacy_bytes = encode_message(&compile_message(
+            &instruction_for_action(PROGRAM_ID, &action).unwrap(),
+            BLOCKHASH,
+        ));
+        assert_eq!(
+            decode_v0_message(&legacy_bytes),
+            Err(TxMessageError::NotV0Message)
+        );
+        assert_eq!(
+            decode_v0_message(&[0x00, 0x01]),
+            Err(TxMessageError::NotV0Message)
+        );
+        // Truncation / trailing bytes.
+        assert_eq!(
+            decode_v0_message(&bytes[..bytes.len() - 1]),
+            Err(TxMessageError::TruncatedMessage)
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0x00);
+        assert_eq!(
+            decode_v0_message(&trailing),
+            Err(TxMessageError::TrailingBytes)
+        );
+        // Overlapping lookup indexes: index 0 in both lists.
+        let mut bad = msg.clone();
+        bad.address_table_lookups[0].readonly_indexes.push(0);
+        assert_eq!(
+            decode_v0_message(&encode_v0_message(&bad)),
+            Err(TxMessageError::InvalidAddressTableLookup)
+        );
+        // Duplicate within one list.
+        let mut bad2 = msg.clone();
+        let dup = bad2.address_table_lookups[0].writable_indexes[0];
+        bad2.address_table_lookups[0].writable_indexes.push(dup);
+        assert_eq!(
+            decode_v0_message(&encode_v0_message(&bad2)),
+            Err(TxMessageError::InvalidAddressTableLookup)
+        );
+        // Instruction index beyond the static + loaded space.
+        let mut bad3 = msg.clone();
+        bad3.instructions[0].accounts[1] = 250;
+        assert_eq!(
+            decode_v0_message(&encode_v0_message(&bad3)),
+            Err(TxMessageError::AccountIndexOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn v0_and_legacy_carry_same_instruction_data() {
+        // The v0 route changes key placement, never the instruction
+        // itself: same program, same data bytes.
+        for a in three_actions() {
+            let table = snapshot_for(&a);
+            let v0 =
+                compile_action_message_v0(PROGRAM_ID, &a, BLOCKHASH, TABLE_KEY, &table).unwrap();
+            let ix = instruction_for_action(PROGRAM_ID, &a).unwrap();
+            let legacy = compile_message(&ix, BLOCKHASH);
+            assert_eq!(v0.instructions[0].data, legacy.instructions[0].data);
+            assert_eq!(
+                v0.instructions[0].program_id_index as usize,
+                v0.static_account_keys
+                    .iter()
+                    .position(|k| *k == PROGRAM_ID)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_v0_route_uses_bundle_alt_table() {
+        // End to end through a real bundle: the bundle's alt_table is
+        // the snapshot, so the keeper's large-account-set bundle ships
+        // v0 messages with fewer static keys than the legacy route.
+        let e_uninit = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES).unwrap();
+        let items = [watch(ID2, Some(e_uninit), ALICE)];
+        let bundles = bundle_execution(&scan_batch_lifecycle(&items, NOW));
+        assert_eq!(bundles.len(), 1);
+        let b = &bundles[0];
+        assert!(
+            !b.alt_table.is_empty(),
+            "the fund bundle stamps the vault into alt_table"
+        );
+        let action = &b.actions[0]; // fund
+        let b64 =
+            bundle_action_message_v0_base64(PROGRAM_ID, b, action, BLOCKHASH, TABLE_KEY).unwrap();
+        let msg = decode_v0_message(&decode_base64(&b64).unwrap()).unwrap();
+        assert_eq!(msg.static_account_keys, vec![ALICE, PROGRAM_ID]);
+        assert_eq!(msg.address_table_lookups[0].address_table_key, TABLE_KEY);
+        let legacy_b64 = signable_message_base64(PROGRAM_ID, action, BLOCKHASH).unwrap();
+        let legacy = decode_message(&decode_base64(&legacy_b64).unwrap()).unwrap();
+        assert!(legacy.account_keys.len() > msg.static_account_keys.len());
     }
 }

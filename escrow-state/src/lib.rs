@@ -304,9 +304,11 @@ pub use execution_bundle::{
 // base64 for a multisig/CLI to sign and submit. Off-chain and unsigned
 // by design; purely additive.
 pub use tx_message::{
-    compile_message, decode_base64, decode_message, encode_base64, encode_message,
-    instruction_for_action, signable_message_base64, CompiledInstruction, MessageHeader,
-    ProgramInstruction, TransactionMessage, TxMessageError,
+    bundle_action_message_v0_base64, compile_action_message_v0, compile_message, decode_base64,
+    decode_message, decode_v0_message, encode_base64, encode_message, encode_v0_message,
+    instruction_for_action, signable_message_base64, signable_message_v0_base64,
+    AddressTableLookup, CompiledInstruction, MessageHeader, ProgramInstruction,
+    TransactionMessage, TxMessageError, V0TransactionMessage,
 };
 
 // AV-78: escrow aggregate statistics view — read-only fleet rollup
