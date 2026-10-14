@@ -1009,6 +1009,7 @@ mod tx_message_tests {
                 amount: AMOUNT,
                 expires_at: EXPIRES,
             },
+            vault_derivation: None,
         }
     }
 

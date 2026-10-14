@@ -399,6 +399,8 @@ mod execution_plan_tests {
     ) -> KeeperAction {
         KeeperAction {
             escrow_id: id,
+            // AV-92: test actions carry no recorded seeds.
+            vault_address: None,
             kind,
             caller,
             caller_role: role,
@@ -575,6 +577,7 @@ mod execution_plan_tests {
             escrow: e,
             // AV-53: no reference memo on this escrow.
             reference: None,
+            vault_derivation: None,
         }];
         let plan = plan_execution(&scan_keeper_actions(&watched, MID));
         assert_eq!(plan.scanned, 1);

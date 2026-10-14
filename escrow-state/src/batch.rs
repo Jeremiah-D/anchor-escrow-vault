@@ -91,6 +91,36 @@ pub struct BatchWatchItem {
     pub escrow: Option<Escrow>,
     /// Initialize parameters, used only when `escrow` is `None`.
     pub initialize: BatchInitializeParams,
+    /// AV-92: opt-in PDA derivation inputs for this vault (see
+    /// [`crate::VaultDerivation`]). Recorded via
+    /// [`BatchWatchItem::with_vault_seeds`]; the scan derives the
+    /// canonical vault address from them and attaches it to the
+    /// emitted action as [`BatchLifecycleAction::vault_address`].
+    /// For `initialize` actions this is the *would-be* vault address
+    /// — the fleet bring-up use case. Real Solana PDAs never store
+    /// their seeds on-chain, so this stays off-chain by design.
+    pub vault_derivation: Option<crate::VaultDerivation>,
+}
+
+impl BatchWatchItem {
+    /// Opt-in builder recording the vault's PDA derivation inputs
+    /// (seeds + program id). Validates the seeds against the Solana
+    /// `create_program_address` limits
+    /// ([`crate::EscrowError::InvalidVaultSeeds`] on violation).
+    pub fn with_vault_seeds(
+        mut self,
+        seeds: &[&[u8]],
+        program_id: &[u8; 32],
+    ) -> Result<Self, crate::EscrowError> {
+        self.vault_derivation = Some(crate::VaultDerivation::new(seeds, program_id)?);
+        Ok(self)
+    }
+
+    /// The canonical vault PDA derived from the recorded seeds, or
+    /// `None` when no seeds were recorded.
+    pub fn vault_address(&self) -> Option<[u8; 32]> {
+        self.vault_derivation.and_then(|d| d.address())
+    }
 }
 
 /// Which lifecycle call a [`BatchLifecycleAction`] invokes.
@@ -141,6 +171,13 @@ pub struct BatchAccount {
 pub struct BatchLifecycleAction {
     /// Which escrow this call targets (the vault PDA).
     pub escrow_id: [u8; 32],
+    /// AV-92: the canonical vault PDA precomputed from the watch
+    /// item's recorded seeds ([`BatchWatchItem::with_vault_seeds`]).
+    /// For `initialize` actions this is the address the vault *will*
+    /// have — the fleet bring-up planner cross-checks it against the
+    /// transaction's account list. `None` when the operator recorded
+    /// no seeds. Informational: never an instruction input.
+    pub vault_address: Option<[u8; 32]>,
     /// Which lifecycle call to invoke.
     pub kind: BatchActionKind,
     /// The key that must sign the call (always the initializer for
@@ -258,7 +295,12 @@ impl BatchReport {
                 BatchItemOutcome::Action(a) => {
                     s.push_str("\",\"outcome\":\"action\",\"action\":\"");
                     s.push_str(a.kind.as_str());
-                    s.push_str("\",\"caller\":\"");
+                    // AV-92: the precomputed vault PDA (hex) or null —
+                    // for `initialize` the address the vault *will*
+                    // have. Informational, never an instruction input.
+                    s.push_str("\",\"vault_address\":");
+                    hex_or_null(&mut s, a.vault_address);
+                    s.push_str(",\"caller\":\"");
                     s.push_str(&hex32(&a.caller));
                     s.push_str("\",\"caller_role\":\"");
                     s.push_str(a.caller_role);
@@ -394,6 +436,7 @@ fn scan_one(item: &BatchWatchItem, now: u64) -> BatchItemOutcome {
         }
         return BatchItemOutcome::Action(BatchLifecycleAction {
             escrow_id: item.escrow_id,
+            vault_address: item.vault_address(),
             kind: BatchActionKind::Initialize,
             caller: p.initializer,
             caller_role: "initializer",
@@ -437,6 +480,7 @@ fn scan_one(item: &BatchWatchItem, now: u64) -> BatchItemOutcome {
             }
             BatchItemOutcome::Action(BatchLifecycleAction {
                 escrow_id: item.escrow_id,
+                vault_address: item.vault_address(),
                 kind: BatchActionKind::Fund,
                 caller: e.initializer(),
                 caller_role: "initializer",
@@ -470,6 +514,7 @@ fn scan_one(item: &BatchWatchItem, now: u64) -> BatchItemOutcome {
         // here (initializer-only, like the plain path).
         EscrowState::Activated => BatchItemOutcome::Action(BatchLifecycleAction {
             escrow_id: item.escrow_id,
+            vault_address: item.vault_address(),
             kind: BatchActionKind::Fund,
             caller: e.initializer(),
             caller_role: "initializer",
@@ -555,6 +600,7 @@ fn scan_one(item: &BatchWatchItem, now: u64) -> BatchItemOutcome {
             }
             BatchItemOutcome::Action(BatchLifecycleAction {
                 escrow_id: item.escrow_id,
+                vault_address: item.vault_address(),
                 kind: BatchActionKind::Release,
                 caller: e.initializer(),
                 caller_role: "initializer",
@@ -621,6 +667,7 @@ mod batch_tests {
             escrow_id: id,
             escrow,
             initialize: params(),
+            vault_derivation: None,
         }
     }
 
@@ -883,7 +930,7 @@ mod batch_tests {
         let report = scan_batch_lifecycle(&[watch(ID1, None)], NOW);
         let json = report.to_json();
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"items\":[{{\"escrow_id\":\"{}\",\"outcome\":\"action\",\"action\":\"initialize\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"taker\":\"{}\",\"expires_at\":1800000000,\"amount\":1000000,\"payout\":0,\"fee\":0,\"accounts\":[{{\"pubkey\":\"{}\",\"role\":\"vault\",\"signer\":false,\"writable\":true,\"alt_index\":0}},{{\"pubkey\":\"{}\",\"role\":\"initializer\",\"signer\":true,\"writable\":true,\"alt_index\":null}}],\"reason\":\"not_created\"}}],\"alt_table\":[\"{}\"]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"items\":[{{\"escrow_id\":\"{}\",\"outcome\":\"action\",\"action\":\"initialize\",\"vault_address\":null,\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"taker\":\"{}\",\"expires_at\":1800000000,\"amount\":1000000,\"payout\":0,\"fee\":0,\"accounts\":[{{\"pubkey\":\"{}\",\"role\":\"vault\",\"signer\":false,\"writable\":true,\"alt_index\":0}},{{\"pubkey\":\"{}\",\"role\":\"initializer\",\"signer\":true,\"writable\":true,\"alt_index\":null}}],\"reason\":\"not_created\"}}],\"alt_table\":[\"{}\"]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xBB),
@@ -892,6 +939,37 @@ mod batch_tests {
             hex_of(0x01),
         );
         assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn vault_address_attached_to_batch_actions() {
+        // AV-92: with recorded seeds, the `initialize` action carries
+        // the *would-be* vault address (fleet bring-up), and the JSON
+        // renders it as hex.
+        let program_id = [0x07; 32];
+        let seeds: &[&[u8]] = &[b"vault", &ALICE];
+        let item = watch(ID1, None)
+            .with_vault_seeds(seeds, &program_id)
+            .unwrap();
+        let expected = crate::find_program_address(seeds, &program_id)
+            .map(|(addr, _)| addr)
+            .unwrap();
+        assert_eq!(item.vault_address(), Some(expected));
+
+        let report = scan_batch_lifecycle(&[item], NOW);
+        let action = action_of(&report, ID1);
+        assert_eq!(action.kind, BatchActionKind::Initialize);
+        assert_eq!(action.vault_address, Some(expected));
+        let json = report.to_json();
+        assert!(
+            json.contains(&format!("\"vault_address\":\"{}\"", hex32(&expected))),
+            "vault_address hex missing: {json}"
+        );
+
+        // No seeds: None + null.
+        let report = scan_batch_lifecycle(&[watch(ID1, None)], NOW);
+        assert_eq!(action_of(&report, ID1).vault_address, None);
+        assert!(report.to_json().contains("\"vault_address\":null"));
     }
 
     #[test]

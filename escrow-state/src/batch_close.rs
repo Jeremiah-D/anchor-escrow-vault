@@ -49,7 +49,33 @@
 //! (see the README's "What's a skeleton") and gains no batch
 //! instruction in this change.
 
-use crate::{Escrow, EscrowError, EscrowState, IndexedEscrow};
+use crate::{Escrow, EscrowError, EscrowState, IndexedEscrow, VaultDerivation};
+
+/// Render 32 bytes as 64 lowercase hex characters (AV-92: for the
+/// `vault_address` report fields).
+fn hex32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+/// Append `"vault_address":<hex|null>` after an already-written
+/// `"index":N` field.
+fn push_vault_address_json(s: &mut String, vault_address: Option<[u8; 32]>) {
+    s.push_str(",\"vault_address\":");
+    match vault_address {
+        Some(v) => {
+            s.push('"');
+            s.push_str(&hex32(&v));
+            s.push('"');
+        }
+        None => s.push_str("null"),
+    }
+}
 
 /// Which vaults a [`close_vaults`] / [`close_indexed_vaults`] batch
 /// attempts to close. Every leg is optional: an unset leg does not
@@ -119,6 +145,53 @@ impl<'a> CloseVaultsFilter<'a> {
     }
 }
 
+/// One vault the batch close watches: the live escrow plus the
+/// opt-in PDA derivation inputs. The batch mutates the escrow
+/// (dry-run is [`crate::keeper::scan_closeable`]'s job); the seeds
+/// only feed the report's precomputed vault addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloseWatchItem {
+    /// The live escrow to close.
+    pub escrow: Escrow,
+    /// AV-92: opt-in PDA derivation inputs for this vault (see
+    /// [`VaultDerivation`]). Recorded via
+    /// [`CloseWatchItem::with_vault_seeds`]; the report attaches the
+    /// derived address to the item's entry as `vault_address`.
+    /// `None` when the operator did not record seeds. Real Solana
+    /// PDAs never store their seeds on-chain, so this stays
+    /// off-chain by design.
+    pub vault_derivation: Option<VaultDerivation>,
+}
+
+impl CloseWatchItem {
+    /// Wrap a live escrow with no recorded seeds.
+    pub fn new(escrow: Escrow) -> Self {
+        Self {
+            escrow,
+            vault_derivation: None,
+        }
+    }
+
+    /// Opt-in builder recording the vault's PDA derivation inputs
+    /// (seeds + program id). Validates the seeds against the Solana
+    /// `create_program_address` limits
+    /// ([`EscrowError::InvalidVaultSeeds`] on violation).
+    pub fn with_vault_seeds(
+        mut self,
+        seeds: &[&[u8]],
+        program_id: &[u8; 32],
+    ) -> Result<Self, EscrowError> {
+        self.vault_derivation = Some(VaultDerivation::new(seeds, program_id)?);
+        Ok(self)
+    }
+
+    /// The canonical vault PDA derived from the recorded seeds, or
+    /// `None` when no seeds were recorded.
+    pub fn vault_address(&self) -> Option<[u8; 32]> {
+        self.vault_derivation.and_then(|d| d.address())
+    }
+}
+
 /// One vault the batch closed: its input index, the terminal state it
 /// closed from, and the rent-exempt lamports reclaimed
 /// ([`crate::vault_close_rent_reclaimed`]).
@@ -127,6 +200,11 @@ pub struct VaultClosedItem {
     pub index: usize,
     pub from: EscrowState,
     pub rent_reclaimed: u64,
+    /// AV-92: the canonical vault PDA precomputed from the watch
+    /// item's recorded seeds ([`CloseWatchItem::with_vault_seeds`]),
+    /// or the recorded vault PDA for the indexed variant. `None`
+    /// when the input carried no seeds. Informational.
+    pub vault_address: Option<[u8; 32]>,
 }
 
 /// One vault the batch skipped: it did not match the
@@ -136,6 +214,8 @@ pub struct VaultClosedItem {
 pub struct VaultSkippedItem {
     pub index: usize,
     pub reason: &'static str,
+    /// AV-92: the precomputed vault PDA, as on [`VaultClosedItem`].
+    pub vault_address: Option<[u8; 32]>,
 }
 
 /// One vault the batch attempted but could not close: the
@@ -148,6 +228,8 @@ pub struct VaultSkippedItem {
 pub struct VaultFailedItem {
     pub index: usize,
     pub error: EscrowError,
+    /// AV-92: the precomputed vault PDA, as on [`VaultClosedItem`].
+    pub vault_address: Option<[u8; 32]>,
 }
 
 /// The batch-close result: per-item outcomes in input order plus the
@@ -200,7 +282,7 @@ impl CloseVaultsReport {
     /// Deterministic field order; items stay in input order.
     pub fn to_json(&self) -> String {
         let mut s = String::with_capacity(
-            128 + self.closed.len() * 72 + self.skipped.len() * 44 + self.failed.len() * 64,
+            128 + self.closed.len() * 140 + self.skipped.len() * 112 + self.failed.len() * 132,
         );
         s.push_str("{\"scanned\":");
         s.push_str(&self.scanned.to_string());
@@ -211,6 +293,8 @@ impl CloseVaultsReport {
             }
             s.push_str("{\"index\":");
             s.push_str(&item.index.to_string());
+            // AV-92: the precomputed vault PDA (hex) or null.
+            push_vault_address_json(&mut s, item.vault_address);
             s.push_str(",\"from\":\"");
             s.push_str(&format!("{:?}", item.from).to_lowercase());
             s.push_str("\",\"rent_reclaimed\":");
@@ -224,6 +308,7 @@ impl CloseVaultsReport {
             }
             s.push_str("{\"index\":");
             s.push_str(&item.index.to_string());
+            push_vault_address_json(&mut s, item.vault_address);
             s.push_str(",\"reason\":\"");
             s.push_str(item.reason);
             s.push_str("\"}");
@@ -235,6 +320,7 @@ impl CloseVaultsReport {
             }
             s.push_str("{\"index\":");
             s.push_str(&item.index.to_string());
+            push_vault_address_json(&mut s, item.vault_address);
             s.push_str(",\"error\":\"");
             s.push_str(&format!("{:?}", item.error));
             s.push_str("\",\"code\":");
@@ -263,15 +349,22 @@ impl CloseVaultsReport {
 /// `VaultClosed` events per vault plus the batch-level
 /// `VaultsBatchClosed` summary; this pure-logic variant emits nothing.
 pub fn close_vaults(
-    escrows: &mut [Escrow],
+    watched: &mut [CloseWatchItem],
     initializer: [u8; 32],
     taker: [u8; 32],
     filter: &CloseVaultsFilter<'_>,
 ) -> CloseVaultsReport {
-    let mut report = CloseVaultsReport::new(escrows.len());
-    for (index, escrow) in escrows.iter_mut().enumerate() {
+    let mut report = CloseVaultsReport::new(watched.len());
+    for (index, item) in watched.iter_mut().enumerate() {
+        // Copy out first: `escrow` mutably borrows the item below.
+        let vault_address = item.vault_address();
+        let escrow = &mut item.escrow;
         if let Some(reason) = filter.skip_reason(escrow) {
-            report.skipped.push(VaultSkippedItem { index, reason });
+            report.skipped.push(VaultSkippedItem {
+                index,
+                reason,
+                vault_address,
+            });
             continue;
         }
         // Dual-party binding: the taker leg is checked here (the
@@ -282,6 +375,7 @@ pub fn close_vaults(
             report.failed.push(VaultFailedItem {
                 index,
                 error: EscrowError::Unauthorized,
+                vault_address,
             });
             continue;
         }
@@ -301,10 +395,15 @@ pub fn close_vaults(
                     index,
                     from,
                     rent_reclaimed: rent,
+                    vault_address,
                 });
             }
             Err(error) => {
-                report.failed.push(VaultFailedItem { index, error });
+                report.failed.push(VaultFailedItem {
+                    index,
+                    error,
+                    vault_address,
+                });
             }
         }
     }
@@ -333,14 +432,23 @@ pub fn close_indexed_vaults(
     let mut report = CloseVaultsReport::new(escrows.len());
     for (index, escrow) in escrows.iter_mut().enumerate() {
         let inner = escrow.inner();
+        // AV-92: the indexed input records the vault PDA as
+        // `escrow_id` (vault-PDA convention), so the report carries it
+        // directly — no seeds needed, the vault already exists.
+        let vault_address = Some(escrow.escrow_id());
         if let Some(reason) = filter.skip_reason(inner) {
-            report.skipped.push(VaultSkippedItem { index, reason });
+            report.skipped.push(VaultSkippedItem {
+                index,
+                reason,
+                vault_address,
+            });
             continue;
         }
         if inner.taker() != taker {
             report.failed.push(VaultFailedItem {
                 index,
                 error: EscrowError::Unauthorized,
+                vault_address,
             });
             continue;
         }
@@ -355,10 +463,15 @@ pub fn close_indexed_vaults(
                     index,
                     from,
                     rent_reclaimed: rent,
+                    vault_address,
                 });
             }
             Err(error) => {
-                report.failed.push(VaultFailedItem { index, error });
+                report.failed.push(VaultFailedItem {
+                    index,
+                    error,
+                    vault_address,
+                });
             }
         }
     }
@@ -430,9 +543,9 @@ mod batch_close_tests {
     #[test]
     fn closes_every_terminal_state_and_sums_rent_from_the_main_formula() {
         let mut vaults = vec![
-            cancelled(1_000_000, FUTURE),
-            released(2_000_000, FUTURE),
-            cancelled(500_000, EXPIRED),
+            CloseWatchItem::new(cancelled(1_000_000, FUTURE)),
+            CloseWatchItem::new(released(2_000_000, FUTURE)),
+            CloseWatchItem::new(cancelled(500_000, EXPIRED)),
         ];
         let report = close_vaults(&mut vaults, ALICE, BOB, &CloseVaultsFilter::any());
         assert_eq!(report.scanned, 3);
@@ -441,7 +554,7 @@ mod batch_close_tests {
         assert_eq!(report.failed_count(), 0);
         assert_eq!(report.closed[0].from, EscrowState::Cancelled);
         assert_eq!(report.closed[1].from, EscrowState::Released);
-        assert!(vaults.iter().all(|e| e.state() == EscrowState::Closed));
+        assert!(vaults.iter().all(|w| w.escrow.state() == EscrowState::Closed));
         // Rent is the main formula per close — never a hardcoded
         // figure; the Σ is exactly closes × formula.
         let per_close = vault_close_rent_reclaimed();
@@ -456,22 +569,22 @@ mod batch_close_tests {
         let mut stranger = Escrow::initialize(ALICE, MALLORY, 1_000_000, FUTURE).unwrap();
         stranger.fund(ALICE, NOW).unwrap();
         stranger.cancel(ALICE, None, ALICE).unwrap();
-        let mut vaults = vec![stranger, cancelled(1_000_000, FUTURE)];
+        let mut vaults = vec![CloseWatchItem::new(stranger), CloseWatchItem::new(cancelled(1_000_000, FUTURE))];
         let report = close_vaults(&mut vaults, ALICE, BOB, &CloseVaultsFilter::any());
         // Item 0: Unauthorized, vault untouched.
         assert_eq!(report.failed_count(), 1);
         assert_eq!(report.failed[0].index, 0);
         assert_eq!(report.failed[0].error, EscrowError::Unauthorized);
-        assert_eq!(vaults[0].state(), EscrowState::Cancelled);
+        assert_eq!(vaults[0].escrow.state(), EscrowState::Cancelled);
         // Item 1 still closed: failure isolation.
         assert_eq!(report.closed_count(), 1);
         assert_eq!(report.closed[0].index, 1);
-        assert_eq!(vaults[1].state(), EscrowState::Closed);
+        assert_eq!(vaults[1].escrow.state(), EscrowState::Closed);
     }
 
     #[test]
     fn wrong_initializer_fails_with_unauthorized() {
-        let mut vaults = vec![cancelled(1_000_000, FUTURE), released(1_000_000, FUTURE)];
+        let mut vaults = vec![CloseWatchItem::new(cancelled(1_000_000, FUTURE)), CloseWatchItem::new(released(1_000_000, FUTURE))];
         let report = close_vaults(&mut vaults, MALLORY, BOB, &CloseVaultsFilter::any());
         assert_eq!(report.closed_count(), 0);
         assert_eq!(report.failed_count(), 2);
@@ -479,7 +592,7 @@ mod batch_close_tests {
             .failed
             .iter()
             .all(|f| f.error == EscrowError::Unauthorized));
-        assert!(vaults.iter().all(|e| e.state() != EscrowState::Closed));
+        assert!(vaults.iter().all(|w| w.escrow.state() != EscrowState::Closed));
     }
 
     #[test]
@@ -493,9 +606,9 @@ mod batch_close_tests {
         e.escalate(ALICE, NOW - 1, None, None, 0).unwrap();
         assert_eq!(e.inner().state(), EscrowState::Disputed);
         let mut vaults = vec![
-            funded(1_000_000, FUTURE), // Funded: not terminal
-            *e.inner(),               // Disputed: arbitration live
-            cancelled(1_000_000, FUTURE),
+            CloseWatchItem::new(funded(1_000_000, FUTURE)), // Funded: not terminal
+            CloseWatchItem::new(*e.inner()),               // Disputed: arbitration live
+            CloseWatchItem::new(cancelled(1_000_000, FUTURE)),
         ];
         let report = close_vaults(&mut vaults, ALICE, BOB, &CloseVaultsFilter::any());
         assert_eq!(report.failed_count(), 2);
@@ -521,22 +634,22 @@ mod batch_close_tests {
         paused.fund(ALICE, NOW).unwrap();
         paused.cancel(ALICE, None, ALICE).unwrap();
         paused.pause(ALICE).unwrap();
-        let mut vaults = vec![paused, cancelled(1_000_000, FUTURE)];
+        let mut vaults = vec![CloseWatchItem::new(paused), CloseWatchItem::new(cancelled(1_000_000, FUTURE))];
         let report = close_vaults(&mut vaults, ALICE, BOB, &CloseVaultsFilter::any());
         assert_eq!(report.failed_count(), 1);
         assert_eq!(report.failed[0].index, 0);
         assert_eq!(report.failed[0].error, EscrowError::Paused);
-        assert_eq!(vaults[0].state(), EscrowState::Cancelled);
+        assert_eq!(vaults[0].escrow.state(), EscrowState::Cancelled);
         assert_eq!(report.closed_count(), 1);
-        assert_eq!(vaults[1].state(), EscrowState::Closed);
+        assert_eq!(vaults[1].escrow.state(), EscrowState::Closed);
     }
 
     #[test]
     fn filter_state_skips_non_matching_vaults() {
         let mut vaults = vec![
-            cancelled(1_000_000, FUTURE),
-            released(1_000_000, FUTURE),
-            funded(1_000_000, FUTURE),
+            CloseWatchItem::new(cancelled(1_000_000, FUTURE)),
+            CloseWatchItem::new(released(1_000_000, FUTURE)),
+            CloseWatchItem::new(funded(1_000_000, FUTURE)),
         ];
         let filter = CloseVaultsFilter {
             states: Some(&[EscrowState::Cancelled]),
@@ -551,16 +664,16 @@ mod batch_close_tests {
         assert_eq!(report.skipped[1].index, 2);
         assert_eq!(report.skipped[1].reason, "filter_state");
         // Skipped vaults are untouched.
-        assert_eq!(vaults[1].state(), EscrowState::Released);
-        assert_eq!(vaults[2].state(), EscrowState::Funded);
+        assert_eq!(vaults[1].escrow.state(), EscrowState::Released);
+        assert_eq!(vaults[2].escrow.state(), EscrowState::Funded);
     }
 
     #[test]
     fn filter_expiry_selects_vaults_expired_before_cutoff() {
         let mut vaults = vec![
-            cancelled(1_000_000, EXPIRED),
-            cancelled(1_000_000, FUTURE),
-            cancelled(1_000_000, NOW), // expires exactly at NOW: not < NOW
+            CloseWatchItem::new(cancelled(1_000_000, EXPIRED)),
+            CloseWatchItem::new(cancelled(1_000_000, FUTURE)),
+            CloseWatchItem::new(cancelled(1_000_000, NOW)), // expires exactly at NOW: not < NOW
         ];
         let filter = CloseVaultsFilter {
             expired_before: Some(NOW),
@@ -576,9 +689,9 @@ mod batch_close_tests {
     #[test]
     fn filter_amount_range_selects_by_locked_amount() {
         let mut vaults = vec![
-            cancelled(100, FUTURE),
-            cancelled(1_000_000, FUTURE),
-            cancelled(100_000_000, FUTURE),
+            CloseWatchItem::new(cancelled(100, FUTURE)),
+            CloseWatchItem::new(cancelled(1_000_000, FUTURE)),
+            CloseWatchItem::new(cancelled(100_000_000, FUTURE)),
         ];
         let filter = CloseVaultsFilter {
             min_amount: Some(1_000),
@@ -689,9 +802,9 @@ mod batch_close_tests {
         stranger.fund(ALICE, NOW).unwrap();
         stranger.cancel(ALICE, None, ALICE).unwrap();
         let mut vaults = vec![
-            stranger,
-            funded(2_000_000, FUTURE),
-            released(3_000_000, FUTURE),
+            CloseWatchItem::new(stranger),
+            CloseWatchItem::new(funded(2_000_000, FUTURE)),
+            CloseWatchItem::new(released(3_000_000, FUTURE)),
         ];
         let report = close_vaults(&mut vaults, ALICE, BOB, &CloseVaultsFilter::any());
         assert_eq!(report.closed_count(), 1);
@@ -699,11 +812,51 @@ mod batch_close_tests {
         let json = report.to_json();
         let per_close = vault_close_rent_reclaimed();
         let expected = format!(
-            "{{\"scanned\":3,\"closed\":[{{\"index\":2,\"from\":\"released\",\"rent_reclaimed\":{per_close}}}],\"skipped\":[],\"failed\":[{{\"index\":0,\"error\":\"Unauthorized\",\"code\":{}}},{{\"index\":1,\"error\":\"InvalidStateTransition\",\"code\":{}}}],\"total_rent_reclaimed\":{per_close}}}",
+            "{{\"scanned\":3,\"closed\":[{{\"index\":2,\"vault_address\":null,\"from\":\"released\",\"rent_reclaimed\":{per_close}}}],\"skipped\":[],\"failed\":[{{\"index\":0,\"vault_address\":null,\"error\":\"Unauthorized\",\"code\":{}}},{{\"index\":1,\"vault_address\":null,\"error\":\"InvalidStateTransition\",\"code\":{}}}],\"total_rent_reclaimed\":{per_close}}}",
             EscrowError::Unauthorized.code(),
             EscrowError::InvalidStateTransition.code(),
         );
         assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn vault_address_attached_to_close_report() {
+        // AV-92: with recorded seeds the closed entry carries the
+        // precomputed vault PDA; the indexed variant carries the
+        // recorded vault PDA (escrow_id) directly.
+        let program_id = [0x07; 32];
+        let seeds: &[&[u8]] = &[b"vault", &ALICE];
+        let expected = crate::find_program_address(seeds, &program_id)
+            .map(|(addr, _)| addr)
+            .unwrap();
+        let mut vaults = vec![
+            CloseWatchItem::new(cancelled(1_000_000, FUTURE))
+                .with_vault_seeds(seeds, &program_id)
+                .unwrap(),
+            CloseWatchItem::new(cancelled(2_000_000, FUTURE)),
+        ];
+        let report = close_vaults(&mut vaults, ALICE, BOB, &CloseVaultsFilter::any());
+        assert_eq!(report.closed.len(), 2);
+        assert_eq!(report.closed[0].vault_address, Some(expected));
+        assert_eq!(report.closed[1].vault_address, None);
+        let json = report.to_json();
+        assert!(
+            json.contains(&format!("\"vault_address\":\"{}\"", hex32(&expected))),
+            "vault_address hex missing: {json}"
+        );
+        assert!(json.contains("\"vault_address\":null"));
+
+        // Indexed variant: escrow_id is the vault PDA by convention.
+        let mut indexed_vaults = vec![indexed(cancelled(1_000_000, FUTURE), ID1)];
+        let report = close_indexed_vaults(
+            &mut indexed_vaults,
+            ALICE,
+            BOB,
+            &CloseVaultsFilter::any(),
+            NOW,
+        );
+        assert_eq!(report.closed.len(), 1);
+        assert_eq!(report.closed[0].vault_address, Some(ID1));
     }
 
     #[test]

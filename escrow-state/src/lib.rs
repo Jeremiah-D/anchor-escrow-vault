@@ -57,6 +57,13 @@ mod cu_estimate;
 // compute-budget instruction data assembly the bundle dry-run report
 // passes through (see `tx_message`). Pure logic, zero dependencies.
 mod priority_fee;
+// AV-92: deterministic vault PDA derivation — hand-rolled Solana
+// `create_program_address` / `find_program_address` (SHA-256 hash
+// layout over the crate's `sha256`, ed25519 off-curve bump search
+// over hand-written field arithmetic), zero dependencies. Seeds are
+// recorded off-chain on the watch structs; the scans attach the
+// derived vault address to their reports. Purely additive.
+mod pda;
 // AV-72: escrow configuration templates — one-call constructors for the
 // four canonical escrow compositions (auction, milestone-plan,
 // subscription, arbitrated-dispute) with template-level combination
@@ -298,8 +305,8 @@ pub use batch::{
 // reclaim via the `vault_close_rent_reclaimed` main formula. Off-chain
 // only; the Anchor skeleton gains no new instruction.
 pub use batch_close::{
-    close_indexed_vaults, close_vaults, CloseVaultsFilter, CloseVaultsReport, VaultClosedItem,
-    VaultFailedItem, VaultSkippedItem,
+    close_indexed_vaults, close_vaults, CloseVaultsFilter, CloseVaultsReport, CloseWatchItem,
+    VaultClosedItem, VaultFailedItem, VaultSkippedItem,
 };
 
 // AV-61: keeper execution bundles over the batch lifecycle scan —
@@ -347,6 +354,17 @@ pub use priority_fee::{
     fee_budget_lamports, Confidence, PriorityFeeConfig, PriorityFeeConfigError,
     PriorityFeeOracle, PriorityFeeRecommendation, DEFAULT_ALPHA, DEFAULT_FALLBACK_MICRO_LAMPORTS_PER_CU,
     DEFAULT_WINDOW, MICRO_LAMPORTS_PER_LAMPORT,
+};
+
+// AV-92: deterministic vault PDA derivation — the hand-rolled Solana
+// `create_program_address` / `find_program_address` (SHA-256 layout +
+// ed25519 off-curve bump search), the validated seed list
+// [`VaultSeeds`], and the off-chain derivation inputs
+// [`VaultDerivation`] the watch structs record. Purely additive: no
+// existing signature changed.
+pub use pda::{
+    derive_vault_address, find_program_address, find_vault_bump, is_on_ed25519_curve,
+    validate_pda_seeds, VaultDerivation, VaultSeeds, MAX_PDA_SEED_LEN, MAX_PDA_SEEDS, PDA_DOMAIN,
 };
 
 // AV-78: escrow aggregate statistics view — read-only fleet rollup
@@ -1446,6 +1464,13 @@ pub enum EscrowError {
     /// the tree shape, or a proof that does not verify against the
     /// committed root.
     InvalidEvidenceProof,
+    /// Invalid vault PDA derivation inputs (AV-92):
+    /// [`VaultSeeds::new`] / [`derive_vault_address`] with more than
+    /// [`MAX_PDA_SEEDS`] seeds or a seed longer than
+    /// [`MAX_PDA_SEED_LEN`] bytes — the Solana
+    /// `create_program_address` limits, enforced off-chain before any
+    /// derivation is attempted.
+    InvalidVaultSeeds,
 }
 
 impl EscrowError {
@@ -1507,6 +1532,7 @@ impl EscrowError {
             EscrowError::InvalidAppealWindow => 146,
             EscrowError::InvalidVestingCurve => 147,
             EscrowError::InvalidEvidenceProof => 148,
+            EscrowError::InvalidVaultSeeds => 149,
         }
     }
 
@@ -1562,6 +1588,7 @@ impl EscrowError {
             EscrowError::InvalidAppealWindow,
             EscrowError::InvalidVestingCurve,
             EscrowError::InvalidEvidenceProof,
+            EscrowError::InvalidVaultSeeds,
         ]
     }
 }
@@ -16229,6 +16256,11 @@ mod error_code_tests {
             148,
             "escalate with a leaf count that does not describe the root (None root with nonzero leaves, Some root with zero or more than 64 leaves); file_evidence with no committed root, a leaf index past the committed leaves, a proof whose length does not match the tree shape, or a proof that does not verify against the committed root",
         ),
+        (
+            EscrowError::InvalidVaultSeeds,
+            149,
+            "VaultSeeds::new / derive_vault_address with more than 16 seeds or a seed longer than 32 bytes (the Solana create_program_address limits)",
+        ),
     ];
 
     #[test]
@@ -21728,6 +21760,7 @@ mod adjust_period_amounts_tests {
             escrow_id: [0x11; 32],
             escrow: e,
             reference: None,
+            vault_derivation: None,
         };
         let report = scan_keeper_actions(&[watched], due(0));
         assert_eq!(report.actions.len(), 1);
@@ -22014,6 +22047,21 @@ mod migrate_schema_tests {
         let err = e.migrate_schema(ALICE).unwrap_err();
         assert_eq!(err, EscrowError::InvalidSchemaMigration);
         assert_eq!(err.code(), 140);
+    }
+
+    #[test]
+    fn invalid_vault_seeds_triggered_by_oversize_seed() {
+        // AV-92: a 33-byte seed exceeds the Solana per-seed limit.
+        let big = [0xAAu8; 33];
+        let err = VaultSeeds::new(&[&big[..]]).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidVaultSeeds);
+        assert_eq!(err.code(), 149);
+        // … and 17 seeds exceed the seed-count limit.
+        let many: Vec<Vec<u8>> = (0..17).map(|i| vec![i as u8]).collect();
+        let refs: Vec<&[u8]> = many.iter().map(|s| s.as_slice()).collect();
+        let err = VaultSeeds::new(&refs).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidVaultSeeds);
+        assert_eq!(err.code(), 149);
     }
 
     // ---------- AV-85: migration chain, atomic rollback, dry-run ----------
@@ -23856,6 +23904,7 @@ mod reference_tests {
             escrow_id: [0x1D; 32],
             escrow: e,
             reference,
+            vault_derivation: None,
         }];
         let report = scan_keeper_actions(&watched, 1_000_000);
         assert!(!report.actions.is_empty());
@@ -23873,6 +23922,7 @@ mod reference_tests {
             escrow_id: [0x1D; 32],
             escrow: e,
             reference: None,
+            vault_derivation: None,
         }];
         let json = scan_keeper_actions(&watched, 1_000_000).to_json();
         assert!(json.contains("\"reference\":null"));
@@ -24422,6 +24472,7 @@ mod timelock_tests {
             escrow: e,
             // AV-53: no reference memo on this escrow.
             reference: None,
+            vault_derivation: None,
         }];
         // Before unlock: the claim call would fail, so it is not listed.
         let early = scan_keeper_actions(&watched, UNLOCK_AT - 1);
@@ -26328,6 +26379,7 @@ mod taker_rotation_tests {
             escrow: e,
             // AV-53: no reference memo on this escrow.
             reference: None,
+            vault_derivation: None,
         }];
         let report = scan_keeper_actions(&watched, 1_750_000_000);
         assert_eq!(report.actions.len(), 1);
@@ -26645,6 +26697,7 @@ mod initializer_rotation_tests {
             escrow: e,
             // AV-53: no reference memo on this escrow.
             reference: None,
+            vault_derivation: None,
         }];
         let report = scan_keeper_actions(&watched, EXPIRES_AT + 1);
         let action = report
@@ -26981,6 +27034,7 @@ mod arbiter_rotation_tests {
             escrow: e,
             // AV-53: no reference memo on this escrow.
             reference: None,
+            vault_derivation: None,
         }];
         let report = scan_keeper_actions(&watched, EXPIRES_AT + 1);
         let action = report
@@ -27659,6 +27713,7 @@ mod extension_tests {
             escrow_id: ESCROW_ID,
             escrow: e,
             reference: None,
+            vault_derivation: None,
         }];
         // Scan just past the *extended* deadline: the escrow is now
         // expiry-eligible on its moved deadline.
@@ -29823,6 +29878,7 @@ mod fee_cap_tests {
                 escrow_id: [0x01; 32],
                 escrow: e,
                 reference: None,
+                vault_derivation: None,
             }],
             NOW,
         );
@@ -30405,6 +30461,7 @@ mod fee_schedule_tests {
             escrow_id: [0xEE; 32],
             escrow: e,
             reference: None,
+            vault_derivation: None,
         }];
         let report = scan_milestones(&watched, NOW);
         let action = report
@@ -30432,6 +30489,7 @@ mod fee_schedule_tests {
                     amount: 1_000_000,
                     expires_at: EXPIRES_AT,
                 },
+                vault_derivation: None,
             }],
             NOW,
         );
@@ -30958,6 +31016,7 @@ mod relative_timelock_tests {
             escrow_id: [0x01; 32],
             escrow: e,
             reference: None,
+            vault_derivation: None,
         }];
         let report = scan_keeper_actions(&watched, UNLOCK_AT - 1);
         assert!(
@@ -31076,7 +31135,8 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::InvalidAppealWindow));
         assert!(EscrowError::all().contains(&EscrowError::InvalidVestingCurve));
         assert!(EscrowError::all().contains(&EscrowError::InvalidEvidenceProof));
-        assert_eq!(EscrowError::all().len(), 49);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidVaultSeeds));
+        assert_eq!(EscrowError::all().len(), 50);
     }
 
     #[test]
@@ -31613,6 +31673,7 @@ mod arbiter_panel_tests {
             escrow_id: ESCROW_ID,
             escrow: e,
             reference: None,
+            vault_derivation: None,
         }];
         let report = scan_keeper_actions(&watched, T0 + 100);
         let panel_actions: Vec<_> = report
@@ -32116,6 +32177,7 @@ mod slash_tests {
             escrow_id: id,
             escrow,
             reference: None,
+            vault_derivation: None,
         }
     }
 
@@ -32471,6 +32533,7 @@ mod appeal_tests {
             escrow_id: id,
             escrow,
             reference: None,
+            vault_derivation: None,
         }
     }
 
@@ -33092,6 +33155,7 @@ mod cpi_allowlist_tests {
             escrow_id: [0xE5; 32],
             escrow: funded_with_allowlist(),
             reference: None,
+            vault_derivation: None,
         };
         // Allowlisted target assembles fine.
         let inv = assemble_cpi_invocation(
@@ -33120,7 +33184,7 @@ mod cpi_allowlist_tests {
         // No allowlist: assembly accepts any well-formed target.
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.fund(ALICE, NOW).unwrap();
-        let watched = WatchedEscrow { escrow_id: [0xE5; 32], escrow: e, reference: None };
+        let watched = WatchedEscrow { escrow_id: [0xE5; 32], escrow: e, reference: None, vault_derivation: None };
         assemble_cpi_invocation(
             &watched,
             EVIL,
@@ -33272,6 +33336,21 @@ mod multisig_tests {
     }
 
     #[test]
+    fn squads_seeds_derive_through_unified_find_program_address() {
+        // AV-92 convergence: the multisig seed assembly feeds the
+        // unified derivation tool — no caller hand-rolls a bump
+        // search anymore.
+        let seeds = squads_v4_multisig_seeds(&CREATE_KEY);
+        let refs: Vec<&[u8]> = seeds.iter().map(|s| s.as_slice()).collect();
+        let (addr, bump) = crate::find_program_address(&refs, &SQUADS_V4_PROGRAM_ID).unwrap();
+        assert_eq!(
+            addr,
+            crate::derive_vault_address(&refs, &SQUADS_V4_PROGRAM_ID, bump).unwrap()
+        );
+        assert!(!crate::is_on_ed25519_curve(&addr));
+    }
+
+    #[test]
     fn assemble_and_validate_multisig_escrow_call() {
         let rest = vec![AccountMeta {
             pubkey: [0x11; 32],
@@ -33390,6 +33469,7 @@ mod multisig_tests {
             escrow_id: [0x1D; 32],
             escrow: e,
             reference: None,
+            vault_derivation: None,
         };
         let report = scan_keeper_actions(&[watched], EXPIRES_AT + 100);
         assert!(!report.actions.is_empty());

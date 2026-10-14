@@ -165,7 +165,7 @@
 
 use crate::{
     aggregate::EscrowAggregateView, format_amount, vault_close_rent_reclaimed, Escrow, EscrowError,
-    EscrowState, IndexedEscrow, MultisigAuthority, SchemaFieldDelta,
+    EscrowState, IndexedEscrow, MultisigAuthority, SchemaFieldDelta, VaultDerivation,
 };
 use super::cpi::{AccountMeta, Pubkey};
 use super::discriminator::instruction_discriminator;
@@ -202,6 +202,38 @@ pub struct WatchedEscrow {
     /// escrow carries no reference. Read-only: it never affects which
     /// actions are listed.
     pub reference: Option<[u8; 32]>,
+    /// AV-92: opt-in PDA derivation inputs for this vault (see
+    /// [`VaultDerivation`]). Recorded via
+    /// [`WatchedEscrow::with_vault_seeds`]; the scan derives the
+    /// canonical vault address from them and attaches it to every
+    /// emitted action as [`KeeperAction::vault_address`]. `None` when
+    /// the operator did not record seeds — the scan still lists the
+    /// same actions, just without the precomputed address. Real
+    /// Solana PDAs never store their seeds on-chain, so this stays
+    /// off-chain by design; the [`Escrow`] layout is untouched.
+    pub vault_derivation: Option<VaultDerivation>,
+}
+
+impl WatchedEscrow {
+    /// Opt-in builder recording the vault's PDA derivation inputs
+    /// (seeds + program id). Validates the seeds against the Solana
+    /// `create_program_address` limits
+    /// ([`EscrowError::InvalidVaultSeeds`] on violation).
+    pub fn with_vault_seeds(
+        mut self,
+        seeds: &[&[u8]],
+        program_id: &[u8; 32],
+    ) -> Result<Self, EscrowError> {
+        self.vault_derivation = Some(VaultDerivation::new(seeds, program_id)?);
+        Ok(self)
+    }
+
+    /// The canonical vault PDA derived from the recorded seeds, or
+    /// `None` when no seeds were recorded (or no bump qualifies —
+    /// practically impossible).
+    pub fn vault_address(&self) -> Option<[u8; 32]> {
+        self.vault_derivation.and_then(|d| d.address())
+    }
 }
 
 /// The keeper-callable action for one escrow.
@@ -296,6 +328,13 @@ impl KeeperActionKind {
 pub struct KeeperAction {
     /// Which escrow this call targets.
     pub escrow_id: [u8; 32],
+    /// AV-92: the canonical vault PDA precomputed from the watch
+    /// entry's recorded seeds ([`WatchedEscrow::with_vault_seeds`]) —
+    /// the address the `initialize` instruction must create (or the
+    /// existing vault's address, for live escrows). `None` when the
+    /// operator recorded no seeds. Informational: it is never an
+    /// instruction input and never affects which actions are listed.
+    pub vault_address: Option<[u8; 32]>,
     /// Which transition to invoke.
     pub kind: KeeperActionKind,
     /// The key that must sign the call. AV-48: for `CrankExpired` actions
@@ -436,7 +475,7 @@ impl KeeperReport {
     ///
     /// ```json
     /// {"at":1000000,"scanned":1,"total_estimated_cu":13814,"actions":[
-    ///   {"escrow_id":"...","action":"cancel_expired","caller":"...",
+    ///   {"escrow_id":"...","vault_address":"...","action":"cancel_expired","caller":"...",
     ///    "caller_role":"initializer","mint":null,
     ///    "refund_to":"...","amount":1000000,"decimals":6,
     ///    "display_amount":"1.000000",
@@ -467,7 +506,19 @@ impl KeeperReport {
             }
             s.push_str("{\"escrow_id\":\"");
             s.push_str(&hex32(&a.escrow_id));
-            s.push_str("\",\"action\":\"");
+            // AV-92: the precomputed vault PDA (hex) or null — the
+            // address the seeds derive to under the recorded program
+            // id; informational, never an instruction input.
+            s.push_str("\",\"vault_address\":");
+            match a.vault_address {
+                Some(v) => {
+                    s.push('"');
+                    s.push_str(&hex32(&v));
+                    s.push('"');
+                }
+                None => s.push_str("null"),
+            }
+            s.push_str(",\"action\":\"");
             s.push_str(a.kind.as_str());
             s.push_str("\",\"caller\":\"");
             s.push_str(&hex32(&a.caller));
@@ -604,6 +655,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     for member in panel.members[..panel.n as usize].iter() {
                         actions.push(KeeperAction {
                             escrow_id: w.escrow_id,
+                            vault_address: w.vault_address(),
                             kind: KeeperActionKind::PanelJudgment,
                             caller: *member,
                             caller_role: "panel_member",
@@ -628,6 +680,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 if remaining > 0 {
                     actions.push(KeeperAction {
                         escrow_id: w.escrow_id,
+                        vault_address: w.vault_address(),
                         kind: KeeperActionKind::Resolve,
                         caller: arbiter,
                         caller_role: "arbiter",
@@ -670,6 +723,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
             // — never fee'd, so no fee accounting is needed here.
             actions.push(KeeperAction {
                 escrow_id: w.escrow_id,
+                vault_address: w.vault_address(),
                 kind: KeeperActionKind::CancelExpired,
                 caller: e.initializer(),
                 caller_role: "initializer",
@@ -704,6 +758,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
             if !e.is_paused() {
                 actions.push(KeeperAction {
                     escrow_id: w.escrow_id,
+                    vault_address: w.vault_address(),
                     kind: KeeperActionKind::CrankExpired,
                     // Permissionless: no specific key must sign — the
                     // keeper substitutes its own key; see `caller` docs.
@@ -738,6 +793,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         {
             actions.push(KeeperAction {
                 escrow_id: w.escrow_id,
+                vault_address: w.vault_address(),
                 kind: KeeperActionKind::Claim,
                 caller: e.taker(),
                 caller_role: "taker",
@@ -783,6 +839,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
             {
                 actions.push(KeeperAction {
                     escrow_id: w.escrow_id,
+                    vault_address: w.vault_address(),
                     kind: KeeperActionKind::ReleasePeriod,
                     caller: e.initializer(),
                     caller_role: "initializer",
@@ -818,6 +875,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         if e.is_slash_eligible(now) && e.remaining_amount() > 0 {
             actions.push(KeeperAction {
                 escrow_id: w.escrow_id,
+                vault_address: w.vault_address(),
                 kind: KeeperActionKind::Slash,
                 caller: e.initializer(),
                 caller_role: "initializer",
@@ -836,6 +894,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
             if let Some(arbiter) = e.arbiter() {
                 actions.push(KeeperAction {
                     escrow_id: w.escrow_id,
+                    vault_address: w.vault_address(),
                     kind: KeeperActionKind::Slash,
                     caller: arbiter,
                     caller_role: "arbiter",
@@ -862,6 +921,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         if e.is_appeal_eligible(now) {
             actions.push(KeeperAction {
                 escrow_id: w.escrow_id,
+                vault_address: w.vault_address(),
                 kind: KeeperActionKind::FileAppeal,
                 caller: e.taker(),
                 caller_role: "taker",
@@ -892,6 +952,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     }
                     actions.push(KeeperAction {
                         escrow_id: w.escrow_id,
+                        vault_address: w.vault_address(),
                         kind: KeeperActionKind::ReviewAppeal,
                         caller: *member,
                         caller_role: "panel_member",
@@ -1521,6 +1582,7 @@ mod keeper_tests {
             escrow_id: id,
             escrow,
             reference,
+            vault_derivation: None,
         }
     }
 
@@ -2008,6 +2070,7 @@ mod keeper_tests {
             report.actions[0],
             KeeperAction {
                 escrow_id: ID1,
+                vault_address: None,
                 kind: KeeperActionKind::CancelExpired,
                 caller: ALICE,
                 caller_role: "initializer",
@@ -2031,6 +2094,7 @@ mod keeper_tests {
             report.actions[1],
             KeeperAction {
                 escrow_id: ID1,
+                vault_address: None,
                 kind: KeeperActionKind::CrankExpired,
                 // Permissionless: the zero key marks "anyone".
                 caller: [0u8; 32],
@@ -2060,7 +2124,7 @@ mod keeper_tests {
         // 3 accounts, 8 data bytes, 1 signer →
         // 10_000 + 3_000 + 3×250 + 8×8 = 13_814 each; total 27_628.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}}]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}}]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -2085,12 +2149,67 @@ mod keeper_tests {
         // AV-88: claim with mint, no refund_to: 3 accounts, 8 data
         // bytes, 1 signer → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":17814}}]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":17814}}]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),
         );
         assert_eq!(report.to_json(), expected);
+    }
+
+    #[test]
+    fn vault_address_attached_when_seeds_recorded() {
+        // AV-92: a watch entry with recorded seeds yields actions
+        // carrying the precomputed vault PDA; without seeds the
+        // field is None and the JSON says null.
+        let program_id = [0x07; 32];
+        let seeds: &[&[u8]] = &[b"vault", &ALICE];
+        // Expired funded escrow: the scan lists `cancel_expired`.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, MID - 3_600).unwrap();
+        e.fund(ALICE, MID - 7_200).unwrap();
+        let watched = watch(ID1, e)
+            .with_vault_seeds(seeds, &program_id)
+            .unwrap();
+        let expected = crate::find_program_address(seeds, &program_id)
+            .map(|(addr, _)| addr)
+            .unwrap();
+        assert_eq!(watched.vault_address(), Some(expected));
+
+        let report = scan_keeper_actions(&[watched], MID);
+        // Expired: both `cancel_expired` and the permissionless
+        // `crank_expired` are listed — both carry the address.
+        assert_eq!(report.actions.len(), 2);
+        for a in &report.actions {
+            assert_eq!(a.vault_address, Some(expected));
+        }
+        let json = report.to_json();
+        assert!(
+            json.contains(&format!("\"vault_address\":\"{}\"", hex32(&expected))),
+            "vault_address hex missing: {json}"
+        );
+
+        // No seeds recorded: None + null, same actions otherwise.
+        let plain = watch(ID1, e);
+        assert_eq!(plain.vault_address(), None);
+        let report = scan_keeper_actions(&[plain], MID);
+        assert_eq!(report.actions[0].vault_address, None);
+        assert!(
+            report.to_json().contains("\"vault_address\":null"),
+            "expected null vault_address"
+        );
+    }
+
+    #[test]
+    fn with_vault_seeds_rejects_invalid_seeds() {
+        // AV-92: the builder validates — a 33-byte seed is
+        // InvalidVaultSeeds, and the entry is unchanged (builder
+        // takes self by value, so the error leaves no half-state).
+        let e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER).unwrap();
+        let big = [0xAAu8; 33];
+        let err = watch(ID1, e)
+            .with_vault_seeds(&[&big[..]], &[0x07; 32])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidVaultSeeds);
     }
 
     #[test]
@@ -2101,6 +2220,7 @@ mod keeper_tests {
         // 10_000 + 3_000 + 3×250 + 8×8 = 13_814.
         let a = KeeperAction {
             escrow_id: ID1,
+            vault_address: None,
             kind: KeeperActionKind::CancelExpired,
             caller: ALICE,
             caller_role: "initializer",
@@ -2395,6 +2515,7 @@ mod close_keeper_tests {
             escrow_id: id,
             escrow,
             reference,
+            vault_derivation: None,
         }
     }
 
@@ -3293,6 +3414,7 @@ mod keeper_milestone_tests {
             escrow_id: id,
             escrow,
             reference,
+            vault_derivation: None,
         }
     }
 
@@ -4018,6 +4140,7 @@ mod schema_migration_tests {
             escrow_id: id,
             escrow,
             reference,
+            vault_derivation: None,
         }
     }
 

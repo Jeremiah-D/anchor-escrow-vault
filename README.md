@@ -1190,6 +1190,10 @@ program error per variant):
 | `InvalidCpiAllowlist` | 144 | `with_cpi_allowlist` / `update_cpi_allowlist` (AV-83) with more than 8 program ids or a zero program id; `update_cpi_allowlist` without both signatures, on a paused escrow, on a `Released`/`Cancelled`/`Expired` vault, or with no allowlist configured |
 | `InvalidMultisigAuthority` | 145 | `with_multisig_authority` (AV-84) with a zero multisig program id, a zero authority PDA, or a zero threshold; `validate_multisig_escrow_call` on a proposed vault-transaction instruction that does not carry the bound authority PDA as a signer |
 | `InvalidAppealWindow` | 146 | `with_appeal_window` (AV-86) with a zero window; `file_appeal` (AV-86) with no slash executed, no window configured, an already-filed or already-resolved appeal, or a lapsed window; `review_appeal` (AV-86) voting on a never-filed or already-resolved appeal |
+| `TemplateOverrideRejected` | 141 | `apply_template` (AV-77) with an override naming a field the preset did not declare overridable (unknown name, or a field from a different preset's review), a value of the wrong `OverrideValue` type, or the same field twice |
+| `InvalidVestingCurve` | 147 | `VestingCurve::stepped` (AV-90) with an empty/oversized tier table, a tier outside `[start, end]`, non-monotone timestamps or unlock fractions, bps above 10_000, or a final tier below full unlock; `VestingCurve::exponential` with zero/too many steps, a non-positive or overflowing growth ratio, or a window shorter than the step count; `with_vesting_curve` with a curve whose tier window does not match the schedule |
+| `InvalidEvidenceProof` | 148 | `escalate` (AV-91) with a leaf count that does not describe the committed root (`None` root with nonzero leaves, `Some` root with zero or more than 64 leaves); `file_evidence` (AV-91) with no committed root, a leaf index past the committed leaves, a proof whose length does not match the tree shape, or a proof that does not verify against the committed root |
+| `InvalidVaultSeeds` | 149 | `VaultSeeds::new` / `derive_vault_address` (AV-92) with more than 16 seeds or a seed longer than 32 bytes (the Solana `create_program_address` limits) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1770,11 +1774,16 @@ same `amount` rendered in human units (`500000` at 6 decimals →
 
 ```json
 {"at":1750000000,"scanned":1,"actions":[
-  {"escrow_id":"...","action":"claim","caller":"...","caller_role":"taker",
+  {"escrow_id":"...","vault_address":"...","action":"claim","caller":"...","caller_role":"taker",
    "mint":null,"refund_to":null,"amount":500000,"decimals":6,
    "display_amount":"0.500000","reason":"vesting_unlocked"}
 ]}
 ```
+
+`vault_address` (AV-92) is the vault PDA precomputed from the watch
+entry's recorded seeds (`WatchedEscrow::with_vault_seeds`) — hex when
+seeds are known, `null` otherwise; informational, never an instruction
+input.
 
 ## Aggregate statistics view (AV-78)
 
@@ -2516,6 +2525,50 @@ for a whole fleet of escrows.
   otherwise bloat every transaction.
 - **Dry-run**: like the keeper report — no events, no clock, no
   mutation. Amounts are as of the scan; execute, then re-scan.
+
+## Vault PDA derivation (AV-92)
+
+Every vault account is a Solana program-derived address (PDA). The
+canonical derivation, hand-rolled in `escrow-state/src/pda.rs` (zero
+dependencies — the crate never gains one):
+
+```
+address = sha256(seeds.. ++ [bump] ++ program_id ++ "ProgramDerivedAddress")
+```
+
+- **Seeds / bump / domain**: seeds are concatenated in order, then the
+  bump byte travels as the *last* seed, then the 32-byte program id,
+  then the literal domain separator `"ProgramDerivedAddress"` —
+  byte-for-byte Solana's `create_program_address` layout (the crate's
+  hand-written SHA-256 is pinned by the Anchor discriminator vectors,
+  and a test re-derives the layout independently so any drift fails
+  loudly). The reference seed convention is `[b"vault",
+  initializer]` (see the `Initialize` accounts struct in
+  `programs/escrow-vault/src/program.rs`); each seed is ≤ 32 bytes,
+  at most 16 seeds — violations are `InvalidVaultSeeds` (code 149).
+- **Bump search**: `find_vault_bump` scans bumps 255 → 0 and returns
+  the first whose derived address is *off* the ed25519 curve
+  (Solana's `find_program_address` semantics). The off-curve check is
+  hand-written Edwards decompression over hand-rolled field
+  arithmetic (`p = 2²⁵⁵ − 19`): `y < p` gate, then `x² = (y²−1) /
+  (d·y²+1)` with the `p ≡ 5 (mod 8)` square root, re-verified against
+  the curve equation. `find_program_address` returns
+  `(address, bump)`; the old multisig "caller runs its own
+  `find_program_address`" convention (AV-84) now resolves to this
+  unified tool.
+- **Seeds live off-chain**: real Solana PDAs never store their seeds
+  on-chain, and the vault layout is rent-critical (`VAULT_FIELDS` is
+  the single source of truth) — so seeds are recorded on the watch
+  structs, never in `Escrow`: `WatchedEscrow::with_vault_seeds(seeds,
+  program_id)`, `BatchWatchItem::with_vault_seeds`, and
+  `CloseWatchItem::with_vault_seeds` (all validate; all `Copy`).
+- **`vault_address` in reports**: where seeds are recorded, the
+  reports attach the precomputed vault PDA as `vault_address`
+  (64-char lowercase hex in JSON, `null` otherwise) — on
+  `KeeperAction`, on `BatchLifecycleAction` (for `initialize` this is
+  the address the vault *will* have — the fleet bring-up
+  cross-check), and on every `CloseVaultsReport` entry (the indexed
+  close variant carries the recorded vault PDA directly).
 
 ## Keeper execution bundles (AV-61)
 

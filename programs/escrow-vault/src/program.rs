@@ -4020,6 +4020,33 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
+    // AV-92: vault PDA derivation. The real build constrains this
+    // account as a program-derived address:
+    //
+    //     #[account(
+    //         init, payer = initializer, space = escrow_state::VAULT_SPACE,
+    //         seeds = [b"vault", initializer.key().as_ref()],
+    //         bump,
+    //     )]
+    //
+    // i.e. `find_program_address([b"vault", initializer], program_id)`:
+    // the canonical address is
+    // `sha256(seeds.. ++ [bump] ++ program_id ++ "ProgramDerivedAddress")`
+    // with the bump scanned 255 → 0 for the first off-curve candidate
+    // (Solana's `create_program_address` / `find_program_address`
+    // semantics). The seeds are chosen at initialize time and recorded
+    // off-chain — PDAs never store their seeds on-chain — so the
+    // keeper/batch/close watch structs carry them
+    // (`WatchedEscrow::with_vault_seeds`, `BatchWatchItem`,
+    // `CloseWatchItem`) and the reports attach the precomputed
+    // `vault_address`. The off-chain derivation itself is
+    // `escrow_state::pda` (hand-rolled, zero dependencies):
+    // `find_program_address` / `derive_vault_address` /
+    // `find_vault_bump` / `is_on_ed25519_curve`. Every later
+    // instruction takes the vault PDA as a plain account and the
+    // program signs via `invoke_signed` with `&[b"vault",
+    // initializer.key().as_ref(), &[bump]]`.
+    //
     // Full vault space: 8-byte discriminator + 2216-byte payload = 2224
     // bytes (see `escrow_state::VAULT_SPACE`; AV-12 added the 1-byte
     // activation bitmask, AV-13 the 17-byte vesting region, AV-14 the

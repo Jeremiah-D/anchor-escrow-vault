@@ -495,6 +495,7 @@ mod execution_bundle_tests {
             escrow_id: id,
             escrow,
             initialize: params(initializer),
+            vault_derivation: None,
         }
     }
 

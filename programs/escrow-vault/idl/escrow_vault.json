@@ -876,7 +876,8 @@
     {"code": 145, "name": "InvalidMultisigAuthority"},
     {"code": 146, "name": "InvalidAppealWindow"},
     {"code": 147, "name": "InvalidVestingCurve"},
-    {"code": 148, "name": "InvalidEvidenceProof"}
+    {"code": 148, "name": "InvalidEvidenceProof"},
+    {"code": 149, "name": "InvalidVaultSeeds"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

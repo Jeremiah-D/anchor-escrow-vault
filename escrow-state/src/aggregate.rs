@@ -334,6 +334,7 @@ mod aggregate_tests {
             escrow_id: [id; 32],
             escrow,
             reference: None,
+            vault_derivation: None,
         }
     }
 

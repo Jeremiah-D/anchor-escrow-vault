@@ -21,9 +21,11 @@
 //!
 //! - [`squads_v4_multisig_seeds`] / [`squads_v4_vault_seeds`]: the PDA
 //!   seed assembly for the multisig account and its vault (the
-//!   authority PDA). The caller runs its own `find_program_address`
-//!   over these seeds — this crate is dependency-free, so derivation
-//!   itself stays out of scope.
+//!   authority PDA). Run [`crate::pda::find_program_address`] over
+//!   these seeds — the crate's unified derivation tool (AV-92:
+//!   hand-rolled Solana `create_program_address` /
+//!   `find_program_address`, zero dependencies) — instead of each
+//!   caller hand-rolling its own bump search.
 //! - [`assemble_multisig_escrow_call`]: builds the [`CpiInvocation`]
 //!   the multisig's vault transaction executes against the escrow
 //!   program.
@@ -101,6 +103,8 @@ impl MultisigAuthority {
 /// Seed assembly for a Squads v4 multisig account PDA: `["multisig",
 /// create_key]`. The `create_key` is the signer key the squad was
 /// created with (see the Squads v4 program's PDA derivation).
+/// Derive the address with [`crate::pda::find_program_address`]
+/// (AV-92) — the unified tool; do not hand-roll a bump search.
 pub fn squads_v4_multisig_seeds(create_key: &Pubkey) -> Vec<Vec<u8>> {
     vec![b"multisig".to_vec(), create_key.to_vec()]
 }
@@ -108,7 +112,9 @@ pub fn squads_v4_multisig_seeds(create_key: &Pubkey) -> Vec<Vec<u8>> {
 /// Seed assembly for a Squads v4 vault PDA (the authority that signs
 /// once the threshold votes): `["multisig", multisig, "vault",
 /// vault_index]`. `vault_index` is the u8 vault number (vault 0 on the
-/// default plan).
+/// default plan). Derive the address with
+/// [`crate::pda::find_program_address`] (AV-92) — the unified tool;
+/// do not hand-roll a bump search.
 pub fn squads_v4_vault_seeds(multisig: &Pubkey, vault_index: u8) -> Vec<Vec<u8>> {
     vec![
         b"multisig".to_vec(),

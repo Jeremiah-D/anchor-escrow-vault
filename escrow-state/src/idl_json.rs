@@ -860,7 +860,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 49, "error variant count drift");
+    assert_eq!(errors.len(), 50, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -901,6 +901,8 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::InvalidVestingCurve.code(), 147);
     // AV-91: appended, never renumbered.
     assert_eq!(EscrowError::InvalidEvidenceProof.code(), 148);
+    // AV-92: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidVaultSeeds.code(), 149);
 }
 
 #[test]
