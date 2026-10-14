@@ -2377,6 +2377,17 @@ multisig/CLI-ready instruction list as JSON.
 - **Determinism**: batches sort by `(mint, caller)` (native-SOL first),
   instructions keep scan order, batch ids are positional — the same
   report always yields byte-identical JSON.
+- **Compute-unit budget estimation (AV-88)**:
+  `escrow-state/src/cu_estimate.rs` holds the single source of truth —
+  a per-instruction cost table (base CU per kind + per-signature /
+  per-account / per-data-byte charges; data bytes pinned against the
+  IDL spec). `PlannedInstruction::estimated_compute_units`,
+  `ExecutionBatch::estimated_compute_units` (bundle-level aggregation),
+  and `compute_budget_warning` flag batches that cannot fit one
+  transaction's 1.4M CU budget; the keeper report passes the same
+  estimate through (`estimated_cu` per action, `total_estimated_cu` on
+  the report). Heuristic planning numbers, not measured on-chain costs
+  — calibrate against `simulateTransaction` for production sizing.
 
 ## Batch lifecycle scan (AV-37)
 
@@ -2488,9 +2499,18 @@ base64 for a multisig or CLI to sign and submit.
   bundle's `args` — and the system program), and for `release` it
   appends `taker`, `payout_to`, the clock sysvar, and the vault token
   account on the SPL path. The instruction *data* needs nothing added.
-  No address-table lookups are compiled in (legacy message); the
-  bundle's `alt_table` stays the operator's ALT material for a later v0
-  upgrade.
+- **v0 messages with address-table lookups (AV-87)**:
+  `compile_action_message_v0` / `signable_message_v0_base64` /
+  `bundle_action_message_v0_base64` resolve ALT-eligible accounts
+  (the bundle's stamped `alt_index`) statically against the caller's
+  snapshot of the on-chain table: signers stay static (the runtime
+  forbids signer lookups), everything else shrinks the static key
+  list — a large-account-set bundle ships fewer static keys per
+  message. Wire bytes are the legacy layout prefixed with the `0x80`
+  version byte plus the lookup list; a stale snapshot (index out of
+  range, key mismatch) fails the build instead of signing against the
+  wrong table, and decode rejects malformed lookup entries. The legacy
+  path is byte-identical with or without the v0 code present.
 - **Pinning**: the tests assert the data bytes against the
   `INSTRUCTIONS` spec table (param name/type/order per kind), the
   account metas 1:1 against the bundle's logical accounts, the wire

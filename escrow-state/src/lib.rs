@@ -45,6 +45,11 @@ mod execution_bundle;
 // multisig/CLI can sign and submit. Off-chain and unsigned by design:
 // the relay never holds keys. Purely additive.
 mod tx_message;
+// AV-88: compute-unit budget estimation for keeper execution plans —
+// heuristic per-instruction CU costs (single source of truth table),
+// batch aggregation, and over-limit warnings against the per-transaction
+// compute budget. Pure logic, zero dependencies.
+mod cu_estimate;
 // AV-72: escrow configuration templates — one-call constructors for the
 // four canonical escrow compositions (auction, milestone-plan,
 // subscription, arbitrated-dispute) with template-level combination
@@ -309,6 +314,16 @@ pub use tx_message::{
     instruction_for_action, signable_message_base64, signable_message_v0_base64,
     AddressTableLookup, CompiledInstruction, MessageHeader, ProgramInstruction,
     TransactionMessage, TxMessageError, V0TransactionMessage,
+};
+
+// AV-88: compute-unit budget estimation — the single-source cost model
+// behind the execution plan's per-instruction estimates and the keeper
+// report's CU passthrough. Heuristic planning numbers, not measured
+// on-chain costs; see the module docs.
+pub use cu_estimate::{
+    check_compute_budget, estimate_instruction_cu, instruction_cu_base, instruction_data_bytes,
+    ComputeBudgetWarning, CU_MAX_PER_TRANSACTION, CU_PER_ACCOUNT, CU_PER_DATA_BYTE,
+    CU_PER_SIGNATURE, INSTRUCTION_CU_TABLE,
 };
 
 // AV-78: escrow aggregate statistics view — read-only fleet rollup

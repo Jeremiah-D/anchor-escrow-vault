@@ -366,6 +366,35 @@ pub struct KeeperAction {
     pub reason: &'static str,
 }
 
+impl KeeperAction {
+    /// AV-88: heuristic compute-unit estimate for this keeper call —
+    /// the dry-run report's CU passthrough. The account count is the
+    /// canonical planned shape (`vault` + `authority` + `refund_to`
+    /// when the kind carries one + `mint` when set) — the same accounts
+    /// [`plan_execution`](super::execution_plan::plan_execution) would
+    /// stamp — and one signature is charged for the caller key (the
+    /// permissionless crank's zero key is substituted by the keeper's
+    /// own key at build time). A planning number, not a measured cost.
+    pub fn estimated_compute_units(&self) -> u64 {
+        let mut accounts = 2; // vault + authority
+        if matches!(
+            self.kind,
+            KeeperActionKind::CancelExpired | KeeperActionKind::CrankExpired
+        ) && self.refund_to.is_some()
+        {
+            accounts += 1;
+        }
+        if self.mint.is_some() {
+            accounts += 1;
+        }
+        super::cu_estimate::estimate_instruction_cu(self.kind.as_str(), accounts, 1)
+            // The cost table covers every keeper instruction kind — the
+            // cu_estimate tests pin that — so this is unreachable on
+            // real scans; the expect guards a hand-built kind.
+            .expect("AV-88: CU table covers every keeper instruction kind")
+    }
+}
+
 /// The scan result: every executable keeper call at [`KeeperReport::at`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeeperReport {
@@ -383,17 +412,28 @@ impl KeeperReport {
         self.actions.is_empty()
     }
 
+    /// AV-88: total estimated compute units across the report's
+    /// actions — the dry-run preview's cost line. Saturates instead of
+    /// wrapping.
+    pub fn total_estimated_compute_units(&self) -> u64 {
+        self.actions
+            .iter()
+            .map(|a| a.estimated_compute_units())
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
     /// Hand-serialized JSON (the crate is dependency-free). Deterministic
     /// field order; keys are 64-char lowercase hex; `mint` is a hex
     /// string or `null`.
     ///
     /// ```json
-    /// {"at":1000000,"scanned":1,"actions":[
+    /// {"at":1000000,"scanned":1,"total_estimated_cu":13814,"actions":[
     ///   {"escrow_id":"...","action":"cancel_expired","caller":"...",
     ///    "caller_role":"initializer","mint":null,
     ///    "refund_to":"...","amount":1000000,"decimals":6,
     ///    "display_amount":"1.000000",
-    ///    "reason":"expired","reference":null,"extension_count":0}
+    ///    "reason":"expired","reference":null,"extension_count":0,
+    ///    "multisig_authority":null,"estimated_cu":13814}
     /// ]}
     /// ```
     ///
@@ -403,11 +443,15 @@ impl KeeperReport {
     /// [`crate::format_amount`]. The instruction itself always moves the
     /// raw `amount`; the display field is for operators and logs only.
     pub fn to_json(&self) -> String {
-        let mut s = String::with_capacity(128 + self.actions.len() * 360);
+        let mut s = String::with_capacity(160 + self.actions.len() * 400);
         s.push_str("{\"at\":");
         s.push_str(&self.at.to_string());
         s.push_str(",\"scanned\":");
         s.push_str(&self.scanned.to_string());
+        // AV-88: the dry-run preview's cost line — the summed CU
+        // estimate across the report's actions.
+        s.push_str(",\"total_estimated_cu\":");
+        s.push_str(&self.total_estimated_compute_units().to_string());
         s.push_str(",\"actions\":[");
         for (i, a) in self.actions.iter().enumerate() {
             if i > 0 {
@@ -485,6 +529,11 @@ impl KeeperReport {
                 }
                 None => s.push_str("null"),
             }
+            // AV-88: the per-action CU passthrough — the heuristic
+            // estimate for this keeper call, same cost model as the
+            // execution plan.
+            s.push_str(",\"estimated_cu\":");
+            s.push_str(&a.estimated_compute_units().to_string());
             s.push_str("}");
         }
         s.push_str("]}");
@@ -1467,7 +1516,7 @@ mod keeper_tests {
         let report = scan_keeper_actions(&[], MID);
         assert!(report.is_empty());
         assert_eq!(report.scanned, 0);
-        assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"actions":[]}"#);
+        assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"total_estimated_cu":0,"actions":[]}"#);
     }
 
     #[test]
@@ -1894,8 +1943,11 @@ mod keeper_tests {
         let report = scan_keeper_actions(&watched, 1_000_000);
         // AV-48: the expired escrow lists both the party-signed
         // `cancel_expired` and the permissionless `crank_expired`.
+        // AV-88: cancel_expired / crank_expired with refund_to, no mint:
+        // 3 accounts, 8 data bytes, 1 signer →
+        // 10_000 + 3_000 + 3×250 + 8×8 = 13_814 each; total 27_628.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null}},{{\"escrow_id\":\"{}\",\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null}}]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"estimated_cu\":13814}}]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -1917,13 +1969,78 @@ mod keeper_tests {
         e.fund(ALICE, MID).unwrap();
         let watched = [watch(ID2, e)];
         let report = scan_keeper_actions(&watched, MID);
+        // AV-88: claim with mint, no refund_to: 3 accounts, 8 data
+        // bytes, 1 signer → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null}}]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"estimated_cu\":17814}}]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),
         );
         assert_eq!(report.to_json(), expected);
+    }
+
+    #[test]
+    fn keeper_action_estimated_cu_uses_canonical_accounts() {
+        // AV-88: the dry-run report's CU passthrough. cancel_expired
+        // with refund_to, no mint: vault + authority + refund_to = 3
+        // accounts, 8 data bytes, 1 signer →
+        // 10_000 + 3_000 + 3×250 + 8×8 = 13_814.
+        let a = KeeperAction {
+            escrow_id: ID1,
+            kind: KeeperActionKind::CancelExpired,
+            caller: ALICE,
+            caller_role: "initializer",
+            mint: None,
+            refund_to: Some(ALICE),
+            amount: AMOUNT,
+            decimals: 0,
+            reference: None,
+            extension_count: 0,
+            multisig_authority: None,
+            reason: "expired",
+        };
+        assert_eq!(a.estimated_compute_units(), 13_814);
+        // Without refund_to the account drops out of the estimate.
+        let no_refund = KeeperAction {
+            refund_to: None,
+            ..a
+        };
+        assert_eq!(no_refund.estimated_compute_units(), 13_814 - 250);
+        // With a mint it joins the estimate.
+        let with_mint = KeeperAction {
+            mint: Some(MINT),
+            ..a
+        };
+        assert_eq!(with_mint.estimated_compute_units(), 13_814 + 250);
+        // resolve carries the 49-byte instruction data and no refund_to
+        // (vault + authority = 2 accounts):
+        // 22_000 + 3_000 + 2×250 + 49×8 = 25_892.
+        let resolve = KeeperAction {
+            kind: KeeperActionKind::Resolve,
+            caller_role: "arbiter",
+            reason: "disputed",
+            refund_to: None,
+            ..a
+        };
+        assert_eq!(resolve.estimated_compute_units(), 25_892);
+    }
+
+    #[test]
+    fn report_total_estimated_cu_sums_actions() {
+        let watched = [watch(ID1, funded(AMOUNT, 0))];
+        let report = scan_keeper_actions(&watched, 1_000_000);
+        // cancel_expired + crank_expired, 13_814 each.
+        let sum: u64 = report
+            .actions
+            .iter()
+            .map(|a| a.estimated_compute_units())
+            .sum();
+        assert_eq!(sum, 27_628);
+        assert_eq!(report.total_estimated_compute_units(), sum);
+        assert!(report
+            .to_json()
+            .contains("\"total_estimated_cu\":27628"));
     }
 
     #[test]

@@ -36,6 +36,9 @@
 //! the report, emits no events, and touches no clock. Amounts are as of
 //! the scan; the keeper executes the plan, then re-scans.
 
+use super::cu_estimate::{
+    check_compute_budget, estimate_instruction_cu, ComputeBudgetWarning, CU_MAX_PER_TRANSACTION,
+};
 use super::discriminator::instruction_discriminator;
 use super::keeper::{KeeperAction, KeeperActionKind, KeeperReport};
 use std::collections::BTreeMap;
@@ -125,6 +128,42 @@ impl ExecutionBatch {
             .iter()
             .map(|i| i.amount)
             .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// AV-88: bundle-level CU aggregation — the sum of the batch's
+    /// per-instruction estimates. Saturates instead of wrapping. The
+    /// operator compares this against the per-transaction compute
+    /// budget before signing: a batch is one signing session, but it
+    /// may need several transactions.
+    pub fn estimated_compute_units(&self) -> u64 {
+        self.instructions
+            .iter()
+            .map(|i| i.estimated_compute_units())
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// AV-88: over-limit warning — `Some` when the batch's estimate
+    /// exceeds one transaction's compute budget, i.e. the batch cannot
+    /// execute as a single transaction and must be split.
+    pub fn compute_budget_warning(&self) -> Option<ComputeBudgetWarning> {
+        check_compute_budget(self.estimated_compute_units())
+    }
+}
+
+impl PlannedInstruction {
+    /// AV-88: heuristic compute-unit estimate for this instruction —
+    /// the kind's base cost plus per-signature, per-account, and
+    /// per-data-byte charges from the [`cu_estimate`](super::cu_estimate)
+    /// cost model. A planning number, not a measured cost: calibrate
+    /// against `simulateTransaction` for production sizing.
+    pub fn estimated_compute_units(&self) -> u64 {
+        let signers = self.accounts.iter().filter(|a| a.signer).count();
+        estimate_instruction_cu(self.kind.as_str(), self.accounts.len(), signers)
+            // The cost table covers every keeper instruction kind — the
+            // cu_estimate tests pin that — so this is unreachable on
+            // real plans; the expect guards a hand-built kind the way
+            // the AV-33 planner guards `refund_to`.
+            .expect("AV-88: CU table covers every keeper instruction kind")
     }
 }
 
@@ -308,6 +347,27 @@ impl ExecutionPlan {
         }
         s.push_str("]}");
         s
+    }
+}
+
+impl ExecutionPlan {
+    /// AV-88: plan-level CU aggregation — the sum of every batch's
+    /// estimate. Saturates instead of wrapping.
+    pub fn total_estimated_compute_units(&self) -> u64 {
+        self.batches
+            .iter()
+            .map(|b| b.estimated_compute_units())
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// AV-88: the batches whose estimate exceeds one transaction's
+    /// compute budget — each needs splitting before submission. Empty
+    /// when every batch fits.
+    pub fn batches_over_budget(&self) -> Vec<&ExecutionBatch> {
+        self.batches
+            .iter()
+            .filter(|b| b.compute_budget_warning().is_some())
+            .collect()
     }
 }
 
@@ -533,5 +593,78 @@ mod execution_plan_tests {
         assert!(json.contains("\"instruction\":\"crank_expired\""));
         assert!(json.contains("\"role\":\"refund_to\""));
         assert!(json.contains("\"signer\":true"));
+    }
+
+    #[test]
+    fn planned_instruction_estimated_cu_matches_cost_model() {
+        // AV-88: cancel_expired plans 3 accounts
+        // (vault/authority/refund_to), 1 signer → 13_814.
+        let r = report(vec![action(
+            ID1,
+            KeeperActionKind::CancelExpired,
+            ALICE,
+            "initializer",
+            None,
+            100,
+        )]);
+        let plan = plan_execution(&r);
+        let ix = &plan.batches[0].instructions[0];
+        assert_eq!(ix.accounts.len(), 3);
+        assert_eq!(ix.estimated_compute_units(), 13_814);
+        // The keeper report's passthrough agrees with the plan's number
+        // — one cost model, two views.
+        assert_eq!(r.actions[0].estimated_compute_units(), 13_814);
+    }
+
+    #[test]
+    fn batch_estimated_cu_aggregates_and_warns() {
+        let plan = plan_execution(&report(vec![
+            action(
+                ID1,
+                KeeperActionKind::CancelExpired,
+                ALICE,
+                "initializer",
+                None,
+                100
+            ),
+            action(ID2, KeeperActionKind::Claim, BOB, "taker", Some(MINT_A), 50),
+        ]));
+        // batch-0 (native, ALICE): cancel_expired → 13_814.
+        // batch-1 (MINT_A, BOB): claim with mint → vault + authority +
+        // mint = 3 accounts → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
+        assert_eq!(plan.batches[0].estimated_compute_units(), 13_814);
+        assert_eq!(plan.batches[1].estimated_compute_units(), 17_814);
+        assert_eq!(plan.total_estimated_compute_units(), 13_814 + 17_814);
+        assert!(plan.batches[0].compute_budget_warning().is_none());
+        assert!(plan.batches[1].compute_budget_warning().is_none());
+        assert!(plan.batches_over_budget().is_empty());
+
+        // A giant batch trips the over-limit warning: 200 × 13_814 =
+        // 2,762,800 > 1,400,000 — it cannot fit one transaction.
+        let many: Vec<KeeperAction> = (0..200)
+            .map(|i| {
+                let mut id = [0u8; 32];
+                id[0] = (i & 0xff) as u8;
+                id[1] = ((i >> 8) & 0xff) as u8;
+                action(
+                    id,
+                    KeeperActionKind::CancelExpired,
+                    ALICE,
+                    "initializer",
+                    None,
+                    100,
+                )
+            })
+            .collect();
+        let big = plan_execution(&report(many));
+        assert_eq!(big.batches.len(), 1);
+        let est = big.batches[0].estimated_compute_units();
+        assert_eq!(est, 200 * 13_814);
+        let w = big.batches[0].compute_budget_warning().unwrap();
+        assert_eq!(w.limit_cu, CU_MAX_PER_TRANSACTION);
+        assert_eq!(w.estimated_cu, est);
+        assert_eq!(w.over_by_cu, est - CU_MAX_PER_TRANSACTION);
+        assert_eq!(big.batches_over_budget().len(), 1);
+        assert_eq!(big.batches_over_budget()[0].batch_id, "batch-0");
     }
 }
