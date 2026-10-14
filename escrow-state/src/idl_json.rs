@@ -221,6 +221,9 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         "Vec<FeeTier>" => IdlType::Vec(Box::new(IdlType::Named("FeeTier"))),
         // AV-90: the non-linear vesting curve's tier table instruction arg.
         "Vec<VestingTier>" => IdlType::Vec(Box::new(IdlType::Named("VestingTier"))),
+        // AV-91: the evidence-disclosure Merkle proof — a Vec of
+        // 32-byte sibling hashes.
+        "Vec<[u8; 32]>" => IdlType::Vec(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         // AV-68: the dispute-evidence disclosure commitment
         // (non-optional — disclosure always carries a hash).
@@ -857,7 +860,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 48, "error variant count drift");
+    assert_eq!(errors.len(), 49, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -896,6 +899,8 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::InvalidAppealWindow.code(), 146);
     // AV-90: appended, never renumbered.
     assert_eq!(EscrowError::InvalidVestingCurve.code(), 147);
+    // AV-91: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidEvidenceProof.code(), 148);
 }
 
 #[test]
@@ -1095,7 +1100,7 @@ fn idl_field_offsets_pin_dispute_path() {
     let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
     e = e.with_arbiter(ARB).unwrap();
     e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-    e.escalate(BOB, EXPIRES_AT - 100, Some(EVIDENCE)).unwrap();
+    e.escalate(BOB, EXPIRES_AT - 100, Some(EVIDENCE), None, 0).unwrap();
 
     let enc = encode_escrow(&e);
     let offsets = vault_field_offsets();

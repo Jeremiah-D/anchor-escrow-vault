@@ -991,6 +991,30 @@ pub struct Escrow {
     /// 8 vote bytes, zeroed when no appeal is filed). Appended last so
     /// every earlier field offset stays stable.
     appeal_ballot: AppealBallot,
+    /// AV-91: the SHA-256 Merkle root over the dispute-evidence
+    /// document set committed at [`Escrow::escalate`] — the multi-doc
+    /// alternative (or supplement) to the AV-22 single
+    /// `evidence_hash`. `None` when no multi-doc evidence was
+    /// committed (backward compatible). Never cleared: a `Settled`
+    /// escrow keeps the root so the settlement carries the audit
+    /// trail of what the arbiter could review. Persisted (1-byte
+    /// discriminant + 32-byte root, zeroed when `None`). Appended
+    /// last so every earlier field offset stays stable.
+    evidence_root: Option<[u8; 32]>,
+    /// AV-91: the leaf count the committed evidence Merkle tree was
+    /// built over — `0` when `evidence_root` is `None`, `1..=64`
+    /// otherwise (see [`MAX_EVIDENCE_DOCS`]). Validated at
+    /// [`Escrow::escalate`] and never cleared, like the root.
+    /// Persisted (1 byte). Appended last.
+    evidence_leaves: u8,
+    /// AV-91: the evidence-disclosure bitmap — bit `i` flips once the
+    /// document at leaf index `i` is disclosed via
+    /// [`Escrow::file_evidence`] with a valid Merkle inclusion proof.
+    /// Zeroed when the root is committed at [`Escrow::escalate`] and
+    /// never cleared, so a `Settled` escrow keeps the disclosure
+    /// audit trail the judgment weight can be checked against.
+    /// Persisted (8 bytes). Appended last.
+    evidence_disclosed: u64,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -1413,6 +1437,15 @@ pub enum EscrowError {
     /// than the step count; or [`Escrow::with_vesting_curve`] with a
     /// curve whose tier window does not match the schedule it prices.
     InvalidVestingCurve,
+    /// Invalid dispute-evidence Merkle commitment or proof (AV-91):
+    /// [`Escrow::escalate`] with a leaf count that does not describe
+    /// the root (`None` root with nonzero leaves, `Some` root with
+    /// zero or more than [`MAX_EVIDENCE_DOCS`] leaves); or
+    /// [`Escrow::file_evidence`] with no committed root, a leaf index
+    /// past the committed leaves, a proof whose length does not match
+    /// the tree shape, or a proof that does not verify against the
+    /// committed root.
+    InvalidEvidenceProof,
 }
 
 impl EscrowError {
@@ -1473,6 +1506,7 @@ impl EscrowError {
             EscrowError::InvalidMultisigAuthority => 145,
             EscrowError::InvalidAppealWindow => 146,
             EscrowError::InvalidVestingCurve => 147,
+            EscrowError::InvalidEvidenceProof => 148,
         }
     }
 
@@ -1527,6 +1561,7 @@ impl EscrowError {
             EscrowError::InvalidMultisigAuthority,
             EscrowError::InvalidAppealWindow,
             EscrowError::InvalidVestingCurve,
+            EscrowError::InvalidEvidenceProof,
         ]
     }
 }
@@ -2543,6 +2578,98 @@ impl VestingSchedule {
 /// curve reserves 81 bytes).
 pub const MAX_VESTING_CURVE_TIERS: usize = 8;
 
+/// AV-91: ceiling on the dispute-evidence document count the escrow
+/// tracks in its Merkle commitment. The disclosure bitmap
+/// ([`Escrow::evidence_disclosed`]) is a `u64`, so 64 documents is
+/// the hard ceiling — one bit per leaf, no heap, no dynamic sizing.
+/// A commitment over more documents belongs off-chain (the root alone
+/// cannot be audited on-chain without the bitmap).
+pub const MAX_EVIDENCE_DOCS: u8 = 64;
+
+/// AV-91: domain-separated leaf hash for the evidence Merkle tree:
+/// `H(0x00 || doc_hash)`. The `0x00` prefix keeps leaf preimages
+/// distinct from inner-node preimages (the standard second-preimage
+/// defense) — a document hash can never be mistaken for an inner
+/// node.
+fn merkle_leaf_hash(doc_hash: &[u8; 32]) -> [u8; 32] {
+    let mut msg = [0u8; 33];
+    msg[0] = 0x00;
+    msg[1..].copy_from_slice(doc_hash);
+    sha256(&msg)
+}
+
+/// AV-91: domain-separated inner-node hash: `H(0x01 || left ||
+/// right)`. The `0x01` prefix is the counterpart of
+/// [`merkle_leaf_hash`]'s `0x00`.
+fn merkle_node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut msg = [0u8; 65];
+    msg[0] = 0x01;
+    msg[1..33].copy_from_slice(left);
+    msg[33..].copy_from_slice(right);
+    sha256(&msg)
+}
+
+/// AV-91: the number of sibling hashes a valid inclusion proof
+/// carries for leaf `leaf_index` in a tree over `leaves` documents.
+/// The tree promotes the last node of an odd-width layer unchanged
+/// (no sibling at that level), so the proof length depends on the
+/// leaf's position — not just the tree depth. `leaves` must be `>=
+/// 1` (callers validate the commitment first).
+fn merkle_proof_len(leaves: u8, leaf_index: u8) -> usize {
+    let mut len = 0usize;
+    let mut width = leaves as u32;
+    let mut index = leaf_index as u32;
+    while width > 1 {
+        // A promoted node contributes no sibling at this level.
+        if !(width % 2 == 1 && index == width - 1) {
+            len += 1;
+        }
+        index /= 2;
+        width = width.div_ceil(2);
+    }
+    len
+}
+
+/// AV-91: verify a Merkle inclusion proof for `doc_hash` at
+/// `leaf_index` against `root`, walking the same promotion
+/// convention as [`merkle_proof_len`]: at each level the node either
+/// pairs with its proof sibling (left or right by position parity)
+/// or — when it is the last node of an odd-width layer — is promoted
+/// unchanged. Returns `false` on any shape mismatch; callers map
+/// that to [`EscrowError::InvalidEvidenceProof`].
+fn verify_merkle_proof(
+    root: &[u8; 32],
+    doc_hash: &[u8; 32],
+    leaf_index: u8,
+    leaves: u8,
+    proof: &[[u8; 32]],
+) -> bool {
+    let mut current = merkle_leaf_hash(doc_hash);
+    let mut index = leaf_index as u32;
+    let mut width = leaves as u32;
+    let mut pi = 0usize;
+    while width > 1 {
+        if width % 2 == 1 && index == width - 1 {
+            // Promoted unchanged — no sibling at this level.
+        } else {
+            let sibling = match proof.get(pi) {
+                Some(s) => *s,
+                None => return false,
+            };
+            pi += 1;
+            let (left, right) = if index % 2 == 0 {
+                (current, sibling)
+            } else {
+                (sibling, current)
+            };
+            current = merkle_node_hash(&left, &right);
+        }
+        index /= 2;
+        width = width.div_ceil(2);
+    }
+    pi == proof.len() && &current == root
+}
+
 /// Serialized length of [`VestingCurve`] under Borsh/Anchor: the live
 /// tier-count byte plus the fixed tier slots (each an unlock timestamp
 /// `u64` and a cumulative unlocked basis-points `u16`). Fixed-size by
@@ -3409,6 +3536,12 @@ impl Escrow {
             appeal_deadline: 0,
             appeal_state: AppealState::None,
             appeal_ballot: AppealBallot::empty(),
+            // AV-91: no evidence Merkle commitment by default
+            // (backward compatible) — committed at `escalate`, never
+            // cleared.
+            evidence_root: None,
+            evidence_leaves: 0,
+            evidence_disclosed: 0,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -6386,6 +6519,8 @@ impl Escrow {
         authority: [u8; 32],
         now: u64,
         evidence_hash: Option<[u8; 32]>,
+        evidence_root: Option<[u8; 32]>,
+        evidence_leaves: u8,
     ) -> Result<(), EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
         self.require_not_paused()?;
@@ -6405,6 +6540,18 @@ impl Escrow {
         if now >= self.expires_at {
             return Err(EscrowError::DisputeWindowClosed);
         }
+        // AV-91: the committed leaf count must describe the root — a
+        // root over zero documents is meaningless, and a leaf count
+        // the u64 disclosure bitmap cannot track (see
+        // `MAX_EVIDENCE_DOCS`) can never be audited on-chain.
+        let leaves_ok = match (evidence_root, evidence_leaves) {
+            (None, 0) => true,
+            (Some(_), 1..=MAX_EVIDENCE_DOCS) => true,
+            _ => false,
+        };
+        if !leaves_ok {
+            return Err(EscrowError::InvalidEvidenceProof);
+        }
         self.state = EscrowState::Disputed;
         // AV-55: record when the escrow entered `Disputed` — the
         // pre-agreed default judgment's deadline (see
@@ -6413,6 +6560,15 @@ impl Escrow {
         // still settle.
         self.disputed_at = now;
         self.evidence_hash = evidence_hash;
+        // AV-91: commit the evidence-document Merkle root (or `None`
+        // for the plain AV-22 single-hash path). The bitmap starts
+        // zeroed — every document is undisclosed until
+        // `file_evidence` proves it. The root and the leaf count are
+        // never cleared, so the settlement keeps the audit trail of
+        // what the arbiter could review.
+        self.evidence_root = evidence_root;
+        self.evidence_leaves = evidence_leaves;
+        self.evidence_disclosed = 0;
         // AV-68: record who escalated — the evidence-disclosure
         // deadline (see `Escrow::with_evidence_deadline`) binds the
         // escalating party, and the judgment-time adverse inference
@@ -6519,7 +6675,10 @@ impl Escrow {
     ///   deadline has lapsed: the judgment-time adverse inference
     ///   applies (see [`Escrow::evidence_defaulted`]).
     pub fn evidence_status(&self, now: u64) -> EvidenceStatus {
-        if self.evidence_hash.is_some() {
+        // AV-91: a committed evidence Merkle root is a submitted
+        // commitment, like the AV-22 single hash — the documents
+        // themselves follow via `file_evidence`.
+        if self.evidence_hash.is_some() || self.evidence_root.is_some() {
             return EvidenceStatus::Submitted;
         }
         match self.evidence_due_at() {
@@ -6606,6 +6765,120 @@ impl Escrow {
         }
         self.evidence_hash = Some(evidence_hash);
         Ok(())
+    }
+
+    /// Disclose one dispute-evidence document against the committed
+    /// Merkle root (AV-91 — Solana arbitration discipline / payment
+    /// fintech): the escalating party reveals the document hash at
+    /// leaf `leaf_index` together with a Merkle inclusion proof, and
+    /// the escrow flips that leaf's bit in the disclosure bitmap.
+    ///
+    /// Why a Merkle root instead of N hashes: the escalating party
+    /// commits to the *whole* evidence set up front (the root at
+    /// [`Escrow::escalate`]), then discloses documents one by one —
+    /// the arbiter panel verifies disclosure *completeness* before
+    /// judgment (see [`Escrow::evidence_disclosure`]): undisclosed
+    /// documents are honestly deducted in the judgment weight, so a
+    /// party cannot win by committing to evidence it never shows.
+    /// The root is never cleared — a `Settled` escrow keeps the audit
+    /// trail of what the arbiter could review.
+    ///
+    /// Proof shape (pinned by the tests): leaf nodes hash as
+    /// `H(0x00 || doc_hash)` and inner nodes as `H(0x01 || left ||
+    /// right)` — domain separation against second-preimage attacks —
+    /// and the last node of an odd-width layer is *promoted unchanged*
+    /// (no sibling at that level). `proof` must carry exactly the
+    /// siblings the tree shape demands for `leaf_index`
+    /// ([`merkle_proof_len`]); a short, long, or non-verifying proof
+    /// is [`EscrowError::InvalidEvidenceProof`]. Re-filing an
+    /// already-disclosed document is an idempotent no-op success —
+    /// like `submit_evidence`, disclosure is monotonic.
+    ///
+    /// Guards mirror [`Escrow::submit_evidence`]: the pause guard
+    /// first, then the escalator-only authority check (`Unauthorized`
+    /// for anyone else — including on a never-disputed escrow),
+    /// `Disputed`-only (`InvalidStateTransition` otherwise), and the
+    /// same AV-68 deadline bar (`EvidenceDisclosureLate` once the
+    /// disclosure window has lapsed — late disclosure is rejected,
+    /// not accepted).
+    pub fn file_evidence(
+        &mut self,
+        authority: [u8; 32],
+        doc_hash: [u8; 32],
+        leaf_index: u8,
+        proof: &[[u8; 32]],
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Disclosure is the escalating party's duty: only the recorded
+        // escalator may file. Mirrors `submit_evidence`.
+        if self.escalated_by != Some(authority) {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Disputed => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Hard deadline bar: a lapsed deadline locks in the default —
+        // late disclosure is rejected, not accepted. Mirrors
+        // `submit_evidence`.
+        if let Some(due_at) = self.evidence_due_at() {
+            if now >= due_at {
+                return Err(EscrowError::EvidenceDisclosureLate);
+            }
+        }
+        let root = match self.evidence_root {
+            Some(r) => r,
+            None => return Err(EscrowError::InvalidEvidenceProof),
+        };
+        if leaf_index >= self.evidence_leaves {
+            return Err(EscrowError::InvalidEvidenceProof);
+        }
+        // The proof must carry exactly the siblings the tree shape
+        // demands for this leaf — no more, no less.
+        if proof.len() != merkle_proof_len(self.evidence_leaves, leaf_index) {
+            return Err(EscrowError::InvalidEvidenceProof);
+        }
+        if !verify_merkle_proof(&root, &doc_hash, leaf_index, self.evidence_leaves, proof) {
+            return Err(EscrowError::InvalidEvidenceProof);
+        }
+        // Idempotent: re-filing an already-disclosed document is a
+        // no-op success. `leaf_index < evidence_leaves <= 64`, so the
+        // shift is always in range.
+        self.evidence_disclosed |= 1u64 << leaf_index;
+        Ok(())
+    }
+
+    /// The committed dispute-evidence Merkle root (AV-91), or `None`
+    /// when no multi-doc evidence was committed at
+    /// [`Escrow::escalate`] (backward compatible). Never cleared.
+    pub fn evidence_root(&self) -> Option<[u8; 32]> {
+        self.evidence_root
+    }
+
+    /// The leaf count the committed evidence Merkle tree was built
+    /// over (AV-91): `0` when no root was committed, `1..=64`
+    /// otherwise. Never cleared.
+    pub fn evidence_leaves(&self) -> u8 {
+        self.evidence_leaves
+    }
+
+    /// Disclosure progress (AV-91): `(disclosed, total)` — the number
+    /// of evidence documents disclosed via [`Escrow::file_evidence`]
+    /// and the committed leaf count. `None` when no evidence Merkle
+    /// root was committed at [`Escrow::escalate`]. The arbiter panel
+    /// checks this before judgment: `disclosed < total` means the
+    /// escalating party is withholding committed evidence, and the
+    /// judgment weight deducts the undisclosed documents honestly.
+    pub fn evidence_disclosure(&self) -> Option<(u64, u8)> {
+        if self.evidence_root.is_none() {
+            return None;
+        }
+        Some((
+            self.evidence_disclosed.count_ones() as u64,
+            self.evidence_leaves,
+        ))
     }
 
     /// The 32-byte commitment to the arbiter's off-chain rationale
@@ -9546,6 +9819,21 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // same treatment as `arbiter` / `mint` / `vesting`. Appended last
     // so every earlier field offset stays stable.
     ("vesting_curve", "Option<VestingCurve>", 1 + VESTING_CURVE_LEN),
+    // AV-91: dispute-evidence Merkle commitment (see
+    // `Escrow::escalate` / `Escrow::file_evidence`): one discriminant
+    // byte, then the 32-byte root. The region is always reserved
+    // (zeroed when `None`) so `escalate` writes it in place — same
+    // treatment as `evidence_hash`. Appended last so every earlier
+    // field offset stays stable.
+    ("evidence_root", "Option<[u8; 32]>", 1 + 32),
+    // AV-91: the committed evidence leaf count (see
+    // `MAX_EVIDENCE_DOCS`): one byte, zeroed when no root was
+    // committed. Appended last.
+    ("evidence_leaves", "u8", 1),
+    // AV-91: the evidence-disclosure bitmap (see
+    // `Escrow::file_evidence`): one bit per committed document, u64
+    // LE, zeroed when the root is committed. Appended last.
+    ("evidence_disclosed", "u64", 8),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -9649,7 +9937,7 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// present: 1-byte discriminant + 81-byte tier region (zeroed when no
 /// curve is configured).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -10177,7 +10465,7 @@ mod tests {
             .with_arbiter(ARBITER)
             .unwrap();
         settled.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        settled.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        settled.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         settled.resolve(ARBITER, 0, None, None, BOB).unwrap();
         // Split (AV-81): dual-signed split path — the parent's funds
         // were re-homed into children; the parent vault carries nothing
@@ -10203,7 +10491,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 28_285_440, "from {state:?}");
+            assert_eq!(rent, 28_577_760, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -10248,7 +10536,7 @@ mod tests {
             .with_arbiter(DISPUTE_ARBITER)
             .unwrap();
         disputed.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(disputed.state(), EscrowState::Disputed);
         assert_eq!(
             disputed.close_vault(ALICE),
@@ -10301,9 +10589,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 28_285_440 by
+        // VAULT_SPACE — pinned at 28_577_760 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 28_285_440);
+        assert_eq!(rent, 28_577_760);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -10394,7 +10682,7 @@ mod tests {
             .with_arbiter(ARBITER)
             .unwrap();
         disputed.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_rejected_unchanged(disputed, "Disputed");
         // Closed is the deepest terminal.
         let mut closed = funded_escrow();
@@ -10464,8 +10752,8 @@ mod tests {
         // then the account is closed. VAULT_SPACE stays 2941 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 3936, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 28_285_440);
+        assert_eq!(VAULT_SPACE, 3978, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 28_577_760);
     }
 
     #[test]
@@ -10484,7 +10772,7 @@ mod tests {
         // 595 (arbiter panel), and AV-68 by 41 (evidence-disclosure
         // deadline + escalating party), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 3936, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3978, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -10563,13 +10851,13 @@ mod permission_tests {
                 // is locked.
                 e = e.with_arbiter(ARBITER).unwrap();
                 e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-                e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+                e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
             }
             EscrowState::Settled => {
                 // AV-14: arbiter split the remainder 600k / 400k.
                 e = e.with_arbiter(ARBITER).unwrap();
                 e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-                e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+                e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
                 e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
             }
             EscrowState::Closed => {
@@ -11902,6 +12190,22 @@ pub(crate) mod anchor_idl_tests {
                 "instruction param; 32-byte commitment to the off-chain \
                  dispute evidence (e.g. SHA-256 of an IPFS CID), None = \
                  no evidence attached",
+            ),
+            (
+                "evidence_root",
+                "Option<[u8; 32]>",
+                "instruction param; AV-91 SHA-256 Merkle root over the \
+                 dispute-evidence document set (the multi-doc \
+                 alternative/supplement to evidence_hash), None = no \
+                 multi-doc evidence committed",
+            ),
+            (
+                "evidence_leaves",
+                "u8",
+                "instruction param; AV-91 leaf count the Merkle tree was \
+                 built over: 0 when evidence_root is None, 1..=64 \
+                 otherwise (InvalidEvidenceProof on a count that does \
+                 not describe the root)",
             )],
             method: "Escrow::escalate",
             input_mapping: "authority <- accounts.authority (signer: \
@@ -11911,11 +12215,58 @@ pub(crate) mod anchor_idl_tests {
                             window, same rationale as cancel_expired); \
                             evidence_hash <- param, persisted on the \
                             escrow so the arbiter and indexers can read \
-                            it; Funded -> Disputed, locks every \
-                            unilateral exit until resolve; requires a \
-                            configured arbitration mechanism - the \
-                            single arbiter or the AV-65 panel \
-                            (InvalidArbiter otherwise)",
+                            it; evidence_root/evidence_leaves <- params \
+                            (AV-91), persisted and never cleared — the \
+                            disclosure bitmap starts zeroed; Funded -> \
+                            Disputed, locks every unilateral exit until \
+                            resolve; requires a configured arbitration \
+                            mechanism - the single arbiter or the AV-65 \
+                            panel (InvalidArbiter otherwise)",
+        },
+        InstructionSpec {
+            // AV-91: disclose one dispute-evidence document against the
+            // committed Merkle root. The arbiter panel verifies
+            // disclosure completeness before judgment — undisclosed
+            // documents are honestly deducted in the judgment weight.
+            name: "file_evidence",
+            params: &[
+                (
+                    "doc_hash",
+                    "[u8; 32]",
+                    "instruction param; SHA-256 of the disclosed evidence \
+                     document (the leaf preimage)",
+                ),
+                (
+                    "leaf_index",
+                    "u8",
+                    "instruction param; the leaf index the document was \
+                     committed at (< evidence_leaves)",
+                ),
+                (
+                    "proof",
+                    "Vec<[u8; 32]>",
+                    "instruction param; Merkle inclusion proof — exactly \
+                     the siblings the tree shape demands for leaf_index \
+                     (leaf = H(0x00 || doc), node = H(0x01 || left || \
+                     right), odd-layer last node promotes unchanged)",
+                ),
+            ],
+            method: "Escrow::file_evidence",
+            input_mapping: "authority <- accounts.authority (signer: must \
+                            equal the recorded escalator — Unauthorized \
+                            otherwise, mirroring submit_evidence); now <- \
+                            clock sysvar (NOT an instruction param — the \
+                            AV-68 disclosure deadline is measured against \
+                            chain time); doc_hash/leaf_index/proof <- \
+                            params, verified against the committed root \
+                            (InvalidEvidenceProof on no root, a past-end \
+                            leaf index, a wrong-length proof, or a \
+                            non-verifying proof); Disputed only \
+                            (InvalidStateTransition otherwise); the pause \
+                            guard and the AV-68 deadline bar apply exactly \
+                            as in submit_evidence; re-filing a disclosed \
+                            document is an idempotent no-op; flips the \
+                            leaf's bit in the disclosure bitmap",
         },
         InstructionSpec {
             name: "resolve",
@@ -13406,6 +13757,9 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::with_multisig_authority",
             // AV-90: opt-in non-linear vesting unlock curve.
             "VestingCurve::stepped + Escrow::with_vesting_curve",
+            // AV-91: per-document evidence disclosure against the
+            // committed Merkle root.
+            "Escrow::file_evidence",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -13451,6 +13805,7 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_vesting_curve",
                 &"initialize_arbiter",
                 &"escalate",
+                &"file_evidence",
                 &"resolve",
                 &"initialize_milestones",
                 &"confirm_milestone",
@@ -13915,7 +14270,7 @@ pub(crate) mod anchor_idl_tests {
             .with_arbiter([0xA9; 32])
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, 1, None).unwrap();
+        e.escalate(ALICE, 1, None, None, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         assert_eq!(
             e.update_attestors(ALICE, BOB, &[ATTESTOR_1], &[1]),
@@ -14507,7 +14862,7 @@ pub(crate) mod anchor_idl_tests {
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         // The taker may escalate too: either party can open the dispute.
-        e.escalate(BOB, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(BOB, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         // Documented failure mode: the dispute window is closed once the
         // escrow is expiry-eligible.
@@ -14517,7 +14872,7 @@ pub(crate) mod anchor_idl_tests {
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         assert_eq!(
-            e.escalate(ALICE, EXPIRES_AT, None),
+            e.escalate(ALICE, EXPIRES_AT, None, None, 0),
             Err(EscrowError::DisputeWindowClosed)
         );
         assert_eq!(e.state(), EscrowState::Funded);
@@ -14537,7 +14892,7 @@ pub(crate) mod anchor_idl_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         assert_eq!((payout, fee, refund), (600_000, 0, 400_000));
         assert_eq!(e.state(), EscrowState::Settled);
@@ -14550,7 +14905,7 @@ pub(crate) mod anchor_idl_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(
             e.resolve(ALICE, 600_000, None, None, BOB),
             Err(EscrowError::Unauthorized)
@@ -14888,7 +15243,7 @@ pub(crate) mod anchor_idl_tests {
                         .with_arbiter(ARBITER)
                         .unwrap();
                     d.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-                    d.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+                    d.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
                     d.resolve(ARBITER, 0, None, None, BOB).unwrap();
                     assert_eq!(d.state(), EscrowState::Settled);
                     return d;
@@ -15104,6 +15459,19 @@ pub(crate) mod anchor_idl_tests {
         // `evidence_hash`; the `Option` discriminant is implied (an
         // attached hash is `Some`).
         ("escalate", "evidence_hash", "evidence_hash"),
+        // AV-91: the Merkle root and leaf count populate the appended
+        // commitment region; the `Option` discriminant is implied (a
+        // committed root is `Some`), mirroring `initialize_mint`. The
+        // disclosure bitmap is derived (zeroed at commit), not a param.
+        ("escalate", "evidence_root", "evidence_root"),
+        ("escalate", "evidence_leaves", "evidence_leaves"),
+        // AV-91: `file_evidence` writes only the disclosure bitmap —
+        // the root, leaves and document set are already committed.
+        // The bitmap is a derived field (bit flips, not param writes),
+        // so the params map to it as the write target.
+        ("file_evidence", "doc_hash", "evidence_disclosed"),
+        ("file_evidence", "leaf_index", "evidence_disclosed"),
+        ("file_evidence", "proof", "evidence_disclosed"),
         // AV-23: the refund address whitelist param populates
         // `refund_to`; the `Option` discriminant is implied (a declared
         // whitelist is `Some`).
@@ -15856,6 +16224,11 @@ mod error_code_tests {
             147,
             "VestingCurve::stepped with an empty/oversized tier table, a tier outside [start, end], non-monotone timestamps or unlock fractions, bps above 10_000, or a final tier below full unlock; VestingCurve::exponential with zero/too many steps, a non-positive or overflowing growth ratio, or a window shorter than the step count; with_vesting_curve with a curve whose tier window does not match the schedule",
         ),
+        (
+            EscrowError::InvalidEvidenceProof,
+            148,
+            "escalate with a leaf count that does not describe the root (None root with nonzero leaves, Some root with zero or more than 64 leaves); file_evidence with no committed root, a leaf index past the committed leaves, a proof whose length does not match the tree shape, or a proof that does not verify against the committed root",
+        ),
     ];
 
     #[test]
@@ -16116,7 +16489,7 @@ mod error_code_tests {
         // configured, so there is nobody to arbitrate.
         let mut e = escrow();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        let err = e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap_err();
+        let err = e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap_err();
         assert_eq!(err, EscrowError::InvalidArbiter);
         assert_eq!(err.code(), 108);
         assert_eq!(e.state(), EscrowState::Funded);
@@ -16142,7 +16515,7 @@ mod error_code_tests {
         const ARBITER: [u8; 32] = [0xA8; 32];
         let mut e = escrow().with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        let err = e.escalate(BOB, EXPIRES_AT, None).unwrap_err();
+        let err = e.escalate(BOB, EXPIRES_AT, None, None, 0).unwrap_err();
         assert_eq!(err, EscrowError::DisputeWindowClosed);
         assert_eq!(err.code(), 109);
         assert_eq!(e.state(), EscrowState::Funded);
@@ -16550,7 +16923,7 @@ mod error_code_tests {
         e.confirm_default_judgment(BOB).unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let disputed_at = EXPIRES_AT - 10_000;
-        e.escalate(ALICE, disputed_at, None).unwrap();
+        e.escalate(ALICE, disputed_at, None, None, 0).unwrap();
         // One second before the deadline: not due.
         let err = e
             .trigger_default_judgment(ALICE, disputed_at + 3_599, None, BOB)
@@ -17696,6 +18069,24 @@ mod account_space_tests {
                 }
             }
         }
+        // AV-91: dispute-evidence Merkle commitment, always reserved
+        // like `evidence_hash`: the `None` discriminant followed by the
+        // zeroed root region, then the leaf-count byte and the u64-LE
+        // disclosure bitmap — so `escalate` / `file_evidence` write in
+        // place without reallocating; appended last so every earlier
+        // offset above is unchanged.
+        match e.evidence_root {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; 32]);
+            }
+            Some(root) => {
+                out.push(1);
+                out.extend_from_slice(&root);
+            }
+        }
+        out.push(e.evidence_leaves);
+        out.extend_from_slice(&e.evidence_disclosed.to_le_bytes());
         out
     }
 
@@ -17756,9 +18147,9 @@ mod account_space_tests {
         // + 26 (AV-86 opt-in slash-appeal window region: 8-byte window
         // + 8-byte appeal deadline + 1-byte appeal state + 9-byte appeal
         // ballot).
-        assert_eq!(ESCROW_BODY_LEN, 3928, "escrow payload bytes");
+        assert_eq!(ESCROW_BODY_LEN, 3970, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 3936, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3978, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -17831,10 +18222,10 @@ mod account_space_tests {
         // configured).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3446);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3488);
     }
 
     #[test]
@@ -18244,16 +18635,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3936) * 3480 * 2 = 4064 * 6960 = 28_285_440 lamports.
-        assert_eq!(full, 28_285_440);
+        // (128 + 3978) * 3480 * 2 = 4106 * 6960 = 28_577_760 lamports.
+        assert_eq!(full, 28_577_760);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3446) * 3480 * 2 = 3574 * 6960 = 24_875_040 lamports.
-        assert_eq!(no_quorum, 24_875_040);
+        // (128 + 3488) * 3480 * 2 = 3616 * 6960 = 25_167_360 lamports.
+        assert_eq!(no_quorum, 25_167_360);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -18297,12 +18688,12 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(28_285_440, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(28_577_760, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(27_533_759, params.0, params.1),
             Err(RentShortfall {
-                required: 28_285_440,
+                required: 28_577_760,
                 provided: 27_533_759,
             })
         );
@@ -18315,7 +18706,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 28_285_440,
+                required: 28_577_760,
                 provided: 0,
             })
         );
@@ -19301,9 +19692,10 @@ mod vesting_curve_tests {
         let e = curved_escrow();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        // The curve region trails the appeal ballot: discriminant 1,
-        // tier-count 2, then the two live tiers.
-        let base = ESCROW_BODY_LEN - (1 + VESTING_CURVE_LEN);
+        // The curve region trails the appeal ballot — and the AV-91
+        // evidence-commitment region (33 + 1 + 8 bytes) trails the
+        // curve: discriminant 1, tier-count 2, then the two live tiers.
+        let base = ESCROW_BODY_LEN - 42 - (1 + VESTING_CURVE_LEN);
         assert_eq!(bytes[base], 1, "curve: Some discriminant");
         assert_eq!(bytes[base + 1], 2, "curve: tier count");
         assert_eq!(
@@ -19366,7 +19758,7 @@ mod arbitration_tests {
 
     fn disputed_escrow() -> Escrow {
         let mut e = funded_arbitrated_escrow();
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         e
     }
 
@@ -19404,7 +19796,7 @@ mod arbitration_tests {
     fn either_party_may_escalate_inside_the_window() {
         for authority in [ALICE, BOB] {
             let mut e = funded_arbitrated_escrow();
-            e.escalate(authority, EXPIRES_AT - 1, None).unwrap();
+            e.escalate(authority, EXPIRES_AT - 1, None, None, 0).unwrap();
             assert_eq!(e.state(), EscrowState::Disputed);
             // Amounts untouched by the escalation itself.
             assert_eq!((e.released_amount(), e.remaining_amount()), (0, 1_000_000));
@@ -19417,7 +19809,7 @@ mod arbitration_tests {
         // InvalidArbiter or InvalidStateTransition.
         let mut e = funded_arbitrated_escrow();
         assert_eq!(
-            e.escalate(MALLORY, EXPIRES_AT - 1, None),
+            e.escalate(MALLORY, EXPIRES_AT - 1, None, None, 0),
             Err(EscrowError::Unauthorized)
         );
         assert_eq!(e.state(), EscrowState::Funded);
@@ -19430,13 +19822,13 @@ mod arbitration_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         assert_eq!(
-            e.escalate(ALICE, EXPIRES_AT - 1, None),
+            e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0),
             Err(EscrowError::InvalidStateTransition)
         );
         // Double escalation: already Disputed.
         let mut e = disputed_escrow();
         assert_eq!(
-            e.escalate(BOB, EXPIRES_AT - 1, None),
+            e.escalate(BOB, EXPIRES_AT - 1, None, None, 0),
             Err(EscrowError::InvalidStateTransition)
         );
         assert_eq!(e.state(), EscrowState::Disputed);
@@ -19448,7 +19840,7 @@ mod arbitration_tests {
         // expiry-eligible, so cancel_expired is the way out.
         let mut e = funded_arbitrated_escrow();
         assert_eq!(
-            e.escalate(ALICE, EXPIRES_AT, None),
+            e.escalate(ALICE, EXPIRES_AT, None, None, 0),
             Err(EscrowError::DisputeWindowClosed)
         );
         assert_eq!(e.state(), EscrowState::Funded);
@@ -19563,7 +19955,7 @@ mod arbitration_tests {
         // arbiter splits only what is still locked.
         let mut e = funded_arbitrated_escrow();
         e.release(ALICE, 1_750_000_000, 400_000, None, BOB).unwrap();
-        e.escalate(BOB, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(BOB, EXPIRES_AT - 1, None, None, 0).unwrap();
         let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         assert_eq!((payout, fee, refund), (600_000, 0, 0));
         assert_eq!(e.released_amount(), 1_000_000);
@@ -19586,7 +19978,7 @@ mod arbitration_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(e.resolve(ARBITER, 500_000, None, None, BOB).unwrap(), (500_000, 0, 500_000));
         assert_eq!(e.state(), EscrowState::Settled);
     }
@@ -19604,7 +19996,7 @@ mod arbitration_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(BOB, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(BOB, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(
             e.claim(BOB, 1_750_000_000, None, BOB),
             Err(EscrowError::InvalidStateTransition)
@@ -19991,7 +20383,7 @@ mod milestone_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         confirm_both(&mut e, 0);
         e.release_milestone(ALICE, 1_750_000_000, 0, None, BOB).unwrap(); // 400_000 to the taker
-        e.escalate(BOB, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(BOB, EXPIRES_AT - 1, None, None, 0).unwrap();
         let (payout, fee, refund) = e.resolve(ARBITER, 300_000, None, None, BOB).unwrap();
         assert_eq!((payout, fee, refund), (300_000, 0, 300_000));
         assert_eq!(e.released_amount(), 700_000, "taker share in released");
@@ -20031,7 +20423,7 @@ mod milestone_tests {
             .with_milestones(plan_2())
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(
             e.confirm_milestone(ALICE, 0),
             Err(EscrowError::InvalidStateTransition)
@@ -20176,7 +20568,7 @@ mod protocol_fee_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         assert_eq!((payout, fee, refund), (540_000, 60_000, 400_000));
         assert_eq!(payout + fee, 600_000, "fee slices the taker's share");
@@ -20904,7 +21296,7 @@ mod adjust_milestone_amounts_tests {
             .with_arbiter([0xA4; 32])
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1_800, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1_800, None, None, 0).unwrap();
         assert_eq!(
             e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 250_000, 250_000]),
             Err(EscrowError::InvalidStateTransition)
@@ -21186,7 +21578,7 @@ mod adjust_period_amounts_tests {
             .with_arbiter([0xA4; 32])
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1_800, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1_800, None, None, 0).unwrap();
         assert_eq!(
             e.adjust_period_amounts(ALICE, BOB, &[400_000, 300_000, 200_000, 100_000]),
             Err(EscrowError::InvalidStateTransition)
@@ -21570,7 +21962,7 @@ mod migrate_schema_tests {
         // the slash region and the CPI allowlist trail it); every
         // earlier offset stays stable, and the carry-over is still a
         // byte-prefix copy.
-        let version_at = ESCROW_BODY_LEN - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        let version_at = ESCROW_BODY_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         let e = v0_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
@@ -22038,7 +22430,7 @@ mod evidence_tests {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         assert_eq!(e.evidence_hash(), None);
         let mut e = funded_arbitrated_escrow();
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         assert_eq!(e.evidence_hash(), None);
     }
@@ -22048,7 +22440,7 @@ mod evidence_tests {
         // Either party may attach evidence when escalating.
         for authority in [ALICE, BOB] {
             let mut e = funded_arbitrated_escrow();
-            e.escalate(authority, EXPIRES_AT - 1, Some(EVIDENCE))
+            e.escalate(authority, EXPIRES_AT - 1, Some(EVIDENCE), None, 0)
                 .unwrap();
             assert_eq!(e.state(), EscrowState::Disputed);
             assert_eq!(e.evidence_hash(), Some(EVIDENCE));
@@ -22061,12 +22453,12 @@ mod evidence_tests {
         // store happens only after every gate passes.
         let mut e = funded_arbitrated_escrow();
         assert_eq!(
-            e.escalate(MALLORY, EXPIRES_AT - 1, Some(EVIDENCE)),
+            e.escalate(MALLORY, EXPIRES_AT - 1, Some(EVIDENCE), None, 0),
             Err(EscrowError::Unauthorized)
         );
         assert_eq!(e.evidence_hash(), None);
         assert_eq!(
-            e.escalate(ALICE, EXPIRES_AT, Some(EVIDENCE)),
+            e.escalate(ALICE, EXPIRES_AT, Some(EVIDENCE), None, 0),
             Err(EscrowError::DisputeWindowClosed)
         );
         assert_eq!(e.evidence_hash(), None);
@@ -22078,7 +22470,7 @@ mod evidence_tests {
             x
         };
         assert_eq!(
-            e2.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE)),
+            e2.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE), None, 0),
             Err(EscrowError::InvalidArbiter)
         );
         assert_eq!(e2.evidence_hash(), None);
@@ -22089,7 +22481,7 @@ mod evidence_tests {
         // The hash is the audit trail of what the arbiter reviewed: it
         // persists through the settlement, never cleared.
         let mut e = funded_arbitrated_escrow();
-        e.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE)).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE), None, 0).unwrap();
         let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         assert_eq!(e.state(), EscrowState::Settled);
         assert_eq!(e.evidence_hash(), Some(EVIDENCE));
@@ -22104,11 +22496,444 @@ mod evidence_tests {
         // AV-51 shifts the post-vesting offsets +8 (vesting schedule
         // grew by the cliff_at u64).
         let mut e = funded_arbitrated_escrow();
-        e.escalate(BOB, EXPIRES_AT - 1, Some(EVIDENCE)).unwrap();
+        e.escalate(BOB, EXPIRES_AT - 1, Some(EVIDENCE), None, 0).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         assert_eq!(bytes[619], 1, "evidence_hash: Some discriminant");
         assert_eq!(&bytes[620..652], &EVIDENCE, "evidence_hash bytes");
+    }
+}
+
+// ---------- AV-91: dispute-evidence Merkle commitment ----------
+//
+// The escalating party commits to the whole evidence-document set up
+// front (the Merkle root at `escalate`), then discloses documents one
+// by one with inclusion proofs (`file_evidence`). The arbiter panel
+// verifies disclosure completeness before judgment — undisclosed
+// documents are honestly deducted in the judgment weight.
+mod evidence_merkle_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+
+    fn doc(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    /// Build the evidence Merkle tree over `docs` with the on-chain
+    /// convention (leaf = H(0x00 || doc), node = H(0x01 || left ||
+    /// right), odd-layer last node promoted unchanged). Returns the
+    /// root and one proof per leaf.
+    fn build_tree(docs: &[[u8; 32]]) -> ([u8; 32], Vec<Vec<[u8; 32]>>) {
+        assert!(!docs.is_empty());
+        let mut level: Vec<[u8; 32]> =
+            docs.iter().map(|d| merkle_leaf_hash(d)).collect();
+        // pos[l] = the current level position of original leaf l.
+        let mut pos: Vec<usize> = (0..docs.len()).collect();
+        let mut proofs: Vec<Vec<[u8; 32]>> = vec![Vec::new(); docs.len()];
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            let mut next_pos = vec![0usize; docs.len()];
+            let mut i = 0;
+            while i < level.len() {
+                if i + 1 < level.len() {
+                    let (l, r) = (level[i], level[i + 1]);
+                    next.push(merkle_node_hash(&l, &r));
+                    let ni = next.len() - 1;
+                    for (leaf, p) in pos.iter().enumerate() {
+                        if *p == i {
+                            proofs[leaf].push(r);
+                            next_pos[leaf] = ni;
+                        } else if *p == i + 1 {
+                            proofs[leaf].push(l);
+                            next_pos[leaf] = ni;
+                        }
+                    }
+                    i += 2;
+                } else {
+                    // Promoted unchanged — no sibling at this level.
+                    next.push(level[i]);
+                    let ni = next.len() - 1;
+                    for (leaf, p) in pos.iter().enumerate() {
+                        if *p == i {
+                            next_pos[leaf] = ni;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            level = next;
+            pos = next_pos;
+        }
+        (level[0], proofs)
+    }
+
+    fn funded_arbitrated() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    fn disputed_with(docs: &[[u8; 32]]) -> (Escrow, Vec<Vec<[u8; 32]>>) {
+        let (root, proofs) = build_tree(docs);
+        let mut e = funded_arbitrated();
+        e.escalate(ALICE, T0 + 1, None, Some(root), docs.len() as u8)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        (e, proofs)
+    }
+
+    // ----- commitment validation at escalate -----
+
+    #[test]
+    fn escalate_validates_the_leaf_count_against_the_root() {
+        let (root, _) = build_tree(&[doc(1)]);
+        // (None, 0): the plain AV-22 path — backward compatible.
+        let mut e = funded_arbitrated();
+        e.escalate(ALICE, T0 + 1, None, None, 0).unwrap();
+        assert_eq!(e.evidence_root(), None);
+        assert_eq!(e.evidence_leaves(), 0);
+        assert_eq!(e.evidence_disclosure(), None);
+        // (Some, 1..=64): the Merkle path.
+        let mut e = funded_arbitrated();
+        e.escalate(ALICE, T0 + 1, None, Some(root), 1).unwrap();
+        assert_eq!(e.evidence_root(), Some(root));
+        assert_eq!(e.evidence_leaves(), 1);
+        assert_eq!(e.evidence_disclosure(), Some((0, 1)));
+        let mut e = funded_arbitrated();
+        e.escalate(ALICE, T0 + 1, None, Some(root), 64).unwrap();
+        assert_eq!(e.evidence_disclosure(), Some((0, 64)));
+        // A root over zero documents is meaningless.
+        let mut e = funded_arbitrated();
+        assert_eq!(
+            e.escalate(ALICE, T0 + 1, None, Some(root), 0),
+            Err(EscrowError::InvalidEvidenceProof)
+        );
+        // A count without a root is meaningless.
+        let mut e = funded_arbitrated();
+        assert_eq!(
+            e.escalate(ALICE, T0 + 1, None, None, 3),
+            Err(EscrowError::InvalidEvidenceProof)
+        );
+        // Past the bitmap ceiling: can never be audited on-chain.
+        let mut e = funded_arbitrated();
+        assert_eq!(
+            e.escalate(ALICE, T0 + 1, None, Some(root), 65),
+            Err(EscrowError::InvalidEvidenceProof)
+        );
+        // A rejected commitment leaves no half-written state.
+        assert_eq!(e.evidence_root(), None);
+        assert_eq!(e.evidence_leaves(), 0);
+    }
+
+    // ----- proof shape -----
+
+    #[test]
+    fn proof_length_follows_the_promotion_convention() {
+        // Depth alone is not the proof length: the last node of an
+        // odd-width layer is promoted without a sibling.
+        assert_eq!(merkle_proof_len(1, 0), 0);
+        assert_eq!(merkle_proof_len(2, 0), 1);
+        assert_eq!(merkle_proof_len(2, 1), 1);
+        assert_eq!(merkle_proof_len(3, 0), 2);
+        assert_eq!(merkle_proof_len(3, 1), 2);
+        assert_eq!(merkle_proof_len(3, 2), 1, "promoted at level 0");
+        assert_eq!(merkle_proof_len(4, 3), 2);
+        assert_eq!(merkle_proof_len(5, 4), 1, "promoted twice");
+        assert_eq!(merkle_proof_len(5, 0), 3);
+        assert_eq!(merkle_proof_len(64, 63), 6);
+        // The builder agrees with the length function on every shape.
+        for n in 1..=9u8 {
+            let docs: Vec<[u8; 32]> = (0..n).map(doc).collect();
+            let (_, proofs) = build_tree(&docs);
+            for (i, p) in proofs.iter().enumerate() {
+                assert_eq!(
+                    p.len(),
+                    merkle_proof_len(n, i as u8),
+                    "n={n} leaf={i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_built_proof_verifies_and_wrong_ones_do_not() {
+        for n in [1u8, 2, 3, 4, 5, 7, 8, 16] {
+            let docs: Vec<[u8; 32]> = (0..n).map(doc).collect();
+            let (root, proofs) = build_tree(&docs);
+            for (i, proof) in proofs.iter().enumerate() {
+                assert!(
+                    verify_merkle_proof(&root, &docs[i], i as u8, n, proof),
+                    "n={n} leaf={i} verifies"
+                );
+                // A tampered sibling breaks the proof.
+                let mut bad = proof.clone();
+                if !bad.is_empty() {
+                    bad[0][0] ^= 0xFF;
+                    assert!(
+                        !verify_merkle_proof(&root, &docs[i], i as u8, n, &bad),
+                        "n={n} leaf={i} tampered sibling rejected"
+                    );
+                }
+                // The proof is bound to the leaf position: the same
+                // document at a different index does not verify.
+                if n > 1 {
+                    let j = (i + 1) % n as usize;
+                    assert!(
+                        !verify_merkle_proof(&root, &docs[i], j as u8, n, proof),
+                        "n={n} proof is position-bound"
+                    );
+                }
+                // ... and to the document: a different document at the
+                // same index does not verify.
+                assert!(
+                    !verify_merkle_proof(&root, &doc(0xFF), i as u8, n, proof),
+                    "n={n} proof is document-bound"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn domain_separation_blocks_leaf_node_confusion() {
+        // A raw document hash is never a valid leaf preimage: the
+        // 0x00 domain tag is load-bearing.
+        let d = doc(7);
+        assert_ne!(merkle_leaf_hash(&d), d);
+        assert_ne!(merkle_leaf_hash(&d), merkle_node_hash(&d, &d));
+    }
+
+    // ----- file_evidence -----
+
+    #[test]
+    fn file_evidence_fills_the_disclosure_bitmap() {
+        let docs: Vec<[u8; 32]> = [1, 2, 3].map(doc).to_vec();
+        let (mut e, proofs) = disputed_with(&docs);
+        // Out-of-order disclosure is fine — the bitmap tracks leaves,
+        // not sequence.
+        e.file_evidence(ALICE, docs[2], 2, &proofs[2], T0 + 2).unwrap();
+        assert_eq!(e.evidence_disclosure(), Some((1, 3)));
+        e.file_evidence(ALICE, docs[0], 0, &proofs[0], T0 + 3).unwrap();
+        assert_eq!(e.evidence_disclosure(), Some((2, 3)));
+        e.file_evidence(ALICE, docs[1], 1, &proofs[1], T0 + 4).unwrap();
+        assert_eq!(e.evidence_disclosure(), Some((3, 3)));
+        // Re-filing a disclosed document is an idempotent no-op.
+        e.file_evidence(ALICE, docs[1], 1, &proofs[1], T0 + 5).unwrap();
+        assert_eq!(e.evidence_disclosure(), Some((3, 3)));
+    }
+
+    #[test]
+    fn file_evidence_rejects_bad_proofs() {
+        let docs: Vec<[u8; 32]> = [1, 2, 3].map(doc).to_vec();
+        let (mut e, proofs) = disputed_with(&docs);
+        // Wrong-length proof.
+        assert_eq!(
+            e.file_evidence(ALICE, docs[0], 0, &proofs[0][..1], T0 + 2),
+            Err(EscrowError::InvalidEvidenceProof)
+        );
+        let mut long = proofs[0].clone();
+        long.push([0xFF; 32]);
+        assert_eq!(
+            e.file_evidence(ALICE, docs[0], 0, &long, T0 + 2),
+            Err(EscrowError::InvalidEvidenceProof)
+        );
+        // Non-verifying proof.
+        let mut bad = proofs[0].clone();
+        bad[0][0] ^= 0x01;
+        assert_eq!(
+            e.file_evidence(ALICE, docs[0], 0, &bad, T0 + 2),
+            Err(EscrowError::InvalidEvidenceProof)
+        );
+        // Wrong document for the proof.
+        assert_eq!(
+            e.file_evidence(ALICE, doc(0xFF), 0, &proofs[0], T0 + 2),
+            Err(EscrowError::InvalidEvidenceProof)
+        );
+        // Leaf index past the committed leaves.
+        assert_eq!(
+            e.file_evidence(ALICE, docs[0], 3, &proofs[0], T0 + 2),
+            Err(EscrowError::InvalidEvidenceProof)
+        );
+        assert_eq!(
+            e.file_evidence(ALICE, docs[0], 64, &proofs[0], T0 + 2),
+            Err(EscrowError::InvalidEvidenceProof)
+        );
+        // Nothing was disclosed by the rejections.
+        assert_eq!(e.evidence_disclosure(), Some((0, 3)));
+    }
+
+    #[test]
+    fn file_evidence_guards_mirror_submit_evidence() {
+        let docs: Vec<[u8; 32]> = [1, 2].map(doc).to_vec();
+        let (mut e, proofs) = disputed_with(&docs);
+        // A stranger learns nothing: authority first.
+        assert_eq!(
+            e.file_evidence(MALLORY, docs[0], 0, &proofs[0], T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        // The counterparty cannot file either — disclosure is the
+        // escalator's duty.
+        assert_eq!(
+            e.file_evidence(BOB, docs[0], 0, &proofs[0], T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        // Disputed only.
+        let mut plain = funded_arbitrated();
+        assert_eq!(
+            plain.file_evidence(ALICE, docs[0], 0, &proofs[0], T0 + 2),
+            Err(EscrowError::Unauthorized),
+            "never-disputed: escalated_by is None, so Unauthorized first"
+        );
+        e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
+        assert_eq!(
+            e.file_evidence(ALICE, docs[0], 0, &proofs[0], T0 + 4),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // No committed root: the plain AV-22 path has nothing to file
+        // against.
+        let mut e2 = funded_arbitrated();
+        e2.escalate(ALICE, T0 + 1, None, None, 0).unwrap();
+        assert_eq!(
+            e2.file_evidence(ALICE, docs[0], 0, &[], T0 + 2),
+            Err(EscrowError::InvalidEvidenceProof)
+        );
+        // A paused escrow fails fast.
+        let mut e3 = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap();
+        e3.fund(ALICE, T0).unwrap();
+        let (root3, proofs3) = build_tree(&docs);
+        e3.escalate(ALICE, T0 + 1, None, Some(root3), 2).unwrap();
+        e3.pause(ALICE).unwrap();
+        assert_eq!(
+            e3.file_evidence(ALICE, docs[0], 0, &proofs3[0], T0 + 3),
+            Err(EscrowError::Paused)
+        );
+    }
+
+    #[test]
+    fn file_evidence_honors_the_disclosure_deadline() {
+        let docs: Vec<[u8; 32]> = [1, 2].map(doc).to_vec();
+        let (root, proofs) = build_tree(&docs);
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_evidence_deadline(1_000)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.escalate(ALICE, T0 + 1, None, Some(root), 2).unwrap();
+        // Within the window: accepted.
+        e.file_evidence(ALICE, docs[0], 0, &proofs[0], T0 + 500).unwrap();
+        assert_eq!(e.evidence_disclosure(), Some((1, 2)));
+        // Past the deadline: rejected, like submit_evidence.
+        assert_eq!(
+            e.file_evidence(ALICE, docs[1], 1, &proofs[1], T0 + 1_001),
+            Err(EscrowError::EvidenceDisclosureLate)
+        );
+        assert_eq!(e.evidence_disclosure(), Some((1, 2)));
+    }
+
+    #[test]
+    fn single_document_tree_needs_no_proof() {
+        // A one-leaf tree's root is the leaf hash; the empty proof
+        // verifies.
+        let docs = [doc(9)];
+        let (mut e, proofs) = disputed_with(&docs);
+        assert!(proofs[0].is_empty());
+        e.file_evidence(ALICE, docs[0], 0, &[], T0 + 2).unwrap();
+        assert_eq!(e.evidence_disclosure(), Some((1, 1)));
+    }
+
+    #[test]
+    fn evidence_status_treats_a_committed_root_as_submitted() {
+        let docs: Vec<[u8; 32]> = [1, 2].map(doc).to_vec();
+        let (e, _) = disputed_with(&docs);
+        assert_eq!(e.evidence_status(T0 + 2), EvidenceStatus::Submitted);
+        // The plain path is unchanged.
+        let mut e2 = funded_arbitrated();
+        e2.escalate(ALICE, T0 + 1, None, None, 0).unwrap();
+        assert_eq!(e2.evidence_status(T0 + 2), EvidenceStatus::Pending);
+    }
+
+    #[test]
+    fn commitment_survives_settlement_for_the_audit_trail() {
+        // The root, leaf count and bitmap are never cleared — a
+        // Settled escrow keeps the full disclosure record.
+        let docs: Vec<[u8; 32]> = [1, 2, 3].map(doc).to_vec();
+        let (root, proofs) = build_tree(&docs);
+        let (mut e, _) = disputed_with(&docs);
+        e.file_evidence(ALICE, docs[0], 0, &proofs[0], T0 + 2).unwrap();
+        e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Settled);
+        assert_eq!(e.evidence_root(), Some(root));
+        assert_eq!(e.evidence_leaves(), 3);
+        assert_eq!(e.evidence_disclosure(), Some((1, 3)));
+    }
+
+    // ----- layout -----
+
+    #[test]
+    fn commitment_region_appends_last_and_encodes() {
+        use crate::account_space_tests::encode_escrow;
+        let docs: Vec<[u8; 32]> = [1, 2].map(doc).to_vec();
+        let (root, _) = build_tree(&docs);
+        let mut e = funded_arbitrated();
+        e.escalate(ALICE, T0 + 1, None, Some(root), 2).unwrap();
+        e.file_evidence(ALICE, docs[0], 0, &build_tree(&docs).1[0], T0 + 2)
+            .unwrap();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        // The commitment region is the new tail: 1-byte discriminant
+        // + 32-byte root, then the leaf-count byte, then the u64-LE
+        // disclosure bitmap with bit 0 set.
+        let base = ESCROW_BODY_LEN - 42;
+        assert_eq!(bytes[base], 1, "evidence_root: Some discriminant");
+        assert_eq!(&bytes[base + 1..base + 33], &root, "evidence_root bytes");
+        assert_eq!(bytes[base + 33], 2, "evidence_leaves");
+        assert_eq!(
+            u64::from_le_bytes(bytes[base + 34..base + 42].try_into().unwrap()),
+            0b01,
+            "evidence_disclosed bitmap"
+        );
+        // A root-less escrow zero-fills the region.
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let plain_bytes = encode_escrow(&plain);
+        assert_eq!(plain_bytes[base], 0, "evidence_root: None discriminant");
+        assert!(plain_bytes[base + 1..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn decode_round_trips_the_commitment() {
+        use crate::account_space_tests::encode_escrow;
+        use crate::discriminator::{decode_vault_account, vault_account_discriminator};
+        let docs: Vec<[u8; 32]> = [1, 2, 3].map(doc).to_vec();
+        let (root, proofs) = build_tree(&docs);
+        let mut e = funded_arbitrated();
+        e.escalate(ALICE, T0 + 1, None, Some(root), 3).unwrap();
+        e.file_evidence(ALICE, docs[1], 1, &proofs[1], T0 + 2).unwrap();
+        let mut bytes = vault_account_discriminator().to_vec();
+        bytes.extend_from_slice(&encode_escrow(&e));
+        let decoded = decode_vault_account(&bytes).unwrap();
+        assert_eq!(decoded.evidence_root(), Some(root));
+        assert_eq!(decoded.evidence_leaves(), 3);
+        assert_eq!(decoded.evidence_disclosure(), Some((1, 3)));
+        // The decoded escrow verifies proofs exactly like the live one.
+        decoded
+            .clone()
+            .file_evidence(ALICE, docs[2], 2, &proofs[2], T0 + 3)
+            .unwrap();
     }
 }
 
@@ -22146,7 +22971,7 @@ mod evidence_deadline_tests {
         let mut e = arbitrated();
         e.fund(ALICE, T0).unwrap();
         let disputed_at = T0 + 100;
-        e.escalate(authority, disputed_at, None).unwrap();
+        e.escalate(authority, disputed_at, None, None, 0).unwrap();
         (e, disputed_at)
     }
 
@@ -22223,7 +23048,7 @@ mod evidence_deadline_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, T0).unwrap();
-        e.escalate(BOB, T0 + 100, None).unwrap();
+        e.escalate(BOB, T0 + 100, None, None, 0).unwrap();
         assert_eq!(e.evidence_deadline_secs(), 0);
         assert_eq!(e.evidence_due_at(), None);
         assert_eq!(e.escalated_by(), Some(BOB));
@@ -22313,7 +23138,7 @@ mod evidence_deadline_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, T0).unwrap();
-        e.escalate(BOB, T0 + 100, None).unwrap();
+        e.escalate(BOB, T0 + 100, None, None, 0).unwrap();
         e.submit_evidence(BOB, EVIDENCE, u64::MAX - 1).unwrap();
         assert_eq!(e.evidence_hash(), Some(EVIDENCE));
     }
@@ -22325,7 +23150,7 @@ mod evidence_deadline_tests {
         let mut e = arbitrated();
         e.fund(ALICE, T0).unwrap();
         let disputed_at = T0 + 100;
-        e.escalate(ALICE, disputed_at, Some(EVIDENCE)).unwrap();
+        e.escalate(ALICE, disputed_at, Some(EVIDENCE), None, 0).unwrap();
         assert_eq!(e.evidence_status(disputed_at), EvidenceStatus::Submitted);
         assert!(!e.evidence_defaulted(disputed_at + DEADLINE + 1));
     }
@@ -22457,7 +23282,7 @@ mod panel_threshold_tests {
             e.update_panel_threshold(ALICE, BOB, 1),
             Err(EscrowError::InvalidStateTransition)
         );
-        e.escalate(ALICE, T0 + 10, None).unwrap();
+        e.escalate(ALICE, T0 + 10, None, None, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         assert_eq!(
             e.update_panel_threshold(ALICE, BOB, 1),
@@ -22532,7 +23357,7 @@ mod panel_threshold_tests {
         let mut e = panel_escrow(3);
         e.update_panel_threshold(ALICE, BOB, 1).unwrap();
         e.fund(ALICE, T0).unwrap();
-        e.escalate(ALICE, T0 + 10, None).unwrap();
+        e.escalate(ALICE, T0 + 10, None, None, 0).unwrap();
         let settled = e
             .submit_panel_judgment(M1, 600_000, None, None, BOB)
             .unwrap();
@@ -22547,7 +23372,7 @@ mod panel_threshold_tests {
         let mut e = panel_escrow(1);
         e.update_panel_threshold(ALICE, BOB, 3).unwrap();
         e.fund(ALICE, T0).unwrap();
-        e.escalate(ALICE, T0 + 10, None).unwrap();
+        e.escalate(ALICE, T0 + 10, None, None, 0).unwrap();
         assert!(e
             .submit_panel_judgment(M1, 600_000, None, None, BOB)
             .unwrap()
@@ -22619,7 +23444,7 @@ mod rationale_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         e
     }
@@ -22703,7 +23528,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3928, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) bytes");
+        assert_eq!(bytes.len(), 3970, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -22728,7 +23553,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 3928);
+        assert_eq!(bytes.len(), 3970);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -22750,18 +23575,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3936) * 3480 * 2 = 4064 * 6960 = 28_285_440 lamports.
-        assert_eq!(VAULT_SPACE, 3936);
-        assert_eq!(full, 28_285_440);
+        // (128 + 3978) * 3480 * 2 = 4106 * 6960 = 28_577_760 lamports.
+        assert_eq!(VAULT_SPACE, 3978);
+        assert_eq!(full, 28_577_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3446) * 3480 * 2 = 3574 * 6960 = 24_875_040 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3446);
-        assert_eq!(no_quorum, 24_875_040);
+        // (128 + 3488) * 3480 * 2 = 3616 * 6960 = 25_167_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3488);
+        assert_eq!(no_quorum, 25_167_360);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -22872,7 +23697,7 @@ mod reference_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(e.reference(), Some(ORDER_REF));
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         assert_eq!(e.state(), EscrowState::Settled);
@@ -22905,7 +23730,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3928);
+        assert_eq!(bytes.len(), 3970);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -22920,7 +23745,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 3928);
+        assert_eq!(bytes.len(), 3970);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -22951,18 +23776,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3936) * 3480 * 2 = 4064 * 6960 = 28_285_440 lamports.
-        assert_eq!(VAULT_SPACE, 3936);
-        assert_eq!(full, 28_285_440);
+        // (128 + 3978) * 3480 * 2 = 4106 * 6960 = 28_577_760 lamports.
+        assert_eq!(VAULT_SPACE, 3978);
+        assert_eq!(full, 28_577_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3446) * 3480 * 2 = 3574 * 6960 = 24_875_040 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3446);
-        assert_eq!(no_quorum, 24_875_040);
+        // (128 + 3488) * 3480 * 2 = 3616 * 6960 = 25_167_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3488);
+        assert_eq!(no_quorum, 25_167_360);
     }
 
     #[test]
@@ -22990,7 +23815,7 @@ mod reference_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, 1_000_001).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         e.resolve(ARBITER, 600_000, None, None, BOB, 1_000_002).unwrap();
         let events = e.drain_events();
         assert_eq!(events[0].reference, None, "Initialized predates the binding");
@@ -23569,7 +24394,7 @@ mod timelock_tests {
             .with_timelock(LATE_UNLOCK)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         let (payout, _fee, _refund) = e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         assert_eq!(payout, 600_000);
         assert_eq!(e.state(), EscrowState::Settled);
@@ -23817,7 +24642,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 3928);
+        assert_eq!(bytes.len(), 3970);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -23992,7 +24817,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 3928, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region");
+        assert_eq!(ESCROW_BODY_LEN, 3970, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -24010,32 +24835,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 3936) * 3480 * 2 = 4064 * 6960 = 28_285_440 lamports.
+        // (128 + 3978) * 3480 * 2 = 4106 * 6960 = 28_577_760 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            28_285_440
+            28_577_760
         );
-        // (128 + 3446) * 3480 * 2 = 3574 * 6960 = 24_875_040 lamports.
+        // (128 + 3488) * 3480 * 2 = 3616 * 6960 = 25_167_360 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            24_875_040
+            25_167_360
         );
         // 1888 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 3936);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3446);
-        assert!(check_vault_rent_exempt(28_285_440, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 3978);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3488);
+        assert!(check_vault_rent_exempt(28_577_760, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -24836,7 +25661,7 @@ mod pause_tests {
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         e.pause(PAUSER).unwrap();
-        assert_paused(e.escalate(ALICE, NOW, None));
+        assert_paused(e.escalate(ALICE, NOW, None, None, 0));
         // And resolve on an already-disputed escrow.
         let mut e2 = base()
             .with_pause_authority(PAUSER)
@@ -24844,7 +25669,7 @@ mod pause_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e2.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e2.escalate(ALICE, NOW, None).unwrap();
+        e2.escalate(ALICE, NOW, None, None, 0).unwrap();
         e2.pause(PAUSER).unwrap();
         assert_paused(e2.resolve(ARBITER, 600_000, None, None, BOB));
         assert_eq!(e2.state(), EscrowState::Disputed);
@@ -25405,7 +26230,7 @@ mod taker_rotation_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         disputed.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(disputed.state(), EscrowState::Disputed);
 
         let mut settled = disputed;
@@ -25422,7 +26247,7 @@ mod taker_rotation_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         disputed.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
 
         for (name, e) in [
             ("Released", released),
@@ -25697,7 +26522,7 @@ mod initializer_rotation_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         disputed.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(disputed.state(), EscrowState::Disputed);
 
         let mut settled = disputed;
@@ -25714,7 +26539,7 @@ mod initializer_rotation_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         disputed.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
 
         for (name, e) in [
             ("Released", released),
@@ -26037,7 +26862,7 @@ mod arbiter_rotation_tests {
         assert_eq!(cancelled.state(), EscrowState::Cancelled);
 
         let mut disputed = arbitrated_funded();
-        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(disputed.state(), EscrowState::Disputed);
 
         let mut settled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
@@ -26045,7 +26870,7 @@ mod arbiter_rotation_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         settled.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        settled.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        settled.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         settled.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         assert_eq!(settled.state(), EscrowState::Settled);
 
@@ -26149,7 +26974,7 @@ mod arbiter_rotation_tests {
         assert_eq!(snap.arbiter, Some(NEW_ARBITER));
         // Escalate, then the keeper's resolve action names the new
         // arbiter as the caller.
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         let watched = [WatchedEscrow {
             escrow_id: ESCROW_ID,
@@ -26427,7 +27252,7 @@ mod fee_recipient_rotation_tests {
             .with_arbiter(DAVE)
             .unwrap();
         disputed.fund(ALICE, T0).unwrap();
-        disputed.escalate(ALICE, T0 + 10, None).unwrap();
+        disputed.escalate(ALICE, T0 + 10, None, None, 0).unwrap();
         assert_eq!(disputed.state(), EscrowState::Disputed);
         // Settled.
         let mut settled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
@@ -26437,7 +27262,7 @@ mod fee_recipient_rotation_tests {
             .with_arbiter(DAVE)
             .unwrap();
         settled.fund(ALICE, T0).unwrap();
-        settled.escalate(ALICE, T0 + 10, None).unwrap();
+        settled.escalate(ALICE, T0 + 10, None, None, 0).unwrap();
         settled.resolve(DAVE, 600_000, None, None, BOB).unwrap();
         assert_eq!(settled.state(), EscrowState::Settled);
         // Closed: cancel first (close_vault only accepts post-terminal
@@ -26862,9 +27687,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3928, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve)");
-        assert_eq!(VAULT_SPACE, 3936);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3446);
+        assert_eq!(bytes.len(), 3970, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment)");
+        assert_eq!(VAULT_SPACE, 3978);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3488);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -26932,7 +27757,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let disputed_at = EXPIRES_AT - 10_000;
-        e.escalate(ALICE, disputed_at, None).unwrap();
+        e.escalate(ALICE, disputed_at, None, None, 0).unwrap();
         assert_eq!(e.disputed_at(), disputed_at, "escalate records disputed_at");
         assert_eq!(e.state(), EscrowState::Disputed);
         (e, disputed_at)
@@ -27091,7 +27916,7 @@ mod default_judgment_tests {
             .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 10_000, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 10_000, None, None, 0).unwrap();
         assert_eq!(
             e.confirm_default_judgment(BOB),
             Err(EscrowError::InvalidStateTransition)
@@ -27159,7 +27984,7 @@ mod default_judgment_tests {
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let disputed_at = EXPIRES_AT - 10_000;
-        e.escalate(ALICE, disputed_at, None).unwrap();
+        e.escalate(ALICE, disputed_at, None, None, 0).unwrap();
         let err = e
             .trigger_default_judgment(ALICE, disputed_at + DEADLINE, None, BOB)
             .unwrap_err();
@@ -27175,7 +28000,7 @@ mod default_judgment_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 10_000, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 10_000, None, None, 0).unwrap();
         assert_eq!(
             e.trigger_default_judgment(ALICE, EXPIRES_AT, None, BOB),
             Err(EscrowError::DefaultJudgmentNotDue)
@@ -27235,7 +28060,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let disputed_at = EXPIRES_AT - 10_000;
-        e.escalate(ALICE, disputed_at, None).unwrap();
+        e.escalate(ALICE, disputed_at, None, None, 0).unwrap();
         assert_eq!(
             e.trigger_default_judgment(ALICE, disputed_at + DEADLINE, None, BOB),
             Err(EscrowError::MintMismatch)
@@ -27262,7 +28087,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let disputed_at = EXPIRES_AT - 10_000;
-        e.escalate(ALICE, disputed_at, None).unwrap();
+        e.escalate(ALICE, disputed_at, None, None, 0).unwrap();
         assert_eq!(
             e.trigger_default_judgment(ALICE, disputed_at + DEADLINE, None, MALLORY),
             Err(EscrowError::PayoutNotAllowlisted)
@@ -27285,7 +28110,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let disputed_at = EXPIRES_AT - 10_000;
-        e.escalate(ALICE, disputed_at, None).unwrap();
+        e.escalate(ALICE, disputed_at, None, None, 0).unwrap();
         // 1000 bps of 600_000 = 60_000; the refund is never fee'd.
         let (payout, fee, refund) = e
             .trigger_default_judgment(BOB, disputed_at + DEADLINE, None, BOB)
@@ -27363,7 +28188,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let disputed_at = EXPIRES_AT - 10_000;
-        e.escalate(ALICE, disputed_at, None).unwrap();
+        e.escalate(ALICE, disputed_at, None, None, 0).unwrap();
         e.pause([0xDD; 32]).unwrap();
         assert_eq!(
             e.trigger_default_judgment(ALICE, disputed_at + DEADLINE, None, BOB),
@@ -27384,7 +28209,7 @@ mod default_judgment_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         assert_eq!(e.disputed_at(), 0, "never disputed yet");
         let disputed_at = EXPIRES_AT - 10_000;
-        e.escalate(BOB, disputed_at, None).unwrap();
+        e.escalate(BOB, disputed_at, None, None, 0).unwrap();
         assert_eq!(e.disputed_at(), disputed_at);
         assert_eq!(e.default_judgment(), None, "no judgment configured here");
         assert!(!e.default_judgment_confirmed());
@@ -27408,7 +28233,7 @@ mod default_judgment_tests {
         // at 960, `default_judgment` at 968, `default_confirmed` at 985
         // (AV-55 body total 986). AV-56 appends `subscription` at 986,
         // `subscription_next` at 1004, `subscription_released` at 1005
-        // (body total 3928 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline + AV-73 per-period-table + AV-75 schema-version + AV-82 slash-region + AV-86 appeal-window appends).
+        // (body total 3970 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline + AV-73 per-period-table + AV-75 schema-version + AV-82 slash-region + AV-86 appeal-window + AV-90 vesting-curve + AV-91 evidence-commitment appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter(ARBITER)
@@ -27418,7 +28243,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3928);
+        assert_eq!(bytes.len(), 3970);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -27471,7 +28296,7 @@ mod default_judgment_tests {
         e = e.confirm_default_judgment(BOB).unwrap();
         let disputed_at = EXPIRES_AT - 10_000;
         let evidence = [0xE8; 32];
-        e.escalate(ALICE, disputed_at, Some(evidence)).unwrap();
+        e.escalate(ALICE, disputed_at, Some(evidence), None, 0).unwrap();
         let (payout, fee, refund) = e
             .trigger_default_judgment(BOB, disputed_at + DEADLINE, None, BOB, disputed_at + DEADLINE)
             .unwrap();
@@ -27976,7 +28801,7 @@ mod subscription_tests {
         // Offsets: `default_confirmed` ends the AV-55 body at 986;
         // `subscription` at 986, `subscription_next` at 1004,
         // `subscription_released` at 1005; the AV-73 live per-period
-        // amount table at 2933..3445 (body total 3928 after the AV-57 +
+        // amount table at 2933..3445 (body total 3970 after the AV-57 +
         // AV-59 + AV-63 + AV-64 + AV-65 + AV-66 + AV-68 + AV-73 + AV-75
         // appends).
         let mut e = escrow()
@@ -27985,7 +28810,7 @@ mod subscription_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3928);
+        assert_eq!(bytes.len(), 3970);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -28312,7 +29137,12 @@ mod event_history_tests {
             45,
             "AV-86: appended after AppealFiled"
         );
-        for d in 0..=45u8 {
+        assert_eq!(
+            EscrowEventKind::EvidenceFiled.discriminant(),
+            46,
+            "AV-91: appended after AppealResolved"
+        );
+        for d in 0..=46u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -28323,7 +29153,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(46), None);
+        assert_eq!(EscrowEventKind::from_discriminant(47), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -28335,11 +29165,11 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42
         );
     }
 
@@ -28348,14 +29178,14 @@ mod event_history_tests {
         // Offsets: `subscription_released` ends the AV-56 body at 1013;
         // `event_head` at 1013, `event_total` at 1014, `event_count` at
         // 1022, `event_capacity` at 1023, `event_slots` at 1024 (body
-        // total 3928 after the AV-59 + AV-63 + AV-64 + AV-68 + AV-73
+        // total 3970 after the AV-59 + AV-63 + AV-64 + AV-68 + AV-73
         // + AV-75 + AV-82 + AV-83 appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3928);
+        assert_eq!(bytes.len(), 3970);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -28383,7 +29213,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82, "AV-82/AV-83/AV-84/AV-86/AV-90 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91 tail");
     }
 
     #[test]
@@ -28398,18 +29228,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3936) * 3480 * 2 = 4064 * 6960 = 28_285_440 lamports.
-        assert_eq!(VAULT_SPACE, 3936);
-        assert_eq!(full, 28_285_440);
+        // (128 + 3978) * 3480 * 2 = 4106 * 6960 = 28_577_760 lamports.
+        assert_eq!(VAULT_SPACE, 3978);
+        assert_eq!(full, 28_577_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3446) * 3480 * 2 = 3574 * 6960 = 24_875_040 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3446);
-        assert_eq!(no_quorum, 24_875_040);
+        // (128 + 3488) * 3480 * 2 = 3616 * 6960 = 25_167_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3488);
+        assert_eq!(no_quorum, 25_167_360);
     }
 
     // ----- decode -----
@@ -28451,9 +29281,9 @@ mod event_history_tests {
         // (AV-77), 40 is `VaultsBatchClosed` (AV-79), 41 is
         // `EscrowSplit` (AV-81), 42 is `Slashed` (AV-82), 43 is
         // `CpiAllowlistUpdated` (AV-83), 44 is `AppealFiled` (AV-86),
-        // 45 is `AppealResolved` (AV-86); 46 is the first
-        // still-unknown byte.
-        for bad in [46u8, 47, 255] {
+        // 45 is `AppealResolved` (AV-86), 46 is `EvidenceFiled`
+        // (AV-91); 47 is the first still-unknown byte.
+        for bad in [47u8, 48, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -28942,7 +29772,7 @@ mod fee_cap_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         // 10% of the 600_000 taker share = 60_000 -> 7_500; the
         // initializer's 400_000 refund is untouched by the cap and by the fee.
         let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
@@ -29092,7 +29922,7 @@ mod fee_cap_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         let (payout, fee, refund) = e.resolve(ARBITER, 0, None, None, BOB).unwrap();
         assert_eq!((payout, fee, refund), (0, 0, 1_000_000));
         assert_eq!(e.fees_paid(), 0);
@@ -29107,17 +29937,17 @@ mod fee_cap_tests {
         // + 258 (AV-83 CPI target allowlist) + 67 (AV-84 multisig
         // authority) + 26 (AV-86 appeal window region) + 82 (AV-90
         // vesting curve).
-        assert_eq!(ESCROW_BODY_LEN, 3928, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 3936, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3446, "no-quorum Vault account space");
+        assert_eq!(ESCROW_BODY_LEN, 3970, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 3978, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3488, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            28_285_440,
-            "(128 + 3936) * 3480 * 2 = 4064 * 6960"
+            28_577_760,
+            "(128 + 3978) * 3480 * 2 = 4106 * 6960"
         );
         assert_eq!(
             rent_exempt_minimum_lamports(
@@ -29125,8 +29955,8 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            24_875_040,
-            "(128 + 3446) * 3480 * 2 = 3574 * 6960"
+            25_167_360,
+            "(128 + 3488) * 3480 * 2 = 3616 * 6960"
         );
     }
 
@@ -29138,7 +29968,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3928);
+        assert_eq!(bytes.len(), 3970);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -29498,7 +30328,7 @@ mod fee_schedule_tests {
     fn resolve_charges_the_tiered_fee_on_the_taker_share() {
         let mut e = scheduled_escrow().with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, NOW, None).unwrap();
+        e.escalate(ALICE, NOW, None, None, 0).unwrap();
         let (payout, fee, refund) = e
             .resolve(ARBITER, 600_000, None, None, BOB)
             .unwrap();
@@ -29533,7 +30363,7 @@ mod fee_schedule_tests {
         // fee'd by tier.
         let mut e = scheduled_escrow().with_arbiter_panel(&[M1, M2], 2).unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(ALICE, NOW, None).unwrap();
+        e.escalate(ALICE, NOW, None, None, 0).unwrap();
         assert_eq!(
             e.submit_panel_judgment(M1, 600_000, None, None, BOB),
             Ok(None)
@@ -29636,8 +30466,8 @@ mod fee_schedule_tests {
         let e = scheduled_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3928);
-        let tail = ESCROW_BODY_LEN - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        assert_eq!(bytes.len(), 3970);
+        let tail = ESCROW_BODY_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(bytes[tail], 3, "tier_count at the tail");
         assert_eq!(
             u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
@@ -29674,7 +30504,7 @@ mod fee_schedule_tests {
         // appeal region (26 bytes), and AV-90 the vesting-curve region
         // (82 bytes) after the fee schedule, so the schedule no longer
         // sits at the body tail.
-        let tail = ESCROW_BODY_LEN - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(
             &bytes[tail..tail + FEE_SCHEDULE_LEN],
             &[0u8; FEE_SCHEDULE_LEN],
@@ -29695,7 +30525,7 @@ mod fee_schedule_tests {
         // appeal region (26 bytes), and AV-90 the vesting-curve region
         // (82 bytes) after the fee schedule, so the schedule no longer
         // sits at the body tail.
-        let tail = ESCROW_BODY_LEN - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         bytes[tail] = 9;
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
@@ -30028,7 +30858,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3928);
+        assert_eq!(bytes.len(), 3970);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -30185,7 +31015,7 @@ mod arbiter_panel_tests {
     fn disputed_panel() -> Escrow {
         let mut e = panel_escrow();
         e.fund(ALICE, T0).unwrap();
-        e.escalate(ALICE, T0 + 10, None).unwrap();
+        e.escalate(ALICE, T0 + 10, None, None, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         e
     }
@@ -30245,7 +31075,8 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::InvalidMultisigAuthority));
         assert!(EscrowError::all().contains(&EscrowError::InvalidAppealWindow));
         assert!(EscrowError::all().contains(&EscrowError::InvalidVestingCurve));
-        assert_eq!(EscrowError::all().len(), 48);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidEvidenceProof));
+        assert_eq!(EscrowError::all().len(), 49);
     }
 
     #[test]
@@ -30346,7 +31177,7 @@ mod arbiter_panel_tests {
         // The panel is a configured arbitration mechanism.
         let mut e = panel_escrow();
         e.fund(ALICE, T0).unwrap();
-        e.escalate(BOB, T0 + 10, None).unwrap();
+        e.escalate(BOB, T0 + 10, None, None, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
     }
 
@@ -30472,7 +31303,7 @@ mod arbiter_panel_tests {
             .with_protocol_fee(1_000) // 10%
             .unwrap();
         e.fund(ALICE, T0).unwrap();
-        e.escalate(ALICE, T0 + 10, None).unwrap();
+        e.escalate(ALICE, T0 + 10, None, None, 0).unwrap();
         e.submit_panel_judgment(M1, 600_000, None, None, BOB).unwrap();
         let (payout, fee, refund) = e
             .submit_panel_judgment(M2, 600_000, None, None, BOB)
@@ -30500,7 +31331,7 @@ mod arbiter_panel_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         s.fund(ALICE, T0).unwrap();
-        s.escalate(ALICE, T0 + 10, None).unwrap();
+        s.escalate(ALICE, T0 + 10, None, None, 0).unwrap();
         assert_eq!(
             s.submit_panel_judgment(ARBITER, 600_000, None, None, BOB),
             Err(EscrowError::InvalidArbiterPanel)
@@ -30538,7 +31369,7 @@ mod arbiter_panel_tests {
             .unwrap();
         e.confirm_default_judgment(BOB).unwrap();
         e.fund(ALICE, T0).unwrap();
-        e.escalate(ALICE, T0 + 10, None).unwrap();
+        e.escalate(ALICE, T0 + 10, None, None, 0).unwrap();
         // Before the deadline: not due.
         assert_eq!(
             e.trigger_default_judgment(ALICE, T0 + 11, None, BOB),
@@ -30577,7 +31408,7 @@ mod arbiter_panel_tests {
             .with_pause_authority(ARBITER)
             .unwrap();
         p.fund(ALICE, T0).unwrap();
-        p.escalate(ALICE, T0 + 10, None).unwrap();
+        p.escalate(ALICE, T0 + 10, None, None, 0).unwrap();
         p.pause(ARBITER).unwrap();
         assert_eq!(
             p.submit_panel_judgment(M1, 600_000, None, None, BOB),
@@ -30592,15 +31423,17 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3928);
-        // AV-90: the vesting-curve region (82 bytes) now trails the
+        assert_eq!(bytes.len(), 3970);
+        // AV-91: the evidence-commitment region (33-byte root + 1-byte
+        // leaf count + 8-byte disclosure bitmap = 42 bytes) now trails
+        // the AV-90 vesting-curve region (82 bytes), which trails the
         // AV-86 appeal region, which trails the AV-84 multisig
         // authority; before that, the AV-83 CPI allowlist region (258
         // bytes) trails the AV-82 slash region (41-byte terms + 8-byte
         // penalty counter), which trails the schema-version byte — so
-        // the panel region ends 82 + 26 + 68 + 258 + 49 + 1 bytes
+        // the panel region ends 42 + 82 + 26 + 68 + 258 + 49 + 1 bytes
         // before the end of the buffer.
-        let version_end = bytes.len() - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        let version_end = bytes.len() - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         // The panel region trails the AV-73 per-period amount table
         // (512 bytes), the AV-68 evidence-deadline region (41 bytes) and
         // the AV-66 fee-schedule region (81 bytes):
@@ -30653,9 +31486,9 @@ mod arbiter_panel_tests {
         assert_eq!(panel.1, "Option<ArbiterPanel>");
         assert_eq!(panel.2, 1 + ARBITER_PANEL_LEN);
         assert_eq!(panel.2, 595);
-        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86/AV-90:
+        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86/AV-90/AV-91:
         // every earlier field offset stays stable.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "fee_schedule");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "fee_schedule");
     }
 
     #[test]
@@ -30671,27 +31504,36 @@ mod arbiter_panel_tests {
         // AV-68 appended two fields after it, AV-73 one more, AV-75
         // the schema byte, AV-82 the slash region, AV-83 the CPI
         // allowlist, AV-84 the multisig authority, AV-86 the appeal
-        // window region, AV-90 the vesting curve: vesting_curve is the
-        // new tail.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "evidence_deadline_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "escalated_by");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "subscription_amounts");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "schema_version");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "slash_terms");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "penalty_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 1 + CPI_ALLOWLIST_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 1 + MULTISIG_AUTHORITY_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "appeal_window_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "appeal_deadline");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "appeal_state");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "appeal_ballot");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, APPEAL_BALLOT_LEN);
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "vesting_curve");
-        assert_eq!(VAULT_FIELDS.last().unwrap().1, "Option<VestingCurve>");
-        assert_eq!(VAULT_FIELDS.last().unwrap().2, 1 + VESTING_CURVE_LEN);
-        assert_eq!(VAULT_FIELDS.last().unwrap().2, 82);
+        // window region, AV-90 the vesting curve, AV-91 the
+        // evidence-commitment region: evidence_disclosed is the new
+        // tail.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "evidence_deadline_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "escalated_by");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "subscription_amounts");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "schema_version");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "slash_terms");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "penalty_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, 1 + CPI_ALLOWLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].2, 1 + MULTISIG_AUTHORITY_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "appeal_window_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "appeal_deadline");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "appeal_state");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "appeal_ballot");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, APPEAL_BALLOT_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "vesting_curve");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].1, "Option<VestingCurve>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 1 + VESTING_CURVE_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 82);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "evidence_root");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].1, "Option<[u8; 32]>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, 33);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "evidence_leaves");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 1);
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "evidence_disclosed");
+        assert_eq!(VAULT_FIELDS.last().unwrap().1, "u64");
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, 8);
     }
 
     #[test]
@@ -30701,7 +31543,7 @@ mod arbiter_panel_tests {
             .with_arbiter_panel(&[M1, M2, M3], 2)
             .unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(ALICE, T0 + 10, None).unwrap();
+        e.escalate(ALICE, T0 + 10, None, None, 0).unwrap();
         e.drain_events();
         // Vote 1: PanelJudgment only (from == to == Disputed).
         assert_eq!(
@@ -30951,7 +31793,7 @@ mod split_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         disputed.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        disputed.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        disputed.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(
             disputed.split_escrow(ALICE, BOB, &[1_000_000], SplitConfig::default(), EXPIRES_AT),
             Err(EscrowError::InvalidStateTransition)
@@ -30978,7 +31820,7 @@ mod split_tests {
                         .with_arbiter(ARBITER)
                         .unwrap();
                     d.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-                    d.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+                    d.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
                     d.resolve(ARBITER, 0, None, None, BOB).unwrap();
                     e = d;
                 }
@@ -31230,7 +32072,7 @@ mod split_tests {
             .unwrap();
         assert_eq!(e.state(), EscrowState::Split);
         assert_eq!(EscrowState::Split as u8, 8, "Split appended last");
-        assert_eq!(VAULT_SPACE, 3936, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3978, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -31401,7 +32243,7 @@ mod slash_tests {
             .with_slash_terms(PENALTY, DEADLINE)
             .unwrap();
         e.fund(ALICE, T0).unwrap();
-        e.escalate(ALICE, T0 + 1, None).unwrap();
+        e.escalate(ALICE, T0 + 1, None, None, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         let err = e.slash(ALICE, 100_000, None, DEADLINE).unwrap_err();
         assert_eq!(err, EscrowError::SlashNotEligible);
@@ -31542,7 +32384,7 @@ mod slash_tests {
         let e = slashable(1_000_000);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let base = ESCROW_BODY_LEN - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
+        let base = ESCROW_BODY_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
         assert_eq!(bytes[base], 3, "schema_version");
         assert_eq!(bytes[base + 1], 1, "slash_terms: Some");
         assert_eq!(&bytes[base + 2..base + 34], &PENALTY, "penalty account");
@@ -31964,7 +32806,7 @@ mod appeal_tests {
         e.review_appeal(M1, true).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3928);
+        assert_eq!(bytes.len(), 3970);
         // Appeal region: [3820..3846] — window (8), deadline (8), state
         // (1), ballot (9).
         assert_eq!(
@@ -32299,7 +33141,7 @@ mod cpi_allowlist_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3928);
+        assert_eq!(bytes.len(), 3970);
         assert_eq!(bytes[3495], 1, "Some discriminant");
         assert_eq!(&bytes[3496..3496 + 32], &DEX);
         assert_eq!(&bytes[3496 + 32..3496 + 64], &LENDING);
@@ -32310,12 +33152,13 @@ mod cpi_allowlist_tests {
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes[3495], 0, "None discriminant");
         assert_eq!(&bytes[3496..3496 + 257], &[0u8; 257]);
-        // The field name is the seventh-from-last VAULT_FIELDS entry
+        // The field name is the tenth-from-last VAULT_FIELDS entry
         // (AV-84 appended the multisig region after it, AV-86 the
         // 4-field appeal region after that, AV-90 the vesting curve
+        // after that, AV-91 the 3-field evidence-commitment region
         // after that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 1 + CPI_ALLOWLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, 1 + CPI_ALLOWLIST_LEN);
     }
 }
 
@@ -32495,7 +33338,7 @@ mod multisig_tests {
         let e = bound_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3928);
+        assert_eq!(bytes.len(), 3970);
         assert_eq!(bytes[3753], 1, "Some discriminant");
         assert_eq!(&bytes[3754..3754 + 32], &SQUADS_V4_PROGRAM_ID);
         assert_eq!(&bytes[3754 + 32..3754 + 64], &VAULT_PDA);
@@ -32509,11 +33352,12 @@ mod multisig_tests {
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes[3753], 0, "None discriminant");
         assert_eq!(&bytes[3754..3820], &[0u8; 66]);
-        // The field name is the sixth-from-last VAULT_FIELDS entry
+        // The field name is the ninth-from-last VAULT_FIELDS entry
         // (AV-86 appended the 4-field appeal region after it, AV-90
-        // the vesting-curve region after that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 1 + MULTISIG_AUTHORITY_LEN);
+        // the vesting-curve region after that, AV-91 the 3-field
+        // evidence-commitment region after that).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].2, 1 + MULTISIG_AUTHORITY_LEN);
         assert_eq!(MULTISIG_AUTHORITY_LEN, 66);
     }
 

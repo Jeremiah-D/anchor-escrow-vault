@@ -68,7 +68,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_arbiter(arbiter)`               | `Uninitialized`| `Uninitialized` | initializer (once, before funding; zero key rejected; mutually exclusive with `initialize_arbiter_panel` — last-wins in both directions) |
 | `initialize_slash_terms(penalty_account, slash_deadline)` (AV-82) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; the zero penalty account is rejected — the penalty sink must be a real identity, `SlashNotEligible` code 143) |
 | `initialize_arbiter_panel(members, threshold)` (AV-65) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opt-in multisig arbitration: 1–8 member keys, threshold 1..=N, zero/duplicate keys rejected as `InvalidArbiterPanel`, code 136; mutually exclusive with the single arbiter — last-wins in both directions; `rotate_arbiter` is `InvalidStateTransition` in panel mode) |
-| `escalate(authority, now, evidence_hash)`   | `Funded`       | `Disputed` | initializer **or** taker, only when `now < expires_at` (locks `release`/`cancel`/`cancel_expired`/`claim`); `evidence_hash` is the optional 32-byte off-chain-evidence commitment, persisted |
+| `escalate(authority, now, evidence_hash, evidence_root, evidence_leaves)` (AV-91) | `Funded`       | `Disputed` | initializer **or** taker, only when `now < expires_at` (locks `release`/`cancel`/`cancel_expired`/`claim`); `evidence_hash` is the optional 32-byte off-chain-evidence commitment, persisted; `evidence_root` is the optional SHA-256 Merkle root over the evidence-document set and `evidence_leaves` the committed leaf count (`0` iff the root is `None`, `1..=64` iff `Some` — `InvalidEvidenceProof`, code 148, on a count that does not describe the root); the root/leaves/zeroed disclosure bitmap are persisted and never cleared |
 | `resolve(authority, taker_amount, rationale_hash)` | `Disputed`     | `Settled` | arbiter only; atomic split of the remainder (taker payout / initializer refund); `rationale_hash` is the optional 32-byte commitment to the arbiter's off-chain rationale document, persisted in `Settled` (never cleared); **disabled in panel mode** (`PanelResolveDisabled`, code 137 — the panel's multisig judgment is the only settlement path once a panel is configured) |
 | `submit_panel_judgment(member, taker_amount, rationale_hash)` (AV-65) | `Disputed` | `Disputed` (vote recorded) / `Settled` (M matching votes) | panel member only (`Unauthorized` for a stranger); one effective vote per member — a re-vote overwrites the earlier vote (the `PanelJudgment` event keeps the audit trail); the first M votes agreeing on the same `(taker_amount, rationale_hash)` pair settle the escrow automatically (`Settled`, settlement identical to `resolve` — fee slices the taker's share, gross lands in the `released` counter, the initializer is refunded the remainder); non-matching votes stay recorded for audit; the settling vote emits `PanelResolved` after its `PanelJudgment`; `InvalidArbiterPanel` (code 136) with no panel configured |
 | `initialize_default_judgment(deadline_secs, default_taker_amount)` (AV-55) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — and only after `initialize_arbiter`; the arbiter must be configured first); declares the fallback split applied when the arbiter never resolves: `deadline_secs` seconds in `Disputed` before the judgment becomes triggerable (must be non-zero — `DefaultJudgmentNotDue` otherwise), `default_taker_amount` the taker's share of the remainder (must be ≤ the locked amount — `ReleaseExceedsLocked` otherwise); the initializer proposes the terms, the taker must still countersign (dual-signed agreement) |
@@ -76,6 +76,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `trigger_default_judgment(caller, now, payout_to)` (AV-55) | `Disputed` | `Settled` | **initializer or taker** (either party — a liveness backstop, not a power grant); only once `now >= disputed_at + deadline_secs` (the judgment's due time, `DefaultJudgmentNotDue` otherwise); settles on the pre-agreed split — fee slices the taker's share like `resolve`, quorum/vesting/timelock do *not* gate (same as `resolve`); the arbiter's `resolve` is unchanged and keeps priority — after the deadline either the arbiter resolves or a party triggers, first writer wins; in AV-65 panel mode the default judgment stays available (same deadline rules) and races the panel's M-vote settlement instead; emits `DefaultJudgment` |
 | `initialize_evidence_deadline(deadline_secs)` (AV-68) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — and only after the arbiter/panel is configured, `InvalidArbiter` otherwise); declares the window the escalating party gets to disclose the dispute evidence, measured from `disputed_at`; must be non-zero (`InvalidEvidenceDeadline`, code 138, otherwise) |
 | `submit_evidence(authority, evidence_hash, now)` (AV-68) | `Disputed` | `Disputed` (commitment recorded) | **escalating party only** (the party `escalate` recorded — a stranger or the counterparty is `Unauthorized`); overwrites any previously attached hash (a within-deadline submission may always refine the bundle); at or past the disclosure deadline the submission is rejected (`EvidenceDisclosureLate`, code 139) — the deadline is a hard bar, so a missed deadline locks in the judgment-time adverse inference; with no deadline configured disclosure is accepted at any time while `Disputed`; emits `EvidenceSubmitted` |
+| `file_evidence(authority, doc_hash, leaf_index, proof, now)` (AV-91) | `Disputed` | `Disputed` (bitmap bit flipped) | **escalating party only** (mirrors `submit_evidence`); discloses one document against the committed Merkle root — `proof` must carry exactly the siblings the tree shape demands (leaf = `H(0x00 \|\| doc)`, node = `H(0x01 \|\| left \|\| right)`, odd-layer last node promotes unchanged); `InvalidEvidenceProof` (code 148) on no committed root, a past-end leaf index, a wrong-length proof, or a non-verifying proof; the AV-68 deadline bar applies (`EvidenceDisclosureLate` past the window); re-filing is an idempotent no-op; emits `EvidenceFiled` |
 | `update_panel_threshold(initializer, taker, new_threshold)` (AV-69) | `Uninitialized` | `Uninitialized` | **dual-signed** — the initializer AND the taker must both sign (one party alone, or a stranger pair, is `Unauthorized`); retunes the arbiter panel's M-of-N judgment threshold, 1 ≤ M ≤ N (`InvalidArbiterPanel`, code 136, for 0, above N, or no panel configured); a panel must be configured — there is no threshold to retune on a single-arbiter escrow; `Uninitialized` only — the threshold must be settled before the dispute starts, so an in-flight arbitration tallies under stable rules; the retune rewrites only the threshold — cast votes and the `voted` bitmask survive, counting continues under the new M; retuning to the current threshold is an idempotent no-op; emits `PanelThresholdChanged` only on an actual change |
 | `initialize_subscription(period_secs, periods, per_period)` (AV-56) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — mutually exclusive with `initialize_milestones`; declares the periodic release schedule, back-scheduled from `expires_at`: period `i` is due at `expires_at - (periods-1-i) * period_secs`; validation — `period_secs` non-zero, `periods` in 1..=64, `per_period` non-zero, `periods * per_period` == locked amount (in u128), `expires_at != u64::MAX`, and the schedule must fit the lifetime — is `InvalidSubscription` otherwise) |
 | `release_period(period_index)` (AV-56) | `Funded` | `Funded` (partial) / `Released` (last period) | initializer only (the initializer's push path); strictly in-order (`period_index` must equal the next due period — skip-ahead and replay are `PeriodNotDue`) and due-date gated (`now >= due_at(period_index)` — `PeriodNotDue` otherwise); quorum satisfied when configured (`QuorumNotReached`), the timelock gate when a lock is configured (`now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64); `TimelockNotReached` — the timelock gates every taker payout path); `MintMismatch` / `PayoutNotAllowlisted` guard the fund movement like `release`; the protocol fee slices the period (`payout + fee == per_period`); vesting claim composes (not blocked); emits `SubscriptionPeriodReleased` |
@@ -548,6 +549,43 @@ account never needs a realloc. The schema revision bumps to 2, and the
 `migrate_schema` gate becomes a catch-up gate (`schema_version <
 SCHEMA_VERSION`) so a v0 vault is never stranded by the intermediate
 v1 revision.
+
+**Dispute-evidence Merkle commitment (AV-91).** The AV-22 single
+`evidence_hash` covers one document; real disputes rest on many. AV-91
+lets the escalating party commit to the *whole* evidence set up front:
+`escalate` takes an optional `evidence_root` (SHA-256 Merkle root over
+the document set) plus `evidence_leaves` (`0` iff the root is `None`,
+`1..=64` iff `Some` — a count that does not describe the root is
+`InvalidEvidenceProof`, code 148). Documents are then disclosed one by
+one with `file_evidence(authority, doc_hash, leaf_index, proof, now)`:
+the escalating party reveals a document hash plus its Merkle inclusion
+proof, and the vault flips that leaf's bit in the disclosure bitmap.
+The proof shape is pinned — leaf = `H(0x00 || doc)`, inner node =
+`H(0x01 || left || right)` (domain separation against second-preimage
+attacks), the last node of an odd-width layer promotes unchanged — and
+a short, long, or non-verifying proof is `InvalidEvidenceProof`.
+Guards mirror `submit_evidence`: pause guard first, escalator-only
+authority (`Unauthorized` otherwise), `Disputed`-only, and the same
+AV-68 deadline bar (`EvidenceDisclosureLate` past the window).
+Re-filing a disclosed document is an idempotent no-op. The arbiter
+panel verifies disclosure *completeness* before judgment:
+`evidence_disclosure()` returns `(disclosed, total)`, and undisclosed
+documents are honestly deducted in the judgment weight — a party cannot
+win by committing to evidence it never shows. The root, leaf count and
+bitmap are never cleared, so a `Settled` escrow keeps the full audit
+trail. Indexer surface: the `EvidenceFiled` event (`from == to ==
+Disputed`, discriminant 46) carries the root on `Escalated` and every
+filing; the three settlement events stamp the `(disclosed, total)`
+progress; keeper `resolve` / `submit_panel_judgment` actions surface
+it for the arbiter dashboard; the snapshot exports `evidence_root`
+and `evidence_disclosure`. New vault fields (appended last):
+`evidence_root` (`Option<[u8; 32]>`, 33 bytes) + `evidence_leaves`
+(u8) + `evidence_disclosed` (u64, 8 bytes) — 42 bytes, so the full
+vault is now 3978 bytes / 28,577,760 lamports rent-exempt. Anchor
+surface: `escalate` gains the two params, plus the new
+`file_evidence` instruction (`doc_hash`, `leaf_index`,
+`proof: Vec<[u8; 32]>`) and the three `Vault` fields, all pinned in
+the generated IDL.
 
 **Migration chain, dry-run, atomic rollback (AV-85).** The catch-up is
 now an explicit N → M step chain: a v0 vault walks `0 → 1 → 2`, each
@@ -1518,7 +1556,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82), `CpiAllowlistUpdated` (AV-83), `AppealFiled` (AV-86), `AppealResolved` (AV-86), `EvidenceFiled` (AV-91) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -2087,7 +2125,10 @@ two-way consistency check against the IDL parameter table:
 | appeal_state | u8 (enum discriminant) | 1 |
 | appeal_ballot | AppealBallot | 9 |
 | vesting_curve | Option<VestingCurve> | 82 |
-| **total**     |                   | **3928** |
+| evidence_root | Option<[u8; 32]> | 33 |
+| evidence_leaves | u8 | 1 |
+| evidence_disclosed | u64 | 8 |
+| **total**     |                   | **3970** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2173,11 +2214,17 @@ flight) — and the 9-byte appeal ballot (AV-86: 1-byte vote count +
 8-byte tally bitmap, zeroed when no appeal is in flight) — and the
 82-byte vesting unlock-curve region (AV-90: 1-byte discriminant + 81-byte
 tier region — 1-byte tier count + eight fixed 10-byte timestamp/bps
-slots — zeroed when the escrow uses the plain AV-13 linear unlock).
-`escrow-state` exposes `VAULT_SPACE` (3936) and
-`VAULT_SPACE_NO_QUORUM` (3446) for the Anchor `space =` constraint, plus a
+slots — zeroed when the escrow uses the plain AV-13 linear unlock) —
+and the 33-byte dispute-evidence Merkle-root region (AV-91: 1-byte
+discriminant + 32-byte root, zeroed when no multi-doc evidence was
+committed) — and the 1-byte committed evidence leaf count (AV-91:
+zeroed when no root was committed) — and the 8-byte
+evidence-disclosure bitmap (AV-91: one bit per committed document,
+zeroed when the root is committed).
+`escrow-state` exposes `VAULT_SPACE` (3978) and
+`VAULT_SPACE_NO_QUORUM` (3488) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **28,285,440 lamports** to be
+mainnet rent parameters the full vault needs **28,577,760 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)

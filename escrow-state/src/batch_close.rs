@@ -490,7 +490,7 @@ mod batch_close_tests {
             .with_arbiter([0xA8; 32])
             .unwrap();
         e.fund(ALICE, NOW - 2).unwrap();
-        e.escalate(ALICE, NOW - 1, None).unwrap();
+        e.escalate(ALICE, NOW - 1, None, None, 0).unwrap();
         assert_eq!(e.inner().state(), EscrowState::Disputed);
         let mut vaults = vec![
             funded(1_000_000, FUTURE), // Funded: not terminal

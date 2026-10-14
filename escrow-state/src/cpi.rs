@@ -834,7 +834,7 @@ mod cpi_tests {
             .with_arbiter(arbiter)
             .unwrap();
         e.fund(init, FUND_AT).unwrap();
-        e.escalate(taker, 0, None).unwrap();
+        e.escalate(taker, 0, None, None, 0).unwrap();
         let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None, key(2)).unwrap();
         assert_eq!(fee, 0);
         assert_eq!(taker_payout + refund, 1_000_000);
@@ -871,7 +871,7 @@ mod cpi_tests {
             .with_protocol_fee(100)
             .unwrap();
         e.fund(init, FUND_AT).unwrap();
-        e.escalate(taker, 0, None).unwrap();
+        e.escalate(taker, 0, None, None, 0).unwrap();
         let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None, key(2)).unwrap();
         assert!(fee > 0);
         let addrs = ResolveAddrs {
@@ -935,7 +935,7 @@ mod cpi_tests {
             .with_fee_recipient(recipient)
             .unwrap();
         e.fund(init, FUND_AT).unwrap();
-        e.escalate(taker, 0, None).unwrap();
+        e.escalate(taker, 0, None, None, 0).unwrap();
         let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None, key(2)).unwrap();
         // 2% of 600_000 = 12_000 fee; the initializer is refunded the rest.
         assert_eq!((taker_payout, fee, refund), (588_000, 12_000, 400_000));

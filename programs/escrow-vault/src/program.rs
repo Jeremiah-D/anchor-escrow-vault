@@ -898,7 +898,19 @@ pub mod escrow_vault {
     /// AV-22: `evidence_hash` is the optional 32-byte commitment to the
     /// off-chain dispute evidence (e.g. the SHA-256 of an IPFS CID),
     /// persisted on the vault so the arbiter and indexers can read it.
-    pub fn escalate(ctx: Context<Escalate>, evidence_hash: Option<[u8; 32]>) -> Result<()> {
+    /// AV-91: `evidence_root` is the optional SHA-256 Merkle root over
+    /// the dispute-evidence document set (the multi-doc
+    /// alternative/supplement to `evidence_hash`), and
+    /// `evidence_leaves` is the committed leaf count (`0` when the
+    /// root is `None`, `1..=64` otherwise — `InvalidEvidenceProof` on
+    /// a count that does not describe the root). Both are persisted
+    /// and never cleared; the disclosure bitmap starts zeroed.
+    pub fn escalate(
+        ctx: Context<Escalate>,
+        evidence_hash: Option<[u8; 32]>,
+        evidence_root: Option<[u8; 32]>,
+        evidence_leaves: u8,
+    ) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
         let from = escrow.state() as u8;
@@ -907,12 +919,15 @@ pub mod escrow_vault {
                 ctx.accounts.authority.key().to_bytes(),
                 now,
                 evidence_hash,
+                evidence_root,
+                evidence_leaves,
             )
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // AV-18: `now` doubles as the event's `at`, mirroring
         // `IndexedEscrow::escalate`. AV-22: the Escalated event carries
-        // the attached evidence hash.
+        // the attached evidence hash. AV-91: it also carries the
+        // committed Merkle root (stamped from the vault).
         emit_transition(
             &ctx.accounts.vault,
             escrow_state::EscrowEventKind::Escalated,
@@ -923,6 +938,55 @@ pub mod escrow_vault {
             0,
             now,
             evidence_hash,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
+    /// Disclose one dispute-evidence document against the committed
+    /// Merkle root (AV-91; mirrors `Escrow::file_evidence`). The
+    /// escalating party reveals `doc_hash` at `leaf_index` together
+    /// with the Merkle inclusion `proof`; the vault flips that leaf's
+    /// bit in the disclosure bitmap. `now` comes from the clock sysvar
+    /// (the AV-68 disclosure deadline is measured against chain time).
+    /// Emits the `EvidenceFiled` indexer event carrying the committed
+    /// root. Re-filing a disclosed document is an idempotent no-op.
+    pub fn file_evidence(
+        ctx: Context<FileEvidence>,
+        doc_hash: [u8; 32],
+        leaf_index: u8,
+        proof: Vec<[u8; 32]>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        let proof_refs: Vec<[u8; 32]> = proof;
+        escrow
+            .file_evidence(
+                ctx.accounts.authority.key().to_bytes(),
+                doc_hash,
+                leaf_index,
+                &proof_refs,
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `now` doubles as the event's `at`, mirroring
+        // `IndexedEscrow::file_evidence`. The EvidenceFiled event
+        // carries the committed root (stamped from the vault).
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::EvidenceFiled,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
             None,
             None,
             None,
@@ -3379,6 +3443,29 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `multisig_authority`).
     pub vesting_curve: Option<VestingCurve>,
+    /// AV-91: the SHA-256 Merkle root over the dispute-evidence
+    /// document set committed at `escalate`; mirrors
+    /// `escrow_state`'s `evidence_root`. `None` when no multi-doc
+    /// evidence was committed (the plain AV-22 single-hash path).
+    /// Never cleared. The account always reserves the full 33-byte
+    /// region (1-byte discriminant + 32-byte root, zeroed when `None`)
+    /// so `escalate` writes it in place without reallocating. Layout
+    /// position matches `escrow_state::VAULT_FIELDS` (appended last,
+    /// after `vesting_curve`).
+    pub evidence_root: Option<[u8; 32]>,
+    /// AV-91: the leaf count the committed evidence Merkle tree was
+    /// built over; mirrors `escrow_state`'s `evidence_leaves` (`0`
+    /// when `evidence_root` is `None`, `1..=64` otherwise). Never
+    /// cleared. Layout position matches `escrow_state::VAULT_FIELDS`
+    /// (appended last, after `evidence_root`).
+    pub evidence_leaves: u8,
+    /// AV-91: the evidence-disclosure bitmap; mirrors
+    /// `escrow_state`'s `evidence_disclosed` — bit `i` flips once the
+    /// document at leaf index `i` is disclosed via `file_evidence`
+    /// with a valid Merkle inclusion proof. Never cleared. Layout
+    /// position matches `escrow_state::VAULT_FIELDS` (appended last,
+    /// after `evidence_leaves`).
+    pub evidence_disclosed: u64,
 }
 
 /// Skeleton mirror of `escrow_state::SlashTerms`: the opt-in
@@ -4378,6 +4465,22 @@ pub struct Escalate<'info> {
     pub clock: AccountInfo<'info>,
 }
 
+/// AV-91: accounts for `file_evidence` — same shape as `Escalate`:
+/// only the recorded escalator may file (the state machine enforces
+/// it), and the clock sysvar supplies `now` for the AV-68 disclosure
+/// deadline check.
+#[derive(Accounts)]
+pub struct FileEvidence<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The recorded escalating party; the state machine rejects anyone
+    /// else with `Unauthorized`, mirroring `SubmitEvidence`.
+    pub authority: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the disclosure-deadline
+    /// check (never an instruction param).
+    pub clock: AccountInfo<'info>,
+}
+
 #[derive(Accounts)]
 pub struct SubmitEvidence<'info> {
     #[account(mut)]
@@ -5327,6 +5430,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidVestingCurve => {
             error!(ErrorCode::InvalidVestingCurve)
         }
+        escrow_state::EscrowError::InvalidEvidenceProof => {
+            error!(ErrorCode::InvalidEvidenceProof)
+        }
     }
 }
 
@@ -5424,4 +5530,6 @@ pub enum ErrorCode {
     InvalidAppealWindow,
     #[msg("Invalid vesting unlock curve (AV-90): VestingCurve::stepped with an empty/oversized tier table, a tier outside [start, end], non-monotone timestamps or unlock fractions, bps above 10_000, or a final tier below full unlock; VestingCurve::exponential with zero/too many steps, a non-positive or overflowing growth ratio, or a window shorter than the step count; with_vesting_curve with a curve whose tier window does not match the schedule")]
     InvalidVestingCurve,
+    #[msg("Invalid dispute-evidence Merkle commitment or proof (AV-91): escalate with a leaf count that does not describe the root (None root with nonzero leaves, Some root with zero or more than 64 leaves); file_evidence with no committed root, a leaf index past the committed leaves, a proof whose length does not match the tree shape, or a proof that does not verify against the committed root")]
+    InvalidEvidenceProof,
 }

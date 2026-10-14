@@ -215,6 +215,11 @@ pub fn csv_to_events(csv: &str) -> Result<Vec<EscrowEvent>, CsvError> {
             // projection either — `None` on import, like the other
             // kind-specific extras.
             appeal_outcome: None,
+            // AV-91: the evidence Merkle root and disclosure progress
+            // are not carried by the CSV projection either — `None`
+            // on import, like the other kind-specific extras.
+            evidence_root: None,
+            evidence_disclosure: None,
         });
     }
     Ok(events)

@@ -805,6 +805,24 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(VESTING_CURVE_LEN)?;
         None
     };
+    // AV-91: the dispute-evidence Merkle commitment, always reserved
+    // like `vesting_curve`: the `None` discriminant followed by the
+    // zeroed root region, then the leaf count byte and the 8-byte
+    // disclosure bitmap. Structural decode only — the commitment
+    // invariants (leaf count describes the root) are enforced by
+    // `escalate`, not re-litigated here.
+    let evidence_root = if c.option_present("evidence_root")? {
+        let mut root = [0u8; 32];
+        for byte in root.iter_mut() {
+            *byte = c.u8()?;
+        }
+        Some(root)
+    } else {
+        c.skip(32)?;
+        None
+    };
+    let evidence_leaves = c.u8()?;
+    let evidence_disclosed = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -945,6 +963,12 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // decoded escrow prices `vested_amount` / `claim` exactly like
         // the live one.
         vesting_curve,
+        // AV-91: the evidence Merkle commitment rides the decode so a
+        // decoded escrow verifies `file_evidence` proofs exactly like
+        // the live one.
+        evidence_root,
+        evidence_leaves,
+        evidence_disclosed,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
@@ -1113,7 +1137,7 @@ mod discriminator_tests {
         e.activate(ALICE).unwrap();
         e.activate(BOB).unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.escalate(BOB, EXPIRES_AT - 1, Some([0xE0; 32])).unwrap();
+        e.escalate(BOB, EXPIRES_AT - 1, Some([0xE0; 32]), None, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         let decoded = decode_vault_account(&account_bytes(&e)).unwrap();
         assert_eq!(decoded, e);

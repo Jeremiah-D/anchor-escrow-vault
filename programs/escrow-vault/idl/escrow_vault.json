@@ -145,7 +145,19 @@
       "discriminator": [123, 99, 100, 10, 66, 238, 154, 23],
       "accounts": [],
       "args": [
-        {"name": "evidence_hash", "type": {"option": {"array": ["u8", 32]}}}
+        {"name": "evidence_hash", "type": {"option": {"array": ["u8", 32]}}},
+        {"name": "evidence_root", "type": {"option": {"array": ["u8", 32]}}},
+        {"name": "evidence_leaves", "type": "u8"}
+      ]
+    },
+    {
+      "name": "file_evidence",
+      "discriminator": [187, 167, 242, 252, 30, 124, 123, 199],
+      "accounts": [],
+      "args": [
+        {"name": "doc_hash", "type": {"array": ["u8", 32]}},
+        {"name": "leaf_index", "type": "u8"},
+        {"name": "proof", "type": {"vec": {"array": ["u8", 32]}}}
       ]
     },
     {
@@ -645,7 +657,10 @@
           {"name": "appeal_deadline", "type": "u64", "offset": 3836},
           {"name": "appeal_state", "type": "u8", "offset": 3844},
           {"name": "appeal_ballot", "type": {"defined": "AppealBallot"}, "offset": 3845},
-          {"name": "vesting_curve", "type": {"option": {"defined": "VestingCurve"}}, "offset": 3854}
+          {"name": "vesting_curve", "type": {"option": {"defined": "VestingCurve"}}, "offset": 3854},
+          {"name": "evidence_root", "type": {"option": {"array": ["u8", 32]}}, "offset": 3936},
+          {"name": "evidence_leaves", "type": "u8", "offset": 3969},
+          {"name": "evidence_disclosed", "type": "u64", "offset": 3970}
         ]
       }
     }
@@ -860,7 +875,8 @@
     {"code": 144, "name": "InvalidCpiAllowlist"},
     {"code": 145, "name": "InvalidMultisigAuthority"},
     {"code": 146, "name": "InvalidAppealWindow"},
-    {"code": 147, "name": "InvalidVestingCurve"}
+    {"code": 147, "name": "InvalidVestingCurve"},
+    {"code": 148, "name": "InvalidEvidenceProof"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

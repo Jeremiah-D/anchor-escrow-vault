@@ -359,6 +359,14 @@ pub struct KeeperAction {
     /// transaction) instead of signing directly — the PDA only signs
     /// once its threshold votes.
     pub multisig_authority: Option<MultisigAuthority>,
+    /// AV-91: dispute-evidence disclosure progress `(disclosed,
+    /// total)` — set on `resolve` and `submit_panel_judgment` actions
+    /// (the `Disputed` branch), `None` on every other kind. The
+    /// arbiter (or panel member) verifies disclosure completeness
+    /// before judgment: `disclosed < total` means the escalating party
+    /// is withholding committed evidence, and the judgment weight
+    /// must deduct the undisclosed documents honestly.
+    pub evidence_disclosure: Option<(u64, u8)>,
     /// Machine-readable reason: `"expired"`, `"vesting_unlocked"`,
     /// `"disputed"` (AV-38, `resolve` actions; AV-65,
     /// `submit_panel_judgment` actions), or
@@ -529,6 +537,21 @@ impl KeeperReport {
                 }
                 None => s.push_str("null"),
             }
+            // AV-91: dispute-evidence disclosure progress — `null`
+            // unless the action is a `resolve` / `submit_panel_judgment`
+            // on a dispute with a committed evidence root, so the
+            // arbiter dashboard reads completeness at a glance.
+            s.push_str(",\"evidence_disclosure\":");
+            match a.evidence_disclosure {
+                Some((disclosed, total)) => {
+                    s.push_str("{\"disclosed\":");
+                    s.push_str(&disclosed.to_string());
+                    s.push_str(",\"total\":");
+                    s.push_str(&total.to_string());
+                    s.push('}');
+                }
+                None => s.push_str("null"),
+            }
             // AV-88: the per-action CU passthrough — the heuristic
             // estimate for this keeper call, same cost model as the
             // execution plan.
@@ -595,6 +618,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                             reference: w.reference,
                             extension_count: e.extension_count(),
                             multisig_authority: e.multisig_authority,
+                            evidence_disclosure: e.evidence_disclosure(),
                             reason: "disputed",
                         });
                     }
@@ -621,6 +645,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         reference: w.reference,
                         extension_count: e.extension_count(),
                         multisig_authority: e.multisig_authority,
+                        evidence_disclosure: e.evidence_disclosure(),
                         reason: "disputed",
                     });
                 }
@@ -663,6 +688,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 reference: w.reference,
                 extension_count: e.extension_count(),
                 multisig_authority: e.multisig_authority,
+                evidence_disclosure: None,
                 reason: "expired",
             });
             // AV-48: the permissionless crank — the same expiry exit,
@@ -694,6 +720,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     reference: w.reference,
                     extension_count: e.extension_count(),
                     multisig_authority: e.multisig_authority,
+                    evidence_disclosure: None,
                     reason: "expired",
                 });
             }
@@ -727,6 +754,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 reference: w.reference,
                 extension_count: e.extension_count(),
                 multisig_authority: e.multisig_authority,
+                evidence_disclosure: None,
                 reason: "vesting_unlocked",
             });
         }
@@ -772,6 +800,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     reference: w.reference,
                     extension_count: e.extension_count(),
                     multisig_authority: e.multisig_authority,
+                    evidence_disclosure: None,
                     reason: "subscription_period_due",
                 });
             }
@@ -801,6 +830,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 reference: w.reference,
                 extension_count: e.extension_count(),
                 multisig_authority: e.multisig_authority,
+                evidence_disclosure: None,
                 reason: "slash_deadline_passed",
             });
             if let Some(arbiter) = e.arbiter() {
@@ -816,6 +846,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     reference: w.reference,
                     extension_count: e.extension_count(),
                     multisig_authority: e.multisig_authority,
+                    evidence_disclosure: None,
                     reason: "slash_deadline_passed",
                 });
             }
@@ -844,6 +875,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 reference: w.reference,
                 extension_count: e.extension_count(),
                 multisig_authority: e.multisig_authority,
+                evidence_disclosure: None,
                 reason: "appeal_window_open",
             });
         }
@@ -874,6 +906,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         reference: w.reference,
                         extension_count: e.extension_count(),
                         multisig_authority: e.multisig_authority,
+                        evidence_disclosure: None,
                         reason: "appeal_filed",
                     });
                 }
@@ -1832,7 +1865,7 @@ mod keeper_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, MID).unwrap();
-        e.escalate(ALICE, MID, None).unwrap();
+        e.escalate(ALICE, MID, None, None, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
@@ -1866,7 +1899,7 @@ mod keeper_tests {
             .with_arbiter([0xA8; 32])
             .unwrap();
         e.fund(ALICE, MID).unwrap();
-        e.escalate(BOB, MID, Some(EVIDENCE)).unwrap();
+        e.escalate(BOB, MID, Some(EVIDENCE), None, 0).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
         assert_eq!(report.actions.len(), 1);
@@ -1875,6 +1908,54 @@ mod keeper_tests {
             watched[0].escrow.evidence_hash(),
             Some(EVIDENCE),
             "keeper scan dropped the dispute evidence hash"
+        );
+    }
+
+    #[test]
+    fn disputed_resolve_action_surfaces_evidence_disclosure() {
+        // AV-91: the arbiter's `resolve` action carries the disclosure
+        // progress — the arbiter dashboard verifies completeness
+        // before judgment: (1, 2) means one committed document is
+        // still undisclosed and the judgment weight must deduct it.
+        let d0 = [0xD0; 32];
+        let d1 = [0xD1; 32];
+        let root = crate::merkle_node_hash(
+            &crate::merkle_leaf_hash(&d0),
+            &crate::merkle_leaf_hash(&d1),
+        );
+        let proof0 = [crate::merkle_leaf_hash(&d1)];
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_arbiter([0xA8; 32])
+            .unwrap();
+        e.fund(ALICE, MID).unwrap();
+        e.escalate(BOB, MID, None, Some(root), 2).unwrap();
+        e.file_evidence(BOB, d0, 0, &proof0, MID).unwrap();
+        let watched = [watch(ID1, e)];
+        let report = scan_keeper_actions(&watched, MID);
+        assert_eq!(report.actions.len(), 1);
+        let a = report.actions[0];
+        assert_eq!(a.kind, KeeperActionKind::Resolve);
+        assert_eq!(a.evidence_disclosure, Some((1, 2)));
+        // The JSON renders the progress for the arbiter dashboard.
+        let json = report.to_json();
+        assert!(
+            json.contains("\"evidence_disclosure\":{\"disclosed\":1,\"total\":2}"),
+            "{json}"
+        );
+        // No committed root: the field is null, not zeroed.
+        let mut e2 = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_arbiter([0xA8; 32])
+            .unwrap();
+        e2.fund(ALICE, MID).unwrap();
+        e2.escalate(BOB, MID, None, None, 0).unwrap();
+        let watched = [watch(ID1, e2)];
+        let report = scan_keeper_actions(&watched, MID);
+        assert_eq!(report.actions[0].evidence_disclosure, None);
+        assert!(
+            report.to_json().contains("\"evidence_disclosure\":null"),
+            "null when no root committed"
         );
     }
 
@@ -1891,7 +1972,7 @@ mod keeper_tests {
             .with_evidence_deadline(3_600)
             .unwrap();
         e.fund(ALICE, MID).unwrap();
-        e.escalate(BOB, MID, None).unwrap();
+        e.escalate(BOB, MID, None, None, 0).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
         assert_eq!(report.actions.len(), 1);
@@ -1942,6 +2023,7 @@ mod keeper_tests {
                 extension_count: 0,
                 // No multisig binding on the watched escrow.
                 multisig_authority: None,
+                evidence_disclosure: None,
                 reason: "expired",
             }
         );
@@ -1960,6 +2042,7 @@ mod keeper_tests {
                 reference: None,
                 extension_count: 0,
                 multisig_authority: None,
+                evidence_disclosure: None,
                 reason: "expired",
             }
         );
@@ -1977,7 +2060,7 @@ mod keeper_tests {
         // 3 accounts, 8 data bytes, 1 signer →
         // 10_000 + 3_000 + 3×250 + 8×8 = 13_814 each; total 27_628.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"estimated_cu\":13814}}]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}}]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -2002,7 +2085,7 @@ mod keeper_tests {
         // AV-88: claim with mint, no refund_to: 3 accounts, 8 data
         // bytes, 1 signer → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"estimated_cu\":17814}}]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"actions\":[{{\"escrow_id\":\"{}\",\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":17814}}]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),
@@ -2028,6 +2111,7 @@ mod keeper_tests {
             reference: None,
             extension_count: 0,
             multisig_authority: None,
+            evidence_disclosure: None,
             reason: "expired",
         };
         assert_eq!(a.estimated_compute_units(), 13_814);
@@ -2340,7 +2424,7 @@ mod close_keeper_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, MID).unwrap();
-        e.escalate(ALICE, MID, None).unwrap();
+        e.escalate(ALICE, MID, None, None, 0).unwrap();
         e.resolve(ARBITER, 400_000, None, None, BOB).unwrap();
         assert_eq!(e.state(), EscrowState::Settled);
         e
@@ -2359,7 +2443,7 @@ mod close_keeper_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, MID).unwrap();
-        e.escalate(ALICE, MID, None).unwrap();
+        e.escalate(ALICE, MID, None, None, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         e
     }
@@ -4420,7 +4504,7 @@ mod stale_sweep_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(initializer, NOW).unwrap();
-        e.escalate(initializer, NOW, None).unwrap();
+        e.escalate(initializer, NOW, None, None, 0).unwrap();
         e.resolve(ARBITER, 400_000, None, None, BOB).unwrap();
         assert_eq!(e.state(), EscrowState::Settled);
         e
@@ -4512,7 +4596,7 @@ mod stale_sweep_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         d.fund(ALICE, NOW).unwrap();
-        d.escalate(ALICE, NOW, None).unwrap();
+        d.escalate(ALICE, NOW, None, None, 0).unwrap();
         assert_eq!(d.state(), EscrowState::Disputed);
         // Closed: the rent is already reclaimed.
         let mut c = cancelled(ALICE, EXPIRED);

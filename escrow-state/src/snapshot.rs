@@ -347,6 +347,15 @@ pub struct EscrowSnapshot {
     /// Dispute evidence commitment attached at `escalate`, or `None`
     /// when no evidence was supplied (AV-22).
     pub evidence_hash: Option<[u8; 32]>,
+    /// Dispute-evidence Merkle root committed at `escalate`, or `None`
+    /// when no multi-doc evidence was committed (AV-91 — the
+    /// multi-doc alternative/supplement to `evidence_hash`).
+    pub evidence_root: Option<[u8; 32]>,
+    /// The committed evidence leaf count (`0` when `evidence_root` is
+    /// `None`), and the number of documents disclosed via
+    /// `file_evidence` — `(disclosed, total)`, or `None` when no root
+    /// was committed (AV-91).
+    pub evidence_disclosure: Option<(u64, u8)>,
     /// Dispute-evidence disclosure deadline in seconds, or `0` when no
     /// deadline was configured (AV-68 — see
     /// [`Escrow::with_evidence_deadline`]).
@@ -611,6 +620,12 @@ impl Escrow {
             subscription,
             skipped: self.skipped_amount(),
             evidence_hash: self.evidence_hash(),
+            // AV-91: the evidence Merkle commitment and the disclosure
+            // progress ride the export, so an off-chain indexer (or
+            // the arbiter panel) reads disclosure completeness from
+            // one snapshot.
+            evidence_root: self.evidence_root(),
+            evidence_disclosure: self.evidence_disclosure(),
             // AV-68: the disclosure deadline and the escalating party
             // ride the export, so an off-chain indexer can compute the
             // disclosure status (pending / defaulted) from one
@@ -962,6 +977,23 @@ impl EscrowSnapshot {
         s.push_str(&format_amount(self.skipped, self.decimals));
         s.push_str("\",\"evidence_hash\":");
         write_opt_hex(&mut s, self.evidence_hash);
+        // AV-91: the evidence Merkle root (`null` when no multi-doc
+        // evidence was committed) and the disclosure progress
+        // (`{"disclosed":n,"total":m}` or `null`) — the arbiter panel
+        // reads disclosure completeness from the snapshot.
+        s.push_str(",\"evidence_root\":");
+        write_opt_hex(&mut s, self.evidence_root);
+        s.push_str(",\"evidence_disclosure\":");
+        match self.evidence_disclosure {
+            Some((disclosed, total)) => {
+                s.push_str("{\"disclosed\":");
+                s.push_str(&disclosed.to_string());
+                s.push_str(",\"total\":");
+                s.push_str(&total.to_string());
+                s.push('}');
+            }
+            None => s.push_str("null"),
+        }
         // AV-68: the disclosure deadline (seconds; 0 = none configured)
         // and the escalating party (`null` when never disputed) — an
         // off-chain indexer derives the disclosure status from these.
@@ -1208,7 +1240,7 @@ mod snapshot_tests {
              \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
-             \"evidence_hash\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
+             \"evidence_hash\":null,\"evidence_root\":null,\"evidence_disclosure\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
              \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\"cpi_allowlist\":null,\"multisig_authority\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
@@ -1397,7 +1429,7 @@ mod snapshot_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, VEST_START).unwrap();
-        e.escalate(BOB, MID, Some(EVIDENCE)).unwrap();
+        e.escalate(BOB, MID, Some(EVIDENCE), None, 0).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.state, "disputed");
         assert_eq!(snap.arbiter, Some(ARBITER));
@@ -1419,7 +1451,7 @@ mod snapshot_tests {
             .with_evidence_deadline(3_600)
             .unwrap();
         e.fund(ALICE, VEST_START).unwrap();
-        e.escalate(BOB, MID, None).unwrap();
+        e.escalate(BOB, MID, None, None, 0).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.evidence_deadline_secs, 3_600);
         assert_eq!(snap.escalated_by, Some(BOB));
@@ -1432,7 +1464,7 @@ mod snapshot_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         plain.fund(ALICE, VEST_START).unwrap();
-        plain.escalate(ALICE, MID, None).unwrap();
+        plain.escalate(ALICE, MID, None, None, 0).unwrap();
         let plain_snap = plain.snapshot(MID);
         assert_eq!(plain_snap.evidence_deadline_secs, 0);
         assert_eq!(plain_snap.escalated_by, Some(ALICE));
@@ -1453,7 +1485,7 @@ mod snapshot_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, VEST_START).unwrap();
-        e.escalate(BOB, MID, None).unwrap();
+        e.escalate(BOB, MID, None, None, 0).unwrap();
         assert_eq!(e.snapshot(MID).rationale_hash, None);
         e.resolve(ARBITER, 400_000, None, Some(RATIONALE), BOB).unwrap();
         let snap = e.snapshot(MID);

@@ -416,6 +416,8 @@ mod execution_plan_tests {
             extension_count: 0,
             // AV-84: test actions carry no multisig binding.
             multisig_authority: None,
+            // AV-91: test actions carry no evidence disclosure.
+            evidence_disclosure: None,
             reason: "test",
         }
     }

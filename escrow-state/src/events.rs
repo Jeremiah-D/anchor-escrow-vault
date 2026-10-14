@@ -574,6 +574,16 @@ pub enum EscrowEventKind {
     /// whose vote was the M-th match. Always emitted on resolution: a
     /// non-resolving vote emits nothing (the ballot is still open).
     AppealResolved,
+    /// AV-91: one dispute-evidence document was disclosed against the
+    /// committed Merkle root ([`Escrow::file_evidence`]). `from == to
+    /// == Disputed` (a disclosure, not a lifecycle move — like
+    /// [`EscrowEventKind::QuorumUpdated`]); the committed root rides
+    /// the event's `evidence_root` field and the disclosure progress
+    /// is read from the vault, so indexers track per-document
+    /// disclosure without replaying the bitmap. Re-filing an
+    /// already-disclosed document is an idempotent no-op that emits
+    /// nothing.
+    EvidenceFiled,
 }
 
 impl EscrowEventKind {
@@ -675,6 +685,9 @@ impl EscrowEventKind {
             // AV-86: appended after AppealFiled so discriminants 0–44
             // stay stable for already-serialized histories.
             45 => Self::AppealResolved,
+            // AV-91: appended after AppealResolved so discriminants
+            // 0–45 stay stable for already-serialized histories.
+            46 => Self::EvidenceFiled,
             _ => return None,
         })
     }
@@ -729,6 +742,7 @@ impl EscrowEventKind {
             Self::CpiAllowlistUpdated => "cpi_allowlist_updated",
             Self::AppealFiled => "appeal_filed",
             Self::AppealResolved => "appeal_resolved",
+            Self::EvidenceFiled => "evidence_filed",
         }
     }
 
@@ -784,6 +798,7 @@ impl EscrowEventKind {
             "cpi_allowlist_updated" => Self::CpiAllowlistUpdated,
             "appeal_filed" => Self::AppealFiled,
             "appeal_resolved" => Self::AppealResolved,
+            "evidence_filed" => Self::EvidenceFiled,
             _ => return None,
         })
     }
@@ -1075,6 +1090,26 @@ pub struct EscrowEvent {
     /// the M-th vote settled, and indexers read the outcome without
     /// replaying the ballot.
     pub appeal_outcome: Option<AppealOutcome>,
+    /// AV-91: the committed dispute-evidence Merkle root
+    /// ([`crate::Escrow::evidence_root`]), carried by
+    /// [`EscrowEventKind::Escalated`] and
+    /// [`EscrowEventKind::EvidenceFiled`] (`None` on every other kind —
+    /// like `rationale_hash`, which rides only `Resolved`). Read from
+    /// the escrow at emit time (never a `push_event` parameter), so the
+    /// log always agrees with the account.
+    pub evidence_root: Option<[u8; 32]>,
+    /// AV-91: disclosure progress `(disclosed, total)` — the
+    /// ([`crate::Escrow::evidence_disclosure`]) count of evidence
+    /// documents disclosed with valid Merkle proofs and the committed
+    /// leaf count — stamped on the settlement kinds (`Resolved`,
+    /// `DefaultJudgment`, `PanelResolved`), read from the escrow at
+    /// emit time (never a `push_event` parameter), like
+    /// `evidence_defaulted`. The arbiter panel verifies disclosure
+    /// completeness before judgment: undisclosed documents are
+    /// honestly deducted in the judgment weight, and the settlement
+    /// event carries the tamper-proof record. `None` on every other
+    /// kind, and on settlements with no committed root.
+    pub evidence_disclosure: Option<(u64, u8)>,
 }
 
 /// One split child on an [`EscrowEventKind::EscrowSplit`] event's
@@ -1271,6 +1306,34 @@ impl IndexedEscrow {
             // AV-86: stamped by the AppealResolved emitter after the
             // push — never a push_event parameter (see above).
             appeal_outcome: None,
+            // AV-91: the committed evidence Merkle root rides the
+            // Escalated and EvidenceFiled events — read from the
+            // escrow at emit time (never a push_event parameter), so
+            // the log always agrees with the account.
+            evidence_root: if matches!(
+                kind,
+                EscrowEventKind::Escalated | EscrowEventKind::EvidenceFiled
+            ) {
+                self.inner.evidence_root()
+            } else {
+                None
+            },
+            // AV-91: disclosure progress (disclosed, total) rides the
+            // settlement kinds — read from the escrow at emit time
+            // (never a push_event parameter), like evidence_defaulted:
+            // the arbiter panel verifies disclosure completeness
+            // before judgment, and the settlement event carries the
+            // tamper-proof record for the judgment-weight audit.
+            evidence_disclosure: if matches!(
+                kind,
+                EscrowEventKind::Resolved
+                    | EscrowEventKind::DefaultJudgment
+                    | EscrowEventKind::PanelResolved
+            ) {
+                self.inner.evidence_disclosure()
+            } else {
+                None
+            },
         };
         self.next_seq += 1;
         self.events.push(event);
@@ -2374,15 +2437,19 @@ impl IndexedEscrow {
 
     /// Escalate the escrow into arbitration (mirrors [`Escrow::escalate`]).
     /// Emits `Escalated` (`Funded -> Disputed`) carrying the evidence
-    /// hash attached at escalation; `now` doubles as the event's `at`.
+    /// hash and the AV-91 evidence Merkle root attached at escalation;
+    /// `now` doubles as the event's `at`.
     pub fn escalate(
         &mut self,
         authority: [u8; 32],
         now: u64,
         evidence_hash: Option<[u8; 32]>,
+        evidence_root: Option<[u8; 32]>,
+        evidence_leaves: u8,
     ) -> Result<(), EscrowError> {
         let from = self.inner.state();
-        self.inner.escalate(authority, now, evidence_hash)?;
+        self.inner
+            .escalate(authority, now, evidence_hash, evidence_root, evidence_leaves)?;
         self.push_event(
             EscrowEventKind::Escalated,
             from,
@@ -2390,6 +2457,37 @@ impl IndexedEscrow {
             EventAmounts::none(),
             now,
             evidence_hash,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(())
+    }
+
+    /// Disclose one dispute-evidence document against the committed
+    /// Merkle root (mirrors [`Escrow::file_evidence`]). Emits
+    /// `EvidenceFiled` carrying the evidence root and the updated
+    /// disclosure progress, so indexers can track per-document
+    /// disclosure without replaying the bitmap.
+    pub fn file_evidence(
+        &mut self,
+        authority: [u8; 32],
+        doc_hash: [u8; 32],
+        leaf_index: u8,
+        proof: &[[u8; 32]],
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner
+            .file_evidence(authority, doc_hash, leaf_index, proof, now)?;
+        self.push_event(
+            EscrowEventKind::EvidenceFiled,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            now,
+            None,
             None,
             None,
             None,
@@ -3821,7 +3919,7 @@ mod event_tests {
     fn escalate_and_resolve_emit_with_split_amounts() {
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(BOB, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(BOB, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_event(
             &last(&e),
             EscrowEventKind::Escalated,
@@ -3856,7 +3954,7 @@ mod event_tests {
         const EVIDENCE: [u8; 32] = [0xE1; 32];
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(BOB, EXPIRES_AT - 1, Some(EVIDENCE)).unwrap();
+        e.escalate(BOB, EXPIRES_AT - 1, Some(EVIDENCE), None, 0).unwrap();
         let event = last(&e);
         assert_eq!(event.kind, EscrowEventKind::Escalated);
         assert_eq!(event.evidence_hash, Some(EVIDENCE));
@@ -3864,7 +3962,7 @@ mod event_tests {
         // invents evidence.
         let mut e2 = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e2.fund(ALICE, T0 + 1).unwrap();
-        e2.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e2.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         assert_eq!(last(&e2).evidence_hash, None);
     }
 
@@ -3877,7 +3975,7 @@ mod event_tests {
         const EVIDENCE: [u8; 32] = [0xE1; 32];
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE)).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE), None, 0).unwrap();
         e.resolve(ARBITER, 600_000, None, None, BOB, T0 + 3).unwrap();
         let event = last(&e);
         assert_eq!(event.kind, EscrowEventKind::Resolved);
@@ -3906,7 +4004,7 @@ mod event_tests {
             .with_evidence_deadline(EVIDENCE_DEADLINE)
             .unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(escalator, at, None).unwrap();
+        e.escalate(escalator, at, None, None, 0).unwrap();
         e
     }
 
@@ -3968,10 +4066,70 @@ mod event_tests {
         // signal — even settling "late".
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(BOB, T0 + 10, None).unwrap();
+        e.escalate(BOB, T0 + 10, None, None, 0).unwrap();
         e.resolve(ARBITER, 600_000, None, None, BOB, u64::MAX - 1)
             .unwrap();
         assert!(!last(&e).evidence_defaulted);
+    }
+
+    #[test]
+    fn evidence_filed_event_carries_root_and_settlement_carries_disclosure() {
+        // AV-91: the Escalated event carries the committed Merkle
+        // root, each EvidenceFiled carries it again, and the Resolved
+        // settlement stamps the disclosure progress — the arbiter
+        // panel audits completeness from the log.
+        let d0 = [0xD0; 32];
+        let d1 = [0xD1; 32];
+        let root = crate::merkle_node_hash(
+            &crate::merkle_leaf_hash(&d0),
+            &crate::merkle_leaf_hash(&d1),
+        );
+        let proof0 = [crate::merkle_leaf_hash(&d1)];
+        let proof1 = [crate::merkle_leaf_hash(&d0)];
+        let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.escalate(BOB, T0 + 10, None, Some(root), 2).unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::Escalated);
+        assert_eq!(event.evidence_root, Some(root));
+        assert_eq!(event.evidence_disclosure, None, "not a settlement kind");
+        e.file_evidence(BOB, d0, 0, &proof0, T0 + 11).unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::EvidenceFiled);
+        assert_eq!(event.from, EscrowState::Disputed);
+        assert_eq!(event.to, EscrowState::Disputed);
+        assert_eq!(event.evidence_root, Some(root));
+        e.file_evidence(BOB, d1, 1, &proof1, T0 + 12).unwrap();
+        assert_eq!(last(&e).kind, EscrowEventKind::EvidenceFiled);
+        // Full disclosure before judgment: the settlement stamps
+        // (2, 2).
+        e.resolve(ARBITER, 600_000, None, None, BOB, T0 + 13).unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::Resolved);
+        assert_eq!(event.evidence_disclosure, Some((2, 2)));
+        assert_eq!(event.evidence_root, None, "root rides Escalated/EvidenceFiled only");
+    }
+
+    #[test]
+    fn partial_disclosure_is_visible_on_the_settlement_event() {
+        // AV-91: when the escalating party withholds a committed
+        // document, the settlement event honestly records (1, 2) —
+        // the judgment weight must deduct the undisclosed document.
+        let d0 = [0xD0; 32];
+        let d1 = [0xD1; 32];
+        let root = crate::merkle_node_hash(
+            &crate::merkle_leaf_hash(&d0),
+            &crate::merkle_leaf_hash(&d1),
+        );
+        let proof0 = [crate::merkle_leaf_hash(&d1)];
+        let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.escalate(BOB, T0 + 10, None, Some(root), 2).unwrap();
+        e.file_evidence(BOB, d0, 0, &proof0, T0 + 11).unwrap();
+        e.resolve(ARBITER, 600_000, None, None, BOB, T0 + 12).unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::Resolved);
+        assert_eq!(event.evidence_disclosure, Some((1, 2)));
     }
 
     #[test]
@@ -3988,7 +4146,7 @@ mod event_tests {
             .confirm_default_judgment(BOB)
             .unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(ALICE, T0 + 10, None).unwrap();
+        e.escalate(ALICE, T0 + 10, None, None, 0).unwrap();
         let trigger_at = T0 + 10 + 7_200;
         e.trigger_default_judgment(BOB, trigger_at, None, BOB, trigger_at)
             .unwrap();
@@ -4008,7 +4166,7 @@ mod event_tests {
             .with_evidence_deadline(EVIDENCE_DEADLINE)
             .unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(BOB, T0 + 10, None).unwrap();
+        e.escalate(BOB, T0 + 10, None, None, 0).unwrap();
         let settled_at = T0 + 10 + EVIDENCE_DEADLINE + 1;
         e.submit_panel_judgment(M1, 600_000, None, None, BOB, settled_at)
             .unwrap();
@@ -4053,7 +4211,7 @@ mod event_tests {
         const EVIDENCE: [u8; 32] = [0xE1; 32];
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE)).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE), None, 0).unwrap();
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE), BOB, T0 + 3)
             .unwrap();
         let event = last(&e);
@@ -4067,7 +4225,7 @@ mod event_tests {
 
         let mut e2 = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e2.fund(ALICE, T0 + 1).unwrap();
-        e2.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e2.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         e2.resolve(ARBITER, 600_000, None, None, BOB, T0 + 3).unwrap();
         assert_eq!(last(&e2).rationale_hash, None);
         // Non-resolve events never carry a rationale hash.
@@ -4189,7 +4347,7 @@ mod event_tests {
         // Attest with no quorum configured.
         assert!(e.attest(ATTESTOR_1, T0 + 9).is_err());
         // Escalate with no arbiter configured.
-        assert!(e.escalate(ALICE, T0 + 9, None).is_err());
+        assert!(e.escalate(ALICE, T0 + 9, None, None, 0).is_err());
         // Resolve outside a dispute.
         assert!(e.resolve(ARBITER, 1, None, None, BOB, T0 + 9).is_err());
         // Milestone ops with no plan attached.
@@ -4379,7 +4537,7 @@ mod event_tests {
             .with_protocol_fee(1_000)
             .unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, BOB, T0 + 3).unwrap();
         // 1000 bps of 600_000 = 60_000; the refund is never fee'd.
         assert_eq!((payout, fee, refund), (540_000, 60_000, 400_000));
@@ -4471,7 +4629,7 @@ mod event_tests {
                     .with_arbiter(ARBITER)
                     .unwrap();
                 d.fund(ALICE, T0 + 1).unwrap();
-                d.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+                d.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
                 d.resolve(ARBITER, 0, None, None, BOB, T0 + 3).unwrap();
                 return d;
             }
@@ -4541,7 +4699,7 @@ mod event_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         d.fund(ALICE, T0 + 1).unwrap();
-        d.escalate(ALICE, EXPIRES_AT - 1, None).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
         let events_before = d.event_count();
         assert_eq!(
             d.close_vault(ALICE, T0 + 10),
@@ -4997,7 +5155,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(46), None);
+        assert_eq!(EscrowEventKind::from_discriminant(47), None);
     }
 
     #[test]
@@ -5013,7 +5171,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(46), None);
+        assert_eq!(EscrowEventKind::from_discriminant(47), None);
     }
 
     #[test]
@@ -5550,7 +5708,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(46), None);
+        assert_eq!(EscrowEventKind::from_discriminant(47), None);
     }
 
     #[test]
@@ -5565,7 +5723,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(46), None);
+        assert_eq!(EscrowEventKind::from_discriminant(47), None);
     }
 
     #[test]
@@ -5577,7 +5735,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(46), None);
+        assert_eq!(EscrowEventKind::from_discriminant(47), None);
     }
 
     #[test]
@@ -5589,7 +5747,19 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(46), None);
+        assert_eq!(EscrowEventKind::from_discriminant(47), None);
+    }
+
+    #[test]
+    fn evidence_filed_kind_round_trips() {
+        // AV-91: discriminant 46, appended after AppealResolved —
+        // 0–45 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::EvidenceFiled;
+        assert_eq!(kind.discriminant(), 46);
+        assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
+        assert_eq!(kind.name(), "evidence_filed");
+        assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
+        assert_eq!(EscrowEventKind::from_discriminant(47), None);
     }
 
     #[test]

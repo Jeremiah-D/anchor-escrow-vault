@@ -554,7 +554,7 @@ impl Runner {
                 s.refunded += (refund + penalty) as u128;
             }
             ValidOp::Escalate(who, evidence) => {
-                Self::expect_ok(s.escrow.escalate(who, now, evidence), "escalate", ctx, idx);
+                Self::expect_ok(s.escrow.escalate(who, now, evidence, None, 0), "escalate", ctx, idx);
             }
             ValidOp::Resolve(taker_amount) => {
                 let (payout, fee, refund) = Self::expect_ok(
