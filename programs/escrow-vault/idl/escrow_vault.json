@@ -110,6 +110,17 @@
       ]
     },
     {
+      "name": "initialize_vesting_curve",
+      "discriminator": [70, 255, 18, 39, 11, 76, 39, 76],
+      "accounts": [],
+      "args": [
+        {"name": "start", "type": "u64"},
+        {"name": "end", "type": "u64"},
+        {"name": "cliff", "type": "u64"},
+        {"name": "tiers", "type": {"vec": {"defined": "VestingTier"}}}
+      ]
+    },
+    {
       "name": "claim",
       "discriminator": [62, 198, 214, 193, 213, 159, 108, 210],
       "accounts": [],
@@ -633,7 +644,8 @@
           {"name": "appeal_window_secs", "type": "u64", "offset": 3828},
           {"name": "appeal_deadline", "type": "u64", "offset": 3836},
           {"name": "appeal_state", "type": "u8", "offset": 3844},
-          {"name": "appeal_ballot", "type": {"defined": "AppealBallot"}, "offset": 3845}
+          {"name": "appeal_ballot", "type": {"defined": "AppealBallot"}, "offset": 3845},
+          {"name": "vesting_curve", "type": {"option": {"defined": "VestingCurve"}}, "offset": 3854}
         ]
       }
     }
@@ -847,7 +859,8 @@
     {"code": 143, "name": "SlashNotEligible"},
     {"code": 144, "name": "InvalidCpiAllowlist"},
     {"code": 145, "name": "InvalidMultisigAuthority"},
-    {"code": 146, "name": "InvalidAppealWindow"}
+    {"code": 146, "name": "InvalidAppealWindow"},
+    {"code": 147, "name": "InvalidVestingCurve"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

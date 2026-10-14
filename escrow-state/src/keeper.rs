@@ -1710,6 +1710,36 @@ mod keeper_tests {
     }
 
     #[test]
+    fn vesting_curve_prices_the_keeper_claim_listing() {
+        // AV-90: the keeper's claim listing goes through
+        // `claimable_amount` -> `vested_amount`, so it inherits the
+        // non-linear curve — the listed amount is the curve's value,
+        // not the linear interpolation.
+        use crate::VestingCurve;
+        let curve =
+            VestingCurve::stepped(&[(MID, 2_500), (VEST_END, 10_000)], VEST_START, VEST_END)
+                .unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_vesting_curve(
+                VestingSchedule::new(VEST_START, VEST_END).unwrap(),
+                curve,
+            )
+            .unwrap();
+        e.fund(ALICE, MID).unwrap();
+        let watched = [watch(ID1, e)];
+        // Linear would list 500_000 at MID; the curve lists 250_000.
+        let report = scan_keeper_actions(&watched, MID);
+        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions[0].kind, KeeperActionKind::Claim);
+        assert_eq!(report.actions[0].amount, 250_000);
+        assert_eq!(report.actions[0].reason, "vesting_unlocked");
+        // Before the first tier nothing is listed.
+        let report = scan_keeper_actions(&watched, MID - 1);
+        assert!(report.is_empty(), "pre-tier: nothing vested, no claim");
+    }
+
+    #[test]
     fn vesting_before_cliff_lists_nothing() {
         // AV-51: the keeper's claim listing goes through
         // `claimable_amount` -> `vested_amount`, so it inherits the

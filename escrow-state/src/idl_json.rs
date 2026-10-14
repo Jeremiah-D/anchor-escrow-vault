@@ -172,6 +172,8 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "bool" => IdlType::Bool,
         "Option<QuorumPolicy>" => IdlType::Option(Box::new(IdlType::Named("QuorumPolicy"))),
         "Option<VestingSchedule>" => IdlType::Option(Box::new(IdlType::Named("VestingSchedule"))),
+        // AV-90: opt-in non-linear vesting unlock curve.
+        "Option<VestingCurve>" => IdlType::Option(Box::new(IdlType::Named("VestingCurve"))),
         "Option<Pubkey>" => IdlType::Option(Box::new(IdlType::PublicKey)),
         "Option<MilestonePlan>" => IdlType::Option(Box::new(IdlType::Named("MilestonePlan"))),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
@@ -217,6 +219,8 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         "Vec<u8>" => IdlType::Vec(Box::new(IdlType::U8)),
         // AV-66: the tiered fee schedule's tier ladder instruction arg.
         "Vec<FeeTier>" => IdlType::Vec(Box::new(IdlType::Named("FeeTier"))),
+        // AV-90: the non-linear vesting curve's tier table instruction arg.
+        "Vec<VestingTier>" => IdlType::Vec(Box::new(IdlType::Named("VestingTier"))),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         // AV-68: the dispute-evidence disclosure commitment
         // (non-optional — disclosure always carries a hash).
@@ -265,6 +269,23 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
             ("start", IdlType::U64),
             ("end", IdlType::U64),
             ("cliff_at", IdlType::U64),
+        ],
+        // VestingCurve { tiers: [(u64, u16); 8], count: u8 } (AV-90):
+        // the fixed tier slots serialize as a named VestingTier array
+        // (IDL has no tuple type), then the live tier-count byte.
+        "VestingCurve" => vec![
+            (
+                "tiers",
+                IdlType::Array(ArrayElem::Defined("VestingTier"), 8),
+            ),
+            ("count", IdlType::U8),
+        ],
+        // VestingTier { at: u64, unlocked_bps: u16 } (AV-90): one
+        // unlock tier — the cumulative unlocked basis points at the
+        // unlock timestamp.
+        "VestingTier" => vec![
+            ("at", IdlType::U64),
+            ("unlocked_bps", IdlType::U16),
         ],
         // MilestonePlan { amounts: [u64; 8], count: u8 }.
         "MilestonePlan" => vec![
@@ -729,6 +750,10 @@ fn named_type_sizes_pin_constants() {
     assert_eq!(size("QuorumPolicy"), QUORUM_POLICY_LEN);
     // AV-51: the cliff_at u64 joins start/end.
     assert_eq!(size("VestingSchedule"), 24);
+    // AV-90: 8 fixed (u64, u16) tier slots + the live tier-count byte.
+    assert_eq!(size("VestingTier"), 10);
+    assert_eq!(size("VestingCurve"), VESTING_CURVE_LEN);
+    assert_eq!(size("VestingCurve"), 81);
     assert_eq!(size("MilestonePlan"), MILESTONE_PLAN_LEN);
     assert_eq!(size("PayoutAllowlist"), PAYOUT_ALLOWLIST_LEN);
     // AV-83: eight 32-byte program ids + count byte.
@@ -832,7 +857,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 47, "error variant count drift");
+    assert_eq!(errors.len(), 48, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -869,6 +894,8 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::InvalidMultisigAuthority.code(), 145);
     // AV-86: appended, never renumbered.
     assert_eq!(EscrowError::InvalidAppealWindow.code(), 146);
+    // AV-90: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidVestingCurve.code(), 147);
 }
 
 #[test]

@@ -121,6 +121,17 @@ pub struct VestingSnapshot {
     pub end: u64,
 }
 
+/// One unlock tier of a non-linear vesting curve (AV-90): at Unix
+/// timestamp `at` the cumulative unlocked fraction reaches
+/// `unlocked_bps / 10_000`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VestingTierSnapshot {
+    /// Unix seconds: this tier's unlock timestamp.
+    pub at: u64,
+    /// Cumulative unlocked basis points at `at`.
+    pub unlocked_bps: u16,
+}
+
 /// One milestone tranche (AV-15): the tranche amount plus its
 /// confirmation and settlement bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +306,9 @@ pub struct EscrowSnapshot {
     pub quorum: Option<QuorumSnapshot>,
     /// Vesting schedule, or `None` when none is attached (AV-13).
     pub vesting: Option<VestingSnapshot>,
+    /// Non-linear unlock curve tiers, or `None` when the schedule
+    /// unlocks linearly (AV-90). Live tiers in unlock order.
+    pub vesting_curve: Option<Vec<VestingTierSnapshot>>,
     /// Amount unlocked by the schedule at [`EscrowSnapshot::at`], or `0`
     /// when no vesting is configured.
     pub vested: u64,
@@ -554,6 +568,17 @@ impl Escrow {
                 start: s.start(),
                 end: s.end(),
             }),
+            // AV-90: the unlock curve rides the export — `None` for the
+            // plain linear schedule (backward compatible), else the
+            // live tiers in unlock order.
+            vesting_curve: self.vesting_curve().map(|c| {
+                (0..c.tier_count() as usize)
+                    .map(|i| {
+                        let (at, unlocked_bps) = c.tier(i).unwrap_or((0, 0));
+                        VestingTierSnapshot { at, unlocked_bps }
+                    })
+                    .collect()
+            }),
             vested: self.vested_amount(now),
             claimable: self.claimable_amount(now),
             arbiter: self.arbiter(),
@@ -780,6 +805,26 @@ impl EscrowSnapshot {
                 s.push_str(",\"end\":");
                 s.push_str(&v.end.to_string());
                 s.push('}');
+            }
+            None => s.push_str("null"),
+        }
+        // AV-90: the non-linear unlock curve tiers (`null` for the
+        // plain linear schedule) — live tiers in unlock order.
+        s.push_str(",\"vesting_curve\":");
+        match &self.vesting_curve {
+            Some(tiers) => {
+                s.push('[');
+                for (i, t) in tiers.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push_str("{\"at\":");
+                    s.push_str(&t.at.to_string());
+                    s.push_str(",\"unlocked_bps\":");
+                    s.push_str(&t.unlocked_bps.to_string());
+                    s.push('}');
+                }
+                s.push(']');
             }
             None => s.push_str("null"),
         }
@@ -1158,7 +1203,7 @@ mod snapshot_tests {
              \"expires_at\":0,\"grace_period\":0,\"expiry_eligible\":true,\
              \"dual_sig\":{{\"required\":false,\"initializer_activated\":false,\"taker_activated\":false}},\
              \"quorum\":null,\
-             \"vesting\":null,\"vested\":0,\"display_vested\":\"0\",\"claimable\":0,\"display_claimable\":\"0\",\
+             \"vesting\":null,\"vesting_curve\":null,\"vested\":0,\"display_vested\":\"0\",\"claimable\":0,\"display_claimable\":\"0\",\
              \"arbiter\":null,\"mint\":null,\
              \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
              \"milestones\":null,\"subscription\":null,\

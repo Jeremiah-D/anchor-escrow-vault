@@ -39,12 +39,13 @@ use super::{
     sha256, AppealBallot, AppealState, ArbiterPanel, CpiAllowlist, DefaultJudgment, Escrow,
     EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier, MilestonePlan,
     MultisigAuthority, PanelVote, PayoutAllowlist, QuorumPolicy, SlashTerms, SubscriptionSchedule,
-    VestingSchedule, ANCHOR_DISCRIMINATOR_LEN, APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN,
+    VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN, APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN,
     CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN,
     MAX_ATTESTORS, MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES,
-    MAX_PANEL_MEMBERS, MAX_PAYOUT_ALLOWLIST, MAX_SUBSCRIPTION_PERIODS, MILESTONE_PLAN_LEN,
-    MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN,
-    SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
+    MAX_PANEL_MEMBERS, MAX_PAYOUT_ALLOWLIST, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
+    MILESTONE_PLAN_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN,
+    QUORUM_POLICY_LEN, SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
+    VESTING_CURVE_LEN,
 };
 
 /// Program-side `#[account]` type names, in Anchor IDL order. The single
@@ -786,6 +787,24 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         1 + 8,
         "appeal ballot region drift vs APPEAL_BALLOT_LEN"
     );
+    // AV-90: the non-linear vesting unlock curve, always reserved like
+    // `quorum`: the `None` discriminant followed by the zeroed curve
+    // region. Structural decode only — the tier table's domain
+    // invariants (monotone tiers, final 10_000 bps) are enforced by
+    // the builders, not re-litigated here (see module docs).
+    let vesting_curve = if c.option_present("vesting_curve")? {
+        let count = c.u8()?;
+        let mut tiers = [(0u64, 0u16); MAX_VESTING_CURVE_TIERS];
+        for tier in tiers.iter_mut() {
+            let at = c.u64_le()?;
+            let bps = c.u16_le()?;
+            *tier = (at, bps);
+        }
+        Some(VestingCurve { tiers, count })
+    } else {
+        c.skip(VESTING_CURVE_LEN)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -922,6 +941,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         appeal_deadline,
         appeal_state,
         appeal_ballot,
+        // AV-90: the non-linear unlock curve rides the decode so a
+        // decoded escrow prices `vested_amount` / `claim` exactly like
+        // the live one.
+        vesting_curve,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

@@ -758,6 +758,45 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Attach a vesting schedule with a non-linear unlock curve (AV-90;
+    /// mirrors `VestingCurve::stepped` + `Escrow::with_vesting_curve`).
+    /// The `tiers` replace the AV-13 linear interpolation between
+    /// `start` and `end` (see `escrow_state::VestingCurve::stepped` for
+    /// the validation: strictly increasing timestamps within
+    /// `[start, end]`, strictly increasing bps, final tier 10_000).
+    /// `cliff == 0` means no cliff (`cliff_at = start`); a nonzero
+    /// `cliff` gates all unlocking until that timestamp, orthogonally
+    /// to the curve. `Uninitialized` only, like `initialize_vesting`:
+    /// the unlock timeline is fixed before funds move. The vault
+    /// account already reserves the full curve region (1 + 81 bytes,
+    /// zeroed when `None`), so the curve is written in place — no
+    /// realloc needed in the real build.
+    pub fn initialize_vesting_curve(
+        ctx: Context<InitializeVestingCurve>,
+        start: u64,
+        end: u64,
+        cliff: u64,
+        tiers: Vec<VestingTier>,
+    ) -> Result<()> {
+        let schedule = escrow_state::VestingSchedule::new_with_cliff(
+            start,
+            end,
+            if cliff == 0 { start } else { cliff },
+        )
+        .map_err(|e| escrow_error(e))?;
+        let tier_tuples: Vec<(u64, u16)> =
+            tiers.iter().map(|t| (t.at, t.unlocked_bps)).collect();
+        let curve =
+            escrow_state::VestingCurve::stepped(&tier_tuples, start, end)
+                .map_err(|e| escrow_error(e))?;
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_vesting_curve(schedule, curve)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
     /// Claim the vested-but-unreleased portion (AV-13; mirrors
     /// `Escrow::claim`). Only the taker may call this; `now` comes from
     /// the Solana clock sysvar (never an instruction param — a
@@ -3331,6 +3370,15 @@ pub struct Vault {
     /// as for an EOA, and the external multisig program guarantees the
     /// PDA only signs once its threshold voted (zero-trust).
     pub multisig_authority: Option<MultisigAuthority>,
+    /// AV-90: opt-in non-linear vesting unlock curve; mirrors
+    /// `escrow_state`'s `vesting_curve`. `None` for the plain AV-13
+    /// linear unlock. The account always reserves the full 82-byte
+    /// region (1-byte discriminant + 81-byte tier region, zeroed when
+    /// `None`) so `initialize_vesting_curve` writes it in place without
+    /// reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `multisig_authority`).
+    pub vesting_curve: Option<VestingCurve>,
 }
 
 /// Skeleton mirror of `escrow_state::SlashTerms`: the opt-in
@@ -3359,6 +3407,27 @@ pub struct Vesting {
     /// AV-51: cliff timestamp before which zero unlocks; equals `start`
     /// for the no-cliff schedule.
     pub cliff_at: u64,
+}
+
+/// Skeleton mirror of `escrow_state::VestingCurve` (AV-90): the
+/// non-linear unlock curve replacing the AV-13 linear shape. Up to 8
+/// tiers; tier `i` unlocks a cumulative `unlocked_bps / 10_000` of the
+/// locked amount at Unix timestamp `at`. Serialized size is pinned by
+/// `escrow_state::VESTING_CURVE_LEN` (82 bytes: 1-byte `Option`
+/// discriminant + 1-byte tier count + eight fixed 10-byte tier slots).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct VestingTier {
+    /// Unix timestamp at which this tier's unlock fraction applies.
+    pub at: u64,
+    /// Cumulative unlocked basis points at `at` (final tier: 10_000).
+    pub unlocked_bps: u16,
+}
+
+/// Skeleton mirror of `escrow_state::VestingCurve` (AV-90).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct VestingCurve {
+    pub tiers: [VestingTier; 8],
+    pub count: u8,
 }
 
 /// Skeleton mirror of `escrow_state::QuorumPolicy`: up to 8 registered
@@ -4111,6 +4180,17 @@ pub struct Activate<'info> {
 
 #[derive(Accounts)]
 pub struct InitializeVesting<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer fixes the unlock curve; the state machine
+    /// rejects re-configuration once the escrow leaves `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-90: accounts for `initialize_vesting_curve` — same shape as
+/// `InitializeVesting`: only the initializer fixes the unlock curve.
+#[derive(Accounts)]
+pub struct InitializeVestingCurve<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Only the initializer fixes the unlock curve; the state machine
@@ -5244,6 +5324,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidAppealWindow => {
             error!(ErrorCode::InvalidAppealWindow)
         }
+        escrow_state::EscrowError::InvalidVestingCurve => {
+            error!(ErrorCode::InvalidVestingCurve)
+        }
     }
 }
 
@@ -5339,4 +5422,6 @@ pub enum ErrorCode {
     InvalidCpiAllowlist,
     #[msg("Invalid slash-appeal window (AV-86): with_appeal_window with a zero window — a zero-second window would give the taker no chance to appeal; file_appeal with no slash executed, no window configured, an already-filed or already-resolved appeal, or a lapsed window")]
     InvalidAppealWindow,
+    #[msg("Invalid vesting unlock curve (AV-90): VestingCurve::stepped with an empty/oversized tier table, a tier outside [start, end], non-monotone timestamps or unlock fractions, bps above 10_000, or a final tier below full unlock; VestingCurve::exponential with zero/too many steps, a non-positive or overflowing growth ratio, or a window shorter than the step count; with_vesting_curve with a curve whose tier window does not match the schedule")]
+    InvalidVestingCurve,
 }

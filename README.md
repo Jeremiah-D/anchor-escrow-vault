@@ -352,6 +352,38 @@ release). The initializer keeps the `release` push path and may release
 ahead of the curve; the schedule itself is immutable once set, and
 `cancel` / `cancel_expired` still refund the unreleased remainder.
 
+**Non-linear vesting unlock curves (AV-90).** The AV-13 linear unlock is
+a degenerate case: an escrow may instead attach a vesting curve
+(`with_vesting_curve(schedule, curve)`, opt-in on `Uninitialized`, fixed
+before funds move like the schedule itself). A curve is a tier table —
+up to 8 tiers, each a `(at, unlocked_bps)` pair with strictly increasing
+timestamps inside `[start, end]` and strictly increasing cumulative basis
+points, the final tier exactly 10,000 (funds that could never vest are a
+configuration error, `InvalidVestingCurve`). The unlock at any timestamp
+is the last tier whose `at` has passed: a step function, so unlocking
+jumps at the tiers and holds flat between them — the cliff semantics
+(AV-51) survive untouched because the curve prices the curve value and
+the cliff gates it orthogonally. Two constructors: `VestingCurve::stepped`
+takes the tier table verbatim (milestone unlocks, cliff-then-lumpsum —
+a single tier at `end` is a pure end-cliff), and
+`VestingCurve::exponential(start, end, steps, growth_bps)` generates a
+geometric schedule in exact integer math (positive growth back-loads,
+negative front-loads, zero is the uniform stepwise analogue of linear;
+the final tier is pinned to exactly 10,000 bps so rounding can never
+strand dust). All pricing is `u128`-exact, clamped past `end`, monotone,
+and never exceeds the locked amount. `claimable_amount` — and therefore
+the keeper's claim listing — prices through the curve, so a keeper bot
+lists the curve's value (a 25%-first-tier curve lists 250,000 at the
+midpoint where the linear schedule would list 500,000); `claim` pays the
+curved amount and accumulates into the same `released` counter, keeping
+the inflow == released + refunded conservation law intact. Attaching a
+plain schedule with `with_vesting` clears a previously set curve back to
+linear. The 82-byte region (1-byte `Option` discriminant + 81-byte tier
+region) is appended last in the vault layout, keeping every earlier
+offset stable. Anchor surface: the `initialize_vesting_curve`
+instruction (`start`, `end`, `cliff`, `tiers: Vec<VestingTier>`) and the
+`Vault.vesting_curve` field, both pinned in the generated IDL.
+
 **Dispute arbitration (escrowed payments with a judge).** An escrow can
 name an arbiter (`with_arbiter`, opt-in on `Uninitialized`, like the
 quorum builder; the zero key is rejected since `resolve` authenticates
@@ -2050,7 +2082,12 @@ two-way consistency check against the IDL parameter table:
 | penalty_paid | u64 | 8 |
 | cpi_allowlist | Option<CpiAllowlist> | 258 |
 | multisig_authority | Option<MultisigAuthority> | 67 |
-| **total**     |                   | **3820** |
+| appeal_window_secs | u64 | 8 |
+| appeal_deadline | u64 | 8 |
+| appeal_state | u8 (enum discriminant) | 1 |
+| appeal_ballot | AppealBallot | 9 |
+| vesting_curve | Option<VestingCurve> | 82 |
+| **total**     |                   | **3928** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2128,11 +2165,19 @@ target-program allowlist region (AV-83: 1-byte live-program count + 8
 32-byte program ids, zeroed when no allowlist is configured) — and the
 67-byte multisig authority region (AV-84: 1-byte discriminant + 32-byte
 multisig program id + 32-byte authority PDA + u16 threshold, zeroed when
-no multisig binding is configured).
-`escrow-state` exposes `VAULT_SPACE` (3828) and
-`VAULT_SPACE_NO_QUORUM` (3338) for the Anchor `space =` constraint, plus a
+no multisig binding is configured) — and the 8-byte slash-appeal window
+(AV-86: zeroed when no window is configured) — and the 8-byte
+slash-appeal deadline (AV-86: zeroed when no appeal is in flight) — and
+the 1-byte appeal state discriminant (AV-86: `None` when no appeal is in
+flight) — and the 9-byte appeal ballot (AV-86: 1-byte vote count +
+8-byte tally bitmap, zeroed when no appeal is in flight) — and the
+82-byte vesting unlock-curve region (AV-90: 1-byte discriminant + 81-byte
+tier region — 1-byte tier count + eight fixed 10-byte timestamp/bps
+slots — zeroed when the escrow uses the plain AV-13 linear unlock).
+`escrow-state` exposes `VAULT_SPACE` (3936) and
+`VAULT_SPACE_NO_QUORUM` (3446) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **27,533,760 lamports** to be
+mainnet rent parameters the full vault needs **28,285,440 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)

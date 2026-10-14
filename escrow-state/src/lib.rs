@@ -439,6 +439,16 @@ pub struct Escrow {
     /// `None` means no vesting (backward compatible): the taker cannot
     /// claim, and `release` keeps its existing semantics.
     vesting: Option<VestingSchedule>,
+    /// AV-90: optional non-linear unlock curve replacing the AV-13
+    /// linear shape between the schedule's `start` and `end` (see
+    /// [`VestingCurve`] / [`Escrow::with_vesting_curve`]). `None` means
+    /// the plain linear curve (backward compatible). Set once via
+    /// `with_vesting_curve` on an `Uninitialized` escrow, like the other
+    /// `with_*` builders; re-attaching a plain schedule via
+    /// [`Escrow::with_vesting`] clears it. Persisted (82 bytes in the
+    /// vault account) so the unlock timeline survives serialization.
+    /// Appended last so every earlier field offset stays stable.
+    vesting_curve: Option<VestingCurve>,
     /// AV-14: optional dispute arbiter. `None` means no arbitration
     /// (backward compatible): `escalate` / `resolve` fail with
     /// [`EscrowError::InvalidArbiter`]. Set once via
@@ -1393,6 +1403,16 @@ pub enum EscrowError {
     /// [`EscrowError::SlashNotEligible`] (the appeal's own eligibility
     /// family, so the one new code (146) stays honest).
     InvalidAppealWindow,
+    /// Invalid non-linear vesting unlock curve (AV-90):
+    /// [`VestingCurve::stepped`] with an empty or oversized tier table,
+    /// a tier outside the schedule window, non-monotone timestamps or
+    /// unlock fractions, a fraction above 10_000 bps, or a final tier
+    /// below full unlock (funds that could never vest);
+    /// [`VestingCurve::exponential`] with zero/too many steps, a
+    /// non-positive or overflowing growth ratio, or a window shorter
+    /// than the step count; or [`Escrow::with_vesting_curve`] with a
+    /// curve whose tier window does not match the schedule it prices.
+    InvalidVestingCurve,
 }
 
 impl EscrowError {
@@ -1452,6 +1472,7 @@ impl EscrowError {
             EscrowError::InvalidCpiAllowlist => 144,
             EscrowError::InvalidMultisigAuthority => 145,
             EscrowError::InvalidAppealWindow => 146,
+            EscrowError::InvalidVestingCurve => 147,
         }
     }
 
@@ -1505,6 +1526,7 @@ impl EscrowError {
             EscrowError::InvalidCpiAllowlist,
             EscrowError::InvalidMultisigAuthority,
             EscrowError::InvalidAppealWindow,
+            EscrowError::InvalidVestingCurve,
         ]
     }
 }
@@ -2514,6 +2536,273 @@ impl VestingSchedule {
     }
 }
 
+/// Maximum number of unlock tiers in a [`VestingCurve`]. Fixed-size so
+/// the crate stays heap-free and `Copy` — the same bound as
+/// [`MAX_MILESTONES`]: eight tiers cover step, exponential, and custom
+/// piecewise unlock shapes without bloating the vault account (the
+/// curve reserves 81 bytes).
+pub const MAX_VESTING_CURVE_TIERS: usize = 8;
+
+/// Serialized length of [`VestingCurve`] under Borsh/Anchor: the live
+/// tier-count byte plus the fixed tier slots (each an unlock timestamp
+/// `u64` and a cumulative unlocked basis-points `u16`). Fixed-size by
+/// design, so account space is known at `initialize` time and never
+/// needs a realloc.
+pub const VESTING_CURVE_LEN: usize = MAX_VESTING_CURVE_TIERS * (8 + 2) + 1;
+
+/// A non-linear unlock curve replacing the AV-13 linear vesting shape
+/// (AV-90 — Solana subscription payments / streaming payroll).
+///
+/// The curve is a fixed table of up to [`MAX_VESTING_CURVE_TIERS`]
+/// tiers; tier *i* is `(at_i, unlocked_bps_i)`: at Unix timestamp
+/// `at_i` the cumulative unlocked fraction jumps to
+/// `unlocked_bps_i / 10_000` of the locked amount. Between tiers the
+/// unlocked amount is constant (step semantics); the final tier always
+/// carries `10_000` bps, so every curve fully unlocks by its window
+/// end and no funds can vest-lock forever.
+///
+/// Three construction spellings, one persisted representation:
+/// - [`VestingCurve::stepped`] — an explicit tier table ("step 分段"
+///   / custom piecewise): e.g. `[(t1, 2500), (t2, 10_000)]` unlocks a
+///   quarter at `t1` and the rest at `t2`;
+/// - [`VestingCurve::exponential`] — a geometric tier table generated
+///   from a per-step growth rate: positive growth back-loads the
+///   unlock (accelerating), negative growth front-loads it
+///   (decelerating), zero growth is uniform steps. The generated table
+///   is frozen at construction — the chain stores tiers, not the growth
+///   parameter, so both parties can audit the exact unlock timeline
+///   off-chain.
+///
+/// The curve is fixed before funding via
+/// [`Escrow::with_vesting_curve`] (which also takes the
+/// [`VestingSchedule`] carrying `start`/`end`/`cliff_at`); it never
+/// changes afterwards. The AV-51 cliff composes orthogonally: before
+/// `cliff_at` nothing unlocks regardless of the curve, and at/after
+/// the cliff the curve value at `now` applies — the cliff gates
+/// unlocking, it does not rebase the curve (same semantics as the
+/// linear schedule).
+///
+/// `Copy` and heap-free like the rest of the crate. All arithmetic is
+/// exact `u128` integer math: `amount * bps / 10_000 <= amount`, so the
+/// downcast to `u64` is exact and the conservation invariant
+/// (`vested <= amount`) holds by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VestingCurve {
+    tiers: [(u64, u16); MAX_VESTING_CURVE_TIERS],
+    count: u8,
+}
+
+impl VestingCurve {
+    /// Build a curve from an explicit tier table (step / custom
+    /// piecewise): `tiers[i] = (at, unlocked_bps)`.
+    ///
+    /// Validation (all [`EscrowError::InvalidVestingCurve`] unless
+    /// noted):
+    /// - 1 to [`MAX_VESTING_CURVE_TIERS`] tiers — an empty table would
+    ///   unlock nothing, ever;
+    /// - `start < end` ([`EscrowError::InvalidVesting`] — the same
+    ///   window check as [`VestingSchedule::new`]);
+    /// - every `at` within `[start, end]` and strictly increasing —
+    ///   tiers outside the vesting window or out of order would
+    ///   misprice the timeline;
+    /// - every `unlocked_bps` strictly increasing and `<= 10_000` —
+    ///   the unlock fraction is monotone by construction;
+    /// - the final tier carries exactly `10_000` bps — otherwise some
+    ///   funds could never vest (the AV-51 `cliff_at > end` rationale:
+    ///   reject curves that lock funds forever).
+    pub fn stepped(
+        tiers: &[(u64, u16)],
+        start: u64,
+        end: u64,
+    ) -> Result<Self, EscrowError> {
+        if start >= end {
+            return Err(EscrowError::InvalidVesting);
+        }
+        if tiers.is_empty() || tiers.len() > MAX_VESTING_CURVE_TIERS {
+            return Err(EscrowError::InvalidVestingCurve);
+        }
+        let mut prev: Option<(u64, u16)> = None;
+        for &(at, bps) in tiers {
+            if at < start || at > end {
+                return Err(EscrowError::InvalidVestingCurve);
+            }
+            if bps > 10_000 {
+                return Err(EscrowError::InvalidVestingCurve);
+            }
+            if let Some((prev_at, prev_bps)) = prev {
+                if at <= prev_at || bps <= prev_bps {
+                    return Err(EscrowError::InvalidVestingCurve);
+                }
+            }
+            prev = Some((at, bps));
+        }
+        // The final tier must fully unlock: anything less leaves funds
+        // that can never vest.
+        if tiers[tiers.len() - 1].1 != 10_000 {
+            return Err(EscrowError::InvalidVestingCurve);
+        }
+        let mut table = [(0u64, 0u16); MAX_VESTING_CURVE_TIERS];
+        table[..tiers.len()].copy_from_slice(tiers);
+        Ok(Self {
+            tiers: table,
+            count: tiers.len() as u8,
+        })
+    }
+
+    /// Build a geometric unlock curve over `[start, end]` (exponential
+    /// shape): the window splits into `steps` equal segments, and the
+    /// per-step unlocked amounts follow a geometric progression with
+    /// ratio `(10_000 + growth_bps) / 10_000`.
+    ///
+    /// - `growth_bps == 0`: uniform steps (each segment unlocks the
+    ///   same fraction — the stepwise analogue of linear vesting);
+    /// - `growth_bps > 0`: accelerating / back-loaded (later segments
+    ///   unlock more — e.g. a team unlock weighted toward later
+    ///   tenure);
+    /// - `growth_bps < 0`: decelerating / front-loaded (earlier
+    ///   segments unlock more).
+    ///
+    /// The generated tier table is frozen at construction and stored as
+    /// plain tiers (see [`VestingCurve::stepped`] for the persisted
+    /// shape) — the growth parameter itself is not persisted, so the
+    /// unlock timeline stays auditable from the account bytes alone.
+    /// Tiers whose rounded basis points would not advance the unlock
+    /// are compacted away (keeping the later timestamp — the unlock
+    /// happens later, never earlier).
+    ///
+    /// Validation: `start < end` ([`EscrowError::InvalidVesting`]);
+    /// `1 <= steps <= MAX_VESTING_CURVE_TIERS`,
+    /// `-10_000 < growth_bps <= 90_000`
+    /// ([`EscrowError::InvalidVestingCurve`] — the ratio must stay
+    /// positive, and the bound keeps `ratio^7` inside `u128`); and
+    /// `end - start >= steps` (each step needs a distinct unlock
+    /// timestamp).
+    pub fn exponential(
+        start: u64,
+        end: u64,
+        steps: u8,
+        growth_bps: i32,
+    ) -> Result<Self, EscrowError> {
+        if start >= end {
+            return Err(EscrowError::InvalidVesting);
+        }
+        if steps == 0 || steps as usize > MAX_VESTING_CURVE_TIERS {
+            return Err(EscrowError::InvalidVestingCurve);
+        }
+        // Ratio r = r_num / r_den with r_den = 10_000. r_num <= 100_000
+        // keeps r_num^7 < u128::MAX (100_000^7 = 1e35 < 3.4e38), and
+        // r_num > 0 keeps every step weight positive.
+        let r_num = 10_000i64 + growth_bps as i64;
+        if r_num <= 0 || r_num > 100_000 {
+            return Err(EscrowError::InvalidVestingCurve);
+        }
+        let steps_usize = steps as usize;
+        let duration = end - start;
+        if duration < steps as u64 {
+            return Err(EscrowError::InvalidVestingCurve);
+        }
+        let r_num = r_num as u128;
+        let r_den = 10_000u128;
+        // Step weights w_i = r^i, kept exact in u128 via
+        // w_i = r_num^i * r_den^(steps-1-i): iterating
+        // w_{i+1} = w_i * r_num / r_den is exact because w_i carries a
+        // spare r_den factor for i < steps - 1.
+        let mut w = r_den.pow(steps_usize as u32 - 1);
+        let mut weights = [0u128; MAX_VESTING_CURVE_TIERS];
+        for w_i in weights.iter_mut().take(steps_usize) {
+            *w_i = w;
+            w = w * r_num / r_den;
+        }
+        let total: u128 = weights[..steps_usize].iter().sum();
+        // Cumulative unlocked bps per step; the final tier pins to
+        // exactly 10_000 (the floor division below can only undershoot).
+        let mut raw = [(0u64, 0u16); MAX_VESTING_CURVE_TIERS];
+        let mut prefix = 0u128;
+        for i in 0..steps_usize {
+            prefix += weights[i];
+            let at = if i + 1 == steps_usize {
+                end
+            } else {
+                start + ((i as u128 + 1) * duration as u128 / steps_usize as u128) as u64
+            };
+            let bps = if i + 1 == steps_usize {
+                10_000u16
+            } else {
+                (10_000u128 * prefix / total) as u16
+            };
+            raw[i] = (at, bps);
+        }
+        // Compact tiers whose rounded bps would not advance the unlock
+        // (extreme growth ratios can round early tiers to 0): keep the
+        // later timestamp, so the unlock only ever moves later.
+        let mut table = [(0u64, 0u16); MAX_VESTING_CURVE_TIERS];
+        let mut count = 0usize;
+        let mut prev_bps = 0u16;
+        // The final tier is always 10_000 > every earlier tier's floor
+        // (its prefix is a strict prefix of the total), so at least one
+        // tier survives compaction.
+        for &(at, bps) in raw[..steps_usize].iter() {
+            if bps > prev_bps {
+                table[count] = (at, bps);
+                count += 1;
+                prev_bps = bps;
+            }
+        }
+        debug_assert!(count > 0, "exponential curve compacted to nothing");
+        Ok(Self {
+            tiers: table,
+            count: count as u8,
+        })
+    }
+
+    /// Number of live tiers (1..=[`MAX_VESTING_CURVE_TIERS`]).
+    pub fn tier_count(&self) -> u8 {
+        self.count
+    }
+
+    /// Tier `index` as `(unlock_timestamp, cumulative_unlocked_bps)`,
+    /// or `None` past the live tiers.
+    pub fn tier(&self, index: usize) -> Option<(u64, u16)> {
+        if index < self.count as usize {
+            Some(self.tiers[index])
+        } else {
+            None
+        }
+    }
+
+    /// Amount unlocked at `now` for a locked total of `amount` under
+    /// this curve and `schedule`: the last tier with `at <= now` sets
+    /// the cumulative unlocked fraction; before the first tier nothing
+    /// is unlocked.
+    ///
+    /// The AV-51 cliff composes orthogonally: before `cliff_at`
+    /// nothing unlocks regardless of the curve — the cliff gates
+    /// unlocking, it does not rebase the curve (same semantics as the
+    /// linear schedule: at `now == cliff_at` the curve value at that
+    /// point applies, not a jump from zero to it).
+    ///
+    /// Computed in `u128`: `amount * bps <= amount * 10_000`, far below
+    /// `u128::MAX`, and the result is `<= amount <= u64::MAX`, so the
+    /// downcast is exact. Monotone non-decreasing in `now` (tiers are
+    /// monotone by construction), so `vested - released` never goes
+    /// negative unexpectedly.
+    pub fn vested_amount(&self, schedule: &VestingSchedule, amount: u64, now: u64) -> u64 {
+        if now < schedule.cliff_at() {
+            return 0;
+        }
+        let mut bps = 0u16;
+        for i in 0..self.count as usize {
+            let (at, tier_bps) = self.tiers[i];
+            if now >= at {
+                bps = tier_bps;
+            } else {
+                break;
+            }
+        }
+        ((amount as u128 * bps as u128) / 10_000u128) as u64
+    }
+}
+
 /// Maximum number of tranches in a [`MilestonePlan`]. Fixed-size so the
 /// crate stays heap-free and `Copy` — the same bound as
 /// [`MAX_ATTESTORS`]: eight tranches cover staged settlements without
@@ -2707,6 +2996,12 @@ pub struct SplitConfig<'a> {
     /// `None` (default): children carry no vesting; the taker cannot
     /// `claim` on them.
     pub vesting: Option<VestingSchedule>,
+    /// Non-linear unlock curve copied onto every child alongside
+    /// `vesting` ([`Escrow::with_vesting_curve`], AV-90). `None`
+    /// (default): children unlock linearly. Only meaningful with
+    /// `vesting: Some` — a curve without a schedule is ignored (the
+    /// builder requires both).
+    pub vesting_curve: Option<VestingCurve>,
     /// Weighted attestor quorum copied onto every child
     /// ([`Escrow::with_quorum`]). `None` (default): plain two-party
     /// children, no attestor gate on their releases.
@@ -2963,6 +3258,10 @@ impl Escrow {
             quorum: None,
             activation: 0,
             vesting: None,
+            // AV-90: no unlock curve by default (backward compatible):
+            // the vesting schedule (when attached) unlocks linearly.
+            // Opt in via `with_vesting_curve` before funding.
+            vesting_curve: None,
             arbiter: None,
             milestones: None,
             milestone_flags: 0,
@@ -3976,6 +4275,12 @@ impl Escrow {
             _ => return Err(EscrowError::InvalidStateTransition),
         }
         self.vesting = Some(schedule);
+        // AV-90: re-attaching a plain linear schedule drops any
+        // previously configured unlock curve — the two are alternative
+        // unlock shapes, and a stale curve silently re-pricing a new
+        // schedule would be a mispricing bug. Use `with_vesting_curve`
+        // for the non-linear shape.
+        self.vesting_curve = None;
         Ok(self)
     }
 
@@ -3996,6 +4301,50 @@ impl Escrow {
     ) -> Result<Self, EscrowError> {
         let schedule = VestingSchedule::new_with_cliff(start, end, cliff_at)?;
         self.with_vesting(schedule)
+    }
+
+    /// Attach a vesting schedule with a non-linear unlock curve (AV-90).
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// unlock timeline is fixed before any funds move — mirroring
+    /// [`Escrow::with_vesting`].
+    ///
+    /// The `curve` replaces the AV-13 linear interpolation between the
+    /// schedule's `start` and `end`: [`VestingCurve::vested_amount`]
+    /// prices every [`Escrow::claim`] and the keeper's claim listing
+    /// (via [`Escrow::claimable_amount`]). The schedule's `cliff_at`
+    /// still gates unlocking orthogonally (before the cliff nothing
+    /// unlocks, whatever the curve says).
+    ///
+    /// The curve's tier window must match the schedule it prices
+    /// ([`EscrowError::InvalidVestingCurve`] otherwise): a curve built
+    /// for a different `[start, end]` window would silently misprice
+    /// the unlock timeline. Re-attaching a plain schedule via
+    /// [`Escrow::with_vesting`] clears the curve back to linear.
+    pub fn with_vesting_curve(
+        mut self,
+        schedule: VestingSchedule,
+        curve: VestingCurve,
+    ) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        for i in 0..curve.tier_count() as usize {
+            // `tier(i)` is `Some` for `i < tier_count` by construction.
+            let (at, _) = curve.tier(i).ok_or(EscrowError::InvalidVestingCurve)?;
+            if at < schedule.start() || at > schedule.end() {
+                return Err(EscrowError::InvalidVestingCurve);
+            }
+        }
+        self.vesting = Some(schedule);
+        self.vesting_curve = Some(curve);
+        Ok(self)
+    }
+
+    /// The non-linear unlock curve attached via
+    /// [`Escrow::with_vesting_curve`], if any.
+    pub fn vesting_curve(&self) -> Option<VestingCurve> {
+        self.vesting_curve
     }
 
     /// Claim the vested-but-unreleased portion of the locked funds
@@ -4060,9 +4409,11 @@ impl Escrow {
         // redirect the claim; the destination must satisfy the payout
         // policy (`PayoutNotAllowlisted` otherwise).
         self.require_payout_recipient(payout_to)?;
-        let schedule = self.vesting.ok_or(EscrowError::InvalidVesting)?;
-        if let Some(policy) = &self.quorum {
-            if !policy.is_satisfied() {
+        // A vesting schedule must be attached for `claim` to mean
+        // anything (`InvalidVesting` otherwise); the unlock amount then
+        // prices through the AV-90 curve when one is configured.
+        let _ = self.vesting.ok_or(EscrowError::InvalidVesting)?;
+        if let Some(policy) = &self.quorum {            if !policy.is_satisfied() {
                 return Err(EscrowError::QuorumNotReached);
             }
         }
@@ -4073,7 +4424,9 @@ impl Escrow {
         if !self.is_unlock_eligible(now) {
             return Err(EscrowError::TimelockNotReached);
         }
-        let vested = schedule.vested_amount(self.amount, now);
+        // AV-90: prices through the attached unlock curve when one is
+        // configured (linear otherwise); the AV-51 cliff gates inside.
+        let vested = self.vested_amount(now);
         // `released` only grows via `release`/`claim`, and `vested` is a
         // pure function of (amount, now): saturating keeps the counter
         // monotonic even if the initializer released ahead of the curve.
@@ -7739,8 +8092,19 @@ impl Escrow {
         for (i, &amount) in amounts.iter().enumerate() {
             let mut child =
                 Escrow::initialize(self.initializer, self.taker, amount, self.expires_at)?;
-            if let Some(schedule) = config.vesting {
-                child = child.with_vesting(schedule)?;
+            // AV-90: the unlock curve rides along with the schedule when
+            // both are configured — `with_vesting_curve` re-validates
+            // the tier window against the schedule, so a misconfigured
+            // pair fails the child build (and the whole split) rather
+            // than mispricing the child's unlocks.
+            match (config.vesting, config.vesting_curve) {
+                (Some(schedule), Some(curve)) => {
+                    child = child.with_vesting_curve(schedule, curve)?;
+                }
+                (Some(schedule), None) => {
+                    child = child.with_vesting(schedule)?;
+                }
+                _ => {}
             }
             if let Some(policy) = config.quorum {
                 child = child.with_quorum(policy)?;
@@ -8750,10 +9114,18 @@ impl Escrow {
     }
     /// Amount vested at `now` under the attached schedule, or `0` when no
     /// vesting is configured.
+    ///
+    /// AV-90: when a non-linear unlock curve is attached (see
+    /// [`Escrow::with_vesting_curve`]), the curve prices the unlock
+    /// between the schedule's `start` and `end` instead of the AV-13
+    /// linear interpolation; the schedule's `cliff_at` still gates
+    /// unlocking orthogonally.
     pub fn vested_amount(&self, now: u64) -> u64 {
-        self.vesting
-            .map(|s| s.vested_amount(self.amount, now))
-            .unwrap_or(0)
+        match (self.vesting, self.vesting_curve) {
+            (Some(schedule), Some(curve)) => curve.vested_amount(&schedule, self.amount, now),
+            (Some(schedule), None) => schedule.vested_amount(self.amount, now),
+            _ => 0,
+        }
     }
     /// Amount the taker could [`Escrow::claim`] right now: vested minus
     /// already released, saturating at zero. `0` when no vesting is
@@ -9165,6 +9537,15 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // no appeal is filed). Appended last so every earlier field offset
     // stays stable.
     ("appeal_ballot", "AppealBallot", APPEAL_BALLOT_LEN),
+    // AV-90: opt-in non-linear vesting unlock curve (see
+    // `Escrow::with_vesting_curve`): one discriminant byte, then the
+    // fixed `VESTING_CURVE_LEN`-byte region (live tier-count byte plus
+    // eight fixed (unlock-timestamp u64, cumulative-unlocked-bps u16)
+    // slots — see `VestingCurve`). The region is always reserved
+    // (zeroed when `None`) so `with_vesting_curve` writes in place —
+    // same treatment as `arbiter` / `mint` / `vesting`. Appended last
+    // so every earlier field offset stays stable.
+    ("vesting_curve", "Option<VestingCurve>", 1 + VESTING_CURVE_LEN),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -9264,8 +9645,11 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// always present: 1-byte discriminant + 40-byte terms (zeroed when no
 /// slash clause is configured) — and so is the cumulative slashed
 /// amount (AV-82): 8 bytes, zeroed when the escrow was never slashed.
+/// The opt-in non-linear vesting curve (AV-90) is likewise always
+/// present: 1-byte discriminant + 81-byte tier region (zeroed when no
+/// curve is configured).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -9819,7 +10203,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 27_714_720, "from {state:?}");
+            assert_eq!(rent, 28_285_440, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -9917,9 +10301,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 27_714_720 by
+        // VAULT_SPACE — pinned at 28_285_440 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 27_714_720);
+        assert_eq!(rent, 28_285_440);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -10080,8 +10464,8 @@ mod tests {
         // then the account is closed. VAULT_SPACE stays 2941 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 3854, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 27_714_720);
+        assert_eq!(VAULT_SPACE, 3936, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 28_285_440);
     }
 
     #[test]
@@ -10100,7 +10484,7 @@ mod tests {
         // 595 (arbiter panel), and AV-68 by 41 (evidence-disclosure
         // deadline + escalating party), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 3854, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3936, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -11438,6 +11822,45 @@ pub(crate) mod anchor_idl_tests {
                             InvalidVesting; the instruction discriminator \
                             is unchanged (name-derived: a new param does \
                             not rename the instruction)",
+        },
+        InstructionSpec {
+            // AV-90: non-linear unlock curve (step / exponential /
+            // custom piecewise), replacing the AV-13 linear curve
+            // between start and end. The AV-51 cliff still gates
+            // unlocking orthogonally.
+            name: "initialize_vesting_curve",
+            params: &[
+                ("start", "u64", "instruction param; unlock begins"),
+                (
+                    "end",
+                    "u64",
+                    "instruction param; fully unlocked at now >= end",
+                ),
+                (
+                    "cliff",
+                    "u64",
+                    "instruction param; 0 = no cliff (cliff_at = start); \
+                     nonzero = nothing unlocks before this timestamp",
+                ),
+                (
+                    "tiers",
+                    "Vec<VestingTier>",
+                    "instruction param; up to 8 (at, unlocked_bps) tiers \
+                     (see VestingCurve::stepped): timestamps strictly \
+                     increasing within [start, end], bps strictly \
+                     increasing, final tier 10_000",
+                ),
+            ],
+            method: "VestingCurve::stepped + Escrow::with_vesting_curve",
+            input_mapping: "start/end/cliff <- params (schedule built \
+                            like initialize_vesting); tiers <- param, \
+                            validated by VestingCurve::stepped \
+                            (InvalidVestingCurve on a malformed table); \
+                            authority <- accounts.initializer (signer), \
+                            enforced by the Anchor account constraint; \
+                            Uninitialized only; the curve's tier window \
+                            must match the schedule (InvalidVestingCurve \
+                            otherwise)",
         },
         InstructionSpec {
             name: "claim",
@@ -12981,6 +13404,8 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::review_appeal",
             // AV-84: opt-in multisig authority binding.
             "Escrow::with_multisig_authority",
+            // AV-90: opt-in non-linear vesting unlock curve.
+            "VestingCurve::stepped + Escrow::with_vesting_curve",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -13023,6 +13448,7 @@ pub(crate) mod anchor_idl_tests {
                 &"update_quorum",
                 &"update_attestors",
                 &"initialize_vesting",
+                &"initialize_vesting_curve",
                 &"initialize_arbiter",
                 &"escalate",
                 &"resolve",
@@ -14605,6 +15031,13 @@ pub(crate) mod anchor_idl_tests {
         // `Option` discriminant is implied (an attached schedule is
         // `Some`), mirroring `initialize_mint`.
         ("initialize_vesting", "cliff", "vesting.cliff_at"),
+        // AV-90: the curve instruction rebuilds the schedule from the
+        // same params, then attaches the tier table to `vesting_curve`
+        // (the `Option` discriminant is implied, like the schedule).
+        ("initialize_vesting_curve", "start", "vesting.start"),
+        ("initialize_vesting_curve", "end", "vesting.end"),
+        ("initialize_vesting_curve", "cliff", "vesting.cliff_at"),
+        ("initialize_vesting_curve", "tiers", "vesting_curve"),
         ("initialize_arbiter", "arbiter", "arbiter"),
         // AV-65: the panel member keys populate the panel's member
         // array; the `Option` discriminant is implied (a configured
@@ -15417,6 +15850,11 @@ mod error_code_tests {
             EscrowError::InvalidAppealWindow,
             146,
             "with_appeal_window with a zero window; slash when the window would overflow the appeal deadline; file_appeal with no slash executed / no window configured / an already-filed or already-resolved appeal (one appeal per slash) / after the window lapsed",
+        ),
+        (
+            EscrowError::InvalidVestingCurve,
+            147,
+            "VestingCurve::stepped with an empty/oversized tier table, a tier outside [start, end], non-monotone timestamps or unlock fractions, bps above 10_000, or a final tier below full unlock; VestingCurve::exponential with zero/too many steps, a non-positive or overflowing growth ratio, or a window shorter than the step count; with_vesting_curve with a curve whose tier window does not match the schedule",
         ),
     ];
 
@@ -17237,6 +17675,27 @@ mod account_space_tests {
         for vote in e.appeal_ballot.votes.iter() {
             out.push(*vote);
         }
+        // AV-90: non-linear vesting unlock curve, always reserved like
+        // `quorum`: the `None` discriminant followed by the zeroed
+        // curve region (tier-count byte plus eight fixed
+        // (unlock-timestamp, cumulative-bps) slots), so
+        // `with_vesting_curve` writes in place without reallocating;
+        // appended last so every earlier offset above is unchanged.
+        match e.vesting_curve {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; VESTING_CURVE_LEN]);
+            }
+            Some(curve) => {
+                out.push(1);
+                out.push(curve.tier_count());
+                for i in 0..MAX_VESTING_CURVE_TIERS {
+                    let (at, bps) = curve.tiers[i];
+                    out.extend_from_slice(&at.to_le_bytes());
+                    out.extend_from_slice(&bps.to_le_bytes());
+                }
+            }
+        }
         out
     }
 
@@ -17297,9 +17756,9 @@ mod account_space_tests {
         // + 26 (AV-86 opt-in slash-appeal window region: 8-byte window
         // + 8-byte appeal deadline + 1-byte appeal state + 9-byte appeal
         // ballot).
-        assert_eq!(ESCROW_BODY_LEN, 3846, "escrow payload bytes");
+        assert_eq!(ESCROW_BODY_LEN, 3928, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 3854, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3936, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -17366,13 +17825,16 @@ mod account_space_tests {
         // when no slash was executed under a configured window) +
         // 1-byte appeal lifecycle state (AV-86, zeroed = no appeal
         // filed) + 9-byte panel appeal ballot (AV-86, 1-byte voter
-        // bitmask + 8 vote slots, zeroed when no appeal is filed).
+        // bitmask + 8 vote slots, zeroed when no appeal is filed) +
+        // 82-byte opt-in non-linear vesting curve (AV-90, 1-byte
+        // discriminant + 81-byte tier region, zeroed when no curve is
+        // configured).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3364);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3446);
     }
 
     #[test]
@@ -17782,16 +18244,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3854) * 3480 * 2 = 3982 * 6960 = 27_714_720 lamports.
-        assert_eq!(full, 27_714_720);
+        // (128 + 3936) * 3480 * 2 = 4064 * 6960 = 28_285_440 lamports.
+        assert_eq!(full, 28_285_440);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3364) * 3480 * 2 = 3492 * 6960 = 24_304_320 lamports.
-        assert_eq!(no_quorum, 24_304_320);
+        // (128 + 3446) * 3480 * 2 = 3574 * 6960 = 24_875_040 lamports.
+        assert_eq!(no_quorum, 24_875_040);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -17835,25 +18297,25 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(27_714_720, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(28_285_440, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(27_533_759, params.0, params.1),
             Err(RentShortfall {
-                required: 27_714_720,
+                required: 28_285_440,
                 provided: 27_533_759,
             })
         );
         // Generous funding: exempt.
         assert_eq!(
-            check_vault_rent_exempt(28_000_000, params.0, params.1),
+            check_vault_rent_exempt(28_600_000, params.0, params.1),
             Ok(())
         );
         // Zero lamports: the full minimum is the shortfall.
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 27_714_720,
+                required: 28_285_440,
                 provided: 0,
             })
         );
@@ -18536,6 +18998,340 @@ mod vesting_tests {
             1_000_000,
             "conservation across mixed release paths"
         );
+    }
+}
+
+// ---------- AV-90: non-linear vesting unlock curves ----------
+
+mod vesting_curve_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const START: u64 = 1_700_000_000;
+    const END: u64 = 1_800_000_000;
+    const AMOUNT: u64 = 1_000_000;
+
+    fn schedule() -> VestingSchedule {
+        VestingSchedule::new(START, END).unwrap()
+    }
+
+    fn curved_escrow() -> Escrow {
+        Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_vesting_curve(
+                schedule(),
+                VestingCurve::stepped(&[(1_750_000_000, 2_500), (END, 10_000)], START, END)
+                    .unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn funded_curved_escrow() -> Escrow {
+        let mut e = curved_escrow();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    // ----- construction and validation -----
+
+    #[test]
+    fn stepped_rejects_malformed_tables() {
+        // Empty table: nothing would ever unlock.
+        assert_eq!(
+            VestingCurve::stepped(&[], START, END),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+        // Oversized table.
+        let many: Vec<(u64, u16)> = (0..9).map(|i| (START + i, 1_000 * (i + 1) as u16)).collect();
+        assert_eq!(
+            VestingCurve::stepped(&many, START, END),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+        // Inverted window: the schedule's own error.
+        assert_eq!(
+            VestingCurve::stepped(&[(END, 10_000)], END, START),
+            Err(EscrowError::InvalidVesting)
+        );
+        // Tier outside the window.
+        assert_eq!(
+            VestingCurve::stepped(&[(START - 1, 10_000)], START, END),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+        assert_eq!(
+            VestingCurve::stepped(&[(END + 1, 10_000)], START, END),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+        // Non-monotone timestamps / fractions.
+        assert_eq!(
+            VestingCurve::stepped(&[(1_750_000_000, 5_000), (1_740_000_000, 10_000)], START, END),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+        assert_eq!(
+            VestingCurve::stepped(&[(1_750_000_000, 5_000), (1_760_000_000, 5_000)], START, END),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+        // Fraction above 10_000 bps.
+        assert_eq!(
+            VestingCurve::stepped(&[(END, 10_001)], START, END),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+        // Final tier below full unlock: funds that could never vest.
+        assert_eq!(
+            VestingCurve::stepped(&[(END, 9_999)], START, END),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+    }
+
+    #[test]
+    fn stepped_accepts_well_formed_tables() {
+        let c = VestingCurve::stepped(&[(START, 2_000), (1_750_000_000, 5_000), (END, 10_000)], START, END)
+            .unwrap();
+        assert_eq!(c.tier_count(), 3);
+        assert_eq!(c.tier(0), Some((START, 2_000)));
+        assert_eq!(c.tier(2), Some((END, 10_000)));
+        assert_eq!(c.tier(3), None);
+        // A single tier at end is the degenerate "cliff at end" curve.
+        let single = VestingCurve::stepped(&[(END, 10_000)], START, END).unwrap();
+        assert_eq!(single.tier_count(), 1);
+        assert_eq!(single.vested_amount(&schedule(), AMOUNT, END - 1), 0);
+        assert_eq!(single.vested_amount(&schedule(), AMOUNT, END), AMOUNT);
+    }
+
+    #[test]
+    fn exponential_generates_geometric_tiers() {
+        // Zero growth: uniform steps — the stepwise analogue of linear.
+        let c = VestingCurve::exponential(START, END, 4, 0).unwrap();
+        assert_eq!(c.tier_count(), 4);
+        assert_eq!(c.tier(0), Some((1_725_000_000, 2_500)));
+        assert_eq!(c.tier(1), Some((1_750_000_000, 5_000)));
+        assert_eq!(c.tier(2), Some((1_775_000_000, 7_500)));
+        assert_eq!(c.tier(3), Some((END, 10_000)));
+        // Positive growth: back-loaded — the first quarter unlocks
+        // less than a quarter of the funds.
+        let back = VestingCurve::exponential(START, END, 4, 10_000).unwrap();
+        let (_, bps0) = back.tier(0).unwrap();
+        assert!(bps0 < 2_500, "back-loaded: first tier under 25%, got {bps0}");
+        assert_eq!(back.tier(3), Some((END, 10_000)));
+        // Negative growth: front-loaded — the first quarter unlocks
+        // more than a quarter.
+        let front = VestingCurve::exponential(START, END, 4, -5_000).unwrap();
+        let (_, fbps0) = front.tier(0).unwrap();
+        assert!(fbps0 > 2_500, "front-loaded: first tier over 25%, got {fbps0}");
+        assert_eq!(front.tier(3), Some((END, 10_000)));
+    }
+
+    #[test]
+    fn exponential_rejects_bad_params() {
+        assert_eq!(
+            VestingCurve::exponential(START, END, 0, 0),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+        assert_eq!(
+            VestingCurve::exponential(START, END, 9, 0),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+        assert_eq!(
+            VestingCurve::exponential(END, START, 4, 0),
+            Err(EscrowError::InvalidVesting)
+        );
+        // Non-positive ratio.
+        assert_eq!(
+            VestingCurve::exponential(START, END, 4, -10_000),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+        // Overflowing ratio bound.
+        assert_eq!(
+            VestingCurve::exponential(START, END, 4, 90_001),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+        // Window shorter than the step count: no distinct timestamps.
+        assert_eq!(
+            VestingCurve::exponential(START, START + 3, 4, 0),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+    }
+
+    // ----- pricing math -----
+
+    #[test]
+    fn curve_prices_unlocks_per_tier() {
+        let s = schedule();
+        let c = VestingCurve::stepped(&[(1_750_000_000, 2_500), (END, 10_000)], START, END).unwrap();
+        assert_eq!(c.vested_amount(&s, AMOUNT, START), 0, "before first tier");
+        assert_eq!(c.vested_amount(&s, AMOUNT, 1_749_999_999), 0);
+        assert_eq!(c.vested_amount(&s, AMOUNT, 1_750_000_000), 250_000);
+        assert_eq!(c.vested_amount(&s, AMOUNT, 1_799_999_999), 250_000, "step: flat between tiers");
+        assert_eq!(c.vested_amount(&s, AMOUNT, END), AMOUNT);
+        assert_eq!(c.vested_amount(&s, AMOUNT, END + 1_000_000), AMOUNT, "clamped past end");
+    }
+
+    #[test]
+    fn curve_vested_is_monotone_and_conserving() {
+        let s = schedule();
+        let c = VestingCurve::exponential(START, END, 8, 5_000).unwrap();
+        let mut prev = 0u64;
+        let mut t = START;
+        while t <= END {
+            let v = c.vested_amount(&s, AMOUNT, t);
+            assert!(v >= prev, "monotone in now");
+            assert!(v <= AMOUNT, "never exceeds the lockup");
+            prev = v;
+            t += 1_234_567;
+        }
+        assert_eq!(c.vested_amount(&s, AMOUNT, END), AMOUNT, "fully vested at end");
+        // u64::MAX amount: exact u128 math, no overflow, exact downcast.
+        assert_eq!(c.vested_amount(&s, u64::MAX, END), u64::MAX);
+    }
+
+    #[test]
+    fn cliff_gates_the_curve_orthogonally() {
+        let cliffed = VestingSchedule::new_with_cliff(START, END, 1_750_000_000).unwrap();
+        let c = VestingCurve::stepped(&[(1_725_000_000, 5_000), (END, 10_000)], START, END).unwrap();
+        // The curve alone would have unlocked 50% by 1_725_000_000 —
+        // the cliff holds it at zero.
+        assert_eq!(c.vested_amount(&cliffed, AMOUNT, 1_725_000_000), 0);
+        assert_eq!(c.vested_amount(&cliffed, AMOUNT, 1_749_999_999), 0);
+        // At the cliff the curve value applies (no rebase, no jump).
+        assert_eq!(c.vested_amount(&cliffed, AMOUNT, 1_750_000_000), 500_000);
+    }
+
+    // ----- builder and escrow integration -----
+
+    #[test]
+    fn with_vesting_curve_requires_uninitialized_and_matching_window() {
+        let e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        // Funded escrows cannot re-fix the curve.
+        let mut funded = e;
+        funded.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let curve = VestingCurve::stepped(&[(END, 10_000)], START, END).unwrap();
+        assert_eq!(
+            funded.with_vesting_curve(schedule(), curve),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Curve built for a different window: mispricing rejected.
+        let e2 = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        let foreign = VestingCurve::stepped(&[(END + 1_000, 10_000)], START, END + 1_000).unwrap();
+        assert_eq!(
+            e2.with_vesting_curve(schedule(), foreign),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+    }
+
+    #[test]
+    fn with_vesting_clears_a_prior_curve() {
+        let curve = VestingCurve::stepped(&[(END, 10_000)], START, END).unwrap();
+        let e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_vesting_curve(schedule(), curve)
+            .unwrap();
+        assert!(e.vesting_curve().is_some());
+        // Re-attaching a plain schedule drops the curve back to linear.
+        let e = e.with_vesting(schedule()).unwrap();
+        assert_eq!(e.vesting_curve(), None);
+        assert_eq!(e.vested_amount(END - 1), 999_999, "linear again");
+    }
+
+    #[test]
+    fn escrow_vested_amount_follows_the_curve() {
+        let e = curved_escrow();
+        assert_eq!(e.vested_amount(1_749_999_999), 0);
+        assert_eq!(e.vested_amount(1_750_000_000), 250_000);
+        assert_eq!(e.vested_amount(END), AMOUNT);
+        assert_eq!(e.claimable_amount(1_750_000_000), 250_000);
+    }
+
+    #[test]
+    fn claim_pulls_the_curved_amount() {
+        let mut e = funded_curved_escrow();
+        // Curve says 25% at 1_750_000_000; linear would have paid 50%.
+        let (payout, fee) = e.claim(BOB, 1_750_000_000, None, BOB).unwrap();
+        assert_eq!(payout, 250_000);
+        assert_eq!(fee, 0);
+        assert_eq!(e.released_amount(), 250_000);
+        // Past end the remainder is claimable.
+        let (payout2, _) = e.claim(BOB, END, None, BOB).unwrap();
+        assert_eq!(payout2, 750_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn curve_and_linear_agree_without_curve() {
+        // No curve attached: the AV-13 linear math is untouched.
+        let e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(schedule())
+            .unwrap();
+        assert_eq!(e.vesting_curve(), None);
+        assert_eq!(e.vested_amount(1_750_000_000), 500_000);
+    }
+
+    #[test]
+    fn split_children_inherit_schedule_and_curve() {
+        use crate::SplitConfig;
+        let curve = VestingCurve::stepped(&[(1_750_000_000, 2_500), (END, 10_000)], START, END).unwrap();
+        let mut parent = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_vesting_curve(schedule(), curve)
+            .unwrap();
+        parent.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let config = SplitConfig {
+            vesting: Some(schedule()),
+            vesting_curve: Some(curve),
+            ..Default::default()
+        };
+        let children = parent
+            .split_escrow(ALICE, BOB, &[600_000, 400_000], config, EXPIRES_AT - 3_600)
+            .unwrap();
+        assert_eq!(children.len(), 2);
+        // 25% of each child's amount is unlocked at 1_750_000_000.
+        assert_eq!(children[0].vested_amount(1_750_000_000), 150_000);
+        assert_eq!(children[1].vested_amount(1_750_000_000), 100_000);
+        for child in &children {
+            assert_eq!(child.vesting_curve(), Some(curve));
+        }
+    }
+
+    // ----- layout -----
+
+    #[test]
+    fn curve_region_appends_last_and_encodes() {
+        use crate::account_space_tests::encode_escrow;
+        let e = curved_escrow();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        // The curve region trails the appeal ballot: discriminant 1,
+        // tier-count 2, then the two live tiers.
+        let base = ESCROW_BODY_LEN - (1 + VESTING_CURVE_LEN);
+        assert_eq!(bytes[base], 1, "curve: Some discriminant");
+        assert_eq!(bytes[base + 1], 2, "curve: tier count");
+        assert_eq!(
+            u64::from_le_bytes(bytes[base + 2..base + 10].try_into().unwrap()),
+            1_750_000_000
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[base + 10..base + 12].try_into().unwrap()),
+            2_500
+        );
+        // A curve-less escrow zero-fills the region.
+        let plain = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        let plain_bytes = encode_escrow(&plain);
+        assert_eq!(plain_bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(plain_bytes[base], 0, "curve: None discriminant");
+        assert!(plain_bytes[base + 1..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn decode_round_trips_the_curve() {
+        use crate::account_space_tests::encode_escrow;
+        use crate::discriminator::{decode_vault_account, vault_account_discriminator};
+        let e = curved_escrow();
+        let mut bytes = vault_account_discriminator().to_vec();
+        bytes.extend_from_slice(&encode_escrow(&e));
+        let decoded = decode_vault_account(&bytes).unwrap();
+        assert_eq!(decoded.vesting_curve(), e.vesting_curve());
+        assert_eq!(decoded.vested_amount(1_750_000_000), 250_000);
     }
 }
 
@@ -20769,11 +21565,12 @@ mod migrate_schema_tests {
 
     #[test]
     fn migrate_schema_moves_the_serialized_tail_byte() {
-        // AV-86: the version byte sits 26 + 49 + 258 bytes before the
-        // tail now (the appeal region, the slash region and the CPI
-        // allowlist trail it); every earlier offset stays stable, and
-        // the carry-over is still a byte-prefix copy.
-        let version_at = ESCROW_BODY_LEN - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        // AV-90: the version byte sits 82 + 26 + 49 + 258 bytes before
+        // the tail now (the vesting-curve region, the appeal region,
+        // the slash region and the CPI allowlist trail it); every
+        // earlier offset stays stable, and the carry-over is still a
+        // byte-prefix copy.
+        let version_at = ESCROW_BODY_LEN - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         let e = v0_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
@@ -21906,7 +22703,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3846, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) bytes");
+        assert_eq!(bytes.len(), 3928, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -21931,7 +22728,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 3846);
+        assert_eq!(bytes.len(), 3928);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -21953,18 +22750,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3854) * 3480 * 2 = 3982 * 6960 = 27_714_720 lamports.
-        assert_eq!(VAULT_SPACE, 3854);
-        assert_eq!(full, 27_714_720);
+        // (128 + 3936) * 3480 * 2 = 4064 * 6960 = 28_285_440 lamports.
+        assert_eq!(VAULT_SPACE, 3936);
+        assert_eq!(full, 28_285_440);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3364) * 3480 * 2 = 3492 * 6960 = 24_304_320 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3364);
-        assert_eq!(no_quorum, 24_304_320);
+        // (128 + 3446) * 3480 * 2 = 3574 * 6960 = 24_875_040 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3446);
+        assert_eq!(no_quorum, 24_875_040);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -22108,7 +22905,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3846);
+        assert_eq!(bytes.len(), 3928);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -22123,7 +22920,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 3846);
+        assert_eq!(bytes.len(), 3928);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -22154,18 +22951,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3854) * 3480 * 2 = 3982 * 6960 = 27_714_720 lamports.
-        assert_eq!(VAULT_SPACE, 3854);
-        assert_eq!(full, 27_714_720);
+        // (128 + 3936) * 3480 * 2 = 4064 * 6960 = 28_285_440 lamports.
+        assert_eq!(VAULT_SPACE, 3936);
+        assert_eq!(full, 28_285_440);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3364) * 3480 * 2 = 3492 * 6960 = 24_304_320 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3364);
-        assert_eq!(no_quorum, 24_304_320);
+        // (128 + 3446) * 3480 * 2 = 3574 * 6960 = 24_875_040 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3446);
+        assert_eq!(no_quorum, 24_875_040);
     }
 
     #[test]
@@ -23020,7 +23817,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 3846);
+        assert_eq!(bytes.len(), 3928);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -23195,7 +23992,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 3846, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region");
+        assert_eq!(ESCROW_BODY_LEN, 3928, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -23213,32 +24010,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 3854) * 3480 * 2 = 3982 * 6960 = 27_714_720 lamports.
+        // (128 + 3936) * 3480 * 2 = 4064 * 6960 = 28_285_440 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            27_714_720
+            28_285_440
         );
-        // (128 + 3364) * 3480 * 2 = 3492 * 6960 = 24_304_320 lamports.
+        // (128 + 3446) * 3480 * 2 = 3574 * 6960 = 24_875_040 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            24_304_320
+            24_875_040
         );
         // 1888 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 3854);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3364);
-        assert!(check_vault_rent_exempt(27_714_720, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 3936);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3446);
+        assert!(check_vault_rent_exempt(28_285_440, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -26065,9 +26862,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3846, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region)");
-        assert_eq!(VAULT_SPACE, 3854);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3364);
+        assert_eq!(bytes.len(), 3928, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve)");
+        assert_eq!(VAULT_SPACE, 3936);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3446);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -26611,7 +27408,7 @@ mod default_judgment_tests {
         // at 960, `default_judgment` at 968, `default_confirmed` at 985
         // (AV-55 body total 986). AV-56 appends `subscription` at 986,
         // `subscription_next` at 1004, `subscription_released` at 1005
-        // (body total 3846 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline + AV-73 per-period-table + AV-75 schema-version + AV-82 slash-region + AV-86 appeal-window appends).
+        // (body total 3928 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline + AV-73 per-period-table + AV-75 schema-version + AV-82 slash-region + AV-86 appeal-window appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter(ARBITER)
@@ -26621,7 +27418,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3846);
+        assert_eq!(bytes.len(), 3928);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -27179,7 +27976,7 @@ mod subscription_tests {
         // Offsets: `default_confirmed` ends the AV-55 body at 986;
         // `subscription` at 986, `subscription_next` at 1004,
         // `subscription_released` at 1005; the AV-73 live per-period
-        // amount table at 2933..3445 (body total 3846 after the AV-57 +
+        // amount table at 2933..3445 (body total 3928 after the AV-57 +
         // AV-59 + AV-63 + AV-64 + AV-65 + AV-66 + AV-68 + AV-73 + AV-75
         // appends).
         let mut e = escrow()
@@ -27188,7 +27985,7 @@ mod subscription_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3846);
+        assert_eq!(bytes.len(), 3928);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -27538,11 +28335,11 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82
         );
     }
 
@@ -27551,14 +28348,14 @@ mod event_history_tests {
         // Offsets: `subscription_released` ends the AV-56 body at 1013;
         // `event_head` at 1013, `event_total` at 1014, `event_count` at
         // 1022, `event_capacity` at 1023, `event_slots` at 1024 (body
-        // total 3846 after the AV-59 + AV-63 + AV-64 + AV-68 + AV-73
+        // total 3928 after the AV-59 + AV-63 + AV-64 + AV-68 + AV-73
         // + AV-75 + AV-82 + AV-83 appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3846);
+        assert_eq!(bytes.len(), 3928);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -27586,7 +28383,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26, "AV-82/AV-83/AV-84/AV-86 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82, "AV-82/AV-83/AV-84/AV-86/AV-90 tail");
     }
 
     #[test]
@@ -27601,18 +28398,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3854) * 3480 * 2 = 3982 * 6960 = 27_714_720 lamports.
-        assert_eq!(VAULT_SPACE, 3854);
-        assert_eq!(full, 27_714_720);
+        // (128 + 3936) * 3480 * 2 = 4064 * 6960 = 28_285_440 lamports.
+        assert_eq!(VAULT_SPACE, 3936);
+        assert_eq!(full, 28_285_440);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3364) * 3480 * 2 = 3492 * 6960 = 24_304_320 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3364);
-        assert_eq!(no_quorum, 24_304_320);
+        // (128 + 3446) * 3480 * 2 = 3574 * 6960 = 24_875_040 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3446);
+        assert_eq!(no_quorum, 24_875_040);
     }
 
     // ----- decode -----
@@ -28308,18 +29105,19 @@ mod fee_cap_tests {
         // +595 over the AV-64 numbers (the AV-65 arbiter-panel region)
         // + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline)
         // + 258 (AV-83 CPI target allowlist) + 67 (AV-84 multisig
-        // authority).
-        assert_eq!(ESCROW_BODY_LEN, 3846, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 3854, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3364, "no-quorum Vault account space");
+        // authority) + 26 (AV-86 appeal window region) + 82 (AV-90
+        // vesting curve).
+        assert_eq!(ESCROW_BODY_LEN, 3928, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 3936, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3446, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            27_714_720,
-            "(128 + 3854) * 3480 * 2 = 3982 * 6960"
+            28_285_440,
+            "(128 + 3936) * 3480 * 2 = 4064 * 6960"
         );
         assert_eq!(
             rent_exempt_minimum_lamports(
@@ -28327,8 +29125,8 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            24_304_320,
-            "(128 + 3364) * 3480 * 2 = 3492 * 6960"
+            24_875_040,
+            "(128 + 3446) * 3480 * 2 = 3574 * 6960"
         );
     }
 
@@ -28340,7 +29138,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3846);
+        assert_eq!(bytes.len(), 3928);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -28831,13 +29629,15 @@ mod fee_schedule_tests {
     fn fee_schedule_persists_in_serialized_layout_tail() {
         // The schedule sits just before the AV-68 evidence-deadline
         // region, the AV-73 per-period table, the AV-75
-        // schema-version byte, the AV-82 slash region, and the AV-83
-        // CPI allowlist region: every earlier offset is unchanged.
+        // schema-version byte, the AV-82 slash region, the AV-83
+        // CPI allowlist region, the AV-84 multisig authority, the
+        // AV-86 appeal region, and the AV-90 vesting-curve region:
+        // every earlier offset is unchanged.
         let e = scheduled_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3846);
-        let tail = ESCROW_BODY_LEN - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        assert_eq!(bytes.len(), 3928);
+        let tail = ESCROW_BODY_LEN - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(bytes[tail], 3, "tier_count at the tail");
         assert_eq!(
             u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
@@ -28869,10 +29669,12 @@ mod fee_schedule_tests {
         // AV-68 appended the evidence-deadline region (8 + 33 bytes),
         // AV-73 the per-period table (512 bytes), AV-75 the
         // schema-version byte (1 byte), AV-82 the slash region
-        // (41 + 8 bytes), and AV-83 the CPI allowlist region (258
-        // bytes) after the fee schedule, so the schedule no longer
+        // (41 + 8 bytes), AV-83 the CPI allowlist region (258
+        // bytes), AV-84 the multisig authority (67 bytes), AV-86 the
+        // appeal region (26 bytes), and AV-90 the vesting-curve region
+        // (82 bytes) after the fee schedule, so the schedule no longer
         // sits at the body tail.
-        let tail = ESCROW_BODY_LEN - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(
             &bytes[tail..tail + FEE_SCHEDULE_LEN],
             &[0u8; FEE_SCHEDULE_LEN],
@@ -28888,10 +29690,12 @@ mod fee_schedule_tests {
         // AV-68 appended the evidence-deadline region (8 + 33 bytes),
         // AV-73 the per-period table (512 bytes), AV-75 the
         // schema-version byte (1 byte), AV-82 the slash region
-        // (41 + 8 bytes), and AV-83 the CPI allowlist region (258
-        // bytes) after the fee schedule, so the schedule no longer
+        // (41 + 8 bytes), AV-83 the CPI allowlist region (258
+        // bytes), AV-84 the multisig authority (67 bytes), AV-86 the
+        // appeal region (26 bytes), and AV-90 the vesting-curve region
+        // (82 bytes) after the fee schedule, so the schedule no longer
         // sits at the body tail.
-        let tail = ESCROW_BODY_LEN - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         bytes[tail] = 9;
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
@@ -29224,7 +30028,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3846);
+        assert_eq!(bytes.len(), 3928);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -29440,7 +30244,8 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::InvalidCpiAllowlist));
         assert!(EscrowError::all().contains(&EscrowError::InvalidMultisigAuthority));
         assert!(EscrowError::all().contains(&EscrowError::InvalidAppealWindow));
-        assert_eq!(EscrowError::all().len(), 47);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidVestingCurve));
+        assert_eq!(EscrowError::all().len(), 48);
     }
 
     #[test]
@@ -29787,12 +30592,15 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3846);
-        // AV-83: the CPI allowlist region (258 bytes) trails the
-        // AV-82 slash region (41-byte terms + 8-byte penalty counter),
-        // which trails the schema-version byte — so the panel region
-        // ends 258 + 49 + 1 bytes before the end of the buffer.
-        let version_end = bytes.len() - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        assert_eq!(bytes.len(), 3928);
+        // AV-90: the vesting-curve region (82 bytes) now trails the
+        // AV-86 appeal region, which trails the AV-84 multisig
+        // authority; before that, the AV-83 CPI allowlist region (258
+        // bytes) trails the AV-82 slash region (41-byte terms + 8-byte
+        // penalty counter), which trails the schema-version byte — so
+        // the panel region ends 82 + 26 + 68 + 258 + 49 + 1 bytes
+        // before the end of the buffer.
+        let version_end = bytes.len() - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         // The panel region trails the AV-73 per-period amount table
         // (512 bytes), the AV-68 evidence-deadline region (41 bytes) and
         // the AV-66 fee-schedule region (81 bytes):
@@ -29845,9 +30653,9 @@ mod arbiter_panel_tests {
         assert_eq!(panel.1, "Option<ArbiterPanel>");
         assert_eq!(panel.2, 1 + ARBITER_PANEL_LEN);
         assert_eq!(panel.2, 595);
-        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86:
+        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86/AV-90:
         // every earlier field offset stays stable.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "fee_schedule");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "fee_schedule");
     }
 
     #[test]
@@ -29863,22 +30671,27 @@ mod arbiter_panel_tests {
         // AV-68 appended two fields after it, AV-73 one more, AV-75
         // the schema byte, AV-82 the slash region, AV-83 the CPI
         // allowlist, AV-84 the multisig authority, AV-86 the appeal
-        // window region: appeal_ballot is the new tail.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "evidence_deadline_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "escalated_by");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "subscription_amounts");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "schema_version");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "slash_terms");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "penalty_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 1 + CPI_ALLOWLIST_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 1 + MULTISIG_AUTHORITY_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "appeal_window_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "appeal_deadline");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "appeal_state");
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "appeal_ballot");
-        assert_eq!(VAULT_FIELDS.last().unwrap().2, APPEAL_BALLOT_LEN);
+        // window region, AV-90 the vesting curve: vesting_curve is the
+        // new tail.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "evidence_deadline_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "escalated_by");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "subscription_amounts");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "schema_version");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "slash_terms");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "penalty_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 1 + CPI_ALLOWLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 1 + MULTISIG_AUTHORITY_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "appeal_window_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "appeal_deadline");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "appeal_state");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "appeal_ballot");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, APPEAL_BALLOT_LEN);
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "vesting_curve");
+        assert_eq!(VAULT_FIELDS.last().unwrap().1, "Option<VestingCurve>");
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, 1 + VESTING_CURVE_LEN);
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, 82);
     }
 
     #[test]
@@ -30317,6 +31130,7 @@ mod split_tests {
         let plans = [plan0, plan1];
         let config = SplitConfig {
             vesting: Some(schedule),
+            vesting_curve: None,
             quorum: Some(policy),
             dual_sig: true,
             milestones: Some(&plans),
@@ -30416,7 +31230,7 @@ mod split_tests {
             .unwrap();
         assert_eq!(e.state(), EscrowState::Split);
         assert_eq!(EscrowState::Split as u8, 8, "Split appended last");
-        assert_eq!(VAULT_SPACE, 3854, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 3936, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -30724,11 +31538,11 @@ mod slash_tests {
     fn slash_terms_persist_in_serialized_tail() {
         // v3 tail: schema_version (1) + slash_terms (41) + penalty_paid (8)
         // + cpi_allowlist (258) + multisig_authority (67) + the 26-byte
-        // appeal region.
+        // appeal region + the 82-byte vesting-curve region.
         let e = slashable(1_000_000);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let base = ESCROW_BODY_LEN - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
+        let base = ESCROW_BODY_LEN - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
         assert_eq!(bytes[base], 3, "schema_version");
         assert_eq!(bytes[base + 1], 1, "slash_terms: Some");
         assert_eq!(&bytes[base + 2..base + 34], &PENALTY, "penalty account");
@@ -31150,7 +31964,7 @@ mod appeal_tests {
         e.review_appeal(M1, true).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3846);
+        assert_eq!(bytes.len(), 3928);
         // Appeal region: [3820..3846] — window (8), deadline (8), state
         // (1), ballot (9).
         assert_eq!(
@@ -31485,7 +32299,7 @@ mod cpi_allowlist_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3846);
+        assert_eq!(bytes.len(), 3928);
         assert_eq!(bytes[3495], 1, "Some discriminant");
         assert_eq!(&bytes[3496..3496 + 32], &DEX);
         assert_eq!(&bytes[3496 + 32..3496 + 64], &LENDING);
@@ -31496,11 +32310,12 @@ mod cpi_allowlist_tests {
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes[3495], 0, "None discriminant");
         assert_eq!(&bytes[3496..3496 + 257], &[0u8; 257]);
-        // The field name is the sixth-from-last VAULT_FIELDS entry
+        // The field name is the seventh-from-last VAULT_FIELDS entry
         // (AV-84 appended the multisig region after it, AV-86 the
-        // 4-field appeal region after that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 1 + CPI_ALLOWLIST_LEN);
+        // 4-field appeal region after that, AV-90 the vesting curve
+        // after that).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 1 + CPI_ALLOWLIST_LEN);
     }
 }
 
@@ -31680,7 +32495,7 @@ mod multisig_tests {
         let e = bound_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3846);
+        assert_eq!(bytes.len(), 3928);
         assert_eq!(bytes[3753], 1, "Some discriminant");
         assert_eq!(&bytes[3754..3754 + 32], &SQUADS_V4_PROGRAM_ID);
         assert_eq!(&bytes[3754 + 32..3754 + 64], &VAULT_PDA);
@@ -31694,10 +32509,11 @@ mod multisig_tests {
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes[3753], 0, "None discriminant");
         assert_eq!(&bytes[3754..3820], &[0u8; 66]);
-        // The field name is the fifth-from-last VAULT_FIELDS entry
-        // (AV-86 appended the 4-field appeal region after it).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 1 + MULTISIG_AUTHORITY_LEN);
+        // The field name is the sixth-from-last VAULT_FIELDS entry
+        // (AV-86 appended the 4-field appeal region after it, AV-90
+        // the vesting-curve region after that).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 1 + MULTISIG_AUTHORITY_LEN);
         assert_eq!(MULTISIG_AUTHORITY_LEN, 66);
     }
 
