@@ -5589,6 +5589,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidReleaseSplit => {
             error!(ErrorCode::InvalidReleaseSplit)
         }
+        escrow_state::EscrowError::GapInEventStream => {
+            error!(ErrorCode::GapInEventStream)
+        }
     }
 }
 
@@ -5690,4 +5693,6 @@ pub enum ErrorCode {
     InvalidEvidenceProof,
     #[msg("Invalid release split (AV-93): release_split with an empty share table, more than 8 recipients, a zero recipient address, a zero bps weight, or a weight table whose sum differs from 10_000 bps; a per-recipient payout-policy violation is PayoutNotAllowlisted, not this code")]
     InvalidReleaseSplit,
+    #[msg("Broken event-stream continuity (AV-94): MaterializedView::apply hit a missing seq (gap), an out-of-order or duplicate seq, or events for a different escrow_id than the view folds")]
+    GapInEventStream,
 }

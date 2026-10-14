@@ -888,7 +888,8 @@
     {"code": 147, "name": "InvalidVestingCurve"},
     {"code": 148, "name": "InvalidEvidenceProof"},
     {"code": 149, "name": "InvalidVaultSeeds"},
-    {"code": 150, "name": "InvalidReleaseSplit"}
+    {"code": 150, "name": "InvalidReleaseSplit"},
+    {"code": 151, "name": "GapInEventStream"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

@@ -51,6 +51,7 @@ No unverified claims are made about deployments, audits, or performance.
 escrow-state/               # pure-Rust state machine, zero dependencies
   src/lib.rs                # Escrow, EscrowState, EscrowError + unit tests
   src/events.rs             # AV-18: IndexedEscrow event-logging wrapper + EscrowEvent types + event_tests
+  src/event_sourcing.rs     # AV-94: event-sourced materialized fund view — per-escrow (locked, released, refunded) fold + fleet aggregate, strict seq continuity
   src/batch_close.rs        # AV-79: batch vault close — dual-party bound, filtered, failure-isolated (off-chain execution; no new on-chain instruction)
 programs/escrow-vault/      # Anchor program skeleton (on-chain part not in cargo build)
   src/program.rs            # instructions wrapping escrow-state (needs anchor-lang)
@@ -1196,6 +1197,7 @@ program error per variant):
 | `InvalidEvidenceProof` | 148 | `escalate` (AV-91) with a leaf count that does not describe the committed root (`None` root with nonzero leaves, `Some` root with zero or more than 64 leaves); `file_evidence` (AV-91) with no committed root, a leaf index past the committed leaves, a proof whose length does not match the tree shape, or a proof that does not verify against the committed root |
 | `InvalidVaultSeeds` | 149 | `VaultSeeds::new` / `derive_vault_address` (AV-92) with more than 16 seeds or a seed longer than 32 bytes (the Solana `create_program_address` limits) |
 | `InvalidReleaseSplit` | 150 | `release_split` (AV-93) with an empty share table, more than 8 recipients, a zero recipient address, a zero bps weight, or a weight table whose sum differs from 10_000 bps (a per-recipient payout-policy violation is `PayoutNotAllowlisted`, not this code) |
+| `GapInEventStream` | 151 | `MaterializedView::apply` (AV-94) with a missing `seq` (gap), an out-of-order or duplicate `seq`, or events for a different `escrow_id` than the view folds |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1654,6 +1656,26 @@ successful calls that change nothing observable:
 - `drain_events()` takes the recorded events and clears the log; the
   sequence counter keeps running, so a resuming indexer never sees
   duplicates.
+
+**Materialized fund view (AV-94).** `escrow-state/src/event_sourcing.rs`
+folds an `EscrowEvent` stream into the per-escrow fund triple
+(`locked`, `released`, `refunded`) that keeper/indexer tooling consumes,
+plus the fleet aggregate (`fold_fleet`). Every event kind maps to a
+`(Δlocked, Δreleased, Δrefunded)` delta: taker payouts book the gross
+(the AV-17 fee is internal routing — `released` matches the state
+machine's `released` counter bit-for-bit), dispute settlements split
+into taker `released` / initializer `refunded`, `EscrowSplit` re-locks
+sideways, and the AV-82 slash books nothing (the penalty has no leg in
+the triple — it stays parked inside `locked`, so the fold's `locked` is
+`remaining_amount() + penalty_paid()`). `apply` enforces strict `seq`
+continuity — a gap, an out-of-order or duplicate `seq`, or a foreign
+`escrow_id` stops the fold with `GapInEventStream` (code 151); the valid
+prefix stays applied and the caller backfills from `next_seq`. Two
+constructors: `replay` (genesis fold from an explicit funded amount —
+the `Funded` event carries none) and `from_snapshot` (snapshot base at
+`snapshot_seq` + incremental `apply`; a genesis replay and a
+snapshot+incremental run agree bit-for-bit). Pure logic, zero
+dependencies.
 
 **Anchor `emit!` mapping.** `programs/escrow-vault/src/program.rs` mirrors
 each kind: `EscrowVaultEvent` (`#[event]`) is the on-chain mirror of

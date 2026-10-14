@@ -74,6 +74,12 @@ mod templates;
 // (per-state counts, amount histogram, escrow durations, locked totals)
 // for keeper/operator dashboards, with deterministic JSON export.
 mod aggregate;
+// AV-94: event-sourced materialized fund view — fold an EscrowEvent
+// stream into the per-escrow (locked, released, refunded) triple plus
+// the fleet aggregate for keeper/indexer consumption, with strict seq
+// continuity (`GapInEventStream`) and snapshot-base + incremental
+// apply. Pure logic, zero dependencies.
+mod event_sourcing;
 #[cfg(test)]
 mod idl_json;
 #[cfg(test)]
@@ -205,6 +211,13 @@ pub use keeper::{
 // (per-state counts, amount histogram, durations, locked totals) with
 // deterministic JSON export. Purely additive.
 pub use keeper::scan_aggregate_view;
+
+// AV-94: event-sourced materialized fund view — fold an EscrowEvent
+// stream into the per-escrow (locked, released, refunded) triple
+// (`MaterializedView`) and roll per-escrow views into the fleet
+// aggregate (`fold_fleet` / `FleetFunds`) for keeper/indexer
+// consumption. Purely additive and read-only.
+pub use event_sourcing::{fold_fleet, FleetFunds, FundsTriple, MaterializedView};
 
 // AV-40: terminal-vault close sweep — scan a batch of escrows for
 // closeable (`Cancelled` / `Released` / `Settled`) vaults, group the
@@ -1484,6 +1497,19 @@ pub enum EscrowError {
     /// [`EscrowError::PayoutNotAllowlisted`], so on-chain clients keep
     /// matching one code for every allowlist rejection.
     InvalidReleaseSplit,
+    /// Broken event-stream continuity (AV-94): folding an
+    /// [`EscrowEvent`](crate::EscrowEvent) slice into a
+    /// [`MaterializedView`](crate::MaterializedView) hit a sequence
+    /// break — a missing `seq` (gap), an out-of-order `seq`, a
+    /// duplicate `seq`, or events for a different `escrow_id` than the
+    /// view folds. The fold stops at the break (the valid prefix stays
+    /// applied) and reports this code, so a keeper/indexer knows to
+    /// backfill from the view's [`MaterializedView::next_seq`](crate::MaterializedView::next_seq)
+    /// instead of trusting a silently gappy aggregate. One code (151)
+    /// for the whole family — paralleling
+    /// [`EscrowError::InvalidReleaseSplit`]'s one-code convention, and
+    /// never renumbered (see [`EscrowError::code`]).
+    GapInEventStream,
 }
 
 impl EscrowError {
@@ -1547,6 +1573,7 @@ impl EscrowError {
             EscrowError::InvalidEvidenceProof => 148,
             EscrowError::InvalidVaultSeeds => 149,
             EscrowError::InvalidReleaseSplit => 150,
+            EscrowError::GapInEventStream => 151,
         }
     }
 
@@ -1604,6 +1631,7 @@ impl EscrowError {
             EscrowError::InvalidEvidenceProof,
             EscrowError::InvalidVaultSeeds,
             EscrowError::InvalidReleaseSplit,
+            EscrowError::GapInEventStream,
         ]
     }
 }
@@ -16517,6 +16545,11 @@ mod error_code_tests {
             150,
             "release_split with an empty share table, more than 8 recipients, a zero recipient address, a zero bps weight, or a weight table whose sum differs from 10_000 bps (a per-recipient payout-policy violation is PayoutNotAllowlisted, not this code)",
         ),
+        (
+            EscrowError::GapInEventStream,
+            151,
+            "MaterializedView::apply with a missing seq (gap), an out-of-order or duplicate seq, or events for a different escrow_id than the view folds (AV-94)",
+        ),
     ];
 
     #[test]
@@ -31395,6 +31428,8 @@ mod arbiter_panel_tests {
         assert_eq!(EscrowError::InvalidCpiAllowlist.code(), 144);
         // AV-93: appended, never renumbered.
         assert_eq!(EscrowError::InvalidReleaseSplit.code(), 150);
+        // AV-94: appended, never renumbered.
+        assert_eq!(EscrowError::GapInEventStream.code(), 151);
         // never-renumber: the full table still pins every code, and
         // `all()` covers the new variants (the AV-46 lesson: a missing
         // variant drifts the IDL error pin).
@@ -31414,7 +31449,8 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::InvalidEvidenceProof));
         assert!(EscrowError::all().contains(&EscrowError::InvalidVaultSeeds));
         assert!(EscrowError::all().contains(&EscrowError::InvalidReleaseSplit));
-        assert_eq!(EscrowError::all().len(), 51);
+        assert!(EscrowError::all().contains(&EscrowError::GapInEventStream));
+        assert_eq!(EscrowError::all().len(), 52);
     }
 
     #[test]
