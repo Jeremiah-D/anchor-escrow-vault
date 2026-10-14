@@ -23,6 +23,13 @@
 //! - **Account metas** mirror the bundle's *logical* accounts
 //!   (`vault` / `initializer` / `mint`) in program-declared order,
 //!   translated 1:1 into `is_signer` / `is_writable` flags.
+//! - **Compute-budget instructions** (AV-89) are hand-serialized too:
+//!   `setComputeUnitLimit` → `0x02 || units:u32 LE` (5 bytes),
+//!   `setComputeUnitPrice` → `0x03 || micro_lamports:u64 LE` (9 bytes)
+//!   — the Solana compute-budget program's Borsh-enum layout. The
+//!   program id stays caller-supplied (same convention as the program
+//!   instructions above); the keeper feeds the AV-88 CU estimate into
+//!   the limit and the AV-89 oracle recommendation into the price.
 //! - **The message** is a genuine Solana legacy transaction message:
 //!   3-byte header, compact-u16-prefixed account keys in canonical order
 //!   (writable signers, readonly signers, writable non-signers, readonly
@@ -201,6 +208,68 @@ pub fn instruction_for_action(
         accounts,
         data,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Compute-budget instructions (AV-89).
+// ---------------------------------------------------------------------------
+
+/// Solana compute-budget program instruction discriminant for
+/// `SetComputeUnitLimit(units: u32)`: `0x02 || units:u32 LE`
+/// (5 bytes). The program's instructions are a Borsh enum, so the
+/// variant index serializes as one little-endian byte.
+pub const COMPUTE_BUDGET_IX_SET_COMPUTE_UNIT_LIMIT: u8 = 2;
+
+/// Solana compute-budget program instruction discriminant for
+/// `SetComputeUnitPrice(micro_lamports: u64)`: `0x03 ||
+/// micro_lamports:u64 LE` (9 bytes).
+pub const COMPUTE_BUDGET_IX_SET_COMPUTE_UNIT_PRICE: u8 = 3;
+
+/// Build the `setComputeUnitLimit` instruction data for the compute
+/// budget program: the AV-88 CU estimate (`estimated_compute_units`)
+/// becomes the transaction's compute-unit cap.
+///
+/// Layout (hand-written, zero dependencies): `0x02 || units:u32 LE`.
+/// The program id is caller-supplied — the keeper passes the cluster's
+/// compute-budget program id (`ComputeBudget111111111111111111111111111111`
+/// on mainnet), per this module's "program id is caller-supplied"
+/// convention. Compute-budget instructions carry no accounts, and
+/// conventionally precede the program instructions in the message.
+pub fn compute_budget_set_compute_unit_limit(
+    program_id: Pubkey,
+    units: u32,
+) -> ProgramInstruction {
+    let mut data = Vec::with_capacity(5);
+    data.push(COMPUTE_BUDGET_IX_SET_COMPUTE_UNIT_LIMIT);
+    data.extend_from_slice(&units.to_le_bytes());
+    ProgramInstruction {
+        program_id,
+        accounts: Vec::new(),
+        data,
+    }
+}
+
+/// Build the `setComputeUnitPrice` instruction data for the compute
+/// budget program: the AV-89 priority-fee oracle's recommendation
+/// (micro-lamports per compute unit) becomes the transaction's
+/// priority fee.
+///
+/// Layout (hand-written, zero dependencies): `0x03 ||
+/// micro_lamports:u64 LE`. Same caller-supplied program id and
+/// account-free convention as
+/// [`compute_budget_set_compute_unit_limit`].
+pub fn compute_budget_set_compute_unit_price(
+    program_id: Pubkey,
+    micro_lamports_per_cu: u64,
+) -> ProgramInstruction {
+    let mut data = Vec::with_capacity(9);
+    data.push(COMPUTE_BUDGET_IX_SET_COMPUTE_UNIT_PRICE);
+    data.extend_from_slice(&micro_lamports_per_cu.to_le_bytes());
+    ProgramInstruction {
+        program_id,
+        accounts: Vec::new(),
+        data,
+    }
 }
 
 /// Compile one instruction into a legacy transaction message.
@@ -1657,5 +1726,64 @@ mod tx_message_tests {
         let legacy_b64 = signable_message_base64(PROGRAM_ID, action, BLOCKHASH).unwrap();
         let legacy = decode_message(&decode_base64(&legacy_b64).unwrap()).unwrap();
         assert!(legacy.account_keys.len() > msg.static_account_keys.len());
+    }
+
+    // ------------------------------------------------------------------
+    // AV-89: compute-budget instruction data assembly.
+    // ------------------------------------------------------------------
+
+    /// `setComputeUnitLimit` is the Borsh enum variant 2 with a u32
+    /// payload: 200_000 = 0x30D40 → LE bytes 40 0D 03 00.
+    #[test]
+    fn compute_budget_limit_layout_is_byte_exact() {
+        let ix = compute_budget_set_compute_unit_limit(PROGRAM_ID, 200_000);
+        assert_eq!(ix.program_id, PROGRAM_ID);
+        assert!(ix.accounts.is_empty());
+        assert_eq!(ix.data, vec![0x02, 0x40, 0x0D, 0x03, 0x00]);
+    }
+
+    /// `setComputeUnitPrice` is the Borsh enum variant 3 with a u64
+    /// payload: 5_000 = 0x1388 → LE bytes 88 13 00….
+    #[test]
+    fn compute_budget_price_layout_is_byte_exact() {
+        let ix = compute_budget_set_compute_unit_price(PROGRAM_ID, 5_000);
+        assert_eq!(ix.program_id, PROGRAM_ID);
+        assert!(ix.accounts.is_empty());
+        assert_eq!(
+            ix.data,
+            vec![0x03, 0x88, 0x13, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    /// The two builders compose with the real pipeline: the AV-88 CU
+    /// estimate feeds the limit, the AV-89 oracle recommendation feeds
+    /// the price, and both compile into a well-formed message ahead of
+    /// the program instruction.
+    #[test]
+    fn compute_budget_instructions_compile_into_message() {
+        use crate::priority_fee::{
+            fee_budget_lamports, PriorityFeeConfig, PriorityFeeOracle,
+        };
+
+        let mut oracle = PriorityFeeOracle::new(PriorityFeeConfig::default());
+        for s in [800u64, 1_200, 1_000, 1_100] {
+            oracle.observe(s);
+        }
+        // 4 < 20 samples: still the flagged fallback — the dry-run
+        // report must say so rather than silently use a thin EWMA.
+        let rec = oracle.recommend();
+        assert!(rec.fallback);
+
+        let limit_ix = compute_budget_set_compute_unit_limit(PROGRAM_ID, 200_000);
+        let price_ix =
+            compute_budget_set_compute_unit_price(PROGRAM_ID, rec.recommended_micro_lamports_per_cu);
+        for ix in [&limit_ix, &price_ix] {
+            let msg = compile_message(ix, BLOCKHASH);
+            assert_eq!(msg.account_keys, vec![PROGRAM_ID]);
+            assert_eq!(msg.instructions.len(), 1);
+        }
+        // The full fee budget line the dry-run report would show:
+        // 200_000 CU × 10_000 micro-lamports/CU = 2_000 lamports.
+        assert_eq!(fee_budget_lamports(200_000, rec.recommended_micro_lamports_per_cu), 2_000);
     }
 }

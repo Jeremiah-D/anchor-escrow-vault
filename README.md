@@ -2517,6 +2517,52 @@ base64 for a multisig or CLI to sign and submit.
   bytes against a golden vector, base64 against RFC 4648 vectors, and
   bundle-JSON ↔ message agreement end to end.
 
+## Priority-fee oracle (AV-89)
+
+`escrow-state/src/priority_fee.rs` closes the cost loop the AV-88 CU
+estimate opened: the keeper now gets a **recommended priority fee in
+micro-lamports per compute unit**, estimated from the recent
+prioritization-fee samples it feeds in (e.g. from the cluster's
+`getRecentPrioritizationFees` RPC).
+
+- **EWMA estimator, configurable**: `PriorityFeeOracle` smooths samples
+  with `ewmaₙ = α·xₙ + (1−α)·ewmaₙ₋₁` — O(1) state, no sample buffer.
+  `window` (minimum trusted samples) and `alpha` (decay /
+  responsiveness) are operator-tunable via `PriorityFeeConfig`
+  (validated: `window ≥ 1`, `α ∈ (0, 1]`); defaults are starting
+  points, not production tuning.
+- **Recommendation + confidence**: `recommend()` returns
+  `⌈ewma⌉` (rounded *up*, so the suggestion never sits below the
+  estimated mean) with `confidence: High` once `samples ≥ window`.
+  Below the window it emits the configured conservative fixed value
+  with `confidence: Low` and `fallback: true` — downstream can never
+  mistake a fallback for a measurement.
+- **Compute-budget passthrough** (`tx_message.rs`):
+  `compute_budget_set_compute_unit_limit` (`0x02 || units:u32 LE`) and
+  `compute_budget_set_compute_unit_price` (`0x03 || micro_lamports:u64
+  LE`) hand-serialize the Solana compute-budget program's Borsh-enum
+  layout, byte-exact and pinned by tests. The program id stays
+  caller-supplied (same convention as the program instructions); the
+  keeper feeds the AV-88 CU estimate into the limit and the oracle
+  recommendation into the price, ahead of the program instructions in
+  the message.
+- **Bundle dry-run passthrough**: `ExecutionBundle::with_priority_fee`
+  stamps the oracle's recommendation onto the bundle; the dry-run JSON
+  carries it as `"estimated_priority_fee":
+  {"micro_lamports_per_cu":N,"confidence":"high","fallback":false}`
+  (or `null` when unstamped) — the fee line paired with the AV-88 CU
+  passthrough.
+- **Full fee budget**: `fee_budget_lamports(estimated_cu,
+  micro_lamports_per_cu)` combines the AV-88 estimate with the
+  recommendation — `⌈cu × micro / 1_000_000⌉` lamports, u128
+  intermediate (no overflow), saturating.
+- **Honest limitations**: the oracle estimates the *mean recent price*,
+  not inclusion probability — a `High`-confidence recommendation can
+  still stall in a sudden congestion spike. Fetching and cleaning the
+  fee feed (polling cadence, slot window, outlier filtering) is keeper
+  wiring outside this crate, and the defaults must be calibrated
+  against the operator's own feed before sizing real transactions.
+
 ## Payout destination allowlist (AV-49)
 
 A taker payout is only as safe as its destination. `release`, `claim`,

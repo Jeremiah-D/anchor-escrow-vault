@@ -50,6 +50,13 @@ mod tx_message;
 // batch aggregation, and over-limit warnings against the per-transaction
 // compute budget. Pure logic, zero dependencies.
 mod cu_estimate;
+// AV-89: priority-fee oracle — keeper-side recent-prioritization-fees
+// EWMA estimator (configurable window/decay, micro-lamports/CU
+// recommendation + confidence, conservative flagged fallback), the
+// AV-88 fee-budget combination (`fee_budget_lamports`), and the
+// compute-budget instruction data assembly the bundle dry-run report
+// passes through (see `tx_message`). Pure logic, zero dependencies.
+mod priority_fee;
 // AV-72: escrow configuration templates — one-call constructors for the
 // four canonical escrow compositions (auction, milestone-plan,
 // subscription, arbitrated-dispute) with template-level combination
@@ -314,6 +321,11 @@ pub use tx_message::{
     instruction_for_action, signable_message_base64, signable_message_v0_base64,
     AddressTableLookup, CompiledInstruction, MessageHeader, ProgramInstruction,
     TransactionMessage, TxMessageError, V0TransactionMessage,
+    // AV-89: compute-budget instruction data assembly — the passthrough
+    // for the AV-88 CU estimate (limit) and the AV-89 oracle
+    // recommendation (price) into a submittable transaction.
+    compute_budget_set_compute_unit_limit, compute_budget_set_compute_unit_price,
+    COMPUTE_BUDGET_IX_SET_COMPUTE_UNIT_LIMIT, COMPUTE_BUDGET_IX_SET_COMPUTE_UNIT_PRICE,
 };
 
 // AV-88: compute-unit budget estimation — the single-source cost model
@@ -324,6 +336,17 @@ pub use cu_estimate::{
     check_compute_budget, estimate_instruction_cu, instruction_cu_base, instruction_data_bytes,
     ComputeBudgetWarning, CU_MAX_PER_TRANSACTION, CU_PER_ACCOUNT, CU_PER_DATA_BYTE,
     CU_PER_SIGNATURE, INSTRUCTION_CU_TABLE,
+};
+
+// AV-89: priority-fee oracle — keeper-side recent-prioritization-fees
+// EWMA estimator (configurable window/decay), micro-lamports/CU
+// recommendation + confidence with a flagged conservative fallback,
+// and the AV-88 fee-budget combination. Heuristic price estimate, not
+// an inclusion guarantee; see the module docs.
+pub use priority_fee::{
+    fee_budget_lamports, Confidence, PriorityFeeConfig, PriorityFeeConfigError,
+    PriorityFeeOracle, PriorityFeeRecommendation, DEFAULT_ALPHA, DEFAULT_FALLBACK_MICRO_LAMPORTS_PER_CU,
+    DEFAULT_WINDOW, MICRO_LAMPORTS_PER_LAMPORT,
 };
 
 // AV-78: escrow aggregate statistics view — read-only fleet rollup

@@ -84,6 +84,7 @@
 
 use super::batch::{BatchAccount, BatchActionKind, BatchItemOutcome, BatchReport};
 use super::discriminator::instruction_discriminator;
+use super::priority_fee::PriorityFeeRecommendation;
 use std::collections::BTreeMap;
 
 /// Render 32 bytes as 64 lowercase hex characters.
@@ -265,12 +266,30 @@ pub struct ExecutionBundle {
     pub at: u64,
     /// How many items the underlying scan covered.
     pub scanned: usize,
+    /// AV-89: the priority-fee recommendation the caller stamped onto
+    /// the bundle (the keeper's
+    /// [`PriorityFeeOracle`](super::priority_fee::PriorityFeeOracle)
+    /// output) — the dry-run report's fee line, paired with the AV-88
+    /// CU passthrough (`action_count` and the per-action CU estimates
+    /// the submitter derives). `None` when the caller stamped nothing;
+    /// the JSON renders it as `null` (the same `Option` convention as
+    /// `mint`).
+    pub estimated_priority_fee: Option<PriorityFeeRecommendation>,
 }
 
 impl ExecutionBundle {
     /// Number of executable instructions in the bundle.
     pub fn action_count(&self) -> usize {
         self.actions.len()
+    }
+
+    /// Stamp the priority-fee recommendation onto the bundle (builder
+    /// style — [`bundle_execution`] leaves it `None`; the keeper calls
+    /// this with its oracle's [`recommend`](super::priority_fee::PriorityFeeOracle::recommend)
+    /// output before handing the bundle JSON to the signer).
+    pub fn with_priority_fee(mut self, fee: PriorityFeeRecommendation) -> Self {
+        self.estimated_priority_fee = Some(fee);
+        self
     }
 
     /// Hand-serialized JSON (the crate is dependency-free). Deterministic
@@ -289,8 +308,13 @@ impl ExecutionBundle {
     ///                 "signer":false,"writable":true,"alt_index":0}],
     ///    "reason":"not_created"}],
     ///  "action_count":1,"alt_table":["01…"],
-    ///  "at":1750000000,"scanned":2}
+    ///  "at":1750000000,"scanned":2,"estimated_priority_fee":
+    ///  {"micro_lamports_per_cu":1200,"confidence":"high","fallback":false}}
     /// ```
+    ///
+    /// `estimated_priority_fee` renders as `null` when the caller
+    /// stamped no recommendation (see
+    /// [`ExecutionBundle::with_priority_fee`]).
     pub fn to_json(&self) -> String {
         let mut s = String::with_capacity(256 + self.actions.len() * 640);
         s.push_str("{\"bundle_id\":\"");
@@ -362,6 +386,13 @@ impl ExecutionBundle {
         s.push_str(&self.at.to_string());
         s.push_str(",\"scanned\":");
         s.push_str(&self.scanned.to_string());
+        // AV-89: the dry-run report's fee line — the caller's stamped
+        // priority-fee recommendation, or null when none was stamped.
+        s.push_str(",\"estimated_priority_fee\":");
+        match &self.estimated_priority_fee {
+            Some(fee) => s.push_str(&fee.to_json()),
+            None => s.push_str("null"),
+        }
         s.push('}');
         s
     }
@@ -425,6 +456,9 @@ pub fn bundle_execution(report: &BatchReport) -> Vec<ExecutionBundle> {
             alt_table: report.alt_table.clone(),
             at: report.at,
             scanned: report.scanned,
+            // AV-89: the keeper stamps its oracle recommendation via
+            // `with_priority_fee` — the bundler itself stays fee-free.
+            estimated_priority_fee: None,
         })
         .collect()
 }
@@ -789,7 +823,7 @@ mod execution_bundle_tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         let expected = format!(
-            "{{\"bundle_id\":\"bundle-0\",\"mint\":null,\"caller\":\"{}\",\"caller_role\":\"initializer\",\"actions\":[{{\"escrow_id\":\"{}\",\"instruction\":\"initialize\",\"discriminator\":\"{}\",\"caller_role\":\"initializer\",\"args\":{{\"taker\":\"{}\",\"amount\":1000000,\"expires_at\":1800000000}},\"accounts\":[{{\"pubkey\":\"{}\",\"role\":\"vault\",\"signer\":false,\"writable\":true,\"alt_index\":0}},{{\"pubkey\":\"{}\",\"role\":\"initializer\",\"signer\":true,\"writable\":true,\"alt_index\":null}}],\"reason\":\"not_created\"}}],\"action_count\":1,\"alt_table\":[\"{}\"],\"at\":1750000000,\"scanned\":1}}",
+            "{{\"bundle_id\":\"bundle-0\",\"mint\":null,\"caller\":\"{}\",\"caller_role\":\"initializer\",\"actions\":[{{\"escrow_id\":\"{}\",\"instruction\":\"initialize\",\"discriminator\":\"{}\",\"caller_role\":\"initializer\",\"args\":{{\"taker\":\"{}\",\"amount\":1000000,\"expires_at\":1800000000}},\"accounts\":[{{\"pubkey\":\"{}\",\"role\":\"vault\",\"signer\":false,\"writable\":true,\"alt_index\":0}},{{\"pubkey\":\"{}\",\"role\":\"initializer\",\"signer\":true,\"writable\":true,\"alt_index\":null}}],\"reason\":\"not_created\"}}],\"action_count\":1,\"alt_table\":[\"{}\"],\"at\":1750000000,\"scanned\":1,\"estimated_priority_fee\":null}}",
             hex_of(0xAA),
             hex_of(0x01),
             disc,
@@ -799,5 +833,42 @@ mod execution_bundle_tests {
             hex_of(0x01),
         );
         assert_eq!(json, expected);
+    }
+
+    /// AV-89: the bundle dry-run report passes through the caller's
+    /// stamped priority-fee recommendation — the fee line the signer
+    /// pairs with the AV-88 CU passthrough. Unstamped bundles render
+    /// `null` (pinned above); stamping never disturbs the rest of the
+    /// JSON, and stamping is deterministic.
+    #[test]
+    fn priority_fee_passthrough_renders_in_json() {
+        use crate::priority_fee::{Confidence, PriorityFeeConfig, PriorityFeeOracle};
+
+        let mut oracle = PriorityFeeOracle::new(PriorityFeeConfig::default());
+        for s in [900u64, 1_100, 1_000, 1_050] {
+            oracle.observe(s);
+        }
+        // Thin sample count: the flagged fallback, not a silent EWMA.
+        let rec = oracle.recommend();
+        assert_eq!(rec.confidence, Confidence::Low);
+        assert!(rec.fallback);
+
+        let bundles = bundle_execution(&scan_batch_lifecycle(&[watch(ID1, None, ALICE)], NOW));
+        assert_eq!(bundles.len(), 1);
+        let stamped = bundles[0].clone().with_priority_fee(rec);
+        let json = stamped.to_json();
+        let want = format!(
+            "\"estimated_priority_fee\":{{\"micro_lamports_per_cu\":{},\"confidence\":\"low\",\"fallback\":true}}",
+            rec.recommended_micro_lamports_per_cu
+        );
+        assert!(json.contains(&want), "fee line missing: {json}");
+        // Deterministic: same stamp, same bytes.
+        assert_eq!(json, bundles[0].clone().with_priority_fee(rec).to_json());
+        // The stamp touches only the fee line.
+        let unstamped = bundles[0].to_json();
+        assert_eq!(
+            json.replace(&want, "\"estimated_priority_fee\":null"),
+            unstamped
+        );
     }
 }
