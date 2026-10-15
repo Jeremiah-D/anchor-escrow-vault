@@ -670,7 +670,8 @@
           {"name": "vesting_curve", "type": {"option": {"defined": "VestingCurve"}}, "offset": 3854},
           {"name": "evidence_root", "type": {"option": {"array": ["u8", 32]}}, "offset": 3936},
           {"name": "evidence_leaves", "type": "u8", "offset": 3969},
-          {"name": "evidence_disclosed", "type": "u64", "offset": 3970}
+          {"name": "evidence_disclosed", "type": "u64", "offset": 3970},
+          {"name": "basket", "type": {"option": {"defined": "BasketLegs"}}, "offset": 3978}
         ]
       }
     }
@@ -835,6 +836,27 @@
           {"name": "votes", "type": {"array": ["u8", 8]}, "offset": 1}
         ]
       }
+    },
+    {
+      "name": "BasketLeg",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "mint", "type": "publicKey", "offset": 0},
+          {"name": "amount", "type": "u64", "offset": 32},
+          {"name": "released", "type": "u64", "offset": 40}
+        ]
+      }
+    },
+    {
+      "name": "BasketLegs",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "legs", "type": {"array": [{"defined": "BasketLeg"}, 8]}, "offset": 0},
+          {"name": "len", "type": "u8", "offset": 384}
+        ]
+      }
     }
   ],
   "errors": [
@@ -889,7 +911,8 @@
     {"code": 148, "name": "InvalidEvidenceProof"},
     {"code": 149, "name": "InvalidVaultSeeds"},
     {"code": 150, "name": "InvalidReleaseSplit"},
-    {"code": 151, "name": "GapInEventStream"}
+    {"code": 151, "name": "GapInEventStream"},
+    {"code": 152, "name": "InvalidBasket"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

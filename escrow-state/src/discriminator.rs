@@ -36,16 +36,16 @@
 //! the result.
 
 use super::{
-    sha256, AppealBallot, AppealState, ArbiterPanel, CpiAllowlist, DefaultJudgment, Escrow,
-    EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier, MilestonePlan,
-    MultisigAuthority, PanelVote, PayoutAllowlist, QuorumPolicy, SlashTerms, SubscriptionSchedule,
-    VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN, APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN,
-    CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN,
-    MAX_ATTESTORS, MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES,
-    MAX_PANEL_MEMBERS, MAX_PAYOUT_ALLOWLIST, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
-    MILESTONE_PLAN_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN,
-    QUORUM_POLICY_LEN, SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE,
-    VESTING_CURVE_LEN,
+    sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, CpiAllowlist,
+    DefaultJudgment, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
+    MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, QuorumPolicy, SlashTerms,
+    SubscriptionSchedule, VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
+    APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
+    ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
+    MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS,
+    MAX_PAYOUT_ALLOWLIST, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS, MILESTONE_PLAN_LEN,
+    MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN,
+    SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE, VESTING_CURVE_LEN,
 };
 
 /// Program-side `#[account]` type names, in Anchor IDL order. The single
@@ -115,6 +115,14 @@ pub enum AccountDecodeError {
     /// the accessors cannot safely read (AV-83; AV-32 panic-free
     /// guarantee).
     InvalidCpiAllowlistLen(u8),
+    /// A present multi-mint basket's leg count is outside `1..=8`
+    /// ([`MAX_BASKET_LEGS`](crate::MAX_BASKET_LEGS)). The count byte
+    /// is part of the field's layout — an out-of-range count would
+    /// make [`BasketLegs::as_slice`](crate::BasketLegs::as_slice)
+    /// read past the live slots, so the decoder rejects it rather
+    /// than decoding a value the accessors cannot safely read
+    /// (AV-95; AV-32 panic-free guarantee).
+    InvalidBasketLegsLen(u8),
     /// An event-history slot's kind byte is not a known
     /// [`EscrowEventKind`] discriminant (0–32). The mapping is pinned
     /// by test to declaration order (AV-57).
@@ -823,6 +831,41 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     };
     let evidence_leaves = c.u8()?;
     let evidence_disclosed = c.u64_le()?;
+    // AV-95: the multi-mint basket leg table, always reserved like
+    // `quorum`: the `None` discriminant followed by the zeroed leg
+    // region, or the `Some` discriminant, the live leg-count byte,
+    // and the eight fixed 48-byte leg slots (32-byte mint + u64
+    // locked amount + u64 released-so-far). Structural decode only —
+    // the table invariants are enforced by `BasketLegs::new`, not
+    // re-litigated here.
+    let basket = if c.option_present("basket")? {
+        let len = c.u8()?;
+        if len == 0 || len as usize > MAX_BASKET_LEGS {
+            return Err(AccountDecodeError::InvalidBasketLegsLen(len));
+        }
+        let mut legs = [BasketLeg {
+            mint: [0u8; 32],
+            amount: 0,
+            released: 0,
+        }; MAX_BASKET_LEGS];
+        for leg in legs.iter_mut() {
+            let mut mint = [0u8; 32];
+            for byte in mint.iter_mut() {
+                *byte = c.u8()?;
+            }
+            let amount = c.u64_le()?;
+            let released = c.u64_le()?;
+            *leg = BasketLeg {
+                mint,
+                amount,
+                released,
+            };
+        }
+        Some(BasketLegs { legs, len })
+    } else {
+        c.skip(BASKET_LEGS_LEN)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -969,6 +1012,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         evidence_root,
         evidence_leaves,
         evidence_disclosed,
+        // AV-95: the multi-mint basket leg table rides the decode so a
+        // decoded escrow carries the same leg table the live one had.
+        basket,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

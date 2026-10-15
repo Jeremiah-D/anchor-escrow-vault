@@ -1046,6 +1046,17 @@ pub struct Escrow {
     /// audit trail the judgment weight can be checked against.
     /// Persisted (8 bytes). Appended last.
     evidence_disclosed: u64,
+    /// AV-95: the multi-mint basket leg table (see [`BasketLegs`]):
+    /// one escrow holding up to [`MAX_BASKET_LEGS`] SPL mints, each
+    /// leg independently locked. `None` means a plain single-amount
+    /// escrow (backward compatible). The escrow-level `amount` is
+    /// the Σ over the legs and `released` the Σ over the legs'
+    /// released counters, so aggregation, snapshots and the event
+    /// fold keep their single-amount semantics. Persisted (1-byte
+    /// discriminant + 1-byte leg count + 8 fixed 48-byte leg slots,
+    /// zeroed when `None`). Appended last so every earlier field
+    /// offset stays stable.
+    basket: Option<BasketLegs>,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -1510,6 +1521,14 @@ pub enum EscrowError {
     /// [`EscrowError::InvalidReleaseSplit`]'s one-code convention, and
     /// never renumbered (see [`EscrowError::code`]).
     GapInEventStream,
+    /// Invalid multi-mint basket configuration (AV-95):
+    /// [`BasketLegs::new`] with an empty leg table, more than
+    /// [`MAX_BASKET_LEGS`] legs, a zero mint, a zero leg amount, a
+    /// duplicate mint, or a Σ leg amount overflowing `u64`. One code
+    /// (152) for the whole family, paralleling
+    /// [`EscrowError::GapInEventStream`]'s one-code convention, and
+    /// never renumbered (see [`EscrowError::code`]).
+    InvalidBasket,
 }
 
 impl EscrowError {
@@ -1574,6 +1593,7 @@ impl EscrowError {
             EscrowError::InvalidVaultSeeds => 149,
             EscrowError::InvalidReleaseSplit => 150,
             EscrowError::GapInEventStream => 151,
+            EscrowError::InvalidBasket => 152,
         }
     }
 
@@ -1632,6 +1652,7 @@ impl EscrowError {
             EscrowError::InvalidVaultSeeds,
             EscrowError::InvalidReleaseSplit,
             EscrowError::GapInEventStream,
+            EscrowError::InvalidBasket,
         ]
     }
 }
@@ -1760,6 +1781,131 @@ impl PayoutAllowlist {
     /// True when `addr` is allowlisted.
     pub fn contains(&self, addr: &[u8; 32]) -> bool {
         self.as_slice().contains(addr)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AV-95: multi-mint basket escrow.
+// ---------------------------------------------------------------------------
+
+/// Maximum number of legs in a [`BasketLegs`] (AV-95). Fixed-size so
+/// the crate stays heap-free and `Copy`.
+pub const MAX_BASKET_LEGS: usize = 8;
+
+/// Serialized length of one [`BasketLeg`]: the 32-byte SPL mint, the
+/// u64 locked amount, and the u64 released-so-far counter.
+pub const BASKET_LEG_LEN: usize = 32 + 8 + 8;
+
+/// Serialized length of [`BasketLegs`]: the one-byte live leg count
+/// plus the fixed leg slots (`len` is `1..=8` — enforced by the
+/// builder, so a `Some` basket is never empty).
+pub const BASKET_LEGS_LEN: usize = 1 + MAX_BASKET_LEGS * BASKET_LEG_LEN;
+
+/// Serialized length of the vault's `basket` region: the `Option`
+/// discriminant byte plus [`BASKET_LEGS_LEN`]. The region is always
+/// reserved (zeroed when `None`) so a basket can be attached in
+/// place without reallocating.
+pub const BASKET_REGION_LEN: usize = 1 + BASKET_LEGS_LEN;
+
+/// One leg of a multi-mint basket escrow (AV-95): an SPL mint plus the
+/// amount locked in that mint. Each leg settles independently — one
+/// mint, one amount — while the escrow-level `amount` / `released`
+/// fields stay the Σ over the legs so fleet aggregation, snapshots
+/// and the event fold keep their single-amount semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BasketLeg {
+    /// The SPL mint this leg locks.
+    pub mint: [u8; 32],
+    /// The amount locked in this mint (`> 0`).
+    pub amount: u64,
+    /// The amount of this leg already released (`<= amount`).
+    /// A settled leg carries `released == amount`.
+    pub released: u64,
+}
+
+/// The multi-mint leg table of a basket escrow (AV-95). Fixed-size so
+/// the crate stays heap-free and `Copy`; only `legs[..len as usize]`
+/// are meaningful, the tail is zeroed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BasketLegs {
+    /// The leg slots; only `legs[..len as usize]` are meaningful.
+    pub legs: [BasketLeg; MAX_BASKET_LEGS],
+    /// How many legs are live (`1..=8`).
+    pub len: u8,
+}
+
+impl BasketLegs {
+    /// Build from `(mint, amount)` pairs, validating the whole table
+    /// (AV-95): non-empty, at most [`MAX_BASKET_LEGS`] legs, no zero
+    /// mint, no zero amount, no duplicate mint (one leg per mint —
+    /// two legs on the same mint would double-lock without a
+    /// settlement order), and a Σ that fits in a `u64` (the
+    /// escrow-level `amount` field). Every violation is
+    /// [`EscrowError::InvalidBasket`].
+    pub fn new(legs: &[([u8; 32], u64)]) -> Result<Self, EscrowError> {
+        if legs.is_empty() || legs.len() > MAX_BASKET_LEGS {
+            return Err(EscrowError::InvalidBasket);
+        }
+        let mut total: u128 = 0;
+        for (i, (mint, amount)) in legs.iter().enumerate() {
+            if *mint == [0u8; 32] {
+                return Err(EscrowError::InvalidBasket);
+            }
+            if *amount == 0 {
+                return Err(EscrowError::InvalidBasket);
+            }
+            for (other_mint, _) in &legs[..i] {
+                if other_mint == mint {
+                    return Err(EscrowError::InvalidBasket);
+                }
+            }
+            total = total
+                .checked_add(*amount as u128)
+                .ok_or(EscrowError::InvalidBasket)?;
+        }
+        if total > u64::MAX as u128 {
+            return Err(EscrowError::InvalidBasket);
+        }
+        let mut out = [BasketLeg {
+            mint: [0u8; 32],
+            amount: 0,
+            released: 0,
+        }; MAX_BASKET_LEGS];
+        for (i, (mint, amount)) in legs.iter().enumerate() {
+            out[i] = BasketLeg {
+                mint: *mint,
+                amount: *amount,
+                released: 0,
+            };
+        }
+        Ok(Self {
+            legs: out,
+            len: legs.len() as u8,
+        })
+    }
+
+    /// The live legs.
+    pub fn as_slice(&self) -> &[BasketLeg] {
+        &self.legs[..self.len as usize]
+    }
+
+    /// The Σ over the legs' locked amounts (`<= u64::MAX`, enforced by
+    /// [`BasketLegs::new`]).
+    pub fn total_amount(&self) -> u64 {
+        let mut total: u64 = 0;
+        for leg in self.as_slice() {
+            total = total.saturating_add(leg.amount);
+        }
+        total
+    }
+
+    /// The Σ over the legs' released counters.
+    pub fn total_released(&self) -> u64 {
+        let mut total: u64 = 0;
+        for leg in self.as_slice() {
+            total = total.saturating_add(leg.released);
+        }
+        total
     }
 }
 
@@ -3623,6 +3769,9 @@ impl Escrow {
             evidence_root: None,
             evidence_leaves: 0,
             evidence_disclosed: 0,
+            // AV-95: no basket by default — a plain single-amount
+            // escrow (backward compatible).
+            basket: None,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -10068,6 +10217,14 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // `Escrow::file_evidence`): one bit per committed document, u64
     // LE, zeroed when the root is committed. Appended last.
     ("evidence_disclosed", "u64", 8),
+    // AV-95: opt-in multi-mint basket leg table (see [`BasketLegs`]):
+    // one discriminant byte, then the live leg-count byte and the
+    // eight fixed 48-byte leg slots (32-byte mint + u64 locked amount
+    // + u64 released-so-far — see `BASKET_REGION_LEN`). The region is
+    // always reserved (zeroed when `None`) so a basket is written in
+    // place — same treatment as `quorum` / `arbiter` / `mint`.
+    // Appended last so every earlier field offset stays stable.
+    ("basket", "Option<BasketLegs>", BASKET_REGION_LEN),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -10169,9 +10326,12 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// amount (AV-82): 8 bytes, zeroed when the escrow was never slashed.
 /// The opt-in non-linear vesting curve (AV-90) is likewise always
 /// present: 1-byte discriminant + 81-byte tier region (zeroed when no
-/// curve is configured).
+/// curve is configured). The opt-in multi-mint basket leg table
+/// (AV-95) is likewise always present: 1-byte discriminant + 1-byte
+/// live leg count + eight fixed 48-byte leg slots (386 bytes, zeroed
+/// when no basket is attached).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -10725,7 +10885,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 28_577_760, "from {state:?}");
+            assert_eq!(rent, 31_264_320, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -10823,9 +10983,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 28_577_760 by
+        // VAULT_SPACE — pinned at 31_264_320 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 28_577_760);
+        assert_eq!(rent, 31_264_320);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -10986,8 +11146,8 @@ mod tests {
         // then the account is closed. VAULT_SPACE stays 2941 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 3978, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 28_577_760);
+        assert_eq!(VAULT_SPACE, 4364, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 31_264_320);
     }
 
     #[test]
@@ -11006,7 +11166,7 @@ mod tests {
         // 595 (arbiter panel), and AV-68 by 41 (evidence-disclosure
         // deadline + escalating party), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 3978, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4364, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -16158,6 +16318,16 @@ pub(crate) mod anchor_idl_tests {
             "zeroed (None) by initialize; Filed by file_appeal, \
              terminally Upheld/Overturned by review_appeal",
         ),
+        // AV-95: no instruction param writes this field in this slice —
+        // the leg table is validated by `BasketLegs::new` and the region
+        // is always reserved (zeroed when `None`), so it is a field
+        // source, not a param mapping. (The basket builders are a
+        // later slice; they will document their own source kind.)
+        (
+            "basket",
+            "None (zeroed region) by initialize; the leg table is \
+             validated by BasketLegs::new",
+        ),
     ];
 
     /// Every vault field path from `VAULT_FIELDS`, with `quorum` unfolded
@@ -16549,6 +16719,11 @@ mod error_code_tests {
             EscrowError::GapInEventStream,
             151,
             "MaterializedView::apply with a missing seq (gap), an out-of-order or duplicate seq, or events for a different escrow_id than the view folds (AV-94)",
+        ),
+        (
+            EscrowError::InvalidBasket,
+            152,
+            "BasketLegs::new with an empty leg table, more than 8 legs, a zero mint, a zero leg amount, a duplicate mint, or a Σ leg amount overflowing u64 (AV-95)",
         ),
     ];
 
@@ -18408,6 +18583,26 @@ mod account_space_tests {
         }
         out.push(e.evidence_leaves);
         out.extend_from_slice(&e.evidence_disclosed.to_le_bytes());
+        // AV-95: multi-mint basket leg table, always reserved like
+        // `quorum`: the `None` discriminant followed by the zeroed
+        // leg region (live leg-count byte + eight fixed 48-byte leg
+        // slots), so a basket writes in place without reallocating;
+        // appended last so every earlier offset above is unchanged.
+        match e.basket {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; BASKET_LEGS_LEN]);
+            }
+            Some(basket) => {
+                out.push(1);
+                out.push(basket.len);
+                for leg in basket.legs.iter() {
+                    out.extend_from_slice(&leg.mint);
+                    out.extend_from_slice(&leg.amount.to_le_bytes());
+                    out.extend_from_slice(&leg.released.to_le_bytes());
+                }
+            }
+        }
         out
     }
 
@@ -18467,10 +18662,12 @@ mod account_space_tests {
         // threshold)
         // + 26 (AV-86 opt-in slash-appeal window region: 8-byte window
         // + 8-byte appeal deadline + 1-byte appeal state + 9-byte appeal
-        // ballot).
-        assert_eq!(ESCROW_BODY_LEN, 3970, "escrow payload bytes");
+        // ballot)
+        // + 386 (AV-95 opt-in multi-mint basket: discriminant + leg
+        // count byte + eight fixed 48-byte leg slots).
+        assert_eq!(ESCROW_BODY_LEN, 4356, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 3978, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4364, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -18540,13 +18737,15 @@ mod account_space_tests {
         // bitmask + 8 vote slots, zeroed when no appeal is filed) +
         // 82-byte opt-in non-linear vesting curve (AV-90, 1-byte
         // discriminant + 81-byte tier region, zeroed when no curve is
-        // configured).
+        // configured) + 386-byte opt-in multi-mint basket (AV-95,
+        // 1-byte discriminant + 1-byte leg count + 8 x 48-byte leg
+        // slots, zeroed when no basket is attached).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3488);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3874);
     }
 
     #[test]
@@ -18956,16 +19155,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3978) * 3480 * 2 = 4106 * 6960 = 28_577_760 lamports.
-        assert_eq!(full, 28_577_760);
+        // (128 + 4364) * 3480 * 2 = 4492 * 6960 = 31_264_320 lamports.
+        assert_eq!(full, 31_264_320);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3488) * 3480 * 2 = 3616 * 6960 = 25_167_360 lamports.
-        assert_eq!(no_quorum, 25_167_360);
+        // (128 + 3874) * 3480 * 2 = 4002 * 6960 = 27_853_920 lamports.
+        assert_eq!(no_quorum, 27_853_920);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -19009,28 +19208,150 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(28_577_760, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(31_264_320, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(27_533_759, params.0, params.1),
             Err(RentShortfall {
-                required: 28_577_760,
+                required: 31_264_320,
                 provided: 27_533_759,
             })
         );
         // Generous funding: exempt.
         assert_eq!(
-            check_vault_rent_exempt(28_600_000, params.0, params.1),
+            check_vault_rent_exempt(31_300_000, params.0, params.1),
             Ok(())
         );
         // Zero lamports: the full minimum is the shortfall.
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 28_577_760,
+                required: 31_264_320,
                 provided: 0,
             })
         );
+    }
+}
+
+// ---------- AV-95: multi-mint basket leg table (data model + layout) ----------
+//
+// AV-95a pins the basket data model and its account layout. The
+// settlement transitions (`release_basket` / `cancel_basket` /
+// `cancel_expired_basket`) are a later slice; this module pins only
+// the serialized sizes and the encode/decode round-trip.
+#[cfg(test)]
+mod basket_tests {
+    use super::account_space_tests::encode_escrow;
+    use super::*;
+    use crate::discriminator::{decode_vault_account, vault_account_discriminator};
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const MINT_A: [u8; 32] = [0xA1; 32];
+    const MINT_B: [u8; 32] = [0xB2; 32];
+
+    fn account_bytes(e: &Escrow) -> Vec<u8> {
+        let mut out = vault_account_discriminator().to_vec();
+        out.extend_from_slice(&encode_escrow(e));
+        out
+    }
+
+    #[test]
+    fn basket_leg_constants_pin_serialized_sizes() {
+        assert_eq!(BASKET_LEG_LEN, 32 + 8 + 8);
+        assert_eq!(BASKET_LEG_LEN, 48);
+        assert_eq!(BASKET_LEGS_LEN, 1 + 8 * 48);
+        assert_eq!(BASKET_LEGS_LEN, 385);
+        assert_eq!(BASKET_REGION_LEN, 1 + 385);
+        assert_eq!(BASKET_REGION_LEN, 386);
+        assert_eq!(MAX_BASKET_LEGS, 8);
+    }
+
+    #[test]
+    fn basket_region_roundtrips_through_account_bytes() {
+        // The basket region is pinned at the tail of the account: the
+        // hand-written encoder, the VAULT_FIELDS table, and the
+        // structural decoder must agree byte-for-byte.
+        let mut e = Escrow::initialize(ALICE, BOB, 3_000, EXPIRES_AT).unwrap();
+        let mut legs = BasketLegs::new(&[(MINT_A, 1_000), (MINT_B, 2_000)]).unwrap();
+        // In-module access to the private field: simulate a partially
+        // settled basket so the released counters round-trip too.
+        legs.legs[0].released = 1_000;
+        legs.legs[1].released = 2_000;
+        e.basket = Some(legs);
+        let body = encode_escrow(&e);
+        assert_eq!(body.len(), ESCROW_BODY_LEN);
+        let basket_at = ESCROW_BODY_LEN - BASKET_REGION_LEN;
+        assert_eq!(body[basket_at], 1, "Some discriminant");
+        assert_eq!(body[basket_at + 1], 2, "leg count");
+        assert_eq!(&body[basket_at + 2..basket_at + 34], &MINT_A);
+        assert_eq!(
+            u64::from_le_bytes(body[basket_at + 34..basket_at + 42].try_into().unwrap()),
+            1_000,
+            "leg 0 locked amount"
+        );
+        assert_eq!(
+            u64::from_le_bytes(body[basket_at + 42..basket_at + 50].try_into().unwrap()),
+            1_000,
+            "leg 0 released counter"
+        );
+        // Full account decode (discriminator + body) preserves the
+        // basket, including the per-leg released counters.
+        let decoded = decode_vault_account(&account_bytes(&e)).unwrap();
+        let basket = decoded.basket.expect("basket decoded");
+        assert_eq!(basket.len, 2);
+        assert_eq!(basket.as_slice()[0].mint, MINT_A);
+        assert_eq!(basket.as_slice()[0].amount, 1_000);
+        assert_eq!(basket.as_slice()[0].released, 1_000);
+        assert_eq!(basket.as_slice()[1].mint, MINT_B);
+        assert_eq!(basket.as_slice()[1].released, 2_000);
+        assert_eq!(basket.total_amount(), 3_000);
+        assert_eq!(basket.total_released(), 3_000);
+        // A basket-less escrow decodes with None and a zeroed tail.
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let body = encode_escrow(&plain);
+        assert_eq!(body[basket_at], 0, "None discriminant");
+        assert!(body[basket_at + 1..].iter().all(|b| *b == 0), "zeroed region");
+        let decoded = decode_vault_account(&account_bytes(&plain)).unwrap();
+        assert_eq!(decoded.basket, None);
+    }
+
+    #[test]
+    fn basket_legs_new_rejects_invalid_tables() {
+        let zero = [0u8; 32];
+        // Empty table.
+        assert_eq!(
+            BasketLegs::new(&[]),
+            Err(EscrowError::InvalidBasket)
+        );
+        // Over-long table.
+        let many: Vec<([u8; 32], u64)> =
+            (0..9).map(|i| ([i as u8 + 1; 32], 1)).collect();
+        assert_eq!(BasketLegs::new(&many), Err(EscrowError::InvalidBasket));
+        // Zero mint / zero amount / duplicate mint.
+        assert_eq!(
+            BasketLegs::new(&[(zero, 1_000)]),
+            Err(EscrowError::InvalidBasket)
+        );
+        assert_eq!(
+            BasketLegs::new(&[(MINT_A, 0)]),
+            Err(EscrowError::InvalidBasket)
+        );
+        assert_eq!(
+            BasketLegs::new(&[(MINT_A, 1_000), (MINT_A, 2_000)]),
+            Err(EscrowError::InvalidBasket)
+        );
+        // Σ overflowing u64.
+        assert_eq!(
+            BasketLegs::new(&[(MINT_A, u64::MAX), (MINT_B, 1)]),
+            Err(EscrowError::InvalidBasket)
+        );
+        // A valid table keeps leg order and the Σ.
+        let legs = BasketLegs::new(&[(MINT_A, 1_000), (MINT_B, 2_000)]).unwrap();
+        assert_eq!(legs.len, 2);
+        assert_eq!(legs.total_amount(), 3_000);
+        assert_eq!(legs.as_slice()[1].mint, MINT_B);
     }
 }
 
@@ -20013,10 +20334,12 @@ mod vesting_curve_tests {
         let e = curved_escrow();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        // The curve region trails the appeal ballot — and the AV-91
+        // The curve region trails the appeal ballot — the AV-91
         // evidence-commitment region (33 + 1 + 8 bytes) trails the
-        // curve: discriminant 1, tier-count 2, then the two live tiers.
-        let base = ESCROW_BODY_LEN - 42 - (1 + VESTING_CURVE_LEN);
+        // curve, and the AV-95 basket region (386 bytes) trails
+        // everything: discriminant 1, tier-count 2, then the two live
+        // tiers.
+        let base = ESCROW_BODY_LEN - BASKET_REGION_LEN - 42 - (1 + VESTING_CURVE_LEN);
         assert_eq!(bytes[base], 1, "curve: Some discriminant");
         assert_eq!(bytes[base + 1], 2, "curve: tier count");
         assert_eq!(
@@ -22279,12 +22602,12 @@ mod migrate_schema_tests {
 
     #[test]
     fn migrate_schema_moves_the_serialized_tail_byte() {
-        // AV-90: the version byte sits 82 + 26 + 49 + 258 bytes before
-        // the tail now (the vesting-curve region, the appeal region,
-        // the slash region and the CPI allowlist trail it); every
-        // earlier offset stays stable, and the carry-over is still a
-        // byte-prefix copy.
-        let version_at = ESCROW_BODY_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        // AV-95: the version byte sits 386 + 82 + 26 + 49 + 258 bytes
+        // before the tail now (the basket region, the vesting-curve
+        // region, the appeal region, the slash region and the CPI
+        // allowlist trail it); every earlier offset stays stable, and
+        // the carry-over is still a byte-prefix copy.
+        let version_at = ESCROW_BODY_LEN - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         let e = v0_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
@@ -23245,10 +23568,11 @@ mod evidence_merkle_tests {
             .unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        // The commitment region is the new tail: 1-byte discriminant
-        // + 32-byte root, then the leaf-count byte, then the u64-LE
-        // disclosure bitmap with bit 0 set.
-        let base = ESCROW_BODY_LEN - 42;
+        // The commitment region used to be the tail; the AV-95 basket
+        // region (386 bytes) is appended after it now: 1-byte
+        // discriminant + 32-byte root, then the leaf-count byte, then
+        // the u64-LE disclosure bitmap with bit 0 set.
+        let base = ESCROW_BODY_LEN - BASKET_REGION_LEN - 42;
         assert_eq!(bytes[base], 1, "evidence_root: Some discriminant");
         assert_eq!(&bytes[base + 1..base + 33], &root, "evidence_root bytes");
         assert_eq!(bytes[base + 33], 2, "evidence_leaves");
@@ -23878,7 +24202,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3970, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) bytes");
+        assert_eq!(bytes.len(), 4356, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -23903,7 +24227,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 3970);
+        assert_eq!(bytes.len(), 4356);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -23925,18 +24249,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3978) * 3480 * 2 = 4106 * 6960 = 28_577_760 lamports.
-        assert_eq!(VAULT_SPACE, 3978);
-        assert_eq!(full, 28_577_760);
+        // (128 + 4364) * 3480 * 2 = 4492 * 6960 = 31_264_320 lamports.
+        assert_eq!(VAULT_SPACE, 4364);
+        assert_eq!(full, 31_264_320);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3488) * 3480 * 2 = 3616 * 6960 = 25_167_360 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3488);
-        assert_eq!(no_quorum, 25_167_360);
+        // (128 + 3874) * 3480 * 2 = 4002 * 6960 = 27_853_920 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3874);
+        assert_eq!(no_quorum, 27_853_920);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -24080,7 +24404,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3970);
+        assert_eq!(bytes.len(), 4356);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -24095,7 +24419,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 3970);
+        assert_eq!(bytes.len(), 4356);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -24126,18 +24450,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3978) * 3480 * 2 = 4106 * 6960 = 28_577_760 lamports.
-        assert_eq!(VAULT_SPACE, 3978);
-        assert_eq!(full, 28_577_760);
+        // (128 + 4364) * 3480 * 2 = 4492 * 6960 = 31_264_320 lamports.
+        assert_eq!(VAULT_SPACE, 4364);
+        assert_eq!(full, 31_264_320);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3488) * 3480 * 2 = 3616 * 6960 = 25_167_360 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3488);
-        assert_eq!(no_quorum, 25_167_360);
+        // (128 + 3874) * 3480 * 2 = 4002 * 6960 = 27_853_920 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3874);
+        assert_eq!(no_quorum, 27_853_920);
     }
 
     #[test]
@@ -24995,7 +25319,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 3970);
+        assert_eq!(bytes.len(), 4356);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -25170,7 +25494,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 3970, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region");
+        assert_eq!(ESCROW_BODY_LEN, 4356, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region, 82 by AV-90 vesting curve, 42 by AV-91 evidence commitment region, 386 by AV-95 basket");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -25188,32 +25512,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 3978) * 3480 * 2 = 4106 * 6960 = 28_577_760 lamports.
+        // (128 + 4364) * 3480 * 2 = 4492 * 6960 = 31_264_320 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            28_577_760
+            31_264_320
         );
-        // (128 + 3488) * 3480 * 2 = 3616 * 6960 = 25_167_360 lamports.
+        // (128 + 3874) * 3480 * 2 = 4002 * 6960 = 27_853_920 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            25_167_360
+            27_853_920
         );
         // 1888 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 3978);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3488);
-        assert!(check_vault_rent_exempt(28_577_760, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 4364);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3874);
+        assert!(check_vault_rent_exempt(31_264_320, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -28044,9 +28368,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3970, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment)");
-        assert_eq!(VAULT_SPACE, 3978);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3488);
+        assert_eq!(bytes.len(), 4356, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket)");
+        assert_eq!(VAULT_SPACE, 4364);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3874);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -28590,7 +28914,7 @@ mod default_judgment_tests {
         // at 960, `default_judgment` at 968, `default_confirmed` at 985
         // (AV-55 body total 986). AV-56 appends `subscription` at 986,
         // `subscription_next` at 1004, `subscription_released` at 1005
-        // (body total 3970 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline + AV-73 per-period-table + AV-75 schema-version + AV-82 slash-region + AV-86 appeal-window + AV-90 vesting-curve + AV-91 evidence-commitment appends).
+        // (body total 4356 after the AV-57 event-history + AV-59 extension + AV-63 fee-cap + AV-64 relative-timelock + AV-65 arbiter-panel + AV-66 fee-schedule + AV-68 evidence-deadline + AV-73 per-period-table + AV-75 schema-version + AV-82 slash-region + AV-86 appeal-window + AV-90 vesting-curve + AV-91 evidence-commitment + AV-95 basket appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter(ARBITER)
@@ -28600,7 +28924,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3970);
+        assert_eq!(bytes.len(), 4356);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -29158,8 +29482,9 @@ mod subscription_tests {
         // Offsets: `default_confirmed` ends the AV-55 body at 986;
         // `subscription` at 986, `subscription_next` at 1004,
         // `subscription_released` at 1005; the AV-73 live per-period
-        // amount table at 2933..3445 (body total 3970 after the AV-57 +
+        // amount table at 2933..3445 (body total 4356 after the AV-57 +
         // AV-59 + AV-63 + AV-64 + AV-65 + AV-66 + AV-68 + AV-73 + AV-75
+        // + AV-82 + AV-83 + AV-84 + AV-86 + AV-90 + AV-91 + AV-95
         // appends).
         let mut e = escrow()
             .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
@@ -29167,7 +29492,7 @@ mod subscription_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3970);
+        assert_eq!(bytes.len(), 4356);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -29527,11 +29852,11 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386
         );
     }
 
@@ -29540,14 +29865,15 @@ mod event_history_tests {
         // Offsets: `subscription_released` ends the AV-56 body at 1013;
         // `event_head` at 1013, `event_total` at 1014, `event_count` at
         // 1022, `event_capacity` at 1023, `event_slots` at 1024 (body
-        // total 3970 after the AV-59 + AV-63 + AV-64 + AV-68 + AV-73
-        // + AV-75 + AV-82 + AV-83 appends).
+        // total 4356 after the AV-59 + AV-63 + AV-64 + AV-68 + AV-73
+        // + AV-75 + AV-82 + AV-83 + AV-84 + AV-86 + AV-90 + AV-91
+        // + AV-95 appends).
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.record_history(EscrowEventKind::Funded, T0, Some(ALICE));
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3970);
+        assert_eq!(bytes.len(), 4356);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -29575,7 +29901,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95 tail");
     }
 
     #[test]
@@ -29590,18 +29916,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3978) * 3480 * 2 = 4106 * 6960 = 28_577_760 lamports.
-        assert_eq!(VAULT_SPACE, 3978);
-        assert_eq!(full, 28_577_760);
+        // (128 + 4364) * 3480 * 2 = 4492 * 6960 = 31_264_320 lamports.
+        assert_eq!(VAULT_SPACE, 4364);
+        assert_eq!(full, 31_264_320);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 3488) * 3480 * 2 = 3616 * 6960 = 25_167_360 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3488);
-        assert_eq!(no_quorum, 25_167_360);
+        // (128 + 3874) * 3480 * 2 = 4002 * 6960 = 27_853_920 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3874);
+        assert_eq!(no_quorum, 27_853_920);
     }
 
     // ----- decode -----
@@ -30301,17 +30627,17 @@ mod fee_cap_tests {
         // + 258 (AV-83 CPI target allowlist) + 67 (AV-84 multisig
         // authority) + 26 (AV-86 appeal window region) + 82 (AV-90
         // vesting curve).
-        assert_eq!(ESCROW_BODY_LEN, 3970, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 3978, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 3488, "no-quorum Vault account space");
+        assert_eq!(ESCROW_BODY_LEN, 4356, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 4364, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 3874, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            28_577_760,
-            "(128 + 3978) * 3480 * 2 = 4106 * 6960"
+            31_264_320,
+            "(128 + 4364) * 3480 * 2 = 4492 * 6960"
         );
         assert_eq!(
             rent_exempt_minimum_lamports(
@@ -30319,8 +30645,8 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            25_167_360,
-            "(128 + 3488) * 3480 * 2 = 3616 * 6960"
+            27_853_920,
+            "(128 + 3874) * 3480 * 2 = 4002 * 6960"
         );
     }
 
@@ -30332,7 +30658,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3970);
+        assert_eq!(bytes.len(), 4356);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -30827,13 +31153,13 @@ mod fee_schedule_tests {
         // region, the AV-73 per-period table, the AV-75
         // schema-version byte, the AV-82 slash region, the AV-83
         // CPI allowlist region, the AV-84 multisig authority, the
-        // AV-86 appeal region, and the AV-90 vesting-curve region:
-        // every earlier offset is unchanged.
+        // AV-86 appeal region, the AV-90 vesting-curve region, and
+        // the AV-95 basket region: every earlier offset is unchanged.
         let e = scheduled_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3970);
-        let tail = ESCROW_BODY_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        assert_eq!(bytes.len(), 4356);
+        let tail = ESCROW_BODY_LEN - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(bytes[tail], 3, "tier_count at the tail");
         assert_eq!(
             u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
@@ -30867,10 +31193,12 @@ mod fee_schedule_tests {
         // schema-version byte (1 byte), AV-82 the slash region
         // (41 + 8 bytes), AV-83 the CPI allowlist region (258
         // bytes), AV-84 the multisig authority (67 bytes), AV-86 the
-        // appeal region (26 bytes), and AV-90 the vesting-curve region
-        // (82 bytes) after the fee schedule, so the schedule no longer
-        // sits at the body tail.
-        let tail = ESCROW_BODY_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        // appeal region (26 bytes), AV-90 the vesting-curve region
+        // (82 bytes), AV-91 the evidence-commitment region (42
+        // bytes), and AV-95 the basket region (386 bytes) after the
+        // fee schedule, so the schedule no longer sits at the body
+        // tail.
+        let tail = ESCROW_BODY_LEN - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(
             &bytes[tail..tail + FEE_SCHEDULE_LEN],
             &[0u8; FEE_SCHEDULE_LEN],
@@ -30888,10 +31216,12 @@ mod fee_schedule_tests {
         // schema-version byte (1 byte), AV-82 the slash region
         // (41 + 8 bytes), AV-83 the CPI allowlist region (258
         // bytes), AV-84 the multisig authority (67 bytes), AV-86 the
-        // appeal region (26 bytes), and AV-90 the vesting-curve region
-        // (82 bytes) after the fee schedule, so the schedule no longer
-        // sits at the body tail.
-        let tail = ESCROW_BODY_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        // appeal region (26 bytes), AV-90 the vesting-curve region
+        // (82 bytes), AV-91 the evidence-commitment region (42
+        // bytes), and AV-95 the basket region (386 bytes) after the
+        // fee schedule, so the schedule no longer sits at the body
+        // tail.
+        let tail = ESCROW_BODY_LEN - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         bytes[tail] = 9;
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
@@ -31224,7 +31554,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3970);
+        assert_eq!(bytes.len(), 4356);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -31430,6 +31760,8 @@ mod arbiter_panel_tests {
         assert_eq!(EscrowError::InvalidReleaseSplit.code(), 150);
         // AV-94: appended, never renumbered.
         assert_eq!(EscrowError::GapInEventStream.code(), 151);
+        // AV-95: appended, never renumbered.
+        assert_eq!(EscrowError::InvalidBasket.code(), 152);
         // never-renumber: the full table still pins every code, and
         // `all()` covers the new variants (the AV-46 lesson: a missing
         // variant drifts the IDL error pin).
@@ -31450,7 +31782,8 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::InvalidVaultSeeds));
         assert!(EscrowError::all().contains(&EscrowError::InvalidReleaseSplit));
         assert!(EscrowError::all().contains(&EscrowError::GapInEventStream));
-        assert_eq!(EscrowError::all().len(), 52);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidBasket));
+        assert_eq!(EscrowError::all().len(), 53);
     }
 
     #[test]
@@ -31797,17 +32130,18 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3970);
+        assert_eq!(bytes.len(), 4356);
         // AV-91: the evidence-commitment region (33-byte root + 1-byte
         // leaf count + 8-byte disclosure bitmap = 42 bytes) now trails
         // the AV-90 vesting-curve region (82 bytes), which trails the
         // AV-86 appeal region, which trails the AV-84 multisig
         // authority; before that, the AV-83 CPI allowlist region (258
         // bytes) trails the AV-82 slash region (41-byte terms + 8-byte
-        // penalty counter), which trails the schema-version byte — so
-        // the panel region ends 42 + 82 + 26 + 68 + 258 + 49 + 1 bytes
-        // before the end of the buffer.
-        let version_end = bytes.len() - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        // penalty counter), which trails the schema-version byte — and
+        // the AV-95 basket region (386 bytes) trails everything, so
+        // the panel region ends 386 + 42 + 82 + 26 + 68 + 258 + 49 + 1
+        // bytes before the end of the buffer.
+        let version_end = bytes.len() - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         // The panel region trails the AV-73 per-period amount table
         // (512 bytes), the AV-68 evidence-deadline region (41 bytes) and
         // the AV-66 fee-schedule region (81 bytes):
@@ -31860,9 +32194,9 @@ mod arbiter_panel_tests {
         assert_eq!(panel.1, "Option<ArbiterPanel>");
         assert_eq!(panel.2, 1 + ARBITER_PANEL_LEN);
         assert_eq!(panel.2, 595);
-        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86/AV-90/AV-91:
+        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95:
         // every earlier field offset stays stable.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "fee_schedule");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "fee_schedule");
     }
 
     #[test]
@@ -31879,35 +32213,39 @@ mod arbiter_panel_tests {
         // the schema byte, AV-82 the slash region, AV-83 the CPI
         // allowlist, AV-84 the multisig authority, AV-86 the appeal
         // window region, AV-90 the vesting curve, AV-91 the
-        // evidence-commitment region: evidence_disclosed is the new
-        // tail.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "evidence_deadline_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "escalated_by");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "subscription_amounts");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "schema_version");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "slash_terms");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "penalty_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, 1 + CPI_ALLOWLIST_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].2, 1 + MULTISIG_AUTHORITY_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "appeal_window_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "appeal_deadline");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "appeal_state");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "appeal_ballot");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, APPEAL_BALLOT_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "vesting_curve");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].1, "Option<VestingCurve>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 1 + VESTING_CURVE_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 82);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "evidence_root");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].1, "Option<[u8; 32]>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, 33);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "evidence_leaves");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 1);
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "evidence_disclosed");
-        assert_eq!(VAULT_FIELDS.last().unwrap().1, "u64");
-        assert_eq!(VAULT_FIELDS.last().unwrap().2, 8);
+        // evidence-commitment region, AV-95 the basket leg table:
+        // basket is the new tail.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "evidence_deadline_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "escalated_by");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "subscription_amounts");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "schema_version");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "slash_terms");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "penalty_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].2, 1 + CPI_ALLOWLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, 1 + MULTISIG_AUTHORITY_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "appeal_window_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "appeal_deadline");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "appeal_state");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "appeal_ballot");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, APPEAL_BALLOT_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "vesting_curve");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].1, "Option<VestingCurve>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 1 + VESTING_CURVE_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 82);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "evidence_root");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].1, "Option<[u8; 32]>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 33);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "evidence_leaves");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, 1);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "evidence_disclosed");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 8);
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "basket");
+        assert_eq!(VAULT_FIELDS.last().unwrap().1, "Option<BasketLegs>");
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, BASKET_REGION_LEN);
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, 386);
     }
 
     #[test]
@@ -32447,7 +32785,7 @@ mod split_tests {
             .unwrap();
         assert_eq!(e.state(), EscrowState::Split);
         assert_eq!(EscrowState::Split as u8, 8, "Split appended last");
-        assert_eq!(VAULT_SPACE, 3978, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4364, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -32717,7 +33055,7 @@ mod release_split_tests {
         e.release_split(ALICE, NOW, 1_000_000, None, &[(BOB, 10_000)])
             .unwrap();
         assert_eq!(e.state(), EscrowState::Released);
-        assert_eq!(VAULT_SPACE, 3978, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4364, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -33026,11 +33364,13 @@ mod slash_tests {
     fn slash_terms_persist_in_serialized_tail() {
         // v3 tail: schema_version (1) + slash_terms (41) + penalty_paid (8)
         // + cpi_allowlist (258) + multisig_authority (67) + the 26-byte
-        // appeal region + the 82-byte vesting-curve region.
+        // appeal region + the 82-byte vesting-curve region + the
+        // 42-byte evidence-commitment region + the 386-byte basket
+        // region.
         let e = slashable(1_000_000);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let base = ESCROW_BODY_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
+        let base = ESCROW_BODY_LEN - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
         assert_eq!(bytes[base], 3, "schema_version");
         assert_eq!(bytes[base + 1], 1, "slash_terms: Some");
         assert_eq!(&bytes[base + 2..base + 34], &PENALTY, "penalty account");
@@ -33041,8 +33381,8 @@ mod slash_tests {
         );
         assert_eq!(
             u64::from_le_bytes(
-                bytes[ESCROW_BODY_LEN - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
-                    ..ESCROW_BODY_LEN - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
+                bytes[ESCROW_BODY_LEN - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
+                    ..ESCROW_BODY_LEN - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
                     .try_into()
                     .unwrap()
             ),
@@ -33453,7 +33793,7 @@ mod appeal_tests {
         e.review_appeal(M1, true).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3970);
+        assert_eq!(bytes.len(), 4356);
         // Appeal region: [3820..3846] — window (8), deadline (8), state
         // (1), ballot (9).
         assert_eq!(
@@ -33789,7 +34129,7 @@ mod cpi_allowlist_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3970);
+        assert_eq!(bytes.len(), 4356);
         assert_eq!(bytes[3495], 1, "Some discriminant");
         assert_eq!(&bytes[3496..3496 + 32], &DEX);
         assert_eq!(&bytes[3496 + 32..3496 + 64], &LENDING);
@@ -33800,13 +34140,13 @@ mod cpi_allowlist_tests {
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes[3495], 0, "None discriminant");
         assert_eq!(&bytes[3496..3496 + 257], &[0u8; 257]);
-        // The field name is the tenth-from-last VAULT_FIELDS entry
+        // The field name is the eleventh-from-last VAULT_FIELDS entry
         // (AV-84 appended the multisig region after it, AV-86 the
         // 4-field appeal region after that, AV-90 the vesting curve
         // after that, AV-91 the 3-field evidence-commitment region
-        // after that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, 1 + CPI_ALLOWLIST_LEN);
+        // after that, AV-95 the basket region after that).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].2, 1 + CPI_ALLOWLIST_LEN);
     }
 }
 
@@ -34001,7 +34341,7 @@ mod multisig_tests {
         let e = bound_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 3970);
+        assert_eq!(bytes.len(), 4356);
         assert_eq!(bytes[3753], 1, "Some discriminant");
         assert_eq!(&bytes[3754..3754 + 32], &SQUADS_V4_PROGRAM_ID);
         assert_eq!(&bytes[3754 + 32..3754 + 64], &VAULT_PDA);
@@ -34015,12 +34355,13 @@ mod multisig_tests {
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes[3753], 0, "None discriminant");
         assert_eq!(&bytes[3754..3820], &[0u8; 66]);
-        // The field name is the ninth-from-last VAULT_FIELDS entry
+        // The field name is the tenth-from-last VAULT_FIELDS entry
         // (AV-86 appended the 4-field appeal region after it, AV-90
         // the vesting-curve region after that, AV-91 the 3-field
-        // evidence-commitment region after that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].2, 1 + MULTISIG_AUTHORITY_LEN);
+        // evidence-commitment region after that, AV-95 the basket
+        // region after that).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, 1 + MULTISIG_AUTHORITY_LEN);
         assert_eq!(MULTISIG_AUTHORITY_LEN, 66);
     }
 

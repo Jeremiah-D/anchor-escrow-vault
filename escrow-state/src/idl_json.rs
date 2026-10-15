@@ -178,6 +178,8 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "Option<MilestonePlan>" => IdlType::Option(Box::new(IdlType::Named("MilestonePlan"))),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         "Option<PayoutAllowlist>" => IdlType::Option(Box::new(IdlType::Named("PayoutAllowlist"))),
+        // AV-95: opt-in multi-mint basket leg table.
+        "Option<BasketLegs>" => IdlType::Option(Box::new(IdlType::Named("BasketLegs"))),
         // AV-83: opt-in CPI target-program allowlist.
         "Option<CpiAllowlist>" => IdlType::Option(Box::new(IdlType::Named("CpiAllowlist"))),
         // AV-84: opt-in multisig authority binding.
@@ -302,6 +304,23 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
         // The 4 payout keys serialize as 4 consecutive 32-byte pubkeys.
         "PayoutAllowlist" => vec![
             ("addrs", IdlType::Array(ArrayElem::PublicKey, 4)),
+            ("len", IdlType::U8),
+        ],
+        // BasketLeg { mint: Pubkey, amount: u64, released: u64 }
+        // (AV-95): one leg of a multi-mint basket — 48 bytes.
+        "BasketLeg" => vec![
+            ("mint", IdlType::PublicKey),
+            ("amount", IdlType::U64),
+            ("released", IdlType::U64),
+        ],
+        // BasketLegs { legs: [BasketLeg; 8], len: u8 } (AV-95): the
+        // multi-mint leg table — 385 bytes (the `Option` discriminant
+        // rides the vault field, not the named type).
+        "BasketLegs" => vec![
+            (
+                "legs",
+                IdlType::Array(ArrayElem::Defined("BasketLeg"), MAX_BASKET_LEGS),
+            ),
             ("len", IdlType::U8),
         ],
         // CpiAllowlist { addrs: [[u8; 32]; 8], len: u8 } (AV-83).
@@ -607,6 +626,9 @@ fn render_idl_json() -> String {
         "CpiAllowlist",
         "MultisigAuthority",
         "AppealBallot",
+        // AV-95: the multi-mint basket leg types.
+        "BasketLeg",
+        "BasketLegs",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -796,6 +818,12 @@ fn named_type_sizes_pin_constants() {
     // AV-86: voter bitmask + 8 vote slots.
     assert_eq!(size("AppealBallot"), APPEAL_BALLOT_LEN);
     assert_eq!(size("AppealBallot"), 9);
+    // AV-95: 32-byte mint + u64 locked amount + u64 released-so-far.
+    assert_eq!(size("BasketLeg"), BASKET_LEG_LEN);
+    assert_eq!(size("BasketLeg"), 48);
+    // AV-95: live leg-count byte + 8 fixed 48-byte leg slots.
+    assert_eq!(size("BasketLegs"), BASKET_LEGS_LEN);
+    assert_eq!(size("BasketLegs"), 385);
 }
 
 #[test]
@@ -863,7 +891,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 52, "error variant count drift");
+    assert_eq!(errors.len(), 53, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -910,6 +938,8 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::InvalidReleaseSplit.code(), 150);
     // AV-94: appended, never renumbered.
     assert_eq!(EscrowError::GapInEventStream.code(), 151);
+    // AV-95: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidBasket.code(), 152);
 }
 
 #[test]
