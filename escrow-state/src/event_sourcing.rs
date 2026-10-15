@@ -185,13 +185,20 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         | EscrowEventKind::ReleasedSplit
         | EscrowEventKind::Claimed
         | EscrowEventKind::MilestoneReleased
-        | EscrowEventKind::SubscriptionPeriodReleased => {
+        | EscrowEventKind::SubscriptionPeriodReleased
+        // AV-95b: one basket leg paid out to the taker — the per-leg
+        // `Released`; the leg's gross books as `released`, like the
+        // plain kind.
+        | EscrowEventKind::BasketReleased => {
             (amounts.payout, amounts.payout, 0)
         }
         // Initializer refunds. `Cancelled` refunds the remainder;
         // `PartiallyCancelled` refunds the tranche (the state machine
         // shrinks `amount`, so `locked` drops by the same).
-        EscrowEventKind::Cancelled | EscrowEventKind::PartiallyCancelled => {
+        // AV-95b: one basket leg refunded — the per-leg `Cancelled`.
+        EscrowEventKind::Cancelled
+        | EscrowEventKind::PartiallyCancelled
+        | EscrowEventKind::BasketCancelled => {
             (amounts.refund, 0, amounts.refund)
         }
         // Expiry cancels: `refund` goes to the pinned destination and
@@ -199,7 +206,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // as compensation — both are initializer receipts, so both
         // book as `refunded`; `refund + penalty == remaining` by
         // construction, so `locked` drops by the full remainder.
-        EscrowEventKind::ExpiredCancelled | EscrowEventKind::ExpiredCranked => {
+        // AV-95b: one basket leg expiry-cancelled — the per-leg
+        // `ExpiredCancelled`.
+        EscrowEventKind::ExpiredCancelled
+        | EscrowEventKind::ExpiredCranked
+        | EscrowEventKind::BasketExpiredCancelled => {
             let out = amounts.refund.saturating_add(amounts.penalty);
             (out, 0, out)
         }
@@ -519,7 +530,7 @@ mod event_sourcing_tests {
         const FEE: u64 = 100;
         const REFUND: u64 = 700;
         const PENALTY: u64 = 50;
-        for d in 0..=47u8 {
+        for d in 0..=50u8 {
             let kind = EscrowEventKind::from_discriminant(d)
                 .unwrap_or_else(|| panic!("missing discriminant {d}"));
             let event = synth(kind, 0, PAYOUT, FEE, REFUND, PENALTY);
@@ -531,11 +542,20 @@ mod event_sourcing_tests {
                 | EscrowEventKind::ReleasedSplit
                 | EscrowEventKind::Claimed
                 | EscrowEventKind::MilestoneReleased
-                | EscrowEventKind::SubscriptionPeriodReleased => (PAYOUT, PAYOUT, 0),
-                EscrowEventKind::Cancelled | EscrowEventKind::PartiallyCancelled => {
+                | EscrowEventKind::SubscriptionPeriodReleased
+                // AV-95b: the per-leg taker payout books like Released.
+                | EscrowEventKind::BasketReleased => (PAYOUT, PAYOUT, 0),
+                EscrowEventKind::Cancelled
+                | EscrowEventKind::PartiallyCancelled
+                // AV-95b: the per-leg refund books like Cancelled.
+                | EscrowEventKind::BasketCancelled => {
                     (REFUND, 0, REFUND)
                 }
-                EscrowEventKind::ExpiredCancelled | EscrowEventKind::ExpiredCranked => {
+                EscrowEventKind::ExpiredCancelled
+                | EscrowEventKind::ExpiredCranked
+                // AV-95b: the per-leg expiry cancel books like
+                // ExpiredCancelled.
+                | EscrowEventKind::BasketExpiredCancelled => {
                     (REFUND + PENALTY, 0, REFUND + PENALTY)
                 }
                 EscrowEventKind::Resolved

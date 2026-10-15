@@ -229,6 +229,9 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         // AV-91: the evidence-disclosure Merkle proof — a Vec of
         // 32-byte sibling hashes.
         "Vec<[u8; 32]>" => IdlType::Vec(Box::new(IdlType::Array(ArrayElem::U8, 32))),
+        // AV-95b: the initialize_basket instruction's (mint, amount)
+        // leg table.
+        "Vec<BasketLeg>" => IdlType::Vec(Box::new(IdlType::Named("BasketLeg"))),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         // AV-68: the dispute-evidence disclosure commitment
         // (non-optional — disclosure always carries a hash).

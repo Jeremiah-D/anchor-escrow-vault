@@ -150,6 +150,28 @@
 //!   derived escrow ID, so every child's lifecycle is independently
 //!   indexable. A failed split emits nothing: the parent stays
 //!   `Funded` and no child exists.
+//! - `release_basket` (AV-95b) emits [`EscrowEventKind::BasketReleased`]
+//!   on every successful leg release — one leg (one SPL mint) per call.
+//!   `from == Funded`, `to == Funded` while legs remain unsettled,
+//!   `to == Released` when the settled leg was the last unsettled
+//!   one — the same lifecycle shape as `Released`, per leg. Amounts
+//!   follow the `Released` shape (`payout` = the leg's gross remainder,
+//!   `fee` = the AV-17 protocol fee on the leg); the actor is the
+//!   initializer. A failed leg release emits nothing.
+//! - `cancel_basket` (AV-95b) emits [`EscrowEventKind::BasketCancelled`]
+//!   on every successful leg cancel. `from == Funded`, `to == Funded`
+//!   while legs remain unsettled, `to == Cancelled` when the settled
+//!   leg was the last unsettled one — the per-leg mirror of
+//!   `Cancelled`. `amounts.refund` carries the leg's remainder; the
+//!   actor is the initializer. A failed leg cancel emits nothing.
+//! - `cancel_expired_basket` (AV-95b) emits
+//!   [`EscrowEventKind::BasketExpiredCancelled`] on every successful
+//!   leg expiry-cancel. `from == Funded`, `to == Funded` while legs
+//!   remain unsettled, `to == Cancelled` when the settled leg was the
+//!   last unsettled one — the per-leg mirror of `ExpiredCancelled`.
+//!   Amounts follow the `ExpiredCancelled` shape (`refund` = the leg's
+//!   net refund, `penalty` = the AV-24 penalty on a taker-initiated
+//!   cancel); the actor is the caller. A failed call emits nothing.
 //! - A rejected reentrant entry (AV-36) emits
 //!   [`EscrowEventKind::ReentryRejected`] — the deliberate exception to
 //!   the "failed calls emit nothing" rule. A blocked reentry is a
@@ -187,6 +209,9 @@
 //! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), PartiallyCancelled, ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-70), SubscriptionAmountsAdjusted (AV-73), SchemaMigrated (AV-75), TemplateApplied (AV-77) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | ReleasedSplit (AV-93) | gross taker amount (Σ net legs + fee) | protocol fee (AV-17, charged on the gross before the split) | 0 | 0 — the per-recipient `(recipient, net_share)` legs ride the event's `release_split` field |
+//! | BasketReleased (AV-95b) | the leg's gross remainder (taker payout + fee) | protocol fee (AV-17, charged on the leg's remainder) | 0 | 0 |
+//! | BasketCancelled (AV-95b) | 0 | 0 | the leg's remainder, refunded to the escrow's refund recipient | 0 |
+//! | BasketExpiredCancelled (AV-95b) | 0 | 0 | the leg's remainder minus penalty, to the refund recipient | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
 //! | BundlePartiallyExecuted (AV-76) | Σ gross of the executed tranches | Σ protocol fee of the executed tranches | 0 | 0 |
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | PartiallyCancelled (AV-60) | 0 | 0 | the partially-cancelled tranche, refunded to the whitelisted destination (the escrow stays `Funded`; the `released` counter is untouched) | 0 |
@@ -602,6 +627,40 @@ pub enum EscrowEventKind {
     /// initializer. Always emitted on success: a successful split
     /// release always moves funds, so there is no no-op case.
     ReleasedSplit,
+    /// AV-95b: one basket leg was released to the taker
+    /// ([`Escrow::release_basket`]) — the per-leg taker payout. `from
+    /// == Funded`, `to == Funded` while legs remain unsettled, `to ==
+    /// Released` when the settled leg was the last unsettled one —
+    /// the same lifecycle shape as [`EscrowEventKind::Released`], one
+    /// leg at a time. Amounts follow the `Released` shape (`payout` =
+    /// the leg's gross remainder = taker payout + fee, `fee` = the
+    /// AV-17 protocol fee charged on the leg). The actor is the
+    /// initializer. Always emitted on success: a successful leg
+    /// release always moves funds, so there is no no-op case.
+    BasketReleased,
+    /// AV-95b: one basket leg was refunded to the escrow's refund
+    /// recipient ([`Escrow::cancel_basket`]) — the per-leg cancel.
+    /// `from == Funded`, `to == Funded` while legs remain unsettled,
+    /// `to == Cancelled` when the settled leg was the last unsettled
+    /// one — the per-leg mirror of [`EscrowEventKind::Cancelled`].
+    /// Amounts follow the `Cancelled` shape (`refund` = the leg's
+    /// remainder). The actor is the initializer. Always emitted on
+    /// success: a successful leg cancel always moves funds, so there
+    /// is no no-op case.
+    BasketCancelled,
+    /// AV-95b: one basket leg was refunded after expiry
+    /// ([`Escrow::cancel_expired_basket`]) — the per-leg expiry
+    /// cancel. `from == Funded`, `to == Funded` while legs remain
+    /// unsettled, `to == Cancelled` when the settled leg was the last
+    /// unsettled one — the per-leg mirror of
+    /// [`EscrowEventKind::ExpiredCancelled`]. Amounts follow the
+    /// `ExpiredCancelled` shape (`refund` = the leg's net refund,
+    /// `penalty` = the AV-24 anti-griefing penalty on a
+    /// taker-initiated cancel, 0 otherwise). The actor is the caller
+    /// (the initializer or the taker). Always emitted on success: a
+    /// successful leg expiry-cancel always moves funds, so there is
+    /// no no-op case.
+    BasketExpiredCancelled,
 }
 
 impl EscrowEventKind {
@@ -709,6 +768,15 @@ impl EscrowEventKind {
             // AV-93: appended after EvidenceFiled so discriminants
             // 0–46 stay stable for already-serialized histories.
             47 => Self::ReleasedSplit,
+            // AV-95b: appended after ReleasedSplit so discriminants
+            // 0–47 stay stable for already-serialized histories.
+            48 => Self::BasketReleased,
+            // AV-95b: appended after BasketReleased so discriminants
+            // 0–48 stay stable for already-serialized histories.
+            49 => Self::BasketCancelled,
+            // AV-95b: appended after BasketCancelled so discriminants
+            // 0–49 stay stable for already-serialized histories.
+            50 => Self::BasketExpiredCancelled,
             _ => return None,
         })
     }
@@ -765,6 +833,9 @@ impl EscrowEventKind {
             Self::AppealResolved => "appeal_resolved",
             Self::EvidenceFiled => "evidence_filed",
             Self::ReleasedSplit => "released_split",
+            Self::BasketReleased => "basket_released",
+            Self::BasketCancelled => "basket_cancelled",
+            Self::BasketExpiredCancelled => "basket_expired_cancelled",
         }
     }
 
@@ -822,6 +893,9 @@ impl EscrowEventKind {
             "appeal_resolved" => Self::AppealResolved,
             "evidence_filed" => Self::EvidenceFiled,
             "released_split" => Self::ReleasedSplit,
+            "basket_released" => Self::BasketReleased,
+            "basket_cancelled" => Self::BasketCancelled,
+            "basket_expired_cancelled" => Self::BasketExpiredCancelled,
             _ => return None,
         })
     }
@@ -1241,6 +1315,41 @@ impl IndexedEscrow {
         Ok(indexed)
     }
 
+    /// AV-95b: stand up a multi-mint basket escrow (mirrors
+    /// [`Escrow::initialize_basket`]). Emits `Initialized` like
+    /// [`Self::initialize`] — the constructor has no prior state, so
+    /// from == to == Uninitialized by convention; the basket leg table
+    /// is visible in the vault state itself.
+    pub fn initialize_basket(
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        legs: &[([u8; 32], u64)],
+        expires_at: u64,
+        escrow_id: [u8; 32],
+        at: u64,
+    ) -> Result<Self, EscrowError> {
+        let inner = Escrow::initialize_basket(initializer, taker, legs, expires_at)?;
+        let mut indexed = Self {
+            inner,
+            escrow_id,
+            events: Vec::new(),
+            next_seq: 0,
+        };
+        indexed.push_event(
+            EscrowEventKind::Initialized,
+            EscrowState::Uninitialized,
+            EscrowState::Uninitialized,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(initializer),
+        );
+        Ok(indexed)
+    }
+
     /// AV-77: stand up a fully-configured escrow from a governance
     /// preset ([`TemplatePreset`]): the preset's defaults plus the
     /// caller's per-field overrides produce the escrow's full
@@ -1571,6 +1680,13 @@ impl IndexedEscrow {
     /// Configuration: emits no event.
     pub fn with_mint(mut self, mint: [u8; 32]) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_mint(mint)?;
+        Ok(self)
+    }
+
+    /// Attach a multi-mint basket leg table (mirrors
+    /// [`Escrow::with_basket`], AV-95). Configuration: emits no event.
+    pub fn with_basket(mut self, legs: &[([u8; 32], u64)]) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_basket(legs)?;
         Ok(self)
     }
 
@@ -2024,6 +2140,118 @@ impl IndexedEscrow {
             None,
             Some(caller),
             Some(caller),
+        );
+        Ok((refund, penalty))
+    }
+
+    /// Settle one basket leg to the taker (mirrors
+    /// [`Escrow::release_basket`], AV-95b). Emits `BasketReleased`
+    /// (`from == Funded`, `to == Funded` while legs remain, `to ==
+    /// Released` on the last leg); `now` doubles as the event's `at`.
+    /// Amounts follow the `Released` shape (`payout` = the leg's gross
+    /// remainder, `fee` = the AV-17 protocol fee on the leg). Returns
+    /// the `(payout, fee)` split so the caller can size the token
+    /// transfer. A failed leg release emits nothing.
+    ///
+    /// [`Escrow::release_basket`]: super::Escrow::release_basket
+    pub fn release_basket(
+        &mut self,
+        authority: [u8; 32],
+        now: u64,
+        mint: Option<[u8; 32]>,
+    ) -> Result<(u64, u64), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected` (`now` doubles as the event's `at`).
+        let result = self.inner.release_basket(authority, now, mint);
+        let (payout, fee) = self.map_reentrant(result, now)?;
+        let to = self.inner.state();
+        // `payout + fee == gross` by construction; it cannot overflow
+        // u64 addition.
+        self.push_event(
+            EscrowEventKind::BasketReleased,
+            from,
+            to,
+            EventAmounts::payout(payout + fee, fee),
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok((payout, fee))
+    }
+
+    /// Refund one basket leg to the escrow's refund recipient (mirrors
+    /// [`Escrow::cancel_basket`], AV-95b). Emits `BasketCancelled`
+    /// (`from == Funded`, `to == Funded` while legs remain, `to ==
+    /// Cancelled` on the last leg) with `amounts.refund` carrying the
+    /// leg's remainder. Returns the refunded remainder so the caller
+    /// can size the token transfer. A failed leg cancel emits nothing.
+    ///
+    /// [`Escrow::cancel_basket`]: super::Escrow::cancel_basket
+    pub fn cancel_basket(
+        &mut self,
+        authority: [u8; 32],
+        mint: Option<[u8; 32]>,
+        at: u64,
+    ) -> Result<u64, EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.cancel_basket(authority, mint);
+        let refund = self.map_reentrant(result, at)?;
+        let to = self.inner.state();
+        self.push_event(
+            EscrowEventKind::BasketCancelled,
+            from,
+            to,
+            EventAmounts::refund(refund),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(refund)
+    }
+
+    /// Refund one basket leg after expiry (mirrors
+    /// [`Escrow::cancel_expired_basket`], AV-95b). Emits
+    /// `BasketExpiredCancelled` (`from == Funded`, `to == Funded`
+    /// while legs remain, `to == Cancelled` on the last leg); `now`
+    /// doubles as the event's `at`. Amounts follow the
+    /// `ExpiredCancelled` shape (`refund` = the leg's net refund,
+    /// `penalty` = the AV-24 penalty on a taker-initiated cancel).
+    /// Returns the `(refund, penalty)` split. A failed call emits
+    /// nothing.
+    ///
+    /// [`Escrow::cancel_expired_basket`]: super::Escrow::cancel_expired_basket
+    pub fn cancel_expired_basket(
+        &mut self,
+        authority: [u8; 32],
+        now: u64,
+        mint: Option<[u8; 32]>,
+    ) -> Result<(u64, u64), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected` (`now` doubles as the event's `at`).
+        let result = self.inner.cancel_expired_basket(authority, now, mint);
+        let (refund, penalty) = self.map_reentrant(result, now)?;
+        let to = self.inner.state();
+        self.push_event(
+            EscrowEventKind::BasketExpiredCancelled,
+            from,
+            to,
+            EventAmounts::expired_cancel(refund, penalty),
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
         );
         Ok((refund, penalty))
     }
@@ -5282,7 +5510,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(48), None);
+        assert_eq!(EscrowEventKind::from_discriminant(51), None);
     }
 
     #[test]
@@ -5298,7 +5526,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(48), None);
+        assert_eq!(EscrowEventKind::from_discriminant(51), None);
     }
 
     #[test]
@@ -5835,7 +6063,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(48), None);
+        assert_eq!(EscrowEventKind::from_discriminant(51), None);
     }
 
     #[test]
@@ -5850,7 +6078,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(48), None);
+        assert_eq!(EscrowEventKind::from_discriminant(51), None);
     }
 
     #[test]
@@ -5862,7 +6090,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(48), None);
+        assert_eq!(EscrowEventKind::from_discriminant(51), None);
     }
 
     #[test]
@@ -5874,7 +6102,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(48), None);
+        assert_eq!(EscrowEventKind::from_discriminant(51), None);
     }
 
     #[test]
@@ -5886,7 +6114,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(48), None);
+        assert_eq!(EscrowEventKind::from_discriminant(51), None);
     }
 
     #[test]
@@ -5898,7 +6126,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(48), None);
+        assert_eq!(EscrowEventKind::from_discriminant(51), None);
     }
 
     #[test]

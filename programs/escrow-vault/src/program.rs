@@ -94,6 +94,54 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Create a multi-mint basket vault (AV-95b; the basket twin of
+    /// `initialize`). `legs` is the (mint, amount) leg table —
+    /// non-empty, at most `escrow_state::MAX_BASKET_LEGS` (8) legs, no
+    /// zero mint, no zero amount, no duplicate mint, and a leg-amount
+    /// Σ that fits in `u64` (every violation is `InvalidBasket`, code
+    /// 152). The vault account is created with the basket region
+    /// reserved in place (386 bytes, always reserved — see AV-95a), so
+    /// the legs are written without reallocating; the escrow-level
+    /// `amount` is the Σ over the legs.
+    pub fn initialize_basket(
+        ctx: Context<InitializeBasket>,
+        legs: Vec<BasketLegArg>,
+        expires_at: u64,
+    ) -> Result<()> {
+        let leg_tuples: Vec<([u8; 32], u64)> = legs
+            .iter()
+            .map(|l| (l.mint.to_bytes(), l.amount))
+            .collect();
+        let escrow = escrow_state::Escrow::initialize_basket(
+            ctx.accounts.initializer.key().to_bytes(),
+            ctx.accounts.taker.key().to_bytes(),
+            &leg_tuples,
+            expires_at,
+        )
+        .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: the constructor has no prior state — from == to ==
+        // Uninitialized by the same convention as
+        // `IndexedEscrow::initialize_basket`.
+        let state = escrow_state::EscrowState::Uninitialized as u8;
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Initialized,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// Lock funds into the vault (`Uninitialized -> Funded`).
     /// AV-64: the funding timestamp is read from the Solana clock
     /// sysvar (never an instruction param) and recorded as
@@ -3124,6 +3172,164 @@ pub mod escrow_vault {
         );
         Ok((payout, fee, rent))
     }
+
+    /// Settle one basket leg to the taker (AV-95b; mirrors
+    /// `Escrow::release_basket`). The leg is named by its SPL token
+    /// account's mint — the real build reads
+    /// `vault_token_account.mint` and the state machine requires it to
+    /// be one of the basket's legs (`InvalidBasket`, code 152,
+    /// otherwise — including on a plain non-basket escrow, which has
+    /// no legs to settle).
+    ///
+    /// One leg (one SPL mint) settles per call: `Funded -> Funded`
+    /// while legs remain, `Funded -> Released` on the last leg. The
+    /// check order mirrors `release` (authority -> basket presence ->
+    /// Funded -> leg lookup -> quorum -> timelock AV-27); the AV-17
+    /// protocol fee is charged on the leg's gross remainder.
+    /// Returns `(payout, fee)` so the real build can size the leg's
+    /// token transfer to the taker and the fee transfer.
+    pub fn release_basket(ctx: Context<ReleaseBasket>) -> Result<(u64, u64)> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        // AV-27: the timelock gate reads the Solana clock sysvar — never
+        // an instruction param, so the initializer cannot fast-forward
+        // the lock they configured.
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let (payout, fee) = escrow
+            .release_basket(
+                ctx.accounts.initializer.key().to_bytes(),
+                now,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-31: settle via `cpi_settle_payout` (`PayoutKind::Release`)
+        // — the real build transfers the leg's net payout to the
+        // taker's token account for this leg's mint and the fee to the
+        // fee account, once the token accounts are wired up.
+        // AV-18: one `BasketReleased` event per settled leg (`now`
+        // doubles as the event's `at`), mirroring
+        // `escrow_state::IndexedEscrow::release_basket`.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::BasketReleased,
+            from,
+            escrow.state() as u8,
+            payout + fee,
+            fee,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok((payout, fee))
+    }
+
+    /// Refund one basket leg to the escrow's refund recipient (AV-95b;
+    /// mirrors `Escrow::cancel_basket`). The leg is named by its SPL
+    /// token account's mint (see `release_basket`).
+    ///
+    /// One leg settles per call: `Funded -> Funded` while legs remain,
+    /// `Funded -> Cancelled` on the last leg. The check order mirrors
+    /// `cancel` (authority -> basket presence -> Funded -> leg
+    /// lookup); quorum / timelock do not gate this path — the
+    /// initializer reclaims their own funds. No fee, no penalty.
+    /// Unlike `cancel`, this instruction takes no caller-chosen
+    /// refund destination: the real build transfers the leg's
+    /// remainder to the escrow's own AV-23 refund policy (the
+    /// whitelisted address, or the initializer). Returns the refunded
+    /// leg remainder so the real build can size the token transfer.
+    pub fn cancel_basket(ctx: Context<CancelBasket>) -> Result<u64> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        let refunded = escrow
+            .cancel_basket(
+                ctx.accounts.initializer.key().to_bytes(),
+                vault_token_mint(&ctx.accounts.vault_token_account),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-31: settle via `cpi_settle_refund` (`RefundKind::Cancel`) —
+        // the real build transfers the leg's remainder to the refund
+        // recipient account once the token accounts are wired up.
+        // AV-18: one `BasketCancelled` event per settled leg, mirroring
+        // `escrow_state::IndexedEscrow::cancel_basket`.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::BasketCancelled,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            refunded,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(refunded)
+    }
+
+    /// Refund one basket leg after expiry (AV-95b; mirrors
+    /// `Escrow::cancel_expired_basket`). Either the initializer or the
+    /// taker may call once the expiry gate passes (`now >= expires_at
+    /// + grace_period`); the leg is named by its SPL token account's
+    /// mint (see `release_basket`).
+    ///
+    /// One leg settles per call: `Funded -> Funded` while legs remain,
+    /// `Funded -> Cancelled` on the last leg. The check order mirrors
+    /// `cancel_expired` (authority -> basket presence -> Funded -> leg
+    /// lookup -> expiry gate). The AV-24 anti-griefing penalty applies
+    /// to the leg's remainder on a *taker-initiated* cancel (routed to
+    /// the initializer); an initializer-initiated cancel pays no
+    /// penalty. Returns `(refund, penalty)` so the real build can size
+    /// both transfers.
+    pub fn cancel_expired_basket(ctx: Context<CancelExpiredBasket>) -> Result<(u64, u64)> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let (refund, penalty) = escrow
+            .cancel_expired_basket(
+                ctx.accounts.authority.key().to_bytes(),
+                now,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-31: settle via `cpi_settle_refund`
+        // (`RefundKind::CancelExpired`) — the real build transfers the
+        // leg's net refund to the refund recipient and the AV-24
+        // penalty (non-zero only on a taker-initiated cancel) to the
+        // initializer, once the token accounts are wired up.
+        // AV-18: `now` doubles as the event's `at`, mirroring
+        // `IndexedEscrow::cancel_expired_basket`. The real build's
+        // `EscrowVaultEvent` gains a `penalty` amounts field mirroring
+        // `escrow_state::EventAmounts::penalty`; the skeleton's
+        // `emit_transition` keeps its current shape until the real
+        // build wires the event struct (the `cancel_expired`
+        // precedent).
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::BasketExpiredCancelled,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            refund,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok((refund, penalty))
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -3565,6 +3771,17 @@ pub struct Vault {
 pub struct SlashTerms {
     pub penalty_account: Pubkey,
     pub slash_deadline: u64,
+}
+
+/// Skeleton mirror of one `escrow_state::BasketLeg` as an instruction
+/// argument (AV-95b): the SPL mint plus the amount to lock in that
+/// mint. The `initialize_basket` handler converts
+/// `Vec<BasketLegArg>` to the `Vec<([u8; 32], u64)>` the state
+/// machine's [`escrow_state::BasketLegs::new`] validates.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct BasketLegArg {
+    pub mint: Pubkey,
+    pub amount: u64,
 }
 
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
@@ -4182,6 +4399,21 @@ pub struct Initialize<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// AV-95b: the basket twin of [`Initialize`] — creates the vault
+/// account for a multi-mint basket escrow. Same account shape as
+/// `Initialize` (the basket region is reserved in place at account
+/// creation, so no realloc is needed); the leg table arrives as the
+/// `initialize_basket` instruction's `legs` param, not as accounts.
+#[derive(Accounts)]
+pub struct InitializeBasket<'info> {
+    #[account(init, payer = initializer, space = escrow_state::VAULT_SPACE)]
+    pub vault: Account<'info, Vault>,
+    pub taker: SystemAccount<'info>,
+    #[account(mut)]
+    pub initializer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
 #[derive(Accounts)]
 pub struct Fund<'info> {
     #[account(mut)]
@@ -4311,6 +4543,70 @@ pub struct CancelExpired<'info> {
     /// is the caller, the refund goes to the declared address, never to
     /// the caller. The real build transfers the refund to this account
     /// after the state machine's `RefundAddressMismatch` check passes.
+    pub refund_to: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ReleaseBasket<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    pub initializer: Signer<'info>,
+    /// CHECK: beneficiary of the leg release (the taker); the real
+    /// build transfers the leg's net payout to this leg's token
+    /// account. Kept as a named account so the IDL stays explicit
+    /// about who the release is for, like `Release`.
+    pub taker: AccountInfo<'info>,
+    /// CHECK: Solana clock sysvar, read for the AV-27 timelock gate
+    /// (never an instruction param — a caller-supplied timestamp would
+    /// let the initializer fast-forward the lock).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account *for the leg being
+    /// settled*. The real build reads this account's `mint` and the
+    /// state machine requires it to be one of the basket's legs
+    /// (`InvalidBasket`, code 152, otherwise — a basket escrow has no
+    /// single bound mint, and there is no native-SOL path: every leg
+    /// carries a real mint).
+    pub vault_token_account: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CancelBasket<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    pub initializer: Signer<'info>,
+    /// CHECK: the vault's SPL token account *for the leg being
+    /// refunded* (see `ReleaseBasket`). The real build reads its
+    /// `mint` for the state machine's leg lookup (`InvalidBasket`,
+    /// code 152, on a mint outside the leg table).
+    pub vault_token_account: AccountInfo<'info>,
+    /// CHECK: the refund destination account. AV-23: unlike `Cancel`,
+    /// this instruction takes no caller-chosen destination — the real
+    /// build transfers the leg's remainder to the escrow's own refund
+    /// policy (the whitelisted address, or the initializer with no
+    /// whitelist), which the state machine resolves, so the
+    /// anti-phishing pin holds by construction.
+    pub refund_to: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CancelExpiredBasket<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker; the state machine enforces
+    /// the either-party rule. A constraint in the real build additionally
+    /// asserts `authority.key() == vault.initializer || authority.key() == vault.taker`.
+    pub authority: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the expiry comparison.
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account *for the leg being
+    /// refunded* (see `ReleaseBasket`). The real build reads its
+    /// `mint` for the state machine's leg lookup (`InvalidBasket`,
+    /// code 152, on a mint outside the leg table).
+    pub vault_token_account: AccountInfo<'info>,
+    /// CHECK: the refund destination account (see `CancelBasket`).
+    /// AV-23: the real build transfers the leg's net refund here; the
+    /// AV-24 penalty (non-zero only on a taker-initiated cancel) goes
+    /// to the initializer.
     pub refund_to: AccountInfo<'info>,
 }
 
@@ -5592,6 +5888,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::GapInEventStream => {
             error!(ErrorCode::GapInEventStream)
         }
+        escrow_state::EscrowError::InvalidBasket => {
+            error!(ErrorCode::InvalidBasket)
+        }
     }
 }
 
@@ -5695,4 +5994,6 @@ pub enum ErrorCode {
     InvalidReleaseSplit,
     #[msg("Broken event-stream continuity (AV-94): MaterializedView::apply hit a missing seq (gap), an out-of-order or duplicate seq, or events for a different escrow_id than the view folds")]
     GapInEventStream,
+    #[msg("Invalid multi-mint basket (AV-95): BasketLegs::new with an empty leg table, more than 8 legs, a zero mint, a zero leg amount, a duplicate mint, or a leg-amount sum overflowing u64; or release_basket / cancel_basket / cancel_expired_basket on an escrow with no basket configured, or with a mint outside the basket's leg table")]
+    InvalidBasket,
 }
