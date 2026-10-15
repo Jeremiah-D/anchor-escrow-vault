@@ -265,7 +265,7 @@ pub fn find_program_address(
 // ---------------------------------------------------------------------------
 
 /// Field prime `p = 2^255 − 19` as 4 LE u64 limbs.
-const FIELD_P: [u64; 4] = [
+pub(crate) const FIELD_P: [u64; 4] = [
     0xFFFF_FFFF_FFFF_FFED,
     0xFFFF_FFFF_FFFF_FFFF,
     0xFFFF_FFFF_FFFF_FFFF,
@@ -273,7 +273,7 @@ const FIELD_P: [u64; 4] = [
 ];
 
 /// `p − 2`, the Fermat inversion exponent.
-const P_MINUS_2: [u64; 4] = [
+pub(crate) const P_MINUS_2: [u64; 4] = [
     0xFFFF_FFFF_FFFF_FFEB,
     0xFFFF_FFFF_FFFF_FFFF,
     0xFFFF_FFFF_FFFF_FFFF,
@@ -281,7 +281,7 @@ const P_MINUS_2: [u64; 4] = [
 ];
 
 /// `(p+3)/8 = 2^252 − 2`, the square-root exponent for `p ≡ 5 (mod 8)`.
-const EXP_SQRT: [u64; 4] = [
+pub(crate) const EXP_SQRT: [u64; 4] = [
     0xFFFF_FFFF_FFFF_FFFE,
     0xFFFF_FFFF_FFFF_FFFF,
     0xFFFF_FFFF_FFFF_FFFF,
@@ -291,7 +291,7 @@ const EXP_SQRT: [u64; 4] = [
 /// √−1 mod p, i.e. `2^((p−1)/4)` (2 is a quadratic non-residue mod p
 /// because `p ≡ 5 (mod 8)`). Verified by
 /// `pda_tests::sqrt_m1_squares_to_minus_one`.
-const SQRT_M1: Fe = Fe([
+pub(crate) const SQRT_M1: Fe = Fe([
     0xC4EE1B274A0EA0B0,
     0x2F431806AD2FE478,
     0x2B4D00993DFBD7A7,
@@ -301,7 +301,7 @@ const SQRT_M1: Fe = Fe([
 /// Edwards `d = −121665 · inv(121666) mod p`. Hardcoded (crate style:
 /// cf. `SQUADS_V4_PROGRAM_ID`) and verified by
 /// `pda_tests::ed25519_d_matches_definition`.
-const ED25519_D: Fe = Fe([
+pub(crate) const ED25519_D: Fe = Fe([
     0x75EB4DCA135978A3,
     0x00700A4D4141D8AB,
     0x8CC740797779E898,
@@ -310,7 +310,7 @@ const ED25519_D: Fe = Fe([
 
 /// Compare raw little-endian bytes against `p` (before any modular
 /// reduction).
-fn raw_bytes_ge_p(yb: &[u8; 32]) -> bool {
+pub(crate) fn raw_bytes_ge_p(yb: &[u8; 32]) -> bool {
     // p = 2^255 − 19 little-endian: 0xED, 0xFF×30, 0x7F.
     let mut p_bytes = [0xFFu8; 32];
     p_bytes[0] = 0xED;
@@ -326,13 +326,13 @@ fn raw_bytes_ge_p(yb: &[u8; 32]) -> bool {
 /// Field element mod `p`, 4 little-endian u64 limbs, always reduced
 /// (`< p`) after each operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Fe([u64; 4]);
+pub(crate) struct Fe([u64; 4]);
 
 impl Fe {
-    const ZERO: Fe = Fe([0, 0, 0, 0]);
-    const ONE: Fe = Fe([1, 0, 0, 0]);
+    pub(crate) const ZERO: Fe = Fe([0, 0, 0, 0]);
+    pub(crate) const ONE: Fe = Fe([1, 0, 0, 0]);
 
-    fn from_bytes(b: &[u8; 32]) -> Fe {
+    pub(crate) fn from_bytes(b: &[u8; 32]) -> Fe {
         let mut t = [0u64; 16];
         for i in 0..4 {
             let mut c = [0u8; 8];
@@ -424,7 +424,7 @@ impl Fe {
         r
     }
 
-    fn add(self, rhs: Fe) -> Fe {
+    pub(crate) fn add(self, rhs: Fe) -> Fe {
         let mut t = [0u64; 16];
         for i in 0..4 {
             Self::acc_add(&mut t, self.0[i] as u128 + rhs.0[i] as u128, i);
@@ -432,7 +432,7 @@ impl Fe {
         Self::reduce(&t)
     }
 
-    fn sub(self, rhs: Fe) -> Fe {
+    pub(crate) fn sub(self, rhs: Fe) -> Fe {
         let mut r = [0u64; 4];
         let mut borrow: u64 = 0;
         for i in 0..4 {
@@ -453,7 +453,7 @@ impl Fe {
         Fe(r)
     }
 
-    fn mul(self, rhs: Fe) -> Fe {
+    pub(crate) fn mul(self, rhs: Fe) -> Fe {
         let mut t = [0u64; 16];
         for i in 0..4 {
             for j in 0..4 {
@@ -464,7 +464,7 @@ impl Fe {
     }
 
     /// Square-and-multiply over the full 256-bit exponent.
-    fn pow(self, exp: [u64; 4]) -> Fe {
+    pub(crate) fn pow(self, exp: [u64; 4]) -> Fe {
         let mut r = Fe::ONE;
         for i in (0..4).rev() {
             for b in (0..64).rev() {
@@ -475,6 +475,26 @@ impl Fe {
             }
         }
         r
+    }
+
+    /// Serialize the (already reduced, `< p`) limbs as 32
+    /// little-endian bytes — the inverse of [`Fe::from_bytes`].
+    pub(crate) fn to_bytes(self) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        for i in 0..4 {
+            b[8 * i..8 * i + 8].copy_from_slice(&self.0[i].to_le_bytes());
+        }
+        b
+    }
+
+    /// The low bit of the field element (point-compression parity).
+    pub(crate) fn is_odd(self) -> bool {
+        self.0[0] & 1 == 1
+    }
+
+    /// Additive inverse mod `p`.
+    pub(crate) fn neg(self) -> Fe {
+        Fe::ZERO.sub(self)
     }
 }
 

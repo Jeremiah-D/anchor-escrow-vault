@@ -1853,6 +1853,35 @@ entry's recorded seeds (`WatchedEscrow::with_vault_seeds`) — hex when
 seeds are known, `null` otherwise; informational, never an instruction
 input.
 
+## Keeper report signing (AV-101)
+
+Keeper reports are consumed by offline signers (multisig CLIs, keeper
+operators) — a report tampered with after the scan must not verify.
+`escrow-state/src/report_signing.rs` wraps any keeper report's canonical
+JSON in a signed envelope:
+
+```json
+{"report":{...},"signature":{"public_key":"...","signature":"..."}}
+```
+
+- The signature is Ed25519 (RFC 8032), computed over the report's
+  canonical `to_json()` bytes — the exact same bytes the unsigned
+  report emits. Hand-rolled in `escrow-state/src/ed25519.rs`
+  (SHA-512 + field/scalar arithmetic over the existing `pda.rs` field
+  backend); zero dependencies, verified byte-for-byte against OpenSSL
+  (`openssl pkey -in seed -sign`) on two independent test vectors.
+- All seven keeper report types implement `SignableReport`:
+  `KeeperReport`, `CloseReport`, `MilestoneReport`,
+  `StaleVaultReport`, `BatchReport`, `ExecutionBundle`,
+  `EscrowAggregateView` — `report.to_signed_json(&key)` signs,
+  `verify_signed_report_json(&envelope)` verifies without a JSON
+  parser (the envelope splits by fixed layout).
+- Opt-in and backward compatible: without a key, `to_json()` output
+  is byte-identical; signing only *wraps* the canonical bytes.
+  Tampering with the report or the signature (or verifying under the
+  wrong key) fails closed; malformed envelopes are rejected without
+  panicking.
+
 ## Aggregate statistics view (AV-78)
 
 `escrow-state/src/aggregate.rs` rolls a watched fleet up into one

@@ -64,6 +64,16 @@ mod priority_fee;
 // recorded off-chain on the watch structs; the scans attach the
 // derived vault address to their reports. Purely additive.
 mod pda;
+// AV-101: Ed25519 signatures (RFC 8032), hand-rolled, zero
+// dependencies — SHA-512, scalar arithmetic mod L, and
+// twisted-Edwards point operations over `pda`'s field arithmetic.
+// Signs keeper reports so offline multisig/CLI verifiers can detect
+// tampering. Purely additive.
+mod ed25519;
+// AV-101: the signed report envelope (`{"report":…,"signature":…}`)
+// plus the `SignableReport` opt-in surface for all seven keeper
+// report types. Purely additive.
+mod report_signing;
 // AV-72: escrow configuration templates — one-call constructors for the
 // four canonical escrow compositions (auction, milestone-plan,
 // subscription, arbitrated-dispute) with template-level combination
@@ -382,6 +392,17 @@ pub use priority_fee::{
 pub use pda::{
     derive_vault_address, find_program_address, find_vault_bump, is_on_ed25519_curve,
     validate_pda_seeds, VaultDerivation, VaultSeeds, MAX_PDA_SEED_LEN, MAX_PDA_SEEDS, PDA_DOMAIN,
+};
+// AV-101: Ed25519 signing keys (RFC 8032, hand-rolled) for keeper
+// report signatures, plus the stateless verifier.
+pub use ed25519::{verify as verify_ed25519_signature, SigningKey};
+
+// AV-101: keeper report signatures — the signed envelope plus the
+// `SignableReport` opt-in surface for all seven keeper report types.
+// Purely additive; unsigned `to_json()` output is byte-identical.
+pub use report_signing::{
+    signed_report_json, sign_report_json, split_signed_report_json, verify_report_json,
+    verify_signed_report_json, ReportSignature, SignableReport,
 };
 
 // AV-78: escrow aggregate statistics view — read-only fleet rollup
