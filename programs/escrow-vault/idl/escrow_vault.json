@@ -657,6 +657,16 @@
         {"name": "legs", "type": {"vec": {"defined": "BasketLeg"}}},
         {"name": "expires_at", "type": "u64"}
       ]
+    },
+    {
+      "name": "initialize_dutch_auction",
+      "discriminator": [42, 252, 88, 140, 232, 114, 60, 135],
+      "accounts": [],
+      "args": [
+        {"name": "start_at", "type": "u64"},
+        {"name": "end_at", "type": "u64"},
+        {"name": "reserve_bps", "type": "u16"}
+      ]
     }
   ],
   "accounts": [
@@ -729,7 +739,8 @@
           {"name": "evidence_leaves", "type": "u8", "offset": 3969},
           {"name": "evidence_disclosed", "type": "u64", "offset": 3970},
           {"name": "basket", "type": {"option": {"defined": "BasketLegs"}}, "offset": 3978},
-          {"name": "payout_denylist", "type": {"option": {"defined": "PayoutDenylist"}}, "offset": 4364}
+          {"name": "payout_denylist", "type": {"option": {"defined": "PayoutDenylist"}}, "offset": 4364},
+          {"name": "auction", "type": {"option": {"defined": "DutchAuction"}}, "offset": 4494}
         ]
       }
     }
@@ -925,6 +936,17 @@
           {"name": "len", "type": "u8", "offset": 128}
         ]
       }
+    },
+    {
+      "name": "DutchAuction",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "start_at", "type": "u64", "offset": 0},
+          {"name": "end_at", "type": "u64", "offset": 8},
+          {"name": "reserve_bps", "type": "u16", "offset": 16}
+        ]
+      }
     }
   ],
   "errors": [
@@ -982,7 +1004,9 @@
     {"code": 151, "name": "GapInEventStream"},
     {"code": 152, "name": "InvalidBasket"},
     {"code": 154, "name": "InvalidPayoutDenylist"},
-    {"code": 153, "name": "PayoutDenied"}
+    {"code": 153, "name": "PayoutDenied"},
+    {"code": 155, "name": "InvalidAuctionParams"},
+    {"code": 156, "name": "AuctionNotActive"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

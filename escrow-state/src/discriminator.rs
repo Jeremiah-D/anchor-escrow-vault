@@ -37,11 +37,11 @@
 
 use super::{
     sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, CpiAllowlist,
-    DefaultJudgment, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
+    DefaultJudgment, DutchAuction, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
     MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, QuorumPolicy,
     SlashTerms, SubscriptionSchedule, VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
     APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
-    ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
+    DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
     MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS,
     MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
     MILESTONE_PLAN_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN,
@@ -160,6 +160,19 @@ pub enum AccountDecodeError {
     /// mapping is pinned to declaration order (AV-86; AV-32 panic-free
     /// guarantee).
     InvalidAppealStateDiscriminant(u8),
+    /// A present Dutch auction's terms violate the
+    /// [`DutchAuction`](crate::DutchAuction) invariants
+    /// (`start_at >= end_at`, or `reserve_bps > 10_000`). The terms
+    /// are part of the field's layout — a degenerate window would
+    /// make [`DutchAuction::payout_cap`](crate::DutchAuction::payout_cap)
+    /// divide by zero, so the decoder rejects it rather than decoding
+    /// a value the accessors cannot safely read (AV-97; AV-32
+    /// panic-free guarantee).
+    InvalidDutchAuctionTerms {
+        start_at: u64,
+        end_at: u64,
+        reserve_bps: u16,
+    },
 }
 
 /// Bounds-checked cursor over the account body. Every read is
@@ -901,6 +914,40 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(PAYOUT_DENYLIST_LEN)?;
         None
     };
+    // AV-97: the Dutch-auction settlement terms, always reserved like
+    // `payout_denylist`: the `None` discriminant followed by the
+    // zeroed 18-byte terms, or the `Some` discriminant and the terms
+    // (`start_at` u64, `end_at` u64, `reserve_bps` u16). Structural
+    // decode only, with one panic-free guarantee: a window that
+    // violates the `DutchAuction::new` invariants would make
+    // `payout_cap` divide by zero or price a floor above the lockup,
+    // so the decoder rejects it rather than decoding a value the
+    // accessors cannot safely read (AV-32 panic-free guarantee).
+    let auction = if c.option_present("auction")? {
+        let start_at = c.u64_le()?;
+        let end_at = c.u64_le()?;
+        let reserve_bps = c.u16_le()?;
+        debug_assert_eq!(
+            DUTCH_AUCTION_LEN,
+            18,
+            "auction region drift vs DUTCH_AUCTION_LEN"
+        );
+        if start_at >= end_at || reserve_bps > 10_000 {
+            return Err(AccountDecodeError::InvalidDutchAuctionTerms {
+                start_at,
+                end_at,
+                reserve_bps,
+            });
+        }
+        Some(DutchAuction {
+            start_at,
+            end_at,
+            reserve_bps,
+        })
+    } else {
+        c.skip(DUTCH_AUCTION_LEN)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1053,6 +1100,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-96: the payout denylist rides the decode so a decoded
         // escrow enforces the same payout veto the live one had.
         payout_denylist,
+        // AV-97: the Dutch-auction terms ride the decode so a decoded
+        // escrow prices `claim` through the same descending curve the
+        // live one used.
+        auction,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

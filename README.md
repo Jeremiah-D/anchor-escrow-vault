@@ -69,7 +69,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_arbiter(arbiter)`               | `Uninitialized`| `Uninitialized` | initializer (once, before funding; zero key rejected; mutually exclusive with `initialize_arbiter_panel` — last-wins in both directions) |
 | `initialize_slash_terms(penalty_account, slash_deadline)` (AV-82) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; the zero penalty account is rejected — the penalty sink must be a real identity, `SlashNotEligible` code 143) |
 | `initialize_arbiter_panel(members, threshold)` (AV-65) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opt-in multisig arbitration: 1–8 member keys, threshold 1..=N, zero/duplicate keys rejected as `InvalidArbiterPanel`, code 136; mutually exclusive with the single arbiter — last-wins in both directions; `rotate_arbiter` is `InvalidStateTransition` in panel mode) |
-| `escalate(authority, now, evidence_hash, evidence_root, evidence_leaves)` (AV-91) | `Funded`       | `Disputed` | initializer **or** taker, only when `now < expires_at` (locks `release`/`cancel`/`cancel_expired`/`claim`); `evidence_hash` is the optional 32-byte off-chain-evidence commitment, persisted; `evidence_root` is the optional SHA-256 Merkle root over the evidence-document set and `evidence_leaves` the committed leaf count (`0` iff the root is `None`, `1..=64` iff `Some` — `InvalidEvidenceProof`, code 148, on a count that does not describe the root); the root/leaves/zeroed disclosure bitmap are persisted and never cleared |
+| `escalate(authority, now, evidence_hash, evidence_root, evidence_leaves)` (AV-91) | `Funded`       | `Disputed` | initializer **or** taker, only when `now < expires_at` (locks `release`/`cancel`/`cancel_expired`/`claim`); `evidence_hash` is the optional 32-byte off-chain-evidence commitment, persisted; `evidence_root` is the optional SHA-256 Merkle root over the evidence-document set and `evidence_leaves` the committed leaf count (`0` iff the root is `None`, `1..=64` iff `Some` — `InvalidEvidenceProof`, code 148, on a count that does not describe the root); the root/leaves/zeroed disclosure bitmap are persisted and never cleared; refused with `AuctionNotActive` (code 156) while an AV-97 Dutch-auction window is live — price discovery and arbitration are mutually exclusive settlement paths |
 | `resolve(authority, taker_amount, rationale_hash)` | `Disputed`     | `Settled` | arbiter only; atomic split of the remainder (taker payout / initializer refund); `rationale_hash` is the optional 32-byte commitment to the arbiter's off-chain rationale document, persisted in `Settled` (never cleared); **disabled in panel mode** (`PanelResolveDisabled`, code 137 — the panel's multisig judgment is the only settlement path once a panel is configured) |
 | `submit_panel_judgment(member, taker_amount, rationale_hash)` (AV-65) | `Disputed` | `Disputed` (vote recorded) / `Settled` (M matching votes) | panel member only (`Unauthorized` for a stranger); one effective vote per member — a re-vote overwrites the earlier vote (the `PanelJudgment` event keeps the audit trail); the first M votes agreeing on the same `(taker_amount, rationale_hash)` pair settle the escrow automatically (`Settled`, settlement identical to `resolve` — fee slices the taker's share, gross lands in the `released` counter, the initializer is refunded the remainder); non-matching votes stay recorded for audit; the settling vote emits `PanelResolved` after its `PanelJudgment`; `InvalidArbiterPanel` (code 136) with no panel configured |
 | `initialize_default_judgment(deadline_secs, default_taker_amount)` (AV-55) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — and only after `initialize_arbiter`; the arbiter must be configured first); declares the fallback split applied when the arbiter never resolves: `deadline_secs` seconds in `Disputed` before the judgment becomes triggerable (must be non-zero — `DefaultJudgmentNotDue` otherwise), `default_taker_amount` the taker's share of the remainder (must be ≤ the locked amount — `ReleaseExceedsLocked` otherwise); the initializer proposes the terms, the taker must still countersign (dual-signed agreement) |
@@ -110,7 +110,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `update_attestors(initializer, taker, attestors)` | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance; no party can unilaterally reshape the electorate); empty set / `> 8` / duplicates / new set smaller than the unchanged threshold is `InvalidQuorum`; approval bits remap by pubkey (retained votes survive, removed voters' bits cleared); emits `AttestorsUpdated` on a real set change, nothing on a no-op |
 | `activate(authority)`                       | `Uninitialized`| `Uninitialized` (one party) / `Activated` (both parties) | initializer **or** taker (dual-sig escrows only) |
 | `initialize_vesting(start, end, cliff)`     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `start < end`; `cliff` 0 = no cliff, else `cliff <= end`) |
-| `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise) |
+| `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); with an AV-97 Dutch auction attached, `claim` prices through the descending auction cap inside `[start_at, end_at]` instead of the vesting curve (`AuctionNotActive`, code 156, outside the window) — the gross lands in the same `released` counter and the initializer reclaims the remainder via `cancel` / `cancel_partial` |
+| `initialize_dutch_auction(start_at, end_at, reserve_bps)` (AV-97) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the descending-price settlement window: `start_at < end_at`, `reserve_bps` in 0–10000 — `InvalidAuctionParams`, code 155, otherwise); the taker's pull path becomes the auction cap `max(amount * (end_at - now) / (end_at - start_at), amount * reserve_bps / 10000)` inside the window — early claimers keep more, the `reserve_bps` floor is the initializer's guaranteed keep; mutually exclusive with the AV-13/AV-90 unlock paths (last-wins) and with dispute arbitration while the window is live (`escalate` is refused with `AuctionNotActive`, code 156) |
 | `fund(authority, now)`                      | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer (`now` <- clock sysvar, recorded as `fund_at` — the origin the AV-64 relative timelock measures from) |
 | `release(authority, now, amount, payout_to)` (AV-49)                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); cumulative releases ≤ locked amount; `payout_to` must satisfy the payout policy — the taker, or a member of the payout allowlist when one is configured (`PayoutNotAllowlisted` otherwise) |
 | `release_split(authority, now, amount, recipients, bps)` (AV-93) | `Funded` | `Funded` (partial) / `Released` (cumulative full) | initializer; the check order mirrors `release` — authority → state → mint → the share-table shape (non-empty, ≤ 8 recipients, no zero address, no zero weight, weights summing to exactly 10_000 bps — `InvalidReleaseSplit`, code 150, otherwise) → every recipient pinned against the AV-49 payout policy (`PayoutNotAllowlisted` otherwise; with no allowlist only the taker passes, so a multi-recipient split is the allowlist's declared distribution set) → milestones / subscription / quorum / timelock gates → amount math (`AmountMismatch` on 0, `ReleaseExceedsLocked` past the remainder); the AV-17 protocol fee is charged on the gross amount first, then the net splits — each leg `floor(net * bps / 10_000)`, the dust landing on the first recipient, so the legs sum to the net exactly; `released` accumulates the gross, so the conservation invariant is untouched; returns the `(recipient, net_share)` legs (sizing the program's transfers) plus the fee; emits `ReleasedSplit` with the legs stamped on the event |
@@ -590,8 +591,10 @@ progress; keeper `resolve` / `submit_panel_judgment` actions surface
 it for the arbiter dashboard; the snapshot exports `evidence_root`
 and `evidence_disclosure`. New vault fields (appended last):
 `evidence_root` (`Option<[u8; 32]>`, 33 bytes) + `evidence_leaves`
-(u8) + `evidence_disclosed` (u64, 8 bytes) — 42 bytes, so the full
-vault is now 3978 bytes / 28,577,760 lamports rent-exempt. Anchor
+(u8) + `evidence_disclosed` (u64, 8 bytes) — 42 bytes at the time,
+bringing the layout to 3978 bytes (the layout has since grown to
+4505 bytes / 4513 with the discriminator — see the account-space
+paragraph below). Anchor
 surface: `escalate` gains the two params, plus the new
 `file_evidence` instruction (`doc_hash`, `leaf_index`,
 `proof: Vec<[u8; 32]>`) and the three `Vault` fields, all pinned in
@@ -1209,6 +1212,8 @@ program error per variant):
 | `InvalidBasket` | 152 | `BasketLegs::new` (AV-95) with an empty leg table, more than 8 legs, a zero mint, a zero leg amount, a duplicate mint, or a leg-amount sum overflowing `u64`; `release_basket` / `cancel_basket` / `cancel_expired_basket` on an escrow with no basket, or with a mint outside the leg table |
 | `PayoutDenied` | 153 | any payout transition (AV-96) whose `payout_to` is on the escrow's payout denylist — deny takes precedence over the AV-49 allowlist |
 | `InvalidPayoutDenylist` | 154 | `PayoutDenylist::new` (AV-96) with an empty list, more than 4 addresses, or a zero address |
+| `InvalidAuctionParams` | 155 | `with_dutch_auction` (AV-97) with `start_at >= end_at` (a zero-length window would divide by zero in the descending-price math) or `reserve_bps > 10_000` (not a valid basis-point floor) |
+| `AuctionNotActive` | 156 | `claim` on an auction-mode escrow outside the `[start_at, end_at]` window, or `escalate` while the auction window is live (price discovery and arbitration are mutually exclusive settlement paths) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2194,7 +2199,8 @@ two-way consistency check against the IDL parameter table:
 | evidence_disclosed | u64 | 8 |
 | basket | Option<BasketLegs> | 386 |
 | payout_denylist | Option<PayoutDenylist> | 130 |
-| **total**     |                   | **4486** |
+| auction | Option<DutchAuction> | 19 |
+| **total**     |                   | **4505** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2286,11 +2292,19 @@ discriminant + 32-byte root, zeroed when no multi-doc evidence was
 committed) — and the 1-byte committed evidence leaf count (AV-91:
 zeroed when no root was committed) — and the 8-byte
 evidence-disclosure bitmap (AV-91: one bit per committed document,
-zeroed when the root is committed).
-`escrow-state` exposes `VAULT_SPACE` (3978) and
-`VAULT_SPACE_NO_QUORUM` (3488) for the Anchor `space =` constraint, plus a
+zeroed when the root is committed) — and the 386-byte basket-leg
+table region (AV-95: 1-byte discriminant + 1-byte live-leg count +
+eight fixed 48-byte (mint, amount, released) slots, zeroed when no
+basket is configured) — and the 130-byte payout-denylist region
+(AV-96: 1-byte discriminant + 129-byte list — 4×32-byte addresses +
+1-byte count — zeroed when no denylist is configured) — and the
+19-byte Dutch-auction region (AV-97: 1-byte discriminant + 18-byte
+terms — `start_at` + `end_at` (u64) + `reserve_bps` (u16) — zeroed
+when no auction is configured).
+`escrow-state` exposes `VAULT_SPACE` (4513) and
+`VAULT_SPACE_NO_QUORUM` (4023) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **28,577,760 lamports** to be
+mainnet rent parameters the full vault needs **32,301,360 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -2825,6 +2839,36 @@ the veto (back to `None`); `DenylistUpdated` (event kind 51,
 130-byte region is always reserved in the vault layout (1-byte
 discriminant + 4×32-byte addresses + 1-byte count, zeroed when
 `None`), so the opt-in writes in place without reallocating.
+
+## Dutch auction settlement (AV-97)
+
+The vesting curve pays *more* over time; the Dutch auction pays
+*less* — the taker's incentive is to settle early, before the price
+decays. An auction escrow is configured via
+`with_dutch_auction(start_at, end_at, reserve_bps)` (or the
+`initialize_dutch_auction` instruction), `Uninitialized` only:
+`start_at < end_at` is the descending-price window in Unix seconds
+and `reserve_bps` (0–10_000) the initializer's guaranteed keep at
+the window's end — `InvalidAuctionParams` (code 155) on
+`start_at >= end_at` (a zero-length window would divide by zero in
+the descending math) or a floor above 10_000. Once funded, the
+taker's `claim` inside `[start_at, end_at]` settles at the
+descending cap `max(amount * (end_at - now) / (end_at - start_at),
+amount * reserve_bps / 10_000)`, computed in `u128` so it cannot
+overflow: the full `amount` at `start_at`, sliding linearly down to
+the `reserve_bps` floor at `end_at`. `claim` outside the window
+fails with `AuctionNotActive` (code 156), and the initializer
+reclaims whatever the taker left via `cancel` / `cancel_partial`.
+The auction and the AV-13/AV-90 unlock paths are mutually
+exclusive (last-wins on the builder), and `escalate` is refused
+with `AuctionNotActive` while the window is live — price discovery
+and arbitration are mutually exclusive settlement paths (design
+comment on `Escrow::escalate`). The gross lands in the same
+`released` counter as every other pull path (the AV-11
+conservation convention), the protocol fee slices the gross, and
+the 19-byte region is always reserved in the vault layout (1-byte
+discriminant + 18-byte terms, zeroed when `None`), so the opt-in
+writes in place without reallocating.
 
 ## Basket escrow (AV-95)
 

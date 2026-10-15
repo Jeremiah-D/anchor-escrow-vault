@@ -1070,6 +1070,19 @@ pub struct Escrow {
     /// count) so the policy survives serialization. Appended last so
     /// every earlier field offset stays stable.
     payout_denylist: Option<PayoutDenylist>,
+    /// AV-97: opt-in Dutch-auction settlement terms (see
+    /// [`DutchAuction`] / [`Escrow::with_dutch_auction`]). `None`
+    /// means no auction (backward compatible): [`Escrow::claim`]
+    /// keeps its AV-13 vesting pricing. `Some` means the taker's pull
+    /// path prices through the descending auction curve while the
+    /// window is live — and [`Escrow::escalate`] is rejected while
+    /// the window is live (price discovery and arbitration are
+    /// mutually exclusive). Set once via [`Escrow::with_dutch_auction`]
+    /// on an `Uninitialized` escrow. Persisted (19 bytes in the
+    /// vault account: 1-byte option tag + 18-byte terms) so the
+    /// terms survive serialization. Appended last so every earlier
+    /// field offset stays stable.
+    auction: Option<DutchAuction>,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -1557,6 +1570,26 @@ pub enum EscrowError {
     /// allowlist pin in [`Escrow::require_payout_recipient`], so a
     /// sanctions-hit payout fails fast, before any state changes.
     PayoutDenied,
+    /// Invalid Dutch-auction terms (AV-97):
+    /// [`DutchAuction::new`] / [`Escrow::with_dutch_auction`] with
+    /// `start_at >= end_at` (a zero-length window would divide by
+    /// zero in the descending-price math) or `reserve_bps > 10_000`
+    /// (not a valid basis-point floor). Parallels
+    /// [`EscrowError::InvalidVesting`] (config error). Never
+    /// renumbered (see [`EscrowError::code`]).
+    InvalidAuctionParams,
+    /// Dutch auction not active (AV-97): [`Escrow::claim`] on an
+    /// auction-mode escrow outside the `[start_at, end_at]` window —
+    /// before the window the price has not started discovering, after
+    /// it the auction is over and the initializer reclaims the
+    /// remainder via [`Escrow::cancel`] / [`Escrow::cancel_partial`].
+    /// Also the AV-14 mutual-exclusion refusal: [`Escrow::escalate`]
+    /// while the auction window is live — price discovery and
+    /// arbitration are alternative settlement paths, and freezing the
+    /// escrow mid-window would kill the descending-price incentive
+    /// (see the design note on [`Escrow::escalate`]). Never
+    /// renumbered (see [`EscrowError::code`]).
+    AuctionNotActive,
 }
 
 impl EscrowError {
@@ -1624,6 +1657,9 @@ impl EscrowError {
             EscrowError::InvalidBasket => 152,
             EscrowError::InvalidPayoutDenylist => 154,
             EscrowError::PayoutDenied => 153,
+            // AV-97: appended, never renumbered.
+            EscrowError::InvalidAuctionParams => 155,
+            EscrowError::AuctionNotActive => 156,
         }
     }
 
@@ -1685,6 +1721,8 @@ impl EscrowError {
             EscrowError::InvalidBasket,
             EscrowError::InvalidPayoutDenylist,
             EscrowError::PayoutDenied,
+            EscrowError::InvalidAuctionParams,
+            EscrowError::AuctionNotActive,
         ]
     }
 }
@@ -1874,6 +1912,129 @@ impl PayoutDenylist {
     /// True when `addr` is denied.
     pub fn contains(&self, addr: &[u8; 32]) -> bool {
         self.as_slice().contains(addr)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AV-97: Dutch-auction descending-price settlement.
+// ---------------------------------------------------------------------------
+
+/// Serialized length of [`DutchAuction`]: the window's `start_at` /
+/// `end_at` u64s plus the `reserve_bps` u16 floor.
+pub const DUTCH_AUCTION_LEN: usize = 8 + 8 + 2;
+
+/// Dutch-auction settlement terms (AV-97): an opt-in descending-price
+/// pull path for the taker, fixed before any funds move (see
+/// [`Escrow::with_dutch_auction`]).
+///
+/// Once `Funded`, the taker may [`Escrow::claim`] inside the window
+/// `[start_at, end_at]`; the gross payout cap descends linearly from
+/// the full locked `amount` at `start_at`, floored at the reserve:
+///
+/// `cap(now) = max(amount * (end_at - now) / (end_at - start_at), floor)`
+///
+/// with `floor = amount * reserve_bps / 10_000` — the initializer's
+/// guaranteed minimum keep. The taker claims once, early, for the
+/// most; whatever stays locked is the initializer's — reclaimed via
+/// the existing [`Escrow::cancel`] / [`Escrow::cancel_partial`]
+/// refund path (`released` keeps the gross payout, so conservation
+/// is untouched).
+///
+/// Why a descending price instead of a fixed vesting curve (AV-13):
+/// vesting rewards *waiting*; the auction rewards *settling now* —
+/// the taker who performs early keeps more of the lockup, and the
+/// initializer gets finality instead of a slow drip. The price
+/// discovery and dispute arbitration (AV-14) are mutually exclusive
+/// settlement paths: [`Escrow::escalate`] is rejected while the
+/// window is live, because freezing the escrow mid-window would kill
+/// the descending-price incentive (see the design note there).
+///
+/// `Copy` and heap-free like the rest of the crate. Computed in
+/// `u128` throughout: `(u64::MAX)^2 < u128::MAX`, so the products
+/// cannot overflow, and every result is `<= amount <= u64::MAX`, so
+/// the downcasts are exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DutchAuction {
+    start_at: u64,
+    end_at: u64,
+    reserve_bps: u16,
+}
+
+impl DutchAuction {
+    /// Build the auction terms. Rejects `start_at >= end_at` (a
+    /// zero-length window would divide by zero in
+    /// [`DutchAuction::payout_cap`]) and `reserve_bps > 10_000` (not
+    /// a valid basis-point floor — a floor above the lockup is
+    /// nonsense) with [`EscrowError::InvalidAuctionParams`].
+    pub fn new(start_at: u64, end_at: u64, reserve_bps: u16) -> Result<Self, EscrowError> {
+        if start_at >= end_at {
+            return Err(EscrowError::InvalidAuctionParams);
+        }
+        if reserve_bps > 10_000 {
+            return Err(EscrowError::InvalidAuctionParams);
+        }
+        Ok(Self {
+            start_at,
+            end_at,
+            reserve_bps,
+        })
+    }
+
+    /// Unix timestamp at which the window opens (the cap is the full
+    /// locked amount here).
+    pub fn start_at(&self) -> u64 {
+        self.start_at
+    }
+
+    /// Unix timestamp at which the window closes (the cap is the
+    /// reserve floor here).
+    pub fn end_at(&self) -> u64 {
+        self.end_at
+    }
+
+    /// Reserve floor in basis points (0–10_000) of the locked amount:
+    /// the initializer's guaranteed keep at `end_at`.
+    pub fn reserve_bps(&self) -> u16 {
+        self.reserve_bps
+    }
+
+    /// True while the auction is live: `start_at <= now <= end_at`.
+    /// [`Escrow::escalate`] consults this for the AV-14 mutual
+    /// exclusion; [`Escrow::claim`] treats the complement as
+    /// [`EscrowError::AuctionNotActive`].
+    pub fn is_live(&self, now: u64) -> bool {
+        now >= self.start_at && now <= self.end_at
+    }
+
+    /// The reserve floor in absolute terms for a locked total of
+    /// `amount`: `amount * reserve_bps / 10_000`, rounded down.
+    /// Computed in `u128` — no overflow.
+    pub fn reserve_floor(&self, amount: u64) -> u64 {
+        ((amount as u128 * self.reserve_bps as u128) / 10_000) as u64
+    }
+
+    /// Gross payout cap for a locked total of `amount` at `now`:
+    /// `max(amount * (end_at - now) / (end_at - start_at), floor)` —
+    /// the full amount at `start_at`, descending linearly, never
+    /// below the reserve floor (which binds from the moment the
+    /// linear value drops under it through `end_at`). Outside the
+    /// window this is [`EscrowError::AuctionNotActive`], not zero: a
+    /// caller that priced nothing must not be confused with a caller
+    /// that priced a zero cap.
+    ///
+    /// Computed in `u128`: `amount * remaining <= (u64::MAX)^2 <
+    /// u128::MAX`, so the multiplication cannot overflow; `duration
+    /// > 0` by construction, so the division is exact-safe; the
+    /// result is `<= amount`, so the downcast is exact.
+    pub fn payout_cap(&self, amount: u64, now: u64) -> Result<u64, EscrowError> {
+        if !self.is_live(now) {
+            return Err(EscrowError::AuctionNotActive);
+        }
+        let floor = self.reserve_floor(amount);
+        let duration = self.end_at - self.start_at; // > 0 by construction
+        let remaining = self.end_at - now; // <= duration: `is_live` checked
+        let linear = (amount as u128 * remaining as u128 / duration as u128) as u64;
+        Ok(linear.max(floor))
     }
 }
 
@@ -3927,6 +4088,10 @@ impl Escrow {
             // AV-96: no payout denylist by default (backward
             // compatible).
             payout_denylist: None,
+            // AV-97: no Dutch auction by default (backward
+            // compatible) — the taker's pull path keeps its AV-13
+            // vesting pricing unless `with_dutch_auction` opts in.
+            auction: None,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -4978,6 +5143,12 @@ impl Escrow {
         // schedule would be a mispricing bug. Use `with_vesting_curve`
         // for the non-linear shape.
         self.vesting_curve = None;
+        // AV-97: re-attaching a plain schedule drops any Dutch
+        // auction for the same reason — the auction and the vesting
+        // unlock paths are alternative pricings of the taker's pull
+        // path, last-wins in both directions (see
+        // `with_dutch_auction`).
+        self.auction = None;
         Ok(self)
     }
 
@@ -5035,6 +5206,10 @@ impl Escrow {
         }
         self.vesting = Some(schedule);
         self.vesting_curve = Some(curve);
+        // AV-97: the curve is a vesting unlock shape, so attaching it
+        // drops any Dutch auction — same last-wins exclusion as
+        // `with_vesting` (see `with_dutch_auction`).
+        self.auction = None;
         Ok(self)
     }
 
@@ -5049,6 +5224,16 @@ impl Escrow {
     /// taker's net payout and the protocol fee (AV-17) — so the caller
     /// (and the Anchor layer) can size both transfers;
     /// `taker_payout + fee == claimable` always.
+    ///
+    /// AV-97: when a Dutch auction is attached (see
+    /// [`Escrow::with_dutch_auction`]), `claim` prices through the
+    /// auction's descending cap instead of the vesting curve: the
+    /// taker pulls `cap(now) - released` inside `[start_at,
+    /// end_at]` (`AuctionNotActive` outside the window), the gross
+    /// lands in the same `released` counter, and whatever stays
+    /// locked belongs to the initializer (reclaimed via `cancel` /
+    /// `cancel_partial`). The protocol fee slices the auction
+    /// payout exactly like a vesting claim.
     ///
     /// Only the taker may claim (`Unauthorized` otherwise): vesting is the
     /// taker's pull path, while [`Escrow::release`] stays the initializer's
@@ -5067,10 +5252,11 @@ impl Escrow {
     ///
     /// Check order is deliberate: authority, then state, then the
     /// milestone plan (AV-15: the plan owns the release schedule), then
-    /// the mint binding (AV-16), then vesting configuration, then
-    /// quorum, then the timelock (AV-27), then the claimable amount — a
-    /// stranger learns nothing, and a misconfigured call fails before the
-    /// gates run.
+    /// the mint binding (AV-16), then the pricing configuration
+    /// (vesting, or the AV-97 auction window when an auction is
+    /// attached), then quorum, then the timelock (AV-27), then the
+    /// claimable amount — a stranger learns nothing, and a
+    /// misconfigured call fails before the gates run.
     pub fn claim(
         &mut self,
         authority: [u8; 32],
@@ -5107,9 +5293,25 @@ impl Escrow {
         // policy (`PayoutNotAllowlisted` otherwise).
         self.require_payout_recipient(payout_to)?;
         // A vesting schedule must be attached for `claim` to mean
-        // anything (`InvalidVesting` otherwise); the unlock amount then
-        // prices through the AV-90 curve when one is configured.
-        let _ = self.vesting.ok_or(EscrowError::InvalidVesting)?;
+        // anything (`InvalidVesting` otherwise) — unless an AV-97
+        // Dutch auction is attached, which prices `claim` on its own
+        // descending curve instead. The two are alternative pricings
+        // of the taker's pull path (see `with_dutch_auction`'s
+        // last-wins clearing), so at most one is ever `Some`.
+        let priced = match &self.auction {
+            // AV-97: the window gates the pull — a claim outside
+            // `[start_at, end_at]` is `AuctionNotActive`, reported
+            // here rather than as `AmountMismatch` so a caller
+            // learns the window, not a zero cap.
+            Some(auction) => auction.payout_cap(self.amount, now)?,
+            None => {
+                let _ = self.vesting.ok_or(EscrowError::InvalidVesting)?;
+                // AV-90: prices through the attached unlock curve when
+                // one is configured (linear otherwise); the AV-51
+                // cliff gates inside.
+                self.vested_amount(now)
+            }
+        };
         if let Some(policy) = &self.quorum {            if !policy.is_satisfied() {
                 return Err(EscrowError::QuorumNotReached);
             }
@@ -5121,21 +5323,21 @@ impl Escrow {
         if !self.is_unlock_eligible(now) {
             return Err(EscrowError::TimelockNotReached);
         }
-        // AV-90: prices through the attached unlock curve when one is
-        // configured (linear otherwise); the AV-51 cliff gates inside.
-        let vested = self.vested_amount(now);
-        // `released` only grows via `release`/`claim`, and `vested` is a
-        // pure function of (amount, now): saturating keeps the counter
-        // monotonic even if the initializer released ahead of the curve.
-        // AV-82: slashed funds are out of the claimable pool too — the
-        // taker claims against the post-slash remainder.
-        let claimable = vested.saturating_sub(self.released.saturating_add(self.penalty_paid));
+        // `priced` is the gross unlock cap at `now` (the AV-13 linear /
+        // AV-90 curve value, or the AV-97 descending auction cap).
+        // `released` only grows via `release`/`claim`, and `priced` is
+        // a pure function of (amount, now): saturating keeps the
+        // counter monotonic even if the initializer released ahead of
+        // the curve. AV-82: slashed funds are out of the claimable
+        // pool too — the taker claims against the post-slash
+        // remainder.
+        let claimable = priced.saturating_sub(self.released.saturating_add(self.penalty_paid));
         if claimable == 0 {
             // Nothing unlocked yet, or everything vested is already
             // released — parallels `release` with `amount == 0`.
             return Err(EscrowError::AmountMismatch);
         }
-        // `released + penalty_paid + claimable <= vested <= amount`: no
+        // `released + penalty_paid + claimable <= priced <= amount`: no
         // overflow, no cap breach — the `release` checked_add path is
         // not needed here.
         // AV-17: the protocol fee slices the gross claimable; the
@@ -7111,8 +7313,10 @@ impl Escrow {
     /// arbiter deliberates. Only [`Escrow::resolve`] leaves `Disputed`.
     ///
     /// Check order is deliberate: authority, then state, then arbiter
-    /// configuration, then the window — a stranger learns nothing, and
-    /// a misconfigured call fails before the time logic runs.
+    /// configuration, then the AV-97 auction mutual-exclusion gate
+    /// (a live Dutch auction window refuses arbitration), then the
+    /// window — a stranger learns nothing, and a misconfigured call
+    /// fails before the time logic runs.
     pub fn escalate(
         &mut self,
         authority: [u8; 32],
@@ -7135,6 +7339,26 @@ impl Escrow {
         // judgment.
         if self.arbiter.is_none() && self.arbiter_panel.is_none() {
             return Err(EscrowError::InvalidArbiter);
+        }
+        // AV-97: the Dutch auction and dispute arbitration are
+        // mutually exclusive settlement paths. While the auction
+        // window is live the price is discovering itself — the
+        // taker's early-claim incentive only works when the window
+        // cannot be frozen. `escalate` would move the escrow to
+        // `Disputed`, locking `claim` (and `release`, `cancel`,
+        // `cancel_expired`) while the arbiter deliberates, which
+        // would kill the descending-price incentive the parties
+        // chose at setup. So an auction-mode escrow settles by price
+        // discovery — the taker claims in the window, the initializer
+        // reclaims the remainder via `cancel` / `cancel_partial` —
+        // never by arbitration while the window is live. Outside the
+        // window the auction is over, so this gate only covers the
+        // live window (`AuctionNotActive` doubles as the refusal
+        // code: the dispute path is not active while the auction is).
+        if let Some(auction) = &self.auction {
+            if auction.is_live(now) {
+                return Err(EscrowError::AuctionNotActive);
+            }
         }
         if now >= self.expires_at {
             return Err(EscrowError::DisputeWindowClosed);
@@ -7769,6 +7993,64 @@ impl Escrow {
     /// configured (no veto).
     pub fn payout_denylist(&self) -> Option<PayoutDenylist> {
         self.payout_denylist
+    }
+
+    /// Opt in to Dutch-auction settlement (AV-97 — Solana /
+    /// marketplace price discovery). Builder-style: only valid on an
+    /// `Uninitialized` escrow, so the window and the reserve floor
+    /// are fixed before any funds move — mirroring
+    /// [`Escrow::with_vesting`].
+    ///
+    /// Once funded, the taker may [`Escrow::claim`] inside
+    /// `[start_at, end_at]` at the descending cap
+    /// [`DutchAuction::payout_cap`]: the full locked amount at
+    /// `start_at`, descending linearly and never below the
+    /// `reserve_bps` floor (which binds once the linear value drops
+    /// under it). Early claimers keep more — the incentive is to
+    /// settle now, not to wait. Whatever stays locked after the
+    /// claim (or after the window closes) belongs to the initializer
+    /// and is reclaimed through the existing [`Escrow::cancel`] /
+    /// [`Escrow::cancel_partial`] refund path; `released` keeps the
+    /// gross payout, so the conservation invariant is untouched.
+    ///
+    /// The auction and the AV-13/AV-90 unlock paths are mutually
+    /// exclusive, last-wins (mirroring AV-65's arbiter/panel
+    /// exclusion): attaching an auction clears any vesting schedule
+    /// and curve, and re-attaching a schedule via
+    /// [`Escrow::with_vesting`] clears the auction — a stale curve
+    /// silently re-pricing the same claim would be a mispricing bug.
+    ///
+    /// The auction and dispute arbitration (AV-14) are mutually
+    /// exclusive *settlement* paths: [`Escrow::escalate`] is rejected
+    /// while the window is live (see the design note there).
+    ///
+    /// `start_at >= end_at` or `reserve_bps > 10_000` is
+    /// [`EscrowError::InvalidAuctionParams`]; configuring after
+    /// funding is [`EscrowError::InvalidStateTransition`]. Emits no
+    /// event (pre-fund configuration, like `with_pause_authority`).
+    pub fn with_dutch_auction(
+        mut self,
+        start_at: u64,
+        end_at: u64,
+        reserve_bps: u16,
+    ) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        self.auction = Some(DutchAuction::new(start_at, end_at, reserve_bps)?);
+        // Last-wins: the auction prices `claim` on its own descending
+        // curve — a stale vesting schedule or curve would misprice the
+        // same pull path.
+        self.vesting = None;
+        self.vesting_curve = None;
+        Ok(self)
+    }
+
+    /// The Dutch-auction terms attached via
+    /// [`Escrow::with_dutch_auction`], if any.
+    pub fn auction(&self) -> Option<DutchAuction> {
+        self.auction
     }
 
     /// Opt in to a CPI target-program allowlist (AV-83 — Solana
@@ -10086,11 +10368,18 @@ impl Escrow {
             _ => 0,
         }
     }
-    /// Amount the taker could [`Escrow::claim`] right now: vested minus
-    /// already released, saturating at zero. `0` when no vesting is
-    /// configured.
+    /// Amount the taker could [`Escrow::claim`] right now: the priced
+    /// cap minus already released, saturating at zero. `0` when no
+    /// pricing is configured — or, for an AV-97 Dutch auction,
+    /// outside the `[start_at, end_at]` window (the keeper's claim
+    /// listing and the snapshot read through here, so a window miss
+    /// reports nothing instead of a stale cap).
     pub fn claimable_amount(&self, now: u64) -> u64 {
-        self.vested_amount(now).saturating_sub(self.released)
+        let priced = match &self.auction {
+            Some(auction) => auction.payout_cap(self.amount, now).unwrap_or(0),
+            None => self.vested_amount(now),
+        };
+        priced.saturating_sub(self.released)
     }
     pub fn state(&self) -> EscrowState {
         self.state
@@ -10535,6 +10824,15 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // as the AV-49 payout allowlist. Appended last so every earlier
     // field offset stays stable.
     ("payout_denylist", "Option<PayoutDenylist>", 1 + PAYOUT_DENYLIST_LEN),
+    // AV-97: opt-in Dutch-auction settlement terms (see
+    // `Escrow::with_dutch_auction`): one discriminant byte, then the
+    // fixed `DUTCH_AUCTION_LEN`-byte terms (`start_at` u64, `end_at`
+    // u64, `reserve_bps` u16 — see `DutchAuction`). The region is
+    // always reserved (zeroed when `None`) so `with_dutch_auction`
+    // writes in place — same treatment as `arbiter` / `mint` /
+    // `vesting`. Appended last so every earlier field offset stays
+    // stable.
+    ("auction", "Option<DutchAuction>", 1 + DUTCH_AUCTION_LEN),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -10639,9 +10937,14 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// curve is configured). The opt-in multi-mint basket leg table
 /// (AV-95) is likewise always present: 1-byte discriminant + 1-byte
 /// live leg count + eight fixed 48-byte leg slots (386 bytes, zeroed
-/// when no basket is attached).
+/// when no basket is attached). The AV-96 payout denylist is likewise
+/// always present: 1-byte discriminant + 128-byte address array +
+/// 1-byte count (130 bytes, zeroed when no veto is configured). The
+/// AV-97 Dutch-auction terms are likewise always present: 1-byte
+/// discriminant + 18-byte terms (19 bytes, zeroed when no auction is
+/// configured).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -11195,7 +11498,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 32_169_120, "from {state:?}");
+            assert_eq!(rent, 32_301_360, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -11293,9 +11596,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 32_169_120 by
+        // VAULT_SPACE — pinned at 32_301_360 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 32_169_120);
+        assert_eq!(rent, 32_301_360);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -11456,8 +11759,8 @@ mod tests {
         // then the account is closed. VAULT_SPACE stays 2941 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 4494, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 32_169_120);
+        assert_eq!(VAULT_SPACE, 4513, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 32_301_360);
     }
 
     #[test]
@@ -11476,7 +11779,7 @@ mod tests {
         // 595 (arbiter panel), and AV-68 by 41 (evidence-disclosure
         // deadline + escalating party), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 4494, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4513, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -14492,6 +14795,34 @@ pub(crate) mod anchor_idl_tests {
             method: "Escrow::initialize_basket",
             input_mapping: "legs <- param (Vec<BasketLeg> -> Vec<([u8; 32], u64)> conversion); initializer <- accounts.initializer (signer); taker <- accounts.taker; expires_at <- param (u64::MAX = no timeout); creates the Vault account (Anchor `init`, space = escrow_state::VAULT_SPACE) with the basket region reserved in place (386 bytes, always reserved — see AV-95a); the escrow-level `amount` is the Σ over the legs; emits the Initialized indexer event (from == to == Uninitialized, by the constructor convention)",
         },
+        InstructionSpec {
+            // AV-97: opt in to Dutch-auction settlement at initialize
+            // time — the descending-price pull path for the taker. IDL:
+            // sha256("global:initialize_dutch_auction")[..8] = [42,
+            // 252, 88, 140, 232, 114, 60, 135] — the Anchor
+            // instruction discriminator for the
+            // initialize_dutch_auction handler.
+            name: "initialize_dutch_auction",
+            params: &[
+                (
+                    "start_at",
+                    "u64",
+                    "instruction param; Unix-seconds timestamp at which the window opens — the payout cap is the full locked amount here",
+                ),
+                (
+                    "end_at",
+                    "u64",
+                    "instruction param; Unix-seconds timestamp at which the window closes — the payout cap is the reserve floor here",
+                ),
+                (
+                    "reserve_bps",
+                    "u16",
+                    "instruction param; the reserve floor in basis points (0-10000) of the locked amount — the initializer's guaranteed keep at end_at",
+                ),
+            ],
+            method: "Escrow::with_dutch_auction",
+            input_mapping: "start_at, end_at, reserve_bps <- params; authority <- accounts.initializer (signer), enforced by the Anchor account constraint, not the state machine; Uninitialized only, like `initialize_vesting` — the window and the floor are fixed before any funds move; start_at >= end_at or reserve_bps > 10000 is InvalidAuctionParams (code 155); the auction and the AV-13/AV-90 unlock paths are mutually exclusive, last-wins (attaching clears any vesting schedule/curve, re-attaching a schedule clears the auction); emits no indexer event (pre-fund configuration); the 19-byte region is reserved in the vault layout whether or not the auction is configured",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -14643,6 +14974,10 @@ pub(crate) mod anchor_idl_tests {
             // rolls the whole settlement back.
             "Escrow::release_basket_all",
             "Escrow::cancel_basket_all",
+            // AV-97: opt-in Dutch-auction settlement — the descending
+            // price curve the taker's `claim` prices through while the
+            // window is live.
+            "Escrow::with_dutch_auction",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -14739,6 +15074,7 @@ pub(crate) mod anchor_idl_tests {
                 &"review_appeal",
                 &"release_basket_all",
                 &"initialize_basket",
+                &"initialize_dutch_auction",
             ]
         );
     }
@@ -16447,6 +16783,14 @@ pub(crate) mod anchor_idl_tests {
         ("initialize_payout_denylist", "denylist", "payout_denylist"),
         // AV-96: the update param rewrites the same field in place.
         ("update_payout_denylist", "denylist", "payout_denylist"),
+        // AV-97: the three auction params all populate the single
+        // `auction` vault field — multiple param mappings onto one
+        // field are fine, like `default_judgment` (AV-55). The
+        // `Option` discriminant is implied (a configured auction is
+        // `Some`).
+        ("initialize_dutch_auction", "start_at", "auction"),
+        ("initialize_dutch_auction", "end_at", "auction"),
+        ("initialize_dutch_auction", "reserve_bps", "auction"),
         // AV-83: the allowlist param populates `cpi_allowlist`; the
         // `Option` discriminant is implied (a configured list is
         // `Some`), mirroring `initialize_payout_allowlist`.
@@ -17173,6 +17517,16 @@ mod error_code_tests {
             EscrowError::InvalidPayoutDenylist,
             154,
             "with_denylist / update_payout_denylist with an empty address list, more than 4 addresses, or a zero address (AV-96)",
+        ),
+        (
+            EscrowError::InvalidAuctionParams,
+            155,
+            "DutchAuction::new / with_dutch_auction with start_at >= end_at or reserve_bps > 10_000 (AV-97)",
+        ),
+        (
+            EscrowError::AuctionNotActive,
+            156,
+            "claim on an auction-mode escrow outside the [start_at, end_at] window, or escalate while the auction window is live (AV-97)",
         ),
     ];
 
@@ -19071,6 +19425,24 @@ mod account_space_tests {
                 out.push(list.len);
             }
         }
+        // AV-97: Dutch-auction settlement terms, always reserved like
+        // `payout_denylist`: the `None` discriminant followed by the
+        // zeroed 18-byte terms (`start_at`/`end_at` u64,
+        // `reserve_bps` u16), so `with_dutch_auction` writes in place
+        // without reallocating; appended last so every earlier offset
+        // above is unchanged.
+        match e.auction {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; DUTCH_AUCTION_LEN]);
+            }
+            Some(a) => {
+                out.push(1);
+                out.extend_from_slice(&a.start_at.to_le_bytes());
+                out.extend_from_slice(&a.end_at.to_le_bytes());
+                out.extend_from_slice(&a.reserve_bps.to_le_bytes());
+            }
+        }
         out
     }
 
@@ -19132,10 +19504,12 @@ mod account_space_tests {
         // + 8-byte appeal deadline + 1-byte appeal state + 9-byte appeal
         // ballot)
         // + 386 (AV-95 opt-in multi-mint basket: discriminant + leg
-        // count byte + eight fixed 48-byte leg slots).
-        assert_eq!(ESCROW_BODY_LEN, 4486, "escrow payload bytes");
+        // count byte + eight fixed 48-byte leg slots)
+        // + 19 (AV-97 opt-in Dutch auction: discriminant + 18-byte
+        // terms — start_at/end_at u64, reserve_bps u16).
+        assert_eq!(ESCROW_BODY_LEN, 4505, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 4494, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4513, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -19210,13 +19584,15 @@ mod account_space_tests {
         // slots, zeroed when no basket is attached) + 130-byte opt-in
         // payout denylist (AV-96, 1-byte discriminant + 128-byte
         // address array + 1-byte count, zeroed when no veto is
-        // configured).
+        // configured) + 19-byte opt-in Dutch-auction terms (AV-97,
+        // 1-byte discriminant + 18-byte terms — start_at/end_at u64,
+        // reserve_bps u16 — zeroed when no auction is configured).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4004);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4023);
     }
 
     #[test]
@@ -19626,16 +20002,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4494) * 3480 * 2 = 4622 * 6960 = 32_169_120 lamports.
-        assert_eq!(full, 32_169_120);
+        // (128 + 4513) * 3480 * 2 = 4641 * 6960 = 32_301_360 lamports.
+        assert_eq!(full, 32_301_360);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4004) * 3480 * 2 = 4132 * 6960 = 28_758_720 lamports.
-        assert_eq!(no_quorum, 28_758_720);
+        // (128 + 4023) * 3480 * 2 = 4151 * 6960 = 28_890_960 lamports.
+        assert_eq!(no_quorum, 28_890_960);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -19679,25 +20055,25 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(32_169_120, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(32_301_360, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(27_533_759, params.0, params.1),
             Err(RentShortfall {
-                required: 32_169_120,
+                required: 32_301_360,
                 provided: 27_533_759,
             })
         );
         // Generous funding: exempt.
         assert_eq!(
-            check_vault_rent_exempt(32_200_000, params.0, params.1),
+            check_vault_rent_exempt(32_400_000, params.0, params.1),
             Ok(())
         );
         // Zero lamports: the full minimum is the shortfall.
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 32_169_120,
+                required: 32_301_360,
                 provided: 0,
             })
         );
@@ -19753,7 +20129,8 @@ mod basket_tests {
         e.basket = Some(legs);
         let body = encode_escrow(&e);
         assert_eq!(body.len(), ESCROW_BODY_LEN);
-        let basket_at = ESCROW_BODY_LEN - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN;
+        let basket_at =
+            ESCROW_BODY_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN;
         assert_eq!(body[basket_at], 1, "Some discriminant");
         assert_eq!(body[basket_at + 1], 2, "leg count");
         assert_eq!(&body[basket_at + 2..basket_at + 34], &MINT_A);
@@ -21360,14 +21737,14 @@ mod denylist_tests {
 
     #[test]
     fn denylist_persists_in_the_serialized_tail() {
-        // The denylist region is the new account tail: after the
-        // 386-byte basket region.
+        // The denylist region trails the 19-byte AV-97 auction region
+        // at the account tail (after the 386-byte basket region).
         use crate::discriminator::{decode_vault_account, vault_account_discriminator};
         use super::account_space_tests::encode_escrow;
         let e = funded_denied();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let tail = ESCROW_BODY_LEN - (1 + PAYOUT_DENYLIST_LEN);
+        let tail = ESCROW_BODY_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN);
         assert_eq!(bytes[tail], 1, "Some discriminant");
         assert_eq!(&bytes[tail + 1..tail + 1 + 32], &MALLORY);
         assert_eq!(&bytes[tail + 33..tail + 129], &[0u8; 96]);
@@ -21380,15 +21757,387 @@ mod denylist_tests {
         let list = decoded.payout_denylist().expect("denylist present");
         assert!(list.contains(&MALLORY));
         assert_eq!(list.as_slice().len(), 1);
-        // The field table pins the tail append.
+        // The field table pins the region (no longer the last entry —
+        // the AV-97 auction region appends after it).
+        let entry = VAULT_FIELDS
+            .iter()
+            .find(|(name, _, _)| *name == "payout_denylist")
+            .expect("payout_denylist in VAULT_FIELDS");
+        assert_eq!(entry.2, 1 + PAYOUT_DENYLIST_LEN);
+    }
+}
+
+// ---------- AV-97: Dutch-auction descending-price settlement ----------
+
+#[cfg(test)]
+mod dutch_auction_tests {
+    use super::*;
+    use crate::account_space_tests::encode_escrow;
+    use crate::discriminator::{
+        decode_vault_account, vault_account_discriminator, AccountDecodeError,
+    };
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const START: u64 = 1_700_000_000;
+    const END: u64 = 1_700_003_600; // one-hour window
+    const RESERVE_BPS: u16 = 2_000; // 20% reserve floor
+    const AMOUNT: u64 = 1_000_000;
+
+    fn auction_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_dutch_auction(START, END, RESERVE_BPS)
+            .unwrap();
+        e.fund(ALICE, START - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn dutch_auction_terms_validate() {
+        // start >= end: a zero-length window would divide by zero in
+        // the descending-price math.
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 1].0,
-            "payout_denylist"
+            DutchAuction::new(END, END, RESERVE_BPS),
+            Err(EscrowError::InvalidAuctionParams)
         );
+        assert_eq!(
+            DutchAuction::new(END, START, RESERVE_BPS),
+            Err(EscrowError::InvalidAuctionParams)
+        );
+        // reserve_bps > 10_000: not a valid basis-point floor.
+        assert_eq!(
+            DutchAuction::new(START, END, 10_001),
+            Err(EscrowError::InvalidAuctionParams)
+        );
+        // The new error codes are pinned (never renumbered).
+        assert_eq!(EscrowError::InvalidAuctionParams.code(), 155);
+        assert_eq!(EscrowError::AuctionNotActive.code(), 156);
+        // Boundary-valid: a one-second window and a 100% floor.
+        let full = DutchAuction::new(START, START + 1, 10_000).unwrap();
+        assert_eq!(full.reserve_floor(AMOUNT), AMOUNT);
+        // Accessors and the live-window predicate.
+        let a = DutchAuction::new(START, END, RESERVE_BPS).unwrap();
+        assert_eq!(
+            (a.start_at(), a.end_at(), a.reserve_bps()),
+            (START, END, RESERVE_BPS)
+        );
+        assert!(a.is_live(START));
+        assert!(a.is_live(START + 1));
+        assert!(a.is_live(END));
+        assert!(!a.is_live(START - 1));
+        assert!(!a.is_live(END + 1));
+    }
+
+    #[test]
+    fn with_dutch_auction_only_on_uninitialized() {
+        let e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        assert!(e.auction().is_none());
+        let e = e.with_dutch_auction(START, END, RESERVE_BPS).unwrap();
+        assert!(e.auction().is_some());
+        let mut e = e;
+        e.fund(ALICE, START - 3_600).unwrap();
+        assert_eq!(
+            e.with_dutch_auction(START, END, RESERVE_BPS).unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+    }
+
+    #[test]
+    fn payout_cap_follows_the_spec_formula() {
+        let a = DutchAuction::new(START, END, RESERVE_BPS).unwrap();
+        // floor = 1_000_000 * 2_000 / 10_000 = 200_000.
+        assert_eq!(a.reserve_floor(AMOUNT), 200_000);
+        // At the window open the cap is the full lockup.
+        assert_eq!(a.payout_cap(AMOUNT, START).unwrap(), 1_000_000);
+        // Quarter in: 1_000_000 * 2_700 / 3_600 = 750_000, above the floor.
+        assert_eq!(a.payout_cap(AMOUNT, START + 900).unwrap(), 750_000);
+        // Half in: 500_000.
+        assert_eq!(a.payout_cap(AMOUNT, START + 1_800).unwrap(), 500_000);
+        // 90% in: the linear value would be 100_000 — the 200_000
+        // floor binds instead (reserve_bps 保底).
+        assert_eq!(a.payout_cap(AMOUNT, START + 3_240).unwrap(), 200_000);
+        // At the close the cap is exactly the floor.
+        assert_eq!(a.payout_cap(AMOUNT, END).unwrap(), 200_000);
+        // Outside the window: AuctionNotActive, not a zero cap.
+        assert_eq!(
+            a.payout_cap(AMOUNT, START - 1),
+            Err(EscrowError::AuctionNotActive)
+        );
+        assert_eq!(
+            a.payout_cap(AMOUNT, END + 1),
+            Err(EscrowError::AuctionNotActive)
+        );
+    }
+
+    #[test]
+    fn payout_cap_has_no_overflow_at_u64_max() {
+        // The u128 math must hold at the extremes: amount = u64::MAX
+        // with a one-basis-point-under-full floor.
+        let a = DutchAuction::new(1_000, 1_000_000_000, 9_999).unwrap();
+        let amount = u64::MAX;
+        let floor = ((amount as u128 * 9_999) / 10_000) as u64;
+        assert_eq!(a.reserve_floor(amount), floor);
+        assert_eq!(a.payout_cap(amount, 1_000).unwrap(), u64::MAX);
+        assert_eq!(a.payout_cap(amount, 1_000_000_000).unwrap(), floor);
+        // Just past the open the linear value still clears the floor.
+        let near = 5_000u64;
+        let linear = (amount as u128 * (1_000_000_000 - near) as u128
+            / (1_000_000_000 - 1_000) as u128) as u64;
+        assert!(linear > floor);
+        assert_eq!(a.payout_cap(amount, near).unwrap(), linear);
+        // Past the crossing point the floor binds.
+        let mid = 500_000_000u64;
+        assert_eq!(a.payout_cap(amount, mid).unwrap(), floor);
+    }
+
+    #[test]
+    fn claim_prices_through_the_descending_cap() {
+        let mut e = auction_escrow();
+        // Taker claims at the quarter mark: the cap is 750_000.
+        let (payout, fee) = e.claim(BOB, START + 900, None, BOB).unwrap();
+        assert_eq!((payout, fee), (750_000, 0));
+        // The gross lands in `released` — the AV-11 conservation
+        // convention: `released` counts gross payouts.
+        assert_eq!(e.released_amount(), 750_000);
+        assert_eq!(e.remaining_amount(), 250_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+        // A second, later claim prices the *later* cap minus what was
+        // already released: 500_000 - 750_000 saturates to zero, so a
+        // late second claim reports AmountMismatch instead of going
+        // negative — the early-claim incentive, enforced by the math.
+        assert_eq!(
+            e.claim(BOB, START + 1_800, None, BOB).unwrap_err(),
+            EscrowError::AmountMismatch
+        );
+    }
+
+    #[test]
+    fn claim_at_window_open_takes_everything() {
+        let mut e = auction_escrow();
+        let (payout, fee) = e.claim(BOB, START, None, BOB).unwrap();
+        assert_eq!((payout, fee), (1_000_000, 0));
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn claim_outside_the_window_is_auction_not_active() {
+        let mut e = auction_escrow();
+        assert_eq!(
+            e.claim(BOB, START - 1, None, BOB).unwrap_err(),
+            EscrowError::AuctionNotActive
+        );
+        assert_eq!(
+            e.claim(BOB, END + 1, None, BOB).unwrap_err(),
+            EscrowError::AuctionNotActive
+        );
+        // Nothing moved.
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn claim_keeps_the_authority_and_state_gates() {
+        let mut e = auction_escrow();
+        // Authority first: a stranger learns nothing about the window.
+        assert_eq!(
+            e.claim(ALICE, START + 900, None, BOB).unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        // Funded-only: the window check never runs pre-funding.
+        let mut fresh = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_dutch_auction(START, END, RESERVE_BPS)
+            .unwrap();
+        assert_eq!(
+            fresh.claim(BOB, START + 900, None, BOB).unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+    }
+
+    #[test]
+    fn claim_slices_the_protocol_fee_from_the_gross() {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_dutch_auction(START, END, RESERVE_BPS)
+            .unwrap()
+            .with_protocol_fee(1_000) // 10%
+            .unwrap();
+        e.fund(ALICE, START - 3_600).unwrap();
+        let (payout, fee) = e.claim(BOB, START + 900, None, BOB).unwrap();
+        // Gross 750_000; fee 75_000; the taker nets 675_000.
+        assert_eq!(fee, 75_000);
+        assert_eq!(payout, 675_000);
+        assert_eq!(payout + fee, 750_000);
+        // `released` keeps the gross — conservation untouched.
+        assert_eq!(e.released_amount(), 750_000);
+        assert_eq!(e.fees_paid(), 75_000);
+    }
+
+    #[test]
+    fn the_initializer_reclaims_the_remainder_after_the_claim() {
+        let mut e = auction_escrow();
+        e.claim(BOB, START + 900, None, BOB).unwrap();
+        // The initializer cancels the 250_000 remainder — this needs
+        // no new transition: the existing refund path honors the
+        // AV-23 refund policy and preserves `released` for audit.
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(e.released_amount(), 750_000);
+        assert_eq!(e.remaining_amount(), 250_000);
+    }
+
+    #[test]
+    fn escalate_is_refused_while_the_auction_is_live() {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_dutch_auction(START, END, RESERVE_BPS)
+            .unwrap();
+        e.fund(ALICE, START - 3_600).unwrap();
+        // Live window: arbitration is refused — price discovery owns
+        // the settlement while the price is discovering itself.
+        assert_eq!(
+            e.escalate(ALICE, START + 900, None, None, 0).unwrap_err(),
+            EscrowError::AuctionNotActive
+        );
+        assert_eq!(
+            e.escalate(BOB, END, None, None, 0).unwrap_err(),
+            EscrowError::AuctionNotActive
+        );
+        // Before the window the auction has not started — arbitration
+        // is available again.
+        e.escalate(ALICE, START - 1, None, None, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+    }
+
+    #[test]
+    fn escalate_after_the_window_closes_is_allowed() {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_dutch_auction(START, END, RESERVE_BPS)
+            .unwrap();
+        e.fund(ALICE, START - 3_600).unwrap();
+        e.escalate(BOB, END + 1, None, None, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+    }
+
+    #[test]
+    fn auction_and_vesting_are_last_wins() {
+        let schedule = VestingSchedule::new(START, END).unwrap();
+        // Attaching an auction clears the vesting schedule.
+        let e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap()
+            .with_dutch_auction(START, END, RESERVE_BPS)
+            .unwrap();
+        assert!(e.auction().is_some());
+        assert!(e.vesting_schedule().is_none());
+        // Re-attaching a schedule clears the auction.
+        let e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_dutch_auction(START, END, RESERVE_BPS)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap();
+        assert!(e.auction().is_none());
+        assert!(e.vesting_schedule().is_some());
+    }
+
+    #[test]
+    fn claimable_amount_prices_the_auction_window() {
+        let e = auction_escrow();
+        assert_eq!(e.claimable_amount(START + 900), 750_000);
+        assert_eq!(e.claimable_amount(END), 200_000);
+        // Outside the window nothing is claimable — the keeper
+        // listing and the snapshot read through here.
+        assert_eq!(e.claimable_amount(START - 1), 0);
+        assert_eq!(e.claimable_amount(END + 1), 0);
+    }
+
+    #[test]
+    fn auction_region_is_append_only_at_the_tail() {
+        // Plain escrow: the 19-byte tail region is zeroed.
+        let mut plain = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, START - 3_600).unwrap();
+        let bytes = encode_escrow(&plain);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        assert_eq!(bytes.len(), 4505);
+        let tail = ESCROW_BODY_LEN - (1 + DUTCH_AUCTION_LEN);
+        assert_eq!(bytes[tail], 0, "auction: None discriminant");
+        assert_eq!(&bytes[tail + 1..], &[0u8; DUTCH_AUCTION_LEN]);
+        // Every earlier offset is stable: expires_at still at 80..88,
+        // and the denylist region still trails the auction tail.
+        assert_eq!(
+            u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
+            EXPIRES_AT
+        );
+        let deny_tail = tail - (1 + PAYOUT_DENYLIST_LEN);
+        assert_eq!(bytes[deny_tail], 0, "denylist: None discriminant");
+        // Configured escrow: the terms encode at the tail and
+        // round-trip through the account decoder.
+        let e = auction_escrow();
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes[tail], 1, "auction: Some discriminant");
+        assert_eq!(
+            u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
+            START
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[tail + 9..tail + 17].try_into().unwrap()),
+            END
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[tail + 17..tail + 19].try_into().unwrap()),
+            RESERVE_BPS
+        );
+        let mut account = vec![0u8; 8 + ESCROW_BODY_LEN];
+        account[..8].copy_from_slice(&vault_account_discriminator());
+        account[8..].copy_from_slice(&bytes);
+        let decoded = decode_vault_account(&account).unwrap();
+        let a = decoded.auction().expect("auction present");
+        assert_eq!(
+            (a.start_at(), a.end_at(), a.reserve_bps()),
+            (START, END, RESERVE_BPS)
+        );
+        // A decoded auction prices `claim` identically.
+        assert_eq!(decoded.claimable_amount(START + 900), 750_000);
+        // The field table pins the tail append.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].0, "auction");
         assert_eq!(
             VAULT_FIELDS[VAULT_FIELDS.len() - 1].2,
-            1 + PAYOUT_DENYLIST_LEN
+            1 + DUTCH_AUCTION_LEN
         );
+    }
+
+    #[test]
+    fn decode_rejects_degenerate_auction_terms() {
+        let e = auction_escrow();
+        let mut account = vec![0u8; 8 + ESCROW_BODY_LEN];
+        account[..8].copy_from_slice(&vault_account_discriminator());
+        account[8..].copy_from_slice(&encode_escrow(&e));
+        let tail = 8 + ESCROW_BODY_LEN - (1 + DUTCH_AUCTION_LEN);
+        // Zero-length window: start_at == end_at would divide by zero
+        // in `payout_cap`.
+        account[tail + 1..tail + 9].copy_from_slice(&END.to_le_bytes());
+        assert!(matches!(
+            decode_vault_account(&account),
+            Err(AccountDecodeError::InvalidDutchAuctionTerms { .. })
+        ));
+        // Restore the window, then break the floor.
+        account[tail + 1..tail + 9].copy_from_slice(&START.to_le_bytes());
+        account[tail + 17..tail + 19].copy_from_slice(&10_001u16.to_le_bytes());
+        assert!(matches!(
+            decode_vault_account(&account),
+            Err(AccountDecodeError::InvalidDutchAuctionTerms { .. })
+        ));
     }
 }
 
@@ -22373,10 +23122,11 @@ mod vesting_curve_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         // The curve region trails the appeal ballot — the AV-91
         // evidence-commitment region (33 + 1 + 8 bytes) trails the
-        // curve, and the AV-95 basket region (386 bytes) trails
-        // everything: discriminant 1, tier-count 2, then the two live
-        // tiers.
-        let base = ESCROW_BODY_LEN - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42 - (1 + VESTING_CURVE_LEN);
+        // curve, the AV-95 basket region (386 bytes) trails that, and
+        // the AV-96 denylist (130 bytes) plus the AV-97 auction
+        // region (19 bytes) trail everything: discriminant 1,
+        // tier-count 2, then the two live tiers.
+        let base = ESCROW_BODY_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42 - (1 + VESTING_CURVE_LEN);
         assert_eq!(bytes[base], 1, "curve: Some discriminant");
         assert_eq!(bytes[base + 1], 2, "curve: tier count");
         assert_eq!(
@@ -24639,12 +25389,13 @@ mod migrate_schema_tests {
 
     #[test]
     fn migrate_schema_moves_the_serialized_tail_byte() {
-        // AV-95: the version byte sits 386 + 82 + 26 + 49 + 258 bytes
-        // before the tail now (the basket region, the vesting-curve
-        // region, the appeal region, the slash region and the CPI
-        // allowlist trail it); every earlier offset stays stable, and
-        // the carry-over is still a byte-prefix copy.
-        let version_at = ESCROW_BODY_LEN - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        // AV-95: the version byte sits 19 + 130 + 386 + 82 + 26 + 49 + 258 bytes
+        // before the tail now (the auction region, the denylist region,
+        // the basket region, the vesting-curve region, the appeal
+        // region, the slash region and the CPI allowlist trail it);
+        // every earlier offset stays stable, and the carry-over is
+        // still a byte-prefix copy.
+        let version_at = ESCROW_BODY_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         let e = v0_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
@@ -25606,10 +26357,11 @@ mod evidence_merkle_tests {
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         // The commitment region used to be the tail; the AV-95 basket
-        // region (386 bytes) is appended after it now: 1-byte
-        // discriminant + 32-byte root, then the leaf-count byte, then
-        // the u64-LE disclosure bitmap with bit 0 set.
-        let base = ESCROW_BODY_LEN - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42;
+        // region (386 bytes), the AV-96 denylist (130 bytes) and the
+        // AV-97 auction region (19 bytes) are appended after it now:
+        // 1-byte discriminant + 32-byte root, then the leaf-count
+        // byte, then the u64-LE disclosure bitmap with bit 0 set.
+        let base = ESCROW_BODY_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42;
         assert_eq!(bytes[base], 1, "evidence_root: Some discriminant");
         assert_eq!(&bytes[base + 1..base + 33], &root, "evidence_root bytes");
         assert_eq!(bytes[base + 33], 2, "evidence_leaves");
@@ -26239,7 +26991,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4486, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) bytes");
+        assert_eq!(bytes.len(), 4505, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -26264,7 +27016,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 4486);
+        assert_eq!(bytes.len(), 4505);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -26286,18 +27038,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4494) * 3480 * 2 = 4622 * 6960 = 32_169_120 lamports.
-        assert_eq!(VAULT_SPACE, 4494);
-        assert_eq!(full, 32_169_120);
+        // (128 + 4513) * 3480 * 2 = 4641 * 6960 = 32_301_360 lamports.
+        assert_eq!(VAULT_SPACE, 4513);
+        assert_eq!(full, 32_301_360);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4004) * 3480 * 2 = 4132 * 6960 = 28_758_720 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4004);
-        assert_eq!(no_quorum, 28_758_720);
+        // (128 + 4023) * 3480 * 2 = 4151 * 6960 = 28_890_960 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4023);
+        assert_eq!(no_quorum, 28_890_960);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -26441,7 +27193,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4486);
+        assert_eq!(bytes.len(), 4505);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -26456,7 +27208,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 4486);
+        assert_eq!(bytes.len(), 4505);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -26487,18 +27239,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4494) * 3480 * 2 = 4622 * 6960 = 32_169_120 lamports.
-        assert_eq!(VAULT_SPACE, 4494);
-        assert_eq!(full, 32_169_120);
+        // (128 + 4513) * 3480 * 2 = 4641 * 6960 = 32_301_360 lamports.
+        assert_eq!(VAULT_SPACE, 4513);
+        assert_eq!(full, 32_301_360);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4004) * 3480 * 2 = 4132 * 6960 = 28_758_720 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4004);
-        assert_eq!(no_quorum, 28_758_720);
+        // (128 + 4023) * 3480 * 2 = 4151 * 6960 = 28_890_960 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4023);
+        assert_eq!(no_quorum, 28_890_960);
     }
 
     #[test]
@@ -27356,7 +28108,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 4486);
+        assert_eq!(bytes.len(), 4505);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -27531,7 +28283,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 4486, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region, 82 by AV-90 vesting curve, 42 by AV-91 evidence commitment region, 386 by AV-95 basket");
+        assert_eq!(ESCROW_BODY_LEN, 4505, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region, 82 by AV-90 vesting curve, 42 by AV-91 evidence commitment region, 386 by AV-95 basket, 19 by AV-97 auction");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -27549,32 +28301,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 4494) * 3480 * 2 = 4622 * 6960 = 32_169_120 lamports.
+        // (128 + 4513) * 3480 * 2 = 4641 * 6960 = 32_301_360 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            32_169_120
+            32_301_360
         );
-        // (128 + 4004) * 3480 * 2 = 4132 * 6960 = 28_758_720 lamports.
+        // (128 + 4023) * 3480 * 2 = 4151 * 6960 = 28_890_960 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            28_758_720
+            28_890_960
         );
         // 1888 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 4494);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4004);
-        assert!(check_vault_rent_exempt(32_169_120, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 4513);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4023);
+        assert!(check_vault_rent_exempt(32_301_360, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -30405,9 +31157,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4486, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist)");
-        assert_eq!(VAULT_SPACE, 4494);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4004);
+        assert_eq!(bytes.len(), 4505, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction)");
+        assert_eq!(VAULT_SPACE, 4513);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4023);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -30961,7 +31713,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4486);
+        assert_eq!(bytes.len(), 4505);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -31529,7 +32281,7 @@ mod subscription_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4486);
+        assert_eq!(bytes.len(), 4505);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -31909,11 +32661,11 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19
         );
     }
 
@@ -31930,7 +32682,7 @@ mod event_history_tests {
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4486);
+        assert_eq!(bytes.len(), 4505);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -31958,7 +32710,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97 tail");
     }
 
     #[test]
@@ -31973,18 +32725,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4494) * 3480 * 2 = 4622 * 6960 = 32_169_120 lamports.
-        assert_eq!(VAULT_SPACE, 4494);
-        assert_eq!(full, 32_169_120);
+        // (128 + 4513) * 3480 * 2 = 4641 * 6960 = 32_301_360 lamports.
+        assert_eq!(VAULT_SPACE, 4513);
+        assert_eq!(full, 32_301_360);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4004) * 3480 * 2 = 4132 * 6960 = 28_758_720 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4004);
-        assert_eq!(no_quorum, 28_758_720);
+        // (128 + 4023) * 3480 * 2 = 4151 * 6960 = 28_890_960 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4023);
+        assert_eq!(no_quorum, 28_890_960);
     }
 
     // ----- decode -----
@@ -32685,18 +33437,19 @@ mod fee_cap_tests {
         // + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline)
         // + 258 (AV-83 CPI target allowlist) + 67 (AV-84 multisig
         // authority) + 26 (AV-86 appeal window region) + 82 (AV-90
-        // vesting curve).
-        assert_eq!(ESCROW_BODY_LEN, 4486, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 4494, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4004, "no-quorum Vault account space");
+        // vesting curve) + 42 (AV-91 evidence commitment) + 386
+        // (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction).
+        assert_eq!(ESCROW_BODY_LEN, 4505, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 4513, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4023, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            32_169_120,
-            "(128 + 4494) * 3480 * 2 = 4622 * 6960"
+            32_301_360,
+            "(128 + 4513) * 3480 * 2 = 4641 * 6960"
         );
         assert_eq!(
             rent_exempt_minimum_lamports(
@@ -32704,8 +33457,8 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            28_758_720,
-            "(128 + 4004) * 3480 * 2 = 4132 * 6960"
+            28_890_960,
+            "(128 + 4023) * 3480 * 2 = 4151 * 6960"
         );
     }
 
@@ -32717,7 +33470,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4486);
+        assert_eq!(bytes.len(), 4505);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -33212,13 +33965,14 @@ mod fee_schedule_tests {
         // region, the AV-73 per-period table, the AV-75
         // schema-version byte, the AV-82 slash region, the AV-83
         // CPI allowlist region, the AV-84 multisig authority, the
-        // AV-86 appeal region, the AV-90 vesting-curve region, and
-        // the AV-95 basket region: every earlier offset is unchanged.
+        // AV-86 appeal region, the AV-90 vesting-curve region,
+        // the AV-95 basket region, the AV-96 denylist region and the
+        // AV-97 auction region: every earlier offset is unchanged.
         let e = scheduled_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4486);
-        let tail = ESCROW_BODY_LEN - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        assert_eq!(bytes.len(), 4505);
+        let tail = ESCROW_BODY_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(bytes[tail], 3, "tier_count at the tail");
         assert_eq!(
             u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
@@ -33254,10 +34008,11 @@ mod fee_schedule_tests {
         // bytes), AV-84 the multisig authority (67 bytes), AV-86 the
         // appeal region (26 bytes), AV-90 the vesting-curve region
         // (82 bytes), AV-91 the evidence-commitment region (42
-        // bytes), and AV-95 the basket region (386 bytes) after the
-        // fee schedule, so the schedule no longer sits at the body
-        // tail.
-        let tail = ESCROW_BODY_LEN - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        // bytes), AV-95 the basket region (386 bytes), AV-96 the
+        // denylist region (130 bytes) and AV-97 the auction region
+        // (19 bytes) after the fee schedule, so the schedule no
+        // longer sits at the body tail.
+        let tail = ESCROW_BODY_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(
             &bytes[tail..tail + FEE_SCHEDULE_LEN],
             &[0u8; FEE_SCHEDULE_LEN],
@@ -33277,10 +34032,11 @@ mod fee_schedule_tests {
         // bytes), AV-84 the multisig authority (67 bytes), AV-86 the
         // appeal region (26 bytes), AV-90 the vesting-curve region
         // (82 bytes), AV-91 the evidence-commitment region (42
-        // bytes), and AV-95 the basket region (386 bytes) after the
-        // fee schedule, so the schedule no longer sits at the body
-        // tail.
-        let tail = ESCROW_BODY_LEN - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        // bytes), AV-95 the basket region (386 bytes), AV-96 the
+        // denylist region (130 bytes) and AV-97 the auction region
+        // (19 bytes) after the fee schedule, so the schedule no
+        // longer sits at the body tail.
+        let tail = ESCROW_BODY_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         bytes[tail] = 9;
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
@@ -33613,7 +34369,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4486);
+        assert_eq!(bytes.len(), 4505);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -33824,6 +34580,9 @@ mod arbiter_panel_tests {
         // AV-96: appended, never renumbered.
         assert_eq!(EscrowError::PayoutDenied.code(), 153);
         assert_eq!(EscrowError::InvalidPayoutDenylist.code(), 154);
+        // AV-97: appended, never renumbered.
+        assert_eq!(EscrowError::InvalidAuctionParams.code(), 155);
+        assert_eq!(EscrowError::AuctionNotActive.code(), 156);
         // never-renumber: the full table still pins every code, and
         // `all()` covers the new variants (the AV-46 lesson: a missing
         // variant drifts the IDL error pin).
@@ -33847,7 +34606,9 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::InvalidBasket));
         assert!(EscrowError::all().contains(&EscrowError::PayoutDenied));
         assert!(EscrowError::all().contains(&EscrowError::InvalidPayoutDenylist));
-        assert_eq!(EscrowError::all().len(), 55);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidAuctionParams));
+        assert!(EscrowError::all().contains(&EscrowError::AuctionNotActive));
+        assert_eq!(EscrowError::all().len(), 57);
     }
 
     #[test]
@@ -34194,7 +34955,7 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4486);
+        assert_eq!(bytes.len(), 4505);
         // AV-91: the evidence-commitment region (33-byte root + 1-byte
         // leaf count + 8-byte disclosure bitmap = 42 bytes) now trails
         // the AV-90 vesting-curve region (82 bytes), which trails the
@@ -34202,10 +34963,12 @@ mod arbiter_panel_tests {
         // authority; before that, the AV-83 CPI allowlist region (258
         // bytes) trails the AV-82 slash region (41-byte terms + 8-byte
         // penalty counter), which trails the schema-version byte — and
-        // the AV-95 basket region (386 bytes) trails everything, so
-        // the panel region ends 386 + 42 + 82 + 26 + 68 + 258 + 49 + 1
-        // bytes before the end of the buffer.
-        let version_end = bytes.len() - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        // the AV-95 basket region (386 bytes), the AV-96 denylist
+        // region (130 bytes) and the AV-97 auction region (19 bytes)
+        // trail everything, so the panel region ends 19 + 130 + 386 +
+        // 42 + 82 + 26 + 68 + 258 + 49 + 1 bytes before the end of the
+        // buffer.
+        let version_end = bytes.len() - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         // The panel region trails the AV-73 per-period amount table
         // (512 bytes), the AV-68 evidence-deadline region (41 bytes) and
         // the AV-66 fee-schedule region (81 bytes):
@@ -34242,7 +35005,7 @@ mod arbiter_panel_tests {
         // A panel-less escrow decodes with `None` and a zeroed region.
         let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let plain_bytes = encode_escrow(&plain);
-        assert_eq!(plain_bytes[plain_bytes.len() - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 595], 0);
+        assert_eq!(plain_bytes[plain_bytes.len() - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - 41 - FEE_SCHEDULE_LEN - 595], 0);
         assert!(decode_vault_account(&account_bytes(&plain))
             .unwrap()
             .arbiter_panel()
@@ -34258,9 +35021,9 @@ mod arbiter_panel_tests {
         assert_eq!(panel.1, "Option<ArbiterPanel>");
         assert_eq!(panel.2, 1 + ARBITER_PANEL_LEN);
         assert_eq!(panel.2, 595);
-        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96:
+        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97:
         // every earlier field offset stays stable.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "fee_schedule");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].0, "fee_schedule");
     }
 
     #[test]
@@ -34277,43 +35040,47 @@ mod arbiter_panel_tests {
         // the schema byte, AV-82 the slash region, AV-83 the CPI
         // allowlist, AV-84 the multisig authority, AV-86 the appeal
         // window region, AV-90 the vesting curve, AV-91 the
-        // evidence-commitment region, AV-95 the basket leg table:
-        // payout_denylist is the new tail (basket moved to len() - 2).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "evidence_deadline_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "escalated_by");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "subscription_amounts");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "schema_version");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "slash_terms");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "penalty_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].2, 1 + CPI_ALLOWLIST_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].2, 1 + MULTISIG_AUTHORITY_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "appeal_window_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "appeal_deadline");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "appeal_state");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "appeal_ballot");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, APPEAL_BALLOT_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "vesting_curve");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].1, "Option<VestingCurve>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 1 + VESTING_CURVE_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 82);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "evidence_root");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].1, "Option<[u8; 32]>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 33);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "evidence_leaves");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 1);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "evidence_disclosed");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "basket");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].1, "Option<BasketLegs>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, BASKET_REGION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 386);
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "payout_denylist");
-        assert_eq!(VAULT_FIELDS.last().unwrap().1, "Option<PayoutDenylist>");
-        assert_eq!(VAULT_FIELDS.last().unwrap().2, 1 + PAYOUT_DENYLIST_LEN);
-        assert_eq!(VAULT_FIELDS.last().unwrap().2, 130);
+        // evidence-commitment region, AV-95 the basket leg table,
+        // AV-96 the payout denylist: the AV-97 auction is the new
+        // tail (denylist moved to len() - 2).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "evidence_deadline_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "escalated_by");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "subscription_amounts");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "schema_version");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "slash_terms");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "penalty_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].2, 1 + CPI_ALLOWLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].2, 1 + MULTISIG_AUTHORITY_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "appeal_window_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "appeal_deadline");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "appeal_state");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "appeal_ballot");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].2, APPEAL_BALLOT_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "vesting_curve");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].1, "Option<VestingCurve>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 1 + VESTING_CURVE_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 82);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "evidence_root");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].1, "Option<[u8; 32]>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 33);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "evidence_leaves");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 1);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "evidence_disclosed");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "basket");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].1, "Option<BasketLegs>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, BASKET_REGION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, 386);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "payout_denylist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].1, "Option<PayoutDenylist>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 1 + PAYOUT_DENYLIST_LEN);
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "auction");
+        assert_eq!(VAULT_FIELDS.last().unwrap().1, "Option<DutchAuction>");
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, 1 + DUTCH_AUCTION_LEN);
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, 19);
     }
 
     #[test]
@@ -34887,7 +35654,7 @@ mod split_tests {
             .unwrap();
         assert_eq!(e.state(), EscrowState::Split);
         assert_eq!(EscrowState::Split as u8, 8, "Split appended last");
-        assert_eq!(VAULT_SPACE, 4494, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4513, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -35157,7 +35924,7 @@ mod release_split_tests {
         e.release_split(ALICE, NOW, 1_000_000, None, &[(BOB, 10_000)])
             .unwrap();
         assert_eq!(e.state(), EscrowState::Released);
-        assert_eq!(VAULT_SPACE, 4494, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4513, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -35468,11 +36235,12 @@ mod slash_tests {
         // + cpi_allowlist (258) + multisig_authority (67) + the 26-byte
         // appeal region + the 82-byte vesting-curve region + the
         // 42-byte evidence-commitment region + the 386-byte basket
+        // region + the 130-byte denylist region + the 19-byte auction
         // region.
         let e = slashable(1_000_000);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let base = ESCROW_BODY_LEN - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
+        let base = ESCROW_BODY_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
         assert_eq!(bytes[base], 3, "schema_version");
         assert_eq!(bytes[base + 1], 1, "slash_terms: Some");
         assert_eq!(&bytes[base + 2..base + 34], &PENALTY, "penalty account");
@@ -35483,8 +36251,8 @@ mod slash_tests {
         );
         assert_eq!(
             u64::from_le_bytes(
-                bytes[ESCROW_BODY_LEN - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
-                    ..ESCROW_BODY_LEN - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
+                bytes[ESCROW_BODY_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
+                    ..ESCROW_BODY_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
                     .try_into()
                     .unwrap()
             ),
@@ -35895,7 +36663,7 @@ mod appeal_tests {
         e.review_appeal(M1, true).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4486);
+        assert_eq!(bytes.len(), 4505);
         // Appeal region: [3820..3846] — window (8), deadline (8), state
         // (1), ballot (9).
         assert_eq!(
@@ -36231,7 +36999,7 @@ mod cpi_allowlist_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4486);
+        assert_eq!(bytes.len(), 4505);
         assert_eq!(bytes[3495], 1, "Some discriminant");
         assert_eq!(&bytes[3496..3496 + 32], &DEX);
         assert_eq!(&bytes[3496 + 32..3496 + 64], &LENDING);
@@ -36242,14 +37010,15 @@ mod cpi_allowlist_tests {
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes[3495], 0, "None discriminant");
         assert_eq!(&bytes[3496..3496 + 257], &[0u8; 257]);
-        // The field name is the twelfth-from-last VAULT_FIELDS entry
+        // The field name is the thirteenth-from-last VAULT_FIELDS entry
         // (AV-84 appended the multisig region after it, AV-86 the
         // 4-field appeal region after that, AV-90 the vesting curve
         // after that, AV-91 the 3-field evidence-commitment region
         // after that, AV-95 the basket region after that, AV-96 the
-        // payout denylist region after that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].2, 1 + CPI_ALLOWLIST_LEN);
+        // payout denylist region after that, AV-97 the auction region
+        // after that).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].2, 1 + CPI_ALLOWLIST_LEN);
     }
 }
 
@@ -36444,7 +37213,7 @@ mod multisig_tests {
         let e = bound_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4486);
+        assert_eq!(bytes.len(), 4505);
         assert_eq!(bytes[3753], 1, "Some discriminant");
         assert_eq!(&bytes[3754..3754 + 32], &SQUADS_V4_PROGRAM_ID);
         assert_eq!(&bytes[3754 + 32..3754 + 64], &VAULT_PDA);
@@ -36458,14 +37227,14 @@ mod multisig_tests {
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes[3753], 0, "None discriminant");
         assert_eq!(&bytes[3754..3820], &[0u8; 66]);
-        // The field name is the eleventh-from-last VAULT_FIELDS entry
+        // The field name is the twelfth-from-last VAULT_FIELDS entry
         // (AV-86 appended the 4-field appeal region after it, AV-90
         // the vesting-curve region after that, AV-91 the 3-field
         // evidence-commitment region after that, AV-95 the basket
         // region after that, AV-96 the payout denylist region after
-        // that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].2, 1 + MULTISIG_AUTHORITY_LEN);
+        // that, AV-97 the auction region after that).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].2, 1 + MULTISIG_AUTHORITY_LEN);
         assert_eq!(MULTISIG_AUTHORITY_LEN, 66);
     }
 

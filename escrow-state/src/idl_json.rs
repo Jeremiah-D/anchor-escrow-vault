@@ -183,6 +183,9 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         // AV-96: opt-in payout destination denylist (initializer's
         // compliance veto, deny beats the AV-49 allowlist).
         "Option<PayoutDenylist>" => IdlType::Option(Box::new(IdlType::Named("PayoutDenylist"))),
+        // AV-97: opt-in Dutch-auction settlement terms (the
+        // descending-price pull path for the taker).
+        "Option<DutchAuction>" => IdlType::Option(Box::new(IdlType::Named("DutchAuction"))),
         // AV-83: opt-in CPI target-program allowlist.
         "Option<CpiAllowlist>" => IdlType::Option(Box::new(IdlType::Named("CpiAllowlist"))),
         // AV-84: opt-in multisig authority binding.
@@ -318,6 +321,13 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
         "PayoutDenylist" => vec![
             ("addrs", IdlType::Array(ArrayElem::PublicKey, 4)),
             ("len", IdlType::U8),
+        ],
+        // DutchAuction { start_at: u64, end_at: u64, reserve_bps: u16 }
+        // (AV-97): the descending-price settlement terms — 18 bytes.
+        "DutchAuction" => vec![
+            ("start_at", IdlType::U64),
+            ("end_at", IdlType::U64),
+            ("reserve_bps", IdlType::U16),
         ],
         // BasketLeg { mint: Pubkey, amount: u64, released: u64 }
         // (AV-95): one leg of a multi-mint basket — 48 bytes.
@@ -644,6 +654,8 @@ fn render_idl_json() -> String {
         "BasketLegs",
         // AV-96: the payout destination denylist type.
         "PayoutDenylist",
+        // AV-97: the Dutch-auction settlement terms type.
+        "DutchAuction",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -801,6 +813,9 @@ fn named_type_sizes_pin_constants() {
     assert_eq!(size("PayoutAllowlist"), PAYOUT_ALLOWLIST_LEN);
     // AV-96: same wire shape as the allowlist (4 pubkeys + count byte).
     assert_eq!(size("PayoutDenylist"), PAYOUT_DENYLIST_LEN);
+    // AV-97: start_at u64 + end_at u64 + reserve_bps u16.
+    assert_eq!(size("DutchAuction"), DUTCH_AUCTION_LEN);
+    assert_eq!(size("DutchAuction"), 18);
     // AV-83: eight 32-byte program ids + count byte.
     assert_eq!(size("CpiAllowlist"), CPI_ALLOWLIST_LEN);
     // AV-84: 32-byte multisig program id + 32-byte authority PDA + u16
@@ -908,7 +923,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 55, "error variant count drift");
+    assert_eq!(errors.len(), 57, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -960,6 +975,9 @@ fn idl_errors_pin_enum() {
     // AV-96: appended, never renumbered.
     assert_eq!(EscrowError::PayoutDenied.code(), 153);
     assert_eq!(EscrowError::InvalidPayoutDenylist.code(), 154);
+    // AV-97: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidAuctionParams.code(), 155);
+    assert_eq!(EscrowError::AuctionNotActive.code(), 156);
 }
 
 #[test]

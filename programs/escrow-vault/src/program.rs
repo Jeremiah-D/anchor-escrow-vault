@@ -931,6 +931,35 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to Dutch-auction settlement (AV-97; mirrors
+    /// `Escrow::with_dutch_auction`). `Uninitialized` only, like
+    /// `initialize_vesting`: the window and the reserve floor are
+    /// fixed before funds move. Once funded, the taker's `claim`
+    /// prices through the descending auction cap inside `[start_at,
+    /// end_at]` (`AuctionNotActive`, code 156, outside the window);
+    /// the initializer reclaims the remainder via `cancel` /
+    /// `cancel_partial`. `start_at >= end_at` or `reserve_bps >
+    /// 10_000` is `InvalidAuctionParams` (code 155). The auction and
+    /// the AV-13/AV-90 unlock paths are mutually exclusive,
+    /// last-wins. The vault account already reserves the full
+    /// auction region (1 + 18 bytes, zeroed when `None`), so the
+    /// terms are written in place — no realloc needed in the real
+    /// build. Emits no event (pre-fund configuration, like
+    /// `initialize_vesting`).
+    pub fn initialize_dutch_auction(
+        ctx: Context<InitializeDutchAuction>,
+        start_at: u64,
+        end_at: u64,
+        reserve_bps: u16,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_dutch_auction(start_at, end_at, reserve_bps)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
     /// Claim the vested-but-unreleased portion (AV-13; mirrors
     /// `Escrow::claim`). Only the taker may call this; `now` comes from
     /// the Solana clock sysvar (never an instruction param — a
@@ -3950,6 +3979,16 @@ pub struct Vault {
     /// matches `escrow_state::VAULT_FIELDS` (appended last, after
     /// `evidence_disclosed`).
     pub payout_denylist: Option<PayoutDenylist>,
+    /// AV-97: opt-in Dutch-auction settlement terms (the
+    /// descending-price pull path for the taker); mirrors
+    /// `escrow_state`'s `auction`. `None` for an escrow with no
+    /// auction. The account always reserves the full 19-byte region
+    /// (1-byte discriminant + 18-byte terms, zeroed when `None`) so
+    /// `initialize_dutch_auction` writes the terms in place without
+    /// reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `payout_denylist`).
+    pub auction: Option<DutchAuction>,
 }
 
 /// Skeleton mirror of `escrow_state::SlashTerms`: the opt-in
@@ -4070,6 +4109,22 @@ pub struct PayoutAllowlist {
 pub struct PayoutDenylist {
     pub addrs: [Pubkey; 4],
     pub len: u8,
+}
+
+/// AV-97: skeleton mirror of `escrow_state::DutchAuction`: the
+/// opt-in descending-price settlement terms — the Unix-seconds
+/// window `[start_at, end_at]` during which the taker's `claim`
+/// prices through the descending cap, plus the `reserve_bps` floor
+/// (0–10_000 basis points) guaranteeing the initializer's minimum
+/// keep at `end_at`. Serialized size is pinned by
+/// `escrow_state::DUTCH_AUCTION_LEN` (18 bytes: two u64 timestamps +
+/// one u16 floor); on the vault it rides a 1-byte `Option`
+/// discriminant.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct DutchAuction {
+    pub start_at: u64,
+    pub end_at: u64,
+    pub reserve_bps: u16,
 }
 
 /// AV-83: skeleton mirror of `escrow_state::CpiAllowlist`: up to 8
@@ -4969,6 +5024,20 @@ pub struct InitializeVestingCurve<'info> {
     pub vault: Account<'info, Vault>,
     /// Only the initializer fixes the unlock curve; the state machine
     /// rejects re-configuration once the escrow leaves `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-97: accounts for `initialize_dutch_auction` — same shape as
+/// `InitializeVesting`: only the initializer fixes the auction terms.
+#[derive(Accounts)]
+pub struct InitializeDutchAuction<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer fixes the auction window and reserve
+    /// floor; the state machine rejects re-configuration once the
+    /// escrow leaves `Uninitialized`, and rejects `start_at >=
+    /// end_at` / `reserve_bps > 10_000` (`InvalidAuctionParams`, code
+    /// 155).
     pub initializer: Signer<'info>,
 }
 
@@ -6158,6 +6227,12 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidPayoutDenylist => {
             error!(ErrorCode::InvalidPayoutDenylist)
         }
+        escrow_state::EscrowError::InvalidAuctionParams => {
+            error!(ErrorCode::InvalidAuctionParams)
+        }
+        escrow_state::EscrowError::AuctionNotActive => {
+            error!(ErrorCode::AuctionNotActive)
+        }
     }
 }
 
@@ -6267,4 +6342,8 @@ pub enum ErrorCode {
     PayoutDenied,
     #[msg("Invalid payout denylist (AV-96): PayoutDenylist::new with an empty list, more than 4 addresses, or a zero address")]
     InvalidPayoutDenylist,
+    #[msg("Invalid Dutch-auction terms (AV-97): with_dutch_auction with start_at >= end_at (a zero-length window would divide by zero in the descending-price math) or reserve_bps > 10_000 (not a valid basis-point floor)")]
+    InvalidAuctionParams,
+    #[msg("Dutch auction not active (AV-97): claim on an auction-mode escrow outside the [start_at, end_at] window, or escalate while the auction window is live (price discovery and arbitration are mutually exclusive settlement paths)")]
+    AuctionNotActive,
 }

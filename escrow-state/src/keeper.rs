@@ -780,12 +780,14 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 });
             }
         }
-        // The taker's pull path: vesting attached, no milestone plan (the
-        // plan owns the release schedule and disables `claim`), something
-        // vested-but-unreleased, any configured quorum satisfied, and the
-        // timelock (AV-27) already unlocked — otherwise the call would
-        // fail and is not executable.
-        if e.vesting_schedule().is_some()
+        // The taker's pull path: vesting attached (or an AV-97 Dutch
+        // auction — the auction prices `claim` on its own descending
+        // curve), no milestone plan (the plan owns the release
+        // schedule and disables `claim`), something priced-but-unreleased,
+        // any configured quorum satisfied, and the timelock (AV-27)
+        // already unlocked — otherwise the call would fail and is not
+        // executable.
+        if (e.vesting_schedule().is_some() || e.auction().is_some())
             && e.milestone_plan().is_none()
             && e.claimable_amount(now) > 0
             && e.quorum().map(|q| q.is_satisfied()).unwrap_or(true)
@@ -811,7 +813,14 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 extension_count: e.extension_count(),
                 multisig_authority: e.multisig_authority,
                 evidence_disclosure: None,
-                reason: "vesting_unlocked",
+                // AV-97: the auction window prices the claim, not a
+                // vesting curve — the reason tells the operator which
+                // pricing the amount came from.
+                reason: if e.auction().is_some() {
+                    "auction_window_open"
+                } else {
+                    "vesting_unlocked"
+                },
             });
         }
         // AV-56: the initializer's push path for the next due
