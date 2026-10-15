@@ -96,6 +96,15 @@ mod idl_json;
 mod sim;
 mod multisig;
 
+// AV-104: authority delegation — a bounded operator grant with a scope
+// bitmap (fund/release/cancel), persisted as a fixed 37-byte region at
+// the end of the vault layout. Pure logic, zero dependencies.
+mod delegation;
+pub use delegation::{
+    validate_delegation_scopes, DelegatedRole, Delegation, DELEGATION_LEN, DELEGATION_SCOPE_CANCEL,
+    DELEGATION_SCOPE_FUND, DELEGATION_SCOPE_MASK, DELEGATION_SCOPE_RELEASE,
+};
+
 // ---------------------------------------------------------------------------
 // SHA-256 (hand-rolled, zero dependencies).
 // ---------------------------------------------------------------------------
@@ -1182,6 +1191,14 @@ pub struct Escrow {
     /// Persisted (8 bytes, zeroed when no appeal is in flight).
     /// Appended last so every earlier field offset stays stable.
     appeal_bond_paid: u64,
+    /// AV-104: the delegated operator grant (see
+    /// [`Escrow::delegate_authority`] / [`Escrow::revoke_delegation`]):
+    /// one discriminant byte, then the 32-byte operator key and the
+    /// u32 scope bitmap ([`DELEGATION_LEN`]). The region is always
+    /// reserved (zeroed when `None`) so grants are written in place —
+    /// same treatment as `arbiter` / `mint` / `refund_to`. Appended
+    /// last so every earlier field offset stays stable.
+    delegation: Option<Delegation>,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -1711,6 +1728,20 @@ pub enum EscrowError {
     /// appeal can never be expired out from under the panel. Never
     /// renumbered (see [`EscrowError::code`]).
     AppealExpiryNotDue,
+    /// Invalid authority-delegation request (AV-104):
+    /// [`Escrow::delegate_authority`] with a grantor who is neither
+    /// the initializer nor the taker, a zero operator key (a grant to
+    /// nowhere), an empty scope bitmap, or scope bits outside
+    /// [`DELEGATION_SCOPE_MASK`]; or a grant/revoke on an escrow
+    /// outside `Uninitialized` / `Funded`; or
+    /// [`Escrow::revoke_delegation`] with no grant to revoke. One
+    /// code (160) for the whole family, paralleling
+    /// [`EscrowError::GapInEventStream`]'s one-code convention. An
+    /// operator calling *outside* their granted scope is *not* this
+    /// code — it is [`EscrowError::Unauthorized`], so on-chain
+    /// clients keep matching one code for every authority
+    /// rejection. Never renumbered (see [`EscrowError::code`]).
+    InvalidDelegation,
 }
 
 impl EscrowError {
@@ -1786,6 +1817,8 @@ impl EscrowError {
             // AV-103: appended, never renumbered.
             EscrowError::InvalidAppealBond => 158,
             EscrowError::AppealExpiryNotDue => 159,
+            // AV-104: appended, never renumbered.
+            EscrowError::InvalidDelegation => 160,
         }
     }
 
@@ -1852,6 +1885,7 @@ impl EscrowError {
             EscrowError::InvalidTransferHook,
             EscrowError::InvalidAppealBond,
             EscrowError::AppealExpiryNotDue,
+            EscrowError::InvalidDelegation,
         ]
     }
 }
@@ -2070,6 +2104,13 @@ pub const STREAMING_FEE_REGION_LEN: usize = 8 + 8;
 /// no appeal is in flight). Appended after the streaming-fee
 /// region, so every pre-AV-103 field keeps its offset.
 pub const APPEAL_BOND_REGION_LEN: usize = 8 + 8;
+
+/// Serialized length of the AV-104 authority-delegation tail region:
+/// a 1-byte `Option` discriminant followed by the 32-byte operator
+/// key and the 4-byte scope bitmap (zeroed when no grant is live).
+/// Appended after the appeal-bond region, so every pre-AV-104 field
+/// keeps its offset.
+pub const DELEGATION_REGION_LEN: usize = DELEGATION_LEN;
 
 /// Dutch-auction settlement terms (AV-97): an opt-in descending-price
 /// pull path for the taker, fixed before any funds move (see
@@ -4260,6 +4301,9 @@ impl Escrow {
             // — filing stays free unless `with_appeal_bond` opts in.
             appeal_bond: 0,
             appeal_bond_paid: 0,
+            // AV-104: no operator grant at creation — delegation is an
+            // explicit post-setup grant, never an initialization input.
+            delegation: None,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -4353,7 +4397,8 @@ impl Escrow {
         // before the reentrancy guard and the authority check.
         self.require_not_paused()?;
         self.require_not_reentrant()?;
-        self.require_initializer(authority)?;
+        // AV-104: the initializer funds, or their FUND-scoped operator.
+        self.require_scoped_authority(authority, DELEGATION_SCOPE_FUND, false)?;
         match self.state {
             EscrowState::Uninitialized if !self.dual_sig_required() => {
                 self.state = EscrowState::Funded;
@@ -4453,6 +4498,150 @@ impl Escrow {
         self.activation & ACTIVATION_TAKER_BIT != 0
     }
 
+    // ----- AV-104: authority delegation -----
+
+    /// The live operator grant ([`Escrow::delegate_authority`]), if any.
+    pub fn delegation(&self) -> Option<Delegation> {
+        self.delegation
+    }
+
+    /// AV-104: the caller's effective authority role. The parties are
+    /// reported as themselves ([`DelegatedRole::Initializer`] /
+    /// [`DelegatedRole::Taker`]) even when they also hold an operator
+    /// grant — the party check always precedes the delegation check on
+    /// every gated path, so a grant never downgrades a party. `None`
+    /// for a stranger. Read-only: the actual gate is
+    /// [`Escrow::require_scoped_authority`].
+    pub fn effective_role(&self, caller: [u8; 32]) -> Option<DelegatedRole> {
+        if caller == self.initializer {
+            return Some(DelegatedRole::Initializer);
+        }
+        if caller == self.taker {
+            return Some(DelegatedRole::Taker);
+        }
+        self.delegation
+            .filter(|grant| grant.delegate() == caller)
+            .map(|grant| DelegatedRole::Operator(grant.scopes()))
+    }
+
+    /// AV-104: authorize `caller` for a scope-gated path (the
+    /// delegation-aware authority check). The parties authorize first —
+    /// the initializer always, the taker only when `taker_allowed` —
+    /// without consulting the grant; only when neither party matches is
+    /// the operator slot checked, and then only when the grant's scope
+    /// bitmap covers `scope`. The spec-mandated order: party check,
+    /// then delegation check (see the `delegation` module docs).
+    ///
+    /// An out-of-scope operator and a stranger both fail with
+    /// [`EscrowError::Unauthorized`] — the pre-AV-104 authority
+    /// semantics, so on-chain clients keep matching one code for every
+    /// authority rejection (see
+    /// [`EscrowError::InvalidDelegation`]'s docs for what stays a new
+    /// code).
+    fn require_scoped_authority(
+        &self,
+        caller: [u8; 32],
+        scope: u32,
+        taker_allowed: bool,
+    ) -> Result<(), EscrowError> {
+        if caller == self.initializer {
+            return Ok(());
+        }
+        if taker_allowed && caller == self.taker {
+            return Ok(());
+        }
+        if let Some(grant) = self.delegation {
+            if grant.delegate() == caller && grant.covers(scope) {
+                return Ok(());
+            }
+        }
+        Err(EscrowError::Unauthorized)
+    }
+
+    /// Grant a bounded slice of the caller's authority to an operator
+    /// (AV-104 — the Solana "approve a delegate" pattern, but for
+    /// transition rights instead of token spend): the operator may act
+    /// for the escrow on the paths their `scopes` bitmap covers (see
+    /// [`DELEGATION_SCOPE_FUND`] / [`DELEGATION_SCOPE_RELEASE`] /
+    /// [`DELEGATION_SCOPE_CANCEL`]).
+    ///
+    /// Check order is pause → authority → state → config, matching the
+    /// crate convention:
+    /// 1. a paused escrow fails fast ([`EscrowError::Paused`] — AV-46);
+    /// 2. only the initializer or the taker may grant
+    ///    ([`EscrowError::Unauthorized`] otherwise — the grant is a
+    ///    party power, never an operator power: an operator cannot
+    ///    sub-delegate);
+    /// 3. `Uninitialized` or `Funded` only
+    ///    ([`EscrowError::InvalidStateTransition`] otherwise — a grant
+    ///    on a terminal escrow could never be exercised);
+    /// 4. config: the zero operator key (a grant to nowhere), an empty
+    ///    scope bitmap, or scope bits outside
+    ///    [`DELEGATION_SCOPE_MASK`] are
+    ///    [`EscrowError::InvalidDelegation`].
+    ///
+    /// The grant overwrites any previous grant (single slot): a later
+    /// grant from either party wins, so a compromised operator is
+    /// cut off by one new grant. Re-granting the identical
+    /// (operator, scopes) pair is a no-op success that emits no event
+    /// (the `update_quorum` no-op precedent).
+    ///
+    /// The [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits
+    /// [`EscrowEventKind::DelegationGranted`](crate::EscrowEventKind::DelegationGranted)
+    /// on an actual change (`from == to ==` the current state).
+    pub fn delegate_authority(
+        &mut self,
+        caller: [u8; 32],
+        delegate: [u8; 32],
+        scopes: u32,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        if caller != self.initializer && caller != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if delegate == [0u8; 32] || !validate_delegation_scopes(scopes) {
+            return Err(EscrowError::InvalidDelegation);
+        }
+        let grant = Delegation::new(delegate, scopes);
+        if self.delegation == Some(grant) {
+            return Ok(());
+        }
+        self.delegation = Some(grant);
+        Ok(())
+    }
+
+    /// Revoke the live operator grant (AV-104). Either party may revoke
+    /// — the initializer can cut off a taker-appointed operator and
+    /// vice versa, so a rogue operator has no protector. Check order
+    /// mirrors [`Escrow::delegate_authority`]: pause → authority →
+    /// state, then [`EscrowError::InvalidDelegation`] when there is no
+    /// grant to revoke.
+    ///
+    /// The [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits
+    /// [`EscrowEventKind::DelegationRevoked`](crate::EscrowEventKind::DelegationRevoked)
+    /// (`from == to ==` the current state).
+    pub fn revoke_delegation(&mut self, caller: [u8; 32]) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        if caller != self.initializer && caller != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if self.delegation.is_none() {
+            return Err(EscrowError::InvalidDelegation);
+        }
+        self.delegation = None;
+        Ok(())
+    }
+
     /// Release `amount` of the locked funds to the taker. Partial releases
     /// accumulate in [`Escrow::released_amount`] and leave the escrow
     /// `Funded`; when the cumulative released total reaches the locked
@@ -4506,7 +4695,12 @@ impl Escrow {
         // before the reentrancy guard and the authority check.
         self.require_not_paused()?;
         self.require_not_reentrant()?;
-        self.require_initializer(authority)?;
+        // AV-104: the initializer releases, or their RELEASE-scoped
+        // operator. The payout destination is still pinned by
+        // `require_payout_recipient` below, so an operator cannot
+        // redirect funds — the grant authorizes the *action*, never
+        // the destination.
+        self.require_scoped_authority(authority, DELEGATION_SCOPE_RELEASE, false)?;
         match self.state {
             EscrowState::Funded => {}
             _ => return Err(EscrowError::InvalidStateTransition),
@@ -4910,7 +5104,10 @@ let fee = self.charge_protocol_fee(amount)?;
         // before the reentrancy guard and the authority check.
         self.require_not_paused()?;
         self.require_not_reentrant()?;
-        self.require_initializer(authority)?;
+        // AV-104: the initializer cancels, or their CANCEL-scoped
+        // operator. The refund destination is still pinned by
+        // `require_refund_recipient` below.
+        self.require_scoped_authority(authority, DELEGATION_SCOPE_CANCEL, false)?;
         match self.state {
             EscrowState::Funded => {
                 self.require_mint_match(mint)?;
@@ -5054,9 +5251,11 @@ let fee = self.charge_protocol_fee(amount)?;
         // before the reentrancy guard and the authority check.
         self.require_not_paused()?;
         self.require_not_reentrant()?;
-        if authority != self.initializer && authority != self.taker {
-            return Err(EscrowError::Unauthorized);
-        }
+        // AV-104: either party cancels expiry, or their CANCEL-scoped
+        // operator. An operator never pays the taker penalty (the
+        // `authority == self.taker` check below still keys off the
+        // actual taker).
+        self.require_scoped_authority(authority, DELEGATION_SCOPE_CANCEL, true)?;
         self.expire_cancel_locked(now, mint, refund_to, authority == self.taker)
     }
 
@@ -7015,6 +7214,11 @@ let fee = self.charge_protocol_fee(claimable)?;
             return Ok(());
         }
         self.taker = new_taker;
+        // AV-104: the operator grant is party-bound — a rotated party
+        // must not inherit an operator it never appointed. Clearing is
+        // the fail-closed choice: the new counterparty re-grants
+        // explicitly if they still want a delegated operator.
+        self.delegation = None;
         Ok(())
     }
 
@@ -7104,6 +7308,10 @@ let fee = self.charge_protocol_fee(claimable)?;
         // is historical and state stays as-is — rotation does not
         // un-activate or un-fund.
         self.activation &= !ACTIVATION_INITIALIZER_BIT;
+        // AV-104: the operator grant is party-bound — the old
+        // initializer's operator must not act for the new key (see
+        // `rotate_taker` for the taker side).
+        self.delegation = None;
         Ok(())
     }
 
@@ -11364,6 +11572,14 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // never mixed into `released` or `penalty_paid`. Appended last
     // so every earlier field offset stays stable.
     ("appeal_bond_paid", "u64", 8),
+    // AV-104: the delegated operator grant (see
+    // `Escrow::delegate_authority` / `Escrow::revoke_delegation`):
+    // one discriminant byte, then the 32-byte operator key and the
+    // 4-byte scope bitmap (`DELEGATION_LEN`). The region is always
+    // reserved (zeroed when `None`) so grants are written in place —
+    // same treatment as `arbiter` / `mint` / `refund_to`. Appended
+    // last so every earlier field offset stays stable.
+    ("delegation", "Option<Delegation>", DELEGATION_LEN),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -11475,9 +11691,12 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// discriminant + 18-byte terms (19 bytes, zeroed when no auction is
 /// configured). The AV-99 Token-2022 transfer-hook program id is
 /// likewise always present: 1-byte discriminant + 32-byte program id
-/// (33 bytes, zeroed when no hook is declared).
+/// (33 bytes, zeroed when no hook is declared). The AV-104 operator
+/// grant is likewise always present: 1-byte discriminant + 32-byte
+/// operator key + u32 scope bitmap (37 bytes, zeroed when no grant is
+/// live).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -12031,7 +12250,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 32_753_760, "from {state:?}");
+            assert_eq!(rent, 33_011_280, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -12129,9 +12348,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 32_753_760 by
+        // VAULT_SPACE — pinned at 33_011_280 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 32_753_760);
+        assert_eq!(rent, 33_011_280);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -12292,8 +12511,8 @@ mod tests {
         // then the account is closed. VAULT_SPACE stays 2941 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 4578, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 32_753_760);
+        assert_eq!(VAULT_SPACE, 4615, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 33_011_280);
     }
 
     #[test]
@@ -12312,7 +12531,7 @@ mod tests {
         // 595 (arbiter panel), and AV-68 by 41 (evidence-disclosure
         // deadline + escalating party), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 4578, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4615, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -15413,6 +15632,39 @@ pub(crate) mod anchor_idl_tests {
             method: "Escrow::with_streaming_fee",
             input_mapping: "rate <- param; authority <- accounts.initializer (signer), enforced by the Anchor account constraint, not the state machine; Uninitialized only — the rate is fixed before any funds move; any u64 rate is legal (0 disables); emits no indexer event (pre-fund configuration); the 16-byte region is reserved in the vault layout whether or not a streaming fee is configured",
         },
+        InstructionSpec {
+            // AV-104: grant a bounded slice of the caller's authority
+            // to an operator (the Solana "approve a delegate" pattern
+            // for transition rights). IDL:
+            // sha256("global:delegate_authority")[..8] — the Anchor
+            // instruction discriminator for the delegate_authority
+            // handler.
+            name: "delegate_authority",
+            params: &[
+                (
+                    "delegate",
+                    "Pubkey",
+                    "instruction param; the operator's key — the zero key is rejected (a grant to nowhere)",
+                ),
+                (
+                    "scopes",
+                    "u32",
+                    "instruction param; the scope bitmap (fund = 1, release = 2, cancel = 4) — empty or with bits outside the mask is rejected",
+                ),
+            ],
+            method: "Escrow::delegate_authority",
+            input_mapping: "delegate <- param (Pubkey -> [u8; 32] conversion); scopes <- param (u32); caller <- accounts.caller (signer) — the grant is a party power: only the initializer or the taker may grant, a stranger (or the operator themselves — no sub-delegation) is Unauthorized; a paused escrow fails fast (Paused); Uninitialized / Funded only (InvalidStateTransition otherwise); the zero operator key, an empty scope bitmap, or scope bits outside the mask are InvalidDelegation (code 160); the grant overwrites any previous grant (single slot) and writes the 37-byte region in place; re-granting the identical (operator, scopes) pair is a no-op success with no event; emits the DelegationGranted indexer event on an actual change (from == to == the current state, actor = the granting party)",
+        },
+        InstructionSpec {
+            // AV-104: revoke the live operator grant. IDL:
+            // sha256("global:revoke_delegation")[..8] — the Anchor
+            // instruction discriminator for the revoke_delegation
+            // handler.
+            name: "revoke_delegation",
+            params: &[],
+            method: "Escrow::revoke_delegation",
+            input_mapping: "caller <- accounts.caller (signer) — either party may revoke (the initializer can cut off a taker-appointed operator and vice versa); a stranger is Unauthorized; a paused escrow fails fast (Paused); Uninitialized / Funded only (InvalidStateTransition otherwise); no live grant is InvalidDelegation (code 160); clears the 37-byte delegation region in place; emits the DelegationRevoked indexer event (from == to == the current state, actor = the revoking party)",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -15578,6 +15830,10 @@ pub(crate) mod anchor_idl_tests {
             // AV-100: opt-in streaming fee on funded time — every taker
             // payout deducts the newly accrued slice.
             "Escrow::with_streaming_fee",
+            // AV-104: authority delegation — a bounded operator grant
+            // with a scope bitmap (fund/release/cancel), revocable.
+            "Escrow::delegate_authority",
+            "Escrow::revoke_delegation",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -15601,7 +15857,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_fifty_one_instructions_take_params() {
+    fn only_fifty_two_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -15678,6 +15934,8 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_dutch_auction",
                 &"initialize_transfer_hook",
                 &"initialize_streaming_fee",
+                // AV-104: the grant params (operator key + scope bitmap).
+                &"delegate_authority",
             ]
         );
     }
@@ -17503,6 +17761,11 @@ pub(crate) mod anchor_idl_tests {
         // penalty additionally accumulates into `released` (a second
         // param source for the field is allowed — see `released`).
         ("review_appeal", "uphold", "appeal_ballot"),
+        // AV-104: the grant params populate the delegation region —
+        // two param sources for one field is allowed (see
+        // `review_appeal` / `appeal_ballot` above).
+        ("delegate_authority", "delegate", "delegation"),
+        ("delegate_authority", "scopes", "delegation"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -18178,6 +18441,11 @@ mod error_code_tests {
             EscrowError::AppealExpiryNotDue,
             159,
             "expire_appeal with now <= appeal_deadline — the appeal window has not lapsed yet (AV-103)",
+        ),
+        (
+            EscrowError::InvalidDelegation,
+            160,
+            "delegate_authority with a non-party grantor, a zero operator key, an empty scope bitmap, scope bits outside the mask, or on a non-Uninitialized/non-Funded escrow; or revoke_delegation with no grant to revoke (AV-104)",
         ),
     ];
 
@@ -20122,6 +20390,21 @@ mod account_space_tests {
         // offset above is unchanged.
         out.extend_from_slice(&e.appeal_bond.to_le_bytes());
         out.extend_from_slice(&e.appeal_bond_paid.to_le_bytes());
+        // AV-104: the operator grant — one Borsh option discriminant,
+        // then the 32-byte operator key and the u32 scope bitmap; the
+        // zeroed 36-byte region when `None`; appended last so every
+        // earlier offset above is unchanged.
+        match e.delegation {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; DELEGATION_LEN - 1]);
+            }
+            Some(d) => {
+                out.push(1);
+                out.extend_from_slice(&d.delegate());
+                out.extend_from_slice(&d.scopes().to_le_bytes());
+            }
+        }
         out
     }
 
@@ -20191,10 +20474,12 @@ mod account_space_tests {
         // + 16 (AV-100 streaming fee: 8-byte rate + 8-byte accrued
         // counter)
         // + 16 (AV-103 appeal bond: 8-byte configured bond + 8-byte
-        // locked-bond counter).
-        assert_eq!(ESCROW_BODY_LEN, 4570, "escrow payload bytes");
+        // locked-bond counter)
+        // + 37 (AV-104 authority delegation: 1-byte discriminant +
+        // 32-byte operator key + 4-byte scope bitmap).
+        assert_eq!(ESCROW_BODY_LEN, 4607, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 4578, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4615, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -20277,13 +20562,15 @@ mod account_space_tests {
         // hook is declared) + 16-byte streaming-fee region (AV-100,
         // 8-byte rate + 8-byte accrued counter) + 16-byte appeal-bond
         // region (AV-103, 8-byte configured bond + 8-byte locked-bond
-        // counter).
+        // counter) + 37-byte operator-grant region (AV-104, 1-byte
+        // discriminant + 32-byte operator key + 4-byte scope bitmap,
+        // zeroed when no grant is live).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4088);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4125);
     }
 
     #[test]
@@ -20693,16 +20980,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4578) * 3480 * 2 = 4706 * 6960 = 32_753_760 lamports.
-        assert_eq!(full, 32_753_760);
+        // (128 + 4615) * 3480 * 2 = 4743 * 6960 = 33_011_280 lamports.
+        assert_eq!(full, 33_011_280);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4088) * 3480 * 2 = 4216 * 6960 = 29_343_360 lamports.
-        assert_eq!(no_quorum, 29_343_360);
+        // (128 + 4125) * 3480 * 2 = 4253 * 6960 = 29_600_880 lamports.
+        assert_eq!(no_quorum, 29_600_880);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -20746,25 +21033,25 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(32_753_760, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(33_011_280, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(27_533_759, params.0, params.1),
             Err(RentShortfall {
-                required: 32_753_760,
+                required: 33_011_280,
                 provided: 27_533_759,
             })
         );
         // Generous funding: exempt.
         assert_eq!(
-            check_vault_rent_exempt(33_000_000, params.0, params.1),
+            check_vault_rent_exempt(34_000_000, params.0, params.1),
             Ok(())
         );
         // Zero lamports: the full minimum is the shortfall.
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 32_753_760,
+                required: 33_011_280,
                 provided: 0,
             })
         );
@@ -20821,7 +21108,7 @@ mod basket_tests {
         let body = encode_escrow(&e);
         assert_eq!(body.len(), ESCROW_BODY_LEN);
         let basket_at =
-            ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN;
+            ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN;
         assert_eq!(body[basket_at], 1, "Some discriminant");
         assert_eq!(body[basket_at + 1], 2, "leg count");
         assert_eq!(&body[basket_at + 2..basket_at + 34], &MINT_A);
@@ -22440,7 +22727,7 @@ mod denylist_tests {
         let e = funded_denied();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN);
+        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN);
         assert_eq!(bytes[tail], 1, "Some discriminant");
         assert_eq!(&bytes[tail + 1..tail + 1 + 32], &MALLORY);
         assert_eq!(&bytes[tail + 33..tail + 129], &[0u8; 96]);
@@ -22762,13 +23049,16 @@ mod dutch_auction_tests {
     fn auction_region_is_append_only_at_the_tail() {
         // Plain escrow: the 19-byte auction region is zeroed. It is no
         // longer the tail itself — the AV-99 transfer-hook region
-        // (33 bytes) trails it — but every earlier offset is stable.
+        // (33 bytes), the AV-100 streaming-fee region (16 bytes), the
+        // AV-103 appeal-bond region (16 bytes) and the AV-104
+        // delegation region (37 bytes) trail it — but every earlier
+        // offset is stable.
         let mut plain = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
         plain.fund(ALICE, START - 3_600).unwrap();
         let bytes = encode_escrow(&plain);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4570);
-        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
+        assert_eq!(bytes.len(), 4607);
+        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
         assert_eq!(bytes[tail], 0, "auction: None discriminant");
         assert_eq!(
             &bytes[tail + 1..tail + 1 + DUTCH_AUCTION_LEN],
@@ -22810,25 +23100,28 @@ mod dutch_auction_tests {
         );
         // A decoded auction prices `claim` identically.
         assert_eq!(decoded.claimable_amount(START + 900), 750_000);
-        // The field table pins the tail append: the AV-103 appeal-bond
-        // region is the new tail, the AV-100 streaming-fee region
-        // trails it, the AV-99 hook region trails the auction region.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].0, "appeal_bond_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "appeal_bond");
+        // The field table pins the tail append: the AV-104 delegation
+        // region is the new tail, the AV-103 appeal-bond region trails
+        // it, the AV-100 streaming-fee region trails the bond region,
+        // the AV-99 hook region trails the auction region.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].0, "delegation");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].2, DELEGATION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "appeal_bond_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "streaming_fees_accrued");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "appeal_bond");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "streaming_fees_accrued");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "transfer_hook");
-        assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 5].2,
-            TRANSFER_HOOK_REGION_LEN
-        );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "auction");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "transfer_hook");
         assert_eq!(
             VAULT_FIELDS[VAULT_FIELDS.len() - 6].2,
+            TRANSFER_HOOK_REGION_LEN
+        );
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "auction");
+        assert_eq!(
+            VAULT_FIELDS[VAULT_FIELDS.len() - 7].2,
             1 + DUTCH_AUCTION_LEN
         );
     }
@@ -22839,7 +23132,7 @@ mod dutch_auction_tests {
         let mut account = vec![0u8; 8 + ESCROW_BODY_LEN];
         account[..8].copy_from_slice(&vault_account_discriminator());
         account[8..].copy_from_slice(&encode_escrow(&e));
-        let tail = 8 + ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
+        let tail = 8 + ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
         // Zero-length window: start_at == end_at would divide by zero
         // in `payout_cap`.
         account[tail + 1..tail + 9].copy_from_slice(&END.to_le_bytes());
@@ -23842,7 +24135,7 @@ mod vesting_curve_tests {
         // the AV-96 denylist (130 bytes) plus the AV-97 auction
         // region (19 bytes) trail everything: discriminant 1,
         // tier-count 2, then the two live tiers.
-        let base = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42 - (1 + VESTING_CURVE_LEN);
+        let base = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42 - (1 + VESTING_CURVE_LEN);
         assert_eq!(bytes[base], 1, "curve: Some discriminant");
         assert_eq!(bytes[base + 1], 2, "curve: tier count");
         assert_eq!(
@@ -26111,7 +26404,7 @@ mod migrate_schema_tests {
         // region, the slash region and the CPI allowlist trail it);
         // every earlier offset stays stable, and the carry-over is
         // still a byte-prefix copy.
-        let version_at = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        let version_at = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         let e = v0_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
@@ -27077,7 +27370,7 @@ mod evidence_merkle_tests {
         // AV-97 auction region (19 bytes) are appended after it now:
         // 1-byte discriminant + 32-byte root, then the leaf-count
         // byte, then the u64-LE disclosure bitmap with bit 0 set.
-        let base = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42;
+        let base = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42;
         assert_eq!(bytes[base], 1, "evidence_root: Some discriminant");
         assert_eq!(&bytes[base + 1..base + 33], &root, "evidence_root bytes");
         assert_eq!(bytes[base + 33], 2, "evidence_leaves");
@@ -27707,7 +28000,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4570, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) bytes");
+        assert_eq!(bytes.len(), 4607, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -27732,7 +28025,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 4570);
+        assert_eq!(bytes.len(), 4607);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -27754,18 +28047,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4578) * 3480 * 2 = 4706 * 6960 = 32_753_760 lamports.
-        assert_eq!(VAULT_SPACE, 4578);
-        assert_eq!(full, 32_753_760);
+        // (128 + 4615) * 3480 * 2 = 4743 * 6960 = 33_011_280 lamports.
+        assert_eq!(VAULT_SPACE, 4615);
+        assert_eq!(full, 33_011_280);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4088) * 3480 * 2 = 4216 * 6960 = 29_343_360 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4088);
-        assert_eq!(no_quorum, 29_343_360);
+        // (128 + 4125) * 3480 * 2 = 4253 * 6960 = 29_600_880 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4125);
+        assert_eq!(no_quorum, 29_600_880);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -27909,7 +28202,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4570);
+        assert_eq!(bytes.len(), 4607);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -27924,7 +28217,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 4570);
+        assert_eq!(bytes.len(), 4607);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -27955,18 +28248,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4578) * 3480 * 2 = 4706 * 6960 = 32_753_760 lamports.
-        assert_eq!(VAULT_SPACE, 4578);
-        assert_eq!(full, 32_753_760);
+        // (128 + 4615) * 3480 * 2 = 4743 * 6960 = 33_011_280 lamports.
+        assert_eq!(VAULT_SPACE, 4615);
+        assert_eq!(full, 33_011_280);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4088) * 3480 * 2 = 4216 * 6960 = 29_343_360 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4088);
-        assert_eq!(no_quorum, 29_343_360);
+        // (128 + 4125) * 3480 * 2 = 4253 * 6960 = 29_600_880 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4125);
+        assert_eq!(no_quorum, 29_600_880);
     }
 
     #[test]
@@ -28824,7 +29117,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 4570);
+        assert_eq!(bytes.len(), 4607);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -28999,7 +29292,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 4570, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region, 82 by AV-90 vesting curve, 42 by AV-91 evidence commitment region, 386 by AV-95 basket, 19 by AV-97 auction, 33 by AV-99 transfer hook, 16 by AV-100 streaming fee, 16 by AV-103 appeal bond");
+        assert_eq!(ESCROW_BODY_LEN, 4607, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region, 82 by AV-90 vesting curve, 42 by AV-91 evidence commitment region, 386 by AV-95 basket, 19 by AV-97 auction, 33 by AV-99 transfer hook, 16 by AV-100 streaming fee, 16 by AV-103 appeal bond");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -29017,32 +29310,33 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 4578) * 3480 * 2 = 4706 * 6960 = 32_753_760 lamports.
+        // (128 + 4615) * 3480 * 2 = 4743 * 6960 = 33_011_280 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            32_753_760
+            33_011_280
         );
-        // (128 + 4088) * 3480 * 2 = 4216 * 6960 = 29_343_360 lamports.
+        // (128 + 4125) * 3480 * 2 = 4253 * 6960 = 29_600_880 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            29_343_360
+            29_600_880
         );
-        // 1888 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
+        // 1925 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
-        // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 4578);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4088);
-        assert!(check_vault_rent_exempt(32_753_760, 3_480, 2.0).is_ok());
+        // AV-56 subscription schedule + AV-57 event-history ring +
+        // AV-104 authority delegation).
+        assert_eq!(VAULT_SPACE, 4615);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4125);
+        assert!(check_vault_rent_exempt(33_011_280, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -31873,9 +32167,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4570, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond)");
-        assert_eq!(VAULT_SPACE, 4578);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4088);
+        assert_eq!(bytes.len(), 4607, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) + 37 (AV-104 authority delegation)");
+        assert_eq!(VAULT_SPACE, 4615);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4125);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -32429,7 +32723,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4570);
+        assert_eq!(bytes.len(), 4607);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -32997,7 +33291,7 @@ mod subscription_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4570);
+        assert_eq!(bytes.len(), 4607);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -33359,7 +33653,17 @@ mod event_history_tests {
             52,
             "AV-103: appended after DenylistUpdated"
         );
-        for d in 0..=52u8 {
+        assert_eq!(
+            EscrowEventKind::DelegationGranted.discriminant(),
+            53,
+            "AV-104: appended after AppealExpired"
+        );
+        assert_eq!(
+            EscrowEventKind::DelegationRevoked.discriminant(),
+            54,
+            "AV-104: appended after DelegationGranted"
+        );
+        for d in 0..=54u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -33370,7 +33674,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(53), None);
+        assert_eq!(EscrowEventKind::from_discriminant(55), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -33382,11 +33686,11 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37
         );
     }
 
@@ -33403,7 +33707,7 @@ mod event_history_tests {
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4570);
+        assert_eq!(bytes.len(), 4607);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -33431,7 +33735,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103/AV-104 tail");
     }
 
     #[test]
@@ -33446,18 +33750,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4578) * 3480 * 2 = 4706 * 6960 = 32_753_760 lamports.
-        assert_eq!(VAULT_SPACE, 4578);
-        assert_eq!(full, 32_753_760);
+        // (128 + 4615) * 3480 * 2 = 4743 * 6960 = 33_011_280 lamports.
+        assert_eq!(VAULT_SPACE, 4615);
+        assert_eq!(full, 33_011_280);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4088) * 3480 * 2 = 4216 * 6960 = 29_343_360 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4088);
-        assert_eq!(no_quorum, 29_343_360);
+        // (128 + 4125) * 3480 * 2 = 4253 * 6960 = 29_600_880 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4125);
+        assert_eq!(no_quorum, 29_600_880);
     }
 
     // ----- decode -----
@@ -33503,9 +33807,11 @@ mod event_history_tests {
         // (AV-91), 47 is `ReleasedSplit` (AV-93), 48 is
         // `BasketReleased` (AV-95b), 49 is `BasketCancelled`
         // (AV-95b), 50 is `BasketExpiredCancelled` (AV-95b), 51 is
-        // `DenylistUpdated` (AV-96), 52 is `AppealExpired` (AV-103);
-        // 53 is the first still-unknown byte.
-        for bad in [53u8, 54, 255] {
+        // `DenylistUpdated` (AV-96), 52 is `AppealExpired` (AV-103),
+        // 53 is `DelegationGranted` (AV-104), 54 is
+        // `DelegationRevoked` (AV-104); 55 is the first still-unknown
+        // byte.
+        for bad in [55u8, 56, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -34161,17 +34467,17 @@ mod fee_cap_tests {
         // authority) + 26 (AV-86 appeal window region) + 82 (AV-90
         // vesting curve) + 42 (AV-91 evidence commitment) + 386
         // (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction).
-        assert_eq!(ESCROW_BODY_LEN, 4570, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 4578, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4088, "no-quorum Vault account space");
+        assert_eq!(ESCROW_BODY_LEN, 4607, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 4615, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4125, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            32_753_760,
-            "(128 + 4578) * 3480 * 2 = 4674 * 6960"
+            33_011_280,
+            "(128 + 4615) * 3480 * 2 = 4743 * 6960"
         );
         assert_eq!(
             rent_exempt_minimum_lamports(
@@ -34179,8 +34485,8 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            29_343_360,
-            "(128 + 4088) * 3480 * 2 = 4184 * 6960"
+            29_600_880,
+            "(128 + 4125) * 3480 * 2 = 4253 * 6960"
         );
     }
 
@@ -34192,7 +34498,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4570);
+        assert_eq!(bytes.len(), 4607);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -34693,8 +34999,8 @@ mod fee_schedule_tests {
         let e = scheduled_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4570);
-        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        assert_eq!(bytes.len(), 4607);
+        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(bytes[tail], 3, "tier_count at the tail");
         assert_eq!(
             u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
@@ -34734,7 +35040,7 @@ mod fee_schedule_tests {
         // denylist region (130 bytes) and AV-97 the auction region
         // (19 bytes) after the fee schedule, so the schedule no
         // longer sits at the body tail.
-        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(
             &bytes[tail..tail + FEE_SCHEDULE_LEN],
             &[0u8; FEE_SCHEDULE_LEN],
@@ -34758,7 +35064,7 @@ mod fee_schedule_tests {
         // denylist region (130 bytes) and AV-97 the auction region
         // (19 bytes) after the fee schedule, so the schedule no
         // longer sits at the body tail.
-        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         bytes[tail] = 9;
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
@@ -35091,7 +35397,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4570);
+        assert_eq!(bytes.len(), 4607);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -35333,7 +35639,8 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::InvalidTransferHook));
         assert!(EscrowError::all().contains(&EscrowError::InvalidAppealBond));
         assert!(EscrowError::all().contains(&EscrowError::AppealExpiryNotDue));
-        assert_eq!(EscrowError::all().len(), 60);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidDelegation));
+        assert_eq!(EscrowError::all().len(), 61);
     }
 
     #[test]
@@ -35680,7 +35987,7 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4570);
+        assert_eq!(bytes.len(), 4607);
         // AV-91: the evidence-commitment region (33-byte root + 1-byte
         // leaf count + 8-byte disclosure bitmap = 42 bytes) now trails
         // the AV-90 vesting-curve region (82 bytes), which trails the
@@ -35693,7 +36000,7 @@ mod arbiter_panel_tests {
         // trail everything, so the panel region ends 19 + 130 + 386 +
         // 42 + 82 + 26 + 68 + 258 + 49 + 1 bytes before the end of the
         // buffer.
-        let version_end = bytes.len() - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        let version_end = bytes.len() - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         // The panel region trails the AV-73 per-period amount table
         // (512 bytes), the AV-68 evidence-deadline region (41 bytes) and
         // the AV-66 fee-schedule region (81 bytes):
@@ -35730,7 +36037,7 @@ mod arbiter_panel_tests {
         // A panel-less escrow decodes with `None` and a zeroed region.
         let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let plain_bytes = encode_escrow(&plain);
-        assert_eq!(plain_bytes[plain_bytes.len() - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - 41 - FEE_SCHEDULE_LEN - 595], 0);
+        assert_eq!(plain_bytes[plain_bytes.len() - DELEGATION_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - 41 - FEE_SCHEDULE_LEN - 595], 0);
         assert!(decode_vault_account(&account_bytes(&plain))
             .unwrap()
             .arbiter_panel()
@@ -35746,9 +36053,9 @@ mod arbiter_panel_tests {
         assert_eq!(panel.1, "Option<ArbiterPanel>");
         assert_eq!(panel.2, 1 + ARBITER_PANEL_LEN);
         assert_eq!(panel.2, 595);
-        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103:
+        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103/AV-104:
         // every earlier field offset stays stable.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].0, "fee_schedule");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 26].0, "fee_schedule");
     }
 
     #[test]
@@ -35770,61 +36077,66 @@ mod arbiter_panel_tests {
         // the transfer-hook region, AV-100 the streaming-fee region:
         // the AV-103 appeal-bond fields are the new tail (auction
         // moved to len() - 6).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 24].0, "evidence_deadline_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].0, "escalated_by");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].0, "subscription_amounts");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].0, "schema_version");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].0, "slash_terms");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "penalty_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].2, 1 + CPI_ALLOWLIST_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].2, 1 + MULTISIG_AUTHORITY_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "appeal_window_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "appeal_deadline");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "appeal_state");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "appeal_ballot");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].2, APPEAL_BALLOT_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "vesting_curve");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].1, "Option<VestingCurve>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].2, 1 + VESTING_CURVE_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].2, 82);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "evidence_root");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].1, "Option<[u8; 32]>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].2, 33);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "evidence_leaves");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, 1);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "evidence_disclosed");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "basket");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].1, "Option<BasketLegs>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].2, BASKET_REGION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].2, 386);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "payout_denylist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].1, "Option<PayoutDenylist>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 1 + PAYOUT_DENYLIST_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "auction");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].1, "Option<DutchAuction>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 1 + DUTCH_AUCTION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 19);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "transfer_hook");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].1, "Option<[u8; 32]>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 33);
-        // AV-103: the appeal bond and the locked-bond counter are the
-        // new tail — two plain u64s.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].0, "evidence_deadline_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 24].0, "escalated_by");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].0, "subscription_amounts");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].0, "schema_version");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].0, "slash_terms");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].0, "penalty_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].2, 1 + CPI_ALLOWLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].2, 1 + MULTISIG_AUTHORITY_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "appeal_window_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "appeal_deadline");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "appeal_state");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "appeal_ballot");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].2, APPEAL_BALLOT_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "vesting_curve");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].1, "Option<VestingCurve>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].2, 1 + VESTING_CURVE_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].2, 82);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "evidence_root");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].1, "Option<[u8; 32]>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].2, 33);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "evidence_leaves");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].2, 1);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "evidence_disclosed");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "basket");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].1, "Option<BasketLegs>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].2, BASKET_REGION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].2, 386);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "payout_denylist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].1, "Option<PayoutDenylist>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].2, 1 + PAYOUT_DENYLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "auction");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].1, "Option<DutchAuction>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 1 + DUTCH_AUCTION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 19);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "transfer_hook");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].1, "Option<[u8; 32]>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 33);
+        // AV-103: the appeal bond and the locked-bond counter —
+        // two plain u64s — and AV-104: the delegation region is the
+        // new tail (37 bytes: 1-byte discriminant + 32-byte operator
+        // key + 4-byte scope bitmap).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "streaming_fees_accrued");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "streaming_fees_accrued");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "appeal_bond");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "appeal_bond");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "appeal_bond_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 8);
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "appeal_bond_paid");
-        assert_eq!(VAULT_FIELDS.last().unwrap().1, "u64");
-        assert_eq!(VAULT_FIELDS.last().unwrap().2, 8);
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "delegation");
+        assert_eq!(VAULT_FIELDS.last().unwrap().1, "Option<Delegation>");
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, DELEGATION_LEN);
     }
 
     #[test]
@@ -36398,7 +36710,7 @@ mod split_tests {
             .unwrap();
         assert_eq!(e.state(), EscrowState::Split);
         assert_eq!(EscrowState::Split as u8, 8, "Split appended last");
-        assert_eq!(VAULT_SPACE, 4578, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4615, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -36668,7 +36980,7 @@ mod release_split_tests {
         e.release_split(ALICE, NOW, 1_000_000, None, &[(BOB, 10_000)])
             .unwrap();
         assert_eq!(e.state(), EscrowState::Released);
-        assert_eq!(VAULT_SPACE, 4578, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4615, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -36984,7 +37296,7 @@ mod slash_tests {
         let e = slashable(1_000_000);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let base = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
+        let base = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
         assert_eq!(bytes[base], 3, "schema_version");
         assert_eq!(bytes[base + 1], 1, "slash_terms: Some");
         assert_eq!(&bytes[base + 2..base + 34], &PENALTY, "penalty account");
@@ -36995,8 +37307,8 @@ mod slash_tests {
         );
         assert_eq!(
             u64::from_le_bytes(
-                bytes[ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
-                    ..ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
+                bytes[ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
+                    ..ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
                     .try_into()
                     .unwrap()
             ),
@@ -37407,7 +37719,7 @@ mod appeal_tests {
         e.review_appeal(M1, true).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4570);
+        assert_eq!(bytes.len(), 4607);
         // Appeal region: [3820..3846] — window (8), deadline (8), state
         // (1), ballot (9).
         assert_eq!(
@@ -37790,9 +38102,10 @@ mod appeal_bond_tests {
         // the 8-byte discriminator + body.
         let mut full = crate::discriminator::vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
-        // The two trailing u64s are the bond region (encode order:
-        // appeal_bond, then appeal_bond_paid).
-        let tail = &full[8 + super::ESCROW_BODY_LEN - 16..];
+        // The two u64s before the delegation region are the bond region
+        // (encode order: appeal_bond, then appeal_bond_paid) — the
+        // AV-104 delegation region (37 bytes) trails them.
+        let tail = &full[8 + super::ESCROW_BODY_LEN - 37 - 16..8 + super::ESCROW_BODY_LEN - 37];
         assert_eq!(&tail[..8], &BOND.to_le_bytes());
         assert_eq!(&tail[8..], &[0u8; 8], "forfeited bond zeroes the counter");
         let decoded = crate::discriminator::decode_vault_account(&full).unwrap();
@@ -38174,7 +38487,7 @@ mod cpi_allowlist_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4570);
+        assert_eq!(bytes.len(), 4607);
         assert_eq!(bytes[3495], 1, "Some discriminant");
         assert_eq!(&bytes[3496..3496 + 32], &DEX);
         assert_eq!(&bytes[3496 + 32..3496 + 64], &LENDING);
@@ -38193,9 +38506,10 @@ mod cpi_allowlist_tests {
         // payout denylist region after that, AV-97 the auction region
         // after that, AV-99 the transfer-hook region after that,
         // AV-100 the streaming-fee region after that, AV-103 the
-        // appeal-bond region after that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].2, 1 + CPI_ALLOWLIST_LEN);
+        // appeal-bond region after that, AV-104 the delegation region
+        // after that).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].2, 1 + CPI_ALLOWLIST_LEN);
     }
 }
 
@@ -38390,7 +38704,7 @@ mod multisig_tests {
         let e = bound_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4570);
+        assert_eq!(bytes.len(), 4607);
         assert_eq!(bytes[3753], 1, "Some discriminant");
         assert_eq!(&bytes[3754..3754 + 32], &SQUADS_V4_PROGRAM_ID);
         assert_eq!(&bytes[3754 + 32..3754 + 64], &VAULT_PDA);
@@ -38413,8 +38727,8 @@ mod multisig_tests {
         // transfer-hook region after that, AV-100 the streaming-fee
         // region after that, AV-103 the appeal-bond region after
         // that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].2, 1 + MULTISIG_AUTHORITY_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].2, 1 + MULTISIG_AUTHORITY_LEN);
         assert_eq!(MULTISIG_AUTHORITY_LEN, 66);
     }
 
@@ -38627,7 +38941,7 @@ mod streaming_fee_tests {
         let mut e = streaming_escrow(10);
         e.release(ALICE, FUND_AT + 100, 600_000, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        let tail = &bytes[ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN..];
+        let tail = &bytes[ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN..];
         assert_eq!(u64::from_le_bytes(tail[..8].try_into().unwrap()), 10);
         assert_eq!(u64::from_le_bytes(tail[8..16].try_into().unwrap()), 1_000);
         let mut account = vec![0u8; 8 + ESCROW_BODY_LEN];
@@ -38636,5 +38950,327 @@ mod streaming_fee_tests {
         let decoded = decode_vault_account(&account).unwrap();
         assert_eq!(decoded.streaming_fee_rate(), 10);
         assert_eq!(decoded.streaming_fees_accrued(), 1_000);
+    }
+}
+
+// ---------- AV-104: authority delegation ----------
+//
+// The initializer/taker may grant a bounded slice of their authority
+// to an operator key (scope bitmap: fund/release/cancel). The
+// delegation-aware authority checks sit behind
+// `require_scoped_authority` on the four core paths (fund, release,
+// cancel, cancel_expired).
+#[cfg(test)]
+mod delegation_tests {
+    use super::*;
+    use crate::discriminator::{decode_vault_account, vault_account_discriminator};
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const OPERATOR: [u8; 32] = [0x0D; 32]; // delegated operator
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn funded() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        e
+    }
+
+    fn full_scopes() -> u32 {
+        DELEGATION_SCOPE_FUND | DELEGATION_SCOPE_RELEASE | DELEGATION_SCOPE_CANCEL
+    }
+
+    #[test]
+    fn grant_requires_a_party() {
+        let mut e = funded();
+        // A stranger cannot grant — and cannot sub-delegate from
+        // nothing.
+        assert_eq!(
+            e.delegate_authority(MALLORY, OPERATOR, full_scopes()),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.delegation(), None, "failed grant stores nothing");
+        // Either party may grant.
+        e.delegate_authority(ALICE, OPERATOR, full_scopes()).unwrap();
+        assert_eq!(
+            e.delegation(),
+            Some(Delegation::new(OPERATOR, full_scopes()))
+        );
+        let mut e2 = funded();
+        e2.delegate_authority(BOB, OPERATOR, DELEGATION_SCOPE_RELEASE)
+            .unwrap();
+        assert_eq!(
+            e2.delegation().unwrap().scopes(),
+            DELEGATION_SCOPE_RELEASE
+        );
+    }
+
+    #[test]
+    fn grant_rejects_zero_key_and_bad_scopes() {
+        let mut e = funded();
+        // Zero operator key: a grant to nowhere.
+        assert_eq!(
+            e.delegate_authority(ALICE, [0u8; 32], full_scopes()),
+            Err(EscrowError::InvalidDelegation)
+        );
+        // Empty bitmap: a grant of nothing.
+        assert_eq!(
+            e.delegate_authority(ALICE, OPERATOR, 0),
+            Err(EscrowError::InvalidDelegation)
+        );
+        // Unknown bits: a future scope smuggled into an old bitmap.
+        assert_eq!(
+            e.delegate_authority(ALICE, OPERATOR, full_scopes() | (1 << 7)),
+            Err(EscrowError::InvalidDelegation)
+        );
+        assert_eq!(EscrowError::InvalidDelegation.code(), 160);
+        assert_eq!(e.delegation(), None, "rejected grants store nothing");
+    }
+
+    #[test]
+    fn grant_rejects_terminal_states() {
+        let mut e = funded();
+        e.cancel(ALICE, None, ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.delegate_authority(ALICE, OPERATOR, full_scopes()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.revoke_delegation(ALICE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn grant_is_idempotent_and_overwrites() {
+        let mut e = funded();
+        e.delegate_authority(ALICE, OPERATOR, DELEGATION_SCOPE_FUND)
+            .unwrap();
+        // Identical re-grant: no-op success.
+        e.delegate_authority(ALICE, OPERATOR, DELEGATION_SCOPE_FUND)
+            .unwrap();
+        assert_eq!(
+            e.delegation().unwrap().scopes(),
+            DELEGATION_SCOPE_FUND
+        );
+        // A later grant wins — the single slot is overwritten, so a
+        // compromised operator is cut off by one new grant.
+        e.delegate_authority(ALICE, MALLORY, DELEGATION_SCOPE_CANCEL)
+            .unwrap();
+        let grant = e.delegation().unwrap();
+        assert_eq!(grant.delegate(), MALLORY);
+        assert_eq!(grant.scopes(), DELEGATION_SCOPE_CANCEL);
+    }
+
+    #[test]
+    fn revoke_needs_a_live_grant_and_either_party() {
+        let mut e = funded();
+        assert_eq!(
+            e.revoke_delegation(ALICE),
+            Err(EscrowError::InvalidDelegation)
+        );
+        assert_eq!(
+            e.revoke_delegation(MALLORY),
+            Err(EscrowError::Unauthorized),
+            "a stranger cannot revoke either"
+        );
+        e.delegate_authority(ALICE, OPERATOR, full_scopes()).unwrap();
+        // The taker can cut off an initializer-appointed operator.
+        e.revoke_delegation(BOB).unwrap();
+        assert_eq!(e.delegation(), None);
+        assert_eq!(
+            e.revoke_delegation(ALICE),
+            Err(EscrowError::InvalidDelegation),
+            "double revoke fails"
+        );
+    }
+
+    #[test]
+    fn operator_funds_with_fund_scope() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.delegate_authority(ALICE, OPERATOR, DELEGATION_SCOPE_FUND)
+            .unwrap();
+        e.fund(OPERATOR, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn operator_cannot_act_outside_scope() {
+        let mut e = funded();
+        e.delegate_authority(ALICE, OPERATOR, DELEGATION_SCOPE_RELEASE)
+            .unwrap();
+        // Out-of-scope calls fail with the pre-existing Unauthorized —
+        // not the new InvalidDelegation code.
+        assert_eq!(
+            e.fund(OPERATOR, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.cancel(OPERATOR, None, ALICE),
+            Err(EscrowError::Unauthorized)
+        );
+        // In-scope: the release goes through to the pinned taker.
+        let (payout, fee) = e.release(OPERATOR, NOW, 400_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.released_amount(), 400_000);
+    }
+
+    #[test]
+    fn operator_cancels_with_cancel_scope() {
+        let mut e = funded();
+        e.delegate_authority(ALICE, OPERATOR, DELEGATION_SCOPE_CANCEL)
+            .unwrap();
+        e.cancel(OPERATOR, None, ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+
+        // cancel_expired through the operator: the refund still goes
+        // to the pinned destination and the operator pays no taker
+        // penalty.
+        let mut e2 = Escrow::initialize(ALICE, BOB, 1_000_000, NOW - 100).unwrap();
+        e2.fund(ALICE, NOW - 200).unwrap();
+        e2.delegate_authority(BOB, OPERATOR, DELEGATION_SCOPE_CANCEL)
+            .unwrap();
+        let (refund, penalty) = e2.cancel_expired(OPERATOR, NOW, None, ALICE).unwrap();
+        assert_eq!(e2.state(), EscrowState::Cancelled);
+        assert_eq!((refund, penalty), (1_000_000, 0));
+    }
+
+    #[test]
+    fn pause_blocks_grant_and_delegated_paths() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap();
+        e.pause(ALICE).unwrap();
+        // The pause gate runs before the authority check (AV-46).
+        assert_eq!(
+            e.delegate_authority(ALICE, OPERATOR, full_scopes()),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            e.revoke_delegation(ALICE),
+            Err(EscrowError::Paused)
+        );
+        e.unpause(ALICE).unwrap();
+        e.delegate_authority(ALICE, OPERATOR, DELEGATION_SCOPE_FUND)
+            .unwrap();
+        e.pause(ALICE).unwrap();
+        assert_eq!(e.fund(OPERATOR, NOW), Err(EscrowError::Paused));
+    }
+
+    #[test]
+    fn rotation_clears_the_grant() {
+        let mut e = funded();
+        e.delegate_authority(ALICE, OPERATOR, full_scopes()).unwrap();
+        e.rotate_taker(ALICE, BOB, MALLORY).unwrap();
+        assert_eq!(e.delegation(), None, "taker rotation clears the grant");
+        assert_eq!(
+            e.release(MALLORY, NOW, 100, None, MALLORY),
+            Err(EscrowError::Unauthorized),
+            "the old operator is cut off"
+        );
+
+        let mut e2 = funded();
+        e2.delegate_authority(BOB, OPERATOR, full_scopes()).unwrap();
+        e2.rotate_initializer(ALICE, BOB, MALLORY).unwrap();
+        assert_eq!(
+            e2.delegation(),
+            None,
+            "initializer rotation clears the grant"
+        );
+    }
+
+    #[test]
+    fn effective_role_reports_party_first() {
+        let mut e = funded();
+        assert_eq!(e.effective_role(ALICE), Some(DelegatedRole::Initializer));
+        assert_eq!(e.effective_role(BOB), Some(DelegatedRole::Taker));
+        assert_eq!(e.effective_role(MALLORY), None);
+        e.delegate_authority(ALICE, OPERATOR, full_scopes()).unwrap();
+        assert_eq!(
+            e.effective_role(OPERATOR),
+            Some(DelegatedRole::Operator(full_scopes()))
+        );
+        // A party that also holds a grant still reports as the party.
+        e.delegate_authority(ALICE, BOB, DELEGATION_SCOPE_FUND).unwrap();
+        assert_eq!(e.effective_role(BOB), Some(DelegatedRole::Taker));
+    }
+
+    #[test]
+    fn grant_round_trips_through_encode_decode() {
+        let mut e = funded();
+        e.delegate_authority(ALICE, OPERATOR, full_scopes()).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), super::ESCROW_BODY_LEN);
+        // The grant sits in the trailing 37 bytes: 1-byte Some
+        // discriminant, the 32-byte operator key, the u32 bitmap.
+        let tail = &bytes[super::ESCROW_BODY_LEN - DELEGATION_LEN..];
+        assert_eq!(tail[0], 1, "Some discriminant");
+        assert_eq!(&tail[1..33], &OPERATOR);
+        assert_eq!(
+            u32::from_le_bytes(tail[33..37].try_into().unwrap()),
+            full_scopes()
+        );
+        let mut account = vec![0u8; 8 + super::ESCROW_BODY_LEN];
+        account[..8].copy_from_slice(&vault_account_discriminator());
+        account[8..].copy_from_slice(&bytes);
+        let decoded = decode_vault_account(&account).unwrap();
+        assert_eq!(decoded.delegation(), Some(Delegation::new(OPERATOR, full_scopes())));
+        // A grant-less escrow still decodes with a zeroed tail.
+        let plain = funded();
+        let plain_bytes = super::account_space_tests::encode_escrow(&plain);
+        assert_eq!(
+            &plain_bytes[super::ESCROW_BODY_LEN - DELEGATION_LEN..],
+            &[0u8; DELEGATION_LEN]
+        );
+        let mut account = vec![0u8; 8 + super::ESCROW_BODY_LEN];
+        account[..8].copy_from_slice(&vault_account_discriminator());
+        account[8..].copy_from_slice(&plain_bytes);
+        assert_eq!(decode_vault_account(&account).unwrap().delegation(), None);
+    }
+
+    #[test]
+    fn indexed_wrapper_emits_grant_and_revoke_events() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xF1; 32], NOW)
+            .unwrap();
+        let before = e.event_count();
+        e.delegate_authority(ALICE, OPERATOR, full_scopes(), NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().expect("grant event");
+        assert_eq!(ev.kind, EscrowEventKind::DelegationGranted);
+        assert_eq!((ev.from, ev.to), (EscrowState::Uninitialized, EscrowState::Uninitialized));
+        assert_eq!(ev.caller, None, "caller is only set for permissionless cranks");
+        // Identical re-grant: no-op, no event.
+        e.delegate_authority(ALICE, OPERATOR, full_scopes(), NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op re-grant emits nothing");
+        e.revoke_delegation(BOB, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 2);
+        let ev = e.events().last().expect("revoke event");
+        assert_eq!(ev.kind, EscrowEventKind::DelegationRevoked);
+        assert_eq!((ev.from, ev.to), (EscrowState::Uninitialized, EscrowState::Uninitialized));
+        assert_eq!(ev.caller, None, "caller is only set for permissionless cranks");
+    }
+
+    #[test]
+    fn scope_bits_and_validation() {
+        assert_eq!(DELEGATION_SCOPE_FUND, 1);
+        assert_eq!(DELEGATION_SCOPE_RELEASE, 2);
+        assert_eq!(DELEGATION_SCOPE_CANCEL, 4);
+        assert_eq!(DELEGATION_SCOPE_MASK, 0b111);
+        assert_eq!(DELEGATION_LEN, 37);
+        assert!(validate_delegation_scopes(DELEGATION_SCOPE_FUND));
+        assert!(validate_delegation_scopes(full_scopes()));
+        assert!(!validate_delegation_scopes(0));
+        assert!(!validate_delegation_scopes(1 << 7));
+        let grant = Delegation::new(OPERATOR, full_scopes());
+        assert!(grant.covers(DELEGATION_SCOPE_FUND));
+        assert!(grant.covers(DELEGATION_SCOPE_RELEASE));
+        assert!(grant.covers(DELEGATION_SCOPE_CANCEL));
+        let narrow = Delegation::new(OPERATOR, DELEGATION_SCOPE_CANCEL);
+        assert!(!narrow.covers(DELEGATION_SCOPE_FUND));
+        assert!(narrow.covers(DELEGATION_SCOPE_CANCEL));
     }
 }

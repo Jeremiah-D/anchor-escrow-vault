@@ -94,6 +94,7 @@ impl ArrayElem {
 enum IdlType {
     U8,
     U16,
+    U32,
     U64,
     Bool,
     PublicKey,
@@ -111,6 +112,7 @@ impl IdlType {
         match self {
             IdlType::U8 => 1,
             IdlType::U16 => 2,
+            IdlType::U32 => 4,
             IdlType::U64 => 8,
             IdlType::Bool => 1,
             IdlType::PublicKey => 32,
@@ -129,6 +131,7 @@ impl IdlType {
         match self {
             IdlType::U8 => w.str_lit("u8"),
             IdlType::U16 => w.str_lit("u16"),
+            IdlType::U32 => w.str_lit("u32"),
             IdlType::U64 => w.str_lit("u64"),
             IdlType::Bool => w.str_lit("bool"),
             IdlType::PublicKey => w.str_lit("publicKey"),
@@ -186,6 +189,9 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         // AV-97: opt-in Dutch-auction settlement terms (the
         // descending-price pull path for the taker).
         "Option<DutchAuction>" => IdlType::Option(Box::new(IdlType::Named("DutchAuction"))),
+        // AV-104: the delegated operator grant (operator key + scope
+        // bitmap; the `Option` discriminant rides the vault field).
+        "Option<Delegation>" => IdlType::Option(Box::new(IdlType::Named("Delegation"))),
         // AV-83: opt-in CPI target-program allowlist.
         "Option<CpiAllowlist>" => IdlType::Option(Box::new(IdlType::Named("CpiAllowlist"))),
         // AV-84: opt-in multisig authority binding.
@@ -219,6 +225,8 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         "u64" => IdlType::U64,
         "u8" => IdlType::U8,
         "u16" => IdlType::U16,
+        // AV-104: the delegate_authority instruction's scope bitmap.
+        "u32" => IdlType::U32,
         "bool" => IdlType::Bool,
         "Pubkey" => IdlType::PublicKey,
         "String" => IdlType::Str,
@@ -328,6 +336,13 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
             ("start_at", IdlType::U64),
             ("end_at", IdlType::U64),
             ("reserve_bps", IdlType::U16),
+        ],
+        // Delegation { delegate: Pubkey, scopes: u32 } (AV-104): the
+        // operator grant — 36 bytes (the `Option` discriminant rides
+        // the vault field, not the named type).
+        "Delegation" => vec![
+            ("delegate", IdlType::PublicKey),
+            ("scopes", IdlType::U32),
         ],
         // BasketLeg { mint: Pubkey, amount: u64, released: u64 }
         // (AV-95): one leg of a multi-mint basket — 48 bytes.
@@ -656,6 +671,8 @@ fn render_idl_json() -> String {
         "PayoutDenylist",
         // AV-97: the Dutch-auction settlement terms type.
         "DutchAuction",
+        // AV-104: the delegated operator grant type.
+        "Delegation",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -816,6 +833,10 @@ fn named_type_sizes_pin_constants() {
     // AV-97: start_at u64 + end_at u64 + reserve_bps u16.
     assert_eq!(size("DutchAuction"), DUTCH_AUCTION_LEN);
     assert_eq!(size("DutchAuction"), 18);
+    // AV-104: 32-byte operator key + u32 scope bitmap (the `Option`
+    // discriminant rides the vault field, not the named type).
+    assert_eq!(size("Delegation"), DELEGATION_LEN - 1);
+    assert_eq!(size("Delegation"), 36);
     // AV-83: eight 32-byte program ids + count byte.
     assert_eq!(size("CpiAllowlist"), CPI_ALLOWLIST_LEN);
     // AV-84: 32-byte multisig program id + 32-byte authority PDA + u16
@@ -923,7 +944,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 60, "error variant count drift");
+    assert_eq!(errors.len(), 61, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -983,6 +1004,8 @@ fn idl_errors_pin_enum() {
     // AV-103: appended, never renumbered.
     assert_eq!(EscrowError::InvalidAppealBond.code(), 158);
     assert_eq!(EscrowError::AppealExpiryNotDue.code(), 159);
+    // AV-104: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidDelegation.code(), 160);
 }
 
 #[test]

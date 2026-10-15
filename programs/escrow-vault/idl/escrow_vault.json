@@ -697,6 +697,21 @@
       "args": [
         {"name": "rate", "type": "u64"}
       ]
+    },
+    {
+      "name": "delegate_authority",
+      "discriminator": [228, 17, 85, 163, 65, 139, 36, 206],
+      "accounts": [],
+      "args": [
+        {"name": "delegate", "type": "publicKey"},
+        {"name": "scopes", "type": "u32"}
+      ]
+    },
+    {
+      "name": "revoke_delegation",
+      "discriminator": [188, 92, 135, 67, 160, 181, 54, 62],
+      "accounts": [],
+      "args": []
     }
   ],
   "accounts": [
@@ -775,7 +790,8 @@
           {"name": "streaming_fee_rate", "type": "u64", "offset": 4546},
           {"name": "streaming_fees_accrued", "type": "u64", "offset": 4554},
           {"name": "appeal_bond", "type": "u64", "offset": 4562},
-          {"name": "appeal_bond_paid", "type": "u64", "offset": 4570}
+          {"name": "appeal_bond_paid", "type": "u64", "offset": 4570},
+          {"name": "delegation", "type": {"option": {"defined": "Delegation"}}, "offset": 4578}
         ]
       }
     }
@@ -982,6 +998,16 @@
           {"name": "reserve_bps", "type": "u16", "offset": 16}
         ]
       }
+    },
+    {
+      "name": "Delegation",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "delegate", "type": "publicKey", "offset": 0},
+          {"name": "scopes", "type": "u32", "offset": 32}
+        ]
+      }
     }
   ],
   "errors": [
@@ -1044,7 +1070,8 @@
     {"code": 156, "name": "AuctionNotActive"},
     {"code": 157, "name": "InvalidTransferHook"},
     {"code": 158, "name": "InvalidAppealBond"},
-    {"code": 159, "name": "AppealExpiryNotDue"}
+    {"code": 159, "name": "AppealExpiryNotDue"},
+    {"code": 160, "name": "InvalidDelegation"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

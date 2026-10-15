@@ -487,6 +487,11 @@ pub struct EscrowSnapshot {
     /// succeed at [`EscrowSnapshot::at`] — the keeper scan lists
     /// exactly these escrows for `expire_appeal`.
     pub appeal_expiry_eligible: bool,
+    /// AV-104: the live operator grant
+    /// ([`Escrow::delegate_authority`](crate::Escrow::delegate_authority))
+    /// as `(operator key, scope bitmap)` — `None` when no grant is
+    /// live, so indexers see who may act for the escrow.
+    pub delegation: Option<([u8; 32], u32)>,
 }
 
 /// AV-82: point-in-time, read-only view of the opt-in slash terms —
@@ -754,6 +759,9 @@ impl Escrow {
             appeal_bond: self.appeal_bond(),
             appeal_bond_paid: self.appeal_bond_paid(),
             appeal_expiry_eligible: self.is_appeal_expired(now),
+            // AV-104: the live operator grant, so the export shows who
+            // may act for the escrow and with what scope.
+            delegation: self.delegation().map(|g| (g.delegate(), g.scopes())),
         }
     }
 }
@@ -1272,6 +1280,20 @@ impl EscrowSnapshot {
         } else {
             "false"
         });
+        // AV-104: the live operator grant — null when no grant is
+        // live, otherwise the operator's hex key and the scope bitmap,
+        // so indexers see who may act for the escrow.
+        s.push_str(",\"delegation\":");
+        match self.delegation {
+            None => s.push_str("null"),
+            Some((operator, scopes)) => {
+                s.push_str("{\"operator\":\"");
+                s.push_str(&hex32(&operator));
+                s.push_str("\",\"scopes\":");
+                s.push_str(&scopes.to_string());
+                s.push('}');
+            }
+        }
         s.push('}');
         s
     }
@@ -1332,7 +1354,8 @@ mod snapshot_tests {
              \"max_extension_secs\":0,\"extension_count\":0,\"arbiter_panel\":null,\
              \"slash_terms\":null,\"penalty_paid\":0,\"slash_eligible\":false,\
              \"appeal_window_secs\":0,\"appeal_deadline\":0,\"appeal_state\":\"none\",\"appeal_eligible\":false,\
-             \"appeal_bond\":0,\"appeal_bond_paid\":0,\"appeal_expiry_eligible\":false\
+             \"appeal_bond\":0,\"appeal_bond_paid\":0,\"appeal_expiry_eligible\":false,\
+             \"delegation\":null\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),

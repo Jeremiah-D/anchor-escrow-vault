@@ -241,6 +241,8 @@
 //! | AppealFiled (AV-86) | 0 | 0 | 0 | 0 — the taker filed the appeal inside the window; no funds move (from == to == `Funded`) — with an AV-103 bond the taker locks the bond into `appeal_bond_paid` at filing (read from the vault, not the event) |
 //! | AppealResolved (AV-86) | the penalty refunded to the taker on overturn — a restitution, no fee — plus the refunded appeal bond (AV-103; the taker's full restitution) (0 on uphold; from == to == `Funded`) | 0 | 0 | the appeal bond forfeited to the initializer on uphold (AV-103; 0 when no bond was locked) |
 //! | AppealExpired (AV-103) | 0 | 0 | 0 | the appeal bond forfeited to the initializer when the window lapsed unresolved (0 when no bond was locked; from == to == `Funded`) |
+//! | DelegationGranted (AV-104) | 0 | 0 | 0 | 0 — the operator key and scope bitmap are read from the vault, the event is the ordering signal (actor = the granting party; from == to == the current state) |
+//! | DelegationRevoked (AV-104) | 0 | 0 | 0 | 0 — the grant is gone; the actor is the revoking party (from == to == the current state) |
 //!
 //! # Backward compatibility
 //!
@@ -705,6 +707,23 @@ pub enum EscrowEventKind {
     /// the sweep. Always emitted on success: a successful sweep always
     /// closes the appeal, so there is no no-op case.
     AppealExpired,
+    /// AV-104: an operator grant was created or replaced
+    /// ([`Escrow::delegate_authority`]). `from == to ==` the current
+    /// state (a config change, not a lifecycle move — like
+    /// [`EscrowEventKind::QuorumUpdated`]); the operator key and scope
+    /// bitmap are read from the vault, the event is the ordering
+    /// signal. The actor is the granting party. Emitted only on an
+    /// actual change: re-granting the identical (operator, scopes)
+    /// pair is an idempotent no-op that emits nothing (paralleling
+    /// [`EscrowEventKind::QuorumUpdated`]'s no-op rule).
+    DelegationGranted,
+    /// AV-104: the operator grant was revoked
+    /// ([`Escrow::revoke_delegation`]). `from == to ==` the current
+    /// state (a config change, not a lifecycle move — like
+    /// [`EscrowEventKind::DelegationGranted`]); the actor is the
+    /// revoking party. Always emitted on success: the call fails
+    /// unless a grant was live, so there is no no-op case.
+    DelegationRevoked,
 }
 
 impl EscrowEventKind {
@@ -828,6 +847,10 @@ impl EscrowEventKind {
             // AV-103: appended after DenylistUpdated so discriminants
             // 0–51 stay stable for already-serialized histories.
             52 => Self::AppealExpired,
+            // AV-104: appended after AppealExpired so discriminants
+            // 0–52 stay stable for already-serialized histories.
+            53 => Self::DelegationGranted,
+            54 => Self::DelegationRevoked,
             _ => return None,
         })
     }
@@ -889,6 +912,8 @@ impl EscrowEventKind {
             Self::BasketExpiredCancelled => "basket_expired_cancelled",
             Self::DenylistUpdated => "payout_denylist_updated",
             Self::AppealExpired => "appeal_expired",
+            Self::DelegationGranted => "delegation_granted",
+            Self::DelegationRevoked => "delegation_revoked",
         }
     }
 
@@ -951,6 +976,8 @@ impl EscrowEventKind {
             "basket_expired_cancelled" => Self::BasketExpiredCancelled,
             "payout_denylist_updated" => Self::DenylistUpdated,
             "appeal_expired" => Self::AppealExpired,
+            "delegation_granted" => Self::DelegationGranted,
+            "delegation_revoked" => Self::DelegationRevoked,
             _ => return None,
         })
     }
@@ -3976,6 +4003,71 @@ impl IndexedEscrow {
         Ok(forfeited)
     }
 
+    /// Grant an operator a bounded slice of the caller's authority
+    /// (AV-104; mirrors [`Escrow::delegate_authority`]). Emits
+    /// [`EscrowEventKind::DelegationGranted`] (`from == to ==` the
+    /// current state, amounts zero, actor = the granting party) on an
+    /// actual change; the identical re-grant is an idempotent no-op
+    /// that emits nothing (the inner machine's no-op rule). On
+    /// failure the state machine rolls back and nothing is emitted,
+    /// like every other failed transition. `at` is the caller-supplied
+    /// event timestamp.
+    ///
+    /// [`Escrow::delegate_authority`]: super::Escrow::delegate_authority
+    pub fn delegate_authority(
+        &mut self,
+        caller: [u8; 32],
+        delegate: [u8; 32],
+        scopes: u32,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.delegation();
+        self.inner.delegate_authority(caller, delegate, scopes)?;
+        if self.inner.delegation() != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::DelegationGranted,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                Some(caller),
+            );
+        }
+        Ok(())
+    }
+
+    /// Revoke the live operator grant (AV-104; mirrors
+    /// [`Escrow::revoke_delegation`]). Emits
+    /// [`EscrowEventKind::DelegationRevoked`] (`from == to ==` the
+    /// current state, amounts zero, actor = the revoking party).
+    /// Always emitted on success: the inner call fails unless a grant
+    /// was live, so there is no no-op case. `at` is the
+    /// caller-supplied event timestamp.
+    ///
+    /// [`Escrow::revoke_delegation`]: super::Escrow::revoke_delegation
+    pub fn revoke_delegation(&mut self, caller: [u8; 32], at: u64) -> Result<(), EscrowError> {
+        self.inner.revoke_delegation(caller)?;
+        let state = self.inner.state();
+        self.push_event(
+            EscrowEventKind::DelegationRevoked,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(caller),
+        );
+        Ok(())
+    }
+
     /// AV-81: wrap a freshly-split child escrow in its own event log.
     /// Replays the exact lifecycle the inner state machine ran —
     /// `Initialized` (seq 0, the per-escrow invariant), then
@@ -5767,7 +5859,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(53), None);
+        assert_eq!(EscrowEventKind::from_discriminant(55), None);
     }
 
     #[test]
@@ -5783,7 +5875,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(53), None);
+        assert_eq!(EscrowEventKind::from_discriminant(55), None);
     }
 
     #[test]
@@ -6320,7 +6412,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(53), None);
+        assert_eq!(EscrowEventKind::from_discriminant(55), None);
     }
 
     #[test]
@@ -6335,7 +6427,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(53), None);
+        assert_eq!(EscrowEventKind::from_discriminant(55), None);
     }
 
     #[test]
@@ -6347,7 +6439,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(53), None);
+        assert_eq!(EscrowEventKind::from_discriminant(55), None);
     }
 
     #[test]
@@ -6359,7 +6451,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(53), None);
+        assert_eq!(EscrowEventKind::from_discriminant(55), None);
     }
 
     #[test]
@@ -6371,7 +6463,37 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(53), None);
+        assert_eq!(EscrowEventKind::from_discriminant(55), None);
+    }
+
+    #[test]
+    fn delegation_granted_kind_round_trips() {
+        // AV-104: discriminant 53, appended after AppealExpired —
+        // 0–52 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::DelegationGranted;
+        assert_eq!(kind.discriminant(), 53);
+        assert_eq!(EscrowEventKind::from_discriminant(53), Some(kind));
+        assert_eq!(kind.name(), "delegation_granted");
+        assert_eq!(
+            EscrowEventKind::from_name("delegation_granted"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(55), None);
+    }
+
+    #[test]
+    fn delegation_revoked_kind_round_trips() {
+        // AV-104: discriminant 54, appended after DelegationGranted —
+        // 0–53 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::DelegationRevoked;
+        assert_eq!(kind.discriminant(), 54);
+        assert_eq!(EscrowEventKind::from_discriminant(54), Some(kind));
+        assert_eq!(kind.name(), "delegation_revoked");
+        assert_eq!(
+            EscrowEventKind::from_name("delegation_revoked"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(55), None);
     }
 
     #[test]
@@ -6383,7 +6505,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(53), None);
+        assert_eq!(EscrowEventKind::from_discriminant(55), None);
     }
 
     #[test]
@@ -6395,7 +6517,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(53), None);
+        assert_eq!(EscrowEventKind::from_discriminant(55), None);
     }
 
     #[test]

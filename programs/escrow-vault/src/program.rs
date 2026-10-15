@@ -3666,6 +3666,94 @@ pub mod escrow_vault {
         );
         Ok(settlement.total_net())
     }
+
+    /// Grant a bounded slice of the caller's authority to an operator
+    /// (AV-104; mirrors `Escrow::delegate_authority` — the Solana
+    /// "approve a delegate" pattern for transition rights). Only the
+    /// initializer or the taker may grant: a stranger is
+    /// `Unauthorized`, and the operator cannot sub-delegate (the grant
+    /// is a party power). `Uninitialized` / `Funded` only
+    /// (`InvalidStateTransition` otherwise); the zero operator key, an
+    /// empty scope bitmap, or scope bits outside
+    /// `escrow_state::DELEGATION_SCOPE_MASK` are `InvalidDelegation`
+    /// (code 160). The grant overwrites any previous grant (single
+    /// slot) and writes the 37-byte region in place — no realloc in
+    /// the real build. Emits `DelegationGranted` (from == to == the
+    /// current state) on an actual change; an identical re-grant is a
+    /// no-op success that emits nothing (the handler re-reads the
+    /// vault after the transition and skips the emit when the grant
+    /// is unchanged, mirroring `update_payout_allowlist`).
+    pub fn delegate_authority(
+        ctx: Context<DelegateAuthority>,
+        delegate: Pubkey,
+        scopes: u32,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.delegation();
+        escrow
+            .delegate_authority(
+                ctx.accounts.caller.key().to_bytes(),
+                delegate.to_bytes(),
+                scopes,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Writes `vault.delegation` in place in the real build
+        // (37 bytes, always reserved, zeroed when `None`).
+        if escrow.delegation() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::DelegationGranted,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// Revoke the live operator grant (AV-104; mirrors
+    /// `Escrow::revoke_delegation`). Either party may revoke — the
+    /// initializer can cut off a taker-appointed operator and vice
+    /// versa. `Uninitialized` / `Funded` only; no live grant is
+    /// `InvalidDelegation` (code 160). Clears the 37-byte delegation
+    /// region in place. Emits `DelegationRevoked` (from == to == the
+    /// current state).
+    pub fn revoke_delegation(ctx: Context<RevokeDelegation>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        escrow
+            .revoke_delegation(ctx.accounts.caller.key().to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Clears `vault.delegation` to `None` in the real build
+        // (in place — the 37-byte region is always reserved).
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::DelegationRevoked,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -4136,6 +4224,15 @@ pub struct Vault {
     /// `escrow_state`'s `streaming_fees_accrued`); the 8 bytes ride
     /// the same always-reserved region as `streaming_fee_rate`.
     pub streaming_fees_accrued: u64,
+    /// AV-104: the delegated operator grant (mirrors
+    /// `escrow_state`'s `delegation`); `None` when no grant is live.
+    /// The account always reserves the full 37-byte region (1-byte
+    /// discriminant + 32-byte operator key + 4-byte scope bitmap,
+    /// zeroed when `None`) so `delegate_authority` /
+    /// `revoke_delegation` write in place without reallocating.
+    /// Layout position matches `escrow_state::VAULT_FIELDS`
+    /// (appended last, after `appeal_bond_paid`).
+    pub delegation: Option<Delegation>,
 }
 
 /// Skeleton mirror of `escrow_state::SlashTerms`: the opt-in
@@ -4272,6 +4369,19 @@ pub struct DutchAuction {
     pub start_at: u64,
     pub end_at: u64,
     pub reserve_bps: u16,
+}
+
+/// AV-104: skeleton mirror of `escrow_state::Delegation`: the
+/// delegated operator's key plus the u32 scope bitmap (`1` = fund,
+/// `2` = release, `4` = cancel — see
+/// `escrow_state::DELEGATION_SCOPE_*`). Serialized size is pinned by
+/// `escrow_state::DELEGATION_LEN` (37 bytes: 1-byte `Option`
+/// discriminant + 32-byte operator key + 4-byte scope bitmap);
+/// `None` when no grant is live.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct Delegation {
+    pub delegate: Pubkey,
+    pub scopes: u32,
 }
 
 /// AV-83: skeleton mirror of `escrow_state::CpiAllowlist`: up to 8
@@ -5048,6 +5158,32 @@ pub struct CancelBasketAll<'info> {
     /// no whitelist), which the state machine resolves, so the
     /// anti-phishing pin holds by construction.
     pub refund_to: AccountInfo<'info>,
+}
+
+/// AV-104: grant a bounded slice of the caller's authority to an
+/// operator (mirrors `Escrow::delegate_authority`).
+#[derive(Accounts)]
+pub struct DelegateAuthority<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker; the state machine enforces
+    /// the party-only rule (a stranger — or the operator themselves —
+    /// is `Unauthorized`, so grants never sub-delegate). A constraint
+    /// in the real build additionally asserts `caller.key() ==
+    /// vault.initializer || caller.key() == vault.taker`.
+    pub caller: Signer<'info>,
+}
+
+/// AV-104: revoke the live operator grant (mirrors
+/// `Escrow::revoke_delegation`).
+#[derive(Accounts)]
+pub struct RevokeDelegation<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker may revoke (the state
+    /// machine enforces the party-only rule); a stranger is
+    /// `Unauthorized`.
+    pub caller: Signer<'info>,
 }
 
 #[derive(Accounts)]
@@ -6441,6 +6577,10 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::AppealExpiryNotDue => {
             error!(ErrorCode::AppealExpiryNotDue)
         }
+        // AV-104: appended, never renumbered.
+        escrow_state::EscrowError::InvalidDelegation => {
+            error!(ErrorCode::InvalidDelegation)
+        }
     }
 }
 
@@ -6560,4 +6700,6 @@ pub enum ErrorCode {
     InvalidAppealBond,
     #[msg("The appeal window has not lapsed yet (AV-103): expire_appeal with now <= appeal_deadline — the sweep only runs once the window is actually over")]
     AppealExpiryNotDue,
+    #[msg("Invalid authority-delegation request (AV-104): delegate_authority with a non-party grantor, a zero operator key, an empty scope bitmap, scope bits outside the mask, or on a non-Uninitialized/non-Funded escrow; or revoke_delegation with no grant to revoke")]
+    InvalidDelegation,
 }

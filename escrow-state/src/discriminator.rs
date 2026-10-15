@@ -38,10 +38,10 @@
 use super::{
     sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, CpiAllowlist,
     DefaultJudgment, DutchAuction, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
-    MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, QuorumPolicy,
+    Delegation, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, QuorumPolicy,
     SlashTerms, SubscriptionSchedule, VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
     APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
-    DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
+    DELEGATION_LEN, DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
     MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS,
     MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
     MILESTONE_PLAN_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN,
@@ -224,6 +224,11 @@ impl<'a> Cursor<'a> {
     fn u16_le(&mut self) -> Result<u16, AccountDecodeError> {
         let b = self.read(2)?;
         Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn u32_le(&mut self) -> Result<u32, AccountDecodeError> {
+        let b = self.read(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     fn u64_le(&mut self) -> Result<u64, AccountDecodeError> {
@@ -971,6 +976,27 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // / no appeal is in flight).
     let appeal_bond = c.u64_le()?;
     let appeal_bond_paid = c.u64_le()?;
+    // AV-104: the delegated operator grant, always reserved like
+    // `refund_to`: the `None` discriminant followed by the zeroed
+    // 36-byte grant region (32-byte operator key + u32 scope bitmap),
+    // appended last so every earlier offset above is unchanged. The
+    // bitmap is not validated here — an unknown bit is the grantor's
+    // problem, not a decode failure (mirroring the bitmask fields
+    // like `activation`); `Delegation::covers` rejects foreign bits
+    // at use time.
+    let delegation = if c.option_present("delegation")? {
+        let delegate = c.pubkey()?;
+        let scopes = c.u32_le()?;
+        debug_assert_eq!(
+            32 + 4,
+            DELEGATION_LEN - 1,
+            "delegation region drift vs DELEGATION_LEN"
+        );
+        Some(Delegation::new(delegate, scopes))
+    } else {
+        c.skip(DELEGATION_LEN - 1)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1141,6 +1167,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // the live one configured and locked.
         appeal_bond,
         appeal_bond_paid,
+        // AV-104: the delegated operator grant is persisted — a decoded
+        // escrow carries the same operator and scope bitmap the grant
+        // recorded, so the delegated authority checks decide identically
+        // after a decode.
+        delegation,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

@@ -101,6 +101,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `rotate_initializer(new_initializer)`      | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the initializer) | **both** the *current* initializer and the taker must sign (dual-signature governance — the mirror of `rotate_taker`; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (arbitration in flight adjudicates the initializer's identity — the refund goes to the initializer); zero address is `InvalidInitializer`; on an actual change the initializer's activation signature bit is cleared (the new key never signed activation); the AV-23 whitelist pins the refund destination when configured, otherwise refunds resolve to the new initializer (keeper/snapshot follow automatically); emits `InitializerRotated` only on an actual change |
 | `rotate_arbiter(new_arbiter)`                | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the arbiter) | **both** the *current* initializer and the *current* taker must sign (dual-signature governance — the mirror of `rotate_initializer` for the arbitration role; the arbiter itself does not sign, so a lost arbiter key cannot block its own replacement; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (no live dispute path left to referee, and arbitration in flight must settle with the referee that heard it); a configured panel is `InvalidStateTransition` too (single-arbiter governance only — rotate the panel via `initialize_arbiter_panel`); no arbiter configured or the zero address is `InvalidArbiter`; the activation bitmask is untouched (it tracks only the initializer and taker); the keeper's `resolve` listing and the snapshot export read the live arbiter field (follow automatically); emits `ArbiterRotated` only on an actual change |
 | `rotate_fee_recipient(new_recipient)`         | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the fee recipient) | **both** the *current* initializer and the *current* taker must sign (dual-signature governance — the mirror of `rotate_arbiter` for the fee-destination role; the fee recipient itself does not sign, so a lost fee-recipient key cannot block its own replacement; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (no future fee leg left to redirect, and the dispute settlement builders pin the fee leg to the configured recipient); no fee recipient configured or the zero address is `InvalidFeeRecipient` (code 123); the activation bitmask is untouched (it tracks only the initializer and taker); the keeper's fee listings and the snapshot export read the live `fee_recipient` field (follow automatically); emits `FeeRecipientRotated` only on an actual change |
+| `delegate_authority(caller, delegate, scopes)` (AV-104) | `Uninitialized`/`Funded` | — (no state change; writes the operator grant) | **initializer or taker** (party power — a stranger, or the operator themselves, is `Unauthorized`, so grants never sub-delegate); the zero operator key, an empty scope bitmap, or scope bits outside the mask (`1` fund / `2` release / `4` cancel) is `InvalidDelegation` (code 160); terminal states and `Disputed` are `InvalidStateTransition`; a later grant overwrites the earlier one (single slot); `rotate_initializer` / `rotate_taker` clear the grant (fail-closed — the new party never inherits the old party's operator); emits `DelegationGranted` only on an actual change (an identical re-grant is a no-op success that emits nothing) |
+| `revoke_delegation(caller)` (AV-104)         | `Uninitialized`/`Funded` | — (no state change; clears the operator grant) | **either** party may revoke — the initializer can cut off a taker-appointed operator and vice versa; a stranger is `Unauthorized`; no live grant is `InvalidDelegation` (code 160); emits `DelegationRevoked` |
 | `initialize_quorum(attestors, weights, threshold)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_extension(max_extension_secs)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding); zero bound is `InvalidExpiryExtension`; persists the extension budget (`max_extension_secs`, `extension_count` starts 0) |
@@ -112,8 +114,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_vesting(start, end, cliff)`     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `start < end`; `cliff` 0 = no cliff, else `cliff <= end`) |
 | `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); with an AV-97 Dutch auction attached, `claim` prices through the descending auction cap inside `[start_at, end_at]` instead of the vesting curve (`AuctionNotActive`, code 156, outside the window) — the gross lands in the same `released` counter and the initializer reclaims the remainder via `cancel` / `cancel_partial` |
 | `initialize_dutch_auction(start_at, end_at, reserve_bps)` (AV-97) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the descending-price settlement window: `start_at < end_at`, `reserve_bps` in 0–10000 — `InvalidAuctionParams`, code 155, otherwise); the taker's pull path becomes the auction cap `max(amount * (end_at - now) / (end_at - start_at), amount * reserve_bps / 10000)` inside the window — early claimers keep more, the `reserve_bps` floor is the initializer's guaranteed keep; mutually exclusive with the AV-13/AV-90 unlock paths (last-wins) and with dispute arbitration while the window is live (`escalate` is refused with `AuctionNotActive`, code 156) |
-| `fund(authority, now)`                      | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer (`now` <- clock sysvar, recorded as `fund_at` — the origin the AV-64 relative timelock measures from) |
-| `release(authority, now, amount, payout_to)` (AV-49)                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); cumulative releases ≤ locked amount; `payout_to` must satisfy the payout policy — the taker, or a member of the payout allowlist when one is configured (`PayoutNotAllowlisted` otherwise) |
+| `fund(authority, now)`                      | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer (`now` <- clock sysvar, recorded as `fund_at` — the origin the AV-64 relative timelock measures from); AV-104: a live FUND-scoped operator may call for the initializer instead (same checks, operator pays nothing — delegation covers transition rights only) |
+| `release(authority, now, amount, payout_to)` (AV-49)                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); AV-104: a live RELEASE-scoped operator may call for the initializer instead (all other gates identical; delegation covers transition rights only); cumulative releases ≤ locked amount; `payout_to` must satisfy the payout policy — the taker, or a member of the payout allowlist when one is configured (`PayoutNotAllowlisted` otherwise) |
 | `release_split(authority, now, amount, recipients, bps)` (AV-93) | `Funded` | `Funded` (partial) / `Released` (cumulative full) | initializer; the check order mirrors `release` — authority → state → mint → the share-table shape (non-empty, ≤ 8 recipients, no zero address, no zero weight, weights summing to exactly 10_000 bps — `InvalidReleaseSplit`, code 150, otherwise) → every recipient pinned against the AV-49 payout policy (`PayoutNotAllowlisted` otherwise; with no allowlist only the taker passes, so a multi-recipient split is the allowlist's declared distribution set) → milestones / subscription / quorum / timelock gates → amount math (`AmountMismatch` on 0, `ReleaseExceedsLocked` past the remainder); the AV-17 protocol fee is charged on the gross amount first, then the net splits — each leg `floor(net * bps / 10_000)`, the dust landing on the first recipient, so the legs sum to the net exactly; `released` accumulates the gross, so the conservation invariant is untouched; returns the `(recipient, net_share)` legs (sizing the program's transfers) plus the fee; emits `ReleasedSplit` with the legs stamped on the event |
 | `slash(authority, amount)` (AV-82) | `Funded` | `Funded` (no state change — the escrow stays live, the taker can still earn the remainder) | initializer **or** the configured arbiter (the neutral enforcer — one party's griefing cannot burn the other's stake); `now` <- clock sysvar; requires the AV-82 slash terms (`Uninitialized`-time opt-in), `now >= slash_deadline`, and the amount ≤ the slashable remainder (`amount - released - penalty_paid`); **one-shot** (a second slash is `SlashNotEligible`); `Disputed` is locked (`SlashNotEligible` — arbitration owns the funds) and milestone/subscription-scheduled escrows reject slash (the schedule owns the release path); on a dual-sig escrow both activation bits must be set; the slashed amount moves to the fixed penalty account and accumulates in `penalty_paid` (never in `released` — the audit trail distinguishes a default penalty from a taker payout); emits `Slashed` (`amounts.penalty` = the slashed amount) |
 | `initialize_basket(legs)` (AV-95) | `Uninitialized` | `Uninitialized` | initializer (once, before funding); `legs` is 1–8 `(mint, amount)` pairs — non-empty, no zero mint, no zero amount, no duplicate mint (one leg per mint), Σ fitting in `u64` (`InvalidBasket`, code 152, otherwise); the escrow-level `amount` becomes the Σ over the legs, so fleet aggregation, snapshots and the event fold keep their single-amount semantics |
@@ -127,8 +129,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_emergency_unlock()`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opts into dual-signed emergency timelock-unlock governance) |
 | `emergency_unlock(initializer, taker)`       | `Funded`       | `Funded` (no state change) | **both** parties must sign (dual-signature governance; one party alone is `Unauthorized`); requires the opt-in and an active timelock (`InvalidStateTransition` otherwise); clears the timelock (`timelock`, or the AV-64 relative lock) to `0` so payouts become immediately eligible — state and amounts untouched; emits `EmergencyUnlock` |
 | `initialize_decimals(decimals)`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `decimals` is the SPL mint's decimal places — SPL mints declare at most 9, `> 18` is rejected; `0` = no decimal metadata; display-only, never gates a transition or moves funds) |
-| `cancel(authority, refund_to)`               | `Funded`       | `Cancelled` | initializer; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise |
-| `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); the refund still goes to the whitelisted address even when the taker calls; returns `(refund, penalty)` — a taker-initiated cancel with `penalty_bps > 0` slices an anti-griefing penalty for the initializer (see below) |
+| `cancel(authority, refund_to)`               | `Funded`       | `Cancelled` | initializer; AV-104: a live CANCEL-scoped operator may call for the initializer instead (the `refund_to` pin is unchanged — delegation never reroutes funds); `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise |
+| `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); AV-104: a live CANCEL-scoped operator may also call (either party's grant — the refund routing is unchanged); the refund still goes to the whitelisted address even when the taker calls; returns `(refund, penalty)` — a taker-initiated cancel with `penalty_bps > 0` slices an anti-griefing penalty for the initializer (see below) |
 | `cancel_partial(authority, amount, refund_to)` (AV-60) | `Funded` | `Funded` (no state change) | initializer; Funded-only; the initializer's counterpart to AV-11's partial release — reclaims a tranche of the lockup instead of streaming it to the taker; `amount == 0` is `AmountMismatch`, `amount` above the still-locked remainder is `ReleaseExceedsLocked`; the `released` counter is untouched and the locked total shrinks; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise; quorum / timelock / vesting do **not** gate it (same as `cancel`); emits `PartiallyCancelled`; returns the refunded amount |
 | `crank_expired(caller, now)` (AV-48) | `Funded` | `Cancelled` | **anyone** — permissionless crank (Solana crank pattern), only when `now >= expires_at + grace_period`; no counterparty signature needed, so a keeper bot that is party to nothing can sweep timed-out vaults; the refund follows the same pinned refund policy (whitelisted address, or the initializer) — the cranker receives nothing (anti-MEV); a taker cranker still pays the anti-griefing penalty; rejected with `Paused` while the escrow is paused |
 | `initialize_payout_allowlist(allowlist)` (AV-49) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–4 live payout-destination addresses; empty / over-long / zero-address input is `InvalidPayoutAllowlist`); the payout policy gates every fund-moving transition's `payout_to` |
@@ -595,7 +597,7 @@ and `evidence_disclosure`. New vault fields (appended last):
 `evidence_root` (`Option<[u8; 32]>`, 33 bytes) + `evidence_leaves`
 (u8) + `evidence_disclosed` (u64, 8 bytes) — 42 bytes at the time,
 bringing the layout to 3978 bytes (the layout has since grown to
-4570 bytes / 4578 with the discriminator — see the account-space
+4607 bytes / 4615 with the discriminator — see the account-space
 paragraph below). Anchor
 surface: `escalate` gains the two params, plus the new
 `file_evidence` instruction (`doc_hash`, `leaf_index`,
@@ -1219,6 +1221,7 @@ program error per variant):
 | `InvalidTransferHook` | 157 | `with_transfer_hook` / `initialize_transfer_hook` (AV-99) with the zero program id, on a non-`Uninitialized` escrow, or before `with_mint` bound a mint (a transfer hook is a Token-2022 concept, meaningless on the native-SOL path) |
 | `InvalidAppealBond` | 158 | `with_appeal_bond` / `initialize_appeal_bond` (AV-103) with a zero bond (a zero bond is a no-op — the no-bond default already covers free filing) |
 | `AppealExpiryNotDue` | 159 | `expire_appeal` (AV-103) with `now <= appeal_deadline` — the permissionless sweep only runs once the window has actually lapsed |
+| `InvalidDelegation` | 160 | `delegate_authority` (AV-104) with a non-party grantor, a zero operator key, an empty scope bitmap, scope bits outside the mask, or on a non-`Uninitialized`/non-`Funded` escrow; or `revoke_delegation` with no grant to revoke (an operator calling outside their scope is the pre-existing `Unauthorized`, not this code) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2265,8 +2268,6 @@ two-way consistency check against the IDL parameter table:
 | appeal_deadline | u64 | 8 |
 | appeal_state | u8 (enum discriminant) | 1 |
 | appeal_ballot | AppealBallot | 9 |
-| appeal_bond | u64 | 8 |
-| appeal_bond_paid | u64 | 8 |
 | vesting_curve | Option<VestingCurve> | 82 |
 | evidence_root | Option<[u8; 32]> | 33 |
 | evidence_leaves | u8 | 1 |
@@ -2279,7 +2280,8 @@ two-way consistency check against the IDL parameter table:
 | streaming_fees_accrued | u64 | 8 |
 | appeal_bond | u64 | 8 |
 | appeal_bond_paid | u64 | 8 |
-| **total**     |                   | **4570** |
+| delegation | Option<Delegation> | 37 |
+| **total**     |                   | **4607** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2381,11 +2383,13 @@ basket is configured) — and the 130-byte payout-denylist region
 terms — `start_at` + `end_at` (u64) + `reserve_bps` (u16) — zeroed
 when no auction is configured) — and the 16-byte appeal-bond tail
 region (AV-103: `appeal_bond` + `appeal_bond_paid` (u64 each), zeroed
-when no bond was configured).
-`escrow-state` exposes `VAULT_SPACE` (4578) and
-`VAULT_SPACE_NO_QUORUM` (4088) for the Anchor `space =` constraint, plus a
+when no bond was configured) — and the 37-byte delegation region
+(AV-104: 1-byte discriminant + 32-byte operator key + 4-byte scope
+bitmap, zeroed when no grant is live).
+`escrow-state` exposes `VAULT_SPACE` (4615) and
+`VAULT_SPACE_NO_QUORUM` (4125) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **32,753,760 lamports** to be
+mainnet rent parameters the full vault needs **33,011,280 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -3040,6 +3044,49 @@ taker-received value is feeable, the AV-17 rule extended. The
 reserved in the vault layout, appended after the AV-99 hook
 region, so the opt-in writes in place without reallocating; the
 snapshot exports both fields.
+
+## Delegated authority (AV-104)
+
+The initializer or the taker may lend a bounded slice of their
+transition rights to an operator — the Solana "approve a delegate"
+pattern applied to escrow authority (e.g. a bot that funds vaults for
+the initializer, or a taker-side service that cancels expired escrows,
+without holding the party key). `delegate_authority(caller, delegate,
+scopes)` writes the grant (`Uninitialized` / `Funded` only); the scope
+bitmap is `1` = fund, `2` = release, `4` = cancel — a non-empty subset
+of the mask (zero operator key, empty bitmap, or bits outside the mask
+is `InvalidDelegation`, code 160). Only the two parties may grant or
+revoke — a stranger is `Unauthorized`, and the operator cannot
+sub-delegate; `revoke_delegation(caller)` may be called by either party
+(the initializer can cut off a taker-appointed operator and vice
+versa), and no live grant is `InvalidDelegation`. One grant slot: a
+later grant overwrites the earlier one, and `rotate_initializer` /
+`rotate_taker` clear the grant (fail-closed — the new party never
+inherits the old party's operator).
+
+The delegation check runs at the authority checkpoint, after the party
+themselves: `fund` / `release` / `cancel` / `cancel_expired` now accept
+"caller is the party, or caller is the live operator whose scope
+covers this path" (a paused escrow still fails fast with `Paused`, and
+the state/config checks run unchanged after authority). An operator
+calling outside their scope is the pre-existing `Unauthorized` — no
+new code. The pause (AV-46) authority is deliberately outside the
+delegation surface: the emergency brake stays party-only. The grant
+itself is `Some((operator, scopes))` in a 37-byte always-reserved tail
+region (1-byte discriminant + 32-byte operator key + 4-byte scope
+bitmap, zeroed when `None`), so grant/revoke write in place with no
+realloc; the snapshot exports it as `{"operator": <hex>, "scopes": n}`
+or `null`, and the `DelegationGranted` / `DelegationRevoked` events
+(53/54) carry from == to == the current state. Coverage is explicit:
+only the four core paths (`fund`, `release`, `cancel`,
+`cancel_expired`) honor the operator — milestone/subscription/claim
+payout paths, dispute and arbitration governance, and the basket
+settlements stay party-only. IDL: `delegate_authority(delegate:
+Pubkey, scopes: u32)` and `revoke_delegation()` with discriminators
+`sha256("global:delegate_authority")[..8]` /
+`sha256("global:revoke_delegation")[..8]`; the Anchor `Vault` gains
+`delegation: Option<Delegation>`, and `ErrorCode::InvalidDelegation`
+maps code 160.
 
 ## Basket escrow (AV-95)
 
