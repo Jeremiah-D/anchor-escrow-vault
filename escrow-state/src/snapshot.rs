@@ -323,6 +323,12 @@ pub struct EscrowSnapshot {
     /// Token-2022 transfer-hook program declared for this escrow, or
     /// `None` when no hook is bound (AV-99).
     pub transfer_hook: Option<[u8; 32]>,
+    /// Streaming fee rate in lamports per second of funded time
+    /// (AV-100); `0` when no streaming fee is configured.
+    pub streaming_fee_rate: u64,
+    /// Cumulative streaming fee already charged across all payouts
+    /// (AV-100).
+    pub streaming_fees_accrued: u64,
     /// Protocol fee rate in basis points (AV-17).
     pub fee_bps: u16,
     /// Cumulative protocol fee charged across all payouts (AV-17).
@@ -598,6 +604,8 @@ impl Escrow {
             arbiter: self.arbiter(),
             mint: self.mint(),
             transfer_hook: self.transfer_hook(),
+            streaming_fee_rate: self.streaming_fee_rate(),
+            streaming_fees_accrued: self.streaming_fees_accrued(),
             fee_bps: self.fee_bps(),
             fees_paid: self.fees_paid(),
             fee_recipient: self.fee_recipient(),
@@ -871,6 +879,13 @@ impl EscrowSnapshot {
         // lowercase hex or `null` — so indexers see the hook binding.
         s.push_str(",\"transfer_hook\":");
         write_opt_hex(&mut s, self.transfer_hook);
+        // AV-100: the streaming-fee rate and accrued counter — plain
+        // u64s, so indexers can track the fee schedule and its
+        // consumption.
+        s.push_str(",\"streaming_fee_rate\":");
+        s.push_str(&self.streaming_fee_rate.to_string());
+        s.push_str(",\"streaming_fees_accrued\":");
+        s.push_str(&self.streaming_fees_accrued.to_string());
         s.push_str(",\"fee_bps\":");
         s.push_str(&self.fee_bps.to_string());
         s.push_str(",\"fees_paid\":");
@@ -1270,7 +1285,7 @@ mod snapshot_tests {
              \"dual_sig\":{{\"required\":false,\"initializer_activated\":false,\"taker_activated\":false}},\
              \"quorum\":null,\
              \"vesting\":null,\"vesting_curve\":null,\"vested\":0,\"display_vested\":\"0\",\"claimable\":0,\"display_claimable\":\"0\",\
-             \"arbiter\":null,\"mint\":null,\"transfer_hook\":null,\
+             \"arbiter\":null,\"mint\":null,\"transfer_hook\":null,\"streaming_fee_rate\":0,\"streaming_fees_accrued\":0,\
              \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\

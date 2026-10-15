@@ -675,6 +675,14 @@
       "args": [
         {"name": "program_id", "type": {"array": ["u8", 32]}}
       ]
+    },
+    {
+      "name": "initialize_streaming_fee",
+      "discriminator": [233, 79, 136, 207, 103, 126, 38, 180],
+      "accounts": [],
+      "args": [
+        {"name": "rate", "type": "u64"}
+      ]
     }
   ],
   "accounts": [
@@ -749,7 +757,9 @@
           {"name": "basket", "type": {"option": {"defined": "BasketLegs"}}, "offset": 3978},
           {"name": "payout_denylist", "type": {"option": {"defined": "PayoutDenylist"}}, "offset": 4364},
           {"name": "auction", "type": {"option": {"defined": "DutchAuction"}}, "offset": 4494},
-          {"name": "transfer_hook", "type": {"option": {"array": ["u8", 32]}}, "offset": 4513}
+          {"name": "transfer_hook", "type": {"option": {"array": ["u8", 32]}}, "offset": 4513},
+          {"name": "streaming_fee_rate", "type": "u64", "offset": 4546},
+          {"name": "streaming_fees_accrued", "type": "u64", "offset": 4554}
         ]
       }
     }

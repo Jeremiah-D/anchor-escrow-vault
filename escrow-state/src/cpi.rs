@@ -1260,7 +1260,8 @@ mod cpi_tests {
 
     #[test]
     fn transfer_hook_persists_in_serialized_tail() {
-        // The hook program id rides the vault account tail (33 bytes:
+        // The hook program id rides the vault account layout just
+        // before the AV-100 streaming-fee region (33 bytes:
         // discriminant + program id), appended after the auction
         // region — earlier offsets unchanged.
         let hook = [0x77; 32];
@@ -1272,12 +1273,18 @@ mod cpi_tests {
             .unwrap();
         let bytes = crate::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), crate::ESCROW_BODY_LEN);
-        let tail = &bytes[crate::ESCROW_BODY_LEN - 33..];
-        assert_eq!(tail[0], 1, "Some discriminant");
-        assert_eq!(&tail[1..], &hook);
+        let hook_at = crate::ESCROW_BODY_LEN - crate::STREAMING_FEE_REGION_LEN - 33;
+        assert_eq!(bytes[hook_at], 1, "Some discriminant");
+        assert_eq!(&bytes[hook_at + 1..hook_at + 33], &hook);
         // A hook-less escrow zero-fills the region.
         let plain = Escrow::initialize(key(1), key(2), 1_000_000, u64::MAX).unwrap();
         let bytes = crate::account_space_tests::encode_escrow(&plain);
-        assert_eq!(&bytes[crate::ESCROW_BODY_LEN - 33..], &[0u8; 33]);
+        assert_eq!(&bytes[hook_at..hook_at + 33], &[0u8; 33]);
+        // The streaming-fee region trails the hook region, zeroed by
+        // default.
+        assert_eq!(
+            &bytes[crate::ESCROW_BODY_LEN - crate::STREAMING_FEE_REGION_LEN..],
+            &[0u8; 16]
+        );
     }
 }

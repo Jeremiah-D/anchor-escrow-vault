@@ -960,6 +960,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(PUBKEY_LEN)?;
         None
     };
+    // AV-100: the streaming-fee rate and accrued counter, always
+    // reserved (8 + 8 bytes, zeroed when no streaming fee is
+    // configured).
+    let streaming_fee_rate = c.u64_le()?;
+    let streaming_fees_accrued = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1120,6 +1125,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // decode so a decoded escrow gates CPI settlement plans on
         // the same hook binding the live one declared.
         transfer_hook,
+        // AV-100: the streaming-fee rate and accrued counter ride the
+        // decode so a decoded escrow bills the same accrual the live
+        // one would.
+        streaming_fee_rate,
+        streaming_fees_accrued,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

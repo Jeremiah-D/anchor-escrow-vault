@@ -593,7 +593,7 @@ and `evidence_disclosure`. New vault fields (appended last):
 `evidence_root` (`Option<[u8; 32]>`, 33 bytes) + `evidence_leaves`
 (u8) + `evidence_disclosed` (u64, 8 bytes) — 42 bytes at the time,
 bringing the layout to 3978 bytes (the layout has since grown to
-4538 bytes / 4546 with the discriminator — see the account-space
+4554 bytes / 4562 with the discriminator — see the account-space
 paragraph below). Anchor
 surface: `escalate` gains the two params, plus the new
 `file_evidence` instruction (`doc_hash`, `leaf_index`,
@@ -2209,7 +2209,9 @@ two-way consistency check against the IDL parameter table:
 | payout_denylist | Option<PayoutDenylist> | 130 |
 | auction | Option<DutchAuction> | 19 |
 | transfer_hook | Option<[u8; 32]> | 33 |
-| **total**     |                   | **4538** |
+| streaming_fee_rate | u64 | 8 |
+| streaming_fees_accrued | u64 | 8 |
+| **total**     |                   | **4554** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2310,10 +2312,10 @@ basket is configured) — and the 130-byte payout-denylist region
 19-byte Dutch-auction region (AV-97: 1-byte discriminant + 18-byte
 terms — `start_at` + `end_at` (u64) + `reserve_bps` (u16) — zeroed
 when no auction is configured).
-`escrow-state` exposes `VAULT_SPACE` (4546) and
-`VAULT_SPACE_NO_QUORUM` (4056) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (4562) and
+`VAULT_SPACE_NO_QUORUM` (4072) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **32,531,040 lamports** to be
+mainnet rent parameters the full vault needs **32,642,400 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -2919,6 +2921,40 @@ CPI builder can append them to the transfer instruction. The plans
 never assert on-chain hook execution — only that the declared
 binding and the plan agree. Indexers see the binding in the state
 snapshot (`"transfer_hook"` as 64-char hex or `null`).
+
+## Streaming fee on funded time (AV-100)
+
+A flat bps fee prices the *size* of a payout; the streaming fee
+prices *time* — compensation for capital locked while the deal
+sits funded. An escrow opts in via
+`with_streaming_fee(rate)` (or the `initialize_streaming_fee`
+instruction), `Uninitialized` only: `rate` is lamports (or
+base-token units) per second of funded time, and any u64 is legal
+(`0`, the default, disables the fee — like `fee_bps` — so no new
+error code exists; the u128 accrual math cannot overflow).
+Accrual starts at `fund_at` and runs only while the escrow is
+`Funded`: a dispute freezes the clock at `disputed_at`, so the
+taker never pays for arbitration time. Every taker payout
+(`release` / `release_split` / `claim` / `release_milestone` /
+`release_period` / `release_basket` / the taker's share of
+`resolve` / `submit_panel_judgment` / `trigger_default_judgment`)
+deducts the newly accrued slice —
+`rate * (accrue_upto - fund_at) - streaming_fees_accrued`
+(saturating), capped at the payout's post-bps-fee remainder so the
+fee never eats principal — and routes it to the fee leg. The
+deduction order is fixed: the AV-17 bps fee slices the gross
+first, the streaming fee slices the remainder, and the returned
+`fee` folds both together (no new return shape). The charged
+amount accumulates in both `streaming_fees_accrued` (the running
+tab, so a later payout never re-bills time an earlier one already
+billed — and on a basket escrow the tab is shared across legs)
+and the unified `fees_paid` counter. Refunds (`cancel` /
+`cancel_expired`) never carry the streaming fee: only
+taker-received value is feeable, the AV-17 rule extended. The
+16-byte region (8-byte rate + 8-byte accrued counter) is always
+reserved in the vault layout, appended after the AV-99 hook
+region, so the opt-in writes in place without reallocating; the
+snapshot exports both fields.
 
 ## Basket escrow (AV-95)
 

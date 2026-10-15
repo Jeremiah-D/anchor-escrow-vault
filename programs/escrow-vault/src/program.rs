@@ -989,6 +989,29 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to a streaming fee on funded time (AV-100; mirrors
+    /// `Escrow::with_streaming_fee`). `Uninitialized` only, like
+    /// `initialize_transfer_hook`: the rate is fixed before funds
+    /// move. Any u64 rate is legal (`0` disables the fee). After
+    /// this, every taker payout deducts the newly accrued slice
+    /// (`rate * (accrue_upto - fund_at) - streaming_fees_accrued`,
+    /// saturating, capped at the payout's post-bps-fee remainder)
+    /// into the fee leg, folding into the returned `fee` alongside
+    /// the AV-17 bps fee; accrual freezes at `disputed_at` once
+    /// disputed. The vault account already reserves the 16-byte
+    /// region (zeroed when no fee is configured), so the rate is
+    /// written in place — no realloc needed in the real build.
+    /// Emits no event (pre-fund configuration, like
+    /// `initialize_transfer_hook`).
+    pub fn initialize_streaming_fee(ctx: Context<InitializeStreamingFee>, rate: u64) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_streaming_fee(rate)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
     /// Claim the vested-but-unreleased portion (AV-13; mirrors
     /// `Escrow::claim`). Only the taker may call this; `now` comes from
     /// the Solana clock sysvar (never an instruction param — a
@@ -4026,6 +4049,18 @@ pub struct Vault {
     /// without reallocating. Layout position matches
     /// `escrow_state::VAULT_FIELDS` (appended last, after `auction`).
     pub transfer_hook: Option<[u8; 32]>,
+    /// AV-100: streaming fee rate in lamports per second of funded
+    /// time (mirrors `escrow_state`'s `streaming_fee_rate`); `0`
+    /// disables the fee. The account always reserves the 8 bytes so
+    /// `initialize_streaming_fee` writes in place without
+    /// reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `transfer_hook`).
+    pub streaming_fee_rate: u64,
+    /// AV-100: cumulative streaming fee already charged (mirrors
+    /// `escrow_state`'s `streaming_fees_accrued`); the 8 bytes ride
+    /// the same always-reserved region as `streaming_fee_rate`.
+    pub streaming_fees_accrued: u64,
 }
 
 /// Skeleton mirror of `escrow_state::SlashTerms`: the opt-in
@@ -5089,6 +5124,19 @@ pub struct InitializeTransferHook<'info> {
     /// `Uninitialized`, the zero program id, and a declaration before
     /// `initialize_mint` bound a mint (`InvalidTransferHook`, code
     /// 157).
+    pub initializer: Signer<'info>,
+}
+
+/// AV-100: accounts for `initialize_streaming_fee` — same shape as
+/// `InitializeTransferHook`: only the initializer fixes the rate.
+#[derive(Accounts)]
+pub struct InitializeStreamingFee<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer fixes the streaming-fee rate; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized` (`InvalidStateTransition`). Any u64 rate is
+    /// legal — `0` disables the fee.
     pub initializer: Signer<'info>,
 }
 
