@@ -328,6 +328,10 @@ pub use batch_close::{
 // multisig/CLI-ready deterministic JSON. Purely additive and read-only.
 pub use execution_bundle::{
     bundle_execution, BundledAccount, BundledAction, ExecutionBundle,
+    // AV-98: opt-in Jito tip on execution bundles + keeper-report tip
+    // annotation — validated config, built instruction, range-checked
+    // errors. Purely additive and off-chain.
+    JitoTip, JitoTipConfig, TipConfigError,
 };
 
 // AV-71: signable transaction-message serialization for keeper

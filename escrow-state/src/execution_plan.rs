@@ -429,6 +429,8 @@ mod execution_plan_tests {
             at: MID,
             scanned: actions.len(),
             actions,
+            // AV-98: execution-plan tests never stamp a tip.
+            jito_tip: None,
         }
     }
 

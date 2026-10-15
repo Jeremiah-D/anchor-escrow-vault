@@ -1831,6 +1831,14 @@ lowercase hex). Every action also carries `decimals` (the escrow's token
 decimal metadata, `0` when none is declared) and `display_amount` — the
 same `amount` rendered in human units (`500000` at 6 decimals →
 `"0.500000"`); the instruction itself always moves the raw `amount`.
+Opt-in Jito tip (AV-98): `KeeperReport::with_jito_tip(lamports,
+recipient)` annotates the report with the operator's intended tip —
+`"jito_tip":{"lamports":N,"recipient":"…"}` (`null` when unstamped) —
+so the dry-run preview shows the tip line. The report only carries the
+amount + recipient; the tip instruction itself is assembled when the
+execution bundle is stamped (the payer is the operator's key, not any
+single action's caller), and the tip always comes out of the operator's
+own pocket, never out of escrowed funds.
 
 ```json
 {"at":1750000000,"scanned":1,"actions":[
@@ -2661,8 +2669,8 @@ consume directly.
   `Fund → "fund"`, `Release → "release"` (checked at implementation —
   no drift between the batch kinds and the IDL instruction names).
 - **JSON shape**: each bundle is self-contained —
-  `{"bundle_id","mint","caller","caller_role","actions","action_count",
-  "alt_table","at","scanned"}`. Actions carry `escrow_id`,
+  `{"bundle_id","mint","caller","caller_role","actions","jito_tip","action_count",
+  "alt_table","at","scanned","estimated_priority_fee"}`. Actions carry `escrow_id`,
   `instruction`, `discriminator` (16-char hex), `args` (per-kind:
   `initialize` → `taker`/`amount`/`expires_at`; `fund` → `amount`
   only, since the program takes no instruction args; `release` →
@@ -2673,6 +2681,23 @@ consume directly.
 - **Failure isolation**: vault sets are disjoint across bundles — a
   failing bundle is retried alone, the others stand. Dry-run by
   construction: the bundler only reads the report.
+- **Opt-in Jito tip (AV-98)**: `ExecutionBundle::with_jito_tip(lamports,
+  recipient)` stamps a tip onto the bundle for Jito bundle submission.
+  The tip instruction is built with the AV-31 `system_transfer` byte
+  constructor (`caller → recipient`, 12-byte transfer encoding) and
+  renders in the JSON after the `actions` array — `"jito_tip":
+  {"lamports":N,"recipient":"…","instruction":{"program_id":"…",
+  "accounts":[…],"data":"…"}}` (`null` when unstamped). Jito
+  convention: the tip instruction goes **last** in the transaction, after
+  every escrow instruction, so a partially executed transaction never pays
+  the tip without doing the work. Range-checked: zero amount, zero
+  recipient, zero payer, or recipient == caller all return
+  `TipConfigError` and leave the bundle untouched. The tip is bundle
+  overhead, not an escrow action — `action_count` excludes it — and it is
+  paid by the bundle's signing caller (the operator), never from escrowed
+  funds. The keeper report annotates the intended tip amount + recipient
+  (`KeeperReport::with_jito_tip`) so the dry-run preview shows the tip
+  line before any instruction is built.
 - **Relation to AV-33**: the same idea as the batch settlement
   execution plan, applied to the proactive lifecycle line instead of
   the keeper report's reactive exits. Same grouping, same

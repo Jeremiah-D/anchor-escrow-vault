@@ -83,6 +83,7 @@
 //! re-scans.
 
 use super::batch::{BatchAccount, BatchActionKind, BatchItemOutcome, BatchReport};
+use super::cpi::{system_transfer, TransferInstruction};
 use super::discriminator::instruction_discriminator;
 use super::priority_fee::PriorityFeeRecommendation;
 use std::collections::BTreeMap;
@@ -239,6 +240,153 @@ impl BundledAction {
     }
 }
 
+/// Render arbitrary bytes as lowercase hex.
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+/// AV-98: validation errors for the opt-in Jito tip attached to a
+/// keeper execution bundle. The backlog calls this "RangeError
+/// validation" — in Rust that is a `Result`: every constructor that
+/// takes a tip amount or recipient rejects degenerate input instead of
+/// building a worthless or dangerous instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TipConfigError {
+    /// The tip would move zero lamports — a no-op instruction that
+    /// still costs the submitter a signature.
+    ZeroTipAmount,
+    /// The tip recipient is the zero address — the lamports would be
+    /// burned.
+    ZeroRecipient,
+    /// The bundle's signing caller is the zero address — there is no
+    /// payer to debit (only reachable on a hand-built bundle; the scan
+    /// always stamps a real caller).
+    ZeroPayer,
+    /// The tip recipient is the bundle's own caller — a self-transfer
+    /// the system program would reject, and a sign the operator pasted
+    /// the wrong address.
+    TipRecipientIsPayer,
+}
+
+/// AV-98: the operator's Jito tip configuration — how much to pay and
+/// who receives it — before it is bound to a specific bundle payer.
+/// [`KeeperReport`](super::keeper::KeeperReport) carries this form:
+/// the report annotates the intended tip (`jito_tip`) without building
+/// the instruction, because the report's actions may name different
+/// callers while the payer is the operator's own key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitoTipConfig {
+    /// Tip in lamports. Always > 0 (see [`TipConfigError`]).
+    pub lamports: u64,
+    /// The Jito tip recipient — a Jito validator tip address the
+    /// operator pastes in. Never the zero address.
+    pub recipient: [u8; 32],
+}
+
+impl JitoTipConfig {
+    /// Validated constructor: rejects a zero amount and a zero
+    /// recipient.
+    pub fn new(lamports: u64, recipient: [u8; 32]) -> Result<Self, TipConfigError> {
+        if lamports == 0 {
+            return Err(TipConfigError::ZeroTipAmount);
+        }
+        if recipient == [0u8; 32] {
+            return Err(TipConfigError::ZeroRecipient);
+        }
+        Ok(JitoTipConfig { lamports, recipient })
+    }
+}
+
+/// AV-98: a Jito tip bound to one execution bundle — the validated
+/// config plus the fully assembled system-transfer instruction, built
+/// with [`system_transfer`](super::cpi::system_transfer) (the AV-31
+/// byte constructor: `u32` index `2` LE followed by the `u64` lamport
+/// amount LE, 12 bytes). The instruction moves `lamports` from the
+/// bundle's caller to the tip recipient.
+///
+/// Jito convention: the tip instruction goes **last** in the
+/// transaction — after every escrow instruction — so a partially
+/// executed transaction never pays the tip without doing the work.
+/// The bundle JSON renders it after the `actions` array for exactly
+/// that reason; the submitter appends it after the escrow instructions
+/// when assembling the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JitoTip {
+    /// The validated amount + recipient.
+    pub config: JitoTipConfig,
+    /// `system_transfer(caller, recipient, lamports)`: program id is
+    /// the system program, accounts are `[payer (signer, writable),
+    /// recipient (writable)]`, data is the 12-byte transfer encoding.
+    pub instruction: TransferInstruction,
+}
+
+impl JitoTip {
+    /// Validated constructor: the config checks plus payer checks
+    /// (nonzero, distinct from the recipient). `payer` is the bundle's
+    /// `caller` — the key that signs the whole bundle.
+    pub fn new(
+        payer: [u8; 32],
+        lamports: u64,
+        recipient: [u8; 32],
+    ) -> Result<Self, TipConfigError> {
+        let config = JitoTipConfig::new(lamports, recipient)?;
+        if payer == [0u8; 32] {
+            return Err(TipConfigError::ZeroPayer);
+        }
+        if recipient == payer {
+            return Err(TipConfigError::TipRecipientIsPayer);
+        }
+        // Every `system_transfer` precondition holds by construction
+        // (nonzero amount, nonzero distinct addresses), so this cannot
+        // fail — the expect documents the invariant, the way the
+        // bundle's other constructors guard hand-built inputs.
+        let instruction = system_transfer(payer, recipient, lamports)
+            .expect("jito tip: system_transfer preconditions validated above");
+        Ok(JitoTip { config, instruction })
+    }
+
+    /// The tip amount in lamports.
+    pub fn lamports(&self) -> u64 {
+        self.config.lamports
+    }
+
+    /// The tip recipient.
+    pub fn recipient(&self) -> [u8; 32] {
+        self.config.recipient
+    }
+}
+
+/// Render a [`TransferInstruction`] as deterministic JSON: program id
+/// as 64-char hex, accounts in order with signer/writable flags, data
+/// as lowercase hex.
+fn transfer_instruction_json(ix: &TransferInstruction) -> String {
+    let mut s = String::from("{\"program_id\":\"");
+    s.push_str(&hex32(&ix.program_id));
+    s.push_str("\",\"accounts\":[");
+    for (i, acc) in ix.accounts.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str("{\"pubkey\":\"");
+        s.push_str(&hex32(&acc.pubkey));
+        s.push_str("\",\"signer\":");
+        s.push_str(if acc.is_signer { "true" } else { "false" });
+        s.push_str(",\"writable\":");
+        s.push_str(if acc.is_writable { "true" } else { "false" });
+        s.push('}');
+    }
+    s.push_str("],\"data\":\"");
+    s.push_str(&hex_bytes(&ix.data));
+    s.push_str("\"}");
+    s
+}
+
 /// One atomicity bundle: actions sharing `(mint, caller)`, safe to
 /// submit as one signing session. Bundles are mutually independent —
 /// vault sets are disjoint by construction, so a failed bundle is
@@ -275,6 +423,13 @@ pub struct ExecutionBundle {
     /// the JSON renders it as `null` (the same `Option` convention as
     /// `mint`).
     pub estimated_priority_fee: Option<PriorityFeeRecommendation>,
+    /// AV-98: the opt-in Jito tip bound to this bundle ([`JitoTip`])
+    /// — `None` unless the keeper stamped one via
+    /// [`with_jito_tip`](ExecutionBundle::with_jito_tip). The tip
+    /// instruction is the bundle's last instruction at submit time;
+    /// it is bundle overhead, not an escrow action, so
+    /// [`action_count`](ExecutionBundle::action_count) excludes it.
+    pub jito_tip: Option<JitoTip>,
 }
 
 impl ExecutionBundle {
@@ -292,6 +447,27 @@ impl ExecutionBundle {
         self
     }
 
+    /// AV-98: stamp the opt-in Jito tip onto the bundle (builder
+    /// style — [`bundle_execution`] leaves it `None`). `payer` is the
+    /// bundle's `caller`: the system-transfer instruction debits the
+    /// signing key, so the tip comes out of the keeper operator's own
+    /// pocket, never out of escrowed funds.
+    ///
+    /// Validation (the backlog's "RangeError" checks): a zero amount,
+    /// a zero recipient, a zero payer, or a recipient equal to the
+    /// payer all return [`TipConfigError`] and leave the bundle
+    /// untouched — `with_jito_tip` takes `self` by value and only
+    /// assigns on success, so a failed stamp cannot half-apply.
+    pub fn with_jito_tip(
+        mut self,
+        lamports: u64,
+        recipient: [u8; 32],
+    ) -> Result<Self, TipConfigError> {
+        let tip = JitoTip::new(self.caller, lamports, recipient)?;
+        self.jito_tip = Some(tip);
+        Ok(self)
+    }
+
     /// Hand-serialized JSON (the crate is dependency-free). Deterministic
     /// field order; pubkeys are 64-char lowercase hex; `mint` is a hex
     /// string or `null`; discriminators are 16-char hex. The bundle is
@@ -307,6 +483,12 @@ impl ExecutionBundle {
     ///    "accounts":[{"pubkey":"01…","role":"vault",
     ///                 "signer":false,"writable":true,"alt_index":0}],
     ///    "reason":"not_created"}],
+    ///  "jito_tip":{"lamports":10000,"recipient":"ee…",
+    ///   "instruction":{"program_id":"00…","accounts":[
+    ///    {"pubkey":"aa…","signer":true,"writable":true},
+    ///    {"pubkey":"ee…","signer":false,"writable":true}],
+    ///   "data":"02000000…"}} — or `null` when unstamped (AV-98: the
+    ///  tip instruction goes last at submit time),
     ///  "action_count":1,"alt_table":["01…"],
     ///  "at":1750000000,"scanned":2,"estimated_priority_fee":
     ///  {"micro_lamports_per_cu":1200,"confidence":"high","fallback":false}}
@@ -371,7 +553,25 @@ impl ExecutionBundle {
             s.push_str(a.reason);
             s.push_str("\"}");
         }
-        s.push_str("],\"action_count\":");
+        // AV-98: the Jito tip, rendered after the escrow actions — at
+        // submit time the tip instruction is appended LAST, after every
+        // escrow instruction, so a partially executed transaction never
+        // pays the tip without doing the work. `null` when the keeper
+        // stamped nothing (same Option convention as `mint`).
+        s.push_str("],\"jito_tip\":");
+        match &self.jito_tip {
+            Some(tip) => {
+                s.push_str("{\"lamports\":");
+                s.push_str(&tip.config.lamports.to_string());
+                s.push_str(",\"recipient\":\"");
+                s.push_str(&hex32(&tip.config.recipient));
+                s.push_str("\",\"instruction\":");
+                s.push_str(&transfer_instruction_json(&tip.instruction));
+                s.push('}');
+            }
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"action_count\":");
         s.push_str(&self.action_count().to_string());
         s.push_str(",\"alt_table\":[");
         for (i, key) in self.alt_table.iter().enumerate() {
@@ -459,6 +659,9 @@ pub fn bundle_execution(report: &BatchReport) -> Vec<ExecutionBundle> {
             // AV-89: the keeper stamps its oracle recommendation via
             // `with_priority_fee` — the bundler itself stays fee-free.
             estimated_priority_fee: None,
+            // AV-98: the keeper stamps its Jito tip via `with_jito_tip`
+            // — the bundler itself stays tip-free.
+            jito_tip: None,
         })
         .collect()
 }
@@ -824,7 +1027,7 @@ mod execution_bundle_tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         let expected = format!(
-            "{{\"bundle_id\":\"bundle-0\",\"mint\":null,\"caller\":\"{}\",\"caller_role\":\"initializer\",\"actions\":[{{\"escrow_id\":\"{}\",\"instruction\":\"initialize\",\"discriminator\":\"{}\",\"caller_role\":\"initializer\",\"args\":{{\"taker\":\"{}\",\"amount\":1000000,\"expires_at\":1800000000}},\"accounts\":[{{\"pubkey\":\"{}\",\"role\":\"vault\",\"signer\":false,\"writable\":true,\"alt_index\":0}},{{\"pubkey\":\"{}\",\"role\":\"initializer\",\"signer\":true,\"writable\":true,\"alt_index\":null}}],\"reason\":\"not_created\"}}],\"action_count\":1,\"alt_table\":[\"{}\"],\"at\":1750000000,\"scanned\":1,\"estimated_priority_fee\":null}}",
+            "{{\"bundle_id\":\"bundle-0\",\"mint\":null,\"caller\":\"{}\",\"caller_role\":\"initializer\",\"actions\":[{{\"escrow_id\":\"{}\",\"instruction\":\"initialize\",\"discriminator\":\"{}\",\"caller_role\":\"initializer\",\"args\":{{\"taker\":\"{}\",\"amount\":1000000,\"expires_at\":1800000000}},\"accounts\":[{{\"pubkey\":\"{}\",\"role\":\"vault\",\"signer\":false,\"writable\":true,\"alt_index\":0}},{{\"pubkey\":\"{}\",\"role\":\"initializer\",\"signer\":true,\"writable\":true,\"alt_index\":null}}],\"reason\":\"not_created\"}}],\"jito_tip\":null,\"action_count\":1,\"alt_table\":[\"{}\"],\"at\":1750000000,\"scanned\":1,\"estimated_priority_fee\":null}}",
             hex_of(0xAA),
             hex_of(0x01),
             disc,
@@ -870,6 +1073,104 @@ mod execution_bundle_tests {
         assert_eq!(
             json.replace(&want, "\"estimated_priority_fee\":null"),
             unstamped
+        );
+    }
+
+    /// AV-98: the opt-in Jito tip on an execution bundle — the tip
+    /// instruction is built from the AV-31 system-transfer constructor,
+    /// renders after the escrow actions (it goes LAST at submit time),
+    /// and the keeper report annotates the tip amount + recipient.
+    #[test]
+    fn jito_tip_renders_after_actions_and_goes_last() {
+        let bundles = bundle_execution(&scan_batch_lifecycle(&[watch(ID1, None, ALICE)], NOW));
+        assert_eq!(bundles.len(), 1);
+        const TIP: u64 = 10_000;
+        const RECIPIENT: [u8; 32] = [0xE0; 32];
+        let stamped = bundles[0].clone().with_jito_tip(TIP, RECIPIENT).unwrap();
+        let tip = stamped.jito_tip.as_ref().unwrap();
+        // The assembled instruction: system program, payer -> recipient,
+        // 12-byte transfer encoding carrying the tip amount.
+        assert_eq!(tip.lamports(), TIP);
+        assert_eq!(tip.recipient(), RECIPIENT);
+        assert_eq!(tip.instruction.program_id, crate::cpi::system_program_id());
+        assert_eq!(tip.instruction.amount(), Some(TIP));
+        assert_eq!(tip.instruction.accounts.len(), 2);
+        assert_eq!(tip.instruction.accounts[0].pubkey, ALICE);
+        assert!(tip.instruction.accounts[0].is_signer);
+        assert_eq!(tip.instruction.accounts[1].pubkey, RECIPIENT);
+        assert!(!tip.instruction.accounts[1].is_signer);
+        // The tip is bundle overhead, not an escrow action.
+        assert_eq!(stamped.action_count(), 1);
+
+        let json = stamped.to_json();
+        // Rendered after the actions array (submit-time: last
+        // instruction), before action_count.
+        let tip_pos = json.find("\"jito_tip\"").unwrap();
+        let actions_end = json.find("\"action_count\"").unwrap();
+        let last_reason = json.rfind("\"reason\"").unwrap();
+        assert!(tip_pos > last_reason, "tip must render after every action: {json}");
+        assert!(tip_pos < actions_end, "tip must render before action_count: {json}");
+        let want = format!(
+            "\"jito_tip\":{{\"lamports\":10000,\"recipient\":\"{}\",\"instruction\":{{\"program_id\":\"{}\",\"accounts\":[{{\"pubkey\":\"{}\",\"signer\":true,\"writable\":true}},{{\"pubkey\":\"{}\",\"signer\":false,\"writable\":true}}],\"data\":\"02000000{}\"}}}},",
+            hex_of(0xE0),
+            hex_of(0x00),
+            hex_of(0xAA),
+            hex_of(0xE0),
+            // 10_000u64 LE, 8 bytes, after the 4-byte index prefix.
+            "1027000000000000",
+        );
+        assert!(json.contains(&want), "tip instruction JSON wrong: {json}");
+        // Deterministic: same stamp, same bytes; the stamp touches only
+        // the tip line.
+        assert_eq!(json, bundles[0].clone().with_jito_tip(TIP, RECIPIENT).unwrap().to_json());
+        let unstamped = bundles[0].to_json();
+        assert_eq!(json.replace(&want[..want.len() - 1], "\"jito_tip\":null"), unstamped);
+        // Unstamped bundles render null.
+        assert!(unstamped.contains("\"jito_tip\":null"), "missing null tip: {unstamped}");
+    }
+
+    #[test]
+    fn jito_tip_config_validation_rejects_degenerate_input() {
+        let bundles = bundle_execution(&scan_batch_lifecycle(&[watch(ID1, None, ALICE)], NOW));
+        let b = &bundles[0];
+        const RECIPIENT: [u8; 32] = [0xE0; 32];
+        // Zero amount: a no-op instruction that still costs a signature.
+        assert_eq!(
+            b.clone().with_jito_tip(0, RECIPIENT).unwrap_err(),
+            TipConfigError::ZeroTipAmount
+        );
+        // Zero recipient: the lamports would be burned.
+        assert_eq!(
+            b.clone().with_jito_tip(1_000, [0u8; 32]).unwrap_err(),
+            TipConfigError::ZeroRecipient
+        );
+        // Recipient == caller (the bundle's payer): a self-transfer the
+        // system program rejects.
+        assert_eq!(
+            b.clone().with_jito_tip(1_000, ALICE).unwrap_err(),
+            TipConfigError::TipRecipientIsPayer
+        );
+        // A failed stamp leaves the bundle untouched.
+        assert!(b.jito_tip.is_none());
+        // The report-level config carries the same validation.
+        assert_eq!(
+            JitoTipConfig::new(0, RECIPIENT).unwrap_err(),
+            TipConfigError::ZeroTipAmount
+        );
+        assert_eq!(
+            JitoTipConfig::new(1_000, [0u8; 32]).unwrap_err(),
+            TipConfigError::ZeroRecipient
+        );
+        let cfg = JitoTipConfig::new(1_000, RECIPIENT).unwrap();
+        assert_eq!(cfg.lamports, 1_000);
+        assert_eq!(cfg.recipient, RECIPIENT);
+        // Zero payer on a hand-built bundle (the scan always stamps a
+        // real caller).
+        let mut zero_caller = b.clone();
+        zero_caller.caller = [0u8; 32];
+        assert_eq!(
+            zero_caller.with_jito_tip(1_000, RECIPIENT).unwrap_err(),
+            TipConfigError::ZeroPayer
         );
     }
 }

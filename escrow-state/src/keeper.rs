@@ -169,6 +169,7 @@ use crate::{
 };
 use super::cpi::{AccountMeta, Pubkey};
 use super::discriminator::instruction_discriminator;
+use super::execution_bundle::{JitoTipConfig, TipConfigError};
 use super::tx_message::{
     compile_message, encode_base64, encode_message, ProgramInstruction, TxMessageError,
 };
@@ -451,6 +452,16 @@ pub struct KeeperReport {
     pub scanned: usize,
     /// Executable actions, in the input's order.
     pub actions: Vec<KeeperAction>,
+    /// AV-98: the operator's intended Jito tip for the bundles built
+    /// from this report — amount + recipient, annotated on the report
+    /// so the dry-run preview shows the tip line. The report does not
+    /// build the tip instruction (the report's actions may name
+    /// different callers; the payer is the operator's own key) — the
+    /// instruction is assembled when the execution bundle is stamped
+    /// ([`ExecutionBundle::with_jito_tip`](super::execution_bundle::ExecutionBundle::with_jito_tip)).
+    /// `None` unless stamped via
+    /// [`with_jito_tip`](KeeperReport::with_jito_tip).
+    pub jito_tip: Option<JitoTipConfig>,
 }
 
 impl KeeperReport {
@@ -469,12 +480,34 @@ impl KeeperReport {
             .fold(0u64, |a, b| a.saturating_add(b))
     }
 
+    /// AV-98: stamp the operator's intended Jito tip onto the report
+    /// (builder style — [`scan_keeper_actions`] leaves it `None`; the
+    /// keeper calls this before handing the report to the bundle
+    /// builder). The report annotates the tip amount + recipient; the
+    /// tip instruction itself is built at bundle-submit time, when the
+    /// payer key is known.
+    ///
+    /// Validation mirrors
+    /// [`JitoTipConfig::new`](super::execution_bundle::JitoTipConfig::new):
+    /// a zero amount or a zero recipient returns [`TipConfigError`]
+    /// and leaves the report untouched.
+    pub fn with_jito_tip(
+        mut self,
+        lamports: u64,
+        recipient: [u8; 32],
+    ) -> Result<Self, TipConfigError> {
+        self.jito_tip = Some(JitoTipConfig::new(lamports, recipient)?);
+        Ok(self)
+    }
+
     /// Hand-serialized JSON (the crate is dependency-free). Deterministic
     /// field order; keys are 64-char lowercase hex; `mint` is a hex
     /// string or `null`.
     ///
     /// ```json
-    /// {"at":1000000,"scanned":1,"total_estimated_cu":13814,"actions":[
+    /// {"at":1000000,"scanned":1,"total_estimated_cu":13814,
+    ///  "jito_tip":{"lamports":10000,"recipient":"ee…"},
+    ///  "actions":[
     ///   {"escrow_id":"...","vault_address":"...","action":"cancel_expired","caller":"...",
     ///    "caller_role":"initializer","mint":null,
     ///    "refund_to":"...","amount":1000000,"decimals":6,
@@ -499,6 +532,21 @@ impl KeeperReport {
         // estimate across the report's actions.
         s.push_str(",\"total_estimated_cu\":");
         s.push_str(&self.total_estimated_compute_units().to_string());
+        // AV-98: the operator's intended Jito tip for the bundles built
+        // from this report — the tip line of the dry-run preview.
+        // `null` when the operator stamped nothing (same Option
+        // convention as the bundle's `mint`).
+        s.push_str(",\"jito_tip\":");
+        match &self.jito_tip {
+            Some(tip) => {
+                s.push_str("{\"lamports\":");
+                s.push_str(&tip.lamports.to_string());
+                s.push_str(",\"recipient\":\"");
+                s.push_str(&hex32(&tip.recipient));
+                s.push_str("\"}");
+            }
+            None => s.push_str("null"),
+        }
         s.push_str(",\"actions\":[");
         for (i, a) in self.actions.iter().enumerate() {
             if i > 0 {
@@ -987,6 +1035,9 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         at: now,
         scanned: watched.len(),
         actions,
+        // AV-98: the operator stamps the intended Jito tip via
+        // `with_jito_tip` — the scan itself stays tip-free.
+        jito_tip: None,
     }
 }
 
@@ -1620,7 +1671,7 @@ mod keeper_tests {
         let report = scan_keeper_actions(&[], MID);
         assert!(report.is_empty());
         assert_eq!(report.scanned, 0);
-        assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"total_estimated_cu":0,"actions":[]}"#);
+        assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"total_estimated_cu":0,"jito_tip":null,"actions":[]}"#);
     }
 
     #[test]
@@ -2133,7 +2184,7 @@ mod keeper_tests {
         // 3 accounts, 8 data bytes, 1 signer →
         // 10_000 + 3_000 + 3×250 + 8×8 = 13_814 each; total 27_628.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}}]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}}]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -2158,12 +2209,47 @@ mod keeper_tests {
         // AV-88: claim with mint, no refund_to: 3 accounts, 8 data
         // bytes, 1 signer → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":17814}}]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":17814}}]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),
         );
         assert_eq!(report.to_json(), expected);
+    }
+
+    /// AV-98: the keeper report annotates the operator's intended Jito
+    /// tip — amount + recipient on the dry-run preview — without
+    /// building the instruction (the payer is the operator's key, not
+    /// any single action's caller).
+    #[test]
+    fn jito_tip_annotation_marks_tip_amount_on_keeper_report() {
+        const RECIPIENT: [u8; 32] = [0xE0; 32];
+        let watched = [watch(ID1, funded(AMOUNT, 0))];
+        let report = scan_keeper_actions(&watched, MID);
+        assert!(report.jito_tip.is_none());
+        assert!(report.to_json().contains("\"jito_tip\":null"));
+
+        let stamped = report.with_jito_tip(25_000, RECIPIENT).unwrap();
+        let tip = stamped.jito_tip.as_ref().unwrap();
+        assert_eq!(tip.lamports, 25_000);
+        assert_eq!(tip.recipient, RECIPIENT);
+        let json = stamped.to_json();
+        assert!(
+            json.contains(&format!("\"jito_tip\":{{\"lamports\":25000,\"recipient\":\"{}\"}}", hex_of(0xE0))),
+            "tip line missing: {json}"
+        );
+        // Deterministic: same stamp, same bytes.
+        let stamped2 = scan_keeper_actions(&watched, MID).with_jito_tip(25_000, RECIPIENT).unwrap();
+        assert_eq!(stamped.to_json(), stamped2.to_json());
+        // The same RangeError-style validation as the bundle stamp.
+        assert_eq!(
+            scan_keeper_actions(&watched, MID).with_jito_tip(0, RECIPIENT).unwrap_err(),
+            TipConfigError::ZeroTipAmount
+        );
+        assert_eq!(
+            scan_keeper_actions(&watched, MID).with_jito_tip(1_000, [0u8; 32]).unwrap_err(),
+            TipConfigError::ZeroRecipient
+        );
     }
 
     #[test]
