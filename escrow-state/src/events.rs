@@ -172,6 +172,18 @@
 //!   Amounts follow the `ExpiredCancelled` shape (`refund` = the leg's
 //!   net refund, `penalty` = the AV-24 penalty on a taker-initiated
 //!   cancel); the actor is the caller. A failed call emits nothing.
+//! - `release_basket_all` (AV-95c) emits a single
+//!   [`EscrowEventKind::BasketReleased`] for the atomic all-legs
+//!   settlement. `from == Funded`, `to == Released`; amounts carry
+//!   the Σ (`payout` = Σ leg gross, `fee` = Σ protocol fee) — the
+//!   event-sourced fold (AV-94) books it bit-identically to the
+//!   per-leg event sequence it replaces. The actor is the
+//!   initializer. A failed call emits nothing.
+//! - `cancel_basket_all` (AV-95c) emits a single
+//!   [`EscrowEventKind::BasketCancelled`] for the atomic all-legs
+//!   cancel. `from == Funded`, `to == Cancelled`;
+//!   `amounts.refund` carries the Σ remainder; the actor is the
+//!   initializer. A failed call emits nothing.
 //! - A rejected reentrant entry (AV-36) emits
 //!   [`EscrowEventKind::ReentryRejected`] — the deliberate exception to
 //!   the "failed calls emit nothing" rule. A blocked reentry is a
@@ -236,7 +248,7 @@
 //! dependency-free.
 
 use crate::{Escrow, EscrowError, EscrowState, MilestonePlan, QuorumPolicy, SplitConfig, VestingSchedule};
-use crate::{AppealOutcome, OverrideValue, TemplatePreset};
+use crate::{AppealOutcome, BasketSettlement, OverrideValue, TemplatePreset};
 use crate::cpi::CpiError;
 use crate::cpi_call::{CpiInvocation, CpiReceipt};
 
@@ -2254,6 +2266,79 @@ impl IndexedEscrow {
             Some(authority),
         );
         Ok((refund, penalty))
+    }
+
+    /// Release every unsettled basket leg atomically to `payout_to`
+    /// (mirrors [`Escrow::release_basket_all`], AV-95c). Emits a
+    /// single `BasketReleased` (`from == Funded`, `to == Released`)
+    /// with the Σ amounts (`payout` = Σ leg gross, `fee` = Σ protocol
+    /// fee) — the event-sourced fold (AV-94) books it bit-identically
+    /// to the per-leg event sequence it replaces; `now` doubles as
+    /// the event's `at`. Returns the [`BasketSettlement`] so the
+    /// caller can size the per-mint transfers. A failed call emits
+    /// nothing.
+    ///
+    /// [`Escrow::release_basket_all`]: super::Escrow::release_basket_all
+    pub fn release_basket_all(
+        &mut self,
+        authority: [u8; 32],
+        now: u64,
+        payout_to: [u8; 32],
+    ) -> Result<BasketSettlement, EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected` (`now` doubles as the event's `at`).
+        let result = self.inner.release_basket_all(authority, now, payout_to);
+        let settlement = self.map_reentrant(result, now)?;
+        let to = self.inner.state();
+        self.push_event(
+            EscrowEventKind::BasketReleased,
+            from,
+            to,
+            EventAmounts::payout(settlement.total_gross(), settlement.fee),
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(settlement)
+    }
+
+    /// Refund every unsettled basket leg to the escrow's refund
+    /// recipient (mirrors [`Escrow::cancel_basket_all`], AV-95c).
+    /// Emits a single `BasketCancelled` (`from == Funded`, `to ==
+    /// Cancelled`) with `amounts.refund` carrying the Σ remainder;
+    /// `at` doubles as the event's timestamp. Returns the
+    /// [`BasketSettlement`] so the caller can size the per-mint
+    /// refund transfers. A failed call emits nothing.
+    ///
+    /// [`Escrow::cancel_basket_all`]: super::Escrow::cancel_basket_all
+    pub fn cancel_basket_all(
+        &mut self,
+        authority: [u8; 32],
+        at: u64,
+    ) -> Result<BasketSettlement, EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.cancel_basket_all(authority);
+        let settlement = self.map_reentrant(result, at)?;
+        let to = self.inner.state();
+        self.push_event(
+            EscrowEventKind::BasketCancelled,
+            from,
+            to,
+            EventAmounts::refund(settlement.total_net()),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(settlement)
     }
 
     /// Record an attestation from a registered attestor (mirrors

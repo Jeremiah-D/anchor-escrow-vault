@@ -620,6 +620,20 @@
       "args": []
     },
     {
+      "name": "release_basket_all",
+      "discriminator": [23, 48, 193, 215, 203, 74, 77, 103],
+      "accounts": [],
+      "args": [
+        {"name": "payout_to", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "cancel_basket_all",
+      "discriminator": [43, 52, 14, 218, 196, 230, 11, 3],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "initialize_basket",
       "discriminator": [246, 234, 106, 12, 103, 95, 178, 166],
       "accounts": [],

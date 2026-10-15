@@ -115,6 +115,12 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `release(authority, now, amount, payout_to)` (AV-49)                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); cumulative releases ≤ locked amount; `payout_to` must satisfy the payout policy — the taker, or a member of the payout allowlist when one is configured (`PayoutNotAllowlisted` otherwise) |
 | `release_split(authority, now, amount, recipients, bps)` (AV-93) | `Funded` | `Funded` (partial) / `Released` (cumulative full) | initializer; the check order mirrors `release` — authority → state → mint → the share-table shape (non-empty, ≤ 8 recipients, no zero address, no zero weight, weights summing to exactly 10_000 bps — `InvalidReleaseSplit`, code 150, otherwise) → every recipient pinned against the AV-49 payout policy (`PayoutNotAllowlisted` otherwise; with no allowlist only the taker passes, so a multi-recipient split is the allowlist's declared distribution set) → milestones / subscription / quorum / timelock gates → amount math (`AmountMismatch` on 0, `ReleaseExceedsLocked` past the remainder); the AV-17 protocol fee is charged on the gross amount first, then the net splits — each leg `floor(net * bps / 10_000)`, the dust landing on the first recipient, so the legs sum to the net exactly; `released` accumulates the gross, so the conservation invariant is untouched; returns the `(recipient, net_share)` legs (sizing the program's transfers) plus the fee; emits `ReleasedSplit` with the legs stamped on the event |
 | `slash(authority, amount)` (AV-82) | `Funded` | `Funded` (no state change — the escrow stays live, the taker can still earn the remainder) | initializer **or** the configured arbiter (the neutral enforcer — one party's griefing cannot burn the other's stake); `now` <- clock sysvar; requires the AV-82 slash terms (`Uninitialized`-time opt-in), `now >= slash_deadline`, and the amount ≤ the slashable remainder (`amount - released - penalty_paid`); **one-shot** (a second slash is `SlashNotEligible`); `Disputed` is locked (`SlashNotEligible` — arbitration owns the funds) and milestone/subscription-scheduled escrows reject slash (the schedule owns the release path); on a dual-sig escrow both activation bits must be set; the slashed amount moves to the fixed penalty account and accumulates in `penalty_paid` (never in `released` — the audit trail distinguishes a default penalty from a taker payout); emits `Slashed` (`amounts.penalty` = the slashed amount) |
+| `initialize_basket(legs)` (AV-95) | `Uninitialized` | `Uninitialized` | initializer (once, before funding); `legs` is 1–8 `(mint, amount)` pairs — non-empty, no zero mint, no zero amount, no duplicate mint (one leg per mint), Σ fitting in `u64` (`InvalidBasket`, code 152, otherwise); the escrow-level `amount` becomes the Σ over the legs, so fleet aggregation, snapshots and the event fold keep their single-amount semantics |
+| `release_basket(authority, now, mint)` (AV-95b) | `Funded` | `Funded` (legs remain) / `Released` (last leg) | initializer; the check order mirrors `release` — authority → basket presence (a plain escrow has no legs to settle — `InvalidBasket`, code 152) → `Funded` → leg lookup (a mint outside the leg table is `InvalidBasket`) → quorum → timelock; the AV-17 protocol fee is charged on the leg's gross remainder; the leg's `released` accumulates the gross and the escrow-level `released` accumulates the Σ (a re-settled leg is `AmountMismatch`); the payout goes to the taker; emits `BasketReleased` per settled leg |
+| `cancel_basket(authority, mint)` (AV-95b) | `Funded` | `Funded` (legs remain) / `Cancelled` (last leg) | initializer; the check order mirrors `cancel` — authority → basket presence → `Funded` → leg lookup; quorum / timelock do NOT gate this path; the refund goes to the escrow's own AV-23 refund policy (no caller-chosen destination); no fee, no penalty; the leg's `released` accumulates the remainder and the escrow-level `released` accumulates the Σ; emits `BasketCancelled` per settled leg |
+| `cancel_expired_basket(authority, now, mint)` (AV-95b) | `Funded` | `Funded` (legs remain) / `Cancelled` (last leg) | initializer **or** taker once `now >= expires_at + grace_period` (`NotExpired` otherwise); the AV-24 anti-griefing penalty applies to the leg's remainder on a taker-initiated cancel only (routed to the initializer); emits `BasketExpiredCancelled` per settled leg |
+| `release_basket_all(authority, now, payout_to)` (AV-95c) | `Funded` | `Released` | initializer; settles **every** unsettled leg in one atomic transition — the basket twin of `release` for the whole table at once; the check order mirrors `release_basket` — authority → basket presence → `Funded` → the AV-49 payout-policy pin on `payout_to` (one destination means one check *is* the per-leg application — `PayoutNotAllowlisted` otherwise) → quorum → timelock; the AV-17 protocol fee is charged on each leg's remainder independently (floored per leg, no dust carried across legs); **atomic** — every gate and every leg's fee math runs before any mutation, so any leg failure rolls the whole settlement back; legs with a zero remainder are skipped (`AmountMismatch` when none); each leg's `released` accumulates its gross and the escrow-level `released` accumulates the Σ; returns the `BasketSettlement` (per-leg `(mint, payout_to, net)` in leg-table order + Σ fee); emits one `BasketReleased` with Σ amounts (the event-sourced fold books it bit-identically to the per-leg sequence) |
+| `cancel_basket_all(authority)` (AV-95c) | `Funded` | `Cancelled` | initializer; refunds **every** unsettled leg in one atomic transition — the basket twin of `cancel`; the check order mirrors `cancel_basket` — authority → basket presence → `Funded`; quorum / timelock do NOT gate this path; the refund goes to the escrow's own AV-23 refund policy (no caller-chosen destination); no fee, no penalty; **atomic** — every leg's remainder math runs before any mutation; legs with a zero remainder are skipped (`AmountMismatch` when none); returns the `BasketSettlement` (`fee == 0`, `penalty == 0`); emits one `BasketCancelled` with the Σ refund |
 | `initialize_timelock(unlock_at)`            | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `unlock_at` is the Unix timestamp before which no taker payout may leave; `0` = no lock) |
 | `initialize_relative_timelock(secs)` (AV-64) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `secs` is the duration in seconds after *funding* before which no taker payout may leave; `0` = no lock; mutually exclusive with the AV-27 absolute timelock — both nonzero is `InvalidTimelock`, code 135) |
 | `initialize_emergency_unlock()`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opts into dual-signed emergency timelock-unlock governance) |
@@ -1646,6 +1652,18 @@ successful calls that change nothing observable:
   legs ride the event's `release_split` field in table order — the first
   leg carries the bps-floor dust, so an indexer re-derives the exact
   transfer sizes from the one event).
+- `release_basket` / `cancel_basket` / `cancel_expired_basket` (AV-95b)
+  emit `BasketReleased` / `BasketCancelled` / `BasketExpiredCancelled`
+  per settled leg (`from == Funded`, `to == Funded` while legs remain,
+  `to == Released` / `Cancelled` on the last leg; amounts follow the
+  `Released` / `Cancelled` / `ExpiredCancelled` shapes per leg).
+- `release_basket_all` / `cancel_basket_all` (AV-95c) emit a **single**
+  `BasketReleased` / `BasketCancelled` for the atomic all-legs
+  settlement (`from == Funded`, `to == Released` / `Cancelled`;
+  `amounts.payout` = Σ leg gross, `amounts.fee` = Σ protocol fee /
+  `amounts.refund` = Σ remainder) — the event-sourced fold (AV-94)
+  books the one Σ event bit-identically to the per-leg sequence it
+  replaces, so indexers need no special case.
 - `submit_panel_judgment` (AV-65) emits `PanelJudgment` for every
   recorded vote (`from == to == Disputed`, zeroed amounts — a vote is
   a judgment, not a payout); the vote that reaches the M-vote
@@ -2779,6 +2797,42 @@ vault. An empty update clears the list (back to any-target-allowed), and
 `CpiAllowlistUpdated` (event kind 43) is emitted only on an actual change.
 The 258-byte region is always reserved in the vault layout (1-byte count +
 8×32-byte program ids), so the opt-in writes in place without reallocating.
+
+## Basket escrow (AV-95)
+
+One escrow, up to 8 SPL mints: a basket escrow locks a per-mint leg
+table (`mint`, `amount`, `released` per leg) instead of a single
+amount — the initializer's multi-mint payout (a single escrow settling
+USDC + USDT + wSOL legs instead of N escrows). The leg table is built
+by `initialize_basket` / `with_basket` (1–8 legs, no zero mint, no zero
+amount, no duplicate mint, Σ fitting in `u64` — `InvalidBasket`, code
+152, otherwise) and lives in a 386-byte tail region of the vault
+account that is always reserved, so attaching a basket never
+reallocates. The escrow-level `amount` is the Σ over the legs, so fleet
+aggregation, snapshots, keeper scans and the event-sourced fold keep
+their single-amount semantics.
+
+Settlement comes in two granularities. The per-leg path (AV-95b —
+`release_basket` / `cancel_basket` / `cancel_expired_basket`) settles
+one leg per call, named by its SPL mint; the escrow moves to the
+terminal state when the settled leg is the last unsettled one. The
+atomic path (AV-95c — `release_basket_all` / `cancel_basket_all`)
+settles every unsettled leg in one transition: every gate and every
+leg's fee math runs before any mutation, so a failure on any leg rolls
+the whole settlement back and nothing observable changes (on-chain a
+failed instruction aborts the transaction; the pure-logic model mirrors
+that atomicity). The AV-49 payout-policy pin applies per leg — for the
+atomic release, one `payout_to` for every leg means one check *is* the
+per-leg application — and the AV-17 protocol fee is charged per leg,
+floored per leg, so no dust is carried across legs. Each leg's
+`released` counter accumulates its settled remainder and the
+escrow-level `released` accumulates the Σ, so the conservation
+invariant `inflow == locked + released + refunded` holds leg-by-leg and
+in aggregate. The atomic calls return a `BasketSettlement` — the
+settled legs' `(mint, recipient, net_amount)` in leg-table order plus
+the Σ fee — sized for the program's per-mint transfers, and emit a
+single `BasketReleased` / `BasketCancelled` event carrying the Σ
+amounts (bit-identical in the event fold to the per-leg sequence).
 
 ## Configuration templates (AV-72)
 

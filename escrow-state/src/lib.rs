@@ -1909,6 +1909,65 @@ impl BasketLegs {
     }
 }
 
+/// One settled leg of an atomic basket settlement (AV-95c): the leg's
+/// SPL mint, the single recipient every leg pays, and the leg's net
+/// (post-fee) payout. `Copy` so the Anchor layer can lift the table
+/// off the return value without borrowing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BasketPayoutLeg {
+    /// The leg's SPL mint.
+    pub mint: [u8; 32],
+    /// The recipient this leg pays (the one `payout_to` / the AV-23
+    /// refund recipient on the cancel path).
+    pub recipient: [u8; 32],
+    /// The leg's net payout (`gross - fee`; the full remainder on the
+    /// cancel path, where no fee is charged).
+    pub net_amount: u64,
+}
+
+/// The result of an atomic all-legs basket settlement (AV-95c): the
+/// per-leg payout legs in leg-table order, the Σ protocol fee, and
+/// the Σ penalty. Legs with a zero remainder are skipped — they
+/// settle nothing — so `len` counts the legs this call actually
+/// settled. Not persisted: this is instruction logic, and the vault
+/// account layout (`VAULT_SPACE`) is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BasketSettlement {
+    /// The settled legs; only `legs[..len as usize]` are meaningful,
+    /// the tail is zeroed.
+    pub legs: [BasketPayoutLeg; MAX_BASKET_LEGS],
+    /// How many legs this settlement settled (`1..=8` on success).
+    pub len: u8,
+    /// The Σ protocol fee across the settled legs (AV-17, floored per
+    /// leg).
+    pub fee: u64,
+    /// The Σ penalty (always zero on the release/cancel paths — the
+    /// cancel-expired penalty rides the per-leg path only).
+    pub penalty: u64,
+}
+
+impl BasketSettlement {
+    /// The legs settled by this call, in leg-table order.
+    pub fn as_slice(&self) -> &[BasketPayoutLeg] {
+        &self.legs[..self.len as usize]
+    }
+
+    /// The Σ net payout across the settled legs.
+    pub fn total_net(&self) -> u64 {
+        let mut total: u64 = 0;
+        for leg in self.as_slice() {
+            total = total.saturating_add(leg.net_amount);
+        }
+        total
+    }
+
+    /// The Σ gross payout across the settled legs (`Σ net + Σ fee` —
+    /// the amount the escrow-level `released` accumulates).
+    pub fn total_gross(&self) -> u64 {
+        self.total_net().saturating_add(self.fee)
+    }
+}
+
 /// Maximum number of CPI target programs in a [`CpiAllowlist`]
 /// (AV-83). Fixed-size so the crate stays heap-free and `Copy`.
 pub const MAX_CPI_ALLOWLIST: usize = 8;
@@ -14170,6 +14229,30 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "authority <- accounts.authority (signer: initializer OR taker); now <- clock sysvar (NOT an instruction param — see module docs); mint <- the leg's SPL token account mint (accounts.vault_token_account; InvalidBasket, code 152, on a mint outside the leg table); the check order mirrors `cancel_expired`: authority -> basket presence (InvalidBasket, code 152, on a plain escrow) -> Funded -> leg lookup -> expiry gate (now >= expires_at + grace_period — NotExpired otherwise); the refund goes to the escrow's AV-23 refund policy (like `cancel_basket`); the AV-24 anti-griefing penalty applies to the leg's remainder on a *taker-initiated* cancel (u128 math, no overflow; an initializer-initiated cancel pays no penalty); the leg's `released` counter accumulates the remainder and the escrow-level `released` accumulates the Σ; the last settled leg moves Funded -> Cancelled; returns (refund, penalty) — refund + penalty == the leg's remainder — so the real build can size both transfers (the penalty routes to the initializer); emits the BasketExpiredCancelled indexer event (from == Funded, to == Funded/Cancelled; amounts follow the ExpiredCancelled shape)",
         },
         InstructionSpec {
+            // AV-95c: release every unsettled basket leg atomically to
+            // one payout destination — the all-legs twin of
+            // `release_basket`. IDL:
+            // sha256("global:release_basket_all")[..8] = [23, 48, 193,
+            // 215, 203, 74, 77, 103] — the Anchor instruction
+            // discriminator for the release_basket_all handler.
+            name: "release_basket_all",
+            params: &[("payout_to", "Pubkey", "instruction param")],
+            method: "Escrow::release_basket_all",
+            input_mapping: "authority <- accounts.initializer (signer); now <- clock sysvar (NOT an instruction param — see module docs); payout_to <- param (Pubkey; the single destination every leg pays — checked against the AV-49 payout policy, PayoutNotAllowlisted, code 127, on a denied destination; one destination means one check *is* the per-leg application); the check order mirrors `release_basket`: authority -> basket presence (a plain escrow has no legs to settle — InvalidBasket, code 152) -> Funded -> payout pin -> quorum (QuorumNotReached) -> timelock (TimelockNotReached); the AV-17 protocol fee is charged on each leg's remainder independently (floored per leg — no dust carried across legs); atomic — every gate and every leg's fee math runs before any mutation, so any leg failure rolls the whole settlement back; legs with a zero remainder are skipped (AmountMismatch when none); each settled leg's `released` accumulates its gross remainder and the escrow-level `released` accumulates the Σ; Funded -> Released; returns the BasketSettlement (per-leg (mint, payout_to, net) in leg-table order + Σ fee) so the real build can size the per-mint transfers; emits one BasketReleased indexer event with Σ amounts (from == Funded, to == Released; payout = Σ leg gross, fee = Σ protocol fee — the event-sourced fold books it bit-identically to the per-leg event sequence)",
+        },
+        InstructionSpec {
+            // AV-95c: refund every unsettled basket leg atomically to
+            // the escrow's refund recipient — the all-legs twin of
+            // `cancel_basket`. IDL:
+            // sha256("global:cancel_basket_all")[..8] = [43, 52, 14,
+            // 218, 196, 230, 11, 3] — the Anchor instruction
+            // discriminator for the cancel_basket_all handler.
+            name: "cancel_basket_all",
+            params: &[],
+            method: "Escrow::cancel_basket_all",
+            input_mapping: "authority <- accounts.initializer (signer); the check order mirrors `cancel_basket`: authority -> basket presence (InvalidBasket, code 152, on a plain escrow) -> Funded; the refund goes to the escrow's own AV-23 refund policy (the whitelisted address, or the initializer with no whitelist) — no caller-chosen destination, so the anti-phishing pin holds by construction; quorum / timelock do NOT gate this path (the initializer reclaims their own funds, like `cancel`); no fee, no penalty; atomic — every leg's remainder math runs before any mutation; legs with a zero remainder are skipped (AmountMismatch when none); each settled leg's `released` accumulates its remainder and the escrow-level `released` accumulates the Σ; Funded -> Cancelled; returns the BasketSettlement (per-leg (mint, refund_recipient, remainder) in leg-table order, fee == 0, penalty == 0) so the real build can size the per-mint refund transfers; emits one BasketCancelled indexer event with the Σ refund (from == Funded, to == Cancelled)",
+        },
+        InstructionSpec {
             // AV-95b: create a multi-mint basket escrow — the basket
             // twin of `initialize`. IDL:
             // sha256("global:initialize_basket")[..8] — the Anchor
@@ -14330,6 +14413,11 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::release_basket",
             "Escrow::cancel_basket",
             "Escrow::cancel_expired_basket",
+            // AV-95c: atomic all-legs basket settlement — every
+            // unsettled leg settles in one transition, any leg failure
+            // rolls the whole settlement back.
+            "Escrow::release_basket_all",
+            "Escrow::cancel_basket_all",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -14422,6 +14510,7 @@ pub(crate) mod anchor_idl_tests {
                 &"slash",
                 &"initialize_appeal_window",
                 &"review_appeal",
+                &"release_basket_all",
                 &"initialize_basket",
             ]
         );
@@ -15933,6 +16022,12 @@ pub(crate) mod anchor_idl_tests {
         // params birth child vaults, these legs ride an event).
         ("release_split", "recipients"),
         ("release_split", "bps"),
+        // AV-95c: the atomic basket settlement's single destination is
+        // consumed at call time and never persisted — the per-leg
+        // `(mint, recipient, net_amount)` roster rides the returned
+        // `BasketSettlement` and the `BasketReleased` event's Σ
+        // amounts (the AV-93 release_split precedent).
+        ("release_basket_all", "payout_to"),
     ];
     const PARAM_FIELD_MAP: &[(&str, &str, &str)] = &[
         ("initialize", "amount", "amount"),
@@ -19735,6 +19830,253 @@ impl Escrow {
         }
         Ok((remainder - penalty, penalty))
     }
+
+    /// Release every unsettled basket leg atomically to `payout_to`
+    /// (AV-95c): `Funded -> Released`. The basket twin of
+    /// [`Escrow::release`] for the whole multi-mint table at once —
+    /// one escrow settling its USDC + USDT + wSOL legs in a single
+    /// transition instead of N per-leg calls (Solana / payment
+    /// fintech).
+    ///
+    /// Check order mirrors [`Escrow::release_basket`]: pause guard
+    /// (AV-46), reentrancy guard (AV-36), authority, then the basket
+    /// presence (a plain escrow has no basket to release —
+    /// [`EscrowError::InvalidBasket`]), `Funded` state, the AV-49
+    /// payout-policy pin on `payout_to`
+    /// ([`EscrowError::PayoutNotAllowlisted`] — checked once for the
+    /// single destination every leg pays, which *is* the per-leg
+    /// application), then the quorum / timelock (AV-27) gates.
+    ///
+    /// Per-leg application (AV-95 / AV-93 convention): the protocol
+    /// fee (AV-17) is charged on each leg's remainder *independently*
+    /// — floored per leg, so no dust is carried across legs — and
+    /// each leg's `released` counter accumulates its gross remainder
+    /// while the escrow-level `released` accumulates the Σ, so the
+    /// conservation invariant `inflow == locked + released + refunded`
+    /// holds leg-by-leg and in aggregate.
+    ///
+    /// Atomicity: every gate and every leg's fee math runs before any
+    /// mutation — a failure on any leg rolls the whole settlement
+    /// back and nothing observable changes: no leg's `released`
+    /// moves, `released` / `fees_paid` / `state` are untouched.
+    /// On-chain a failed instruction aborts the transaction and no
+    /// state change persists; the pure-logic model mirrors that
+    /// atomicity.
+    ///
+    /// Legs whose remainder is already zero (settled by an earlier
+    /// per-leg [`Escrow::release_basket`] call) are skipped — the
+    /// settlement covers the legs this call actually settles; when no
+    /// leg has a remainder the call is
+    /// [`EscrowError::AmountMismatch`].
+    ///
+    /// Returns the [`BasketSettlement`]: the settled legs' `(mint,
+    /// payout_to, net_amount)` in leg-table order (sized for the
+    /// Anchor layer's per-mint transfers) and the Σ protocol fee.
+    pub fn release_basket_all(
+        &mut self,
+        authority: [u8; 32],
+        now: u64,
+        payout_to: [u8; 32],
+    ) -> Result<BasketSettlement, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast, before
+        // the reentrancy guard and the authority check.
+        self.require_not_paused()?;
+        // AV-36: reentrancy guard (see `require_not_reentrant`).
+        self.require_not_reentrant()?;
+        self.require_initializer(authority)?;
+        // AV-95: the basket owns its settlement path — a plain escrow
+        // has no legs to settle. Checked right after authority: a path
+        // error is a config error, not a state error.
+        let basket = self.basket.ok_or(EscrowError::InvalidBasket)?;
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // AV-49: the payout destination must satisfy the escrow's
+        // payout policy — checked once for the single `payout_to`
+        // every leg pays into (`PayoutNotAllowlisted` otherwise). One
+        // destination means one check *is* the per-leg application.
+        self.require_payout_recipient(payout_to)?;
+        if let Some(policy) = &self.quorum {
+            if !policy.is_satisfied() {
+                return Err(EscrowError::QuorumNotReached);
+            }
+        }
+        // AV-27: the timelock gates every taker payout path, including
+        // the atomic basket release — otherwise the lock would be
+        // trivially bypassable by attaching a basket.
+        if !self.is_unlock_eligible(now) {
+            return Err(EscrowError::TimelockNotReached);
+        }
+        // Per-leg fee math first — no mutation until every leg checks
+        // out, so any failure rolls the whole settlement back.
+        let mut legs = [BasketPayoutLeg {
+            mint: [0u8; 32],
+            recipient: [0u8; 32],
+            net_amount: 0,
+        }; MAX_BASKET_LEGS];
+        let mut len: u8 = 0;
+        let mut total_gross: u64 = 0;
+        let mut total_fee: u64 = 0;
+        for leg in basket.as_slice() {
+            let gross = leg
+                .amount
+                .checked_sub(leg.released)
+                .ok_or(EscrowError::ReleaseExceedsLocked)?;
+            if gross == 0 {
+                // Settled by an earlier per-leg call — skip.
+                continue;
+            }
+            // AV-17: the fee slices each leg's gross independently
+            // (floored per leg — no dust is carried across legs).
+            let fee = self.protocol_fee_for(gross);
+            total_fee = total_fee
+                .checked_add(fee)
+                .ok_or(EscrowError::ReleaseExceedsLocked)?;
+            total_gross = total_gross
+                .checked_add(gross)
+                .ok_or(EscrowError::ReleaseExceedsLocked)?;
+            legs[len as usize] = BasketPayoutLeg {
+                mint: leg.mint,
+                recipient: payout_to,
+                net_amount: gross - fee,
+            };
+            len += 1;
+        }
+        if len == 0 {
+            return Err(EscrowError::AmountMismatch);
+        }
+        // The releasable cap mirrors `release`: `amount - penalty_paid`
+        // (slash is `InvalidBasket` on basket escrows, so
+        // `penalty_paid` is always 0 here — the guard is defense in
+        // depth).
+        if total_gross > self.amount.saturating_sub(self.penalty_paid) {
+            return Err(EscrowError::ReleaseExceedsLocked);
+        }
+        // Commit: every settled leg's `released` accumulates its gross
+        // remainder; the escrow-level `released` accumulates the Σ.
+        // All fallible accumulation happens BEFORE any mutation, so a
+        // failure here still rolls the whole settlement back.
+        let new_released = self
+            .released
+            .checked_add(total_gross)
+            .ok_or(EscrowError::ReleaseExceedsLocked)?;
+        let new_fees_paid = self
+            .fees_paid
+            .checked_add(total_fee)
+            .ok_or(EscrowError::ReleaseExceedsLocked)?;
+        let mut basket = basket;
+        for leg in basket.legs.iter_mut().take(basket.len as usize) {
+            if leg.released < leg.amount {
+                leg.released = leg.amount;
+            }
+        }
+        self.basket = Some(basket);
+        self.released = new_released;
+        self.fees_paid = new_fees_paid;
+        self.state = EscrowState::Released;
+        Ok(BasketSettlement {
+            legs,
+            len,
+            fee: total_fee,
+            penalty: 0,
+        })
+    }
+
+    /// Refund every unsettled basket leg to the escrow's refund
+    /// recipient (AV-95c): `Funded -> Cancelled`. The basket twin of
+    /// [`Escrow::cancel`] for the whole table at once — the initializer
+    /// reclaims every leg's remainder in a single transition.
+    ///
+    /// Like `cancel`, quorum / timelock do not gate this path, and
+    /// like [`Escrow::cancel_basket`] there is no caller-chosen
+    /// destination: the refund goes to the escrow's own AV-23 refund
+    /// policy ([`Escrow::refund_recipient`] — the whitelisted address
+    /// when one is configured, otherwise the initializer), so the
+    /// anti-phishing pin holds by construction. No fee and no penalty
+    /// on an initializer-initiated cancel.
+    ///
+    /// Atomicity: every leg's remainder math runs before any mutation
+    /// — a failure rolls the whole cancel back and nothing observable
+    /// changes. Legs with a zero remainder are skipped; when no leg
+    /// has a remainder the call is [`EscrowError::AmountMismatch`].
+    ///
+    /// Returns the [`BasketSettlement`] with each settled leg's
+    /// refundable remainder (`fee == 0`, `penalty == 0`), in leg-table
+    /// order, so the Anchor layer can size the per-mint refund
+    /// transfers.
+    pub fn cancel_basket_all(
+        &mut self,
+        authority: [u8; 32],
+    ) -> Result<BasketSettlement, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast, before
+        // the reentrancy guard and the authority check.
+        self.require_not_paused()?;
+        // AV-36: reentrancy guard (see `require_not_reentrant`).
+        self.require_not_reentrant()?;
+        self.require_initializer(authority)?;
+        // AV-95: the basket owns its cancel path (see
+        // `release_basket_all`).
+        let basket = self.basket.ok_or(EscrowError::InvalidBasket)?;
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let recipient = self.refund_recipient();
+        let mut legs = [BasketPayoutLeg {
+            mint: [0u8; 32],
+            recipient: [0u8; 32],
+            net_amount: 0,
+        }; MAX_BASKET_LEGS];
+        let mut len: u8 = 0;
+        let mut total: u64 = 0;
+        for leg in basket.as_slice() {
+            let remainder = leg
+                .amount
+                .checked_sub(leg.released)
+                .ok_or(EscrowError::ReleaseExceedsLocked)?;
+            if remainder == 0 {
+                // Settled by an earlier per-leg call — skip.
+                continue;
+            }
+            total = total
+                .checked_add(remainder)
+                .ok_or(EscrowError::ReleaseExceedsLocked)?;
+            legs[len as usize] = BasketPayoutLeg {
+                mint: leg.mint,
+                recipient,
+                net_amount: remainder,
+            };
+            len += 1;
+        }
+        if len == 0 {
+            return Err(EscrowError::AmountMismatch);
+        }
+        // Commit: every settled leg's `released` accumulates its
+        // remainder and the escrow-level `released` accumulates the Σ
+        // (the cancel convention — see `cancel_basket`). The fallible
+        // accumulation happens BEFORE any mutation, so a failure here
+        // still rolls the whole cancel back.
+        let new_released = self
+            .released
+            .checked_add(total)
+            .ok_or(EscrowError::ReleaseExceedsLocked)?;
+        let mut basket = basket;
+        for leg in basket.legs.iter_mut().take(basket.len as usize) {
+            if leg.released < leg.amount {
+                leg.released = leg.amount;
+            }
+        }
+        self.basket = Some(basket);
+        self.released = new_released;
+        self.state = EscrowState::Cancelled;
+        Ok(BasketSettlement {
+            legs,
+            len,
+            fee: 0,
+            penalty: 0,
+        })
+    }
 }
 
 // ---------- AV-95b: per-leg basket settlement tests ----------
@@ -20206,6 +20548,361 @@ mod basket_settlement_tests {
             Err(EscrowError::NotExpired)
         );
         assert_eq!(e.event_count(), before, "failed calls emit nothing");
+    }
+}
+
+// ---------- AV-95c: atomic all-legs basket settlement tests ----------
+//
+// `release_basket_all` / `cancel_basket_all` settle every unsettled
+// leg in one transition. These tests pin the semantics the backlog
+// item names: atomicity (any leg failure rolls the whole settlement
+// back), per-leg fee/allowlist application (the AV-49/AV-93
+// convention), and per-leg `released` accumulation with the Σ
+// conservation invariant.
+#[cfg(test)]
+mod basket_atomic_tests {
+    use super::*;
+    use crate::{EscrowEventKind, IndexedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const DEST: [u8; 32] = [0xDD; 32]; // allowlisted payout destination
+    const MINT_A: [u8; 32] = [0xA1; 32];
+    const MINT_B: [u8; 32] = [0xB2; 32];
+    const PAUSE_AUTH: [u8; 32] = [0xE0; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn basket_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_basket(&[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        e
+    }
+
+    fn assert_untouched(e: &Escrow, legs: &[(u64, u64)]) {
+        // No leg's `released` moved, the escrow-level counters are
+        // untouched, and the lifecycle state did not move.
+        let basket = e.basket().expect("basket present");
+        assert_eq!(basket.as_slice().len(), legs.len());
+        for (leg, (amount, released)) in basket.as_slice().iter().zip(legs) {
+            assert_eq!((leg.amount, leg.released), (*amount, *released));
+        }
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.fees_paid(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn release_basket_all_settles_every_leg_in_one_transition() {
+        let mut e = basket_escrow();
+        let s = e.release_basket_all(ALICE, NOW, BOB).unwrap();
+        assert_eq!(s.len, 2);
+        assert_eq!(s.fee, 0);
+        assert_eq!(s.penalty, 0);
+        let legs = s.as_slice();
+        assert_eq!(legs[0].mint, MINT_A);
+        assert_eq!(legs[0].recipient, BOB);
+        assert_eq!(legs[0].net_amount, 1_000);
+        assert_eq!(legs[1].mint, MINT_B);
+        assert_eq!(legs[1].recipient, BOB);
+        assert_eq!(legs[1].net_amount, 2_000);
+        assert_eq!(s.total_net(), 3_000);
+        assert_eq!(s.total_gross(), 3_000);
+        // Every leg fully settled; the escrow-level counter holds the Σ.
+        let basket = e.basket().expect("basket present");
+        for leg in basket.as_slice() {
+            assert_eq!(leg.released, leg.amount, "leg fully settled");
+        }
+        assert_eq!(basket.total_released(), 3_000);
+        assert_eq!(e.released_amount(), 3_000);
+        assert_eq!(e.remaining_amount(), 0);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn release_basket_all_charges_fee_floored_per_leg() {
+        // 105 + 105 at 1000 bps: per-leg floor(10.5) = 10 each, Σ fee
+        // 20 — a Σ-based charge would floor(21) = 21. The pin proves
+        // the AV-93 convention (fee first, floored per leg, no dust
+        // carried across legs).
+        let mut e = Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_basket(&[(MINT_A, 105), (MINT_B, 105)])
+            .unwrap()
+            .with_protocol_fee(1000)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        let s = e.release_basket_all(ALICE, NOW, BOB).unwrap();
+        assert_eq!(s.fee, 20, "fee floored per leg, not on the Σ");
+        assert_eq!(s.as_slice()[0].net_amount, 95);
+        assert_eq!(s.as_slice()[1].net_amount, 95);
+        assert_eq!(e.fees_paid(), 20);
+        assert_eq!(e.released_amount(), 210);
+        assert!(e.fees_paid() <= e.released_amount());
+    }
+
+    #[test]
+    fn release_basket_all_is_atomic_on_gate_failure() {
+        // Quorum configured but unsatisfied (builders run before fund).
+        let mut e = Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_basket(&[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[[0x01; 32], [0x02; 32]], &[1, 1], 2).unwrap())
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            e.release_basket_all(ALICE, NOW, BOB),
+            Err(EscrowError::QuorumNotReached)
+        );
+        assert_untouched(&e, &[(1_000, 0), (2_000, 0)]);
+
+        // Timelock not reached.
+        let mut e = Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_basket(&[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap()
+            .with_timelock(NOW + 100)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            e.release_basket_all(ALICE, NOW, BOB),
+            Err(EscrowError::TimelockNotReached)
+        );
+        assert_untouched(&e, &[(1_000, 0), (2_000, 0)]);
+
+        // Stranger authority.
+        let mut e = basket_escrow();
+        assert_eq!(
+            e.release_basket_all(MALLORY, NOW, BOB),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_untouched(&e, &[(1_000, 0), (2_000, 0)]);
+
+        // Paused escrow fails fast.
+        let mut e = Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_basket(&[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap()
+            .with_pause_authority(PAUSE_AUTH)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        e.pause(PAUSE_AUTH).unwrap();
+        assert_eq!(
+            e.release_basket_all(ALICE, NOW, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert_untouched(&e, &[(1_000, 0), (2_000, 0)]);
+
+        // A plain (non-basket) escrow has no legs to settle.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            plain.release_basket_all(ALICE, NOW, BOB),
+            Err(EscrowError::InvalidBasket)
+        );
+    }
+
+    #[test]
+    fn release_basket_all_rolls_back_on_commit_boundary_failure() {
+        // In-module access: configure a 100% fee and break the fee
+        // accumulator, so the *second* leg's fee math fails after the
+        // first leg already checked out — the whole settlement must
+        // roll back.
+        let mut e = Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_basket(&[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap()
+            .with_protocol_fee(10_000)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        e.fees_paid = u64::MAX;
+        assert_eq!(
+            e.release_basket_all(ALICE, NOW, BOB),
+            Err(EscrowError::ReleaseExceedsLocked)
+        );
+        let basket = e.basket().expect("basket present");
+        assert_eq!(basket.as_slice()[0].released, 0, "no leg moved");
+        assert_eq!(basket.as_slice()[1].released, 0, "no leg moved");
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+
+        // Break the releasable cap the same way: amount < Σ legs.
+        let mut e = basket_escrow();
+        e.amount = 1;
+        assert_eq!(
+            e.release_basket_all(ALICE, NOW, BOB),
+            Err(EscrowError::ReleaseExceedsLocked)
+        );
+        assert_untouched(&e, &[(1_000, 0), (2_000, 0)]);
+    }
+
+    #[test]
+    fn release_basket_all_pins_payout_to_allowlist() {
+        // AV-49 convention: a destination outside the allowlist fails
+        // before any leg moves.
+        let mut e = Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_basket(&[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap()
+            .with_payout_allowlist(&[DEST])
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            e.release_basket_all(ALICE, NOW, MALLORY),
+            Err(EscrowError::PayoutNotAllowlisted)
+        );
+        assert_untouched(&e, &[(1_000, 0), (2_000, 0)]);
+        // The allowlisted destination settles.
+        let s = e.release_basket_all(ALICE, NOW, DEST).unwrap();
+        assert_eq!(s.len, 2);
+        assert!(s.as_slice().iter().all(|l| l.recipient == DEST));
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn release_basket_all_skips_already_settled_legs() {
+        let mut e = basket_escrow();
+        let (payout, _fee) = e.release_basket(ALICE, NOW, Some(MINT_A)).unwrap();
+        assert_eq!(payout, 1_000);
+        // The atomic call settles only the remaining leg.
+        let s = e.release_basket_all(ALICE, NOW, BOB).unwrap();
+        assert_eq!(s.len, 1);
+        assert_eq!(s.as_slice()[0].mint, MINT_B);
+        assert_eq!(s.as_slice()[0].net_amount, 2_000);
+        assert_eq!(e.released_amount(), 3_000, "Σ accumulates across calls");
+        assert_eq!(e.state(), EscrowState::Released);
+        // Nothing left to settle.
+        assert_eq!(
+            e.release_basket_all(ALICE, NOW, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn cancel_basket_all_refunds_every_leg_atomically() {
+        let mut e = basket_escrow();
+        let s = e.cancel_basket_all(ALICE).unwrap();
+        assert_eq!(s.len, 2);
+        assert_eq!(s.fee, 0);
+        assert_eq!(s.penalty, 0);
+        let legs = s.as_slice();
+        assert_eq!((legs[0].mint, legs[0].recipient, legs[0].net_amount), (MINT_A, ALICE, 1_000));
+        assert_eq!((legs[1].mint, legs[1].recipient, legs[1].net_amount), (MINT_B, ALICE, 2_000));
+        assert_eq!(s.total_net(), 3_000);
+        // Per-leg counters accumulate the refund; the escrow-level
+        // counter accumulates the Σ (the cancel convention).
+        let basket = e.basket().expect("basket present");
+        for leg in basket.as_slice() {
+            assert_eq!(leg.released, leg.amount);
+        }
+        assert_eq!(e.released_amount(), 3_000);
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn cancel_basket_all_honors_refund_whitelist_and_rolls_back() {
+        // AV-23: the refund follows the whitelisted address.
+        let mut e = Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_basket(&[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap()
+            .with_refund_address(DEST)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        let s = e.cancel_basket_all(ALICE).unwrap();
+        assert!(s.as_slice().iter().all(|l| l.recipient == DEST));
+        assert_eq!(e.state(), EscrowState::Cancelled);
+
+        // A stranger's cancel moves nothing.
+        let mut e = basket_escrow();
+        assert_eq!(
+            e.cancel_basket_all(MALLORY),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_untouched(&e, &[(1_000, 0), (2_000, 0)]);
+    }
+
+    #[test]
+    fn atomic_settlement_keeps_conservation_exact() {
+        // inflow == locked + released + refunded, leg-by-leg and in
+        // aggregate: the Σ over the legs' counters always agrees with
+        // the escrow-level counter.
+        let mut e = basket_escrow();
+        e.release_basket_all(ALICE, NOW, BOB).unwrap();
+        let basket = e.basket().expect("basket present");
+        assert_eq!(basket.total_released(), e.released_amount());
+        assert_eq!(e.released_amount(), e.amount());
+        assert_eq!(e.remaining_amount(), 0);
+
+        let mut e = basket_escrow();
+        e.cancel_basket_all(ALICE).unwrap();
+        let basket = e.basket().expect("basket present");
+        assert_eq!(basket.total_released(), e.released_amount());
+        assert_eq!(e.released_amount(), e.amount());
+    }
+
+    #[test]
+    fn atomic_settlement_emits_single_sigma_events() {
+        // One BasketReleased with Σ amounts — the event-sourced fold
+        // (AV-94) books it bit-identically to the per-leg sequence.
+        let mut w = IndexedEscrow::initialize_basket(
+            ALICE,
+            BOB,
+            &[(MINT_A, 1_000), (MINT_B, 2_000)],
+            EXPIRES_AT,
+            [0xEE; 32],
+            NOW,
+        )
+        .unwrap();
+        w.fund(ALICE, NOW).unwrap();
+        let before = w.event_count();
+        w.release_basket_all(ALICE, NOW, BOB).unwrap();
+        assert_eq!(w.event_count(), before + 1, "exactly one event");
+        let ev = w.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::BasketReleased);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Released));
+        assert_eq!(ev.amounts.payout, 3_000, "Σ leg gross");
+        assert_eq!(ev.amounts.fee, 0);
+
+        let mut w = IndexedEscrow::initialize_basket(
+            ALICE,
+            BOB,
+            &[(MINT_A, 1_000), (MINT_B, 2_000)],
+            EXPIRES_AT,
+            [0xEE; 32],
+            NOW,
+        )
+        .unwrap();
+        w.fund(ALICE, NOW).unwrap();
+        let before = w.event_count();
+        w.cancel_basket_all(ALICE, NOW).unwrap();
+        assert_eq!(w.event_count(), before + 1, "exactly one event");
+        let ev = w.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::BasketCancelled);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Cancelled));
+        assert_eq!(ev.amounts.refund, 3_000, "Σ remainder");
+    }
+
+    #[test]
+    fn atomic_settlement_rejects_non_funded_state() {
+        // Unfunded: the state gate fires before any leg math.
+        let mut e = Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_basket(&[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap();
+        assert_eq!(
+            e.release_basket_all(ALICE, NOW, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.cancel_basket_all(ALICE),
+            Err(EscrowError::InvalidStateTransition)
+        );
     }
 }
 

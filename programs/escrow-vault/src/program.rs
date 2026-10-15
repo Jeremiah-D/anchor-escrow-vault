@@ -3330,6 +3330,111 @@ pub mod escrow_vault {
         );
         Ok((refund, penalty))
     }
+
+    /// Release every unsettled basket leg atomically to `payout_to`
+    /// (AV-95c; mirrors `escrow_state::Escrow::release_basket_all`).
+    /// `Funded -> Released` in one transition: the whole multi-mint
+    /// table settles at once instead of N per-leg calls.
+    ///
+    /// The check order mirrors `release_basket` (authority -> basket
+    /// presence -> Funded -> AV-49 payout pin on `payout_to`
+    /// (`PayoutNotAllowlisted`, code 127) -> quorum -> timelock
+    /// AV-27); the AV-17 protocol fee is charged per leg (floored per
+    /// leg, no dust carried across legs). Atomic — any leg failure
+    /// rolls the whole settlement back. Legs with a zero remainder
+    /// are skipped (`AmountMismatch` when none).
+    /// Returns `(total_net, total_fee)` — the Σ net payout and the Σ
+    /// protocol fee — so the real build can size the per-mint
+    /// transfers (the per-leg `(mint, payout_to, net)` table comes
+    /// from the state machine's `BasketSettlement`).
+    pub fn release_basket_all(
+        ctx: Context<ReleaseBasketAll>,
+        payout_to: Pubkey,
+    ) -> Result<(u64, u64)> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        // AV-27: the timelock gate reads the Solana clock sysvar — never
+        // an instruction param, so the initializer cannot fast-forward
+        // the lock they configured.
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let settlement = escrow
+            .release_basket_all(
+                ctx.accounts.initializer.key().to_bytes(),
+                now,
+                payout_to.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-31: settle via `cpi_settle_payout` (`PayoutKind::Release`)
+        // — the real build transfers each leg's net payout to
+        // `payout_to`'s token account for that leg's mint and the Σ fee
+        // to the fee account, once the token accounts are wired up.
+        // AV-18: one `BasketReleased` event with Σ amounts (`now`
+        // doubles as the event's `at`), mirroring
+        // `escrow_state::IndexedEscrow::release_basket_all`.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::BasketReleased,
+            from,
+            escrow.state() as u8,
+            settlement.total_gross(),
+            settlement.fee,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok((settlement.total_net(), settlement.fee))
+    }
+
+    /// Refund every unsettled basket leg to the escrow's refund
+    /// recipient (AV-95c; mirrors
+    /// `escrow_state::Escrow::cancel_basket_all`). `Funded ->
+    /// Cancelled` in one transition.
+    ///
+    /// The check order mirrors `cancel_basket` (authority -> basket
+    /// presence -> Funded); quorum / timelock do not gate this path —
+    /// the initializer reclaims their own funds. No fee, no penalty.
+    /// Unlike `cancel`, this instruction takes no caller-chosen
+    /// refund destination: the real build transfers each leg's
+    /// remainder to the escrow's own AV-23 refund policy (the
+    /// whitelisted address, or the initializer). Atomic — any leg
+    /// failure rolls the whole cancel back; legs with a zero
+    /// remainder are skipped (`AmountMismatch` when none).
+    /// Returns the Σ refunded remainder so the real build can size
+    /// the per-mint refund transfers.
+    pub fn cancel_basket_all(ctx: Context<CancelBasketAll>) -> Result<u64> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        let settlement = escrow
+            .cancel_basket_all(ctx.accounts.initializer.key().to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-31: settle via `cpi_settle_refund` (`RefundKind::Cancel`) —
+        // the real build transfers each leg's remainder to the refund
+        // recipient account once the token accounts are wired up.
+        // AV-18: one `BasketCancelled` event with the Σ refund,
+        // mirroring `escrow_state::IndexedEscrow::cancel_basket_all`.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::BasketCancelled,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            settlement.total_net(),
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(settlement.total_net())
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -4607,6 +4712,40 @@ pub struct CancelExpiredBasket<'info> {
     /// AV-23: the real build transfers the leg's net refund here; the
     /// AV-24 penalty (non-zero only on a taker-initiated cancel) goes
     /// to the initializer.
+    pub refund_to: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ReleaseBasketAll<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    pub initializer: Signer<'info>,
+    /// CHECK: the single payout destination every unsettled leg pays.
+    /// AV-49: the state machine pins it against the escrow's payout
+    /// policy (`PayoutNotAllowlisted`, code 127, on a denied
+    /// destination) before any leg moves. The real build transfers
+    /// each leg's net payout to this destination's token account for
+    /// that leg's mint; the per-leg token accounts ride
+    /// `remaining_accounts` in leg-table order (mirroring the
+    /// `BasketSettlement` the state machine returns).
+    pub payout_to: AccountInfo<'info>,
+    /// CHECK: Solana clock sysvar, read for the AV-27 timelock gate
+    /// (never an instruction param — a caller-supplied timestamp would
+    /// let the initializer fast-forward the lock).
+    pub clock: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CancelBasketAll<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    pub initializer: Signer<'info>,
+    /// CHECK: the refund destination account. AV-23: unlike `Cancel`,
+    /// this instruction takes no caller-chosen destination — the real
+    /// build transfers every leg's remainder to the escrow's own
+    /// refund policy (the whitelisted address, or the initializer with
+    /// no whitelist), which the state machine resolves, so the
+    /// anti-phishing pin holds by construction.
     pub refund_to: AccountInfo<'info>,
 }
 
