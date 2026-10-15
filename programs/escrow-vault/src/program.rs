@@ -2073,6 +2073,81 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Set the payout destination denylist (AV-96; mirrors
+    /// `Escrow::with_denylist`). Only the initializer signs, and only
+    /// while the escrow is `Uninitialized` — the denylist is a
+    /// funding-time compliance veto, like the quorum or vesting
+    /// schedule. 1–4 live addresses; empty / over-long / zero-address
+    /// input is `InvalidPayoutDenylist` (code 154). The 130-byte
+    /// region is always present (zeroed when `None`), so this writes
+    /// in place — no realloc in the real build. Deny takes precedence
+    /// over the AV-49 allowlist: a destination on both lists is
+    /// rejected with `PayoutDenied` (code 153). Emits no event
+    /// (pre-fund configuration, like `with_pause_authority`).
+    pub fn initialize_payout_denylist(
+        ctx: Context<InitializePayoutDenylist>,
+        denylist: Vec<Pubkey>,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let addrs: Vec<[u8; 32]> = denylist.iter().map(|k| k.to_bytes()).collect();
+        let escrow = escrow
+            .with_denylist(&addrs)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.payout_denylist` is always present (130 bytes, zeroed
+        // by default), so the list is written in place — no realloc
+        // needed in the real build.
+        Ok(())
+    }
+
+    /// Update the payout destination denylist (AV-96; mirrors
+    /// `Escrow::update_payout_denylist`). Initializer-signature-alone
+    /// governance (unlike `update_payout_allowlist`'s dual-signature
+    /// reshape): the denylist is the initializer's compliance veto,
+    /// not a bilateral fund route. An empty list clears the veto
+    /// (back to `None`). `Uninitialized` / `Funded` only — the veto
+    /// must be raisable while funds are locked, but never from a
+    /// terminal state. `InvalidPayoutDenylist` (code 154) on
+    /// over-long / zero-address input. Emits `DenylistUpdated`
+    /// (from == to == the current state) only on an actual change; a
+    /// same-list no-op stays silent.
+    pub fn update_payout_denylist(
+        ctx: Context<UpdatePayoutDenylist>,
+        denylist: Vec<Pubkey>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.payout_denylist();
+        let addrs: Vec<[u8; 32]> = denylist.iter().map(|k| k.to_bytes()).collect();
+        escrow
+            .update_payout_denylist(
+                ctx.accounts.initializer.key().to_bytes(),
+                &addrs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.payout_denylist` in place in the real build
+        // (130 bytes, always present, zeroed when None) — no realloc.
+        if escrow.payout_denylist() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::DenylistUpdated,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Initialize the opt-in CPI target-program allowlist (AV-83;
     /// mirrors `Escrow::with_cpi_allowlist`): the only programs
     /// `release_via_cpi` may invoke when the list is configured. An
@@ -3863,6 +3938,18 @@ pub struct Vault {
     /// position matches `escrow_state::VAULT_FIELDS` (appended last,
     /// after `evidence_leaves`).
     pub evidence_disclosed: u64,
+    /// AV-96: opt-in payout destination denylist (the initializer's
+    /// compliance veto); mirrors `escrow_state`'s `payout_denylist`.
+    /// `None` for an escrow with no veto. The account always reserves
+    /// the full 130-byte region (1-byte discriminant + 4×32-byte
+    /// addresses + 1-byte count, zeroed when `None`) so
+    /// `initialize_payout_denylist` / `update_payout_denylist` write
+    /// the list in place without reallocating. Deny takes precedence
+    /// over the AV-49 allowlist: a destination on both lists is
+    /// rejected with `PayoutDenied` (code 153). Layout position
+    /// matches `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `evidence_disclosed`).
+    pub payout_denylist: Option<PayoutDenylist>,
 }
 
 /// Skeleton mirror of `escrow_state::SlashTerms`: the opt-in
@@ -3969,6 +4056,18 @@ pub struct MilestonePlan {
 /// (129 bytes: 4×32-byte addresses + 1-byte count).
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
 pub struct PayoutAllowlist {
+    pub addrs: [Pubkey; 4],
+    pub len: u8,
+}
+
+/// AV-96: skeleton mirror of `escrow_state::PayoutDenylist`: up to 4
+/// denied payout-destination pubkeys in slot order plus the live
+/// count. Same wire shape as [`PayoutAllowlist`]; serialized size is
+/// pinned by `escrow_state::PAYOUT_DENYLIST_LEN` (129 bytes: 4×32-byte
+/// addresses + 1-byte count). Deny takes precedence over the
+/// allowlist — a destination on both lists is `PayoutDenied`.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct PayoutDenylist {
     pub addrs: [Pubkey; 4],
     pub len: u8,
 }
@@ -5514,6 +5613,29 @@ pub struct UpdatePayoutAllowlist<'info> {
 }
 
 #[derive(Accounts)]
+pub struct InitializePayoutDenylist<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer sets the funding-time compliance veto; the
+    /// state machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`, and rejects empty / over-long / zero-address
+    /// input (`InvalidPayoutDenylist`, code 154).
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UpdatePayoutDenylist<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Initializer-signature-alone governance: the denylist is the
+    /// initializer's compliance veto, not a bilateral fund route — the
+    /// state machine enforces the initializer check and rejects
+    /// strangers (`Unauthorized`), terminal states
+    /// (`InvalidStateTransition`), and paused escrows (`Paused`).
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitializeCpiAllowlist<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
@@ -6030,6 +6152,12 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidBasket => {
             error!(ErrorCode::InvalidBasket)
         }
+        escrow_state::EscrowError::PayoutDenied => {
+            error!(ErrorCode::PayoutDenied)
+        }
+        escrow_state::EscrowError::InvalidPayoutDenylist => {
+            error!(ErrorCode::InvalidPayoutDenylist)
+        }
     }
 }
 
@@ -6135,4 +6263,8 @@ pub enum ErrorCode {
     GapInEventStream,
     #[msg("Invalid multi-mint basket (AV-95): BasketLegs::new with an empty leg table, more than 8 legs, a zero mint, a zero leg amount, a duplicate mint, or a leg-amount sum overflowing u64; or release_basket / cancel_basket / cancel_expired_basket on an escrow with no basket configured, or with a mint outside the basket's leg table")]
     InvalidBasket,
+    #[msg("Payout destination is denylisted (AV-96): the payout recipient is on the escrow's payout denylist — deny takes precedence over the AV-49 allowlist, so a destination on both lists is rejected with this code, not PayoutNotAllowlisted")]
+    PayoutDenied,
+    #[msg("Invalid payout denylist (AV-96): PayoutDenylist::new with an empty list, more than 4 addresses, or a zero address")]
+    InvalidPayoutDenylist,
 }

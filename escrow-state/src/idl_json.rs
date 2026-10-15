@@ -180,6 +180,9 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "Option<PayoutAllowlist>" => IdlType::Option(Box::new(IdlType::Named("PayoutAllowlist"))),
         // AV-95: opt-in multi-mint basket leg table.
         "Option<BasketLegs>" => IdlType::Option(Box::new(IdlType::Named("BasketLegs"))),
+        // AV-96: opt-in payout destination denylist (initializer's
+        // compliance veto, deny beats the AV-49 allowlist).
+        "Option<PayoutDenylist>" => IdlType::Option(Box::new(IdlType::Named("PayoutDenylist"))),
         // AV-83: opt-in CPI target-program allowlist.
         "Option<CpiAllowlist>" => IdlType::Option(Box::new(IdlType::Named("CpiAllowlist"))),
         // AV-84: opt-in multisig authority binding.
@@ -306,6 +309,13 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
         // PayoutAllowlist { addrs: [[u8; 32]; 4], len: u8 } (AV-49).
         // The 4 payout keys serialize as 4 consecutive 32-byte pubkeys.
         "PayoutAllowlist" => vec![
+            ("addrs", IdlType::Array(ArrayElem::PublicKey, 4)),
+            ("len", IdlType::U8),
+        ],
+        // PayoutDenylist { addrs: [[u8; 32]; 4], len: u8 } (AV-96).
+        // Same wire shape as the allowlist; the veto check runs before
+        // the allowlist check in `require_payout_recipient`.
+        "PayoutDenylist" => vec![
             ("addrs", IdlType::Array(ArrayElem::PublicKey, 4)),
             ("len", IdlType::U8),
         ],
@@ -632,6 +642,8 @@ fn render_idl_json() -> String {
         // AV-95: the multi-mint basket leg types.
         "BasketLeg",
         "BasketLegs",
+        // AV-96: the payout destination denylist type.
+        "PayoutDenylist",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -787,6 +799,8 @@ fn named_type_sizes_pin_constants() {
     assert_eq!(size("VestingCurve"), 81);
     assert_eq!(size("MilestonePlan"), MILESTONE_PLAN_LEN);
     assert_eq!(size("PayoutAllowlist"), PAYOUT_ALLOWLIST_LEN);
+    // AV-96: same wire shape as the allowlist (4 pubkeys + count byte).
+    assert_eq!(size("PayoutDenylist"), PAYOUT_DENYLIST_LEN);
     // AV-83: eight 32-byte program ids + count byte.
     assert_eq!(size("CpiAllowlist"), CPI_ALLOWLIST_LEN);
     // AV-84: 32-byte multisig program id + 32-byte authority PDA + u16
@@ -894,7 +908,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 53, "error variant count drift");
+    assert_eq!(errors.len(), 55, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -943,6 +957,9 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::GapInEventStream.code(), 151);
     // AV-95: appended, never renumbered.
     assert_eq!(EscrowError::InvalidBasket.code(), 152);
+    // AV-96: appended, never renumbered.
+    assert_eq!(EscrowError::PayoutDenied.code(), 153);
+    assert_eq!(EscrowError::InvalidPayoutDenylist.code(), 154);
 }
 
 #[test]

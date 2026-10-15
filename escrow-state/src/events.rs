@@ -673,6 +673,17 @@ pub enum EscrowEventKind {
     /// successful leg expiry-cancel always moves funds, so there is
     /// no no-op case.
     BasketExpiredCancelled,
+    /// AV-96: the payout destination denylist was changed by
+    /// initializer governance ([`Escrow::update_payout_denylist`]).
+    /// `from == to ==` the current state (a config change, not a
+    /// lifecycle move — like
+    /// [`EscrowEventKind::PayoutAllowlistUpdated`]); the new list is
+    /// read from the vault, the event is the ordering signal. Amounts
+    /// are zero. (The initialize-time builder
+    /// [`Escrow::with_denylist`] emits no event — pre-fund
+    /// configuration, like [`Escrow::with_payout_allowlist`].)
+    /// Emitted only on an actual change.
+    DenylistUpdated,
 }
 
 impl EscrowEventKind {
@@ -789,6 +800,10 @@ impl EscrowEventKind {
             // AV-95b: appended after BasketCancelled so discriminants
             // 0–49 stay stable for already-serialized histories.
             50 => Self::BasketExpiredCancelled,
+            // AV-96: appended after BasketExpiredCancelled so
+            // discriminants 0–50 stay stable for already-serialized
+            // histories.
+            51 => Self::DenylistUpdated,
             _ => return None,
         })
     }
@@ -848,6 +863,7 @@ impl EscrowEventKind {
             Self::BasketReleased => "basket_released",
             Self::BasketCancelled => "basket_cancelled",
             Self::BasketExpiredCancelled => "basket_expired_cancelled",
+            Self::DenylistUpdated => "payout_denylist_updated",
         }
     }
 
@@ -908,6 +924,7 @@ impl EscrowEventKind {
             "basket_released" => Self::BasketReleased,
             "basket_cancelled" => Self::BasketCancelled,
             "basket_expired_cancelled" => Self::BasketExpiredCancelled,
+            "payout_denylist_updated" => Self::DenylistUpdated,
             _ => return None,
         })
     }
@@ -1699,6 +1716,14 @@ impl IndexedEscrow {
     /// [`Escrow::with_basket`], AV-95). Configuration: emits no event.
     pub fn with_basket(mut self, legs: &[([u8; 32], u64)]) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_basket(legs)?;
+        Ok(self)
+    }
+
+    /// Opt in to a payout destination denylist (mirrors
+    /// [`Escrow::with_denylist`], AV-96). Configuration: emits no
+    /// event.
+    pub fn with_denylist(mut self, addrs: &[[u8; 32]]) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_denylist(addrs)?;
         Ok(self)
     }
 
@@ -2617,6 +2642,42 @@ impl IndexedEscrow {
             None,
             None,
             None,
+        );
+        }
+        Ok(())
+    }
+
+    /// Update the payout destination denylist (mirrors
+    /// [`Escrow::update_payout_denylist`], AV-96). Emits
+    /// `DenylistUpdated` only when the list actually changes; `from ==
+    /// to ==` the current state. `at` is the caller-supplied event
+    /// timestamp. The actor is the initializer (the veto is the
+    /// initializer's compliance instrument).
+    pub fn update_payout_denylist(
+        &mut self,
+        initializer: [u8; 32],
+        addrs: &[[u8; 32]],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.payout_denylist();
+        self.inner.update_payout_denylist(initializer, addrs)?;
+        let after = self.inner.payout_denylist();
+        // The inner call rejects bad input, strangers, and wrong states,
+        // so a changed list here always means real governance — and a
+        // same-list no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+            EscrowEventKind::DenylistUpdated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(initializer),
         );
         }
         Ok(())
@@ -5595,7 +5656,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(51), None);
+        assert_eq!(EscrowEventKind::from_discriminant(52), None);
     }
 
     #[test]
@@ -5611,7 +5672,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(51), None);
+        assert_eq!(EscrowEventKind::from_discriminant(52), None);
     }
 
     #[test]
@@ -6148,7 +6209,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(51), None);
+        assert_eq!(EscrowEventKind::from_discriminant(52), None);
     }
 
     #[test]
@@ -6163,7 +6224,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(51), None);
+        assert_eq!(EscrowEventKind::from_discriminant(52), None);
     }
 
     #[test]
@@ -6175,7 +6236,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(51), None);
+        assert_eq!(EscrowEventKind::from_discriminant(52), None);
     }
 
     #[test]
@@ -6187,7 +6248,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(51), None);
+        assert_eq!(EscrowEventKind::from_discriminant(52), None);
     }
 
     #[test]
@@ -6199,7 +6260,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(51), None);
+        assert_eq!(EscrowEventKind::from_discriminant(52), None);
     }
 
     #[test]
@@ -6211,7 +6272,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(51), None);
+        assert_eq!(EscrowEventKind::from_discriminant(52), None);
     }
 
     #[test]

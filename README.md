@@ -132,6 +132,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `crank_expired(caller, now)` (AV-48) | `Funded` | `Cancelled` | **anyone** — permissionless crank (Solana crank pattern), only when `now >= expires_at + grace_period`; no counterparty signature needed, so a keeper bot that is party to nothing can sweep timed-out vaults; the refund follows the same pinned refund policy (whitelisted address, or the initializer) — the cranker receives nothing (anti-MEV); a taker cranker still pays the anti-griefing penalty; rejected with `Paused` while the escrow is paused |
 | `initialize_payout_allowlist(allowlist)` (AV-49) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–4 live payout-destination addresses; empty / over-long / zero-address input is `InvalidPayoutAllowlist`); the payout policy gates every fund-moving transition's `payout_to` |
 | `update_payout_allowlist(initializer, taker, allowlist)` (AV-49) | `Uninitialized` / `Funded` | same (no state change) | dual-signature governance — both initializer and taker on a dual-sig escrow, initializer alone on a plain escrow (`Unauthorized` otherwise); empty clears the allowlist (back to taker-only payouts); emits `PayoutAllowlistUpdated` only on an actual change |
+| `initialize_payout_denylist(addrs)` (AV-96) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–4 live addresses — empty / over-long / zero-address input is `InvalidPayoutDenylist`, code 154); deny takes precedence over the AV-49 allowlist — a destination on both lists is rejected with `PayoutDenied` (code 153) |
+| `update_payout_denylist(initializer, addrs)` (AV-96) | `Uninitialized` / `Funded` | same (no state change) | initializer-signature-alone governance (the denylist is the initializer's compliance veto, not a bilateral fund route — unlike the allowlist's dual-signature reshape); pause-guarded, terminal states frozen; empty clears the veto (back to `None`); emits `DenylistUpdated` (kind 51) only on an actual change |
 | `initialize_cpi_allowlist(allowlist)` (AV-83) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–8 live target-program ids; empty list leaves the allowlist unset — any target allowed; over-long / zero-address input is `InvalidCpiAllowlist`); when configured, `release_via_cpi` may only invoke a listed target program — `InvalidCpiTarget` (code 120) with full rollback otherwise |
 | `update_cpi_allowlist(initializer, taker, allowlist)` (AV-83) | `Uninitialized` / `Funded` | same (no state change) | **always dual-signed** — both initializer and taker even on a plain escrow (stricter than AV-49 by design: the allowlist guards a privileged execution path); `Uninitialized`/`Funded` only; empty list clears the allowlist (back to any-target-allowed); emits `CpiAllowlistUpdated` only on an actual change |
 | `initialize_multisig_authority(multisig_authority)` (AV-84) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; binds the external multisig program id, the vault PDA that must sign, and the u16 threshold metadata; zero program id / zero authority / zero threshold is `InvalidMultisigAuthority`); immutable once set — the binding is load-bearing for every later authority check; read-only pass-through, never a check gate (zero-trust) |
@@ -1204,6 +1206,9 @@ program error per variant):
 | `InvalidVaultSeeds` | 149 | `VaultSeeds::new` / `derive_vault_address` (AV-92) with more than 16 seeds or a seed longer than 32 bytes (the Solana `create_program_address` limits) |
 | `InvalidReleaseSplit` | 150 | `release_split` (AV-93) with an empty share table, more than 8 recipients, a zero recipient address, a zero bps weight, or a weight table whose sum differs from 10_000 bps (a per-recipient payout-policy violation is `PayoutNotAllowlisted`, not this code) |
 | `GapInEventStream` | 151 | `MaterializedView::apply` (AV-94) with a missing `seq` (gap), an out-of-order or duplicate `seq`, or events for a different `escrow_id` than the view folds |
+| `InvalidBasket` | 152 | `BasketLegs::new` (AV-95) with an empty leg table, more than 8 legs, a zero mint, a zero leg amount, a duplicate mint, or a leg-amount sum overflowing `u64`; `release_basket` / `cancel_basket` / `cancel_expired_basket` on an escrow with no basket, or with a mint outside the leg table |
+| `PayoutDenied` | 153 | any payout transition (AV-96) whose `payout_to` is on the escrow's payout denylist — deny takes precedence over the AV-49 allowlist |
+| `InvalidPayoutDenylist` | 154 | `PayoutDenylist::new` (AV-96) with an empty list, more than 4 addresses, or a zero address |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2187,7 +2192,9 @@ two-way consistency check against the IDL parameter table:
 | evidence_root | Option<[u8; 32]> | 33 |
 | evidence_leaves | u8 | 1 |
 | evidence_disclosed | u64 | 8 |
-| **total**     |                   | **3970** |
+| basket | Option<BasketLegs> | 386 |
+| payout_denylist | Option<PayoutDenylist> | 130 |
+| **total**     |                   | **4486** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2797,6 +2804,27 @@ vault. An empty update clears the list (back to any-target-allowed), and
 `CpiAllowlistUpdated` (event kind 43) is emitted only on an actual change.
 The 258-byte region is always reserved in the vault layout (1-byte count +
 8×32-byte program ids), so the opt-in writes in place without reallocating.
+
+## Payout destination denylist (AV-96)
+
+The allowlist says where funds *may* go; the denylist says where they
+*may not* — the initializer's compliance veto. Configured via
+`with_denylist` (1–4 live addresses, set at initialize time) or
+`update_payout_denylist` once funded, it is checked **before** the
+allowlist on every payout path (`release`, `release_split`, `claim`,
+`resolve`, the basket settlement): a denied destination fails with
+`PayoutDenied` (code 153) even when it is also allowlisted — deny
+beats allow, deliberately, so a sanctions hit cannot be smuggled
+through the allowlist. Governance is the initializer's signature
+alone (unlike `update_payout_allowlist`'s dual-signature reshape):
+the veto must be raisable while funds are locked, so updates are
+valid on `Uninitialized` / `Funded` but never from a terminal state,
+and a paused escrow fails fast (`Paused`). An empty update clears
+the veto (back to `None`); `DenylistUpdated` (event kind 51,
+`payout_denylist_updated`) is emitted only on an actual change. The
+130-byte region is always reserved in the vault layout (1-byte
+discriminant + 4×32-byte addresses + 1-byte count, zeroed when
+`None`), so the opt-in writes in place without reallocating.
 
 ## Basket escrow (AV-95)
 

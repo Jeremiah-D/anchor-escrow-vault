@@ -396,6 +396,8 @@ pub struct EscrowSnapshot {
     /// configured (AV-49). When `Some`, every fund-moving transition
     /// requires its `payout_to` to be a member.
     pub payout_allowlist: Option<Vec<[u8; 32]>>,
+    /// AV-96: the payout destination denylist (`None` = no veto).
+    pub payout_denylist: Option<Vec<[u8; 32]>>,
     /// CPI target-program allowlist, or `None` when no allowlist is
     /// configured (AV-83). When `Some`, a `release_via_cpi` whose
     /// target program is outside the list is rejected.
@@ -637,6 +639,12 @@ impl Escrow {
             refund_recipient: self.refund_recipient(),
             payout_allowlist: self
                 .payout_allowlist()
+                .map(|list| list.as_slice().to_vec()),
+            // AV-96: the payout destination denylist rides the export
+            // for reconciliation — read-only except through
+            // `update_payout_denylist` (initializer's compliance veto).
+            payout_denylist: self
+                .payout_denylist()
                 .map(|list| list.as_slice().to_vec()),
             // AV-83: the CPI target allowlist rides the export for
             // reconciliation — read-only, enforced by
@@ -1040,6 +1048,24 @@ impl EscrowSnapshot {
             }
             None => s.push_str("null"),
         }
+        // AV-96: payout destination denylist — `null` when no veto is
+        // configured, else the denied addresses as hex strings.
+        s.push_str(",\"payout_denylist\":");
+        match &self.payout_denylist {
+            Some(addrs) => {
+                s.push('[');
+                for (i, a) in addrs.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push('"');
+                    s.push_str(&hex32(a));
+                    s.push('"');
+                }
+                s.push(']');
+            }
+            None => s.push_str("null"),
+        }
         // AV-83: CPI target-program allowlist — `null` when none is
         // configured, else the allowlisted program ids as hex strings.
         s.push_str(",\"cpi_allowlist\":");
@@ -1241,7 +1267,7 @@ mod snapshot_tests {
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"evidence_root\":null,\"evidence_disclosure\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
-             \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\"cpi_allowlist\":null,\"multisig_authority\":null,\
+             \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\"payout_denylist\":null,\"cpi_allowlist\":null,\"multisig_authority\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
              \"max_extension_secs\":0,\"extension_count\":0,\"arbiter_panel\":null,\

@@ -410,6 +410,22 @@
       ]
     },
     {
+      "name": "initialize_payout_denylist",
+      "discriminator": [93, 18, 4, 14, 58, 95, 161, 162],
+      "accounts": [],
+      "args": [
+        {"name": "denylist", "type": {"vec": "publicKey"}}
+      ]
+    },
+    {
+      "name": "update_payout_denylist",
+      "discriminator": [21, 69, 155, 229, 219, 133, 150, 63],
+      "accounts": [],
+      "args": [
+        {"name": "denylist", "type": {"vec": "publicKey"}}
+      ]
+    },
+    {
       "name": "initialize_cpi_allowlist",
       "discriminator": [156, 187, 23, 210, 103, 8, 231, 39],
       "accounts": [],
@@ -712,7 +728,8 @@
           {"name": "evidence_root", "type": {"option": {"array": ["u8", 32]}}, "offset": 3936},
           {"name": "evidence_leaves", "type": "u8", "offset": 3969},
           {"name": "evidence_disclosed", "type": "u64", "offset": 3970},
-          {"name": "basket", "type": {"option": {"defined": "BasketLegs"}}, "offset": 3978}
+          {"name": "basket", "type": {"option": {"defined": "BasketLegs"}}, "offset": 3978},
+          {"name": "payout_denylist", "type": {"option": {"defined": "PayoutDenylist"}}, "offset": 4364}
         ]
       }
     }
@@ -898,6 +915,16 @@
           {"name": "len", "type": "u8", "offset": 384}
         ]
       }
+    },
+    {
+      "name": "PayoutDenylist",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "addrs", "type": {"array": ["publicKey", 4]}, "offset": 0},
+          {"name": "len", "type": "u8", "offset": 128}
+        ]
+      }
     }
   ],
   "errors": [
@@ -953,7 +980,9 @@
     {"code": 149, "name": "InvalidVaultSeeds"},
     {"code": 150, "name": "InvalidReleaseSplit"},
     {"code": 151, "name": "GapInEventStream"},
-    {"code": 152, "name": "InvalidBasket"}
+    {"code": 152, "name": "InvalidBasket"},
+    {"code": 154, "name": "InvalidPayoutDenylist"},
+    {"code": 153, "name": "PayoutDenied"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

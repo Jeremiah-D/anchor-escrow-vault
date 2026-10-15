@@ -38,14 +38,15 @@
 use super::{
     sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, CpiAllowlist,
     DefaultJudgment, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
-    MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, QuorumPolicy, SlashTerms,
-    SubscriptionSchedule, VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
+    MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, QuorumPolicy,
+    SlashTerms, SubscriptionSchedule, VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
     APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
     ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
     MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS,
-    MAX_PAYOUT_ALLOWLIST, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS, MILESTONE_PLAN_LEN,
-    MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN,
-    SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN, VAULT_SPACE, VESTING_CURVE_LEN,
+    MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
+    MILESTONE_PLAN_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN,
+    PAYOUT_DENYLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN,
+    VAULT_SPACE, VESTING_CURVE_LEN,
 };
 
 /// Program-side `#[account]` type names, in Anchor IDL order. The single
@@ -123,6 +124,15 @@ pub enum AccountDecodeError {
     /// than decoding a value the accessors cannot safely read
     /// (AV-95; AV-32 panic-free guarantee).
     InvalidBasketLegsLen(u8),
+    /// A present payout denylist's entry count is outside `1..=4`
+    /// ([`MAX_PAYOUT_DENYLIST`](crate::MAX_PAYOUT_DENYLIST)). The
+    /// count byte is part of the field's layout — an out-of-range
+    /// count would make
+    /// [`PayoutDenylist::as_slice`](crate::PayoutDenylist::as_slice)
+    /// read past the live slots, so the decoder rejects it rather
+    /// than decoding a value the accessors cannot safely read
+    /// (AV-96; AV-32 panic-free guarantee).
+    InvalidPayoutDenylistLen(u8),
     /// An event-history slot's kind byte is not a known
     /// [`EscrowEventKind`] discriminant (0–50). The mapping is pinned
     /// by test to declaration order (AV-57).
@@ -866,6 +876,31 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(BASKET_LEGS_LEN)?;
         None
     };
+    // AV-96: the payout destination denylist, always reserved like the
+    // AV-49 payout allowlist: the `None` discriminant followed by the
+    // zeroed address region, or the `Some` discriminant, four fixed
+    // 32-byte addresses, and the live entry-count byte. Structural
+    // decode only — the list invariants are enforced by
+    // `PayoutDenylist::new`, not re-litigated here.
+    let payout_denylist = if c.option_present("payout_denylist")? {
+        let mut addrs = [[0u8; 32]; MAX_PAYOUT_DENYLIST];
+        for a in addrs.iter_mut() {
+            *a = c.pubkey()?;
+        }
+        let len = c.u8()?;
+        if len == 0 || len as usize > MAX_PAYOUT_DENYLIST {
+            return Err(AccountDecodeError::InvalidPayoutDenylistLen(len));
+        }
+        debug_assert_eq!(
+            PAYOUT_DENYLIST_LEN,
+            4 * 32 + 1,
+            "denylist region drift vs PAYOUT_DENYLIST_LEN"
+        );
+        Some(PayoutDenylist { addrs, len })
+    } else {
+        c.skip(PAYOUT_DENYLIST_LEN)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1015,6 +1050,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-95: the multi-mint basket leg table rides the decode so a
         // decoded escrow carries the same leg table the live one had.
         basket,
+        // AV-96: the payout denylist rides the decode so a decoded
+        // escrow enforces the same payout veto the live one had.
+        payout_denylist,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

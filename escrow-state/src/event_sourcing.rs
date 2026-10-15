@@ -132,6 +132,8 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         | EscrowEventKind::Unpaused
         | EscrowEventKind::PauseAuthorityRotated
         | EscrowEventKind::PayoutAllowlistUpdated
+        // AV-96: a config change — no fund movement.
+        | EscrowEventKind::DenylistUpdated
         | EscrowEventKind::TakerRotated
         | EscrowEventKind::InitializerRotated
         | EscrowEventKind::ExpiryExtended
@@ -530,7 +532,7 @@ mod event_sourcing_tests {
         const FEE: u64 = 100;
         const REFUND: u64 = 700;
         const PENALTY: u64 = 50;
-        for d in 0..=50u8 {
+        for d in 0..=51u8 {
             let kind = EscrowEventKind::from_discriminant(d)
                 .unwrap_or_else(|| panic!("missing discriminant {d}"));
             let event = synth(kind, 0, PAYOUT, FEE, REFUND, PENALTY);
@@ -578,6 +580,8 @@ mod event_sourcing_tests {
                 | EscrowEventKind::Unpaused
                 | EscrowEventKind::PauseAuthorityRotated
                 | EscrowEventKind::PayoutAllowlistUpdated
+                // AV-96: a config change — no fund movement.
+                | EscrowEventKind::DenylistUpdated
                 | EscrowEventKind::TakerRotated
                 | EscrowEventKind::InitializerRotated
                 | EscrowEventKind::ExpiryExtended
