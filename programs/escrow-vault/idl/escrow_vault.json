@@ -752,6 +752,21 @@
         {"name": "escrow_id_a", "type": {"array": ["u8", 32]}},
         {"name": "escrow_id_b", "type": {"array": ["u8", 32]}}
       ]
+    },
+    {
+      "name": "initialize_insurance_pool",
+      "discriminator": [109, 87, 201, 131, 246, 236, 11, 238],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "pool_payout",
+      "discriminator": [96, 126, 156, 222, 124, 179, 148, 159],
+      "accounts": [],
+      "args": [
+        {"name": "beneficiary", "type": "publicKey"},
+        {"name": "amount", "type": "u64"}
+      ]
     }
   ],
   "accounts": [
@@ -832,7 +847,12 @@
           {"name": "appeal_bond", "type": "u64", "offset": 4562},
           {"name": "appeal_bond_paid", "type": "u64", "offset": 4570},
           {"name": "delegation", "type": {"option": {"defined": "Delegation"}}, "offset": 4578},
-          {"name": "swap_link", "type": {"option": {"array": ["u8", 32]}}, "offset": 4615}
+          {"name": "swap_link", "type": {"option": {"array": ["u8", 32]}}, "offset": 4615},
+          {"name": "insurance_pool", "type": "bool", "offset": 4648},
+          {"name": "pool_paid", "type": "u64", "offset": 4649},
+          {"name": "pool_slashed", "type": "u64", "offset": 4657},
+          {"name": "pool_inflow", "type": "u64", "offset": 4665},
+          {"name": "pool_payout_paid", "type": "u64", "offset": 4673}
         ]
       }
     }
@@ -1115,7 +1135,8 @@
     {"code": 160, "name": "InvalidDelegation"},
     {"code": 161, "name": "InvalidSwapParties"},
     {"code": 162, "name": "InvalidSwapAmounts"},
-    {"code": 163, "name": "SwapLinkActive"}
+    {"code": 163, "name": "SwapLinkActive"},
+    {"code": 164, "name": "InvalidPoolPayout"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

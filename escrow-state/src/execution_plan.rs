@@ -431,6 +431,10 @@ mod execution_plan_tests {
             actions,
             // AV-98: execution-plan tests never stamp a tip.
             jito_tip: None,
+            // AV-106: execution-plan tests carry no pool lines.
+            pool_balance: 0,
+            pool_inflow: 0,
+            pool_outflow: 0,
         }
     }
 

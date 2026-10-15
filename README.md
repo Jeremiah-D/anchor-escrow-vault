@@ -3167,6 +3167,73 @@ penalty_a, refund_b, penalty_b)`, each with discriminator
 `VAULT_SPACE_NO_QUORUM` 4125 → **4158**, rent-exempt 33,011,280 →
 **33,240,960** lamports.
 
+## Penalty insurance pool (AV-106)
+
+The problem: a slash pays the penalty to the initializer, and a
+rejected appeal forfeits the taker's bond to the initializer — so the
+initializer *profits* from declaring the taker in default, even
+wrongfully. The penalty is supposed to price non-performance, not to
+be a revenue line for the party that unilaterally triggers it.
+
+The pool fixes the incentive, opt-in via `with_insurance_pool()`
+(`Uninitialized`-only; the default stays the pre-AV-106
+slash-to-initializer behavior). Slashed penalties and forfeited
+appeal bonds accrue in a neutral per-escrow pool instead of flowing
+to the initializer. The pool is neutral custody — neither party can
+touch it alone. The only outflow is `pool_payout(authority,
+beneficiary, amount, mint, now)`, authorized by the arbiter (the
+AV-14 neutral role) or the bound multisig authority PDA (AV-84 —
+the PDA signs only after its threshold voted, so the escrow stays
+zero-trust and never interprets the threshold itself).
+
+Five persisted counters (all zero unless opted in): `insurance_pool`
+(the flag), `pool_paid` (the balance — credits on slash/forfeit,
+debits on payout and overturn restitution), `pool_slashed` (the slash
+principal held in the pool, driving `remaining_amount =
+amount - released - penalty_paid - pool_slashed` so the releasable
+lockup excludes pooled principal), `pool_inflow` (cumulative
+credits, never debited — the keeper's inflow line), and
+`pool_payout_paid` (cumulative authorized payouts, never debited).
+
+The accounting rule that matters: a payout debits *only* `pool_paid`
+and accumulates `pool_payout_paid` — it never reduces `pool_slashed`.
+The slashed principal left the releasable lockup when the slash
+landed; paying it out of the pool must not grow the lockup back
+(that would double-count the same funds in `remaining_amount` and
+let the taker release money that already left the vault). Only an
+overturned appeal reverses `pool_slashed`, and that returns principal
+to the lockup through `released` (the AV-86 precedent). The
+conservation identity becomes `inflow == locked + released +
+refunded + penalty_paid + appeal_bond_paid + pool_paid +
+pool_payout_paid` — one term per sink — and the pool tests assert it
+across slash → forfeit → partial payout lifecycles.
+
+Gates on `pool_payout`: the escrow must be `Funded`, the pool
+opted-in and non-empty, the amount non-zero and within the balance,
+the beneficiary through the AV-49/AV-96 recipient gate, the mint
+through the AV-16 binding (`MintMismatch` otherwise), and the pool
+unencumbered — no filed appeal, no appealable pooled slash
+(`InvalidPoolPayout` otherwise; the pool must stay able to make the
+taker whole while an appeal is live). A non-empty pool blocks
+`close_vault` (`InvalidPoolPayout`) — closing would hand the
+neutralized penalties to the initializer with the rent reclaim,
+resurrecting the exact incentive the pool removes; drain via
+`pool_payout` first. A pool with no arbiter and no multisig binding
+can never pay out: pair `with_insurance_pool` with `with_arbiter` or
+`with_multisig_authority`. Overturn restitution is not booked in
+`pool_payout_paid` — it rides `released` like every other taker
+payout — so the keeper's outflow line is `pool_inflow - pool_paid`.
+
+The keeper report carries the pool lines (`pool_balance`,
+`pool_inflow`, `pool_outflow`) and lists a `PoolPayout` action per
+authorized drainer (arbiter + bound multisig PDA) once eligible; the
+CU table prices `pool_payout` at 18,000 base CU (8 + 32 + 8 = 48 data
+bytes: discriminator + beneficiary + amount), and the state snapshot
+exports all five counters. Account layout grows by the 33-byte pool
+region (flag + four u64 counters): body 4640 → **4673**,
+`VAULT_SPACE` 4648 → **4681**, `VAULT_SPACE_NO_QUORUM` 4158 →
+**4191**, rent-exempt 33,240,960 → **33,470,640** lamports.
+
 ## Basket escrow (AV-95)
 
 One escrow, up to 8 SPL mints: a basket escrow locks a per-mint leg

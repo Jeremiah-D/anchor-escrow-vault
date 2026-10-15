@@ -497,6 +497,29 @@ pub struct EscrowSnapshot {
     /// not linked into a swap pair, so indexers see which two vaults
     /// settle as one.
     pub swap_link: Option<[u8; 32]>,
+    /// AV-106: whether the penalty insurance pool is opted in (see
+    /// [`Escrow::with_insurance_pool`](crate::Escrow::with_insurance_pool)).
+    pub insurance_pool: bool,
+    /// AV-106: the insurance pool balance — slashed penalties and
+    /// forfeited appeal bonds held in neutral custody (`0` when the
+    /// pool is not opted in or empty).
+    pub pool_paid: u64,
+    /// AV-106: the principal currently held in the pool (the
+    /// slash-to-pool inflow net of overturn reversals).
+    pub pool_slashed: u64,
+    /// AV-106: cumulative pool inflow — every slash-to-pool and
+    /// bond-forfeit-to-pool credit.
+    pub pool_inflow: u64,
+    /// AV-106: the pool's outflow line — `pool_inflow - pool_paid`
+    /// (overturn restitution plus authorized payouts).
+    pub pool_outflow: u64,
+    /// AV-106: cumulative authorized pool payouts via
+    /// [`Escrow::pool_payout`](crate::Escrow::pool_payout).
+    pub pool_payout_paid: u64,
+    /// AV-106: whether [`Escrow::pool_payout`](crate::Escrow::pool_payout)
+    /// could succeed at [`EscrowSnapshot::at`] — the keeper scan lists
+    /// exactly these escrows for `pool_payout`.
+    pub pool_payout_eligible: bool,
 }
 
 /// AV-82: point-in-time, read-only view of the opt-in slash terms —
@@ -770,6 +793,18 @@ impl Escrow {
             // AV-105: the swap counterparty id, so the export shows
             // the pair the escrow settles with.
             swap_link: self.swap_link(),
+            // AV-106: the insurance-pool opt-in, the balance, the
+            // pooled principal, the inflow/outflow lines and the
+            // at-`now` payout eligibility ride the export — so an
+            // off-chain indexer can watch the neutral pool without
+            // replaying the slash / appeal / payout transitions.
+            insurance_pool: self.insurance_pool(),
+            pool_paid: self.pool_paid(),
+            pool_slashed: self.pool_slashed(),
+            pool_inflow: self.pool_inflow(),
+            pool_outflow: self.pool_outflow(),
+            pool_payout_paid: self.pool_payout_paid(),
+            pool_payout_eligible: self.is_pool_payout_eligible(now),
         }
     }
 }
@@ -1306,6 +1341,27 @@ impl EscrowSnapshot {
         // not linked into a swap pair.
         s.push_str(",\"swap_link\":");
         write_opt_hex(&mut s, self.swap_link);
+        // AV-106: the insurance-pool opt-in, balance, pooled
+        // principal, inflow/outflow lines, cumulative payouts, and
+        // payout eligibility.
+        s.push_str(",\"insurance_pool\":");
+        s.push_str(if self.insurance_pool { "true" } else { "false" });
+        s.push_str(",\"pool_paid\":");
+        s.push_str(&self.pool_paid.to_string());
+        s.push_str(",\"pool_slashed\":");
+        s.push_str(&self.pool_slashed.to_string());
+        s.push_str(",\"pool_inflow\":");
+        s.push_str(&self.pool_inflow.to_string());
+        s.push_str(",\"pool_outflow\":");
+        s.push_str(&self.pool_outflow.to_string());
+        s.push_str(",\"pool_payout_paid\":");
+        s.push_str(&self.pool_payout_paid.to_string());
+        s.push_str(",\"pool_payout_eligible\":");
+        s.push_str(if self.pool_payout_eligible {
+            "true"
+        } else {
+            "false"
+        });
         s.push('}');
         s
     }
@@ -1367,7 +1423,10 @@ mod snapshot_tests {
              \"slash_terms\":null,\"penalty_paid\":0,\"slash_eligible\":false,\
              \"appeal_window_secs\":0,\"appeal_deadline\":0,\"appeal_state\":\"none\",\"appeal_eligible\":false,\
              \"appeal_bond\":0,\"appeal_bond_paid\":0,\"appeal_expiry_eligible\":false,\
-             \"delegation\":null,\"swap_link\":null\
+             \"delegation\":null,\"swap_link\":null,\
+             \"insurance_pool\":false,\"pool_paid\":0,\"pool_slashed\":0,\
+             \"pool_inflow\":0,\"pool_outflow\":0,\"pool_payout_paid\":0,\
+             \"pool_payout_eligible\":false\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),

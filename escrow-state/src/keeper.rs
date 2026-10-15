@@ -320,6 +320,21 @@ pub enum KeeperActionKind {
     /// appeal); `refund_to` is `None` (the destination is the
     /// initializer by rule, like `slash`'s penalty account).
     ExpireAppeal,
+    /// `pool_payout(authority, beneficiary, amount)` (AV-106): the
+    /// arbiter- or multisig-authorized drain of the penalty insurance
+    /// pool. Listed when [`Escrow::is_pool_payout_eligible`] holds at
+    /// scan time — a listed payout is always executable, never a
+    /// `Paused` or `InvalidPoolPayout` rejection. One action per
+    /// authorized drainer: the arbiter (`caller_role: "arbiter"`)
+    /// and/or the bound multisig authority PDA (`caller_role:
+    /// "multisig_authority"` — the keeper proposes the payout to the
+    /// multisig via
+    /// [`validate_pool_payout_proposal`](crate::validate_pool_payout_proposal),
+    /// it does not sign as the PDA). `amount` is the pool balance —
+    /// the ceiling, not a decided payout; the beneficiary and the
+    /// exact amount are the drainer's call-time judgment, so
+    /// `refund_to` is `None`.
+    PoolPayout,
 }
 
 impl KeeperActionKind {
@@ -337,6 +352,7 @@ impl KeeperActionKind {
             KeeperActionKind::FileAppeal => "file_appeal",
             KeeperActionKind::ReviewAppeal => "review_appeal",
             KeeperActionKind::ExpireAppeal => "expire_appeal",
+            KeeperActionKind::PoolPayout => "pool_payout",
         }
     }
 }
@@ -480,6 +496,17 @@ pub struct KeeperReport {
     /// `None` unless stamped via
     /// [`with_jito_tip`](KeeperReport::with_jito_tip).
     pub jito_tip: Option<JitoTipConfig>,
+    /// AV-106: total insurance-pool balance across the scanned
+    /// escrows — the neutral penalties held fleet-wide. Saturates
+    /// instead of wrapping.
+    pub pool_balance: u64,
+    /// AV-106: total cumulative pool inflow across the scanned
+    /// escrows (slash-to-pool + bond-forfeit-to-pool credits).
+    pub pool_inflow: u64,
+    /// AV-106: total pool outflow across the scanned escrows
+    /// (`pool_inflow - pool_balance`: overturn restitution plus
+    /// authorized payouts).
+    pub pool_outflow: u64,
 }
 
 impl KeeperReport {
@@ -525,6 +552,7 @@ impl KeeperReport {
     /// ```json
     /// {"at":1000000,"scanned":1,"total_estimated_cu":13814,
     ///  "jito_tip":{"lamports":10000,"recipient":"ee…"},
+    ///  "pool_balance":0,"pool_inflow":0,"pool_outflow":0,
     ///  "actions":[
     ///   {"escrow_id":"...","vault_address":"...","action":"cancel_expired","caller":"...",
     ///    "caller_role":"initializer","mint":null,
@@ -565,6 +593,14 @@ impl KeeperReport {
             }
             None => s.push_str("null"),
         }
+        // AV-106: the fleet-wide insurance-pool lines — balance,
+        // cumulative inflow, and outflow (`inflow - balance`).
+        s.push_str(",\"pool_balance\":");
+        s.push_str(&self.pool_balance.to_string());
+        s.push_str(",\"pool_inflow\":");
+        s.push_str(&self.pool_inflow.to_string());
+        s.push_str(",\"pool_outflow\":");
+        s.push_str(&self.pool_outflow.to_string());
         s.push_str(",\"actions\":[");
         for (i, a) in self.actions.iter().enumerate() {
             if i > 0 {
@@ -695,8 +731,14 @@ impl KeeperReport {
 /// keeper with the party path.
 pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport {
     let mut actions = Vec::new();
+    // AV-106: fleet-wide insurance-pool lines — saturating sums over
+    // the scanned escrows.
+    let mut pool_balance = 0u64;
+    let mut pool_inflow = 0u64;
     for w in watched {
         let e = &w.escrow;
+        pool_balance = pool_balance.saturating_add(e.pool_paid());
+        pool_inflow = pool_inflow.saturating_add(e.pool_inflow());
         // AV-38: a disputed escrow has exactly one keeper-executable
         // call — the arbiter's `resolve`. The unilateral exits stay
         // locked, so nothing else is listed; the taker/initializer split
@@ -1078,6 +1120,45 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 reason: "appeal_window_lapsed",
             });
         }
+        // AV-106: the insurance-pool payout. Listed when
+        // `is_pool_payout_eligible` holds at scan time — the predicate
+        // mirrors every `pool_payout` gate (pool opted in and funded,
+        // Funded, unencumbered, not paused, an authorized drainer
+        // exists), so a listed payout is always executable. One action
+        // per authorized drainer: the arbiter, and/or the bound
+        // multisig authority PDA (the keeper proposes the payout to
+        // the multisig — it does not sign as the PDA). `amount` is the
+        // pool balance — the ceiling; the beneficiary and the exact
+        // payout are the drainer's call-time judgment.
+        if e.is_pool_payout_eligible(now) {
+            let mut drainers: Vec<([u8; 32], &'static str)> = Vec::new();
+            if let Some(arbiter) = e.arbiter() {
+                drainers.push((arbiter, "arbiter"));
+            }
+            if let Some(bound) = e.multisig_authority() {
+                drainers.push((bound.authority, "multisig_authority"));
+            }
+            for (caller, caller_role) in drainers {
+                actions.push(KeeperAction {
+                    escrow_id: w.escrow_id,
+                    vault_address: w.vault_address(),
+                    kind: KeeperActionKind::PoolPayout,
+                    caller,
+                    caller_role,
+                    mint: e.mint(),
+                    // The beneficiary is the drainer's call-time
+                    // judgment — no destination is pinned by rule.
+                    refund_to: None,
+                    amount: e.pool_paid(),
+                    decimals: e.decimals(),
+                    reference: w.reference,
+                    extension_count: e.extension_count(),
+                    multisig_authority: e.multisig_authority,
+                    evidence_disclosure: None,
+                    reason: "pool_payout_available",
+                });
+            }
+        }
     }
     KeeperReport {
         at: now,
@@ -1086,6 +1167,10 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         // AV-98: the operator stamps the intended Jito tip via
         // `with_jito_tip` — the scan itself stays tip-free.
         jito_tip: None,
+        // AV-106: the fleet-wide pool lines.
+        pool_balance,
+        pool_inflow,
+        pool_outflow: pool_inflow.saturating_sub(pool_balance),
     }
 }
 
@@ -1719,7 +1804,7 @@ mod keeper_tests {
         let report = scan_keeper_actions(&[], MID);
         assert!(report.is_empty());
         assert_eq!(report.scanned, 0);
-        assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"total_estimated_cu":0,"jito_tip":null,"actions":[]}"#);
+        assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"total_estimated_cu":0,"jito_tip":null,"pool_balance":0,"pool_inflow":0,"pool_outflow":0,"actions":[]}"#);
     }
 
     #[test]
@@ -2232,7 +2317,7 @@ mod keeper_tests {
         // 3 accounts, 8 data bytes, 1 signer →
         // 10_000 + 3_000 + 3×250 + 8×8 = 13_814 each; total 27_628.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}}]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}}]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -2257,7 +2342,7 @@ mod keeper_tests {
         // AV-88: claim with mint, no refund_to: 3 accounts, 8 data
         // bytes, 1 signer → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":17814}}]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":17814}}]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),

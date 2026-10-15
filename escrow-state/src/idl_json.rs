@@ -944,7 +944,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 64, "error variant count drift");
+    assert_eq!(errors.len(), 65, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -1010,6 +1010,8 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::InvalidSwapParties.code(), 161);
     assert_eq!(EscrowError::InvalidSwapAmounts.code(), 162);
     assert_eq!(EscrowError::SwapLinkActive.code(), 163);
+    // AV-106: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidPoolPayout.code(), 164);
 }
 
 #[test]

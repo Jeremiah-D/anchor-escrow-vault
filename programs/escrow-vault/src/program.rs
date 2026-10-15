@@ -3024,11 +3024,16 @@ pub mod escrow_vault {
         // Pin the penalty destination to the terms: the skeleton's
         // state machine takes no destination param (the terms fix it),
         // so the account constraint is enforced here, before the
-        // state machine runs.
+        // state machine runs. AV-106: when the insurance pool is
+        // opted in the slash routes to the pool (no penalty-account
+        // transfer), so the pin is skipped — the state machine's
+        // `slash` already refuses a second slash.
         let terms = escrow
             .slash_terms()
             .ok_or(error!(ErrorCode::SlashNotEligible))?;
-        if ctx.accounts.penalty_account.key().to_bytes() != terms.penalty_account {
+        if !escrow.insurance_pool()
+            && ctx.accounts.penalty_account.key().to_bytes() != terms.penalty_account
+        {
             return Err(error!(ErrorCode::SlashNotEligible));
         }
         let slashed = escrow
@@ -3197,15 +3202,18 @@ pub mod escrow_vault {
     /// (AV-103; mirrors `Escrow::expire_appeal`): `Funded -> Funded` —
     /// the appeal moves terminally to `Expired`, the slash stands, and
     /// the locked appeal bond (if any) is forfeited to the initializer
-    /// (the anti-malicious-appeal-delay rule). Permissionless, like
-    /// `crank_expired`: anyone may crank a lapsed appeal — the caller
-    /// signs only as the event actor; the forfeited bond routes to the
-    /// initializer, never the caller. `now` comes from the Solana clock
+    /// (the anti-malicious-appeal-delay rule). AV-106: when the
+    /// insurance pool is opted in the forfeit credits the pool
+    /// instead — the bond stays in the vault, no initializer
+    /// transfer. Permissionless, like `crank_expired`: anyone may
+    /// crank a lapsed appeal — the caller signs only as the event
+    /// actor; the forfeited bond routes to the initializer (or the
+    /// pool), never the caller. `now` comes from the Solana clock
     /// sysvar (never an instruction param). Emits `AppealExpired`
     /// (from == to == `Funded`), mirroring
     /// `IndexedEscrow::expire_appeal`. Returns the forfeited bond (`0`
     /// when no bond was locked) so the real build can size the
-    /// transfer to the initializer.
+    /// transfer to the initializer (zero when pool-routed).
     pub fn expire_appeal(ctx: Context<ExpireAppeal>) -> Result<u64> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let from = escrow.state() as u8;
@@ -3992,6 +4000,49 @@ pub mod escrow_vault {
         }
         Ok((refund_a, penalty_a, refund_b, penalty_b))
     }
+
+    /// Opt the vault into the penalty insurance pool (AV-106;
+    /// mirrors `escrow_state::initialize_insurance_pool`).
+    /// Uninitialized-only, party-only (initializer). No params;
+    /// sets `vault.insurance_pool` in place in the real build.
+    pub fn initialize_insurance_pool(ctx: Context<InitializeInsurancePool>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow_state::initialize_insurance_pool(&mut escrow)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Writes `vault.insurance_pool` in place in the real build
+        // (1 byte, always reserved, zeroed when `false`).
+        Ok(())
+    }
+
+    /// Pay out from the insurance pool to an authorized beneficiary
+    /// (AV-106; mirrors `escrow_state::pool_payout`). Caller must be
+    /// the arbiter or the bound multisig PDA; the beneficiary passes
+    /// the AV-49/AV-96 recipient gate. The pool must not be
+    /// encumbered by a live appeal. `now` comes from the clock
+    /// sysvar (never an instruction param). In the real build the
+    /// vault token account transfers `amount` to the beneficiary's
+    /// token account and `vault.pool_payout_paid` accumulates the
+    /// payout in place.
+    pub fn pool_payout(
+        ctx: Context<PoolPayout>,
+        beneficiary: [u8; 32],
+        amount: u64,
+    ) -> Result<u64> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = Clock::get()?.unix_timestamp as u64;
+        let paid = escrow_state::pool_payout(
+            &mut escrow,
+            ctx.accounts.authority.key().to_bytes(),
+            beneficiary,
+            amount,
+            vault_token_mint(&ctx.accounts.vault_token_account),
+            now,
+        )
+        .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(paid)
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -4481,6 +4532,23 @@ pub struct Vault {
     /// `delegation`). There is no unlink: the link persists through
     /// the terminal states as the audit trail.
     pub swap_link: Option<[u8; 32]>,
+    /// AV-106: opt-in penalty insurance pool (mirrors
+    /// `escrow_state`'s `insurance_pool`); false unless the
+    /// initializer called `initialize_insurance_pool` while
+    /// Uninitialized.
+    pub insurance_pool: bool,
+    /// AV-106: current pool balance (mirrors `escrow_state`'s
+    /// `pool_paid`).
+    pub pool_paid: u64,
+    /// AV-106: slash principal currently held by the pool and still
+    /// appealable (mirrors `escrow_state`'s `pool_slashed`).
+    pub pool_slashed: u64,
+    /// AV-106: cumulative pool inflow (mirrors `escrow_state`'s
+    /// `pool_inflow`); never debited.
+    pub pool_inflow: u64,
+    /// AV-106: cumulative authorized pool payouts (mirrors
+    /// `escrow_state`'s `pool_payout_paid`); the outflow sink.
+    pub pool_payout_paid: u64,
 }
 
 /// Skeleton mirror of `escrow_state::SlashTerms`: the opt-in
@@ -5479,6 +5547,41 @@ pub struct ReleaseSwap<'info> {
     pub vault_token_account_a: AccountInfo<'info>,
     /// CHECK: leg B's vault SPL token account (see `Release`).
     pub vault_token_account_b: AccountInfo<'info>,
+}
+
+/// AV-106: opt the vault into the penalty insurance pool (mirrors
+/// `escrow_state::initialize_insurance_pool`).
+#[derive(Accounts)]
+pub struct InitializeInsurancePool<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The initializer; the state machine enforces the party-only
+    /// Uninitialized-only rule.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-106: pay out from the insurance pool (mirrors
+/// `escrow_state::pool_payout`).
+#[derive(Accounts)]
+pub struct PoolPayout<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The arbiter or the bound multisig PDA; the state machine
+    /// enforces the authorization (a stranger is `InvalidPoolPayout`).
+    pub authority: Signer<'info>,
+    /// CHECK: the payout destination. The state machine pins it
+    /// against the AV-49/AV-96 recipient gate (allowlist/denylist) —
+    /// a phishing frontend cannot redirect the payout by swapping
+    /// this account. The real build transfers `amount` to this
+    /// account's token account after the state machine's checks pass.
+    pub beneficiary: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build reads its `mint` for the state machine's `MintMismatch`
+    /// check and transfers `amount` out of it.
+    pub vault_token_account: AccountInfo<'info>,
+    /// CHECK: Solana clock sysvar, read for the appeal-window
+    /// encumbrance check (never an instruction param).
+    pub clock: AccountInfo<'info>,
 }
 
 /// AV-105: cancel both legs of a linked swap pair atomically
@@ -6938,6 +7041,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::SwapLinkActive => {
             error!(ErrorCode::SwapLinkActive)
         }
+        escrow_state::EscrowError::InvalidPoolPayout => {
+            error!(ErrorCode::InvalidPoolPayout)
+        }
     }
 }
 
@@ -7065,4 +7171,6 @@ pub enum ErrorCode {
     InvalidSwapAmounts,
     #[msg("Live swap link blocks a single-side move (AV-105): fund-moving single-side transition on a live-linked non-terminal escrow; link_swap on an already-linked escrow; or a pair op on an unlinked escrow")]
     SwapLinkActive,
+    #[msg("Invalid insurance-pool payout (AV-106): pool_payout with no pool opted in, by a non-arbiter/non-multisig caller, a zero or over-balance amount, a denied/non-allowlisted beneficiary, on a non-Funded escrow, or while the pool is encumbered by a live appeal; or close_vault with a non-empty pool")]
+    InvalidPoolPayout,
 }

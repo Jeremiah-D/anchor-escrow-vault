@@ -87,6 +87,10 @@ pub const INSTRUCTION_CU_TABLE: &[(&str, u64, usize)] = &[
     // AV-103: no params → 8 + 0; a permissionless sweep like
     // crank_expired.
     ("expire_appeal", 10_000, 8),
+    // AV-106: beneficiary:Pubkey + amount:u64 → 8 + 32 + 8; a
+    // fund-moving payout with authority + recipient gates, ranked
+    // with slash.
+    ("pool_payout", 18_000, 48),
 ];
 
 /// Base cost for `instruction`, or `None` when the table has no row —
@@ -175,6 +179,7 @@ mod cu_estimate_tests {
             KeeperActionKind::FileAppeal,
             KeeperActionKind::ReviewAppeal,
             KeeperActionKind::ExpireAppeal,
+            KeeperActionKind::PoolPayout,
         ];
         assert_eq!(kinds.len(), INSTRUCTION_CU_TABLE.len());
         for k in kinds {
@@ -244,6 +249,8 @@ mod cu_estimate_tests {
             ("slash", 18_000),
             ("file_appeal", 6_000),
             ("review_appeal", 14_000),
+            ("expire_appeal", 10_000),
+            ("pool_payout", 18_000),
         ];
         for (name, base) in expected {
             assert_eq!(instruction_cu_base(name), Some(*base), "base drift for {name}");

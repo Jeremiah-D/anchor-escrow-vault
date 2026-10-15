@@ -1014,6 +1014,15 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         None
     };
 
+    // AV-106: the penalty insurance pool, always reserved: the 1-byte
+    // opt-in flag plus the four u64 pool counters, appended last so
+    // every earlier offset above is unchanged.
+    let insurance_pool = c.u8()? != 0;
+    let pool_paid = c.u64_le()?;
+    let pool_slashed = c.u64_le()?;
+    let pool_inflow = c.u64_le()?;
+    let pool_payout_paid = c.u64_le()?;
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1193,6 +1202,15 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // recorded, so the single-side refusal and the pair
         // cross-checks decide identically after a decode.
         swap_link,
+        // AV-106: the insurance-pool opt-in flag and the four pool
+        // counters ride the decode so a decoded escrow routes slashes
+        // and forfeits to the pool, prices `remaining_amount`, and
+        // reports pool balances exactly like the live one.
+        insurance_pool,
+        pool_paid,
+        pool_slashed,
+        pool_inflow,
+        pool_payout_paid,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
