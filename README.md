@@ -2734,6 +2734,21 @@ consume directly.
   execution plan, applied to the proactive lifecycle line instead of
   the keeper report's reactive exits. Same grouping, same
   discriminator rule, same deterministic hand-serialized JSON.
+- **Bundle simulation (AV-102)**: `simulate_bundle(bundle, watched,
+  at)` dry-runs a bundle before submission — each action executes in
+  bundle order on a per-escrow `IndexedEscrow` clone seeded from the
+  keeper's snapshots (`IndexedEscrow::wrap` converts plain `Escrow`
+  snapshots; `initialize` actions create a fresh vault and need no
+  snapshot). The caller's snapshots are never mutated and no events
+  leak (AV-76 atomicity convention: everything happens on the clone).
+  Each `SimulatedAction` predicts the post-state, `released`,
+  `payout`/`fee`, and the events the action would emit; the first
+  gate rejection stops the simulation with the exact `EscrowError`
+  and its stable numeric code, and later actions are marked
+  `skipped` (`bundle_aborted`) — a real submission would abort the
+  whole transaction there. `BundleSimulation::to_json()` renders the
+  keeper's dry-run report (`all_ok` green light, per-action
+  `executed`/`failed`/`skipped` with `error:{name,code}`).
 
 ## Signable transaction messages (AV-71)
 

@@ -85,7 +85,9 @@
 use super::batch::{BatchAccount, BatchActionKind, BatchItemOutcome, BatchReport};
 use super::cpi::{system_transfer, TransferInstruction};
 use super::discriminator::instruction_discriminator;
+use super::events::IndexedEscrow;
 use super::priority_fee::PriorityFeeRecommendation;
+use crate::{EscrowError, EscrowState};
 use std::collections::BTreeMap;
 
 /// Render 32 bytes as 64 lowercase hex characters.
@@ -666,6 +668,426 @@ pub fn bundle_execution(report: &BatchReport) -> Vec<ExecutionBundle> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// AV-102: bundle simulation — the keeper dry-run.
+// ---------------------------------------------------------------------------
+
+/// Why a simulated action was not executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulatedSkipReason {
+    /// An earlier action in the bundle failed: the bundle is atomic, so
+    /// a real submission would abort the whole transaction here.
+    BundleAborted,
+    /// No snapshot was supplied for a non-`initialize` action — the
+    /// keeper must pass the current [`IndexedEscrow`] for every vault
+    /// the bundle touches (fresh vaults are created by `initialize`
+    /// and need no snapshot).
+    MissingSnapshot,
+}
+
+/// What a simulated bundle action produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulatedOutcome {
+    /// The action would execute; the predicted post-state and amounts
+    /// on the [`SimulatedAction`] apply.
+    Executed,
+    /// The action would fail: the gate rejects it with this exact
+    /// [`EscrowError`] — see [`EscrowError::code`] for the stable
+    /// numeric code. Simulation stops here (atomicity).
+    Failed(EscrowError),
+    /// Not attempted (see [`SimulatedSkipReason`]).
+    Skipped(SimulatedSkipReason),
+}
+
+/// One event the simulated action would emit, in `seq` order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimulatedEvent {
+    /// The event kind name (e.g. `"Initialized"`, `"Funded"`,
+    /// `"Released"`).
+    pub kind: String,
+    pub from: EscrowState,
+    pub to: EscrowState,
+    /// Taker payout carried by the event (`Released` only).
+    pub payout: u64,
+    /// Protocol fee carried by the event (`Released` only).
+    pub fee: u64,
+}
+
+/// The predicted outcome of one bundle action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimulatedAction {
+    /// Which escrow this instruction targets (the vault PDA).
+    pub escrow_id: [u8; 32],
+    /// The program-side instruction name (`"initialize"`, `"fund"`,
+    /// `"release"`).
+    pub instruction: &'static str,
+    pub outcome: SimulatedOutcome,
+    /// Post-action state when executed; pre-action state otherwise
+    /// (a failed action changes nothing — the AV-76 no-mutation
+    /// guarantee — so pre == post on failure).
+    pub state: EscrowState,
+    /// Cumulative released amount after the action.
+    pub released: u64,
+    /// Cumulative refunded amount after the action (`0` on this
+    /// lifecycle line — `initialize -> fund -> release` never refunds;
+    /// the field exists so the dry-run shape matches the keeper's
+    /// other reports).
+    pub refunded: u64,
+    /// This action's taker payout (`release` only).
+    pub payout: u64,
+    /// This action's protocol fee (`release` only).
+    pub fee: u64,
+    /// Events the action would emit, in `seq` order (captured on the
+    /// simulation clone — zero leakage into the caller's escrows).
+    pub events: Vec<SimulatedEvent>,
+}
+
+impl SimulatedAction {
+    fn failed(
+        action: &BundledAction,
+        error: EscrowError,
+        state: EscrowState,
+        released: u64,
+    ) -> Self {
+        Self {
+            escrow_id: action.escrow_id,
+            instruction: action.instruction,
+            outcome: SimulatedOutcome::Failed(error),
+            state,
+            released,
+            refunded: 0,
+            payout: 0,
+            fee: 0,
+            events: Vec::new(),
+        }
+    }
+
+    fn skipped(action: &BundledAction, reason: SimulatedSkipReason) -> Self {
+        Self {
+            escrow_id: action.escrow_id,
+            instruction: action.instruction,
+            outcome: SimulatedOutcome::Skipped(reason),
+            // Unknown without a snapshot; `Uninitialized` is the honest
+            // "no information" marker here, documented as such.
+            state: EscrowState::Uninitialized,
+            released: 0,
+            refunded: 0,
+            payout: 0,
+            fee: 0,
+            events: Vec::new(),
+        }
+    }
+}
+
+/// The dry-run prediction for a whole [`ExecutionBundle`]: one
+/// [`SimulatedAction`] per bundle action, in bundle order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleSimulation {
+    /// The simulated bundle's id.
+    pub bundle_id: String,
+    /// The `at` the simulation ran against (the state machine's
+    /// `now` for gate checks).
+    pub at: u64,
+    pub actions: Vec<SimulatedAction>,
+}
+
+impl BundleSimulation {
+    /// `true` iff every action would execute — the keeper's green
+    /// light to submit.
+    pub fn all_ok(&self) -> bool {
+        self.actions
+            .iter()
+            .all(|a| a.outcome == SimulatedOutcome::Executed)
+    }
+
+    /// The first action that would fail, if any.
+    pub fn failed_action(&self) -> Option<&SimulatedAction> {
+        self.actions.iter().find(|a| {
+            matches!(a.outcome, SimulatedOutcome::Failed(_))
+        })
+    }
+
+    fn hex32(b: &[u8; 32]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut s = String::with_capacity(64);
+        for byte in b {
+            s.push(HEX[(byte >> 4) as usize] as char);
+            s.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        s
+    }
+
+    /// Hand-serialized JSON (the crate is dependency-free).
+    /// Deterministic field order; a failed action carries
+    /// `"error":{"name":"…","code":N}` and every later action
+    /// `"outcome":"skipped"`.
+    pub fn to_json(&self) -> String {
+        let mut s = String::new();
+        s.push_str("{\"bundle_id\":\"");
+        s.push_str(&self.bundle_id);
+        s.push_str("\",\"at\":");
+        s.push_str(&self.at.to_string());
+        s.push_str(",\"all_ok\":");
+        s.push_str(if self.all_ok() { "true" } else { "false" });
+        s.push_str(",\"actions\":[");
+        for (i, a) in self.actions.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"escrow_id\":\"");
+            s.push_str(&Self::hex32(&a.escrow_id));
+            s.push_str("\",\"instruction\":\"");
+            s.push_str(a.instruction);
+            s.push_str("\",\"outcome\":\"");
+            match &a.outcome {
+                SimulatedOutcome::Executed => s.push_str("executed"),
+                SimulatedOutcome::Failed(_) => s.push_str("failed"),
+                SimulatedOutcome::Skipped(_) => s.push_str("skipped"),
+            }
+            s.push('"');
+            match &a.outcome {
+                SimulatedOutcome::Failed(e) => {
+                    s.push_str(",\"error\":{\"name\":\"");
+                    s.push_str(&format!("{:?}", e));
+                    s.push_str("\",\"code\":");
+                    s.push_str(&e.code().to_string());
+                    s.push('}');
+                }
+                SimulatedOutcome::Skipped(reason) => {
+                    s.push_str(",\"skip_reason\":\"");
+                    s.push_str(match reason {
+                        SimulatedSkipReason::BundleAborted => "bundle_aborted",
+                        SimulatedSkipReason::MissingSnapshot => "missing_snapshot",
+                    });
+                    s.push('"');
+                }
+                SimulatedOutcome::Executed => {}
+            }
+            s.push_str(",\"state\":\"");
+            s.push_str(&format!("{:?}", a.state));
+            s.push_str("\",\"released\":");
+            s.push_str(&a.released.to_string());
+            s.push_str(",\"refunded\":");
+            s.push_str(&a.refunded.to_string());
+            s.push_str(",\"payout\":");
+            s.push_str(&a.payout.to_string());
+            s.push_str(",\"fee\":");
+            s.push_str(&a.fee.to_string());
+            s.push_str(",\"events\":[");
+            for (j, e) in a.events.iter().enumerate() {
+                if j > 0 {
+                    s.push(',');
+                }
+                s.push_str("{\"kind\":\"");
+                s.push_str(&e.kind);
+                s.push_str("\",\"from\":\"");
+                s.push_str(&format!("{:?}", e.from));
+                s.push_str("\",\"to\":\"");
+                s.push_str(&format!("{:?}", e.to));
+                s.push_str("\",\"payout\":");
+                s.push_str(&e.payout.to_string());
+                s.push_str(",\"fee\":");
+                s.push_str(&e.fee.to_string());
+                s.push('}');
+            }
+            s.push_str("]}");
+        }
+        s.push_str("]}");
+        s
+    }
+}
+
+/// Dry-run an [`ExecutionBundle`] without touching anything real.
+///
+/// Each action executes in bundle order on a per-escrow
+/// [`IndexedEscrow`] clone seeded from `watched` (`initialize`
+/// actions create a fresh vault — they need no snapshot). The
+/// caller's `watched` snapshots are never mutated and no events leak
+/// anywhere: every transition — including its event log — happens on
+/// the clone, following the AV-76 all-or-nothing convention.
+///
+/// The first action whose gate rejects it ends the simulation with
+/// [`SimulatedOutcome::Failed`] carrying the exact [`EscrowError`]
+/// (and its stable [`code`](EscrowError::code)); every later action
+/// is [`SimulatedOutcome::Skipped`] (`bundle_aborted`) because a real
+/// submission would abort the whole transaction there. A
+/// non-`initialize` action with no snapshot in `watched` is skipped
+/// (`missing_snapshot`) — the keeper must pass the current snapshot
+/// for every vault the bundle touches.
+///
+/// `at` is the state machine's `now` for gate checks (timelock,
+/// expiry). It defaults to the bundle's own `at` when the caller
+/// passes `bundle.at`; pass a newer timestamp to dry-run "what if I
+/// submit this bundle later".
+pub fn simulate_bundle(
+    bundle: &ExecutionBundle,
+    watched: &[IndexedEscrow],
+    at: u64,
+) -> BundleSimulation {
+    let mut sim = BundleSimulation {
+        bundle_id: bundle.bundle_id.clone(),
+        at,
+        actions: Vec::with_capacity(bundle.actions.len()),
+    };
+    // Per-escrow working clones, in first-seen order. Only these are
+    // ever mutated.
+    let mut working: Vec<IndexedEscrow> = Vec::new();
+    let mut aborted = false;
+    for action in &bundle.actions {
+        if aborted {
+            sim.actions.push(SimulatedAction::skipped(
+                action,
+                SimulatedSkipReason::BundleAborted,
+            ));
+            continue;
+        }
+        let simulated = simulate_one(bundle, action, watched, &mut working, at);
+        if matches!(simulated.outcome, SimulatedOutcome::Failed(_)) {
+            aborted = true;
+        }
+        sim.actions.push(simulated);
+    }
+    sim
+}
+
+/// Simulate one bundle action against the per-escrow working clones.
+fn simulate_one(
+    bundle: &ExecutionBundle,
+    action: &BundledAction,
+    watched: &[IndexedEscrow],
+    working: &mut Vec<IndexedEscrow>,
+    at: u64,
+) -> SimulatedAction {
+    // Resolve the working clone for this escrow, creating it on first
+    // touch. Returns the index into `working`, or a complete
+    // `SimulatedAction` when the action is fully resolved during
+    // setup (fresh `initialize`, missing snapshot, contradictory
+    // input).
+    let work_idx: usize = match working.iter().position(|w| w.escrow_id() == action.escrow_id) {
+        Some(i) => i,
+        None => {
+            if action.kind == BatchActionKind::Initialize {
+                // A fresh vault: the scan lists `initialize` only for
+                // not-created items, so an existing snapshot here
+                // means the bundle contradicts the watch list — the
+                // chain would reject the duplicate create.
+                if watched.iter().any(|w| w.escrow_id() == action.escrow_id) {
+                    return SimulatedAction::failed(
+                        action,
+                        EscrowError::InvalidStateTransition,
+                        EscrowState::Uninitialized,
+                        0,
+                    );
+                }
+                let fresh = IndexedEscrow::initialize(
+                    bundle.caller,
+                    action.taker.unwrap_or([0u8; 32]),
+                    action.amount,
+                    action.expires_at,
+                    action.escrow_id,
+                    at,
+                );
+                match fresh {
+                    Ok(w) => {
+                        let events: Vec<SimulatedEvent> = w
+                            .events()
+                            .iter()
+                            .map(|e| SimulatedEvent {
+                                kind: format!("{:?}", e.kind),
+                                from: e.from,
+                                to: e.to,
+                                payout: e.amounts.payout,
+                                fee: e.amounts.fee,
+                            })
+                            .collect();
+                        let simulated = SimulatedAction {
+                            escrow_id: action.escrow_id,
+                            instruction: action.instruction,
+                            outcome: SimulatedOutcome::Executed,
+                            state: w.inner().state(),
+                            released: w.inner().released_amount(),
+                            refunded: 0,
+                            payout: 0,
+                            fee: 0,
+                            events,
+                        };
+                        working.push(w);
+                        return simulated;
+                    }
+                    Err(e) => {
+                        return SimulatedAction::failed(
+                            action,
+                            e,
+                            EscrowState::Uninitialized,
+                            0,
+                        )
+                    }
+                }
+            } else {
+                match watched.iter().find(|w| w.escrow_id() == action.escrow_id) {
+                    Some(snap) => {
+                        working.push(snap.clone());
+                        working.len() - 1
+                    }
+                    None => {
+                        return SimulatedAction::skipped(
+                            action,
+                            SimulatedSkipReason::MissingSnapshot,
+                        )
+                    }
+                }
+            }
+        }
+    };
+    let work = &mut working[work_idx];
+    let events_before = work.events().len();
+    let pre_state = work.inner().state();
+    let pre_released = work.inner().released_amount();
+
+    // Apply the action to the clone. On failure the state machine
+    // leaves the escrow untouched (AV-76), so pre-state == post-state.
+    let result: Result<(u64, u64), EscrowError> = match action.kind {
+        BatchActionKind::Initialize => {
+            // Already created above on first touch; a second
+            // `initialize` for the same escrow in one bundle is a
+            // caller bug — the chain would reject the duplicate.
+            Err(EscrowError::InvalidStateTransition)
+        }
+        BatchActionKind::Fund => work.fund(bundle.caller, at).map(|()| (0, 0)),
+        BatchActionKind::Release => {
+            let payout_to = work.inner().taker();
+            work.release(bundle.caller, action.amount, bundle.mint, payout_to, at)
+        }
+    };
+
+    let (payout, fee) = match result {
+        Ok((p, f)) => (p, f),
+        Err(e) => return SimulatedAction::failed(action, e, pre_state, pre_released),
+    };
+
+    let events: Vec<SimulatedEvent> = work.events()[events_before..]
+        .iter()
+        .map(|e| SimulatedEvent {
+            kind: format!("{:?}", e.kind),
+            from: e.from,
+            to: e.to,
+            payout: e.amounts.payout,
+            fee: e.amounts.fee,
+        })
+        .collect();
+    SimulatedAction {
+        escrow_id: action.escrow_id,
+        instruction: action.instruction,
+        outcome: SimulatedOutcome::Executed,
+        state: work.inner().state(),
+        released: work.inner().released_amount(),
+        refunded: 0,
+        payout,
+        fee,
+        events,
+    }
+}
+
 #[cfg(test)]
 mod execution_bundle_tests {
     use super::*;
@@ -1172,5 +1594,189 @@ mod execution_bundle_tests {
             zero_caller.with_jito_tip(1_000, RECIPIENT).unwrap_err(),
             TipConfigError::ZeroPayer
         );
+    }
+
+    // ---------------------------------------------------------------
+    // AV-102: bundle simulation tests.
+    // ---------------------------------------------------------------
+
+    /// Build `IndexedEscrow` snapshots from plain escrows (the
+    /// keeper's watch-list conversion via `IndexedEscrow::wrap`).
+    fn indexed_watch(items: &[([u8; 32], Escrow)]) -> Vec<IndexedEscrow> {
+        items
+            .iter()
+            .map(|(id, e)| IndexedEscrow::wrap(*id, e.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn simulate_initialize_then_fund_predicts_state_and_events() {
+        // One not-created vault: the bundle holds `initialize`.
+        let items = vec![watch(ID1, None, ALICE)];
+        let report = scan_batch_lifecycle(&items, NOW);
+        let bundles = bundle_execution(&report);
+        assert_eq!(bundles.len(), 1);
+        let sim = simulate_bundle(&bundles[0], &[], NOW);
+        assert!(sim.all_ok());
+        assert_eq!(sim.actions.len(), 1);
+        let a = &sim.actions[0];
+        assert_eq!(a.instruction, "initialize");
+        assert_eq!(a.outcome, SimulatedOutcome::Executed);
+        // A fresh initialize leaves the escrow `Uninitialized`
+        // (funding is a separate step) with no funds moved.
+        assert_eq!(a.state, EscrowState::Uninitialized);
+        assert_eq!(a.released, 0);
+        assert_eq!(a.payout, 0);
+        assert_eq!(a.fee, 0);
+        assert_eq!(a.events.len(), 1);
+        assert_eq!(a.events[0].kind, "Initialized");
+        // The dry-run JSON carries the prediction.
+        let json = sim.to_json();
+        assert!(json.contains("\"all_ok\":true"));
+        assert!(json.contains("\"instruction\":\"initialize\""));
+        assert!(json.contains("\"outcome\":\"executed\""));
+    }
+
+    #[test]
+    fn simulate_fund_and_release_end_to_end() {
+        // Funded escrow past its timelock: the bundle holds `release`.
+        let e = funded(ALICE, None);
+        let items = vec![watch(ID1, Some(e.clone()), ALICE)];
+        let report = scan_batch_lifecycle(&items, NOW);
+        let bundles = bundle_execution(&report);
+        assert_eq!(bundles.len(), 1);
+        // Sanity: the scan listed a release for the funded escrow.
+        assert!(bundles[0].actions.iter().any(|a| a.instruction == "release"));
+
+        let watched = indexed_watch(&[(ID1, e)]);
+        let sim = simulate_bundle(&bundles[0], &watched, NOW);
+        assert!(sim.all_ok());
+        let a = sim.actions.iter().find(|a| a.instruction == "release").unwrap();
+        assert_eq!(a.outcome, SimulatedOutcome::Executed);
+        assert_eq!(a.state, EscrowState::Released);
+        assert_eq!(a.released, AMOUNT);
+        assert_eq!(a.payout + a.fee, AMOUNT);
+        assert_eq!(a.refunded, 0);
+        assert_eq!(a.events.len(), 1);
+        assert_eq!(a.events[0].kind, "Released");
+        assert_eq!(a.events[0].payout, a.payout);
+    }
+
+    #[test]
+    fn simulate_stops_at_first_failure_with_precise_error() {
+        // Hand-build a bundle whose fund must fail: the escrow is
+        // already `Funded`, so a second `fund` hits the state gate.
+        // The scan would never list this — the test pins the
+        // failure-prediction path directly.
+        let e = funded(ALICE, None);
+        let bundle = ExecutionBundle {
+            bundle_id: "bundle-0".to_string(),
+            mint: None,
+            caller: ALICE,
+            caller_role: "initializer",
+            actions: vec![
+                BundledAction {
+                    escrow_id: ID1,
+                    kind: BatchActionKind::Fund,
+                    instruction: "fund",
+                    discriminator: [0u8; 8],
+                    caller_role: "initializer",
+                    taker: None,
+                    expires_at: 0,
+                    amount: AMOUNT,
+                    payout: 0,
+                    fee: 0,
+                    accounts: vec![],
+                    reason: "unfunded",
+                },
+                BundledAction {
+                    escrow_id: ID1,
+                    kind: BatchActionKind::Release,
+                    instruction: "release",
+                    discriminator: [0u8; 8],
+                    caller_role: "initializer",
+                    taker: None,
+                    expires_at: 0,
+                    amount: AMOUNT,
+                    payout: 0,
+                    fee: 0,
+                    accounts: vec![],
+                    reason: "releasable",
+                },
+            ],
+            alt_table: vec![],
+            at: NOW,
+            scanned: 1,
+            estimated_priority_fee: None,
+            jito_tip: None,
+        };
+        let watched = indexed_watch(&[(ID1, e)]);
+        let sim = simulate_bundle(&bundle, &watched, NOW);
+        assert!(!sim.all_ok());
+        // The fund action failed with the state gate's exact error.
+        let failed = sim.failed_action().expect("one failure");
+        assert_eq!(failed.instruction, "fund");
+        match failed.outcome {
+            SimulatedOutcome::Failed(err) => {
+                assert_eq!(err, EscrowError::InvalidStateTransition);
+                assert_eq!(err.code(), EscrowError::InvalidStateTransition.code());
+            }
+            _ => panic!("expected Failed"),
+        }
+        // The release was never attempted (atomicity).
+        assert_eq!(
+            sim.actions[1].outcome,
+            SimulatedOutcome::Skipped(SimulatedSkipReason::BundleAborted)
+        );
+        let json = sim.to_json();
+        assert!(json.contains("\"all_ok\":false"));
+        assert!(json.contains("\"outcome\":\"failed\""));
+        assert!(json.contains("\"name\":\"InvalidStateTransition\""));
+        assert!(json.contains("\"outcome\":\"skipped\""));
+        assert!(json.contains("\"skip_reason\":\"bundle_aborted\""));
+    }
+
+    #[test]
+    fn simulate_never_mutates_watched_or_leaks_events() {
+        let e = funded(ALICE, None);
+        let items = vec![watch(ID1, Some(e.clone()), ALICE)];
+        let report = scan_batch_lifecycle(&items, NOW);
+        let bundles = bundle_execution(&report);
+        let mut watched = indexed_watch(&[(ID1, e)]);
+        let events_before = watched[0].events().len();
+        let state_before = watched[0].inner().state();
+        let _ = simulate_bundle(&bundles[0], &watched, NOW);
+        // The caller's snapshots are bit-identical afterwards.
+        assert_eq!(watched[0].inner().state(), state_before);
+        assert_eq!(watched[0].events().len(), events_before);
+        assert_eq!(watched.len(), 1);
+        // And a second simulation sees the same starting point
+        // (idempotent dry-run).
+        let sim2 = simulate_bundle(&bundles[0], &watched, NOW);
+        assert!(sim2.all_ok());
+    }
+
+    #[test]
+    fn simulate_missing_snapshot_skips_with_reason() {
+        let items = vec![watch(ID1, Some(funded(ALICE, None)), ALICE)];
+        let report = scan_batch_lifecycle(&items, NOW);
+        let bundles = bundle_execution(&report);
+        // No snapshots at all: non-initialize actions cannot run.
+        let sim = simulate_bundle(&bundles[0], &[], NOW);
+        assert!(!sim.all_ok());
+        assert!(sim.actions.iter().all(|a| matches!(
+            a.outcome,
+            SimulatedOutcome::Skipped(SimulatedSkipReason::MissingSnapshot)
+        )));
+        assert!(sim.to_json().contains("\"skip_reason\":\"missing_snapshot\""));
+    }
+
+    #[test]
+    fn wrap_starts_with_empty_event_log() {
+        let e = funded(ALICE, None);
+        let w = IndexedEscrow::wrap(ID1, e);
+        assert_eq!(w.escrow_id(), ID1);
+        assert!(w.events().is_empty());
+        assert_eq!(w.inner().state(), EscrowState::Funded);
     }
 }

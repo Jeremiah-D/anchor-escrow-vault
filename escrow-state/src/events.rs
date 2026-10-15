@@ -1588,6 +1588,24 @@ impl IndexedEscrow {
         self.escrow_id
     }
 
+    /// AV-102: wrap a plain [`Escrow`] snapshot as an [`IndexedEscrow`]
+    /// so keeper-side tooling (notably
+    /// [`simulate_bundle`](super::execution_bundle::simulate_bundle))
+    /// can run the event-emitting transitions on a clone. The event
+    /// log starts empty (`next_seq` 0) — the wrapper records only
+    /// transitions applied *after* the wrap, so a wrapped snapshot
+    /// never invents history. Read-only with respect to the caller's
+    /// `escrow` (it is moved in, the caller's copy — if any — is
+    /// untouched).
+    pub fn wrap(escrow_id: [u8; 32], escrow: crate::Escrow) -> Self {
+        Self {
+            inner: escrow,
+            escrow_id,
+            events: Vec::new(),
+            next_seq: 0,
+        }
+    }
+
     /// All recorded events, in `seq` order.
     pub fn events(&self) -> &[EscrowEvent] {
         &self.events
