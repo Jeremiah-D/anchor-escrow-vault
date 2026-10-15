@@ -3076,11 +3076,31 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to the appeal bond (AV-103; mirrors
+    /// `Escrow::with_appeal_bond`): the amount the taker must lock when
+    /// filing a slash appeal. `Uninitialized` only, like
+    /// `initialize_appeal_window` — the bond is fixed before funds
+    /// move. A zero bond is `InvalidAppealBond` (code 158) — a zero
+    /// bond is a no-op; the no-bond default already covers free filing.
+    /// Emits no event (pre-fund configuration).
+    pub fn initialize_appeal_bond(
+        ctx: Context<InitializeAppealBond>,
+        bond: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_appeal_bond(bond)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
     /// File an appeal against the executed slash (AV-86; mirrors
-    /// `Escrow::file_appeal`): `Funded -> Funded` — filing moves no
-    /// funds, it only records the taker's challenge and opens the
-    /// arbiter panel's review. The taker signs — only the slashed party
-    /// may contest the penalty.
+    /// `Escrow::file_appeal`): `Funded -> Funded` — filing records the
+    /// taker's challenge and opens the arbiter panel's review (and,
+    /// AV-103, locks the configured appeal bond — the real build
+    /// transfers it from the taker into the vault). The taker signs —
+    /// only the slashed party may contest the penalty.
     /// `now` comes from the Solana clock sysvar (never an instruction
     /// param — a caller-supplied timestamp could rewind back inside
     /// the window). The state machine enforces the full eligibility
@@ -3122,12 +3142,18 @@ pub mod escrow_vault {
     /// side reaches the panel threshold (the AV-65 tally precedent).
     /// A non-resolving vote emits nothing (the ballot is still open);
     /// the M-th matching vote emits `AppealResolved` (from == to ==
-    /// `Funded`; the refunded penalty rides `payout` on overturn, zero
-    /// on uphold), mirroring `IndexedEscrow::review_appeal`. Returns
-    /// the resolution as `(outcome, refunded)` — `outcome` 0 ==
-    /// upheld, 1 == overturned — so the real build can size the
-    /// restitution transfer; `None` while the ballot is open.
-    pub fn review_appeal(ctx: Context<ReviewAppeal>, uphold: bool) -> Result<Option<(u8, u64)>> {
+    /// `Funded`; on overturn the taker's full restitution — refunded
+    /// penalty plus refunded appeal bond (AV-103) — rides `payout`,
+    /// zero on uphold), mirroring `IndexedEscrow::review_appeal`.
+    /// Returns the resolution as `(outcome, penalty_refunded,
+    /// bond_moved)` — `outcome` 0 == upheld, 1 == overturned;
+    /// `bond_moved` is the forfeited bond on uphold and the refunded
+    /// bond on overturn (`0` when no bond was configured) — so the
+    /// real build can size both transfers; `None` while the ballot is
+    /// open. (The skeleton emitter has no `penalty` slot, so an
+    /// uphold forfeiture rides the vault state here; the real build's
+    /// `AppealResolved` event carries it in `amounts.penalty`.)
+    pub fn review_appeal(ctx: Context<ReviewAppeal>, uphold: bool) -> Result<Option<(u8, u64, u64)>> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let from = escrow.state() as u8;
         let resolved = escrow
@@ -3135,13 +3161,23 @@ pub mod escrow_vault {
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
-        if let Some((outcome, refunded)) = resolved {
+        if let Some((outcome, penalty_refunded, bond_moved)) = resolved {
+            // AV-103: on overturn the taker's full restitution
+            // (penalty + refunded bond) rides `payout`; on uphold the
+            // forfeited bond has no emitter slot here — it rides the
+            // vault state (the real build carries it in
+            // `amounts.penalty`).
+            let payout = if matches!(outcome, escrow_state::AppealOutcome::Overturned) {
+                penalty_refunded.saturating_add(bond_moved)
+            } else {
+                0
+            };
             emit_transition(
                 &ctx.accounts.vault,
                 escrow_state::EscrowEventKind::AppealResolved,
                 from,
                 escrow.state() as u8,
-                refunded,
+                payout,
                 0,
                 0,
                 now,
@@ -3151,10 +3187,49 @@ pub mod escrow_vault {
                 None,
                 Some(ctx.accounts.member.key()),
             );
-            Ok(Some((outcome as u8, refunded)))
+            Ok(Some((outcome as u8, penalty_refunded, bond_moved)))
         } else {
             Ok(None)
         }
+    }
+
+    /// Sweep a filed slash appeal whose window lapsed unresolved
+    /// (AV-103; mirrors `Escrow::expire_appeal`): `Funded -> Funded` —
+    /// the appeal moves terminally to `Expired`, the slash stands, and
+    /// the locked appeal bond (if any) is forfeited to the initializer
+    /// (the anti-malicious-appeal-delay rule). Permissionless, like
+    /// `crank_expired`: anyone may crank a lapsed appeal — the caller
+    /// signs only as the event actor; the forfeited bond routes to the
+    /// initializer, never the caller. `now` comes from the Solana clock
+    /// sysvar (never an instruction param). Emits `AppealExpired`
+    /// (from == to == `Funded`), mirroring
+    /// `IndexedEscrow::expire_appeal`. Returns the forfeited bond (`0`
+    /// when no bond was locked) so the real build can size the
+    /// transfer to the initializer.
+    pub fn expire_appeal(ctx: Context<ExpireAppeal>) -> Result<u64> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let forfeited = escrow
+            .expire_appeal(ctx.accounts.caller.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::AppealExpired,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.caller.key()),
+        );
+        Ok(forfeited)
     }
 
     /// Clear the AV-27 timelock by dual-signed emergency governance
@@ -5305,6 +5380,31 @@ pub struct ReviewAppeal<'info> {
     pub clock: AccountInfo<'info>,
 }
 
+/// AV-103: opt into the appeal bond (pre-fund configuration).
+#[derive(Accounts)]
+pub struct InitializeAppealBond<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer fixes the appeal bond; the state machine
+    /// rejects re-configuration once the escrow leaves `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-103: permissionless sweep of a filed appeal whose window lapsed
+/// unresolved.
+#[derive(Accounts)]
+pub struct ExpireAppeal<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Anyone may crank a lapsed appeal (the state machine performs no
+    /// authority check); the forfeited bond routes to the initializer,
+    /// never the caller.
+    pub caller: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the window-lapse check
+    /// (never an instruction param).
+    pub clock: AccountInfo<'info>,
+}
+
 #[derive(Accounts)]
 pub struct Escalate<'info> {
     #[account(mut)]
@@ -6335,6 +6435,12 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidTransferHook => {
             error!(ErrorCode::InvalidTransferHook)
         }
+        escrow_state::EscrowError::InvalidAppealBond => {
+            error!(ErrorCode::InvalidAppealBond)
+        }
+        escrow_state::EscrowError::AppealExpiryNotDue => {
+            error!(ErrorCode::AppealExpiryNotDue)
+        }
     }
 }
 
@@ -6450,4 +6556,8 @@ pub enum ErrorCode {
     AuctionNotActive,
     #[msg("Invalid Token-2022 transfer-hook declaration (AV-99): with_transfer_hook with the zero program id, on a non-Uninitialized escrow, or before with_mint bound a mint (a transfer hook is a Token-2022 concept, meaningless on the native-SOL path)")]
     InvalidTransferHook,
+    #[msg("Invalid appeal-bond configuration (AV-103): with_appeal_bond with a zero bond (a zero bond is a no-op; the no-bond default already covers free filing)")]
+    InvalidAppealBond,
+    #[msg("The appeal window has not lapsed yet (AV-103): expire_appeal with now <= appeal_deadline — the sweep only runs once the window is actually over")]
+    AppealExpiryNotDue,
 }

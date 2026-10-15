@@ -989,7 +989,9 @@ pub struct Escrow {
     /// [`Escrow::slash`] — kept separate from `released` so the audit
     /// trail distinguishes a default penalty from a taker payout. The
     /// conservation invariant becomes
-    /// `inflow == locked + released + refunded + penalty_paid`.
+    /// `inflow == locked + released + refunded + penalty_paid`
+    /// (plus `appeal_bond_paid` under AV-103 — the taker-locked
+    /// appeal bond is additional inflow on top of the principal).
     /// `slash` is one-shot, so this is `0` or a single slash amount;
     /// always `<= amount`. Persisted (8 bytes, zeroed when never
     /// slashed). Appended last so every earlier field offset stays
@@ -1156,6 +1158,30 @@ pub struct Escrow {
     /// (the unified cumulative-fee counter) as well as tracked
     /// separately here for the snapshot.
     streaming_fees_accrued: u64,
+    /// AV-103: opt-in appeal bond configured via
+    /// [`Escrow::with_appeal_bond`] — the amount the taker must lock
+    /// when filing a slash appeal ([`Escrow::file_appeal`]). `0` (the
+    /// default) means no bond is required: filing stays free, backward
+    /// compatible. Set once on an `Uninitialized` escrow. Persisted
+    /// (8 bytes, zeroed when no bond is configured). Appended last so
+    /// every earlier field offset stays stable.
+    appeal_bond: u64,
+    /// AV-103: the appeal bond actually locked by the taker at
+    /// [`Escrow::file_appeal`] — the independent bond counter. Never
+    /// mixed into `released` or `penalty_paid`: on overturn
+    /// ([`Escrow::review_appeal`]) it is refunded to the taker in
+    /// full, on uphold or on window expiry
+    /// ([`Escrow::expire_appeal`]) it is forfeited to the initializer.
+    /// While an appeal is pending the bond is NOT part of the
+    /// claimable / release base — `claimable_amount`,
+    /// [`Escrow::claim`] and [`Escrow::release`] price only against
+    /// `released` + `penalty_paid`, never this counter. The
+    /// conservation invariant becomes `inflow == locked + released +
+    /// refunded + penalty_paid + appeal_bond_paid`, where `inflow`
+    /// counts the taker-locked bond on top of the escrow principal.
+    /// Persisted (8 bytes, zeroed when no appeal is in flight).
+    /// Appended last so every earlier field offset stays stable.
+    appeal_bond_paid: u64,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// the hand-written Borsh layout tests, `decode_vault_account`,
@@ -1673,6 +1699,18 @@ pub enum EscrowError {
     /// `with_arbitration_deadline`). Never renumbered (see
     /// [`EscrowError::code`]).
     InvalidTransferHook,
+    /// Invalid appeal-bond configuration (AV-103):
+    /// [`Escrow::with_appeal_bond`] with a zero bond — a zero bond
+    /// is a no-op, so opting in requires a real amount; the
+    /// no-bond default already covers the free-filing case. Never
+    /// renumbered (see [`EscrowError::code`]).
+    InvalidAppealBond,
+    /// The appeal window has not lapsed yet (AV-103):
+    /// [`Escrow::expire_appeal`] with `now <= appeal_deadline` — the
+    /// sweep only runs once the window is actually over, so a live
+    /// appeal can never be expired out from under the panel. Never
+    /// renumbered (see [`EscrowError::code`]).
+    AppealExpiryNotDue,
 }
 
 impl EscrowError {
@@ -1745,6 +1783,9 @@ impl EscrowError {
             EscrowError::AuctionNotActive => 156,
             // AV-99: appended, never renumbered.
             EscrowError::InvalidTransferHook => 157,
+            // AV-103: appended, never renumbered.
+            EscrowError::InvalidAppealBond => 158,
+            EscrowError::AppealExpiryNotDue => 159,
         }
     }
 
@@ -1809,6 +1850,8 @@ impl EscrowError {
             EscrowError::InvalidAuctionParams,
             EscrowError::AuctionNotActive,
             EscrowError::InvalidTransferHook,
+            EscrowError::InvalidAppealBond,
+            EscrowError::AppealExpiryNotDue,
         ]
     }
 }
@@ -2020,6 +2063,13 @@ pub const TRANSFER_HOOK_REGION_LEN: usize = 1 + 32;
 /// `streaming_fees_accrued`. Appended after the transfer-hook
 /// region, so every pre-AV-100 field keeps its offset.
 pub const STREAMING_FEE_REGION_LEN: usize = 8 + 8;
+
+/// Serialized length of the AV-103 appeal-bond tail region: the
+/// 8-byte configured `appeal_bond` followed by the 8-byte
+/// `appeal_bond_paid` counter (zeroed when no bond is configured /
+/// no appeal is in flight). Appended after the streaming-fee
+/// region, so every pre-AV-103 field keeps its offset.
+pub const APPEAL_BOND_REGION_LEN: usize = 8 + 8;
 
 /// Dutch-auction settlement terms (AV-97): an opt-in descending-price
 /// pull path for the taker, fixed before any funds move (see
@@ -2397,7 +2447,9 @@ pub const SLASH_TERMS_LEN: usize = 32 + 8;
 /// the dedicated [`Escrow::penalty_paid`] counter — never mixed into
 /// `released` — so the audit trail distinguishes a default penalty
 /// from a taker payout and the conservation invariant stays exact:
-/// `inflow == locked + released + refunded + penalty_paid`.
+/// `inflow == locked + released + refunded + penalty_paid +
+/// appeal_bond_paid` (AV-103: the taker-locked appeal bond counts as
+/// additional inflow on top of the escrow principal).
 ///
 /// `Copy` so keeper/indexer tooling can lift the terms off a snapshot
 /// without borrowing the escrow.
@@ -2446,6 +2498,13 @@ pub enum AppealState {
     /// Panel overturned the slash; the penalty was refunded to the
     /// taker.
     Overturned,
+    /// AV-103: the appeal window lapsed while the appeal was still
+    /// `Filed` — [`Escrow::expire_appeal`] swept it. Terminal: the
+    /// slash stands (like `Upheld`), and any locked appeal bond was
+    /// forfeited to the initializer (the anti-malicious-appeal-delay
+    /// rule). Appended last so discriminants 0–3 stay stable for
+    /// already-serialized vaults.
+    Expired,
 }
 
 /// The panel's verdict on a slash appeal (AV-86): the outcome the
@@ -4197,6 +4256,10 @@ impl Escrow {
             transfer_hook: None,
             streaming_fee_rate: 0,
             streaming_fees_accrued: 0,
+            // AV-103: no appeal bond by default (backward compatible)
+            // — filing stays free unless `with_appeal_bond` opts in.
+            appeal_bond: 0,
+            appeal_bond_paid: 0,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -4697,7 +4760,9 @@ let fee = self.charge_protocol_fee(amount)?;
     /// Conservation: `self.released` accumulates the *gross* amount,
     /// exactly like `release` — the invariant
     /// `inflow == locked + released + refunded` (plus `penalty_paid`
-    /// under AV-82) is untouched by the split.
+    /// under AV-82 and `appeal_bond_paid` under AV-103 — the bond is
+    /// taker-supplied additional inflow, never part of the split
+    /// base) is untouched by the split.
     ///
     /// Returns `(legs, fee)`: the per-recipient `(recipient, net_share)`
     /// legs in table order (sized for the Anchor layer's transfers) and
@@ -5547,7 +5612,9 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// `0` when never slashed. Kept separate from `released` — the
     /// audit trail distinguishes a default penalty from a taker
     /// payout — and part of the conservation invariant:
-    /// `inflow == locked + released + refunded + penalty_paid`.
+    /// `inflow == locked + released + refunded + penalty_paid +
+    /// appeal_bond_paid` (AV-103 — the bond is additional inflow from
+    /// the taker, tracked in its own counter).
     pub fn penalty_paid(&self) -> u64 {
         self.penalty_paid
     }
@@ -5792,6 +5859,85 @@ let fee = self.charge_protocol_fee(claimable)?;
         self.appeal_ballot
     }
 
+    /// Opt in to an appeal bond (AV-103 — Solana dispute economics /
+    /// anti-griefing): require the taker to lock `bond` lamports (or
+    /// base-token units) when filing a slash appeal, via
+    /// [`Escrow::file_appeal`]. The bond prices frivolous or
+    /// delay-motivated appeals: overturn refunds it in full (no fee),
+    /// while an upheld appeal — or a window that lapses unresolved
+    /// ([`Escrow::expire_appeal`]) — forfeits it to the initializer.
+    ///
+    /// Why: a free appeal lets the taker stall a legitimate slash for
+    /// the whole window at zero cost. The bond makes the appeal a
+    /// staked claim — the taker only files when they believe the
+    /// slash was wrongful.
+    ///
+    /// Builder-style: only valid on an `Uninitialized` escrow, so the
+    /// bond is fixed before any funds move — mirroring
+    /// [`Escrow::with_appeal_window`]. A zero bond is
+    /// [`EscrowError::InvalidAppealBond`] (a zero bond is a no-op —
+    /// the no-bond default already covers free filing; parallels
+    /// `with_appeal_window`'s zero-window rejection). Configuring
+    /// after funding is [`EscrowError::InvalidStateTransition`]. A
+    /// paused escrow fails fast ([`EscrowError::Paused`]).
+    ///
+    /// The bond is deliberately order-independent of
+    /// [`Escrow::with_appeal_window`]: a bond without a configured
+    /// window is simply inert ([`Escrow::file_appeal`] requires the
+    /// window anyway), so builders compose in any order.
+    pub fn with_appeal_bond(mut self, bond: u64) -> Result<Self, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast, even
+        // for pre-fund configuration.
+        self.require_not_paused()?;
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if bond == 0 {
+            return Err(EscrowError::InvalidAppealBond);
+        }
+        self.appeal_bond = bond;
+        Ok(self)
+    }
+
+    /// The opt-in appeal bond configured via
+    /// [`Escrow::with_appeal_bond`] (AV-103), or `0` when no bond was
+    /// configured (filing stays free — backward compatible).
+    pub fn appeal_bond(&self) -> u64 {
+        self.appeal_bond
+    }
+
+    /// The appeal bond currently locked by the taker (AV-103): set to
+    /// the configured [`Escrow::appeal_bond`] by
+    /// [`Escrow::file_appeal`], back to `0` when the appeal resolves
+    /// ([`Escrow::review_appeal`] — refunded on overturn, forfeited
+    /// on uphold) or the window lapses ([`Escrow::expire_appeal`] —
+    /// forfeited). Independent counter: never folded into `released`
+    /// or `penalty_paid`, and never part of the claimable / release
+    /// base while the appeal is pending.
+    pub fn appeal_bond_paid(&self) -> u64 {
+        self.appeal_bond_paid
+    }
+
+    /// Whether [`Escrow::expire_appeal`] could succeed right now: a
+    /// slash appeal is `Filed` and the window has lapsed (`now >
+    /// appeal_deadline`), the escrow is `Funded` and not paused. Pure
+    /// read — the keeper scan lists exactly the escrows this returns
+    /// `true` for, so a listed expiry sweep is always executable; the
+    /// state machine re-checks every gate on the call itself.
+    pub fn is_appeal_expired(&self, now: u64) -> bool {
+        if !matches!(self.state, EscrowState::Funded) {
+            return false;
+        }
+        if self.is_paused() {
+            return false;
+        }
+        if !matches!(self.appeal_state, AppealState::Filed) {
+            return false;
+        }
+        now > self.appeal_deadline
+    }
+
     /// Whether [`Escrow::file_appeal`] could succeed right now: a slash
     /// was executed (`penalty_paid > 0`), an appeal window is
     /// configured, no appeal was filed or resolved yet, the window is
@@ -5835,8 +5981,9 @@ let fee = self.charge_protocol_fee(claimable)?;
 
     /// File an appeal against the executed slash (AV-86): the taker
     /// contests the penalty inside the opt-in window, opening the
-    /// arbiter panel's review. `Funded -> Funded` — filing moves no
-    /// funds, it only records the challenge; the panel's
+    /// arbiter panel's review. `Funded -> Funded` — filing records
+    /// the challenge (and, AV-103, locks the configured appeal bond
+    /// into `appeal_bond_paid` — the only fund movement); the panel's
     /// [`Escrow::review_appeal`] votes then decide it.
     ///
     /// Authorization (checked first — a stranger learns nothing about
@@ -5859,13 +6006,26 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// window (`now <= appeal_deadline` — a lapsed window rejects the
     /// filing).
     ///
+    /// AV-103: when an appeal bond was configured via
+    /// [`Escrow::with_appeal_bond`], filing locks it automatically —
+    /// `appeal_bond_paid` is set to the configured bond (an
+    /// independent counter, never mixed into `released` or
+    /// `penalty_paid`, and never part of the claimable / release
+    /// base while the appeal is pending). Returns the locked bond
+    /// (`0` when no bond was configured) so the real build can size
+    /// the taker's bond transfer into the vault.
+    ///
     /// Emits nothing by itself — the
     /// [`EscrowEventKind::AppealFiled`](crate::EscrowEventKind::AppealFiled)
     /// indexer event is emitted by the `IndexedEscrow` wrapper (and the
     /// Anchor layer), paralleling `slash`'s `Slashed` event.
-    pub fn file_appeal(&mut self, taker: [u8; 32], now: u64) -> Result<(), EscrowError> {
+    pub fn file_appeal(&mut self, taker: [u8; 32], now: u64) -> Result<u64, EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
         self.require_not_paused()?;
+        // AV-36: reentrancy guard — with an opt-in bond, filing locks
+        // funds (the taker's bond transfer), so the guard applies
+        // like on every other fund-moving transition.
+        self.require_not_reentrant()?;
         // Authority: only the taker may appeal their own slash.
         // Checked before state validity.
         if taker != self.taker {
@@ -5900,7 +6060,11 @@ let fee = self.charge_protocol_fee(claimable)?;
             return Err(EscrowError::InvalidAppealWindow);
         }
         self.appeal_state = AppealState::Filed;
-        Ok(())
+        // AV-103: lock the configured bond (the real build transfers
+        // it from the taker into the vault; the pure-logic records
+        // the independent counter).
+        self.appeal_bond_paid = self.appeal_bond;
+        Ok(self.appeal_bond_paid)
     }
 
     /// Cast a panel member's review vote on the filed slash appeal
@@ -5911,13 +6075,17 @@ let fee = self.charge_protocol_fee(claimable)?;
     ///
     /// The first side (uphold or overturn) to collect `threshold`
     /// matching votes resolves the appeal:
-    /// - uphold: [`AppealState::Upheld`] — the penalty stands;
+    /// - uphold: [`AppealState::Upheld`] — the penalty stands, and the
+    ///   locked appeal bond (AV-103) is forfeited to the initializer
+    ///   (the anti-malicious-appeal-delay rule);
     /// - overturn: [`AppealState::Overturned`] — the penalty is
     ///   refunded to the taker: `penalty_paid` returns to `0` and the
     ///   amount accumulates in `released` (the restitution is a taker
     ///   payout, so the conservation invariant `inflow == locked +
-    ///   released + refunded + penalty_paid` stays exact and the audit
-    ///   trail keeps the reversal visible).
+    ///   released + refunded + penalty_paid + appeal_bond_paid` stays
+    ///   exact and the audit trail keeps the reversal visible), and
+    ///   the locked appeal bond is refunded to the taker in full, no
+    ///   fee — the bond is never mixed into `released`.
     ///
     /// Check order is deliberate (pause, reentrancy, authority, config,
     /// state, appeal — the crate convention): a stranger learns nothing
@@ -5925,27 +6093,33 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// reentrancy guard applies.
     ///
     /// Returns `Ok(None)` when the vote did not reach the threshold
-    /// (the appeal stays `Filed`), or `Ok(Some((outcome, refunded)))`
-    /// when this vote was the M-th match — `refunded` is the penalty
-    /// returned to the taker (`0` on uphold) so the caller (and the
-    /// Anchor layer) can size the transfer. No panel configured is
-    /// [`EscrowError::InvalidArbiterPanel`]; a non-member caller is
-    /// [`EscrowError::Unauthorized`]; voting when no appeal is filed
-    /// (or the appeal already resolved) is
+    /// (the appeal stays `Filed`), or `Ok(Some((outcome,
+    /// penalty_refunded, bond_moved)))` when this vote was the M-th
+    /// match — `penalty_refunded` is the penalty returned to the taker
+    /// (`0` on uphold); `bond_moved` is the locked appeal bond, `0`
+    /// when no bond was configured — forfeited to the initializer on
+    /// uphold, refunded to the taker in full (no fee) on overturn, so
+    /// the caller (and the Anchor layer) can size both transfers. The
+    /// outcome tells the caller which direction the bond moved. No
+    /// panel configured is [`EscrowError::InvalidArbiterPanel`]; a
+    /// non-member caller is [`EscrowError::Unauthorized`]; voting when
+    /// no appeal is filed (or the appeal already resolved) is
     /// [`EscrowError::InvalidAppealWindow`].
     ///
     /// The resolution emits
     /// [`EscrowEventKind::AppealResolved`](crate::EscrowEventKind::AppealResolved)
     /// via the `IndexedEscrow` wrapper (and the Anchor layer) —
     /// `from == to == Funded`, with the refunded penalty riding
-    /// `amounts.payout` on overturn (a taker restitution, no fee). The
-    /// wrapper supplies the event timestamp; the review itself is not
-    /// time-gated — the window gates the filing.
+    /// `amounts.payout` on overturn (a taker restitution, no fee; the
+    /// refunded bond rides `payout` too — the taker's full
+    /// restitution) and the forfeited bond riding `amounts.penalty`
+    /// on uphold. The wrapper supplies the event timestamp; the
+    /// review itself is not time-gated — the window gates the filing.
     pub fn review_appeal(
         &mut self,
         member: [u8; 32],
         uphold: bool,
-    ) -> Result<Option<(AppealOutcome, u64)>, EscrowError> {
+    ) -> Result<Option<(AppealOutcome, u64, u64)>, EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
         self.require_not_paused()?;
         // AV-36: reentrancy guard — an overturn moves funds.
@@ -5984,7 +6158,15 @@ let fee = self.charge_protocol_fee(claimable)?;
         } else {
             AppealOutcome::Overturned
         };
-        let refunded = if uphold {
+        // AV-103: settle the locked appeal bond. On uphold the bond is
+        // forfeited to the initializer (the anti-malicious-appeal-delay
+        // rule — a stalled appeal costs the taker); on overturn it is
+        // refunded to the taker in full, no fee. Either way the
+        // independent counter returns to zero — the bond is never
+        // mixed into `released` or `penalty_paid`.
+        let bond_moved = self.appeal_bond_paid;
+        self.appeal_bond_paid = 0;
+        let penalty_refunded = if uphold {
             0
         } else {
             // Overturn: the penalty returns to the taker. `penalty_paid`
@@ -6007,7 +6189,63 @@ let fee = self.charge_protocol_fee(claimable)?;
         // The ballot is terminal — a resolved appeal rejects further
         // votes via the `Filed` gate above, so the recorded votes stay
         // as the audit trail of how the panel decided.
-        Ok(Some((outcome, refunded)))
+        Ok(Some((outcome, penalty_refunded, bond_moved)))
+    }
+
+    /// Sweep a slash appeal whose window lapsed while still unresolved
+    /// (AV-103): `Funded -> Funded` — the appeal moves terminally to
+    /// [`AppealState::Expired`]. The slash stands (like an upheld
+    /// appeal), and the locked appeal bond — if any — is forfeited to
+    /// the initializer: the anti-malicious-appeal-delay rule, so a
+    /// taker cannot stall a legitimate slash for the whole window at
+    /// zero cost and then walk away.
+    ///
+    /// Permissionless, like AV-48's `crank_expired`: deliberately no
+    /// authority check — anyone may crank a lapsed appeal, and the
+    /// forfeited bond routes to the initializer, never the caller.
+    /// Check order is deliberate (pause, reentrancy, state, appeal,
+    /// deadline): only a `Filed` appeal past its deadline
+    /// (`now > appeal_deadline` — the window is inclusive, mirroring
+    /// [`Escrow::file_appeal`]'s filing bar) is expirable —
+    /// [`EscrowError::InvalidAppealWindow`] when no appeal is filed
+    /// or it already resolved, [`EscrowError::AppealExpiryNotDue`]
+    /// when the window has not lapsed yet.
+    ///
+    /// Returns the forfeited bond (`0` when no bond was locked) so
+    /// the real build can size the transfer to the initializer.
+    ///
+    /// Emits nothing by itself — the
+    /// [`EscrowEventKind::AppealExpired`](crate::EscrowEventKind::AppealExpired)
+    /// indexer event is emitted by the `IndexedEscrow` wrapper (and
+    /// the Anchor layer).
+    pub fn expire_appeal(&mut self, caller: [u8; 32], now: u64) -> Result<u64, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // AV-36: reentrancy guard — the sweep moves the forfeited bond.
+        self.require_not_reentrant()?;
+        // Deliberately no authority check: the sweep is permissionless
+        // (the AV-48 `crank_expired` precedent). The caller only acts
+        // as the indexer event's actor; the forfeited bond routes to
+        // the initializer, never the caller.
+        let _caller = caller;
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Only a filed appeal can lapse — expiring a never-filed or
+        // already-resolved appeal is rejected.
+        if !matches!(self.appeal_state, AppealState::Filed) {
+            return Err(EscrowError::InvalidAppealWindow);
+        }
+        // The window is a hard procedural bar in both directions: the
+        // sweep only runs once it has actually lapsed.
+        if now <= self.appeal_deadline {
+            return Err(EscrowError::AppealExpiryNotDue);
+        }
+        let forfeited = self.appeal_bond_paid;
+        self.appeal_bond_paid = 0;
+        self.appeal_state = AppealState::Expired;
+        Ok(forfeited)
     }
 
     /// Opt in to an arbiter-panel multisig judgment (AV-65 — Solana
@@ -11044,8 +11282,9 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     ("appeal_deadline", "u64", 8),
     // AV-86: the slash appeal's lifecycle state (see `AppealState`):
     // one u8 discriminant (0 = None, 1 = Filed, 2 = Upheld,
-    // 3 = Overturned), always present. Appended last so every earlier
-    // field offset stays stable.
+    // 3 = Overturned, 4 = Expired via `expire_appeal`, AV-103),
+    // always present. Appended last so every earlier field offset
+    // stays stable.
     ("appeal_state", "u8 (enum discriminant)", 1),
     // AV-86: the arbiter panel's running ballot on the filed appeal
     // (see `Escrow::review_appeal`): the 1-byte voter bitmask plus the
@@ -11113,6 +11352,18 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // cumulative accrued counter, so earlier offsets stay stable.
     ("streaming_fee_rate", "u64", 8),
     ("streaming_fees_accrued", "u64", 8),
+    // AV-103: opt-in appeal bond configured via
+    // `Escrow::with_appeal_bond` (see `Escrow::appeal_bond`): one
+    // u64, always present (zeroed when no bond is configured — filing
+    // stays free, backward compatible). Appended last so every
+    // earlier field offset stays stable.
+    ("appeal_bond", "u64", 8),
+    // AV-103: the appeal bond locked by `Escrow::file_appeal` (see
+    // `Escrow::appeal_bond_paid`): one u64, always present (zeroed
+    // when no appeal is in flight). The independent bond counter —
+    // never mixed into `released` or `penalty_paid`. Appended last
+    // so every earlier field offset stays stable.
+    ("appeal_bond_paid", "u64", 8),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -11226,7 +11477,7 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// likewise always present: 1-byte discriminant + 32-byte program id
 /// (33 bytes, zeroed when no hook is declared).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -11780,7 +12031,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 32_642_400, "from {state:?}");
+            assert_eq!(rent, 32_753_760, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -11878,9 +12129,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 32_642_400 by
+        // VAULT_SPACE — pinned at 32_753_760 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 32_642_400);
+        assert_eq!(rent, 32_753_760);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -12041,8 +12292,8 @@ mod tests {
         // then the account is closed. VAULT_SPACE stays 2941 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 4562, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 32_642_400);
+        assert_eq!(VAULT_SPACE, 4578, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 32_753_760);
     }
 
     #[test]
@@ -12061,7 +12312,7 @@ mod tests {
         // 595 (arbiter panel), and AV-68 by 41 (evidence-disclosure
         // deadline + escalating party), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 4562, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4578, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -14968,7 +15219,7 @@ pub(crate) mod anchor_idl_tests {
                 "instruction param; how much of the locked funds moves to the penalty account — 0 is AmountMismatch (code 102); above the slashable remainder (amount - released) is SlashNotEligible, code 143",
             )],
             method: "Escrow::slash",
-            input_mapping: "authority <- accounts.authority (signer) - the initializer, or the configured arbiter as the neutral enforcer (a stranger, the taker, or a panel member is Unauthorized, checked before state validity); Funded only (InvalidStateTransition otherwise; Disputed is SlashNotEligible, code 143 - slash is locked while arbitration owns the funds, the arbiter settles via resolve); a paused escrow fails fast (Paused); slash terms must be configured (SlashNotEligible otherwise); now <- clock sysvar (NOT an instruction param - the default must be measured on chain time); now >= slash_deadline required (SlashNotEligible otherwise - the default has not occurred yet); one-shot - an already-slashed escrow refuses a second slash (SlashNotEligible); milestone / subscription-scheduled escrows refuse the slash (SlashNotEligible - the schedule owns the release path); the slashed amount accumulates in penalty_paid (never in released), the escrow stays Funded, and the conservation invariant becomes inflow == locked + released + refunded + penalty_paid; when an appeal window is configured the slash stamps appeal_deadline = now + window_secs (InvalidAppealWindow, code 146, when the addition would overflow); emits the EscrowSlashed indexer event (from == to == Funded, amounts.penalty = the slashed amount)",
+            input_mapping: "authority <- accounts.authority (signer) - the initializer, or the configured arbiter as the neutral enforcer (a stranger, the taker, or a panel member is Unauthorized, checked before state validity); Funded only (InvalidStateTransition otherwise; Disputed is SlashNotEligible, code 143 - slash is locked while arbitration owns the funds, the arbiter settles via resolve); a paused escrow fails fast (Paused); slash terms must be configured (SlashNotEligible otherwise); now <- clock sysvar (NOT an instruction param - the default must be measured on chain time); now >= slash_deadline required (SlashNotEligible otherwise - the default has not occurred yet); one-shot - an already-slashed escrow refuses a second slash (SlashNotEligible); milestone / subscription-scheduled escrows refuse the slash (SlashNotEligible - the schedule owns the release path); the slashed amount accumulates in penalty_paid (never in released), the escrow stays Funded, and the conservation invariant becomes inflow == locked + released + refunded + penalty_paid (plus appeal_bond_paid once the taker files under a configured bond, AV-103); when an appeal window is configured the slash stamps appeal_deadline = now + window_secs (InvalidAppealWindow, code 146, when the addition would overflow); emits the EscrowSlashed indexer event (from == to == Funded, amounts.penalty = the slashed amount)",
         },
         InstructionSpec {
             // AV-86: opt-in slash-appeal window.
@@ -14985,13 +15236,27 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "no signer beyond the initializer (Uninitialized only - InvalidStateTransition otherwise; a paused escrow fails fast (Paused)); window_secs <- param (0 is InvalidAppealWindow, code 146); the 8-byte appeal_window_secs region is always reserved (zeroed when unconfigured), so the window is written in place — no realloc; pre-fund configuration only, emits no event",
         },
         InstructionSpec {
+            // AV-103: opt-in appeal bond.
+            // IDL: sha256("global:initialize_appeal_bond")[..8] = [212,
+            // 156, 40, 145, 244, 132, 190, 84] — the Anchor instruction
+            // discriminator for the initialize_appeal_bond handler.
+            name: "initialize_appeal_bond",
+            params: &[(
+                "bond",
+                "u64",
+                "instruction param; lamports (or base-token units) the taker must lock when filing a slash appeal — 0 is InvalidAppealBond, code 158 (a zero bond is a no-op; the no-bond default already covers free filing)",
+            )],
+            method: "Escrow::with_appeal_bond",
+            input_mapping: "no signer beyond the initializer (Uninitialized only - InvalidStateTransition otherwise; a paused escrow fails fast (Paused)); bond <- param (0 is InvalidAppealBond, code 158); the 8-byte appeal_bond region is always reserved (zeroed when unconfigured), so the bond is written in place — no realloc; pre-fund configuration only, emits no event; order-independent of initialize_appeal_window — a bond without a configured window is inert (file_appeal requires the window anyway)",
+        },
+        InstructionSpec {
             // AV-86: taker's appeal against the executed slash.
             // IDL: sha256("global:file_appeal")[..8] — the Anchor
             // instruction discriminator for the file_appeal handler.
             name: "file_appeal",
             params: &[],
             method: "Escrow::file_appeal",
-            input_mapping: "taker <- accounts.taker (signer) - only the taker may appeal their own slash (a stranger or the initializer is Unauthorized, checked before state validity); a paused escrow fails fast (Paused); an arbiter panel must be configured (InvalidArbiterPanel, code 136 - the panel is the only review mechanism, so an appeal with no panel to decide it is refused rather than stranded); Funded only (InvalidStateTransition otherwise); a slash must have been executed, an appeal window must be configured, no appeal filed or resolved yet, and now <- clock sysvar (NOT an instruction param) must be within the window (InvalidAppealWindow, code 146, otherwise - the window is a hard procedural bar); filing moves no funds - the escrow stays Funded and the panel's review_appeal votes decide the appeal; emits the AppealFiled indexer event (from == to == Funded, amounts zero, actor = the taker)",
+            input_mapping: "taker <- accounts.taker (signer) - only the taker may appeal their own slash (a stranger or the initializer is Unauthorized, checked before state validity); a paused escrow fails fast (Paused); an arbiter panel must be configured (InvalidArbiterPanel, code 136 - the panel is the only review mechanism, so an appeal with no panel to decide it is refused rather than stranded); Funded only (InvalidStateTransition otherwise); a slash must have been executed, an appeal window must be configured, no appeal filed or resolved yet, and now <- clock sysvar (NOT an instruction param) must be within the window (InvalidAppealWindow, code 146, otherwise - the window is a hard procedural bar); when an appeal bond was configured via initialize_appeal_bond, filing locks it automatically into the independent appeal_bond_paid counter (never mixed into released or penalty_paid, never part of the claimable / release base while pending); the escrow stays Funded and the panel's review_appeal votes decide the appeal; returns the locked bond (0 when no bond was configured) so the real build can size the taker's bond transfer into the vault; emits the AppealFiled indexer event (from == to == Funded, amounts zero, actor = the taker)",
         },
         InstructionSpec {
             // AV-86: arbiter-panel review vote on the filed slash appeal.
@@ -15004,7 +15269,18 @@ pub(crate) mod anchor_idl_tests {
                 "instruction param; true = uphold the slash (the penalty stands), false = overturn it (the penalty is refunded to the taker)",
             )],
             method: "Escrow::review_appeal",
-            input_mapping: "member <- accounts.member (signer) - must be a panel member (a non-member is Unauthorized, checked before state validity); a paused escrow fails fast (Paused); a panel must be configured (InvalidArbiterPanel, code 136 otherwise); Funded only (InvalidStateTransition otherwise); the appeal must be Filed (InvalidAppealWindow, code 146, when never filed or already resolved); each member has one effective vote (a re-vote overwrites); the first side (uphold or overturn) to collect threshold matching votes resolves the appeal - uphold keeps the penalty, overturn zeroes penalty_paid and accumulates the refund in released (the restitution is a taker payout, conservation stays exact); returns (outcome, refunded) - the refunded penalty (0 on uphold) so the real build can size the transfer from the penalty account to the taker; the event timestamp comes from the clock sysvar (NOT an instruction param); emits the AppealResolved indexer event (from == to == Funded, amounts.payout = the refunded penalty on overturn, 0 on uphold, actor = the voting member)",
+            input_mapping: "member <- accounts.member (signer) - must be a panel member (a non-member is Unauthorized, checked before state validity); a paused escrow fails fast (Paused); a panel must be configured (InvalidArbiterPanel, code 136 otherwise); Funded only (InvalidStateTransition otherwise); the appeal must be Filed (InvalidAppealWindow, code 146, when never filed or already resolved); each member has one effective vote (a re-vote overwrites); the first side (uphold or overturn) to collect threshold matching votes resolves the appeal - uphold keeps the penalty and forfeits the locked appeal bond to the initializer (the AV-103 anti-malicious-appeal-delay rule), overturn zeroes penalty_paid and accumulates the refund in released (the restitution is a taker payout, conservation stays exact) and refunds the locked appeal bond to the taker in full, no fee (the bond is never mixed into released); returns (outcome, penalty_refunded, bond_moved) - the refunded penalty (0 on uphold) and the moved bond (0 when no bond was configured; forfeited to the initializer on uphold, refunded to the taker on overturn) so the real build can size both transfers; the event timestamp comes from the clock sysvar (NOT an instruction param); emits the AppealResolved indexer event (from == to == Funded, amounts.payout = the refunded penalty plus the refunded bond on overturn, amounts.penalty = the forfeited bond on uphold, actor = the voting member)",
+        },
+        InstructionSpec {
+            // AV-103: permissionless sweep of a slash appeal whose
+            // window lapsed while still unresolved.
+            // IDL: sha256("global:expire_appeal")[..8] = [103, 85, 227,
+            // 157, 166, 89, 78, 46] — the Anchor instruction
+            // discriminator for the expire_appeal handler.
+            name: "expire_appeal",
+            params: &[],
+            method: "Escrow::expire_appeal",
+            input_mapping: "caller <- accounts.caller (signer) - permissionless (the AV-48 crank_expired precedent: anyone may crank a lapsed appeal; no authority check, the caller only acts as the event actor); a paused escrow fails fast (Paused); Funded only (InvalidStateTransition otherwise); the appeal must be Filed (InvalidAppealWindow, code 146, when never filed or already resolved); now <- clock sysvar (NOT an instruction param) must be past the window (AppealExpiryNotDue, code 159, when now <= appeal_deadline - the window is inclusive, mirroring file_appeal's filing bar); the appeal moves terminally to Expired (the slash stands, like an upheld appeal) and the locked appeal bond - if any - is forfeited to the initializer (the anti-malicious-appeal-delay rule); returns the forfeited bond (0 when no bond was locked) so the real build can size the transfer to the initializer; emits the AppealExpired indexer event (from == to == Funded, amounts.penalty = the forfeited bond, actor = the caller)",
         },
         InstructionSpec {
             // AV-95b: settle one basket leg to the taker — the basket
@@ -15269,6 +15545,10 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::with_appeal_window",
             "Escrow::file_appeal",
             "Escrow::review_appeal",
+            // AV-103: opt-in appeal bond + the permissionless sweep of
+            // a lapsed unresolved appeal.
+            "Escrow::with_appeal_bond",
+            "Escrow::expire_appeal",
             // AV-84: opt-in multisig authority binding.
             "Escrow::with_multisig_authority",
             // AV-90: opt-in non-linear vesting unlock curve.
@@ -15321,7 +15601,7 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-    fn only_fifty_instructions_take_params() {
+    fn only_fifty_one_instructions_take_params() {
         // Pins which instructions carry IDL params; any new param must be
         // justified in the spec table above.
         let with_params: Vec<&&str> = INSTRUCTIONS
@@ -15391,6 +15671,7 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_slash_terms",
                 &"slash",
                 &"initialize_appeal_window",
+                &"initialize_appeal_bond",
                 &"review_appeal",
                 &"release_basket_all",
                 &"initialize_basket",
@@ -17212,6 +17493,11 @@ pub(crate) mod anchor_idl_tests {
         // region is zeroed by `initialize` and written in place,
         // mirroring `initialize_slash_terms`.
         ("initialize_appeal_window", "window_secs", "appeal_window_secs"),
+        // AV-103: the appeal-bond param populates `appeal_bond` via
+        // `initialize_appeal_bond` (Uninitialized only); the region is
+        // zeroed by `initialize` and written in place, mirroring
+        // `initialize_appeal_window`.
+        ("initialize_appeal_bond", "bond", "appeal_bond"),
         // AV-86: a panel member's review vote populates their slot of
         // the appeal ballot; on the M-th overturn vote the refunded
         // penalty additionally accumulates into `released` (a second
@@ -17446,7 +17732,20 @@ pub(crate) mod anchor_idl_tests {
         (
             "appeal_state",
             "zeroed (None) by initialize; Filed by file_appeal, \
-             terminally Upheld/Overturned by review_appeal",
+             terminally Upheld/Overturned by review_appeal, terminally \
+             Expired by expire_appeal",
+        ),
+        // AV-103: no instruction param writes this field:
+        // `file_appeal` locks the configured `appeal_bond` (a
+        // param-less side effect of filing), and `review_appeal` /
+        // `expire_appeal` zero it on resolution / expiry, so it is a
+        // field source, not a param mapping.
+        (
+            "appeal_bond_paid",
+            "zeroed by initialize; locked to appeal_bond by \
+             file_appeal, zeroed by review_appeal (refunded on \
+             overturn, forfeited on uphold) and by expire_appeal \
+             (forfeited on window lapse)",
         ),
     ];
 
@@ -17869,6 +18168,16 @@ mod error_code_tests {
             EscrowError::InvalidTransferHook,
             157,
             "with_transfer_hook with the zero program id, on a non-Uninitialized escrow, or before with_mint bound a mint (AV-99)",
+        ),
+        (
+            EscrowError::InvalidAppealBond,
+            158,
+            "with_appeal_bond with a zero bond (AV-103)",
+        ),
+        (
+            EscrowError::AppealExpiryNotDue,
+            159,
+            "expire_appeal with now <= appeal_deadline — the appeal window has not lapsed yet (AV-103)",
         ),
     ];
 
@@ -19806,6 +20115,13 @@ mod account_space_tests {
         // appended last so every earlier offset above is unchanged.
         out.extend_from_slice(&e.streaming_fee_rate.to_le_bytes());
         out.extend_from_slice(&e.streaming_fees_accrued.to_le_bytes());
+        // AV-103: opt-in appeal bond + the locked-bond counter, always
+        // reserved (zeroed when no bond is configured / no appeal in
+        // flight), so `with_appeal_bond` / `file_appeal` write in
+        // place without reallocating; appended last so every earlier
+        // offset above is unchanged.
+        out.extend_from_slice(&e.appeal_bond.to_le_bytes());
+        out.extend_from_slice(&e.appeal_bond_paid.to_le_bytes());
         out
     }
 
@@ -19873,10 +20189,12 @@ mod account_space_tests {
         // + 33 (AV-99 opt-in Token-2022 transfer hook: discriminant +
         // 32-byte hook program id)
         // + 16 (AV-100 streaming fee: 8-byte rate + 8-byte accrued
-        // counter).
-        assert_eq!(ESCROW_BODY_LEN, 4554, "escrow payload bytes");
+        // counter)
+        // + 16 (AV-103 appeal bond: 8-byte configured bond + 8-byte
+        // locked-bond counter).
+        assert_eq!(ESCROW_BODY_LEN, 4570, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 4562, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4578, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -19957,13 +20275,15 @@ mod account_space_tests {
         // 33-byte opt-in Token-2022 transfer-hook program id (AV-99,
         // 1-byte discriminant + 32-byte program id, zeroed when no
         // hook is declared) + 16-byte streaming-fee region (AV-100,
-        // 8-byte rate + 8-byte accrued counter).
+        // 8-byte rate + 8-byte accrued counter) + 16-byte appeal-bond
+        // region (AV-103, 8-byte configured bond + 8-byte locked-bond
+        // counter).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4072);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4088);
     }
 
     #[test]
@@ -20373,16 +20693,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4562) * 3480 * 2 = 4690 * 6960 = 32_642_400 lamports.
-        assert_eq!(full, 32_642_400);
+        // (128 + 4578) * 3480 * 2 = 4706 * 6960 = 32_753_760 lamports.
+        assert_eq!(full, 32_753_760);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4072) * 3480 * 2 = 4200 * 6960 = 29_232_000 lamports.
-        assert_eq!(no_quorum, 29_232_000);
+        // (128 + 4088) * 3480 * 2 = 4216 * 6960 = 29_343_360 lamports.
+        assert_eq!(no_quorum, 29_343_360);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -20426,25 +20746,25 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(32_642_400, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(32_753_760, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(27_533_759, params.0, params.1),
             Err(RentShortfall {
-                required: 32_642_400,
+                required: 32_753_760,
                 provided: 27_533_759,
             })
         );
         // Generous funding: exempt.
         assert_eq!(
-            check_vault_rent_exempt(32_700_000, params.0, params.1),
+            check_vault_rent_exempt(33_000_000, params.0, params.1),
             Ok(())
         );
         // Zero lamports: the full minimum is the shortfall.
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 32_642_400,
+                required: 32_753_760,
                 provided: 0,
             })
         );
@@ -20501,7 +20821,7 @@ mod basket_tests {
         let body = encode_escrow(&e);
         assert_eq!(body.len(), ESCROW_BODY_LEN);
         let basket_at =
-            ESCROW_BODY_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN;
+            ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN;
         assert_eq!(body[basket_at], 1, "Some discriminant");
         assert_eq!(body[basket_at + 1], 2, "leg count");
         assert_eq!(&body[basket_at + 2..basket_at + 34], &MINT_A);
@@ -22120,7 +22440,7 @@ mod denylist_tests {
         let e = funded_denied();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let tail = ESCROW_BODY_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN);
+        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN);
         assert_eq!(bytes[tail], 1, "Some discriminant");
         assert_eq!(&bytes[tail + 1..tail + 1 + 32], &MALLORY);
         assert_eq!(&bytes[tail + 33..tail + 129], &[0u8; 96]);
@@ -22447,8 +22767,8 @@ mod dutch_auction_tests {
         plain.fund(ALICE, START - 3_600).unwrap();
         let bytes = encode_escrow(&plain);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4554);
-        let tail = ESCROW_BODY_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
+        assert_eq!(bytes.len(), 4570);
+        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
         assert_eq!(bytes[tail], 0, "auction: None discriminant");
         assert_eq!(
             &bytes[tail + 1..tail + 1 + DUTCH_AUCTION_LEN],
@@ -22490,21 +22810,25 @@ mod dutch_auction_tests {
         );
         // A decoded auction prices `claim` identically.
         assert_eq!(decoded.claimable_amount(START + 900), 750_000);
-        // The field table pins the tail append: the AV-100
-        // streaming-fee region is the new tail, the AV-99 hook region
-        // trails the auction region.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].0, "streaming_fees_accrued");
+        // The field table pins the tail append: the AV-103 appeal-bond
+        // region is the new tail, the AV-100 streaming-fee region
+        // trails it, the AV-99 hook region trails the auction region.
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].0, "appeal_bond_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "appeal_bond");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "transfer_hook");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "streaming_fees_accrued");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "transfer_hook");
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 3].2,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 5].2,
             TRANSFER_HOOK_REGION_LEN
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "auction");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "auction");
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 4].2,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 6].2,
             1 + DUTCH_AUCTION_LEN
         );
     }
@@ -22515,7 +22839,7 @@ mod dutch_auction_tests {
         let mut account = vec![0u8; 8 + ESCROW_BODY_LEN];
         account[..8].copy_from_slice(&vault_account_discriminator());
         account[8..].copy_from_slice(&encode_escrow(&e));
-        let tail = 8 + ESCROW_BODY_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
+        let tail = 8 + ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
         // Zero-length window: start_at == end_at would divide by zero
         // in `payout_cap`.
         account[tail + 1..tail + 9].copy_from_slice(&END.to_le_bytes());
@@ -23518,7 +23842,7 @@ mod vesting_curve_tests {
         // the AV-96 denylist (130 bytes) plus the AV-97 auction
         // region (19 bytes) trail everything: discriminant 1,
         // tier-count 2, then the two live tiers.
-        let base = ESCROW_BODY_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42 - (1 + VESTING_CURVE_LEN);
+        let base = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42 - (1 + VESTING_CURVE_LEN);
         assert_eq!(bytes[base], 1, "curve: Some discriminant");
         assert_eq!(bytes[base + 1], 2, "curve: tier count");
         assert_eq!(
@@ -25787,7 +26111,7 @@ mod migrate_schema_tests {
         // region, the slash region and the CPI allowlist trail it);
         // every earlier offset stays stable, and the carry-over is
         // still a byte-prefix copy.
-        let version_at = ESCROW_BODY_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        let version_at = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         let e = v0_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
@@ -26753,7 +27077,7 @@ mod evidence_merkle_tests {
         // AV-97 auction region (19 bytes) are appended after it now:
         // 1-byte discriminant + 32-byte root, then the leaf-count
         // byte, then the u64-LE disclosure bitmap with bit 0 set.
-        let base = ESCROW_BODY_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42;
+        let base = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42;
         assert_eq!(bytes[base], 1, "evidence_root: Some discriminant");
         assert_eq!(&bytes[base + 1..base + 33], &root, "evidence_root bytes");
         assert_eq!(bytes[base + 33], 2, "evidence_leaves");
@@ -27383,7 +27707,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4554, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) bytes");
+        assert_eq!(bytes.len(), 4570, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -27408,7 +27732,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 4554);
+        assert_eq!(bytes.len(), 4570);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -27430,18 +27754,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4562) * 3480 * 2 = 4690 * 6960 = 32_642_400 lamports.
-        assert_eq!(VAULT_SPACE, 4562);
-        assert_eq!(full, 32_642_400);
+        // (128 + 4578) * 3480 * 2 = 4706 * 6960 = 32_753_760 lamports.
+        assert_eq!(VAULT_SPACE, 4578);
+        assert_eq!(full, 32_753_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4072) * 3480 * 2 = 4200 * 6960 = 29_232_000 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4072);
-        assert_eq!(no_quorum, 29_232_000);
+        // (128 + 4088) * 3480 * 2 = 4216 * 6960 = 29_343_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4088);
+        assert_eq!(no_quorum, 29_343_360);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -27585,7 +27909,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4554);
+        assert_eq!(bytes.len(), 4570);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -27600,7 +27924,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 4554);
+        assert_eq!(bytes.len(), 4570);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -27631,18 +27955,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4562) * 3480 * 2 = 4690 * 6960 = 32_642_400 lamports.
-        assert_eq!(VAULT_SPACE, 4562);
-        assert_eq!(full, 32_642_400);
+        // (128 + 4578) * 3480 * 2 = 4706 * 6960 = 32_753_760 lamports.
+        assert_eq!(VAULT_SPACE, 4578);
+        assert_eq!(full, 32_753_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4072) * 3480 * 2 = 4200 * 6960 = 29_232_000 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4072);
-        assert_eq!(no_quorum, 29_232_000);
+        // (128 + 4088) * 3480 * 2 = 4216 * 6960 = 29_343_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4088);
+        assert_eq!(no_quorum, 29_343_360);
     }
 
     #[test]
@@ -28500,7 +28824,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 4554);
+        assert_eq!(bytes.len(), 4570);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -28675,7 +28999,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 4554, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region, 82 by AV-90 vesting curve, 42 by AV-91 evidence commitment region, 386 by AV-95 basket, 19 by AV-97 auction, 33 by AV-99 transfer hook, 16 by AV-100 streaming fee");
+        assert_eq!(ESCROW_BODY_LEN, 4570, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region, 82 by AV-90 vesting curve, 42 by AV-91 evidence commitment region, 386 by AV-95 basket, 19 by AV-97 auction, 33 by AV-99 transfer hook, 16 by AV-100 streaming fee, 16 by AV-103 appeal bond");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -28693,32 +29017,32 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 4562) * 3480 * 2 = 4690 * 6960 = 32_642_400 lamports.
+        // (128 + 4578) * 3480 * 2 = 4706 * 6960 = 32_753_760 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            32_642_400
+            32_753_760
         );
-        // (128 + 4072) * 3480 * 2 = 4200 * 6960 = 29_232_000 lamports.
+        // (128 + 4088) * 3480 * 2 = 4216 * 6960 = 29_343_360 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            29_232_000
+            29_343_360
         );
         // 1888 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring).
-        assert_eq!(VAULT_SPACE, 4562);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4072);
-        assert!(check_vault_rent_exempt(32_642_400, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 4578);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4088);
+        assert!(check_vault_rent_exempt(32_753_760, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -31549,9 +31873,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4554, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee)");
-        assert_eq!(VAULT_SPACE, 4562);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4072);
+        assert_eq!(bytes.len(), 4570, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond)");
+        assert_eq!(VAULT_SPACE, 4578);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4088);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -32105,7 +32429,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4554);
+        assert_eq!(bytes.len(), 4570);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -32673,7 +32997,7 @@ mod subscription_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4554);
+        assert_eq!(bytes.len(), 4570);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -33030,7 +33354,12 @@ mod event_history_tests {
             51,
             "AV-96: appended after BasketExpiredCancelled"
         );
-        for d in 0..=51u8 {
+        assert_eq!(
+            EscrowEventKind::AppealExpired.discriminant(),
+            52,
+            "AV-103: appended after DenylistUpdated"
+        );
+        for d in 0..=52u8 {
             assert!(
                 EscrowEventKind::from_discriminant(d).is_some(),
                 "discriminant {d}"
@@ -33041,7 +33370,7 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(52), None);
+        assert_eq!(EscrowEventKind::from_discriminant(53), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -33053,11 +33382,11 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16
         );
     }
 
@@ -33074,7 +33403,7 @@ mod event_history_tests {
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4554);
+        assert_eq!(bytes.len(), 4570);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -33102,7 +33431,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103 tail");
     }
 
     #[test]
@@ -33117,18 +33446,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4562) * 3480 * 2 = 4690 * 6960 = 32_642_400 lamports.
-        assert_eq!(VAULT_SPACE, 4562);
-        assert_eq!(full, 32_642_400);
+        // (128 + 4578) * 3480 * 2 = 4706 * 6960 = 32_753_760 lamports.
+        assert_eq!(VAULT_SPACE, 4578);
+        assert_eq!(full, 32_753_760);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4072) * 3480 * 2 = 4200 * 6960 = 29_232_000 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4072);
-        assert_eq!(no_quorum, 29_232_000);
+        // (128 + 4088) * 3480 * 2 = 4216 * 6960 = 29_343_360 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4088);
+        assert_eq!(no_quorum, 29_343_360);
     }
 
     // ----- decode -----
@@ -33174,8 +33503,9 @@ mod event_history_tests {
         // (AV-91), 47 is `ReleasedSplit` (AV-93), 48 is
         // `BasketReleased` (AV-95b), 49 is `BasketCancelled`
         // (AV-95b), 50 is `BasketExpiredCancelled` (AV-95b), 51 is
-        // `DenylistUpdated` (AV-96); 52 is the first still-unknown byte.
-        for bad in [52u8, 53, 255] {
+        // `DenylistUpdated` (AV-96), 52 is `AppealExpired` (AV-103);
+        // 53 is the first still-unknown byte.
+        for bad in [53u8, 54, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -33831,17 +34161,17 @@ mod fee_cap_tests {
         // authority) + 26 (AV-86 appeal window region) + 82 (AV-90
         // vesting curve) + 42 (AV-91 evidence commitment) + 386
         // (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction).
-        assert_eq!(ESCROW_BODY_LEN, 4554, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 4562, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4072, "no-quorum Vault account space");
+        assert_eq!(ESCROW_BODY_LEN, 4570, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 4578, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4088, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            32_642_400,
-            "(128 + 4562) * 3480 * 2 = 4674 * 6960"
+            32_753_760,
+            "(128 + 4578) * 3480 * 2 = 4674 * 6960"
         );
         assert_eq!(
             rent_exempt_minimum_lamports(
@@ -33849,8 +34179,8 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            29_232_000,
-            "(128 + 4072) * 3480 * 2 = 4184 * 6960"
+            29_343_360,
+            "(128 + 4088) * 3480 * 2 = 4184 * 6960"
         );
     }
 
@@ -33862,7 +34192,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4554);
+        assert_eq!(bytes.len(), 4570);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -34363,8 +34693,8 @@ mod fee_schedule_tests {
         let e = scheduled_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4554);
-        let tail = ESCROW_BODY_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        assert_eq!(bytes.len(), 4570);
+        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(bytes[tail], 3, "tier_count at the tail");
         assert_eq!(
             u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
@@ -34404,7 +34734,7 @@ mod fee_schedule_tests {
         // denylist region (130 bytes) and AV-97 the auction region
         // (19 bytes) after the fee schedule, so the schedule no
         // longer sits at the body tail.
-        let tail = ESCROW_BODY_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(
             &bytes[tail..tail + FEE_SCHEDULE_LEN],
             &[0u8; FEE_SCHEDULE_LEN],
@@ -34428,7 +34758,7 @@ mod fee_schedule_tests {
         // denylist region (130 bytes) and AV-97 the auction region
         // (19 bytes) after the fee schedule, so the schedule no
         // longer sits at the body tail.
-        let tail = ESCROW_BODY_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         bytes[tail] = 9;
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
@@ -34761,7 +35091,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4554);
+        assert_eq!(bytes.len(), 4570);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -35000,7 +35330,10 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::InvalidPayoutDenylist));
         assert!(EscrowError::all().contains(&EscrowError::InvalidAuctionParams));
         assert!(EscrowError::all().contains(&EscrowError::AuctionNotActive));
-        assert_eq!(EscrowError::all().len(), 58);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidTransferHook));
+        assert!(EscrowError::all().contains(&EscrowError::InvalidAppealBond));
+        assert!(EscrowError::all().contains(&EscrowError::AppealExpiryNotDue));
+        assert_eq!(EscrowError::all().len(), 60);
     }
 
     #[test]
@@ -35347,7 +35680,7 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4554);
+        assert_eq!(bytes.len(), 4570);
         // AV-91: the evidence-commitment region (33-byte root + 1-byte
         // leaf count + 8-byte disclosure bitmap = 42 bytes) now trails
         // the AV-90 vesting-curve region (82 bytes), which trails the
@@ -35360,7 +35693,7 @@ mod arbiter_panel_tests {
         // trail everything, so the panel region ends 19 + 130 + 386 +
         // 42 + 82 + 26 + 68 + 258 + 49 + 1 bytes before the end of the
         // buffer.
-        let version_end = bytes.len() - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        let version_end = bytes.len() - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         // The panel region trails the AV-73 per-period amount table
         // (512 bytes), the AV-68 evidence-deadline region (41 bytes) and
         // the AV-66 fee-schedule region (81 bytes):
@@ -35413,9 +35746,9 @@ mod arbiter_panel_tests {
         assert_eq!(panel.1, "Option<ArbiterPanel>");
         assert_eq!(panel.2, 1 + ARBITER_PANEL_LEN);
         assert_eq!(panel.2, 595);
-        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100:
+        // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103:
         // every earlier field offset stays stable.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].0, "fee_schedule");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].0, "fee_schedule");
     }
 
     #[test]
@@ -35434,55 +35767,62 @@ mod arbiter_panel_tests {
         // window region, AV-90 the vesting curve, AV-91 the
         // evidence-commitment region, AV-95 the basket leg table,
         // AV-96 the payout denylist, AV-97 the auction region, AV-99
-        // the transfer-hook region: the AV-100 streaming-fee fields
-        // are the new tail (auction moved to len() - 4).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].0, "evidence_deadline_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].0, "escalated_by");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].0, "subscription_amounts");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "schema_version");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "slash_terms");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "penalty_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].2, 1 + CPI_ALLOWLIST_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].2, 1 + MULTISIG_AUTHORITY_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "appeal_window_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "appeal_deadline");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "appeal_state");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "appeal_ballot");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].2, APPEAL_BALLOT_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "vesting_curve");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].1, "Option<VestingCurve>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, 1 + VESTING_CURVE_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, 82);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "evidence_root");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].1, "Option<[u8; 32]>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].2, 33);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "evidence_leaves");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].2, 1);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "evidence_disclosed");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "basket");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].1, "Option<BasketLegs>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, BASKET_REGION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 386);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "payout_denylist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].1, "Option<PayoutDenylist>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 1 + PAYOUT_DENYLIST_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "auction");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].1, "Option<DutchAuction>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 1 + DUTCH_AUCTION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 19);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "transfer_hook");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].1, "Option<[u8; 32]>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, 33);
-        // AV-100: the streaming-fee rate and accrued counter are the
+        // the transfer-hook region, AV-100 the streaming-fee region:
+        // the AV-103 appeal-bond fields are the new tail (auction
+        // moved to len() - 6).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 24].0, "evidence_deadline_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].0, "escalated_by");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].0, "subscription_amounts");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].0, "schema_version");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].0, "slash_terms");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "penalty_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].2, 1 + CPI_ALLOWLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].2, 1 + MULTISIG_AUTHORITY_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "appeal_window_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "appeal_deadline");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "appeal_state");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "appeal_ballot");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].2, APPEAL_BALLOT_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "vesting_curve");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].1, "Option<VestingCurve>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].2, 1 + VESTING_CURVE_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].2, 82);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "evidence_root");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].1, "Option<[u8; 32]>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].2, 33);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "evidence_leaves");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, 1);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "evidence_disclosed");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "basket");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].1, "Option<BasketLegs>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].2, BASKET_REGION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].2, 386);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "payout_denylist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].1, "Option<PayoutDenylist>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 1 + PAYOUT_DENYLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "auction");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].1, "Option<DutchAuction>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 1 + DUTCH_AUCTION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 19);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "transfer_hook");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].1, "Option<[u8; 32]>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 33);
+        // AV-103: the appeal bond and the locked-bond counter are the
         // new tail — two plain u64s.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "streaming_fees_accrued");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "appeal_bond");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 8);
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "streaming_fees_accrued");
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "appeal_bond_paid");
         assert_eq!(VAULT_FIELDS.last().unwrap().1, "u64");
         assert_eq!(VAULT_FIELDS.last().unwrap().2, 8);
     }
@@ -36058,7 +36398,7 @@ mod split_tests {
             .unwrap();
         assert_eq!(e.state(), EscrowState::Split);
         assert_eq!(EscrowState::Split as u8, 8, "Split appended last");
-        assert_eq!(VAULT_SPACE, 4562, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4578, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -36328,7 +36668,7 @@ mod release_split_tests {
         e.release_split(ALICE, NOW, 1_000_000, None, &[(BOB, 10_000)])
             .unwrap();
         assert_eq!(e.state(), EscrowState::Released);
-        assert_eq!(VAULT_SPACE, 4562, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 4578, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -36644,7 +36984,7 @@ mod slash_tests {
         let e = slashable(1_000_000);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let base = ESCROW_BODY_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
+        let base = ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
         assert_eq!(bytes[base], 3, "schema_version");
         assert_eq!(bytes[base + 1], 1, "slash_terms: Some");
         assert_eq!(&bytes[base + 2..base + 34], &PENALTY, "penalty account");
@@ -36655,8 +36995,8 @@ mod slash_tests {
         );
         assert_eq!(
             u64::from_le_bytes(
-                bytes[ESCROW_BODY_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
-                    ..ESCROW_BODY_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
+                bytes[ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
+                    ..ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
                     .try_into()
                     .unwrap()
             ),
@@ -36913,7 +37253,7 @@ mod appeal_tests {
         let mut e = windowed_slashed();
         e.file_appeal(BOB, DEADLINE + 1).unwrap();
         e.review_appeal(M1, true).unwrap();
-        let (outcome, refunded) = e.review_appeal(M2, true).unwrap().unwrap();
+        let (outcome, refunded, _bond) = e.review_appeal(M2, true).unwrap().unwrap();
         assert_eq!(outcome, AppealOutcome::Upheld);
         assert_eq!(refunded, 0);
         assert_eq!(e.appeal_state(), AppealState::Upheld);
@@ -36931,7 +37271,7 @@ mod appeal_tests {
         let mut e = windowed_slashed();
         e.file_appeal(BOB, DEADLINE + 1).unwrap();
         e.review_appeal(M1, false).unwrap();
-        let (outcome, refunded) = e.review_appeal(M2, false).unwrap().unwrap();
+        let (outcome, refunded, _bond) = e.review_appeal(M2, false).unwrap().unwrap();
         assert_eq!(outcome, AppealOutcome::Overturned);
         assert_eq!(refunded, 200_000);
         assert_eq!(e.appeal_state(), AppealState::Overturned);
@@ -36953,7 +37293,7 @@ mod appeal_tests {
         e.review_appeal(M2, true).unwrap();
         assert_eq!(e.appeal_state(), AppealState::Filed, "split vote stalls");
         // The second overturner finally reaches threshold.
-        let (outcome, refunded) = e.review_appeal(M3, false).unwrap().unwrap();
+        let (outcome, refunded, _bond) = e.review_appeal(M3, false).unwrap().unwrap();
         assert_eq!(outcome, AppealOutcome::Overturned);
         assert_eq!(refunded, 200_000);
     }
@@ -36978,7 +37318,7 @@ mod appeal_tests {
         // resolution ride the ring.
         e.review_appeal(M1, false, DEADLINE + 2).unwrap();
         assert_eq!(e.event_count(), before + 1);
-        let (outcome, refunded) = e.review_appeal(M2, false, DEADLINE + 3).unwrap().unwrap();
+        let (outcome, refunded, _bond) = e.review_appeal(M2, false, DEADLINE + 3).unwrap().unwrap();
         assert_eq!(outcome, AppealOutcome::Overturned);
         assert_eq!(e.event_count(), before + 2);
         let events = e.events();
@@ -37067,7 +37407,7 @@ mod appeal_tests {
         e.review_appeal(M1, true).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4554);
+        assert_eq!(bytes.len(), 4570);
         // Appeal region: [3820..3846] — window (8), deadline (8), state
         // (1), ballot (9).
         assert_eq!(
@@ -37112,6 +37452,437 @@ mod appeal_tests {
         )));
         assert!(json.contains("\"appeal_state\":\"filed\""));
         assert!(json.contains("\"appeal_eligible\":false"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AV-103: appeal-bond tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod appeal_bond_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+    use crate::keeper::{scan_keeper_actions, KeeperActionKind, WatchedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const PENALTY: [u8; 32] = [0xDD; 32];
+    const M1: [u8; 32] = [0x11; 32];
+    const M2: [u8; 32] = [0x22; 32];
+    const M3: [u8; 32] = [0x33; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+    const DEADLINE: u64 = T0 + 86_400;
+    const WINDOW: u64 = 7 * 86_400; // 7 days.
+    const AMOUNT: u64 = 1_000_000;
+    const SLASHED: u64 = 200_000;
+    const BOND: u64 = 50_000;
+
+    fn bonded_uninitialized() -> Escrow {
+        Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap()
+            .with_appeal_bond(BOND)
+            .unwrap()
+    }
+
+    fn bonded_slashed() -> Escrow {
+        let mut e = bonded_uninitialized()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        e
+    }
+
+    fn watch(id: [u8; 32], escrow: Escrow) -> WatchedEscrow {
+        WatchedEscrow {
+            escrow_id: id,
+            escrow,
+            reference: None,
+            vault_derivation: None,
+        }
+    }
+
+    #[test]
+    fn bond_builder_stores_the_bond() {
+        let e = bonded_uninitialized();
+        assert_eq!(e.appeal_bond(), BOND);
+        assert_eq!(e.appeal_bond_paid(), 0, "nothing locked before filing");
+        // The no-bond default keeps filing free (backward compatible).
+        let plain = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        assert_eq!(plain.appeal_bond(), 0);
+        assert_eq!(plain.appeal_bond_paid(), 0);
+    }
+
+    #[test]
+    fn bond_builder_rejects_a_zero_bond() {
+        let e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        let err = e.with_appeal_bond(0).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidAppealBond);
+        assert_eq!(EscrowError::InvalidAppealBond.code(), 158);
+    }
+
+    #[test]
+    fn bond_builder_is_uninitialized_only() {
+        let live = bonded_slashed();
+        let err = live.with_appeal_bond(BOND).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+    }
+
+    #[test]
+    fn bond_builder_fails_fast_when_paused() {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.pause(ALICE).unwrap();
+        // The pause guard fires before the Uninitialized-state gate.
+        let err = e.with_appeal_bond(BOND).unwrap_err();
+        assert_eq!(err, EscrowError::Paused);
+    }
+
+    #[test]
+    fn filing_locks_the_configured_bond() {
+        let mut e = bonded_slashed();
+        let locked = e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        assert_eq!(locked, BOND, "file_appeal returns the locked bond");
+        assert_eq!(e.appeal_bond_paid(), BOND);
+        assert_eq!(e.appeal_state(), AppealState::Filed);
+        // The bond is an independent counter — never mixed into the
+        // other sinks.
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.penalty_paid(), SLASHED);
+    }
+
+    #[test]
+    fn filing_without_a_bond_locks_nothing() {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        let locked = e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        assert_eq!(locked, 0);
+        assert_eq!(e.appeal_bond_paid(), 0);
+        assert_eq!(e.appeal_state(), AppealState::Filed);
+    }
+
+    #[test]
+    fn uphold_forfeits_the_bond_to_the_initializer() {
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        e.review_appeal(M1, true).unwrap();
+        let (outcome, penalty_refunded, bond_moved) =
+            e.review_appeal(M2, true).unwrap().unwrap();
+        assert_eq!(outcome, AppealOutcome::Upheld);
+        assert_eq!(penalty_refunded, 0);
+        assert_eq!(
+            bond_moved, BOND,
+            "the forfeited bond is returned for transfer sizing"
+        );
+        assert_eq!(e.appeal_bond_paid(), 0, "counter zeroes on forfeit");
+        assert_eq!(e.appeal_state(), AppealState::Upheld);
+        assert_eq!(e.penalty_paid(), SLASHED, "uphold keeps the penalty");
+        // The bond is never mixed into `released`.
+        assert_eq!(e.released_amount(), 0);
+        // Principal conservation stays exact: the bond is additional
+        // inflow, tracked in its own (now zeroed) counter.
+        assert_eq!(
+            e.remaining_amount() + e.released_amount() + e.penalty_paid(),
+            AMOUNT,
+            "principal conservation: amount == locked + released + penalty"
+        );
+    }
+
+    #[test]
+    fn overturn_refunds_the_bond_in_full_with_no_fee() {
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        e.review_appeal(M1, false).unwrap();
+        let (outcome, penalty_refunded, bond_moved) =
+            e.review_appeal(M2, false).unwrap().unwrap();
+        assert_eq!(outcome, AppealOutcome::Overturned);
+        assert_eq!(penalty_refunded, SLASHED);
+        assert_eq!(bond_moved, BOND, "bond refunded in full, no fee");
+        assert_eq!(e.appeal_bond_paid(), 0, "counter zeroes on refund");
+        assert_eq!(e.appeal_state(), AppealState::Overturned);
+        assert_eq!(e.penalty_paid(), 0);
+        // Only the penalty restitution accumulates in `released` — the
+        // bond is never mixed in.
+        assert_eq!(e.released_amount(), SLASHED);
+        assert_eq!(
+            e.remaining_amount() + e.released_amount() + e.penalty_paid(),
+            AMOUNT,
+            "principal conservation after overturn"
+        );
+    }
+
+    #[test]
+    fn conservation_counts_the_bond_as_additional_inflow() {
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        // inflow (principal + taker-locked bond) == locked + released +
+        // refunded + penalty_paid + appeal_bond_paid.
+        let inflow = AMOUNT as u128 + e.appeal_bond_paid() as u128;
+        let sinks = e.remaining_amount() as u128
+            + e.released_amount() as u128
+            + e.penalty_paid() as u128
+            + e.appeal_bond_paid() as u128;
+        assert_eq!(inflow, sinks, "extended conservation identity");
+    }
+
+    #[test]
+    fn bond_is_excluded_from_the_claimable_base_while_pending() {
+        // A vesting escrow, slashed, with a bonded appeal in flight.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(T0, T0 + 86_400).unwrap())
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap()
+            .with_appeal_bond(BOND)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        let vested_end = T0 + 86_400;
+        let claimable_before = e.claimable_amount(vested_end);
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        // Fully vested: priced == AMOUNT; the claimable base prices
+        // only against `released` — the pending bond is invisible to
+        // it (like `claim`, which additionally prices against
+        // `penalty_paid`, the bond never enters either base).
+        assert_eq!(
+            e.claimable_amount(vested_end),
+            claimable_before,
+            "pending bond must not shrink the claimable base"
+        );
+        assert_eq!(
+            e.claimable_amount(vested_end),
+            AMOUNT,
+            "claimable == vested - released, bond excluded"
+        );
+        assert_eq!(
+            e.remaining_amount(),
+            AMOUNT - SLASHED,
+            "remaining_amount excludes the bond too"
+        );
+    }
+
+    #[test]
+    fn expiry_sweep_forfeits_the_bond_and_closes_the_appeal() {
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        assert!(!e.is_appeal_expired(DEADLINE + WINDOW), "window is inclusive");
+        assert!(e.is_appeal_expired(DEADLINE + WINDOW + 1));
+        let forfeited = e.expire_appeal(ALICE, DEADLINE + WINDOW + 1).unwrap();
+        assert_eq!(
+            forfeited, BOND,
+            "the forfeited bond is returned for transfer sizing"
+        );
+        assert_eq!(e.appeal_bond_paid(), 0);
+        assert_eq!(e.appeal_state(), AppealState::Expired);
+        assert_eq!(e.penalty_paid(), SLASHED, "the slash stands");
+        assert_eq!(e.released_amount(), 0, "bond never mixed into released");
+        // A swept appeal is terminal: no more votes, no second sweep.
+        assert_eq!(
+            e.review_appeal(M1, true),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+        assert_eq!(
+            e.expire_appeal(ALICE, DEADLINE + WINDOW + 2),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+        assert!(!e.is_appeal_under_review());
+        assert!(!e.is_appeal_expired(DEADLINE + WINDOW + 2));
+    }
+
+    #[test]
+    fn expiry_sweep_rejects_a_live_window() {
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        let err = e.expire_appeal(ALICE, DEADLINE + WINDOW).unwrap_err();
+        assert_eq!(err, EscrowError::AppealExpiryNotDue);
+        assert_eq!(EscrowError::AppealExpiryNotDue.code(), 159);
+        assert_eq!(e.appeal_state(), AppealState::Filed, "state unchanged");
+        assert_eq!(e.appeal_bond_paid(), BOND, "bond untouched");
+    }
+
+    #[test]
+    fn expiry_sweep_rejects_a_never_filed_appeal() {
+        let mut e = bonded_slashed();
+        assert_eq!(
+            e.expire_appeal(ALICE, DEADLINE + WINDOW + 1),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+    }
+
+    #[test]
+    fn keeper_lists_the_expiry_sweep_once_the_window_lapses() {
+        let id = [0xE1; 32];
+        // Before the lapse: no sweep listed (the appeal is under review
+        // instead — one action per unvoted panel member).
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        let report = scan_keeper_actions(&[watch(id, e)], DEADLINE + WINDOW);
+        assert!(
+            report
+                .actions
+                .iter()
+                .all(|a| a.kind != KeeperActionKind::ExpireAppeal),
+            "no sweep while the window is live"
+        );
+        // After the lapse: exactly one permissionless sweep.
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        let report = scan_keeper_actions(&[watch(id, e)], DEADLINE + WINDOW + 1);
+        let sweeps: Vec<_> = report
+            .actions
+            .iter()
+            .filter(|a| a.kind == KeeperActionKind::ExpireAppeal)
+            .collect();
+        assert_eq!(sweeps.len(), 1);
+        let sweep = sweeps[0];
+        assert_eq!(sweep.caller_role, "anyone");
+        assert_eq!(sweep.amount, BOND, "the forfeitable bond, informational");
+        assert_eq!(sweep.reason, "appeal_window_lapsed");
+        assert_eq!(sweep.kind.as_str(), "expire_appeal");
+    }
+
+    #[test]
+    fn snapshot_carries_the_bond_and_expiry_eligibility() {
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        let snap = e.snapshot(DEADLINE + WINDOW + 1);
+        let json = snap.to_json();
+        assert!(json.contains(&format!("\"appeal_bond\":{}", BOND)));
+        assert!(json.contains(&format!("\"appeal_bond_paid\":{}", BOND)));
+        assert!(json.contains("\"appeal_expiry_eligible\":true"));
+        assert!(json.contains("\"appeal_state\":\"filed\""));
+        let live = e.snapshot(DEADLINE + 1);
+        assert!(live
+            .to_json()
+            .contains("\"appeal_expiry_eligible\":false"));
+    }
+
+    #[test]
+    fn decode_round_trips_the_bond_fields_and_expired_state() {
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        e.expire_appeal(ALICE, DEADLINE + WINDOW + 1).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), super::ESCROW_BODY_LEN);
+        // Full-state decode (AV-75 decoder path) — the decoder expects
+        // the 8-byte discriminator + body.
+        let mut full = crate::discriminator::vault_account_discriminator().to_vec();
+        full.extend_from_slice(&bytes);
+        // The two trailing u64s are the bond region (encode order:
+        // appeal_bond, then appeal_bond_paid).
+        let tail = &full[8 + super::ESCROW_BODY_LEN - 16..];
+        assert_eq!(&tail[..8], &BOND.to_le_bytes());
+        assert_eq!(&tail[8..], &[0u8; 8], "forfeited bond zeroes the counter");
+        let decoded = crate::discriminator::decode_vault_account(&full).unwrap();
+        assert_eq!(decoded.appeal_bond, BOND);
+        assert_eq!(decoded.appeal_bond_paid, 0);
+        assert_eq!(decoded.appeal_state, AppealState::Expired);
+    }
+
+    #[test]
+    fn indexed_wrapper_emits_the_expiry_event() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT, [0xF1; 32], T0)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap()
+            .with_appeal_bond(BOND)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        let locked = e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        assert_eq!(locked, BOND);
+        let before = e.event_count();
+        let forfeited = e.expire_appeal(ALICE, DEADLINE + WINDOW + 1).unwrap();
+        assert_eq!(forfeited, BOND);
+        assert_eq!(e.event_count(), before + 1);
+        let expired = &e.events()[before];
+        assert_eq!(expired.kind, EscrowEventKind::AppealExpired);
+        assert_eq!(expired.from, EscrowState::Funded);
+        assert_eq!(expired.to, EscrowState::Funded);
+        assert_eq!(
+            expired.amounts.penalty, BOND,
+            "the forfeited bond rides amounts.penalty"
+        );
+        assert_eq!(expired.amounts.payout, 0);
+    }
+
+    #[test]
+    fn indexed_wrapper_resolution_events_carry_the_bond() {
+        // Overturn: the taker's full restitution (penalty + bond) rides
+        // payout.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT, [0xF1; 32], T0)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap()
+            .with_appeal_bond(BOND)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        e.review_appeal(M1, false, DEADLINE + 2).unwrap();
+        let (outcome, penalty_refunded, bond_moved) =
+            e.review_appeal(M2, false, DEADLINE + 3).unwrap().unwrap();
+        assert_eq!(outcome, AppealOutcome::Overturned);
+        assert_eq!((penalty_refunded, bond_moved), (SLASHED, BOND));
+        let resolved = e.events().last().unwrap();
+        assert_eq!(resolved.kind, EscrowEventKind::AppealResolved);
+        assert_eq!(
+            resolved.amounts.payout,
+            SLASHED + BOND,
+            "penalty + bond restitution rides payout"
+        );
+        // Uphold: the forfeited bond rides penalty.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT, [0xF2; 32], T0)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap()
+            .with_appeal_bond(BOND)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        e.review_appeal(M1, true, DEADLINE + 2).unwrap();
+        let (outcome, penalty_refunded, bond_moved) =
+            e.review_appeal(M2, true, DEADLINE + 3).unwrap().unwrap();
+        assert_eq!(outcome, AppealOutcome::Upheld);
+        assert_eq!((penalty_refunded, bond_moved), (0, BOND));
+        let resolved = e.events().last().unwrap();
+        assert_eq!(resolved.amounts.penalty, BOND, "forfeiture rides penalty");
+        assert_eq!(resolved.amounts.payout, 0);
     }
 }
 
@@ -37403,7 +38174,7 @@ mod cpi_allowlist_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4554);
+        assert_eq!(bytes.len(), 4570);
         assert_eq!(bytes[3495], 1, "Some discriminant");
         assert_eq!(&bytes[3496..3496 + 32], &DEX);
         assert_eq!(&bytes[3496 + 32..3496 + 64], &LENDING);
@@ -37414,16 +38185,17 @@ mod cpi_allowlist_tests {
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes[3495], 0, "None discriminant");
         assert_eq!(&bytes[3496..3496 + 257], &[0u8; 257]);
-        // The field name is the fourteenth-from-last VAULT_FIELDS entry
+        // The field name is the sixteenth-from-last VAULT_FIELDS entry
         // (AV-84 appended the multisig region after it, AV-86 the
         // 4-field appeal region after that, AV-90 the vesting curve
         // after that, AV-91 the 3-field evidence-commitment region
         // after that, AV-95 the basket region after that, AV-96 the
         // payout denylist region after that, AV-97 the auction region
         // after that, AV-99 the transfer-hook region after that,
-        // AV-100 the streaming-fee region after that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].2, 1 + CPI_ALLOWLIST_LEN);
+        // AV-100 the streaming-fee region after that, AV-103 the
+        // appeal-bond region after that).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].2, 1 + CPI_ALLOWLIST_LEN);
     }
 }
 
@@ -37618,7 +38390,7 @@ mod multisig_tests {
         let e = bound_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 4554);
+        assert_eq!(bytes.len(), 4570);
         assert_eq!(bytes[3753], 1, "Some discriminant");
         assert_eq!(&bytes[3754..3754 + 32], &SQUADS_V4_PROGRAM_ID);
         assert_eq!(&bytes[3754 + 32..3754 + 64], &VAULT_PDA);
@@ -37632,16 +38404,17 @@ mod multisig_tests {
         let bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(bytes[3753], 0, "None discriminant");
         assert_eq!(&bytes[3754..3820], &[0u8; 66]);
-        // The field name is the thirteenth-from-last VAULT_FIELDS entry
+        // The field name is the fifteenth-from-last VAULT_FIELDS entry
         // (AV-86 appended the 4-field appeal region after it, AV-90
         // the vesting-curve region after that, AV-91 the 3-field
         // evidence-commitment region after that, AV-95 the basket
         // region after that, AV-96 the payout denylist region after
         // that, AV-97 the auction region after that, AV-99 the
         // transfer-hook region after that, AV-100 the streaming-fee
-        // region after that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].2, 1 + MULTISIG_AUTHORITY_LEN);
+        // region after that, AV-103 the appeal-bond region after
+        // that).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].2, 1 + MULTISIG_AUTHORITY_LEN);
         assert_eq!(MULTISIG_AUTHORITY_LEN, 66);
     }
 
@@ -37854,7 +38627,7 @@ mod streaming_fee_tests {
         let mut e = streaming_escrow(10);
         e.release(ALICE, FUND_AT + 100, 600_000, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        let tail = &bytes[ESCROW_BODY_LEN - STREAMING_FEE_REGION_LEN..];
+        let tail = &bytes[ESCROW_BODY_LEN - APPEAL_BOND_REGION_LEN - STREAMING_FEE_REGION_LEN..];
         assert_eq!(u64::from_le_bytes(tail[..8].try_into().unwrap()), 10);
         assert_eq!(u64::from_le_bytes(tail[8..16].try_into().unwrap()), 1_000);
         let mut account = vec![0u8; 8 + ESCROW_BODY_LEN];

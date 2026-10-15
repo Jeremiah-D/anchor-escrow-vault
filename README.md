@@ -139,8 +139,10 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `update_cpi_allowlist(initializer, taker, allowlist)` (AV-83) | `Uninitialized` / `Funded` | same (no state change) | **always dual-signed** — both initializer and taker even on a plain escrow (stricter than AV-49 by design: the allowlist guards a privileged execution path); `Uninitialized`/`Funded` only; empty list clears the allowlist (back to any-target-allowed); emits `CpiAllowlistUpdated` only on an actual change |
 | `initialize_multisig_authority(multisig_authority)` (AV-84) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; binds the external multisig program id, the vault PDA that must sign, and the u16 threshold metadata; zero program id / zero authority / zero threshold is `InvalidMultisigAuthority`); immutable once set — the binding is load-bearing for every later authority check; read-only pass-through, never a check gate (zero-trust) |
 | `initialize_appeal_window(window_secs)` (AV-86) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the opt-in slash-appeal window in seconds; `0` is rejected — a zero-second window would give the taker no chance to appeal, `InvalidAppealWindow` code 146); no window configured means slashes are final (backward compatible); emits no event (pre-fund configuration) |
-| `file_appeal(taker)` (AV-86) | `Funded` | `Funded` (no state change — filing moves no funds, it only records the challenge) | taker **only** (`Unauthorized` otherwise, checked before state validity); requires an executed slash (`penalty_paid > 0`), a configured window, no appeal filed or resolved yet (one appeal per slash), `now <= appeal_deadline` (a lapsed window is a hard procedural bar), and a configured arbiter panel to review it — any missing gate is `InvalidAppealWindow` (or `InvalidArbiterPanel` for the missing panel); `now` <- clock sysvar; emits `AppealFiled` (amounts zero) |
-| `review_appeal(member, uphold)` (AV-86) | `Funded` | `Funded` (no state change) | panel member **only** (`Unauthorized` otherwise); one effective vote per member (a re-vote overwrites); the first side to reach the panel threshold resolves — `uphold` keeps the penalty (`Upheld`), `overturn` refunds it to the taker (`penalty_paid` → `0`, accumulated in `released` so the conservation invariant stays exact); a non-resolving vote emits nothing; the resolving vote emits `AppealResolved` (the refunded penalty rides `payout` on overturn, zero on uphold); returns `(outcome, refunded)` — `0` == upheld, `1` == overturned — so the restitution transfer can be sized |
+| `initialize_appeal_bond(bond)` (AV-103) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the opt-in appeal bond in lamports/base-token units the taker must lock when filing a slash appeal; `0` is rejected — a zero bond is a no-op, `InvalidAppealBond` code 158; the no-bond default keeps filing free, backward compatible); order-independent of `initialize_appeal_window` — a bond without a window is inert; emits no event (pre-fund configuration) |
+| `file_appeal(taker)` (AV-86) | `Funded` | `Funded` (no state change — filing records the challenge, and locks the configured AV-103 appeal bond) | taker **only** (`Unauthorized` otherwise, checked before state validity); requires an executed slash (`penalty_paid > 0`), a configured window, no appeal filed or resolved yet (one appeal per slash), `now <= appeal_deadline` (a lapsed window is a hard procedural bar), and a configured arbiter panel to review it — any missing gate is `InvalidAppealWindow` (or `InvalidArbiterPanel` for the missing panel); when a bond was configured via `initialize_appeal_bond`, filing locks it automatically into the independent `appeal_bond_paid` counter (never mixed into `released`/`penalty_paid`, never part of the claimable/release base while pending); returns the locked bond (`0` when none) so the transfer can be sized; `now` <- clock sysvar; emits `AppealFiled` (amounts zero) |
+| `review_appeal(member, uphold)` (AV-86) | `Funded` | `Funded` (no state change) | panel member **only** (`Unauthorized` otherwise); one effective vote per member (a re-vote overwrites); the first side to reach the panel threshold resolves — `uphold` keeps the penalty (`Upheld`) and forfeits the locked appeal bond to the initializer (AV-103, the anti-malicious-appeal-delay rule), `overturn` refunds the penalty to the taker (`penalty_paid` → `0`, accumulated in `released` so the conservation invariant stays exact) and refunds the locked bond in full, no fee (never mixed into `released`); a non-resolving vote emits nothing; the resolving vote emits `AppealResolved` (on overturn `payout` = refunded penalty + refunded bond; on uphold `penalty` = forfeited bond); returns `(outcome, penalty_refunded, bond_moved)` — `0` == upheld, `1` == overturned — so both transfers can be sized |
+| `expire_appeal(caller)` (AV-103) | `Funded` | `Funded` (appeal → `Expired`, terminal) | **permissionless** — anyone may crank a lapsed appeal (no authority check; the caller only acts as the event actor); requires a `Filed` appeal and `now > appeal_deadline` (`InvalidAppealWindow` when never filed or already resolved, `AppealExpiryNotDue` code 159 when the window has not lapsed yet); the slash stands (like an upheld appeal) and the locked appeal bond — if any — is forfeited to the initializer; returns the forfeited bond (`0` when none) so the transfer can be sized; `now` <- clock sysvar; emits `AppealExpired` (`penalty` = the forfeited bond) |
 | `initialize_reference(reference)` (AV-53) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the 32-byte off-chain correlation id — order id / invoice hash; any 32 bytes accepted — read-only pass-through: never read by a check gate, never cleared, never affects amount conservation) |
 | `split_escrow(initializer, taker, amounts, vesting, quorum, dual_sig, milestones)` (AV-81) | `Funded` | `Split` (new terminal state) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`; degenerate initializer == taker self-escrow authorizes with one key passed twice); `Disputed` is `InvalidStateTransition` (arbitration in flight adjudicates the locked funds) and every terminal state rejects a re-split; the amount table must be non-empty, hold at most 16 entries, contain no zero entry, and sum in `u128` to exactly the parent's remaining lockup (`InvalidSplit`, code 142, otherwise — a partial release before the split shrinks the splittable pool); each child is born `Funded` with the parent's initializer / taker / `expires_at` and the explicitly inherited config — vesting / quorum / dual-sig / per-child milestones are *not* inherited unless named (default-inert, anti-misconfiguration); child *i*'s escrow ID derives as `H(parent_id \|\| i)` (SHA-256, `u64` little-endian index); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in `Funded` — no half-split); emits `EscrowSplit` (`Funded -> Split`, `amounts.payout` = Σ child amounts, the `(child_id, amount)` roster rides the event) |
 | `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` / `Split` (AV-81) | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it); a split parent's funds were re-homed into the children, so its vault carries nothing but the rent deposit — closeable like the other terminals |
@@ -593,7 +595,7 @@ and `evidence_disclosure`. New vault fields (appended last):
 `evidence_root` (`Option<[u8; 32]>`, 33 bytes) + `evidence_leaves`
 (u8) + `evidence_disclosed` (u64, 8 bytes) — 42 bytes at the time,
 bringing the layout to 3978 bytes (the layout has since grown to
-4554 bytes / 4562 with the discriminator — see the account-space
+4570 bytes / 4578 with the discriminator — see the account-space
 paragraph below). Anchor
 surface: `escalate` gains the two params, plus the new
 `file_evidence` instruction (`doc_hash`, `leaf_index`,
@@ -1214,10 +1216,15 @@ program error per variant):
 | `InvalidPayoutDenylist` | 154 | `PayoutDenylist::new` (AV-96) with an empty list, more than 4 addresses, or a zero address |
 | `InvalidAuctionParams` | 155 | `with_dutch_auction` (AV-97) with `start_at >= end_at` (a zero-length window would divide by zero in the descending-price math) or `reserve_bps > 10_000` (not a valid basis-point floor) |
 | `AuctionNotActive` | 156 | `claim` on an auction-mode escrow outside the `[start_at, end_at]` window, or `escalate` while the auction window is live (price discovery and arbitration are mutually exclusive settlement paths) |
+| `InvalidTransferHook` | 157 | `with_transfer_hook` / `initialize_transfer_hook` (AV-99) with the zero program id, on a non-`Uninitialized` escrow, or before `with_mint` bound a mint (a transfer hook is a Token-2022 concept, meaningless on the native-SOL path) |
+| `InvalidAppealBond` | 158 | `with_appeal_bond` / `initialize_appeal_bond` (AV-103) with a zero bond (a zero bond is a no-op — the no-bond default already covers free filing) |
+| `AppealExpiryNotDue` | 159 | `expire_appeal` (AV-103) with `now <= appeal_deadline` — the permissionless sweep only runs once the window has actually lapsed |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
-`inflow == locked + released + refunded` after every operation, with
+`inflow == locked + released + refunded + penalty_paid + appeal_bond_paid`
+after every operation (AV-103: the taker-locked appeal bond counts in the
+inflow on top of the principal), with
 `amount`/`expires_at` immutable and failed operations state-preserving
 (the fuzz drives full, partial, over-limit, and zero-amount releases, so
 `locked` is recomputed as the unreleased remainder of `Funded` escrows
@@ -1568,6 +1575,33 @@ threshold gates the *resolution*, and the ballot is terminal — a
 resolved appeal rejects further votes, so the recorded votes stay as
 the audit trail of how the panel decided.
 
+**Appeal bond (AV-103) — the taker stakes on the challenge.** The
+initializer may additionally opt in to a bond (before funding, alongside
+the window): when the taker files, the configured bond is locked into
+an independent `appeal_bond_paid` counter — never mixed into
+`released` or `penalty_paid`, never part of the claimable/release
+base while the appeal is pending (the conservation invariant becomes
+`inflow == locked + released + refunded + penalty_paid +
+appeal_bond_paid`, with the locked bond counted in the inflow). The
+bond is a cost the taker pays for a frivolous appeal, not a price the
+panel can negotiate with:
+
+- **Overturn** — the bond is refunded to the taker in full, no fee
+  (never into `released`); `AppealResolved` carries the full
+  restitution in `payout` (penalty + bond).
+- **Upheld** — the bond is forfeited to the initializer
+  (`AppealResolved` carries it in `amounts.penalty`).
+- **Window expires unresolved** — the slash stands as if upheld; the
+  bond is forfeited to the initializer via the permissionless
+  `expire_appeal` sweep (anyone may crank a lapsed appeal — the
+  keeper surfaces it as `ExpireAppeal`), which emits `AppealExpired`
+  and returns the forfeited amount so the transfer can be sized. A
+  sweep attempt before the deadline is `AppealExpiryNotDue` (code
+  159).
+
+No bond configured means filing stays free (backward compatible) —
+`file_appeal` then returns `0`, and both loss paths transfer nothing.
+
 ## Indexer events (AV-18)
 
 Every state transition of the escrow state machine emits one typed
@@ -1808,6 +1842,7 @@ returns a `KeeperReport` of immediately executable calls:
 | `submit_panel_judgment(member, taker_amount, mint, rationale_hash)` (AV-65) | `Disputed`, panel configured, remainder > 0 — one action **per panel member** | panel member (`caller_role: "panel_member"`) | remaining locked amount the member's voted split divides (the split and the rationale commitment are the member's call-time judgment; the panel settles itself once M votes agree) |
 | `close_vault(authority)` (AV-40) | `Cancelled` / `Released` / `Settled` / `Split` — the terminal states AV-34's `close_vault` accepts (`Split` since AV-81). `Disputed` is never listed (the arbitration is still live; the vault account is the arbiter's audit surface) and `Closed` is never listed (the rent is already reclaimed) — the scan lists only calls the chain would accept | initializer (the only key `close_vault` accepts — AV-34 checks authority before state) | `rent_reclaimed`: the mainnet rent-exempt minimum for the current `VAULT_SPACE` (via `vault_close_rent_reclaimed()`, never a hardcoded figure) |
 | `slash(authority, amount)` (AV-82) | `Funded` with slash terms configured, `now >= slash_deadline`, slashable remainder > 0, and (dual-sig escrows) both activation bits set — one action for the initializer, plus one for the configured arbiter as the neutral enforcer; never listed on `Disputed` (arbitration owns the funds), milestone/subscription-scheduled, or already-slashed escrows | initializer / arbiter (per action) | the slashable remainder (`amount - released - penalty_paid`) |
+| `expire_appeal(caller)` (AV-103) | `Funded` with a `Filed` appeal and `now > appeal_deadline` (window lapsed, unresolved — the keeper never lists a call the chain would reject as `AppealExpiryNotDue`) | `\"anyone\"` — permissionless; the forfeited bond routes to the initializer, never the cranker (anti-MEV) | the locked appeal bond (`appeal_bond_paid`; `0` when no bond was configured) — forfeited to the initializer |
 
 Only *executable* calls are listed: a vesting claim behind an unsatisfied
 quorum is withheld (the call would fail), a claim behind a locked timelock
@@ -2230,6 +2265,8 @@ two-way consistency check against the IDL parameter table:
 | appeal_deadline | u64 | 8 |
 | appeal_state | u8 (enum discriminant) | 1 |
 | appeal_ballot | AppealBallot | 9 |
+| appeal_bond | u64 | 8 |
+| appeal_bond_paid | u64 | 8 |
 | vesting_curve | Option<VestingCurve> | 82 |
 | evidence_root | Option<[u8; 32]> | 33 |
 | evidence_leaves | u8 | 1 |
@@ -2240,7 +2277,9 @@ two-way consistency check against the IDL parameter table:
 | transfer_hook | Option<[u8; 32]> | 33 |
 | streaming_fee_rate | u64 | 8 |
 | streaming_fees_accrued | u64 | 8 |
-| **total**     |                   | **4554** |
+| appeal_bond | u64 | 8 |
+| appeal_bond_paid | u64 | 8 |
+| **total**     |                   | **4570** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2340,11 +2379,13 @@ basket is configured) — and the 130-byte payout-denylist region
 1-byte count — zeroed when no denylist is configured) — and the
 19-byte Dutch-auction region (AV-97: 1-byte discriminant + 18-byte
 terms — `start_at` + `end_at` (u64) + `reserve_bps` (u16) — zeroed
-when no auction is configured).
-`escrow-state` exposes `VAULT_SPACE` (4562) and
-`VAULT_SPACE_NO_QUORUM` (4072) for the Anchor `space =` constraint, plus a
+when no auction is configured) — and the 16-byte appeal-bond tail
+region (AV-103: `appeal_bond` + `appeal_bond_paid` (u64 each), zeroed
+when no bond was configured).
+`escrow-state` exposes `VAULT_SPACE` (4578) and
+`VAULT_SPACE_NO_QUORUM` (4088) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **32,642,400 lamports** to be
+mainnet rent parameters the full vault needs **32,753,760 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)

@@ -923,7 +923,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 58, "error variant count drift");
+    assert_eq!(errors.len(), 60, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -980,6 +980,9 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::AuctionNotActive.code(), 156);
     // AV-99: appended, never renumbered.
     assert_eq!(EscrowError::InvalidTransferHook.code(), 157);
+    // AV-103: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidAppealBond.code(), 158);
+    assert_eq!(EscrowError::AppealExpiryNotDue.code(), 159);
 }
 
 #[test]

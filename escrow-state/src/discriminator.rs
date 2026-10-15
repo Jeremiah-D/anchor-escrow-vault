@@ -134,7 +134,7 @@ pub enum AccountDecodeError {
     /// (AV-96; AV-32 panic-free guarantee).
     InvalidPayoutDenylistLen(u8),
     /// An event-history slot's kind byte is not a known
-    /// [`EscrowEventKind`] discriminant (0–50). The mapping is pinned
+    /// [`EscrowEventKind`] discriminant (0–52). The mapping is pinned
     /// by test to declaration order (AV-57).
     InvalidEventKindDiscriminant(u8),
     /// A present arbiter panel's member count is outside `1..=8`
@@ -156,9 +156,9 @@ pub enum AccountDecodeError {
     /// panic-free guarantee).
     InvalidFeeSchedule { tier_count: u8, tier: u8 },
     /// The appeal lifecycle byte is not a known
-    /// [`AppealState`](crate::AppealState) discriminant (0–3). The
-    /// mapping is pinned to declaration order (AV-86; AV-32 panic-free
-    /// guarantee).
+    /// [`AppealState`](crate::AppealState) discriminant (0–4). The
+    /// mapping is pinned to declaration order (AV-86; AV-103 added
+    /// `Expired`; AV-32 panic-free guarantee).
     InvalidAppealStateDiscriminant(u8),
     /// A present Dutch auction's terms violate the
     /// [`DutchAuction`](crate::DutchAuction) invariants
@@ -789,7 +789,7 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // Appended last so every earlier offset above is unchanged.
     let appeal_deadline = c.u64_le()?;
     // AV-86: the appeal lifecycle discriminant, always present. The
-    // discriminant is validated 0–3 — an out-of-range value would
+    // discriminant is validated 0–4 — an out-of-range value would
     // decode to a state the accessors cannot name, so the panic-free
     // decoder rejects it (see `InvalidAppealStateDiscriminant`).
     let appeal_state = match c.u8()? {
@@ -797,6 +797,7 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         1 => AppealState::Filed,
         2 => AppealState::Upheld,
         3 => AppealState::Overturned,
+        4 => AppealState::Expired,
         other => return Err(AccountDecodeError::InvalidAppealStateDiscriminant(other)),
     };
     // AV-86: the panel's running appeal ballot, always present: the
@@ -965,6 +966,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // configured).
     let streaming_fee_rate = c.u64_le()?;
     let streaming_fees_accrued = c.u64_le()?;
+    // AV-103: the opt-in appeal bond and the locked-bond counter,
+    // always reserved (8 + 8 bytes, zeroed when no bond is configured
+    // / no appeal is in flight).
+    let appeal_bond = c.u64_le()?;
+    let appeal_bond_paid = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1130,6 +1136,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // one would.
         streaming_fee_rate,
         streaming_fees_accrued,
+        // AV-103: the opt-in appeal bond and the locked-bond counter
+        // ride the decode so a decoded escrow enforces the same bond
+        // the live one configured and locked.
+        appeal_bond,
+        appeal_bond_paid,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

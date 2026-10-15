@@ -44,6 +44,10 @@
 //!     fold never booked, so it is the symmetric no-op (and the
 //!     fold's `locked` realigns with `remaining_amount()` exactly when
 //!     `penalty_paid` returns to 0).
+//!   - `AppealExpired` (AV-103): a lapsed appeal forfeits the bond —
+//!     taker-supplied funds the fold never booked (the bond is
+//!     additional inflow outside the principal) — so it is the
+//!     symmetric no-op too.
 //!   - `MilestoneSkipped`: the tranche stays in the lockup (it joins
 //!     the refundable remainder — `remaining_amount()` still counts
 //!     it), so the fold books nothing now; the tranche is counted
@@ -177,7 +181,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // fold's `locked` realigns with `remaining_amount()` exactly
         // when `penalty_paid` returns to 0. An upheld appeal moves
         // nothing either.
-        | EscrowEventKind::AppealResolved => (0, 0, 0),
+        // AV-103: an expired appeal forfeits the bond — taker-supplied
+        // funds the fold never booked (the bond is additional inflow
+        // outside the principal) — so it is the symmetric no-op too.
+        | EscrowEventKind::AppealResolved
+        | EscrowEventKind::AppealExpired => (0, 0, 0),
         // Taker payouts, gross (AV-17: the fee is an internal routing
         // slice of the gross — `payout` already includes it, matching
         // `Escrow::released_amount`). `ReleasedSplit` (AV-93) likewise
@@ -599,6 +607,7 @@ mod event_sourcing_tests {
                 | EscrowEventKind::CpiAllowlistUpdated
                 | EscrowEventKind::AppealFiled
                 | EscrowEventKind::AppealResolved
+                | EscrowEventKind::AppealExpired
                 | EscrowEventKind::EvidenceFiled
                 | EscrowEventKind::Slashed => (0, 0, 0),
             };

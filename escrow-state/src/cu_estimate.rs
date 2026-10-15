@@ -84,6 +84,9 @@ pub const INSTRUCTION_CU_TABLE: &[(&str, u64, usize)] = &[
     ("file_appeal", 6_000, 8),
     // uphold:bool → 8 + 1.
     ("review_appeal", 14_000, 9),
+    // AV-103: no params → 8 + 0; a permissionless sweep like
+    // crank_expired.
+    ("expire_appeal", 10_000, 8),
 ];
 
 /// Base cost for `instruction`, or `None` when the table has no row —
@@ -171,6 +174,7 @@ mod cu_estimate_tests {
             KeeperActionKind::Slash,
             KeeperActionKind::FileAppeal,
             KeeperActionKind::ReviewAppeal,
+            KeeperActionKind::ExpireAppeal,
         ];
         assert_eq!(kinds.len(), INSTRUCTION_CU_TABLE.len());
         for k in kinds {

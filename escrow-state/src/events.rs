@@ -238,14 +238,19 @@
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
 //! | Slashed (AV-82) | 0 | 0 | 0 | the slashed amount, routed to the penalty account (the escrow stays `Funded`; from == to == `Funded`) |
-//! | AppealFiled (AV-86) | 0 | 0 | 0 | 0 — the taker filed the appeal inside the window; no funds move (from == to == `Funded`) |
-//! | AppealResolved (AV-86) | the penalty refunded to the taker on overturn — a restitution, no fee (0 on uphold; from == to == `Funded`) | 0 | 0 | 0 |
+//! | AppealFiled (AV-86) | 0 | 0 | 0 | 0 — the taker filed the appeal inside the window; no funds move (from == to == `Funded`) — with an AV-103 bond the taker locks the bond into `appeal_bond_paid` at filing (read from the vault, not the event) |
+//! | AppealResolved (AV-86) | the penalty refunded to the taker on overturn — a restitution, no fee — plus the refunded appeal bond (AV-103; the taker's full restitution) (0 on uphold; from == to == `Funded`) | 0 | 0 | the appeal bond forfeited to the initializer on uphold (AV-103; 0 when no bond was locked) |
+//! | AppealExpired (AV-103) | 0 | 0 | 0 | the appeal bond forfeited to the initializer when the window lapsed unresolved (0 when no bond was locked; from == to == `Funded`) |
 //!
 //! # Backward compatibility
 //!
-//! No existing public method signature changed: the wrapper is purely
-//! additive, and [`Escrow`] itself is untouched. The crate stays
-//! dependency-free.
+//! AV-103 changed two existing public signatures: `file_appeal` now
+//! returns the locked bond (`Result<u64>`), and `review_appeal`
+//! returns `(outcome, penalty_refunded, bond_moved)` on resolution —
+//! the bond additions the appeal-bond feature needs. [`Escrow`] gained
+//! two appended fields (`appeal_bond`, `appeal_bond_paid`), the
+//! `with_appeal_bond` builder, and `expire_appeal`; every earlier
+//! field offset stays stable. The crate stays dependency-free.
 
 use crate::{Escrow, EscrowError, EscrowState, MilestonePlan, QuorumPolicy, SplitConfig, VestingSchedule};
 use crate::{AppealOutcome, BasketSettlement, OverrideValue, TemplatePreset};
@@ -606,11 +611,15 @@ pub enum EscrowEventKind {
     /// to collect `threshold` matching votes. `from == to == Funded`.
     /// On overturn the refunded penalty rides [`EventAmounts::payout`]
     /// (a taker restitution, no fee — the penalty is neither a fresh
-    /// payout nor an initializer refund); on uphold all amounts are
-    /// zero. The verdict rides the event's `appeal_outcome` field (see
-    /// [`EscrowEvent::appeal_outcome`]), and the actor is the member
-    /// whose vote was the M-th match. Always emitted on resolution: a
-    /// non-resolving vote emits nothing (the ballot is still open).
+    /// payout nor an initializer refund); AV-103: the refunded appeal
+    /// bond rides `payout` too (the taker's full restitution, no fee).
+    /// On uphold the forfeited appeal bond rides
+    /// [`EventAmounts::penalty`] (a penalty-like sink, 0 when no bond
+    /// was locked). The verdict rides the event's `appeal_outcome`
+    /// field (see [`EscrowEvent::appeal_outcome`]), and the actor is
+    /// the member whose vote was the M-th match. Always emitted on
+    /// resolution: a non-resolving vote emits nothing (the ballot is
+    /// still open).
     AppealResolved,
     /// AV-91: one dispute-evidence document was disclosed against the
     /// committed Merkle root ([`Escrow::file_evidence`]). `from == to
@@ -684,6 +693,18 @@ pub enum EscrowEventKind {
     /// configuration, like [`Escrow::with_payout_allowlist`].)
     /// Emitted only on an actual change.
     DenylistUpdated,
+    /// AV-103: a filed slash appeal's window lapsed while still
+    /// unresolved ([`Escrow::expire_appeal`]) — the permissionless
+    /// sweep moved the appeal terminally to `Expired`. `from == to
+    /// == Funded` (the sweep is a procedural close, like the appeal
+    /// review itself). The slash stands, and the locked appeal bond
+    /// — if any — was forfeited to the initializer (the
+    /// anti-malicious-appeal-delay rule): the forfeited amount rides
+    /// [`EventAmounts::penalty`] (a penalty-like sink, 0 when no bond
+    /// was locked). The actor is the permissionless caller that ran
+    /// the sweep. Always emitted on success: a successful sweep always
+    /// closes the appeal, so there is no no-op case.
+    AppealExpired,
 }
 
 impl EscrowEventKind {
@@ -804,6 +825,9 @@ impl EscrowEventKind {
             // discriminants 0–50 stay stable for already-serialized
             // histories.
             51 => Self::DenylistUpdated,
+            // AV-103: appended after DenylistUpdated so discriminants
+            // 0–51 stay stable for already-serialized histories.
+            52 => Self::AppealExpired,
             _ => return None,
         })
     }
@@ -864,6 +888,7 @@ impl EscrowEventKind {
             Self::BasketCancelled => "basket_cancelled",
             Self::BasketExpiredCancelled => "basket_expired_cancelled",
             Self::DenylistUpdated => "payout_denylist_updated",
+            Self::AppealExpired => "appeal_expired",
         }
     }
 
@@ -925,6 +950,7 @@ impl EscrowEventKind {
             "basket_cancelled" => Self::BasketCancelled,
             "basket_expired_cancelled" => Self::BasketExpiredCancelled,
             "payout_denylist_updated" => Self::DenylistUpdated,
+            "appeal_expired" => Self::AppealExpired,
             _ => return None,
         })
     }
@@ -1052,15 +1078,32 @@ impl EventAmounts {
 
     /// A slash-appeal overturn (AV-86): the refunded penalty rides
     /// `payout` — it is a taker restitution (no fee sliced), neither a
-    /// fresh payout for work nor an initializer refund. Rides the
-    /// [`EscrowEventKind::AppealResolved`] event; an upheld appeal
-    /// resolves with [`EventAmounts::none`].
-    pub(crate) fn appeal_overturn(refunded: u64) -> Self {
+    /// fresh payout for work nor an initializer refund. AV-103: the
+    /// refunded appeal bond rides `payout` too — the taker's full
+    /// restitution, no fee. Rides the
+    /// [`EscrowEventKind::AppealResolved`] event.
+    pub(crate) fn appeal_overturn(refunded: u64, bond_refunded: u64) -> Self {
         Self {
-            payout: refunded,
+            payout: refunded.saturating_add(bond_refunded),
             fee: 0,
             refund: 0,
             penalty: 0,
+            rent_reclaimed: 0,
+        }
+    }
+
+    /// A slash-appeal uphold or window-lapse forfeiture (AV-103): the
+    /// forfeited appeal bond rides `penalty` — a penalty-like sink
+    /// routed to the initializer, neither a taker payout nor an
+    /// initializer refund. Rides the
+    /// [`EscrowEventKind::AppealResolved`] event on uphold and the
+    /// [`EscrowEventKind::AppealExpired`] event on expiry.
+    pub(crate) fn appeal_bond_forfeited(forfeited: u64) -> Self {
+        Self {
+            payout: 0,
+            fee: 0,
+            refund: 0,
+            penalty: forfeited,
             rent_reclaimed: 0,
         }
     }
@@ -3798,19 +3841,30 @@ impl IndexedEscrow {
         Ok(self)
     }
 
+    /// Opt in to the appeal bond (mirrors
+    /// [`Escrow::with_appeal_bond`], AV-103). Configuration: emits no
+    /// event.
+    pub fn with_appeal_bond(mut self, bond: u64) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_appeal_bond(bond)?;
+        Ok(self)
+    }
+
     /// File an appeal against the executed slash (AV-86; mirrors
     /// [`Escrow::file_appeal`]): `Funded -> Funded` — the taker contests
     /// the penalty inside the opt-in window, opening the arbiter
     /// panel's review. Emits [`EscrowEventKind::AppealFiled`] (from ==
-    /// to == `Funded`, amounts zero) with the taker as the actor. On
-    /// executor failure the state machine rolls back and nothing is
-    /// emitted, like every other failed transition. `at` is both the
-    /// event timestamp and the state machine's `now`.
+    /// to == `Funded`, amounts zero — a locked AV-103 bond is read
+    /// from the vault's `appeal_bond_paid`, not the event) with the
+    /// taker as the actor. On executor failure the state machine rolls
+    /// back and nothing is emitted, like every other failed transition.
+    /// `at` is both the event timestamp and the state machine's `now`.
+    /// Returns the locked bond (`0` when no bond was configured) so the
+    /// caller can size the taker's bond transfer into the vault.
     ///
     /// [`Escrow::file_appeal`]: super::Escrow::file_appeal
-    pub fn file_appeal(&mut self, taker: [u8; 32], at: u64) -> Result<(), EscrowError> {
+    pub fn file_appeal(&mut self, taker: [u8; 32], at: u64) -> Result<u64, EscrowError> {
         let from = self.inner.state();
-        self.inner.file_appeal(taker, at)?;
+        let locked = self.inner.file_appeal(taker, at)?;
         self.push_event(
             EscrowEventKind::AppealFiled,
             from,
@@ -3823,7 +3877,7 @@ impl IndexedEscrow {
             None,
             Some(taker),
         );
-        Ok(())
+        Ok(locked)
     }
 
     /// Cast a panel member's review vote on the filed slash appeal
@@ -3831,13 +3885,18 @@ impl IndexedEscrow {
     /// emits nothing — the ballot is still open, so there is no
     /// no-op-case event. The M-th matching vote resolves the appeal and
     /// emits [`EscrowEventKind::AppealResolved`] (from == to ==
-    /// `Funded`; on overturn `amounts.payout` is the penalty refunded
-    /// to the taker, zero on uphold) with the voting member as the
-    /// actor, and the verdict is stamped on the event's `appeal_outcome`
-    /// field. Returns `Ok(None)` while the ballot is open, or
-    /// `Ok(Some((outcome, refunded)))` on resolution — `refunded` is the
-    /// penalty returned to the taker (`0` on uphold) so the caller can
-    /// size the transfer. `at` is the event timestamp; the state
+    /// `Funded`; on overturn `amounts.payout` is the refunded penalty
+    /// plus the refunded appeal bond — the taker's full restitution, no
+    /// fee; on uphold `amounts.penalty` is the bond forfeited to the
+    /// initializer) with the voting member as the actor, and the
+    /// verdict is stamped on the event's `appeal_outcome` field.
+    /// Returns `Ok(None)` while the ballot is open, or
+    /// `Ok(Some((outcome, penalty_refunded, bond_moved)))` on
+    /// resolution — `penalty_refunded` is the penalty returned to the
+    /// taker (`0` on uphold), `bond_moved` the locked appeal bond (`0`
+    /// when none was configured; forfeited to the initializer on
+    /// uphold, refunded to the taker on overturn) so the caller can
+    /// size both transfers. `at` is the event timestamp; the state
     /// machine itself is not time-gated here (the window gates the
     /// filing, not the review).
     ///
@@ -3847,17 +3906,18 @@ impl IndexedEscrow {
         member: [u8; 32],
         uphold: bool,
         at: u64,
-    ) -> Result<Option<(AppealOutcome, u64)>, EscrowError> {
+    ) -> Result<Option<(AppealOutcome, u64, u64)>, EscrowError> {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
         let result = self.inner.review_appeal(member, uphold);
         let resolved = self.map_reentrant(result, at)?;
-        if let Some((outcome, refunded)) = resolved {
-            let amounts = if refunded > 0 {
-                EventAmounts::appeal_overturn(refunded)
-            } else {
-                EventAmounts::none()
+        if let Some((outcome, penalty_refunded, bond_moved)) = resolved {
+            let amounts = match outcome {
+                AppealOutcome::Overturned => {
+                    EventAmounts::appeal_overturn(penalty_refunded, bond_moved)
+                }
+                AppealOutcome::Upheld => EventAmounts::appeal_bond_forfeited(bond_moved),
             };
             self.push_event(
                 EscrowEventKind::AppealResolved,
@@ -3881,6 +3941,39 @@ impl IndexedEscrow {
                 .appeal_outcome = Some(outcome);
         }
         Ok(resolved)
+    }
+
+    /// Sweep a filed slash appeal whose window lapsed unresolved
+    /// (AV-103; mirrors [`Escrow::expire_appeal`]): `Funded -> Funded`
+    /// — the appeal moves terminally to `Expired`, the slash stands,
+    /// and the locked appeal bond (if any) is forfeited to the
+    /// initializer. Permissionless: anyone may crank a lapsed appeal.
+    /// Emits [`EscrowEventKind::AppealExpired`] (from == to ==
+    /// `Funded`, `amounts.penalty` = the forfeited bond) with the
+    /// caller as the actor. On executor failure the state machine
+    /// rolls back and nothing is emitted, like every other failed
+    /// transition. `at` is both the event timestamp and the state
+    /// machine's `now`. Returns the forfeited bond (`0` when no bond
+    /// was locked) so the caller can size the transfer to the
+    /// initializer.
+    ///
+    /// [`Escrow::expire_appeal`]: super::Escrow::expire_appeal
+    pub fn expire_appeal(&mut self, caller: [u8; 32], at: u64) -> Result<u64, EscrowError> {
+        let from = self.inner.state();
+        let forfeited = self.inner.expire_appeal(caller, at)?;
+        self.push_event(
+            EscrowEventKind::AppealExpired,
+            from,
+            self.inner.state(),
+            EventAmounts::appeal_bond_forfeited(forfeited),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(caller),
+        );
+        Ok(forfeited)
     }
 
     /// AV-81: wrap a freshly-split child escrow in its own event log.
@@ -5674,7 +5767,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(52), None);
+        assert_eq!(EscrowEventKind::from_discriminant(53), None);
     }
 
     #[test]
@@ -5690,7 +5783,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(52), None);
+        assert_eq!(EscrowEventKind::from_discriminant(53), None);
     }
 
     #[test]
@@ -6227,7 +6320,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(52), None);
+        assert_eq!(EscrowEventKind::from_discriminant(53), None);
     }
 
     #[test]
@@ -6242,7 +6335,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(52), None);
+        assert_eq!(EscrowEventKind::from_discriminant(53), None);
     }
 
     #[test]
@@ -6254,7 +6347,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(52), None);
+        assert_eq!(EscrowEventKind::from_discriminant(53), None);
     }
 
     #[test]
@@ -6266,7 +6359,19 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(52), None);
+        assert_eq!(EscrowEventKind::from_discriminant(53), None);
+    }
+
+    #[test]
+    fn appeal_expired_kind_round_trips() {
+        // AV-103: discriminant 52, appended after DenylistUpdated —
+        // 0–51 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::AppealExpired;
+        assert_eq!(kind.discriminant(), 52);
+        assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
+        assert_eq!(kind.name(), "appeal_expired");
+        assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
+        assert_eq!(EscrowEventKind::from_discriminant(53), None);
     }
 
     #[test]
@@ -6278,7 +6383,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(52), None);
+        assert_eq!(EscrowEventKind::from_discriminant(53), None);
     }
 
     #[test]
@@ -6290,7 +6395,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(52), None);
+        assert_eq!(EscrowEventKind::from_discriminant(53), None);
     }
 
     #[test]

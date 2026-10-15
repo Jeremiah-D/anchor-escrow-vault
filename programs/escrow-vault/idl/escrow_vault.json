@@ -604,6 +604,14 @@
       ]
     },
     {
+      "name": "initialize_appeal_bond",
+      "discriminator": [212, 156, 40, 145, 244, 132, 190, 84],
+      "accounts": [],
+      "args": [
+        {"name": "bond", "type": "u64"}
+      ]
+    },
+    {
       "name": "file_appeal",
       "discriminator": [254, 237, 206, 155, 40, 232, 240, 211],
       "accounts": [],
@@ -616,6 +624,12 @@
       "args": [
         {"name": "uphold", "type": "bool"}
       ]
+    },
+    {
+      "name": "expire_appeal",
+      "discriminator": [103, 85, 227, 157, 166, 89, 78, 46],
+      "accounts": [],
+      "args": []
     },
     {
       "name": "release_basket",
@@ -759,7 +773,9 @@
           {"name": "auction", "type": {"option": {"defined": "DutchAuction"}}, "offset": 4494},
           {"name": "transfer_hook", "type": {"option": {"array": ["u8", 32]}}, "offset": 4513},
           {"name": "streaming_fee_rate", "type": "u64", "offset": 4546},
-          {"name": "streaming_fees_accrued", "type": "u64", "offset": 4554}
+          {"name": "streaming_fees_accrued", "type": "u64", "offset": 4554},
+          {"name": "appeal_bond", "type": "u64", "offset": 4562},
+          {"name": "appeal_bond_paid", "type": "u64", "offset": 4570}
         ]
       }
     }
@@ -1026,7 +1042,9 @@
     {"code": 153, "name": "PayoutDenied"},
     {"code": 155, "name": "InvalidAuctionParams"},
     {"code": 156, "name": "AuctionNotActive"},
-    {"code": 157, "name": "InvalidTransferHook"}
+    {"code": 157, "name": "InvalidTransferHook"},
+    {"code": 158, "name": "InvalidAppealBond"},
+    {"code": 159, "name": "AppealExpiryNotDue"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

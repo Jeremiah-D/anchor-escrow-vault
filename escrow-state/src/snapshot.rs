@@ -466,12 +466,27 @@ pub struct EscrowSnapshot {
     pub appeal_deadline: u64,
     /// AV-86: the slash appeal's lifecycle state — `None` until the
     /// taker files, `Filed` while the arbiter panel reviews, terminally
-    /// `Upheld` or `Overturned`.
+    /// `Upheld`, `Overturned`, or `Expired` (AV-103: the window lapsed
+    /// unresolved and the sweep closed it).
     pub appeal_state: AppealState,
     /// AV-86: whether [`Escrow::file_appeal`](crate::Escrow::file_appeal)
     /// could succeed at [`EscrowSnapshot::at`] — the keeper scan lists
     /// exactly these escrows for `file_appeal`.
     pub appeal_eligible: bool,
+    /// AV-103: the opt-in appeal bond configured via
+    /// [`Escrow::with_appeal_bond`](crate::Escrow::with_appeal_bond)
+    /// (`0` = no bond — filing stays free).
+    pub appeal_bond: u64,
+    /// AV-103: the appeal bond locked by the taker at filing (`0`
+    /// when no appeal is in flight, or after the appeal resolved or
+    /// expired). Independent counter — never mixed into `released`
+    /// or `penalty_paid`.
+    pub appeal_bond_paid: u64,
+    /// AV-103: whether
+    /// [`Escrow::expire_appeal`](crate::Escrow::expire_appeal) could
+    /// succeed at [`EscrowSnapshot::at`] — the keeper scan lists
+    /// exactly these escrows for `expire_appeal`.
+    pub appeal_expiry_eligible: bool,
 }
 
 /// AV-82: point-in-time, read-only view of the opt-in slash terms —
@@ -731,6 +746,14 @@ impl Escrow {
             appeal_deadline: self.appeal_deadline(),
             appeal_state: self.appeal_state(),
             appeal_eligible: self.is_appeal_eligible(now),
+            // AV-103: the configured bond, the locked bond counter,
+            // and the at-`now` expiry-sweep eligibility ride the
+            // export — so an off-chain indexer can watch for bonded
+            // appeals and lapsed windows without replaying the appeal
+            // events.
+            appeal_bond: self.appeal_bond(),
+            appeal_bond_paid: self.appeal_bond_paid(),
+            appeal_expiry_eligible: self.is_appeal_expired(now),
         }
     }
 }
@@ -1233,9 +1256,22 @@ impl EscrowSnapshot {
             AppealState::Filed => "filed",
             AppealState::Upheld => "upheld",
             AppealState::Overturned => "overturned",
+            AppealState::Expired => "expired",
         });
         s.push_str("\",\"appeal_eligible\":");
         s.push_str(if self.appeal_eligible { "true" } else { "false" });
+        // AV-103: the bond config, the locked bond, and the
+        // expiry-sweep eligibility.
+        s.push_str(",\"appeal_bond\":");
+        s.push_str(&self.appeal_bond.to_string());
+        s.push_str(",\"appeal_bond_paid\":");
+        s.push_str(&self.appeal_bond_paid.to_string());
+        s.push_str(",\"appeal_expiry_eligible\":");
+        s.push_str(if self.appeal_expiry_eligible {
+            "true"
+        } else {
+            "false"
+        });
         s.push('}');
         s
     }
@@ -1295,7 +1331,8 @@ mod snapshot_tests {
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
              \"max_extension_secs\":0,\"extension_count\":0,\"arbiter_panel\":null,\
              \"slash_terms\":null,\"penalty_paid\":0,\"slash_eligible\":false,\
-             \"appeal_window_secs\":0,\"appeal_deadline\":0,\"appeal_state\":\"none\",\"appeal_eligible\":false\
+             \"appeal_window_secs\":0,\"appeal_deadline\":0,\"appeal_state\":\"none\",\"appeal_eligible\":false,\
+             \"appeal_bond\":0,\"appeal_bond_paid\":0,\"appeal_expiry_eligible\":false\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),

@@ -49,13 +49,18 @@
 //!   the slashable remainder (`amount`), not a decided slash.
 //! - `file_appeal` (AV-86): the taker appeals the executed slash inside
 //!   the opt-in window (see [`Escrow::is_appeal_eligible`]) — the taker
-//!   is the caller (`caller_role: "taker"`). Filing moves no funds; it
-//!   opens the panel's review.
+//!   is the caller (`caller_role: "taker"`). Filing opens the panel's
+//!   review (and locks the AV-103 appeal bond when one was
+//!   configured).
 //! - `review_appeal` (AV-86): a filed slash appeal awaits panel review
 //!   (see [`Escrow::is_appeal_under_review`]) — one action per panel
 //!   member who has not voted yet (`caller_role: "panel_member"`), so
 //!   a member-operated keeper bot learns which appeals await its vote;
 //!   the uphold/overturn judgment is the member's call-time decision.
+//! - `expire_appeal` (AV-103): a filed slash appeal whose window lapsed
+//!   unresolved (see [`Escrow::is_appeal_expired`]) — the
+//!   permissionless sweep (`caller_role: "anyone"`) that closes the
+//!   appeal and forfeits the locked bond to the initializer.
 //!
 //! Every listed action carries the exact arguments the keeper needs to
 //! build the instruction: `caller` (the signing key), `mint` (the bound
@@ -303,6 +308,18 @@ pub enum KeeperActionKind {
     /// not a keeper input. `amount` is the slashed penalty the ballot
     /// decides over.
     ReviewAppeal,
+    /// `expire_appeal(caller, now)` (AV-103): the permissionless sweep
+    /// of a filed slash appeal whose window lapsed unresolved. Listed
+    /// when [`Escrow::is_appeal_expired`] holds at scan time — a listed
+    /// sweep is always executable, never a `Paused` or
+    /// `AppealExpiryNotDue` rejection. The caller is `"anyone"` (see
+    /// [`KeeperAction::caller`]), never the escrow's parties — the
+    /// forfeited bond routes to the initializer by rule, never the
+    /// caller. `amount` is the locked appeal bond the sweep forfeits
+    /// (`0` when no bond was configured — the sweep still closes the
+    /// appeal); `refund_to` is `None` (the destination is the
+    /// initializer by rule, like `slash`'s penalty account).
+    ExpireAppeal,
 }
 
 impl KeeperActionKind {
@@ -319,6 +336,7 @@ impl KeeperActionKind {
             KeeperActionKind::Slash => "slash",
             KeeperActionKind::FileAppeal => "file_appeal",
             KeeperActionKind::ReviewAppeal => "review_appeal",
+            KeeperActionKind::ExpireAppeal => "expire_appeal",
         }
     }
 }
@@ -1029,6 +1047,36 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     });
                 }
             }
+        }
+        // AV-103: the appeal-expiry sweep. A filed appeal whose window
+        // lapsed unresolved is listed for `expire_appeal` — the
+        // predicate mirrors every `expire_appeal` gate (Funded, Filed,
+        // window lapsed, not paused), so a listed sweep is always
+        // executable. Permissionless: the keeper substitutes its own
+        // key (the zero key), like `crank_expired`; the forfeited bond
+        // routes to the initializer by rule, never the caller.
+        if e.is_appeal_expired(now) {
+            actions.push(KeeperAction {
+                escrow_id: w.escrow_id,
+                vault_address: w.vault_address(),
+                kind: KeeperActionKind::ExpireAppeal,
+                // Permissionless: no specific key must sign — the
+                // keeper substitutes its own key; see `caller` docs.
+                caller: [0u8; 32],
+                caller_role: "anyone",
+                mint: e.mint(),
+                // The forfeited bond routes to the initializer by rule
+                // (like `slash`'s penalty account) — no caller-chosen
+                // destination.
+                refund_to: None,
+                amount: e.appeal_bond_paid(),
+                decimals: e.decimals(),
+                reference: w.reference,
+                extension_count: e.extension_count(),
+                multisig_authority: e.multisig_authority,
+                evidence_disclosure: None,
+                reason: "appeal_window_lapsed",
+            });
         }
     }
     KeeperReport {
