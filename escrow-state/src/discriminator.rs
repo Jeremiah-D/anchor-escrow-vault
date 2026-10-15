@@ -948,6 +948,18 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(DUTCH_AUCTION_LEN)?;
         None
     };
+    // AV-99: the Token-2022 transfer-hook program id, always reserved
+    // like `mint`: the `None` discriminant followed by the zeroed
+    // 32-byte program id, or the `Some` discriminant and the program
+    // id. Structural decode only — the builder-time validity (nonzero
+    // id, mint bound) is enforced by `with_transfer_hook`, not
+    // re-checked here (decode is panic-free by the AV-32 guarantee).
+    let transfer_hook = if c.option_present("transfer_hook")? {
+        Some(c.pubkey()?)
+    } else {
+        c.skip(PUBKEY_LEN)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1104,6 +1116,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // escrow prices `claim` through the same descending curve the
         // live one used.
         auction,
+        // AV-99: the Token-2022 transfer-hook program id rides the
+        // decode so a decoded escrow gates CPI settlement plans on
+        // the same hook binding the live one declared.
+        transfer_hook,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

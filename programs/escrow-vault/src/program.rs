@@ -960,6 +960,35 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Declare the Token-2022 transfer-hook program this escrow's
+    /// token transfers execute under (AV-99; mirrors
+    /// `Escrow::with_transfer_hook`). `Uninitialized` only, like
+    /// `initialize_mint`: the hook binding is fixed before funds
+    /// move. Must come after `initialize_mint` bound a mint — a
+    /// transfer hook is a Token-2022 concept, meaningless on the
+    /// native-SOL path (`InvalidTransferHook`, code 157, when no mint
+    /// is bound); the zero program id is likewise rejected. After
+    /// this, the CPI settlement builders
+    /// (`escrow_state::cpi::payout_plan` and siblings) require the
+    /// caller's hook context to name exactly this program
+    /// (`SettlementMismatch` otherwise) and annotate the plan with
+    /// the hook's extra accounts. The vault account already reserves
+    /// the full hook region (33 bytes, zeroed when `None`), so the
+    /// binding is written in place — no realloc needed in the real
+    /// build. Emits no event (pre-fund configuration, like
+    /// `initialize_mint`).
+    pub fn initialize_transfer_hook(
+        ctx: Context<InitializeTransferHook>,
+        program_id: [u8; 32],
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_transfer_hook(program_id)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
     /// Claim the vested-but-unreleased portion (AV-13; mirrors
     /// `Escrow::claim`). Only the taker may call this; `now` comes from
     /// the Solana clock sysvar (never an instruction param — a
@@ -3989,6 +4018,14 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `payout_denylist`).
     pub auction: Option<DutchAuction>,
+    /// AV-99: opt-in Token-2022 transfer-hook program (mirrors
+    /// `escrow_state`'s `transfer_hook`); `None` for an escrow with
+    /// no hook. The account always reserves the full 33-byte region
+    /// (1-byte discriminant + 32-byte program id, zeroed when `None`)
+    /// so `initialize_transfer_hook` writes the binding in place
+    /// without reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after `auction`).
+    pub transfer_hook: Option<[u8; 32]>,
 }
 
 /// Skeleton mirror of `escrow_state::SlashTerms`: the opt-in
@@ -5038,6 +5075,20 @@ pub struct InitializeDutchAuction<'info> {
     /// escrow leaves `Uninitialized`, and rejects `start_at >=
     /// end_at` / `reserve_bps > 10_000` (`InvalidAuctionParams`, code
     /// 155).
+    pub initializer: Signer<'info>,
+}
+
+/// AV-99: accounts for `initialize_transfer_hook` — same shape as
+/// `InitializeMint`: only the initializer declares the hook binding.
+#[derive(Accounts)]
+pub struct InitializeTransferHook<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer declares the transfer-hook program; the
+    /// state machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`, the zero program id, and a declaration before
+    /// `initialize_mint` bound a mint (`InvalidTransferHook`, code
+    /// 157).
     pub initializer: Signer<'info>,
 }
 
@@ -6233,6 +6284,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::AuctionNotActive => {
             error!(ErrorCode::AuctionNotActive)
         }
+        escrow_state::EscrowError::InvalidTransferHook => {
+            error!(ErrorCode::InvalidTransferHook)
+        }
     }
 }
 
@@ -6346,4 +6400,6 @@ pub enum ErrorCode {
     InvalidAuctionParams,
     #[msg("Dutch auction not active (AV-97): claim on an auction-mode escrow outside the [start_at, end_at] window, or escalate while the auction window is live (price discovery and arbitration are mutually exclusive settlement paths)")]
     AuctionNotActive,
+    #[msg("Invalid Token-2022 transfer-hook declaration (AV-99): with_transfer_hook with the zero program id, on a non-Uninitialized escrow, or before with_mint bound a mint (a transfer hook is a Token-2022 concept, meaningless on the native-SOL path)")]
+    InvalidTransferHook,
 }

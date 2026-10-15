@@ -667,6 +667,14 @@
         {"name": "end_at", "type": "u64"},
         {"name": "reserve_bps", "type": "u16"}
       ]
+    },
+    {
+      "name": "initialize_transfer_hook",
+      "discriminator": [22, 166, 19, 247, 193, 62, 186, 143],
+      "accounts": [],
+      "args": [
+        {"name": "program_id", "type": {"array": ["u8", 32]}}
+      ]
     }
   ],
   "accounts": [
@@ -740,7 +748,8 @@
           {"name": "evidence_disclosed", "type": "u64", "offset": 3970},
           {"name": "basket", "type": {"option": {"defined": "BasketLegs"}}, "offset": 3978},
           {"name": "payout_denylist", "type": {"option": {"defined": "PayoutDenylist"}}, "offset": 4364},
-          {"name": "auction", "type": {"option": {"defined": "DutchAuction"}}, "offset": 4494}
+          {"name": "auction", "type": {"option": {"defined": "DutchAuction"}}, "offset": 4494},
+          {"name": "transfer_hook", "type": {"option": {"array": ["u8", 32]}}, "offset": 4513}
         ]
       }
     }
@@ -1006,7 +1015,8 @@
     {"code": 154, "name": "InvalidPayoutDenylist"},
     {"code": 153, "name": "PayoutDenied"},
     {"code": 155, "name": "InvalidAuctionParams"},
-    {"code": 156, "name": "AuctionNotActive"}
+    {"code": 156, "name": "AuctionNotActive"},
+    {"code": 157, "name": "InvalidTransferHook"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

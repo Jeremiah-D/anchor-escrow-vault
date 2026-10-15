@@ -593,7 +593,7 @@ and `evidence_disclosure`. New vault fields (appended last):
 `evidence_root` (`Option<[u8; 32]>`, 33 bytes) + `evidence_leaves`
 (u8) + `evidence_disclosed` (u64, 8 bytes) — 42 bytes at the time,
 bringing the layout to 3978 bytes (the layout has since grown to
-4505 bytes / 4513 with the discriminator — see the account-space
+4538 bytes / 4546 with the discriminator — see the account-space
 paragraph below). Anchor
 surface: `escalate` gains the two params, plus the new
 `file_evidence` instruction (`doc_hash`, `leaf_index`,
@@ -2208,7 +2208,8 @@ two-way consistency check against the IDL parameter table:
 | basket | Option<BasketLegs> | 386 |
 | payout_denylist | Option<PayoutDenylist> | 130 |
 | auction | Option<DutchAuction> | 19 |
-| **total**     |                   | **4505** |
+| transfer_hook | Option<[u8; 32]> | 33 |
+| **total**     |                   | **4538** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2309,10 +2310,10 @@ basket is configured) — and the 130-byte payout-denylist region
 19-byte Dutch-auction region (AV-97: 1-byte discriminant + 18-byte
 terms — `start_at` + `end_at` (u64) + `reserve_bps` (u16) — zeroed
 when no auction is configured).
-`escrow-state` exposes `VAULT_SPACE` (4513) and
-`VAULT_SPACE_NO_QUORUM` (4023) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (4546) and
+`VAULT_SPACE_NO_QUORUM` (4056) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **32,301,360 lamports** to be
+mainnet rent parameters the full vault needs **32,531,040 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -2894,6 +2895,30 @@ conservation convention), the protocol fee slices the gross, and
 the 19-byte region is always reserved in the vault layout (1-byte
 discriminant + 18-byte terms, zeroed when `None`), so the opt-in
 writes in place without reallocating.
+
+## Token-2022 transfer hooks (AV-99)
+
+SPL Token-2022 mints can carry a transfer hook — a program that
+runs on every transfer. An escrow over such a mint declares the
+hook program via `with_transfer_hook(program_id)` (or the
+`initialize_transfer_hook` instruction), `Uninitialized` only and
+only *after* `with_mint` bound the mint: a hook is a Token-2022
+concept, meaningless on the native-SOL path, so declaring one with
+no mint bound — or with the zero program id — is
+`InvalidTransferHook` (code 157, pinned, never renumbered). The
+33-byte region is always reserved in the vault layout (1-byte
+discriminant + 32-byte program id, zeroed when `None`), so the
+binding writes in place without reallocating, and every earlier
+field keeps its offset. The pure-Rust settlement plans
+(`cpi::payout_plan` / `refund_plan` / `resolve_plan`) then gate on
+the binding: the caller's hook context must name exactly the
+declared program (`SettlementMismatch` on any mismatch — declared
+but unnamed, unnamed but claimed, or a different program), and the
+plan annotates the hook program plus its extra accounts so the
+CPI builder can append them to the transfer instruction. The plans
+never assert on-chain hook execution — only that the declared
+binding and the plan agree. Indexers see the binding in the state
+snapshot (`"transfer_hook"` as 64-char hex or `null`).
 
 ## Basket escrow (AV-95)
 

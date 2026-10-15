@@ -320,6 +320,9 @@ pub struct EscrowSnapshot {
     /// SPL token mint bound to this escrow, or `None` for native SOL
     /// (AV-16).
     pub mint: Option<[u8; 32]>,
+    /// Token-2022 transfer-hook program declared for this escrow, or
+    /// `None` when no hook is bound (AV-99).
+    pub transfer_hook: Option<[u8; 32]>,
     /// Protocol fee rate in basis points (AV-17).
     pub fee_bps: u16,
     /// Cumulative protocol fee charged across all payouts (AV-17).
@@ -594,6 +597,7 @@ impl Escrow {
             claimable: self.claimable_amount(now),
             arbiter: self.arbiter(),
             mint: self.mint(),
+            transfer_hook: self.transfer_hook(),
             fee_bps: self.fee_bps(),
             fees_paid: self.fees_paid(),
             fee_recipient: self.fee_recipient(),
@@ -863,6 +867,10 @@ impl EscrowSnapshot {
         write_opt_hex(&mut s, self.arbiter);
         s.push_str(",\"mint\":");
         write_opt_hex(&mut s, self.mint);
+        // AV-99: the declared Token-2022 transfer-hook program — 64-char
+        // lowercase hex or `null` — so indexers see the hook binding.
+        s.push_str(",\"transfer_hook\":");
+        write_opt_hex(&mut s, self.transfer_hook);
         s.push_str(",\"fee_bps\":");
         s.push_str(&self.fee_bps.to_string());
         s.push_str(",\"fees_paid\":");
@@ -1262,7 +1270,7 @@ mod snapshot_tests {
              \"dual_sig\":{{\"required\":false,\"initializer_activated\":false,\"taker_activated\":false}},\
              \"quorum\":null,\
              \"vesting\":null,\"vesting_curve\":null,\"vested\":0,\"display_vested\":\"0\",\"claimable\":0,\"display_claimable\":\"0\",\
-             \"arbiter\":null,\"mint\":null,\
+             \"arbiter\":null,\"mint\":null,\"transfer_hook\":null,\
              \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\

@@ -193,6 +193,30 @@ pub enum PayoutKind {
     MilestoneRelease,
 }
 
+/// The Token-2022 transfer-hook execution context a settlement plan
+/// is built for (AV-99).
+///
+/// Token-2022 invokes the hook program itself during the transfer —
+/// the vault program only passes the extra accounts through — so
+/// this is a *compatibility annotation*, not an execution proof:
+/// [`payout_plan`] and its siblings check the named `program`
+/// against the escrow's declared [`Escrow::transfer_hook`], and the
+/// plan carries the `extra_accounts` so the on-chain CPI context can
+/// include them. Pure logic never asserts the hook actually ran
+/// on-chain (see the field docs on [`Escrow::transfer_hook`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferHookPlan {
+    /// The hook program this settlement executes under. Must equal
+    /// the escrow's declared hook program — a mismatch fails the
+    /// plan with [`CpiError::SettlementMismatch`].
+    pub program: Pubkey,
+    /// Extra accounts the hook program needs (hook-specific; Token-2022
+    /// derives them per its interface). Annotated on the plan, not
+    /// validated — they are chain state the pure-logic machine cannot
+    /// check.
+    pub extra_accounts: Vec<AccountMeta>,
+}
+
 /// Addresses for a taker-payout settlement (`release` / `claim` /
 /// `release_milestone`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +236,11 @@ pub struct PayoutAddrs {
     /// with a zero address is rejected. When the escrow pins a fee
     /// recipient (AV-44), the address must equal it.
     pub fee_leg: Pubkey,
+    /// Token-2022 transfer-hook execution context (AV-99). `None`
+    /// when the escrow declares no hook; `Some` must name the
+    /// declared hook program when it does (mismatch →
+    /// [`CpiError::SettlementMismatch`]).
+    pub transfer_hook: Option<TransferHookPlan>,
 }
 
 /// Which refund transition this plan settles.
@@ -239,6 +268,9 @@ pub struct RefundAddrs {
     pub refund_leg: Pubkey,
     /// Penalty destination account (`penalty == 0` → no leg emitted).
     pub penalty_leg: Pubkey,
+    /// Token-2022 transfer-hook execution context (AV-99). Same
+    /// semantics as [`PayoutAddrs::transfer_hook`].
+    pub transfer_hook: Option<TransferHookPlan>,
 }
 
 /// Addresses for a dispute-arbitration settlement (`resolve`).
@@ -260,6 +292,9 @@ pub struct ResolveAddrs {
     pub initializer: Pubkey,
     /// Initializer-refund destination account.
     pub refund_leg: Pubkey,
+    /// Token-2022 transfer-hook execution context (AV-99). Same
+    /// semantics as [`PayoutAddrs::transfer_hook`].
+    pub transfer_hook: Option<TransferHookPlan>,
 }
 
 /// A validated settlement: the transfer instructions to submit, in order.
@@ -269,6 +304,16 @@ pub struct ResolveAddrs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettlementPlan {
     pub transfers: Vec<TransferInstruction>,
+    /// The Token-2022 transfer-hook program this settlement executes
+    /// under (AV-99): `Some` exactly when the escrow declared a hook
+    /// and the plan's hook context matched it. The on-chain CPI
+    /// context must include [`Self::transfer_hook_accounts`] when
+    /// this is `Some`.
+    pub transfer_hook_program: Option<Pubkey>,
+    /// Extra accounts the hook program needs (AV-99), annotated from
+    /// the plan's hook context — chain state the pure-logic machine
+    /// annotates but never validates.
+    pub transfer_hook_accounts: Vec<AccountMeta>,
 }
 
 impl SettlementPlan {
@@ -325,6 +370,37 @@ fn push_fee_leg(
     Ok(())
 }
 
+/// Check the plan's Token-2022 transfer-hook context against the
+/// escrow's declared hook binding (AV-99), and return the annotation
+/// for the [`SettlementPlan`].
+///
+/// The gate is exact-equality in both directions:
+/// - escrow declares a hook, plan names the same program → the hook
+///   program and its extra accounts ride the plan;
+/// - escrow declares a hook, plan names nothing or a different program
+///   → [`CpiError::SettlementMismatch`] (a plan that would silently
+///   drop or swap the hook is never built);
+/// - escrow declares no hook, plan names one →
+///   [`CpiError::SettlementMismatch`] (the plan claims hook execution
+///   the escrow never authorized).
+///
+/// Pure logic never asserts the hook actually ran on-chain — that is
+/// Token-2022's job during the transfer. This gate only guarantees
+/// the plan and the declaration agree.
+fn check_transfer_hook(
+    escrow: &Escrow,
+    hook: &Option<TransferHookPlan>,
+) -> Result<(Option<Pubkey>, Vec<AccountMeta>), CpiError> {
+    match (escrow.transfer_hook(), hook) {
+        (None, None) => Ok((None, Vec::new())),
+        (Some(declared), Some(plan)) if plan.program == declared => Ok((
+            Some(declared),
+            plan.extra_accounts.clone(),
+        )),
+        _ => Err(CpiError::SettlementMismatch),
+    }
+}
+
 /// Build the transfers for a taker payout after `release` / `claim` /
 /// `release_milestone` returned `(payout, fee)`.
 ///
@@ -337,7 +413,11 @@ fn push_fee_leg(
 ///   must go straight to the taker wallet (`taker_leg == taker`);
 /// - `addrs.fee_leg` equals the escrow's pinned fee recipient when one
 ///   is configured (AV-44);
-/// - the transfer program follows the escrow's mint binding.
+/// - the transfer program follows the escrow's mint binding;
+/// - AV-99: the plan's transfer-hook context matches the escrow's
+///   declared hook binding exactly (mismatch →
+///   [`CpiError::SettlementMismatch`); the plan annotates the hook
+///   program and its extra accounts.
 pub fn payout_plan(
     kind: PayoutKind,
     escrow: &Escrow,
@@ -378,7 +458,15 @@ pub fn payout_plan(
         transfers.push(leg(escrow, addrs.source, addrs.vault_authority, addrs.taker_leg, payout)?);
     }
     push_fee_leg(escrow, addrs.source, addrs.vault_authority, addrs.fee_leg, fee, &mut transfers)?;
-    Ok(SettlementPlan { transfers })
+    // AV-99: the hook gate runs after every other check — a plan that
+    // fails amount/recipient validation never reaches hook annotation.
+    let (transfer_hook_program, transfer_hook_accounts) =
+        check_transfer_hook(escrow, &addrs.transfer_hook)?;
+    Ok(SettlementPlan {
+        transfers,
+        transfer_hook_program,
+        transfer_hook_accounts,
+    })
 }
 
 /// Build the transfers for a refund after `cancel` (refund amount
@@ -394,7 +482,11 @@ pub fn payout_plan(
 ///   initializer and refund policy (AV-23 whitelist pinning);
 /// - on the native path the refund goes to the pinned `refund_to` address
 ///   and the penalty (taker-initiated expiry cancels, AV-24) to the
-///   initializer.
+///   initializer;
+/// - AV-99: the plan's transfer-hook context matches the escrow's
+///   declared hook binding exactly (mismatch →
+///   [`CpiError::SettlementMismatch`); the plan annotates the hook
+///   program and its extra accounts.
 pub fn refund_plan(
     kind: RefundKind,
     escrow: &Escrow,
@@ -445,7 +537,14 @@ pub fn refund_plan(
         // above, so nothing merges silently.
         transfers.push(leg(escrow, addrs.source, addrs.vault_authority, addrs.penalty_leg, penalty)?);
     }
-    Ok(SettlementPlan { transfers })
+    // AV-99: hook gate after every other check, like `payout_plan`.
+    let (transfer_hook_program, transfer_hook_accounts) =
+        check_transfer_hook(escrow, &addrs.transfer_hook)?;
+    Ok(SettlementPlan {
+        transfers,
+        transfer_hook_program,
+        transfer_hook_accounts,
+    })
 }
 
 /// Build the transfers for a dispute settlement after `resolve` returned
@@ -460,7 +559,11 @@ pub fn refund_plan(
 /// - taker / initializer identities pinned; native-path legs go to the
 ///   pinned wallets;
 /// - `addrs.fee_leg` equals the escrow's pinned fee recipient when one
-///   is configured (AV-44).
+///   is configured (AV-44);
+/// - AV-99: the plan's transfer-hook context matches the escrow's
+///   declared hook binding exactly (mismatch →
+///   [`CpiError::SettlementMismatch`); the plan annotates the hook
+///   program and its extra accounts.
 pub fn resolve_plan(
     escrow: &Escrow,
     addrs: &ResolveAddrs,
@@ -511,7 +614,14 @@ pub fn resolve_plan(
     if refund > 0 {
         transfers.push(leg(escrow, addrs.source, addrs.vault_authority, addrs.refund_leg, refund)?);
     }
-    Ok(SettlementPlan { transfers })
+    // AV-99: hook gate after every other check, like `payout_plan`.
+    let (transfer_hook_program, transfer_hook_accounts) =
+        check_transfer_hook(escrow, &addrs.transfer_hook)?;
+    Ok(SettlementPlan {
+        transfers,
+        transfer_hook_program,
+        transfer_hook_accounts,
+    })
 }
 
 #[cfg(test)]
@@ -541,6 +651,7 @@ mod cpi_tests {
             taker: key(2),
             taker_leg: key(2),       // native path: straight to the taker wallet
             fee_leg: key(9),
+            transfer_hook: None,
         }
     }
 
@@ -732,6 +843,7 @@ mod cpi_tests {
             taker,
             taker_leg: key(12), // taker's associated token account
             fee_leg: key(9),
+            transfer_hook: None,
         };
         let plan = payout_plan(PayoutKind::Release, &e, &addrs, payout, fee).unwrap();
         assert_eq!(plan.transfers.len(), 1);
@@ -756,6 +868,7 @@ mod cpi_tests {
             refund_to: key(1),
             refund_leg: key(1),
             penalty_leg: key(1),
+            transfer_hook: None,
         };
         let plan = refund_plan(RefundKind::Cancel, &e, &addrs, 1_000_000, 0).unwrap();
         assert_eq!(plan.transfers.len(), 1);
@@ -782,6 +895,7 @@ mod cpi_tests {
             refund_to: init,
             refund_leg: init,
             penalty_leg: init,
+            transfer_hook: None,
         };
         let plan = refund_plan(RefundKind::CancelExpired, &e, &addrs, refund, penalty).unwrap();
         assert_eq!(plan.transfers.len(), 2);
@@ -801,6 +915,7 @@ mod cpi_tests {
             refund_to: key(1),
             refund_leg: key(1),
             penalty_leg: key(1),
+            transfer_hook: None,
         };
         // Inflated refund: total != amount - released.
         assert_eq!(
@@ -846,6 +961,7 @@ mod cpi_tests {
             fee_leg: key(9),
             initializer: init,
             refund_leg: init,
+            transfer_hook: None,
         };
         let plan = resolve_plan(&e, &addrs, taker_payout, fee, refund).unwrap();
         assert_eq!(plan.transfers.len(), 2); // no fee leg at 0 bps
@@ -882,6 +998,7 @@ mod cpi_tests {
             fee_leg: key(9),
             initializer: init,
             refund_leg: init,
+            transfer_hook: None,
         };
         let plan = resolve_plan(&e, &addrs, taker_payout, fee, refund).unwrap();
         assert_eq!(plan.transfers.len(), 3);
@@ -948,6 +1065,7 @@ mod cpi_tests {
             fee_leg: key(8), // swapped
             initializer: init,
             refund_leg: init,
+            transfer_hook: None,
         };
         assert_eq!(
             resolve_plan(&e, &addrs, taker_payout, fee, refund),
@@ -977,5 +1095,189 @@ mod cpi_tests {
         let plan = payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout, fee).unwrap();
         assert_eq!(plan.transfers.len(), 2);
         assert_eq!(plan.transfers[1].accounts[1].pubkey, key(9));
+    }
+
+    // --- AV-99: Token-2022 transfer-hook compatibility ---------------------------
+
+    #[test]
+    fn transfer_hook_builder_matrix() {
+        let hook = [0x77; 32];
+        let mint = [0xD0; 32];
+        // Happy path: Uninitialized + mint bound + nonzero program id.
+        let e = Escrow::initialize(key(1), key(2), 1_000_000, u64::MAX)
+            .unwrap()
+            .with_mint(mint)
+            .unwrap()
+            .with_transfer_hook(hook)
+            .unwrap();
+        assert_eq!(e.transfer_hook(), Some(hook));
+        // Zero program id: a hook that is nowhere cannot be pinned.
+        assert_eq!(
+            Escrow::initialize(key(1), key(2), 1_000_000, u64::MAX)
+                .unwrap()
+                .with_mint(mint)
+                .unwrap()
+                .with_transfer_hook([0u8; 32]),
+            Err(EscrowError::InvalidTransferHook)
+        );
+        // No mint bound: a transfer hook is a Token-2022 concept,
+        // meaningless on the native-SOL path.
+        assert_eq!(
+            Escrow::initialize(key(1), key(2), 1_000_000, u64::MAX)
+                .unwrap()
+                .with_transfer_hook(hook),
+            Err(EscrowError::InvalidTransferHook)
+        );
+        // Builder is Uninitialized-only.
+        let mut funded = Escrow::initialize(key(1), key(2), 1_000_000, u64::MAX)
+            .unwrap()
+            .with_mint(mint)
+            .unwrap();
+        funded.fund(key(1), FUND_AT).unwrap();
+        assert_eq!(
+            funded.with_transfer_hook(hook),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // The new error code is pinned (never renumbered).
+        assert_eq!(EscrowError::InvalidTransferHook.code(), 157);
+    }
+
+    fn hook_escrow() -> (Escrow, Pubkey) {
+        let hook = [0x77; 32];
+        let mint = [0xD0; 32];
+        let mut e = Escrow::initialize(key(1), key(2), 1_000_000, u64::MAX)
+            .unwrap()
+            .with_mint(mint)
+            .unwrap()
+            .with_transfer_hook(hook)
+            .unwrap();
+        e.fund(key(1), FUND_AT).unwrap();
+        (e, hook)
+    }
+
+    fn hook_plan(hook: Pubkey) -> TransferHookPlan {
+        TransferHookPlan {
+            program: hook,
+            extra_accounts: vec![
+                AccountMeta { pubkey: key(20), is_signer: false, is_writable: true },
+                AccountMeta { pubkey: key(21), is_signer: false, is_writable: false },
+            ],
+        }
+    }
+
+    fn hook_payout_addrs(hook: Pubkey) -> PayoutAddrs {
+        PayoutAddrs {
+            source: key(11),
+            vault_authority: key(10),
+            taker: key(2),
+            taker_leg: key(12),
+            fee_leg: key(9),
+            transfer_hook: Some(hook_plan(hook)),
+        }
+    }
+
+    #[test]
+    fn matching_hook_plan_annotates_program_and_extra_accounts() {
+        let (mut e, hook) = hook_escrow();
+        let mint = [0xD0; 32];
+        let (payout, fee) = e.release(key(1), 0, 1_000_000, Some(mint), key(2)).unwrap();
+        let plan = payout_plan(PayoutKind::Release, &e, &hook_payout_addrs(hook), payout, fee).unwrap();
+        assert_eq!(plan.transfer_hook_program, Some(hook));
+        assert_eq!(plan.transfer_hook_accounts.len(), 2);
+        assert_eq!(plan.transfer_hook_accounts[0].pubkey, key(20));
+        assert_eq!(plan.transfer_hook_accounts[1].pubkey, key(21));
+        // The money movement itself is unchanged: one SPL-token leg.
+        assert_eq!(plan.transfers.len(), 1);
+        assert_eq!(plan.transfers[0].program_id, spl_token_program_id());
+    }
+
+    #[test]
+    fn hook_mismatch_matrix_fails_closed() {
+        let (mut e, hook) = hook_escrow();
+        let mint = [0xD0; 32];
+        let (payout, fee) = e.release(key(1), 0, 1_000_000, Some(mint), key(2)).unwrap();
+        // Escrow declares a hook, plan names none → SettlementMismatch.
+        let mut addrs = hook_payout_addrs(hook);
+        addrs.transfer_hook = None;
+        assert_eq!(
+            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee),
+            Err(CpiError::SettlementMismatch)
+        );
+        // Escrow declares a hook, plan names a different program →
+        // SettlementMismatch (a swapped hook is never built).
+        let mut addrs = hook_payout_addrs([0x78; 32]);
+        assert_eq!(
+            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee),
+            Err(CpiError::SettlementMismatch)
+        );
+        // Escrow declares no hook, plan names one → SettlementMismatch
+        // (the plan claims hook execution the escrow never authorized).
+        let mut e2 = funded_escrow(1_000_000);
+        let (payout2, fee2) = e2.release(key(1), 0, 1_000_000, None, key(2)).unwrap();
+        let mut addrs2 = payout_addrs_native();
+        addrs2.transfer_hook = Some(hook_plan(hook));
+        assert_eq!(
+            payout_plan(PayoutKind::Release, &e2, &addrs2, payout2, fee2),
+            Err(CpiError::SettlementMismatch)
+        );
+        // No hook on either side → clean plan, empty annotation.
+        let addrs3 = payout_addrs_native();
+        let plan = payout_plan(PayoutKind::Release, &e2, &addrs3, payout2, fee2).unwrap();
+        assert_eq!(plan.transfer_hook_program, None);
+        assert!(plan.transfer_hook_accounts.is_empty());
+    }
+
+    #[test]
+    fn hook_gate_applies_to_refund_and_resolve_plans() {
+        let hook = [0x77; 32];
+        let mint = [0xD0; 32];
+        // Refund plan with a declared hook.
+        let mut e = Escrow::initialize(key(1), key(2), 1_000_000, 1_000_000)
+            .unwrap()
+            .with_mint(mint)
+            .unwrap()
+            .with_transfer_hook(hook)
+            .unwrap();
+        e.fund(key(1), FUND_AT).unwrap();
+        e.cancel(key(1), Some(mint), key(1)).unwrap();
+        let mut raddrs = RefundAddrs {
+            source: key(11),
+            vault_authority: key(10),
+            initializer: key(1),
+            refund_to: key(1),
+            refund_leg: key(1),
+            penalty_leg: key(1),
+            transfer_hook: Some(hook_plan(hook)),
+        };
+        let plan = refund_plan(RefundKind::Cancel, &e, &raddrs, 1_000_000, 0).unwrap();
+        assert_eq!(plan.transfer_hook_program, Some(hook));
+        raddrs.transfer_hook = Some(hook_plan([0x78; 32]));
+        assert_eq!(
+            refund_plan(RefundKind::Cancel, &e, &raddrs, 1_000_000, 0),
+            Err(CpiError::SettlementMismatch)
+        );
+    }
+
+    #[test]
+    fn transfer_hook_persists_in_serialized_tail() {
+        // The hook program id rides the vault account tail (33 bytes:
+        // discriminant + program id), appended after the auction
+        // region — earlier offsets unchanged.
+        let hook = [0x77; 32];
+        let e = Escrow::initialize(key(1), key(2), 1_000_000, u64::MAX)
+            .unwrap()
+            .with_mint([0xD0; 32])
+            .unwrap()
+            .with_transfer_hook(hook)
+            .unwrap();
+        let bytes = crate::account_space_tests::encode_escrow(&e);
+        assert_eq!(bytes.len(), crate::ESCROW_BODY_LEN);
+        let tail = &bytes[crate::ESCROW_BODY_LEN - 33..];
+        assert_eq!(tail[0], 1, "Some discriminant");
+        assert_eq!(&tail[1..], &hook);
+        // A hook-less escrow zero-fills the region.
+        let plain = Escrow::initialize(key(1), key(2), 1_000_000, u64::MAX).unwrap();
+        let bytes = crate::account_space_tests::encode_escrow(&plain);
+        assert_eq!(&bytes[crate::ESCROW_BODY_LEN - 33..], &[0u8; 33]);
     }
 }
