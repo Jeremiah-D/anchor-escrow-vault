@@ -155,6 +155,8 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // AV-104: a config change — no fund movement.
         | EscrowEventKind::DelegationGranted
         | EscrowEventKind::DelegationRevoked
+        // AV-105: a config change — no fund movement.
+        | EscrowEventKind::SwapLinked
         // A panel vote moves no funds — and `PanelJudgment`'s `payout`
         // is the *voted* split, not an executed one, so booking it
         // would invent a payout; only the settling `PanelResolved`
@@ -615,6 +617,8 @@ mod event_sourcing_tests {
                 // AV-104: config changes — no fund movement.
                 | EscrowEventKind::DelegationGranted
                 | EscrowEventKind::DelegationRevoked
+                // AV-105: a config change — no fund movement.
+                | EscrowEventKind::SwapLinked
                 | EscrowEventKind::Slashed => (0, 0, 0),
             };
             assert_eq!(got, want, "delta for {kind:?} (discriminant {d})");

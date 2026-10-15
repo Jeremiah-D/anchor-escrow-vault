@@ -103,6 +103,10 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `rotate_fee_recipient(new_recipient)`         | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the fee recipient) | **both** the *current* initializer and the *current* taker must sign (dual-signature governance — the mirror of `rotate_arbiter` for the fee-destination role; the fee recipient itself does not sign, so a lost fee-recipient key cannot block its own replacement; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (no future fee leg left to redirect, and the dispute settlement builders pin the fee leg to the configured recipient); no fee recipient configured or the zero address is `InvalidFeeRecipient` (code 123); the activation bitmask is untouched (it tracks only the initializer and taker); the keeper's fee listings and the snapshot export read the live `fee_recipient` field (follow automatically); emits `FeeRecipientRotated` only on an actual change |
 | `delegate_authority(caller, delegate, scopes)` (AV-104) | `Uninitialized`/`Funded` | — (no state change; writes the operator grant) | **initializer or taker** (party power — a stranger, or the operator themselves, is `Unauthorized`, so grants never sub-delegate); the zero operator key, an empty scope bitmap, or scope bits outside the mask (`1` fund / `2` release / `4` cancel) is `InvalidDelegation` (code 160); terminal states and `Disputed` are `InvalidStateTransition`; a later grant overwrites the earlier one (single slot); `rotate_initializer` / `rotate_taker` clear the grant (fail-closed — the new party never inherits the old party's operator); emits `DelegationGranted` only on an actual change (an identical re-grant is a no-op success that emits nothing) |
 | `revoke_delegation(caller)` (AV-104)         | `Uninitialized`/`Funded` | — (no state change; clears the operator grant) | **either** party may revoke — the initializer can cut off a taker-appointed operator and vice versa; a stranger is `Unauthorized`; no live grant is `InvalidDelegation` (code 160); emits `DelegationRevoked` |
+| `link_swap(caller, escrow_id_a, escrow_id_b, amount_a, amount_b)` (AV-105) | `Uninitialized` (both legs) | — (no state change; writes each vault's counterparty id) | **one of the two parties** (an AV-104 operator is `Unauthorized`); mirrored parties required (`InvalidSwapParties` code 161 — zero/duplicate counterparty id is the same code); leg amounts must equal the locked amounts (`InvalidSwapAmounts` code 162); already-linked is `SwapLinkActive` (code 163); on-chain requires *both* parties as signers; emits `SwapLinked` on each vault |
+| `release_swap(caller, escrow_id_a, escrow_id_b, amount_a, amount_b)` (AV-105) | `Funded` (both legs, cross-link matched) | `Funded` (partial) / `Released` (cumulative full), per leg | **party-only** — an AV-104 operator is `Unauthorized`; each leg runs under *its own* initializer (on-chain requires both parties as signers); two-phase atomic — either leg failing returns the single-side error with both escrows untouched and zero events; emits `Released` A→B |
+| `cancel_swap(caller, escrow_id_a, escrow_id_b)` (AV-105) | `Funded` (both legs, cross-link matched) | `Cancelled` (both legs) | caller must be the initializer of at least one leg (party-only — a stranger or AV-104 operator is `Unauthorized`; on-chain requires both parties as signers); two-phase atomic like `release_swap`; emits `Cancelled` A→B |
+| `cancel_swap_expired(caller, escrow_id_a, escrow_id_b)` (AV-105) | `Funded` (both legs, cross-link matched, *both* expiry-eligible) | `Cancelled` (both legs) | either party (an AV-104 operator is `Unauthorized`); *both* legs must be expiry-eligible or the whole call refuses with `NotExpired` (no partial expiry); per-leg authority is the caller (AV-24 penalty keys per leg); emits `ExpiredCancelled` A→B |
 | `initialize_quorum(attestors, weights, threshold)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_extension(max_extension_secs)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding); zero bound is `InvalidExpiryExtension`; persists the extension budget (`max_extension_secs`, `extension_count` starts 0) |
@@ -597,7 +601,7 @@ and `evidence_disclosure`. New vault fields (appended last):
 `evidence_root` (`Option<[u8; 32]>`, 33 bytes) + `evidence_leaves`
 (u8) + `evidence_disclosed` (u64, 8 bytes) — 42 bytes at the time,
 bringing the layout to 3978 bytes (the layout has since grown to
-4607 bytes / 4615 with the discriminator — see the account-space
+4640 bytes / 4648 with the discriminator — see the account-space
 paragraph below). Anchor
 surface: `escalate` gains the two params, plus the new
 `file_evidence` instruction (`doc_hash`, `leaf_index`,
@@ -1222,6 +1226,9 @@ program error per variant):
 | `InvalidAppealBond` | 158 | `with_appeal_bond` / `initialize_appeal_bond` (AV-103) with a zero bond (a zero bond is a no-op — the no-bond default already covers free filing) |
 | `AppealExpiryNotDue` | 159 | `expire_appeal` (AV-103) with `now <= appeal_deadline` — the permissionless sweep only runs once the window has actually lapsed |
 | `InvalidDelegation` | 160 | `delegate_authority` (AV-104) with a non-party grantor, a zero operator key, an empty scope bitmap, scope bits outside the mask, or on a non-`Uninitialized`/non-`Funded` escrow; or `revoke_delegation` with no grant to revoke (an operator calling outside their scope is the pre-existing `Unauthorized`, not this code) |
+| `InvalidSwapParties` | 161 | `link_swap` (AV-105) with a zero or duplicate counterparty escrow id, or with non-mirrored parties (`a.initializer != b.taker` or `a.taker != b.initializer`); also a pair settlement whose cross-link does not match the claimed pair |
+| `InvalidSwapAmounts` | 162 | `link_swap` (AV-105) with a leg amount disagreeing with that leg's locked amount |
+| `SwapLinkActive` | 163 | `link_swap` on an already-linked escrow; any fund-moving *single-side* transition on a live-linked non-terminal escrow (see the refusal list in the AV-105 section); or a pair op on an unlinked escrow (`None` link is this code, not a parties mismatch) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2281,7 +2288,8 @@ two-way consistency check against the IDL parameter table:
 | appeal_bond | u64 | 8 |
 | appeal_bond_paid | u64 | 8 |
 | delegation | Option<Delegation> | 37 |
-| **total**     |                   | **4607** |
+| swap_link | Option<[u8; 32]> | 33 |
+| **total**     |                   | **4640** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2385,11 +2393,13 @@ when no auction is configured) — and the 16-byte appeal-bond tail
 region (AV-103: `appeal_bond` + `appeal_bond_paid` (u64 each), zeroed
 when no bond was configured) — and the 37-byte delegation region
 (AV-104: 1-byte discriminant + 32-byte operator key + 4-byte scope
-bitmap, zeroed when no grant is live).
-`escrow-state` exposes `VAULT_SPACE` (4615) and
-`VAULT_SPACE_NO_QUORUM` (4125) for the Anchor `space =` constraint, plus a
+bitmap, zeroed when no grant is live) — and the 33-byte swap-link
+region (AV-105: 1-byte discriminant + 32-byte counterparty escrow id,
+zeroed when the escrow is not linked into a swap pair).
+`escrow-state` exposes `VAULT_SPACE` (4648) and
+`VAULT_SPACE_NO_QUORUM` (4158) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **33,011,280 lamports** to be
+mainnet rent parameters the full vault needs **33,240,960 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -3087,6 +3097,75 @@ Pubkey, scopes: u32)` and `revoke_delegation()` with discriminators
 `sha256("global:revoke_delegation")[..8]`; the Anchor `Vault` gains
 `delegation: Option<Delegation>`, and `ErrorCode::InvalidDelegation`
 maps code 160.
+
+## Atomic swap (AV-105)
+
+Two escrows linked as a swap pair: leg A is X→Y, leg B is Y→X.
+`link_swap(a, b, caller, escrow_id_a, escrow_id_b, amount_a,
+amount_b)` links the pair — both vaults must be `Uninitialized`
+(`InvalidStateTransition` otherwise); the parties must be *mirrored*
+(`a.initializer == b.taker && a.taker == b.initializer`, else
+`InvalidSwapParties`, code 161 — a zero or duplicate counterparty id
+is the same code); the asserted amounts must equal each leg's locked
+amount (`InvalidSwapAmounts`, code 162); a double link is
+`SwapLinkActive` (code 163). Only one of the two parties may link —
+an AV-104 operator is `Unauthorized` (the delegation slot is never
+consulted, and pair ops deliberately sit outside the four
+operator-honoring core paths). The check order is pause → caller
+(party-only) → state → link → params.
+
+Pair settlement is atomic by construction: `release_swap` /
+`cancel_swap` / `cancel_swap_expired` run the two legs' checks on
+copies with the links stripped *before* touching either original —
+any failure (a leg's timelock not reached, one leg not expiry-eligible,
+a broken cross-link) returns the single-side error and both escrows
+are byte-identical to before the call, so no partial settlement is
+ever observable. The event layer mirrors the atomicity: the
+`IndexedEscrow` pair wrappers emit nothing on failure, and on success
+emit in deterministic A→B order (`SwapLinked`, then per-leg
+`Released` / `Cancelled` / `ExpiredCancelled`). Each leg runs under
+*its own* initializer's authority (release) or per-leg initializer /
+caller authority (cancel / cancel_expired — the AV-24 penalty keys
+per leg exactly as the single-side path charges it); the on-chain
+instruction requires *both* parties as signers. The link is stored on
+both sides as the counterparty's 32-byte escrow id in a 33-byte
+always-reserved tail region (zeroed when unlinked), and there is no
+unlink: the link persists through the terminal states as the audit
+trail. The enforcement applies only to non-terminal states — once
+both legs are `Released` / `Cancelled`, the surviving link is inert
+(`is_terminal` covers `Released`, `Cancelled`, `Settled`, `Split`, and
+`Closed`).
+
+The single-side refusal: every fund-moving single-side transition
+refuses with `SwapLinkActive` (code 163) while the escrow is live-linked
+and non-terminal — `release`, `release_via_cpi`, `release_split`,
+`release_milestone`, `release_period`, `release_basket`,
+`release_basket_all`, `cancel`, `cancel_partial`, `cancel_expired`
+(and the `crank_expired` sweep, which runs the same locked path),
+`cancel_basket`, `cancel_basket_all`, `cancel_expired_basket`, `claim`,
+`slash`, `resolve`, `trigger_default_judgment`, `split_escrow`. The
+refusal is checked right after the state check, so a paused escrow
+still reports `Paused` (code 124) first. Deliberately exempt:
+`fund` (the link is established pre-fund), `close_vault`,
+pause/unpause, delegation, and the key rotations — none of them move
+funds along the settlement path the link guards.
+
+`cancel_swap_expired` is all-or-nothing by expiry too: *both* legs
+must be expiry-eligible or the whole call refuses with `NotExpired`
+— no partial expiry. The event kind `SwapLinked` is 55; the IDL
+instructions are `link_swap(escrow_id_a, escrow_id_b, amount_a,
+amount_b)`, `release_swap(escrow_id_a, escrow_id_b, amount_a,
+amount_b)` → `(payout_a, fee_a, payout_b, fee_b)`,
+`cancel_swap(escrow_id_a, escrow_id_b)`, and
+`cancel_swap_expired(escrow_id_a, escrow_id_b)` → `(refund_a,
+penalty_a, refund_b, penalty_b)`, each with discriminator
+`sha256("global:<name>")[..8]`; the Anchor `Vault` gains
+`swap_link: Option<[u8; 32]>`, and
+`ErrorCode::InvalidSwapParties` / `InvalidSwapAmounts` /
+`SwapLinkActive` map codes 161/162/163. Account layout grows by the
+33-byte region: body 4607 → **4640**, `VAULT_SPACE` 4615 → **4648**,
+`VAULT_SPACE_NO_QUORUM` 4125 → **4158**, rent-exempt 33,011,280 →
+**33,240,960** lamports.
 
 ## Basket escrow (AV-95)
 

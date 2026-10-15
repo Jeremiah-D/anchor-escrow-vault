@@ -3754,6 +3754,244 @@ pub mod escrow_vault {
         );
         Ok(())
     }
+
+    /// Link two escrows as an atomic swap pair (AV-105; mirrors
+    /// `escrow_state::link_swap`). Leg A is the X→Y leg, leg B the
+    /// Y→X leg; on success each vault's `swap_link` records the
+    /// counterparty's id. Both vaults must be `Uninitialized`
+    /// (`InvalidStateTransition` otherwise); the parties must be
+    /// mirrored and the asserted amounts must equal the locked
+    /// amounts (`InvalidSwapParties` code 161 / `InvalidSwapAmounts`
+    /// code 162 otherwise). Party-only: the caller must be one of the
+    /// two parties — an AV-104 operator is `Unauthorized` (the
+    /// delegation slot is never consulted). The real build requires
+    /// *both* parties as signers. Writes each vault's 33-byte
+    /// swap_link region in place. Emits `SwapLinked` on each vault
+    /// (from == to == Uninitialized).
+    pub fn link_swap(
+        ctx: Context<LinkSwap>,
+        escrow_id_a: [u8; 32],
+        escrow_id_b: [u8; 32],
+        amount_a: u64,
+        amount_b: u64,
+    ) -> Result<()> {
+        let mut escrow_a = read_escrow(&ctx.accounts.vault_a);
+        let mut escrow_b = read_escrow(&ctx.accounts.vault_b);
+        let state = escrow_a.state() as u8;
+        escrow_state::link_swap(
+            &mut escrow_a,
+            &mut escrow_b,
+            ctx.accounts.caller.key().to_bytes(),
+            escrow_id_a,
+            escrow_id_b,
+            amount_a,
+            amount_b,
+        )
+        .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault_a, &escrow_a);
+        write_escrow(&mut ctx.accounts.vault_b, &escrow_b);
+        // Writes `vault.swap_link` in place in the real build
+        // (33 bytes, always reserved, zeroed when `None`).
+        let at = Clock::get()?.unix_timestamp as u64;
+        for vault in [&ctx.accounts.vault_a, &ctx.accounts.vault_b] {
+            emit_transition(
+                vault,
+                escrow_state::EscrowEventKind::SwapLinked,
+                state,
+                state,
+                0,
+                0,
+                0,
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// Release both legs of a linked swap pair atomically (AV-105;
+    /// mirrors `escrow_state::release_swap`). Either leg failing
+    /// rolls the whole release back (the two-phase run emits nothing
+    /// on failure). Party-only — an AV-104 operator is
+    /// `Unauthorized`; the real build requires *both* parties as
+    /// signers and each leg runs under its own initializer. `now`
+    /// comes from the clock sysvar (never an instruction param).
+    /// Emits `Released` on each vault (from Funded; partial releases
+    /// carry from == to == Funded). Returns
+    /// `(payout_a, fee_a, payout_b, fee_b)`.
+    pub fn release_swap(
+        ctx: Context<ReleaseSwap>,
+        escrow_id_a: [u8; 32],
+        escrow_id_b: [u8; 32],
+        amount_a: u64,
+        amount_b: u64,
+    ) -> Result<(u64, u64, u64, u64)> {
+        let mut escrow_a = read_escrow(&ctx.accounts.vault_a);
+        let mut escrow_b = read_escrow(&ctx.accounts.vault_b);
+        // AV-27: the timelock gate reads the Solana clock sysvar —
+        // never an instruction param.
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let (payout_a, fee_a, payout_b, fee_b) = escrow_state::release_swap(
+            &mut escrow_a,
+            &mut escrow_b,
+            ctx.accounts.caller.key().to_bytes(),
+            escrow_id_a,
+            escrow_id_b,
+            now,
+            amount_a,
+            vault_token_mint(&ctx.accounts.vault_token_account_a),
+            ctx.accounts.payout_to_a.key().to_bytes(),
+            amount_b,
+            vault_token_mint(&ctx.accounts.vault_token_account_b),
+            ctx.accounts.payout_to_b.key().to_bytes(),
+        )
+        .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault_a, &escrow_a);
+        write_escrow(&mut ctx.accounts.vault_b, &escrow_b);
+        // AV-18: `payout + fee` is the gross amount per leg; the
+        // closing release carries to == Released.
+        let at = Clock::get()?.unix_timestamp as u64;
+        emit_transition(
+            &ctx.accounts.vault_a,
+            escrow_state::EscrowEventKind::Released,
+            escrow_state::EscrowState::Funded as u8,
+            escrow_a.state() as u8,
+            payout_a + fee_a,
+            fee_a,
+            0,
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        emit_transition(
+            &ctx.accounts.vault_b,
+            escrow_state::EscrowEventKind::Released,
+            escrow_state::EscrowState::Funded as u8,
+            escrow_b.state() as u8,
+            payout_b + fee_b,
+            fee_b,
+            0,
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok((payout_a, fee_a, payout_b, fee_b))
+    }
+
+    /// Cancel both legs of a linked swap pair atomically (AV-105;
+    /// mirrors `escrow_state::cancel_swap`): one party's cancel
+    /// triggers the pair-wide cancel. The caller must be the
+    /// initializer of at least one leg (party-only — a stranger or an
+    /// AV-104 operator is `Unauthorized`); the real build requires
+    /// *both* parties as signers and each leg runs under its own
+    /// initializer. Emits `Cancelled` on each vault (from Funded to
+    /// Cancelled).
+    pub fn cancel_swap(
+        ctx: Context<CancelSwap>,
+        escrow_id_a: [u8; 32],
+        escrow_id_b: [u8; 32],
+    ) -> Result<()> {
+        let mut escrow_a = read_escrow(&ctx.accounts.vault_a);
+        let mut escrow_b = read_escrow(&ctx.accounts.vault_b);
+        escrow_state::cancel_swap(
+            &mut escrow_a,
+            &mut escrow_b,
+            ctx.accounts.caller.key().to_bytes(),
+            escrow_id_a,
+            escrow_id_b,
+            vault_token_mint(&ctx.accounts.vault_token_account_a),
+            ctx.accounts.refund_to_a.key().to_bytes(),
+            vault_token_mint(&ctx.accounts.vault_token_account_b),
+            ctx.accounts.refund_to_b.key().to_bytes(),
+        )
+        .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault_a, &escrow_a);
+        write_escrow(&mut ctx.accounts.vault_b, &escrow_b);
+        let at = Clock::get()?.unix_timestamp as u64;
+        for vault in [&ctx.accounts.vault_a, &ctx.accounts.vault_b] {
+            emit_transition(
+                vault,
+                escrow_state::EscrowEventKind::Cancelled,
+                escrow_state::EscrowState::Funded as u8,
+                escrow_state::EscrowState::Cancelled as u8,
+                0,
+                0,
+                0,
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// Cancel both legs of a linked swap pair on expiry (AV-105;
+    /// mirrors `escrow_state::cancel_swap_expired`). Atomic refusal:
+    /// *both* legs must be expiry-eligible or the whole call fails
+    /// with `NotExpired` — no partial expiry. Either party may call
+    /// (the single-side path allows either party); an AV-104 operator
+    /// is `Unauthorized`. The real build requires *both* parties as
+    /// signers and each leg runs under the caller, so the AV-24
+    /// anti-griefing penalty keys per leg exactly as the single-side
+    /// path charges it. `now` comes from the clock sysvar. Emits
+    /// `ExpiredCancelled` on each vault. Returns
+    /// `(refund_a, penalty_a, refund_b, penalty_b)`.
+    pub fn cancel_swap_expired(
+        ctx: Context<CancelSwapExpired>,
+        escrow_id_a: [u8; 32],
+        escrow_id_b: [u8; 32],
+    ) -> Result<(u64, u64, u64, u64)> {
+        let mut escrow_a = read_escrow(&ctx.accounts.vault_a);
+        let mut escrow_b = read_escrow(&ctx.accounts.vault_b);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let (refund_a, penalty_a, refund_b, penalty_b) = escrow_state::cancel_swap_expired(
+            &mut escrow_a,
+            &mut escrow_b,
+            ctx.accounts.caller.key().to_bytes(),
+            escrow_id_a,
+            escrow_id_b,
+            now,
+            vault_token_mint(&ctx.accounts.vault_token_account_a),
+            ctx.accounts.refund_to_a.key().to_bytes(),
+            vault_token_mint(&ctx.accounts.vault_token_account_b),
+            ctx.accounts.refund_to_b.key().to_bytes(),
+        )
+        .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault_a, &escrow_a);
+        write_escrow(&mut ctx.accounts.vault_b, &escrow_b);
+        let at = Clock::get()?.unix_timestamp as u64;
+        for vault in [&ctx.accounts.vault_a, &ctx.accounts.vault_b] {
+            emit_transition(
+                vault,
+                escrow_state::EscrowEventKind::ExpiredCancelled,
+                escrow_state::EscrowState::Funded as u8,
+                escrow_state::EscrowState::Cancelled as u8,
+                0,
+                0,
+                0,
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok((refund_a, penalty_a, refund_b, penalty_b))
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -4233,6 +4471,16 @@ pub struct Vault {
     /// Layout position matches `escrow_state::VAULT_FIELDS`
     /// (appended last, after `appeal_bond_paid`).
     pub delegation: Option<Delegation>,
+    /// AV-105: the atomic-swap counterparty's escrow id (mirrors
+    /// `escrow_state`'s `swap_link`); `None` when the escrow is not
+    /// linked into a swap pair. The account always reserves the full
+    /// 33-byte region (1-byte discriminant + 32-byte counterparty
+    /// id, zeroed when `None`) so `link_swap` writes in place
+    /// without reallocating. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `delegation`). There is no unlink: the link persists through
+    /// the terminal states as the audit trail.
+    pub swap_link: Option<[u8; 32]>,
 }
 
 /// Skeleton mirror of `escrow_state::SlashTerms`: the opt-in
@@ -5184,6 +5432,105 @@ pub struct RevokeDelegation<'info> {
     /// machine enforces the party-only rule); a stranger is
     /// `Unauthorized`.
     pub caller: Signer<'info>,
+}
+
+/// AV-105: link two escrows as an atomic swap pair (mirrors
+/// `escrow_state::link_swap`).
+#[derive(Accounts)]
+pub struct LinkSwap<'info> {
+    #[account(mut)]
+    pub vault_a: Account<'info, Vault>,
+    #[account(mut)]
+    pub vault_b: Account<'info, Vault>,
+    /// One of the two parties; the state machine enforces the
+    /// party-only rule (an AV-104 operator is `Unauthorized`). The
+    /// real build additionally requires the counterparty as a second
+    /// signer — the instruction is dual-party.
+    pub caller: Signer<'info>,
+    /// CHECK: the counterparty's signature — the on-chain instruction
+    /// requires both parties as signers (the pure-logic layer models
+    /// this dual-party authorization).
+    pub counterparty: Signer<'info>,
+}
+
+/// AV-105: release both legs of a linked swap pair atomically
+/// (mirrors `escrow_state::release_swap`).
+#[derive(Accounts)]
+pub struct ReleaseSwap<'info> {
+    #[account(mut)]
+    pub vault_a: Account<'info, Vault>,
+    #[account(mut)]
+    pub vault_b: Account<'info, Vault>,
+    /// One of the two parties (party-only — an AV-104 operator is
+    /// `Unauthorized`); the real build requires both parties as
+    /// signers and each leg runs under its own initializer.
+    pub caller: Signer<'info>,
+    /// CHECK: the counterparty's signature (see `LinkSwap`).
+    pub counterparty: Signer<'info>,
+    /// CHECK: explicit payout destination of leg A (AV-49 — pinned
+    /// against leg A's payout policy).
+    pub payout_to_a: AccountInfo<'info>,
+    /// CHECK: explicit payout destination of leg B.
+    pub payout_to_b: AccountInfo<'info>,
+    /// CHECK: Solana clock sysvar, read for the AV-27 timelock gate
+    /// (never an instruction param).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: leg A's vault SPL token account (see `Release`).
+    pub vault_token_account_a: AccountInfo<'info>,
+    /// CHECK: leg B's vault SPL token account (see `Release`).
+    pub vault_token_account_b: AccountInfo<'info>,
+}
+
+/// AV-105: cancel both legs of a linked swap pair atomically
+/// (mirrors `escrow_state::cancel_swap`).
+#[derive(Accounts)]
+pub struct CancelSwap<'info> {
+    #[account(mut)]
+    pub vault_a: Account<'info, Vault>,
+    #[account(mut)]
+    pub vault_b: Account<'info, Vault>,
+    /// The initializer of at least one leg (party-only — a stranger
+    /// or an AV-104 operator is `Unauthorized`); the real build
+    /// requires both parties as signers.
+    pub caller: Signer<'info>,
+    /// CHECK: the counterparty's signature (see `LinkSwap`).
+    pub counterparty: Signer<'info>,
+    /// CHECK: leg A's refund destination (AV-23 — pinned against leg
+    /// A's refund policy).
+    pub refund_to_a: AccountInfo<'info>,
+    /// CHECK: leg B's refund destination.
+    pub refund_to_b: AccountInfo<'info>,
+    /// CHECK: leg A's vault SPL token account (see `Release`).
+    pub vault_token_account_a: AccountInfo<'info>,
+    /// CHECK: leg B's vault SPL token account (see `Release`).
+    pub vault_token_account_b: AccountInfo<'info>,
+}
+
+/// AV-105: cancel both legs of a linked swap pair on expiry (mirrors
+/// `escrow_state::cancel_swap_expired`).
+#[derive(Accounts)]
+pub struct CancelSwapExpired<'info> {
+    #[account(mut)]
+    pub vault_a: Account<'info, Vault>,
+    #[account(mut)]
+    pub vault_b: Account<'info, Vault>,
+    /// Either party (the single-side path allows either party); an
+    /// AV-104 operator is `Unauthorized`. The real build requires
+    /// both parties as signers.
+    pub caller: Signer<'info>,
+    /// CHECK: the counterparty's signature (see `LinkSwap`).
+    pub counterparty: Signer<'info>,
+    /// CHECK: leg A's refund destination (AV-23).
+    pub refund_to_a: AccountInfo<'info>,
+    /// CHECK: leg B's refund destination.
+    pub refund_to_b: AccountInfo<'info>,
+    /// CHECK: Solana clock sysvar, read for the expiry gate (never an
+    /// instruction param).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: leg A's vault SPL token account (see `Release`).
+    pub vault_token_account_a: AccountInfo<'info>,
+    /// CHECK: leg B's vault SPL token account (see `Release`).
+    pub vault_token_account_b: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -6581,6 +6928,16 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidDelegation => {
             error!(ErrorCode::InvalidDelegation)
         }
+        // AV-105: appended, never renumbered.
+        escrow_state::EscrowError::InvalidSwapParties => {
+            error!(ErrorCode::InvalidSwapParties)
+        }
+        escrow_state::EscrowError::InvalidSwapAmounts => {
+            error!(ErrorCode::InvalidSwapAmounts)
+        }
+        escrow_state::EscrowError::SwapLinkActive => {
+            error!(ErrorCode::SwapLinkActive)
+        }
     }
 }
 
@@ -6702,4 +7059,10 @@ pub enum ErrorCode {
     AppealExpiryNotDue,
     #[msg("Invalid authority-delegation request (AV-104): delegate_authority with a non-party grantor, a zero operator key, an empty scope bitmap, scope bits outside the mask, or on a non-Uninitialized/non-Funded escrow; or revoke_delegation with no grant to revoke")]
     InvalidDelegation,
+    #[msg("Invalid atomic-swap pairing (AV-105): link_swap with a zero or duplicate counterparty escrow id or non-mirrored parties; or a pair settlement whose cross-link does not match the claimed pair")]
+    InvalidSwapParties,
+    #[msg("Invalid atomic-swap amounts (AV-105): link_swap with a leg amount disagreeing with the escrow's locked amount")]
+    InvalidSwapAmounts,
+    #[msg("Live swap link blocks a single-side move (AV-105): fund-moving single-side transition on a live-linked non-terminal escrow; link_swap on an already-linked escrow; or a pair op on an unlinked escrow")]
+    SwapLinkActive,
 }

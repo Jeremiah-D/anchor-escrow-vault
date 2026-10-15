@@ -1274,7 +1274,7 @@ mod cpi_tests {
         let bytes = crate::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), crate::ESCROW_BODY_LEN);
         let hook_at =
-            crate::ESCROW_BODY_LEN - crate::APPEAL_BOND_REGION_LEN - crate::DELEGATION_REGION_LEN - crate::STREAMING_FEE_REGION_LEN - 33;
+            crate::ESCROW_BODY_LEN - crate::SWAP_LINK_REGION_LEN - crate::APPEAL_BOND_REGION_LEN - crate::DELEGATION_REGION_LEN - crate::STREAMING_FEE_REGION_LEN - 33;
         assert_eq!(bytes[hook_at], 1, "Some discriminant");
         assert_eq!(&bytes[hook_at + 1..hook_at + 33], &hook);
         // A hook-less escrow zero-fills the region.
@@ -1294,7 +1294,15 @@ mod cpi_tests {
             &[0u8; 16]
         );
         assert_eq!(
-            &bytes[crate::ESCROW_BODY_LEN - crate::APPEAL_BOND_REGION_LEN..],
+            &bytes[crate::ESCROW_BODY_LEN
+                - crate::SWAP_LINK_REGION_LEN
+                - crate::DELEGATION_REGION_LEN
+                - crate::STREAMING_FEE_REGION_LEN
+                - crate::APPEAL_BOND_REGION_LEN
+                ..crate::ESCROW_BODY_LEN
+                    - crate::SWAP_LINK_REGION_LEN
+                    - crate::DELEGATION_REGION_LEN
+                    - crate::STREAMING_FEE_REGION_LEN],
             &[0u8; 16]
         );
     }

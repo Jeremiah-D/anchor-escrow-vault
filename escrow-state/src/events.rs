@@ -243,6 +243,7 @@
 //! | AppealExpired (AV-103) | 0 | 0 | 0 | the appeal bond forfeited to the initializer when the window lapsed unresolved (0 when no bond was locked; from == to == `Funded`) |
 //! | DelegationGranted (AV-104) | 0 | 0 | 0 | 0 — the operator key and scope bitmap are read from the vault, the event is the ordering signal (actor = the granting party; from == to == the current state) |
 //! | DelegationRevoked (AV-104) | 0 | 0 | 0 | 0 — the grant is gone; the actor is the revoking party (from == to == the current state) |
+//! | SwapLinked (AV-105) | 0 | 0 | 0 | 0 — the two legs were linked as an atomic swap pair; the counterparty id is read from the vault, the event is the ordering signal (actor = the linking party; from == to == the current state) |
 //!
 //! # Backward compatibility
 //!
@@ -724,6 +725,14 @@ pub enum EscrowEventKind {
     /// revoking party. Always emitted on success: the call fails
     /// unless a grant was live, so there is no no-op case.
     DelegationRevoked,
+    /// AV-105: two escrows were linked as an atomic swap pair
+    /// ([`link_swap`](crate::link_swap)). `from == to ==` the current
+    /// state (a config change, not a lifecycle move — like
+    /// [`EscrowEventKind::DelegationGranted`]); the counterparty
+    /// escrow id is read from the vault, the event is the ordering
+    /// signal. The actor is the linking party. Emitted on each leg
+    /// in deterministic A→B order; always emitted on success.
+    SwapLinked,
 }
 
 impl EscrowEventKind {
@@ -851,6 +860,10 @@ impl EscrowEventKind {
             // 0–52 stay stable for already-serialized histories.
             53 => Self::DelegationGranted,
             54 => Self::DelegationRevoked,
+            // AV-105: appended after DelegationRevoked so
+            // discriminants 0–54 stay stable for already-serialized
+            // histories.
+            55 => Self::SwapLinked,
             _ => return None,
         })
     }
@@ -914,6 +927,7 @@ impl EscrowEventKind {
             Self::AppealExpired => "appeal_expired",
             Self::DelegationGranted => "delegation_granted",
             Self::DelegationRevoked => "delegation_revoked",
+            Self::SwapLinked => "swap_linked",
         }
     }
 
@@ -978,6 +992,7 @@ impl EscrowEventKind {
             "appeal_expired" => Self::AppealExpired,
             "delegation_granted" => Self::DelegationGranted,
             "delegation_revoked" => Self::DelegationRevoked,
+            "swap_linked" => Self::SwapLinked,
             _ => return None,
         })
     }
@@ -4068,6 +4083,240 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Link two indexed escrows as an atomic swap pair (AV-105;
+    /// mirrors [`link_swap`](super::link_swap)). On success each leg
+    /// emits [`EscrowEventKind::SwapLinked`] (`from == to ==` the
+    /// current state — `Uninitialized` — amounts zero, actor = the
+    /// linking party) in deterministic A→B order. On failure the
+    /// state machine rolls back and nothing is emitted, like every
+    /// other failed transition. `at` is the caller-supplied event
+    /// timestamp.
+    ///
+    /// [`link_swap`](super::link_swap): super::link_swap
+    #[allow(clippy::too_many_arguments)]
+    pub fn link_swap_pair(
+        a: &mut IndexedEscrow,
+        b: &mut IndexedEscrow,
+        caller: [u8; 32],
+        escrow_id_a: [u8; 32],
+        escrow_id_b: [u8; 32],
+        amount_a: u64,
+        amount_b: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        super::link_swap(
+            &mut a.inner,
+            &mut b.inner,
+            caller,
+            escrow_id_a,
+            escrow_id_b,
+            amount_a,
+            amount_b,
+        )?;
+        for escrow in [a, b] {
+            let state = escrow.inner.state();
+            escrow.push_event(
+                EscrowEventKind::SwapLinked,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                Some(caller),
+            );
+        }
+        Ok(())
+    }
+
+    /// Release both legs of a linked swap pair atomically (AV-105;
+    /// mirrors [`release_swap`](super::release_swap)). On success each
+    /// leg emits `Released` exactly like
+    /// [`IndexedEscrow::release`] — partial releases carry
+    /// `from == to == Funded`, the closing one `to == Released` —
+    /// with `amounts` in the `Released` shape (`payout` = the leg's
+    /// gross amount, `fee` = the AV-17 protocol fee) and the actor =
+    /// that leg's initializer (the per-side authority). Events land
+    /// in deterministic A→B order. Returns
+    /// `(payout_a, fee_a, payout_b, fee_b)` like the inner function.
+    /// On failure nothing is emitted on either leg (the two-phase
+    /// run rolls back with zero event leakage). `now` doubles as the
+    /// event timestamp and the state machine's clock (so the AV-27
+    /// timelock gate sees the same clock the event log records).
+    ///
+    /// [`release_swap`](super::release_swap): super::release_swap
+    /// [`IndexedEscrow::release`]: IndexedEscrow::release
+    #[allow(clippy::too_many_arguments)]
+    pub fn release_swap_pair(
+        a: &mut IndexedEscrow,
+        b: &mut IndexedEscrow,
+        caller: [u8; 32],
+        escrow_id_a: [u8; 32],
+        escrow_id_b: [u8; 32],
+        now: u64,
+        amount_a: u64,
+        mint_a: Option<[u8; 32]>,
+        payout_to_a: [u8; 32],
+        amount_b: u64,
+        mint_b: Option<[u8; 32]>,
+        payout_to_b: [u8; 32],
+    ) -> Result<(u64, u64, u64, u64), EscrowError> {
+        let (payout_a, fee_a, payout_b, fee_b) = super::release_swap(
+            &mut a.inner,
+            &mut b.inner,
+            caller,
+            escrow_id_a,
+            escrow_id_b,
+            now,
+            amount_a,
+            mint_a,
+            payout_to_a,
+            amount_b,
+            mint_b,
+            payout_to_b,
+        )?;
+        // `amount` is the gross payout by construction
+        // (`payout + fee == amount`); it cannot overflow u64 addition.
+        let from_a = EscrowState::Funded;
+        a.push_event(
+            EscrowEventKind::Released,
+            from_a,
+            a.inner.state(),
+            EventAmounts::payout(amount_a, fee_a),
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(a.inner.initializer()),
+        );
+        let from_b = EscrowState::Funded;
+        b.push_event(
+            EscrowEventKind::Released,
+            from_b,
+            b.inner.state(),
+            EventAmounts::payout(amount_b, fee_b),
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(b.inner.initializer()),
+        );
+        Ok((payout_a, fee_a, payout_b, fee_b))
+    }
+
+    /// Cancel both legs of a linked swap pair atomically (AV-105;
+    /// mirrors [`cancel_swap`](super::cancel_swap)). On success each
+    /// leg emits `Cancelled` exactly like [`IndexedEscrow::cancel`]
+    /// (`from == Funded`, `to == Cancelled`,
+    /// `amounts.refund` = the leg's remainder, actor = that leg's
+    /// initializer) in deterministic A→B order. On failure nothing
+    /// is emitted on either leg. `at` is the caller-supplied event
+    /// timestamp.
+    ///
+    /// [`cancel_swap`](super::cancel_swap): super::cancel_swap
+    /// [`IndexedEscrow::cancel`]: IndexedEscrow::cancel
+    #[allow(clippy::too_many_arguments)]
+    pub fn cancel_swap_pair(
+        a: &mut IndexedEscrow,
+        b: &mut IndexedEscrow,
+        caller: [u8; 32],
+        escrow_id_a: [u8; 32],
+        escrow_id_b: [u8; 32],
+        mint_a: Option<[u8; 32]>,
+        refund_to_a: [u8; 32],
+        mint_b: Option<[u8; 32]>,
+        refund_to_b: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        super::cancel_swap(
+            &mut a.inner,
+            &mut b.inner,
+            caller,
+            escrow_id_a,
+            escrow_id_b,
+            mint_a,
+            refund_to_a,
+            mint_b,
+            refund_to_b,
+        )?;
+        for escrow in [a, b] {
+            let refund = escrow.inner.remaining_amount();
+            escrow.push_event(
+                EscrowEventKind::Cancelled,
+                EscrowState::Funded,
+                escrow.inner.state(),
+                EventAmounts::refund(refund),
+                at,
+                None,
+                None,
+                None,
+                None,
+                Some(escrow.inner.initializer()),
+            );
+        }
+        Ok(())
+    }
+
+    /// Cancel both legs of a linked swap pair on expiry (AV-105;
+    /// mirrors [`cancel_swap_expired`](super::cancel_swap_expired)).
+    /// On success each leg emits `ExpiredCancelled` exactly like
+    /// [`IndexedEscrow::cancel_expired`] (`amounts` in the
+    /// [`EventAmounts::expired_cancel`] shape, actor = the caller) in
+    /// deterministic A→B order. Returns
+    /// `(refund_a, penalty_a, refund_b, penalty_b)` like the inner
+    /// function. On failure — including the atomic `NotExpired`
+    /// refusal when either leg is ineligible — nothing is emitted on
+    /// either leg. `now` doubles as the event timestamp.
+    ///
+    /// [`cancel_swap_expired`](super::cancel_swap_expired): super::cancel_swap_expired
+    /// [`IndexedEscrow::cancel_expired`]: IndexedEscrow::cancel_expired
+    #[allow(clippy::too_many_arguments)]
+    pub fn cancel_swap_expired_pair(
+        a: &mut IndexedEscrow,
+        b: &mut IndexedEscrow,
+        caller: [u8; 32],
+        escrow_id_a: [u8; 32],
+        escrow_id_b: [u8; 32],
+        now: u64,
+        mint_a: Option<[u8; 32]>,
+        refund_to_a: [u8; 32],
+        mint_b: Option<[u8; 32]>,
+        refund_to_b: [u8; 32],
+    ) -> Result<(u64, u64, u64, u64), EscrowError> {
+        let (refund_a, penalty_a, refund_b, penalty_b) = super::cancel_swap_expired(
+            &mut a.inner,
+            &mut b.inner,
+            caller,
+            escrow_id_a,
+            escrow_id_b,
+            now,
+            mint_a,
+            refund_to_a,
+            mint_b,
+            refund_to_b,
+        )?;
+        let splits = [(refund_a, penalty_a), (refund_b, penalty_b)];
+        for (escrow, (refund, penalty)) in [a, b].into_iter().zip(splits) {
+            escrow.push_event(
+                EscrowEventKind::ExpiredCancelled,
+                EscrowState::Funded,
+                escrow.inner.state(),
+                EventAmounts::expired_cancel(refund, penalty),
+                now,
+                None,
+                None,
+                None,
+                None,
+                Some(caller),
+            );
+        }
+        Ok((refund_a, penalty_a, refund_b, penalty_b))
+    }
+
     /// AV-81: wrap a freshly-split child escrow in its own event log.
     /// Replays the exact lifecycle the inner state machine ran —
     /// `Initialized` (seq 0, the per-escrow invariant), then
@@ -5859,7 +6108,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(55), None);
+        assert_eq!(EscrowEventKind::from_discriminant(56), None);
     }
 
     #[test]
@@ -5875,7 +6124,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(55), None);
+        assert_eq!(EscrowEventKind::from_discriminant(56), None);
     }
 
     #[test]
@@ -6412,7 +6661,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(55), None);
+        assert_eq!(EscrowEventKind::from_discriminant(56), None);
     }
 
     #[test]
@@ -6427,7 +6676,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(55), None);
+        assert_eq!(EscrowEventKind::from_discriminant(56), None);
     }
 
     #[test]
@@ -6439,7 +6688,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(55), None);
+        assert_eq!(EscrowEventKind::from_discriminant(56), None);
     }
 
     #[test]
@@ -6451,7 +6700,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(55), None);
+        assert_eq!(EscrowEventKind::from_discriminant(56), None);
     }
 
     #[test]
@@ -6463,7 +6712,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(55), None);
+        assert_eq!(EscrowEventKind::from_discriminant(56), None);
     }
 
     #[test]
@@ -6478,7 +6727,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(55), None);
+        assert_eq!(EscrowEventKind::from_discriminant(56), None);
     }
 
     #[test]
@@ -6493,7 +6742,19 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(55), None);
+        assert_eq!(EscrowEventKind::from_discriminant(56), None);
+    }
+
+    #[test]
+    fn swap_linked_kind_round_trips() {
+        // AV-105: discriminant 55, appended after DelegationRevoked —
+        // 0–54 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::SwapLinked;
+        assert_eq!(kind.discriminant(), 55);
+        assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
+        assert_eq!(kind.name(), "swap_linked");
+        assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
+        assert_eq!(EscrowEventKind::from_discriminant(56), None);
     }
 
     #[test]
@@ -6505,7 +6766,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(55), None);
+        assert_eq!(EscrowEventKind::from_discriminant(56), None);
     }
 
     #[test]
@@ -6517,7 +6778,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(55), None);
+        assert_eq!(EscrowEventKind::from_discriminant(56), None);
     }
 
     #[test]

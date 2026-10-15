@@ -492,6 +492,11 @@ pub struct EscrowSnapshot {
     /// as `(operator key, scope bitmap)` — `None` when no grant is
     /// live, so indexers see who may act for the escrow.
     pub delegation: Option<([u8; 32], u32)>,
+    /// AV-105: the atomic-swap counterparty's escrow id
+    /// ([`link_swap`](crate::link_swap)) — `None` when the escrow is
+    /// not linked into a swap pair, so indexers see which two vaults
+    /// settle as one.
+    pub swap_link: Option<[u8; 32]>,
 }
 
 /// AV-82: point-in-time, read-only view of the opt-in slash terms —
@@ -762,6 +767,9 @@ impl Escrow {
             // AV-104: the live operator grant, so the export shows who
             // may act for the escrow and with what scope.
             delegation: self.delegation().map(|g| (g.delegate(), g.scopes())),
+            // AV-105: the swap counterparty id, so the export shows
+            // the pair the escrow settles with.
+            swap_link: self.swap_link(),
         }
     }
 }
@@ -1294,6 +1302,10 @@ impl EscrowSnapshot {
                 s.push('}');
             }
         }
+        // AV-105: the swap counterparty id — null when the escrow is
+        // not linked into a swap pair.
+        s.push_str(",\"swap_link\":");
+        write_opt_hex(&mut s, self.swap_link);
         s.push('}');
         s
     }
@@ -1355,7 +1367,7 @@ mod snapshot_tests {
              \"slash_terms\":null,\"penalty_paid\":0,\"slash_eligible\":false,\
              \"appeal_window_secs\":0,\"appeal_deadline\":0,\"appeal_state\":\"none\",\"appeal_eligible\":false,\
              \"appeal_bond\":0,\"appeal_bond_paid\":0,\"appeal_expiry_eligible\":false,\
-             \"delegation\":null\
+             \"delegation\":null,\"swap_link\":null\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),

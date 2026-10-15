@@ -46,7 +46,7 @@ use super::{
     MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
     MILESTONE_PLAN_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN,
     PAYOUT_DENYLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN,
-    VAULT_SPACE, VESTING_CURVE_LEN,
+    SWAP_LINK_REGION_LEN, VAULT_SPACE, VESTING_CURVE_LEN,
 };
 
 /// Program-side `#[account]` type names, in Anchor IDL order. The single
@@ -997,6 +997,22 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(DELEGATION_LEN - 1)?;
         None
     };
+    // AV-105: the atomic-swap counterparty link, always reserved like
+    // `delegation`: the `None` discriminant followed by the zeroed
+    // 32-byte counterparty id, appended last so every earlier offset
+    // above is unchanged.
+    let swap_link = if c.option_present("swap_link")? {
+        let counterparty = c.pubkey()?;
+        debug_assert_eq!(
+            32,
+            SWAP_LINK_REGION_LEN - 1,
+            "swap-link region drift vs SWAP_LINK_REGION_LEN"
+        );
+        Some(counterparty)
+    } else {
+        c.skip(SWAP_LINK_REGION_LEN - 1)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1172,6 +1188,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // recorded, so the delegated authority checks decide identically
         // after a decode.
         delegation,
+        // AV-105: the atomic-swap counterparty link is persisted — a
+        // decoded escrow carries the same counterparty id the link
+        // recorded, so the single-side refusal and the pair
+        // cross-checks decide identically after a decode.
+        swap_link,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

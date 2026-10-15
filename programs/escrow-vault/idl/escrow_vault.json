@@ -712,6 +712,46 @@
       "discriminator": [188, 92, 135, 67, 160, 181, 54, 62],
       "accounts": [],
       "args": []
+    },
+    {
+      "name": "link_swap",
+      "discriminator": [165, 119, 91, 2, 66, 143, 234, 181],
+      "accounts": [],
+      "args": [
+        {"name": "escrow_id_a", "type": {"array": ["u8", 32]}},
+        {"name": "escrow_id_b", "type": {"array": ["u8", 32]}},
+        {"name": "amount_a", "type": "u64"},
+        {"name": "amount_b", "type": "u64"}
+      ]
+    },
+    {
+      "name": "release_swap",
+      "discriminator": [61, 205, 84, 196, 165, 106, 157, 210],
+      "accounts": [],
+      "args": [
+        {"name": "escrow_id_a", "type": {"array": ["u8", 32]}},
+        {"name": "escrow_id_b", "type": {"array": ["u8", 32]}},
+        {"name": "amount_a", "type": "u64"},
+        {"name": "amount_b", "type": "u64"}
+      ]
+    },
+    {
+      "name": "cancel_swap",
+      "discriminator": [88, 174, 98, 148, 24, 252, 93, 89],
+      "accounts": [],
+      "args": [
+        {"name": "escrow_id_a", "type": {"array": ["u8", 32]}},
+        {"name": "escrow_id_b", "type": {"array": ["u8", 32]}}
+      ]
+    },
+    {
+      "name": "cancel_swap_expired",
+      "discriminator": [148, 19, 233, 185, 202, 202, 213, 118],
+      "accounts": [],
+      "args": [
+        {"name": "escrow_id_a", "type": {"array": ["u8", 32]}},
+        {"name": "escrow_id_b", "type": {"array": ["u8", 32]}}
+      ]
     }
   ],
   "accounts": [
@@ -791,7 +831,8 @@
           {"name": "streaming_fees_accrued", "type": "u64", "offset": 4554},
           {"name": "appeal_bond", "type": "u64", "offset": 4562},
           {"name": "appeal_bond_paid", "type": "u64", "offset": 4570},
-          {"name": "delegation", "type": {"option": {"defined": "Delegation"}}, "offset": 4578}
+          {"name": "delegation", "type": {"option": {"defined": "Delegation"}}, "offset": 4578},
+          {"name": "swap_link", "type": {"option": {"array": ["u8", 32]}}, "offset": 4615}
         ]
       }
     }
@@ -1071,7 +1112,10 @@
     {"code": 157, "name": "InvalidTransferHook"},
     {"code": 158, "name": "InvalidAppealBond"},
     {"code": 159, "name": "AppealExpiryNotDue"},
-    {"code": 160, "name": "InvalidDelegation"}
+    {"code": 160, "name": "InvalidDelegation"},
+    {"code": 161, "name": "InvalidSwapParties"},
+    {"code": 162, "name": "InvalidSwapAmounts"},
+    {"code": 163, "name": "SwapLinkActive"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
