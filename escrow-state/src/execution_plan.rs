@@ -422,6 +422,8 @@ mod execution_plan_tests {
             evidence_disclosure: None,
             // AV-111: test actions carry no funding progress.
             funding_progress: None,
+            // AV-115: test actions carry no penalty estimate.
+            penalty_estimate: 0,
             reason: "test",
             // AV-114: test actions carry no merge source.
             merge_source: None,

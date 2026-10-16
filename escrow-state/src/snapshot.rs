@@ -387,6 +387,12 @@ pub struct EscrowSnapshot {
     /// Anti-griefing penalty rate in basis points charged on
     /// taker-initiated `cancel_expired` (AV-24).
     pub penalty_bps: u16,
+    /// AV-115: penalty escalation rate in basis points per day, `0`
+    /// when no escalation is configured.
+    pub penalty_escalation_rate_bps: u16,
+    /// AV-115: penalty escalation cap in basis points, `0` when no
+    /// escalation is configured.
+    pub penalty_escalation_cap_bps: u16,
     /// Timelock unlock timestamp, or `0` when no timelock is configured
     /// (AV-27).
     pub unlock_at: u64,
@@ -818,6 +824,8 @@ impl Escrow {
                 }
             }),
             penalty_bps: self.penalty_bps(),
+            penalty_escalation_rate_bps: self.penalty_escalation_rate_bps(),
+            penalty_escalation_cap_bps: self.penalty_escalation_cap_bps(),
             unlock_at: self.unlock_at(),
             unlock_eligible: self.is_unlock_eligible(now),
             // AV-64: the relative lock and its funding origin ride the
@@ -1239,6 +1247,10 @@ impl EscrowSnapshot {
         s.push_str(&hex32(&self.refund_recipient));
         s.push_str("\",\"penalty_bps\":");
         s.push_str(&self.penalty_bps.to_string());
+        s.push_str(",\"penalty_escalation_rate_bps\":");
+        s.push_str(&self.penalty_escalation_rate_bps.to_string());
+        s.push_str(",\"penalty_escalation_cap_bps\":");
+        s.push_str(&self.penalty_escalation_cap_bps.to_string());
         // AV-27: timelock.
         s.push_str(",\"unlock_at\":");
         s.push_str(&self.unlock_at.to_string());
@@ -1597,7 +1609,7 @@ mod snapshot_tests {
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"evidence_root\":null,\"evidence_disclosure\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
-             \"penalty_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\"payout_denylist\":null,\"cpi_allowlist\":null,\"multisig_authority\":null,\
+             \"penalty_bps\":0,\"penalty_escalation_rate_bps\":0,\"penalty_escalation_cap_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\"payout_denylist\":null,\"cpi_allowlist\":null,\"multisig_authority\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
              \"max_extension_secs\":0,\"extension_count\":0,\"arbiter_panel\":null,\

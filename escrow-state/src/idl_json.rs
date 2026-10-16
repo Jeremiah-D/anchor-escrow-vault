@@ -1320,7 +1320,26 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .copied()
         .expect("price_gate in IDL offsets");
     assert_eq!(pg_len, PRICE_GATE_LEN);
-    assert_eq!(pg_offset, 8 + ESCROW_BODY_LEN - PRICE_GATE_LEN);
+    // AV-115 appended the escalation tail after price_gate, so the
+    // gate no longer sits at the body's end.
+    assert_eq!(pg_offset, 8 + ESCROW_BODY_LEN - PRICE_GATE_LEN - 4);
+    // AV-115: the escalation tail is the last 4 bytes of the body.
+    let rate = body_field(&enc, &offsets, "penalty_escalation_rate_bps");
+    assert_eq!(rate.len(), 2);
+    let (_, rate_offset, _) = offsets
+        .iter()
+        .find(|(n, _, _)| *n == "penalty_escalation_rate_bps")
+        .copied()
+        .expect("penalty_escalation_rate_bps in IDL offsets");
+    assert_eq!(rate_offset, 8 + ESCROW_BODY_LEN - 4);
+    let cap = body_field(&enc, &offsets, "penalty_escalation_cap_bps");
+    assert_eq!(cap.len(), 2);
+    let (_, cap_offset, _) = offsets
+        .iter()
+        .find(|(n, _, _)| *n == "penalty_escalation_cap_bps")
+        .copied()
+        .expect("penalty_escalation_cap_bps in IDL offsets");
+    assert_eq!(cap_offset, 8 + ESCROW_BODY_LEN - 2);
 }
 
 #[test]

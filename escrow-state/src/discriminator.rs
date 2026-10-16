@@ -1153,6 +1153,13 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         None
     };
 
+    // AV-115: the anti-griefing penalty escalation tail — the 2-byte
+    // daily rate plus the 2-byte cap, both in basis points. Structural
+    // decode only — the 0–10000 invariants are enforced by
+    // `Escrow::with_penalty_escalation`, not re-litigated here.
+    let penalty_escalation_rate_bps = c.u16_le()?;
+    let penalty_escalation_cap_bps = c.u16_le()?;
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1374,6 +1381,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-113: the opt-in oracle price gate decodes like any other
         // persisted tail field.
         price_gate,
+        // AV-115: the opt-in penalty escalation schedule decodes like
+        // any other persisted tail field.
+        penalty_escalation_rate_bps,
+        penalty_escalation_cap_bps,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

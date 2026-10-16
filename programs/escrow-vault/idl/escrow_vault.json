@@ -268,6 +268,15 @@
       ]
     },
     {
+      "name": "initialize_penalty_escalation",
+      "discriminator": [234, 39, 208, 42, 43, 251, 64, 224],
+      "accounts": [],
+      "args": [
+        {"name": "rate_bps_per_day", "type": "u16"},
+        {"name": "cap_bps", "type": "u16"}
+      ]
+    },
+    {
       "name": "initialize_timelock",
       "discriminator": [47, 125, 243, 32, 170, 86, 24, 243],
       "accounts": [],
@@ -970,7 +979,9 @@
           {"name": "funding_plan", "type": {"option": {"defined": "FundingPlan"}}, "offset": 5093},
           {"name": "release_cooling_secs", "type": "u64", "offset": 5104},
           {"name": "release_intent_at", "type": {"option": "u64"}, "offset": 5112},
-          {"name": "price_gate", "type": {"option": {"defined": "PriceGate"}}, "offset": 5121}
+          {"name": "price_gate", "type": {"option": {"defined": "PriceGate"}}, "offset": 5121},
+          {"name": "penalty_escalation_rate_bps", "type": "u16", "offset": 5139},
+          {"name": "penalty_escalation_cap_bps", "type": "u16", "offset": 5141}
         ]
       }
     }

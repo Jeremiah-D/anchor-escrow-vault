@@ -213,6 +213,25 @@ still routes to the initializer personally: the compensation follows
 the harmed party, not the refund address. `InvalidPenalty`, code 117,
 rejects rates above 10_000.
 
+**Penalty escalation (time-weighted anti-griefing).** An escrow can
+additionally opt into time-weighted escalation of the penalty
+(`with_penalty_escalation(rate_bps_per_day, cap_bps)`, both in basis
+points, `0`–`10000`, once, before funding; a `0` rate — the default —
+disables escalation and keeps the fixed AV-24 rate). The effective
+rate starts at `penalty_bps` and grows by `rate_bps_per_day` for every
+whole day elapsed past the expiry gate (`expires_at + grace_period`),
+capped at `cap_bps`: `effective = min(penalty_bps + rate_bps_per_day ×
+days_late, cap_bps)`, and the cancel charges `floor(remaining ×
+effective / 10000)` (u128 math, no overflow). A cancel within the
+first 24 hours past the gate still pays exactly the AV-24 rate; the
+cap never *reduces* the base rate — a `cap_bps` below `penalty_bps`
+degrades to the fixed rate. The basket `cancel_expired_basket` path
+escalates identically. The keeper report discloses the escalated
+penalty estimate (`penalty_estimate`) on `cancel_expired` /
+`crank_expired` actions so operators watch the meter grow, and the
+state snapshot exposes the schedule (`penalty_escalation_rate_bps` /
+`penalty_escalation_cap_bps`) for indexers.
+
 **Timelock.** An escrow can opt into a timelock (`with_timelock(unlock_at)`,
 once, before funding; `unlock_at` is a Unix timestamp, `0` = no lock). After
 that, every taker payout path — `release`, `claim`, and `release_milestone`
@@ -2339,7 +2358,9 @@ two-way consistency check against the IDL parameter table:
 | release_cooling_secs | u64 | 8 |
 | release_intent_at | Option<u64> (1-byte discriminant + 8-byte stamp) | 9 |
 | price_gate | Option<PriceGate> (1-byte discriminant + 1-byte direction + 8-byte target + 8-byte max_staleness_secs) | 18 |
-| **total**     |                   | **5131** |
+| penalty_escalation_rate_bps | u16 | 2 |
+| penalty_escalation_cap_bps | u16 | 2 |
+| **total**     |                   | **5135** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2461,10 +2482,10 @@ plan payload — `total_amount` u64 + `max_tranches` u8 +
 `release_cooling_secs` (u64, 0 = unconfigured) +
 `release_intent_at` (Option<u64>: 1-byte discriminant + 8-byte
 stamp, `None` when no intent is live)).
-`escrow-state` exposes `VAULT_SPACE` (5121) and
-`VAULT_SPACE_NO_QUORUM` (4631) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (5143) and
+`VAULT_SPACE_NO_QUORUM` (4653) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **36,533,040 lamports** to be
+mainnet rent parameters the full vault needs **36,686,160 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)

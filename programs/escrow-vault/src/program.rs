@@ -2456,6 +2456,34 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to time-weighted escalation of the anti-griefing penalty
+    /// (AV-115; mirrors `Escrow::with_penalty_escalation`).
+    /// `Uninitialized` only, like `initialize_penalty`: the schedule is
+    /// fixed before funds move. Both params are basis points
+    /// (`rate_bps_per_day <= 10_000`, `cap_bps <= 10_000`;
+    /// `InvalidPenalty` otherwise); `rate_bps_per_day == 0` disables
+    /// escalation (pure AV-24 behavior). After this, a
+    /// *taker-initiated* `cancel_expired` charges
+    /// `floor(remaining * min(penalty_bps + rate_bps_per_day * whole
+    /// days past the expiry gate, cap_bps) / 10_000)` to the
+    /// initializer as griefing compensation.
+    pub fn initialize_penalty_escalation(
+        ctx: Context<InitializePenaltyEscalation>,
+        rate_bps_per_day: u16,
+        cap_bps: u16,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_penalty_escalation(rate_bps_per_day, cap_bps)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.penalty_escalation_rate_bps` /
+        // `vault.penalty_escalation_cap_bps` are always present (2
+        // bytes each, zeroed by default), so the schedule is written
+        // in place — no realloc needed in the real build.
+        Ok(())
+    }
+
     /// Declare the timelock (AV-27; mirrors `Escrow::with_timelock`):
     /// after this, `release` / `claim` / `release_milestone` require the
     /// Solana clock to have passed `unlock_at` (`TimelockNotReached`
@@ -7035,6 +7063,16 @@ pub struct InitializePenalty<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Only the initializer declares the anti-griefing penalty rate;
+    /// the state machine rejects re-configuration once the escrow
+    /// leaves `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitializePenaltyEscalation<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer declares the penalty escalation schedule;
     /// the state machine rejects re-configuration once the escrow
     /// leaves `Uninitialized`.
     pub initializer: Signer<'info>,

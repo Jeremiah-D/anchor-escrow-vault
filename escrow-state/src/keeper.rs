@@ -504,6 +504,17 @@ pub struct KeeperAction {
     /// `merge_escrows` instruction takes the source vault as its
     /// second account.
     pub merge_source: Option<[u8; 32]>,
+    /// AV-115: the taker-initiated anti-griefing penalty estimate at
+    /// scan time, in the escrow's smallest unit. Set on
+    /// [`KeeperActionKind::CancelExpired`] /
+    /// [`KeeperActionKind::CrankExpired`] actions as
+    /// `expiry_cancel_penalty_at(remaining, scan_now)` — the
+    /// compensation at stake if the taker (rather than the listed
+    /// caller) executes the cancel, so the operator watches the
+    /// escalation meter grow. `0` on every other kind, and `0` when
+    /// no penalty is configured. Informational: it is never an
+    /// instruction input and never affects which actions are listed.
+    pub penalty_estimate: u64,
 }
 
 /// AV-111: the live tranched-funding counters passed through on a
@@ -633,7 +644,8 @@ impl KeeperReport {
     ///    "display_amount":"1.000000",
     ///    "reason":"expired","reference":null,"extension_count":0,
     ///    "multisig_authority":null,"evidence_disclosure":null,
-    ///    "funding_progress":null,"estimated_cu":13814}
+    ///    "funding_progress":null,"merge_source":null,
+    ///    "penalty_estimate":0,"estimated_cu":13814}
     /// ]}
     /// ```
     ///
@@ -810,6 +822,13 @@ impl KeeperReport {
                 }
                 None => s.push_str("null"),
             }
+            // AV-115: the taker-initiated anti-griefing penalty estimate
+            // at scan time — `0` unless the action is a
+            // `cancel_expired` / `crank_expired` on a penalty-configured
+            // escrow. The operator watches this number grow as the
+            // escalation meter runs.
+            s.push_str(",\"penalty_estimate\":");
+            s.push_str(&a.penalty_estimate.to_string());
             // AV-88: the per-action CU passthrough — the heuristic
             // estimate for this keeper call, same cost model as the
             // execution plan.
@@ -887,6 +906,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                             funding_progress: None,
                             reason: "disputed",
                             merge_source: None,
+                            // AV-115: the penalty estimate is zero on non-cancel actions.
+                            penalty_estimate: 0,
                         });
                     }
                 }
@@ -917,6 +938,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         funding_progress: None,
                         reason: "disputed",
                         merge_source: None,
+                        // AV-115: the penalty estimate is zero on non-cancel actions.
+                        penalty_estimate: 0,
                     });
                 }
             }
@@ -966,6 +989,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         }),
                         reason: "funding_incomplete",
                         merge_source: None,
+                        // AV-115: the penalty estimate is zero on non-cancel actions.
+                        penalty_estimate: 0,
                     });
                 }
             }
@@ -1011,6 +1036,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 funding_progress: None,
                 reason: "expired",
                 merge_source: None,
+                // AV-115: the taker-initiated penalty estimate at scan time.
+                penalty_estimate: e.expiry_cancel_penalty_at(e.remaining_amount(), now),
             });
             // AV-48: the permissionless crank — the same expiry exit,
             // callable by anyone. A keeper bot that is party to nothing
@@ -1046,6 +1073,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     funding_progress: None,
                     reason: "expired",
                     merge_source: None,
+                    // AV-115: the taker-initiated penalty estimate at scan time.
+                    penalty_estimate: e.expiry_cancel_penalty_at(e.remaining_amount(), now),
                 });
             }
         }
@@ -1083,6 +1112,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 funding_progress: None,
                 reason: "deadman_inactivity_elapsed",
                 merge_source: None,
+                // AV-115: the penalty estimate is zero on non-cancel actions.
+                penalty_estimate: 0,
             });
         }
         // The taker's pull path: vesting attached (or an AV-97 Dutch
@@ -1128,6 +1159,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     "vesting_unlocked"
                 },
                 merge_source: None,
+                // AV-115: the penalty estimate is zero on non-cancel actions.
+                penalty_estimate: 0,
             });
         }
         // AV-56: the initializer's push path for the next due
@@ -1177,6 +1210,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     funding_progress: None,
                     reason: "subscription_period_due",
                     merge_source: None,
+                    // AV-115: the penalty estimate is zero on non-cancel actions.
+                    penalty_estimate: 0,
                 });
             }
         }
@@ -1210,6 +1245,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 funding_progress: None,
                 reason: "slash_deadline_passed",
                 merge_source: None,
+                // AV-115: the penalty estimate is zero on non-cancel actions.
+                penalty_estimate: 0,
             });
             if let Some(arbiter) = e.arbiter() {
                 actions.push(KeeperAction {
@@ -1229,6 +1266,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     funding_progress: None,
                     reason: "slash_deadline_passed",
                     merge_source: None,
+                    // AV-115: the penalty estimate is zero on non-cancel actions.
+                    penalty_estimate: 0,
                 });
             }
         }
@@ -1261,6 +1300,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 funding_progress: None,
                 reason: "appeal_window_open",
                 merge_source: None,
+                // AV-115: the penalty estimate is zero on non-cancel actions.
+                penalty_estimate: 0,
             });
         }
         if e.is_appeal_under_review() {
@@ -1295,6 +1336,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         funding_progress: None,
                         reason: "appeal_filed",
                         merge_source: None,
+                        // AV-115: the penalty estimate is zero on non-cancel actions.
+                        penalty_estimate: 0,
                     });
                 }
             }
@@ -1329,6 +1372,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 funding_progress: None,
                 reason: "appeal_window_lapsed",
                 merge_source: None,
+                // AV-115: the penalty estimate is zero on non-cancel actions.
+                penalty_estimate: 0,
             });
         }
         // AV-106: the insurance-pool payout. Listed when
@@ -1369,6 +1414,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     funding_progress: None,
                     reason: "pool_payout_available",
                     merge_source: None,
+                    // AV-115: the penalty estimate is zero on non-cancel actions.
+                    penalty_estimate: 0,
                 });
             }
         }
@@ -1439,6 +1486,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     funding_progress: None,
                     reason: "mergeable_pair",
                     merge_source: Some(source.escrow_id),
+                    // AV-115: the penalty estimate is zero on non-cancel actions.
+                    penalty_estimate: 0,
                 });
                 break;
             }
@@ -2093,6 +2142,66 @@ mod keeper_tests {
     }
 
     #[test]
+    fn keeper_discloses_escalated_penalty_estimate() {
+        // AV-115: the report carries the taker-initiated penalty at
+        // scan time — base 250 bps + 100 bps/day × 10 days = 1250 bps
+        // of the 1_000_000 remainder = 125_000.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, 0)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap()
+            .with_penalty_escalation(100, 10_000)
+            .unwrap();
+        e.fund(ALICE, MID).unwrap();
+        let now = 10 * 86_400; // 10 days past the expiry gate (0)
+        let watched = [watch(ID1, e)];
+        let report = scan_keeper_actions(&watched, now);
+        assert_eq!(report.actions.len(), 2);
+        for a in &report.actions {
+            assert!(
+                matches!(
+                    a.kind,
+                    KeeperActionKind::CancelExpired | KeeperActionKind::CrankExpired
+                ),
+                "unexpected kind {:?}",
+                a.kind
+            );
+            assert_eq!(a.penalty_estimate, 125_000, "escalated estimate on {:?}", a.kind);
+        }
+        // The estimate rides the report JSON for operator dashboards.
+        let json = report.to_json();
+        assert_eq!(json.matches("\"penalty_estimate\":125000").count(), 2);
+    }
+
+    #[test]
+    fn keeper_penalty_estimate_is_zero_without_penalty() {
+        let watched = [watch(ID1, funded(AMOUNT, 0))];
+        let report = scan_keeper_actions(&watched, MID);
+        assert_eq!(report.actions.len(), 2);
+        for a in &report.actions {
+            assert_eq!(a.penalty_estimate, 0);
+        }
+        assert!(report.to_json().contains("\"penalty_estimate\":0"));
+    }
+
+    #[test]
+    fn keeper_penalty_estimate_uses_fixed_rate_without_escalation() {
+        // AV-24 only: the estimate is the fixed rate no matter how
+        // late the scan runs.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, 0)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap();
+        e.fund(ALICE, MID).unwrap();
+        let watched = [watch(ID1, e)];
+        let report = scan_keeper_actions(&watched, 365 * 86_400);
+        assert_eq!(report.actions.len(), 2);
+        for a in &report.actions {
+            assert_eq!(a.penalty_estimate, 25_000);
+        }
+    }
+
+    #[test]
     fn unfunded_and_terminal_escrows_yield_no_actions() {
         let uninit = Escrow::initialize(ALICE, BOB, AMOUNT, 0).unwrap();
         let mut released = funded(AMOUNT, NEVER);
@@ -2568,6 +2677,8 @@ mod keeper_tests {
                 funding_progress: None,
                 reason: "expired",
                 merge_source: None,
+                // AV-115: the penalty estimate is zero on non-cancel actions.
+                penalty_estimate: 0,
             }
         );
         assert_eq!(
@@ -2590,6 +2701,8 @@ mod keeper_tests {
                 funding_progress: None,
                 reason: "expired",
                 merge_source: None,
+                // AV-115: the penalty estimate is zero on non-cancel actions.
+                penalty_estimate: 0,
             }
         );
         assert_eq!(report.actions[2].escrow_id, ID2);
@@ -2694,7 +2807,7 @@ mod keeper_tests {
         // 3 accounts, 8 data bytes, 1 signer →
         // 10_000 + 3_000 + 3×250 + 8×8 = 13_814 each; total 27_628.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"estimated_cu\":13814}}]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"estimated_cu\":13814}}]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -2719,7 +2832,7 @@ mod keeper_tests {
         // AV-88: claim with mint, no refund_to: 3 accounts, 8 data
         // bytes, 1 signer → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"estimated_cu\":17814}}]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"estimated_cu\":17814}}]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),
@@ -2840,6 +2953,8 @@ mod keeper_tests {
             funding_progress: None,
             reason: "expired",
             merge_source: None,
+            // AV-115: the penalty estimate is zero on non-cancel actions.
+            penalty_estimate: 0,
         };
         assert_eq!(a.estimated_compute_units(), 13_814);
         // Without refund_to the account drops out of the estimate.
@@ -2863,6 +2978,8 @@ mod keeper_tests {
             funding_progress: None,
             reason: "disputed",
             merge_source: None,
+            // AV-115: the penalty estimate is zero on non-cancel actions.
+            penalty_estimate: 0,
             refund_to: None,
             ..a
         };
