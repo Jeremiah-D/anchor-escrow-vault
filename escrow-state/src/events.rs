@@ -260,7 +260,7 @@
 //! `with_appeal_bond` builder, and `expire_appeal`; every earlier
 //! field offset stays stable. The crate stays dependency-free.
 
-use crate::{Escrow, EscrowError, EscrowState, MilestonePlan, QuorumPolicy, SplitConfig, VestingSchedule};
+use crate::{Escrow, EscrowError, EscrowState, MilestonePlan, PriceFeed, QuorumPolicy, SplitConfig, VestingSchedule};
 use crate::{AppealOutcome, BasketSettlement, OverrideValue, TemplatePreset};
 use crate::cpi::CpiError;
 use crate::cpi_call::{CpiInvocation, CpiReceipt};
@@ -2138,6 +2138,88 @@ impl IndexedEscrow {
             self.inner.state(),
             EventAmounts::payout(amount, fee),
             at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok((payout, fee))
+    }
+
+    /// Release `amount` through the AV-113 oracle price gate (mirrors
+    /// [`Escrow::release_price_gated`]). Emits `Released` exactly like
+    /// [`IndexedEscrow::release`] — the gate is a check, not a
+    /// lifecycle move (mirroring the AV-27 timelock, which likewise
+    /// added no event kind). `at` doubles as the state machine's
+    /// `now` and the event timestamp; the oracle quote arrives via
+    /// `feed` (on-chain: the oracle account's data, passed through by
+    /// the Anchor layer).
+    ///
+    /// [`Escrow::release_price_gated`]: crate::Escrow::release_price_gated
+    /// [`IndexedEscrow::release`]: IndexedEscrow::release
+    pub fn release_price_gated(
+        &mut self,
+        authority: [u8; 32],
+        amount: u64,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+        at: u64,
+        feed: &dyn PriceFeed,
+    ) -> Result<(u64, u64), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`. The price gate itself runs before the
+        // reentrancy guard (see `Escrow::release_price_gated`); a
+        // gate failure is not a reentrant entry and emits nothing.
+        let result = self
+            .inner
+            .release_price_gated(authority, at, amount, mint, payout_to, feed);
+        let (payout, fee) = self.map_reentrant(result, at)?;
+        self.push_event(
+            EscrowEventKind::Released,
+            from,
+            self.inner.state(),
+            EventAmounts::payout(amount, fee),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok((payout, fee))
+    }
+
+    /// Claim the vested amount through the AV-113 oracle price gate
+    /// (mirrors [`Escrow::claim_price_gated`]). Emits `Claimed`
+    /// exactly like [`IndexedEscrow::claim`].
+    ///
+    /// [`Escrow::claim_price_gated`]: crate::Escrow::claim_price_gated
+    /// [`IndexedEscrow::claim`]: IndexedEscrow::claim
+    pub fn claim_price_gated(
+        &mut self,
+        authority: [u8; 32],
+        now: u64,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+        feed: &dyn PriceFeed,
+    ) -> Result<(u64, u64), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected` (`now` doubles as the event's `at`).
+        let result = self
+            .inner
+            .claim_price_gated(authority, now, mint, payout_to, feed);
+        let (payout, fee) = self.map_reentrant(result, now)?;
+        // `payout + fee` is the gross claimable (`<= amount`); no
+        // overflow possible.
+        self.push_event(
+            EscrowEventKind::Claimed,
+            from,
+            self.inner.state(),
+            EventAmounts::payout(payout + fee, fee),
+            now,
             None,
             None,
             None,

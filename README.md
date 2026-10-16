@@ -1252,6 +1252,8 @@ program error per variant):
 | `FundingTranchesExhausted` | 172 | `fund_tranche` (AV-111) when the plan's tranche budget is spent |
 | `InvalidFundingPlan` | 173 | `with_funding_plan` (AV-111) with `max_tranches == 0`; `fund_tranche` with no plan attached; `fund` on a plan escrow |
 | `ReleaseCoolingNotElapsed` | 174 | `release` (AV-112) while cooling is configured and no live intent exists, or before `intent_at + cooling_secs` (stacked after the AV-27 timelock gate) |
+| `PriceGateNotSatisfied` | 175 | `release_price_gated` / `claim_price_gated` (AV-113) with a configured gate when the oracle is dark, the quote is stale (`now - observed_at > max_staleness_secs`), or the price misses the gate's direction condition |
+| `InvalidPriceGate` | 176 | `with_price_gate` / `initialize_price_gate` (AV-113) with `target == 0`, or a vault-account decode hitting an out-of-range direction byte |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2335,7 +2337,8 @@ two-way consistency check against the IDL parameter table:
 | funding_plan | Option<FundingPlan> (1-byte discriminant + total_amount u64 + max_tranches u8 + tranches_used u8) | 11 |
 | release_cooling_secs | u64 | 8 |
 | release_intent_at | Option<u64> (1-byte discriminant + 8-byte stamp) | 9 |
-| **total**     |                   | **5113** |
+| price_gate | Option<PriceGate> (1-byte discriminant + 1-byte direction + 8-byte target + 8-byte max_staleness_secs) | 18 |
+| **total**     |                   | **5131** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -3729,6 +3732,67 @@ initializer                  taker                      vault
    |                               | release(12:45) →      |
    |                               |   ReleaseCoolingNotElapsed
    |                               |<----------------------|
+```
+
+## Oracle price-gated release (AV-113)
+
+The problem: an escrow's release is priced at signing time, but
+crypto prices move — a taker who locked in 200 USDC/SOL watches SOL
+crash and releases anyway, or the initializer wants the payout to
+happen only once the collateral leg is worth enough to cover the
+invoice. AV-113 adds an opt-in oracle price gate: release (and
+claim) proceeds only when a fresh oracle quote satisfies a
+directional price condition.
+
+`with_price_gate(direction, target, max_staleness_secs)` is a
+builder on an `Uninitialized` escrow (like the other `with_*`
+opt-ins); `target == 0` is rejected with `InvalidPriceGate` (code
+176). The gate is a `PriceGate` — `AtOrAbove` / `AtOrBelow` plus the
+target price and the maximum quote age in seconds — and lives in an
+18-byte tail region of the vault account (1-byte `Option`
+discriminant + 17 bytes: direction, target, staleness bound).
+
+`release_price_gated(authority, now, amount, payout_to, recipient,
+feed)` and `claim_price_gated(...)` are the gated entries. The gate
+is evaluated *first*, before the release/claim guard chains: the
+oracle input is the most failure-prone external dependency, and the
+gate's existence is public in the vault bytes anyway, so no
+information leaks by checking it up front. With no gate attached
+both degrade to plain `release` / `claim`; plain `release` /
+`claim` stay ungated for backward compatibility. A missing quote
+(dark oracle), a stale quote (`now - observed_at >
+max_staleness_secs`, `saturating_sub` — no underflow path), or a
+price on the wrong side of the target (boundaries inclusive) all
+refuse with `PriceGateNotSatisfied` (code 175). The gate stacks
+*after* the AV-27 fixed timelock and composes with the AV-112
+cooling window: a release must clear all three. The on-chain
+skeleton reads the quote from the first remaining account
+(16-byte price ++ observed_at; missing/short account → code 175);
+no new event kind — the standard `Released` / `Claimed` fire, the
+gate is a check like the timelock, not a new transition. Account
+layout grows by the 18-byte tail: body 5113 → **5131**,
+`VAULT_SPACE` 5121 → **5139**, `VAULT_SPACE_NO_QUORUM` 4631 →
+**4649**, rent-exempt 36,533,040 → **36,658,320** lamports.
+
+**Walkthrough — the release that waited for the price.** The
+initializer gates the escrow at 200 USDC/SOL with a 5-minute
+staleness bound; at noon SOL trades at 190 and the taker tries to
+release:
+
+```
+initializer              taker                    oracle
+   | with_price_gate(AtOrAbove, 200, 300)             |
+   |-------------------->|                            |
+   |                     | release_price_gated(noon)  |
+   |                     |   quote = 190 (fresh)      |
+   |                     |--------------------------->|
+   |                     |   PriceGateNotSatisfied    |
+   |                     |<---------------------------|
+   |                     | release_price_gated(14:00) |
+   |                     |   quote = 205 (fresh)      |
+   |                     |--------------------------->|
+   |                     |   Released                 |
+   |                     |<---------------------------|
 ```
 
 ## Basket escrow (AV-95)

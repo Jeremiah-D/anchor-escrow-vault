@@ -1392,6 +1392,16 @@ pub struct Escrow {
     /// of a CPI target program invoking the escrow program again
     /// mid-instruction). Every fund-moving transition
     /// ([`Escrow::fund`], [`Escrow::release`],
+    /// AV-113: opt-in oracle price gate (see
+    /// [`Escrow::with_price_gate`]). `None` means no gate (backward
+    /// compatible): [`Escrow::release`] / [`Escrow::claim`] keep their
+    /// existing semantics, and the gated wrappers delegate straight
+    /// through. Set once via `with_price_gate` on an `Uninitialized`
+    /// escrow, like the other `with_*` builders. Persisted (18 bytes
+    /// in the vault account: 1-byte discriminant + 17-byte
+    /// [`PriceGate`]) so the gate survives serialization. Appended
+    /// last so every earlier field offset stays stable.
+    price_gate: Option<PriceGate>,
     /// [`Escrow::release_via_cpi`], [`Escrow::release_milestone`],
     /// [`Escrow::claim`], [`Escrow::cancel`],
     /// [`Escrow::cancel_expired`], [`Escrow::resolve`],
@@ -2022,6 +2032,22 @@ pub enum EscrowError {
     /// [`Escrow::with_release_cooling`]). The escrow is untouched.
     /// Never renumbered (see [`EscrowError::code`]).
     ReleaseCoolingNotElapsed,
+    /// AV-113: the oracle price gate blocked the payout —
+    /// [`Escrow::release_price_gated`] / [`Escrow::claim_price_gated`]
+    /// on a price-gated escrow whose feed yielded no quote, whose
+    /// quote was stale (`now - observed_at > max_staleness_secs`),
+    /// or whose price missed the gate's direction condition (see
+    /// [`Escrow::require_price_gate`]). One code for all three modes:
+    /// the caller learns the gate blocked, never which sub-condition
+    /// tripped. The escrow is untouched. Never renumbered (see
+    /// [`EscrowError::code`]).
+    PriceGateNotSatisfied,
+    /// AV-113: price-gate misconfiguration — [`Escrow::with_price_gate`]
+    /// with `target == 0` (a zero threshold is never a deliberate
+    /// policy). Parallels [`EscrowError::InvalidQuorum`] and the
+    /// other `Invalid*` config errors. Never renumbered (see
+    /// [`EscrowError::code`]).
+    InvalidPriceGate,
 }
 
 impl EscrowError {
@@ -2120,6 +2146,9 @@ impl EscrowError {
             EscrowError::InvalidFundingPlan => 173,
             // AV-112: appended, never renumbered.
             EscrowError::ReleaseCoolingNotElapsed => 174,
+            // AV-113: appended, never renumbered.
+            EscrowError::PriceGateNotSatisfied => 175,
+            EscrowError::InvalidPriceGate => 176,
         }
     }
 
@@ -2201,6 +2230,8 @@ impl EscrowError {
             EscrowError::FundingTranchesExhausted,
             EscrowError::InvalidFundingPlan,
             EscrowError::ReleaseCoolingNotElapsed,
+            EscrowError::PriceGateNotSatisfied,
+            EscrowError::InvalidPriceGate,
         ]
     }
 }
@@ -4676,6 +4707,112 @@ const SCHEMA_STEP_DELTAS: &[(u8, &[SchemaFieldDelta])] = &[
     ),
 ];
 
+/// AV-113: the direction of an oracle price-gate condition (see
+/// [`PriceGate`]). Serialized as one byte (`0` = `AtOrAbove`, `1` =
+/// `AtOrBelow`); the numeric mapping is pinned by test and never
+/// reordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriceDirection {
+    /// The gate passes when `price >= target` (e.g. a seller's floor:
+    /// release only if the oracle reports the asset held its value).
+    AtOrAbove,
+    /// The gate passes when `price <= target` (e.g. a buyer's ceiling:
+    /// release only if the oracle reports the asset stayed cheap).
+    AtOrBelow,
+}
+
+/// AV-113: opt-in oracle price gate on the taker-payout paths (DeFi
+/// conditional settlement). When attached via
+/// [`Escrow::with_price_gate`], [`Escrow::release_price_gated`] and
+/// [`Escrow::claim_price_gated`] require a fresh oracle [`PriceQuote`]
+/// satisfying the condition; a missing feed, a stale quote, or an
+/// unmet condition fails with [`EscrowError::PriceGateNotSatisfied`].
+///
+/// Prices are `u64` in the oracle's native quote units (whatever scale
+/// the feed publishes — e.g. Pyth-style scaled integers): the state
+/// machine never interprets the scale, it only compares. `Copy` and
+/// heap-free like the rest of the crate. Persisted (18 bytes in the
+/// vault account: 1-byte `Option` discriminant + 1-byte direction +
+/// 8-byte target + 8-byte staleness bound) so the gate survives
+/// serialization; appended last so every earlier field offset stays
+/// stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriceGate {
+    /// Which side of `target` the oracle price must sit on.
+    pub direction: PriceDirection,
+    /// The threshold price in the oracle's quote units. Must be `> 0`
+    /// ([`EscrowError::InvalidPriceGate`] otherwise — a zero threshold
+    /// is a misconfiguration, not a policy).
+    pub target: u64,
+    /// Maximum age of a quote in seconds. A quote with
+    /// `now - observed_at > max_staleness_secs` is stale and the gate
+    /// fails — a dark or censored oracle cannot silently pass old
+    /// prices. `0` means the quote must be from exactly `now`
+    /// (exact-freshness, usable with injected clocks in tests).
+    pub max_staleness_secs: u64,
+}
+
+/// Serialized length of the persisted `price_gate` vault region:
+/// 1-byte `Option` discriminant + 1-byte direction + 8-byte target +
+/// 8-byte staleness bound.
+pub const PRICE_GATE_LEN: usize = 1 + 1 + 8 + 8;
+
+/// AV-113: a single oracle price observation. Transient — carried on
+/// the call, never persisted. On-chain the keeper (or the oracle
+/// account the instruction references) supplies it; the Anchor layer
+/// passes it through to
+/// [`Escrow::release_price_gated`]/[`Escrow::claim_price_gated`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriceQuote {
+    /// The observed price in the oracle's quote units.
+    pub price: u64,
+    /// Unix timestamp the observation was taken at.
+    pub observed_at: u64,
+}
+
+/// AV-113: pluggable oracle price feed. The state machine takes
+/// `&dyn PriceFeed` so callers inject whatever source they trust —
+/// an oracle account's parsed data on-chain, a keeper's signed feed
+/// off-chain, or a deterministic script in tests. Object-safe by
+/// construction (one method, no generics).
+pub trait PriceFeed {
+    /// The latest price observation, or `None` when the oracle is
+    /// dark / the account carries no usable quote. A `None` feed
+    /// fails the gate ([`EscrowError::PriceGateNotSatisfied`]) — a
+    /// missing price is never treated as a passing price.
+    fn quote(&self) -> Option<PriceQuote>;
+}
+
+/// AV-113: deterministic [`PriceFeed`] for tests — a scripted quote
+/// (or a dark oracle via [`StaticPriceFeed::empty`]). Zero clock or
+/// network access; staleness is exercised by choosing `observed_at`
+/// relative to the `now` the test passes in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticPriceFeed {
+    quote: Option<PriceQuote>,
+}
+
+impl StaticPriceFeed {
+    /// A feed that always reports `price` observed at `observed_at`.
+    pub fn new(price: u64, observed_at: u64) -> Self {
+        Self {
+            quote: Some(PriceQuote { price, observed_at }),
+        }
+    }
+
+    /// A dark oracle: every gate evaluation fails with
+    /// [`EscrowError::PriceGateNotSatisfied`].
+    pub fn empty() -> Self {
+        Self { quote: None }
+    }
+}
+
+impl PriceFeed for StaticPriceFeed {
+    fn quote(&self) -> Option<PriceQuote> {
+        self.quote
+    }
+}
+
 impl Escrow {
     /// AV-75: the current schema version of the persisted vault layout
     /// (see `VAULT_FIELDS`). New vaults are born at this version;
@@ -4947,6 +5084,10 @@ impl Escrow {
             // announces one.
             release_cooling_secs: 0,
             release_intent_at: None,
+            // AV-113: no oracle price gate by default (backward
+            // compatible) — `release` / `claim` are ungated until the
+            // initializer opts in via `with_price_gate` before funding.
+            price_gate: None,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -5303,6 +5444,136 @@ impl Escrow {
             return Err(EscrowError::ReleaseCoolingNotElapsed);
         }
         Ok(())
+    }
+
+    /// Attach an oracle price gate (AV-113, Solana/DeFi conditional
+    /// settlement). Builder-style: only valid on an `Uninitialized`
+    /// escrow, so the market condition is fixed before any funds move
+    /// — mirroring [`Escrow::with_vesting`] and the other `with_*`
+    /// opt-ins. `target == 0` is [`EscrowError::InvalidPriceGate`]: a
+    /// zero threshold can never be a deliberate policy.
+    ///
+    /// Once attached, the plain [`Escrow::release`] / [`Escrow::claim`]
+    /// stay ungated (backward compatible — existing callers and the
+    /// CPI router are untouched); the price condition is enforced by
+    /// [`Escrow::release_price_gated`] /
+    /// [`Escrow::claim_price_gated`], which the Anchor program routes
+    /// to when a gate is configured (the oracle account feeds the
+    /// quote; the program passes it through).
+    ///
+    /// The [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits no
+    /// indexer event for the configuration itself (pre-fund
+    /// configuration, like the other `with_*` / `initialize_*`
+    /// opt-ins).
+    pub fn with_price_gate(mut self, gate: PriceGate) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if gate.target == 0 {
+            return Err(EscrowError::InvalidPriceGate);
+        }
+        self.price_gate = Some(gate);
+        Ok(self)
+    }
+
+    /// The oracle price gate configured via
+    /// [`Escrow::with_price_gate`]; `None` when none is configured
+    /// (backward compatible).
+    pub fn price_gate(&self) -> Option<PriceGate> {
+        self.price_gate
+    }
+
+    /// Evaluate the AV-113 price gate against `feed` at `now`. No gate
+    /// configured → `Ok(())` (backward compatible). Otherwise the feed
+    /// must yield a quote, the quote must be fresh
+    /// (`now - observed_at <= max_staleness_secs`, saturating so a
+    /// future-dated quote from a skewed clock reads as fresh rather
+    /// than underflowing), and the price must satisfy the gate's
+    /// direction condition — any failure is
+    /// [`EscrowError::PriceGateNotSatisfied`]. One code for all three
+    /// failure modes: the caller learns the gate blocked the payout,
+    /// never which sub-condition tripped (an oracle's darkness is not
+    /// market data worth distinguishing on the wire).
+    pub fn require_price_gate(&self, feed: &dyn PriceFeed, now: u64) -> Result<(), EscrowError> {
+        let gate = match self.price_gate {
+            Some(gate) => gate,
+            None => return Ok(()),
+        };
+        let quote = feed.quote().ok_or(EscrowError::PriceGateNotSatisfied)?;
+        if now.saturating_sub(quote.observed_at) > gate.max_staleness_secs {
+            return Err(EscrowError::PriceGateNotSatisfied);
+        }
+        let satisfied = match gate.direction {
+            PriceDirection::AtOrAbove => quote.price >= gate.target,
+            PriceDirection::AtOrBelow => quote.price <= gate.target,
+        };
+        if !satisfied {
+            return Err(EscrowError::PriceGateNotSatisfied);
+        }
+        Ok(())
+    }
+
+    /// Release `amount` to the taker through the AV-113 oracle price
+    /// gate (mirrors [`Escrow::release`]). The price gate is evaluated
+    /// *first*, before [`Escrow::release`]'s own guard chain — the
+    /// oracle quote is the most failure-prone external input (a dark
+    /// or censored feed is the common failure), so a stale/missing
+    /// quote fails fast without touching escrow state. This ordering
+    /// is deliberate and safe against the usual
+    /// authority-first convention: the gate's *existence* is already
+    /// public in the vault account bytes (any observer reads the
+    /// `price_gate` region), so a pre-authority
+    /// [`EscrowError::PriceGateNotSatisfied`] leaks nothing an
+    /// unauthorized caller could not already see. Once the gate
+    /// passes, the full `release` check order applies unchanged:
+    /// pause → authority → state → mint → payout destination →
+    /// milestone/subscription/payout-split ownership → quorum →
+    /// timelock → cooling → amount math.
+    ///
+    /// With no gate configured this is exactly `release` (the
+    /// `require_price_gate` no-op) — the Anchor program routes here
+    /// only when `price_gate` is `Some`, so ungated escrows never pay
+    /// for the indirection.
+    ///
+    /// The [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits
+    /// [`EscrowEventKind::Released`](crate::EscrowEventKind::Released)
+    /// exactly like a plain release — the gate is a check, not a
+    /// lifecycle move (mirroring the AV-27 timelock, which likewise
+    /// added no event kind).
+    pub fn release_price_gated(
+        &mut self,
+        authority: [u8; 32],
+        now: u64,
+        amount: u64,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+        feed: &dyn PriceFeed,
+    ) -> Result<(u64, u64), EscrowError> {
+        self.require_price_gate(feed, now)?;
+        self.release(authority, now, amount, mint, payout_to)
+    }
+
+    /// Claim the vested amount through the AV-113 oracle price gate
+    /// (mirrors [`Escrow::claim`]). Same gate-first ordering and
+    /// rationale as [`Escrow::release_price_gated`]: the oracle input
+    /// is validated before the `claim` guard chain (pause → authority
+    /// → state → funding → milestones → mint → payout destination →
+    /// vesting/auction pricing → quorum → timelock → amount math).
+    ///
+    /// The [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits
+    /// [`EscrowEventKind::Claimed`](crate::EscrowEventKind::Claimed)
+    /// exactly like a plain claim.
+    pub fn claim_price_gated(
+        &mut self,
+        authority: [u8; 32],
+        now: u64,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+        feed: &dyn PriceFeed,
+    ) -> Result<(u64, u64), EscrowError> {
+        self.require_price_gate(feed, now)?;
+        self.claim(authority, now, mint, payout_to)
     }
 
     /// Announce a release intent (AV-112): either party records that a
@@ -13854,6 +14125,14 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // earlier offset stays stable.
     ("release_cooling_secs", "u64", 8),
     ("release_intent_at", "Option<u64>", 9),
+    // AV-113: the oracle price-gate tail — the `Option<PriceGate>`
+    // region (1-byte discriminant + 1-byte direction + 8-byte target
+    // + 8-byte staleness bound; `None` → discriminant 0 + zeroed
+    // payload). The region is always reserved (zeroed when `None`) so
+    // `with_price_gate` writes in place — same treatment as `arbiter`
+    // / `mint` / `reference`. Appended last so every earlier field
+    // offset stays stable.
+    ("price_gate", "Option<PriceGate>", PRICE_GATE_LEN),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -13985,7 +14264,7 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// when no cooling is configured) plus the `Option<u64>` intent
 /// timestamp (9 bytes, `None` when no intent is live).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + 321 + 49 + 8 + 8 + 11 + 8 + 9;
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + 321 + 49 + 8 + 8 + 11 + 8 + 9 + PRICE_GATE_LEN;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -14539,7 +14818,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 36_533_040, "from {state:?}");
+            assert_eq!(rent, 36_658_320, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -14637,9 +14916,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 36_533_040 by
+        // VAULT_SPACE — pinned at 36_658_320 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 36_533_040);
+        assert_eq!(rent, 36_658_320);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -14800,8 +15079,8 @@ mod tests {
         // then the account is closed. VAULT_SPACE stays 2941 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 5121, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 36_533_040);
+        assert_eq!(VAULT_SPACE, 5139, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 36_658_320);
     }
 
     #[test]
@@ -14820,7 +15099,7 @@ mod tests {
         // 595 (arbiter panel), and AV-68 by 41 (evidence-disclosure
         // deadline + escalating party), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 5121, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 5139, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -18263,6 +18542,34 @@ pub(crate) mod anchor_idl_tests {
             method: "Escrow::veto_release",
             input_mapping: "no params; caller <- accounts.authority (signer) — the initializer or the taker (party power — a stranger or an AV-104 operator is Unauthorized); a paused escrow fails fast (Paused); Funded only (InvalidStateTransition otherwise); clears release_intent_at and resets the AV-109 deadman activity clock; no live intent is a no-op success (nothing cleared, nothing emitted); after a veto, release is ReleaseCoolingNotElapsed (code 174) again until a fresh announce_release restarts the window; emits the ReleaseIntentVetoed indexer event (from == to == the current state) when an intent was actually cleared; `now`/`at` <- clock sysvar on the Anchor layer (never instruction params)",
         },
+        InstructionSpec {
+            // AV-113: the oracle price-gate opt-in. IDL:
+            // discriminator = sha256("global:initialize_price_gate")[..8] =
+            // [0x25, 0x64, 0x84, 0x26, 0x9b, 0x61, 0x45, 0x15] — the
+            // Anchor instruction discriminator for the
+            // initialize_price_gate handler (pinned by the
+            // discriminator test below).
+            name: "initialize_price_gate",
+            params: &[
+                (
+                    "direction",
+                    "u8",
+                    "instruction param; 0 = price must sit at or above target (AtOrAbove), 1 = at or below (AtOrBelow); any other byte is InvalidPriceGate on decode, rejected at the gate",
+                ),
+                (
+                    "target",
+                    "u64",
+                    "instruction param; the threshold price in the oracle's quote units — must be > 0 (InvalidPriceGate, code 176, otherwise)",
+                ),
+                (
+                    "max_staleness_secs",
+                    "u64",
+                    "instruction param; maximum quote age in seconds — a quote with now - observed_at beyond this is stale and fails the gate (PriceGateNotSatisfied, code 175)",
+                ),
+            ],
+            method: "Escrow::with_price_gate",
+            input_mapping: "direction/target/max_staleness_secs <- params; authority <- accounts.initializer (signer) — the initializer owns the release governance; Uninitialized only (InvalidStateTransition once funded — the market condition is fixed before any funds move; builder-style like the other initialize_* opt-ins, overwriting is allowed while Uninitialized); target == 0 is InvalidPriceGate (code 176); a paused escrow fails fast (Paused); writes the price_gate tail region in place (see PARAM_FIELD_MAP); no indexer event (pre-fund configuration). The gate itself is enforced by release_price_gated / claim_price_gated: the Anchor release/claim handlers route to the gated entry points when price_gate is Some, feeding the oracle account's quote through",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -18475,6 +18782,9 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::with_release_cooling",
             "Escrow::announce_release",
             "Escrow::veto_release",
+            // AV-113: the oracle price-gate opt-in builder
+            // (Uninitialized only).
+            "Escrow::with_price_gate",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -18612,6 +18922,10 @@ pub(crate) mod anchor_idl_tests {
                 // window (u64); announce/veto carry no params (the
                 // intent timestamp comes from the clock sysvar).
                 &"initialize_release_cooling",
+                // AV-113: the price-gate opt-in carries the direction
+                // (u8), the target price (u64) and the staleness bound
+                // (u64).
+                &"initialize_price_gate",
             ]
         );
     }
@@ -20513,6 +20827,12 @@ pub(crate) mod anchor_idl_tests {
         // clock sysvar (never an instruction param — see
         // FIELD_SOURCES).
         ("initialize_release_cooling", "cooling_secs", "release_cooling_secs"),
+        // AV-113: the price-gate opt-in writes the `price_gate` tail
+        // region in place (Uninitialized only): all three params land
+        // in the one region.
+        ("initialize_price_gate", "direction", "price_gate"),
+        ("initialize_price_gate", "target", "price_gate"),
+        ("initialize_price_gate", "max_staleness_secs", "price_gate"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -21353,6 +21673,16 @@ mod error_code_tests {
             EscrowError::ReleaseCoolingNotElapsed,
             174,
             "release before the release-cooling window elapses: no intent announced, or now < intent_at + cooling_secs (AV-112)",
+        ),
+        (
+            EscrowError::PriceGateNotSatisfied,
+            175,
+            "gated release/claim blocked: no oracle quote, a stale quote (now - observed_at > max_staleness_secs), or the price missed the gate's direction condition (AV-113)",
+        ),
+        (
+            EscrowError::InvalidPriceGate,
+            176,
+            "with_price_gate with target == 0, or an out-of-range direction byte on decode (AV-113)",
         ),
     ];
 
@@ -23404,6 +23734,23 @@ mod account_space_tests {
                 out.extend_from_slice(&at.to_le_bytes());
             }
         }
+        // AV-113: the oracle price-gate tail — the `Option<PriceGate>`
+        // region (1-byte discriminant + 1-byte direction + 8-byte
+        // target + 8-byte staleness bound; `None` → discriminant 0 +
+        // zeroed payload, mirroring the other reserved `Option`
+        // regions above).
+        match e.price_gate {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; PRICE_GATE_LEN - 1]);
+            }
+            Some(gate) => {
+                out.push(1);
+                out.push(gate.direction as u8);
+                out.extend_from_slice(&gate.target.to_le_bytes());
+                out.extend_from_slice(&gate.max_staleness_secs.to_le_bytes());
+            }
+        }
         out
     }
 
@@ -23500,9 +23847,9 @@ mod account_space_tests {
         assert_eq!(FUNDING_TAIL_LEN, 19);
         assert_eq!(RELEASE_COOLING_TAIL_LEN, 8 + 1 + 8, "release-cooling tail bytes");
         assert_eq!(RELEASE_COOLING_TAIL_LEN, 17);
-        assert_eq!(ESCROW_BODY_LEN, 5113, "escrow payload bytes");
+        assert_eq!(ESCROW_BODY_LEN, 5131, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 5121, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 5139, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -23606,13 +23953,14 @@ mod account_space_tests {
         // region (AV-111, zeroed/`None` when no plan is attached) +
         // 8-byte release-cooling window + 9-byte Option<u64> intent
         // timestamp (AV-112, zeroed/`None` when no cooling is
-        // configured).
+        // configured) + 18-byte Option<PriceGate> region (AV-113,
+        // zeroed/`None` when no gate is configured).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + 321 + 49 + 8 + 8 + 11 + 8 + 9,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + 321 + 49 + 8 + 8 + 11 + 8 + 9 + 18,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4631);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4649);
     }
 
     #[test]
@@ -24022,16 +24370,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5121) * 3480 * 2 = 5249 * 6960 = 36_533_040 lamports.
-        assert_eq!(full, 36_533_040);
+        // (128 + 5139) * 3480 * 2 = 5267 * 6960 = 36_658_320 lamports.
+        assert_eq!(full, 36_658_320);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4631) * 3480 * 2 = 4759 * 6960 = 33_122_640 lamports.
-        assert_eq!(no_quorum, 33_122_640);
+        // (128 + 4649) * 3480 * 2 = 4777 * 6960 = 33_247_920 lamports.
+        assert_eq!(no_quorum, 33_247_920);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -24075,12 +24423,12 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(36_533_040, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(36_658_320, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(36_345_119, params.0, params.1),
             Err(RentShortfall {
-                required: 36_533_040,
+                required: 36_658_320,
                 provided: 36_345_119,
             })
         );
@@ -24093,7 +24441,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 36_533_040,
+                required: 36_658_320,
                 provided: 0,
             })
         );
@@ -24150,7 +24498,7 @@ mod basket_tests {
         let body = encode_escrow(&e);
         assert_eq!(body.len(), ESCROW_BODY_LEN);
         let basket_at =
-            ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN;
+            ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN;
         assert_eq!(body[basket_at], 1, "Some discriminant");
         assert_eq!(body[basket_at + 1], 2, "leg count");
         assert_eq!(&body[basket_at + 2..basket_at + 34], &MINT_A);
@@ -25807,7 +26155,7 @@ mod denylist_tests {
         let e = funded_denied();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let tail = ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN);
+        let tail = ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN);
         assert_eq!(bytes[tail], 1, "Some discriminant");
         assert_eq!(&bytes[tail + 1..tail + 1 + 32], &MALLORY);
         assert_eq!(&bytes[tail + 33..tail + 129], &[0u8; 96]);
@@ -26130,15 +26478,16 @@ mod dutch_auction_tests {
         // Plain escrow: the 19-byte auction region is zeroed. It is no
         // longer the tail itself — the AV-99 transfer-hook region
         // (33 bytes), the AV-100 streaming-fee region (16 bytes), the
-        // AV-103 appeal-bond region (16 bytes) and the AV-104
-        // delegation region (37 bytes) trail it — but every earlier
+        // AV-103 appeal-bond region (16 bytes), the AV-104 delegation
+        // region (37 bytes), the AV-111/AV-112 tails and the AV-113
+        // price-gate tail (18 bytes) trail it — but every earlier
         // offset is stable.
         let mut plain = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
         plain.fund(ALICE, START - 3_600).unwrap();
         let bytes = encode_escrow(&plain);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113);
-        let tail = ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
+        assert_eq!(bytes.len(), 5131);
+        let tail = ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
         assert_eq!(bytes[tail], 0, "auction: None discriminant");
         assert_eq!(
             &bytes[tail + 1..tail + 1 + DUTCH_AUCTION_LEN],
@@ -26194,65 +26543,65 @@ mod dutch_auction_tests {
         // appeal-bond region trails the delegation region, the
         // AV-100 streaming-fee region trails the bond region, the
         // AV-99 hook region trails the auction region.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "insurance_pool");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].2, 1);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "pool_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "insurance_pool");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].2, 1);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "pool_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "pool_slashed");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "pool_slashed");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "pool_inflow");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "pool_inflow");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "pool_payout_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "pool_payout_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].2, 8);
         // AV-107: the interest-bearing tail — 2-byte
         // annual rate in basis points, then the accrual-clock base,
         // the outstanding yield claim, and the cumulative paid
         // counter (26 bytes: INTEREST_REGION_LEN).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "interest_rate_bps");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].2, 2);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "interest_rate_bps");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].2, 2);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 12].0,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 13].0,
             "interest_accrual_base"
         );
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "interest_accrued");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "interest_accrued");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "interest_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "interest_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, 8);
         // AV-108: the payout-split tail (1-byte live split count +
         // eight 32-byte recipient slots + eight 8-byte share slots).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "payout_split");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].2, PAYOUT_SPLIT_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "payout_split");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, PAYOUT_SPLIT_LEN);
         // AV-109: the dead-man's switch tail (8-byte inactivity
         // threshold + 33-byte Option<Pubkey> heir + 8-byte activity
         // clock) sits just before the AV-110 tail.
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 8].0,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 9].0,
             "deadman_inactivity_secs"
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "deadman_heir");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 1 + PUBKEY_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "deadman_heir");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].2, 1 + PUBKEY_LEN);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 6].0,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 7].0,
             "deadman_last_activity"
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 8);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 6].2
-                + VAULT_FIELDS[VAULT_FIELDS.len() - 7].2
-                + VAULT_FIELDS[VAULT_FIELDS.len() - 8].2,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 7].2
+                + VAULT_FIELDS[VAULT_FIELDS.len() - 8].2
+                + VAULT_FIELDS[VAULT_FIELDS.len() - 9].2,
             DEADMAN_REGION_LEN
         );
         // AV-110: the rent top-up counter trails the AV-111 tail —
         // one u64, zeroed when no top-up was ever made.
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 5].0,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 6].0,
             "rent_topped_up_total"
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 8);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 5].2,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 6].2,
             RENT_TOP_UP_LEN
         );
         // AV-111: the tranched-funding tail — the 8-byte cumulative
@@ -26261,46 +26610,53 @@ mod dutch_auction_tests {
         // total_amount u64 + max_tranches u8 + tranches_used u8).
         // The AV-112 release-cooling tail is the new absolute tail
         // after it.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "funded_total");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "funding_plan");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "funded_total");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "funding_plan");
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 3].1,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 4].1,
             "Option<FundingPlan>"
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, FUNDING_PLAN_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, FUNDING_PLAN_LEN);
         // AV-112: the release-cooling tail is the absolute tail — the
         // 8-byte cooling window (0 = unconfigured), then the
         // `Option<u64>` intent timestamp (1-byte discriminant +
         // 8-byte stamp, `None` when no intent is live).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "release_cooling_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].0, "release_intent_at");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].1, "Option<u64>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].2, 9);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "swap_link");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "release_cooling_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "release_intent_at");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].1, "Option<u64>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 9);
+        // AV-113: the oracle price-gate tail is the absolute tail —
+        // the `Option<PriceGate>` region (1-byte discriminant +
+        // 1-byte direction + 8-byte target + 8-byte staleness bound).
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].0, "price_gate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].1, "Option<PriceGate>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].2, PRICE_GATE_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 1].2, 18);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].0, "swap_link");
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 19].2,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 20].2,
             SWAP_LINK_REGION_LEN
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].0, "delegation");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].2, DELEGATION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].0, "appeal_bond_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].0, "appeal_bond");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].0, "delegation");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].2, DELEGATION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].0, "appeal_bond_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].0, "streaming_fees_accrued");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].0, "appeal_bond");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 24].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 24].0, "streaming_fees_accrued");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 24].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].0, "transfer_hook");
-        assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 25].2,
-            TRANSFER_HOOK_REGION_LEN
-        );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 26].0, "auction");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 26].0, "transfer_hook");
         assert_eq!(
             VAULT_FIELDS[VAULT_FIELDS.len() - 26].2,
+            TRANSFER_HOOK_REGION_LEN
+        );
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 27].0, "auction");
+        assert_eq!(
+            VAULT_FIELDS[VAULT_FIELDS.len() - 27].2,
             1 + DUTCH_AUCTION_LEN
         );
     }
@@ -26311,7 +26667,7 @@ mod dutch_auction_tests {
         let mut account = vec![0u8; 8 + ESCROW_BODY_LEN];
         account[..8].copy_from_slice(&vault_account_discriminator());
         account[8..].copy_from_slice(&encode_escrow(&e));
-        let tail = 8 + ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
+        let tail = 8 + ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
         // Zero-length window: start_at == end_at would divide by zero
         // in `payout_cap`.
         account[tail + 1..tail + 9].copy_from_slice(&END.to_le_bytes());
@@ -26811,7 +27167,7 @@ mod payout_split_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         // The split region now sits just before the AV-109 deadman
         // tail: count, 8 recipients, 8 amounts.
-        let split_start = ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN;
+        let split_start = ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN;
         let tail = &bytes[split_start..split_start + PAYOUT_SPLIT_LEN];
         assert_eq!(tail[0], 2, "split_count");
         assert_eq!(&tail[1..33], &R1, "recipient slot 0");
@@ -26831,7 +27187,7 @@ mod payout_split_tests {
         // but `fund` anchored the activity clock (the clock resets on
         // every now-transition whether or not the switch is
         // configured).
-        let ptail = &plain[ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
+        let ptail = &plain[ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
         assert_eq!(&ptail[..8], &[0u8; 8], "threshold zeroed");
         assert_eq!(ptail[8], 0, "heir discriminant");
         assert_eq!(&ptail[9..41], &[0u8; 32], "heir zeroed");
@@ -27159,7 +27515,7 @@ mod deadman_tests {
         // The deadman tail is the 49 bytes before the AV-110 rent
         // top-up tail: threshold, heir discriminant + key, activity
         // clock.
-        let tail = &bytes[ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
+        let tail = &bytes[ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
         assert_eq!(&tail[..8], &INACTIVITY.to_le_bytes(), "threshold");
         assert_eq!(tail[8], 1, "heir discriminant");
         assert_eq!(&tail[9..41], &HEIR_KEY, "heir");
@@ -27189,7 +27545,7 @@ mod deadman_tests {
         // clock (the clock resets on every now-transition whether or
         // not the switch is configured).
         let plain = encode_escrow(&funded_plain());
-        let ptail = &plain[ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
+        let ptail = &plain[ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
         assert_eq!(&ptail[..8], &[0u8; 8], "threshold zeroed");
         assert_eq!(ptail[8], 0, "heir discriminant");
         assert_eq!(&ptail[9..41], &[0u8; 32], "heir zeroed");
@@ -27204,14 +27560,18 @@ mod deadman_tests {
         // classic single-shot funding, no plan attached).
         assert_eq!(&ptail[57..65], &AMOUNT.to_le_bytes(), "funded total");
         assert_eq!(ptail[65], 0, "funding plan None discriminant");
-        // AV-112: the release-cooling tail rides last — zeroed when
-        // no cooling is configured.
+        // AV-112: the release-cooling tail — zeroed when no cooling
+        // is configured (the AV-113 price-gate tail rides last now).
         assert_eq!(&ptail[76..84], &[0u8; 8], "cooling window zeroed");
         assert_eq!(ptail[84], 0, "intent None discriminant");
         assert_eq!(&ptail[85..93], &[0u8; 8], "intent timestamp zeroed");
         assert_eq!(
             ptail.len(),
-            DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN
+            DEADMAN_REGION_LEN
+                + RENT_TOP_UP_LEN
+                + FUNDING_TAIL_LEN
+                + RELEASE_COOLING_TAIL_LEN
+                + PRICE_GATE_LEN
         );
     }
 
@@ -27351,7 +27711,7 @@ mod topup_rent_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         // The counter rides 8 bytes before the AV-111 funding tail at
         // the end of the body.
-        let tail = &bytes[ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN..];
+        let tail = &bytes[ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN..];
         assert_eq!(&tail[..8], &123_456u64.to_le_bytes());
         let mut account = vec![0u8; 8 + ESCROW_BODY_LEN];
         account[..8].copy_from_slice(&crate::discriminator::vault_account_discriminator());
@@ -27690,7 +28050,7 @@ mod funding_tranche_tests {
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         // funded_total at 57..65, plan discriminant at 65, payload at 66..76.
-        let tail = &bytes[ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
+        let tail = &bytes[ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
         assert_eq!(&tail[57..65], &400_000u64.to_le_bytes());
         assert_eq!(tail[65], 1, "funding plan Some discriminant");
         assert_eq!(&tail[66..74], &AMOUNT.to_le_bytes(), "total_amount");
@@ -28158,14 +28518,15 @@ mod release_cooling_tests {
 
     #[test]
     fn cooling_tail_serializes_at_the_layout_tail() {
-        // The 17-byte AV-112 tail sits after the AV-111 fields: the
-        // 8-byte window, then the Option<u64> intent timestamp.
+        // The 17-byte AV-112 tail sits after the AV-111 fields and
+        // before the AV-113 price-gate tail: the 8-byte window, then
+        // the Option<u64> intent timestamp.
         let mut e = funded_cooling_escrow();
         e.announce_release(ALICE, T0).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113);
-        let tail_at = ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN;
+        assert_eq!(bytes.len(), 5131);
+        let tail_at = ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN;
         assert_eq!(RELEASE_COOLING_TAIL_LEN, 17);
         assert_eq!(
             &bytes[tail_at..tail_at + 8],
@@ -28192,9 +28553,11 @@ mod release_cooling_tests {
         let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
         e.fund(ALICE, T0).unwrap();
         let bytes = encode_escrow(&e);
-        assert_eq!(bytes.len(), 5113);
+        assert_eq!(bytes.len(), 5131);
+        // The cooling tail now sits before the AV-113 price-gate tail.
+        let cooling_at = ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN;
         assert_eq!(
-            &bytes[ESCROW_BODY_LEN - 17..],
+            &bytes[cooling_at..cooling_at + RELEASE_COOLING_TAIL_LEN],
             &[0u8; 17],
             "unconfigured cooling tail is zeroed"
         );
@@ -28218,6 +28581,408 @@ mod release_cooling_tests {
             "{json}"
         );
         assert!(json.contains("\"release_cooling_eligible\":true"), "{json}");
+    }
+}
+
+// ---------- AV-113: oracle price-gated release ----------
+//
+// `with_price_gate` attaches a market condition to the taker-payout
+// paths (DeFi conditional settlement): `release_price_gated` /
+// `claim_price_gated` require a fresh oracle quote on the configured
+// side of the target. The gate is evaluated *before* `release` /
+// `claim`'s own guard chains — the oracle input is the most
+// failure-prone external dependency, so a dark or stale feed fails
+// fast; the gate's existence is public in the vault account bytes,
+// so the pre-authority check leaks nothing. Plain `release` /
+// `claim` stay ungated (backward compatible).
+#[cfg(test)]
+mod price_gate_tests {
+    use super::*;
+
+    fn with_discriminator(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ANCHOR_DISCRIMINATOR_LEN + body.len());
+        out.extend_from_slice(&crate::discriminator::vault_account_discriminator());
+        out.extend_from_slice(body);
+        out
+    }
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const AMOUNT: u64 = 1_000_000;
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+
+    fn floor_gate() -> PriceGate {
+        PriceGate {
+            direction: PriceDirection::AtOrAbove,
+            target: 100_000,
+            max_staleness_secs: 300,
+        }
+    }
+
+    fn ceiling_gate() -> PriceGate {
+        PriceGate {
+            direction: PriceDirection::AtOrBelow,
+            target: 50_000,
+            max_staleness_secs: 300,
+        }
+    }
+
+    fn gated_escrow(gate: PriceGate) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_price_gate(gate)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn with_price_gate_only_on_uninitialized() {
+        let e = gated_escrow(floor_gate());
+        assert_eq!(
+            e.with_price_gate(floor_gate()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // The configured gate survives the rejected reconfiguration.
+        assert_eq!(e.price_gate(), Some(floor_gate()));
+    }
+
+    #[test]
+    fn with_price_gate_rejects_zero_target() {
+        let e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        assert_eq!(
+            e.with_price_gate(PriceGate {
+                direction: PriceDirection::AtOrAbove,
+                target: 0,
+                max_staleness_secs: 300,
+            }),
+            Err(EscrowError::InvalidPriceGate)
+        );
+        assert_eq!(
+            EscrowError::InvalidPriceGate.code(),
+            176,
+            "error code never renumbers"
+        );
+        assert_eq!(e.price_gate(), None);
+    }
+
+    #[test]
+    fn price_direction_discriminants_are_pinned() {
+        // Pinned to declaration order — the vault bytes carry the raw
+        // byte, so reordering would corrupt stored gates.
+        assert_eq!(PriceDirection::AtOrAbove as u8, 0);
+        assert_eq!(PriceDirection::AtOrBelow as u8, 1);
+        assert_eq!(PRICE_GATE_LEN, 18, "1 + 1 + 8 + 8");
+    }
+
+    #[test]
+    fn gate_failure_code_is_pinned() {
+        assert_eq!(
+            EscrowError::PriceGateNotSatisfied.code(),
+            175,
+            "error code never renumbers"
+        );
+    }
+
+    #[test]
+    fn ungated_escrow_ignores_a_dark_oracle() {
+        // No gate configured: the gated wrappers delegate straight to
+        // `release` / `claim` — even a dark oracle cannot block.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(e.price_gate(), None);
+        let dark = StaticPriceFeed::empty();
+        let (payout, fee) = e
+            .release_price_gated(ALICE, T0, AMOUNT, None, BOB, &dark)
+            .unwrap();
+        assert_eq!((payout, fee), (AMOUNT, 0));
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn gated_release_passes_above_target() {
+        let mut e = gated_escrow(floor_gate());
+        let feed = StaticPriceFeed::new(120_000, T0);
+        let (payout, fee) = e
+            .release_price_gated(ALICE, T0, AMOUNT, None, BOB, &feed)
+            .unwrap();
+        assert_eq!((payout, fee), (AMOUNT, 0));
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn gated_release_passes_at_exact_target() {
+        // Boundary is inclusive — mirrors the AV-112 window / AV-21
+        // grace boundary convention.
+        let mut e = gated_escrow(floor_gate());
+        let feed = StaticPriceFeed::new(100_000, T0);
+        e.release_price_gated(ALICE, T0, AMOUNT, None, BOB, &feed)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn gated_release_fails_below_target_and_touches_nothing() {
+        let mut e = gated_escrow(floor_gate());
+        let feed = StaticPriceFeed::new(99_999, T0);
+        assert_eq!(
+            e.release_price_gated(ALICE, T0, AMOUNT, None, BOB, &feed),
+            Err(EscrowError::PriceGateNotSatisfied)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn ceiling_direction_passes_below_and_fails_above() {
+        let mut e = gated_escrow(ceiling_gate());
+        let cheap = StaticPriceFeed::new(49_999, T0);
+        e.release_price_gated(ALICE, T0, AMOUNT, None, BOB, &cheap)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+
+        let mut e = gated_escrow(ceiling_gate());
+        let expensive = StaticPriceFeed::new(50_001, T0);
+        assert_eq!(
+            e.release_price_gated(ALICE, T0, AMOUNT, None, BOB, &expensive),
+            Err(EscrowError::PriceGateNotSatisfied)
+        );
+    }
+
+    #[test]
+    fn dark_oracle_fails_the_gate() {
+        // A missing quote is never treated as a passing price.
+        let mut e = gated_escrow(floor_gate());
+        let dark = StaticPriceFeed::empty();
+        assert_eq!(
+            e.release_price_gated(ALICE, T0, AMOUNT, None, BOB, &dark),
+            Err(EscrowError::PriceGateNotSatisfied)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn stale_quote_fails_the_gate() {
+        let mut e = gated_escrow(floor_gate());
+        // Observed 301s ago; the bound is 300s.
+        let stale = StaticPriceFeed::new(200_000, T0 - 301);
+        assert_eq!(
+            e.release_price_gated(ALICE, T0, AMOUNT, None, BOB, &stale),
+            Err(EscrowError::PriceGateNotSatisfied)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn staleness_boundary_is_inclusive() {
+        // Exactly at the bound still counts as fresh.
+        let mut e = gated_escrow(floor_gate());
+        let edge = StaticPriceFeed::new(200_000, T0 - 300);
+        e.release_price_gated(ALICE, T0, AMOUNT, None, BOB, &edge)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn future_dated_quote_reads_as_fresh_not_underflow() {
+        // A skewed oracle clock dating the quote in the future must
+        // not underflow the staleness subtraction — saturating math
+        // reads it as age 0.
+        let mut e = gated_escrow(floor_gate());
+        let future = StaticPriceFeed::new(200_000, T0 + 60);
+        e.release_price_gated(ALICE, T0, AMOUNT, None, BOB, &future)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn gate_is_evaluated_before_authority() {
+        // Documented check order: the oracle input is validated before
+        // the `release` guard chain. A stranger probing with a dark
+        // oracle learns the gate blocked — never the authority verdict
+        // — and the gate's existence is already public in the vault
+        // account bytes.
+        let mut e = gated_escrow(floor_gate());
+        let dark = StaticPriceFeed::empty();
+        assert_eq!(
+            e.release_price_gated(MALLORY, T0, AMOUNT, None, BOB, &dark),
+            Err(EscrowError::PriceGateNotSatisfied)
+        );
+        // With a passing quote, the stranger is rejected as a
+        // stranger.
+        let feed = StaticPriceFeed::new(200_000, T0);
+        assert_eq!(
+            e.release_price_gated(MALLORY, T0, AMOUNT, None, BOB, &feed),
+            Err(EscrowError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn gate_stacks_after_the_av27_timelock_in_release() {
+        // The gate runs first (wrapper), the timelock second (inside
+        // `release`): a stable, documented order across the two
+        // independent conditions.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_price_gate(floor_gate())
+            .unwrap()
+            .with_timelock(T0 + 1000)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        // Gate fails → the gate reports, even though the timelock
+        // would also block.
+        let bad = StaticPriceFeed::new(1, T0);
+        assert_eq!(
+            e.release_price_gated(ALICE, T0, AMOUNT, None, BOB, &bad),
+            Err(EscrowError::PriceGateNotSatisfied)
+        );
+        // Gate passes → the timelock reports.
+        let good = StaticPriceFeed::new(200_000, T0);
+        assert_eq!(
+            e.release_price_gated(ALICE, T0, AMOUNT, None, BOB, &good),
+            Err(EscrowError::TimelockNotReached)
+        );
+        // Both pass → the release goes through (fresh quote for the
+        // later `now` — the 300s staleness bound applies at each call).
+        let good_later = StaticPriceFeed::new(200_000, T0 + 1000);
+        e.release_price_gated(ALICE, T0 + 1000, AMOUNT, None, BOB, &good_later)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn gated_claim_pulls_vested_amount() {
+        // The taker's pull path is gated the same way.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_price_gate(floor_gate())
+            .unwrap()
+            .with_vesting(VestingSchedule::new(T0, T0 + 1000).unwrap())
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        let at = T0 + 500; // half vested
+        let bad = StaticPriceFeed::new(1, at);
+        assert_eq!(
+            e.claim_price_gated(BOB, at, None, BOB, &bad),
+            Err(EscrowError::PriceGateNotSatisfied)
+        );
+        let good = StaticPriceFeed::new(200_000, at);
+        let (payout, fee) = e.claim_price_gated(BOB, at, None, BOB, &good).unwrap();
+        assert_eq!((payout, fee), (AMOUNT / 2, 0));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn plain_release_stays_ungated_on_a_gated_escrow() {
+        // Backward compatibility by design: the gate only bites on the
+        // gated entry points. (On-chain the program routes to the
+        // gated entry when `price_gate` is `Some`.)
+        let mut e = gated_escrow(floor_gate());
+        let (payout, _) = e.release(ALICE, T0, AMOUNT, None, BOB).unwrap();
+        assert_eq!(payout, AMOUNT);
+    }
+
+    #[test]
+    fn encode_decode_round_trips_the_gate() {
+        use crate::account_space_tests::encode_escrow;
+        let e = gated_escrow(floor_gate());
+        let bytes = encode_escrow(&e);
+        assert_eq!(bytes.len(), ESCROW_BODY_LEN);
+        // The tail region carries the gate: discriminant 1, direction
+        // 0 (AtOrAbove), target, staleness bound.
+        let tail = &bytes[bytes.len() - PRICE_GATE_LEN..];
+        assert_eq!(tail[0], 1);
+        assert_eq!(tail[1], 0);
+        assert_eq!(u64::from_le_bytes(tail[2..10].try_into().unwrap()), 100_000);
+        assert_eq!(u64::from_le_bytes(tail[10..18].try_into().unwrap()), 300);
+        // Decode round-trips through the panic-free account decoder.
+        let d = decode_vault_account(&with_discriminator(&bytes)).expect("decodes");
+        assert_eq!(d.price_gate(), Some(floor_gate()));
+        assert_eq!(d, e);
+    }
+
+    #[test]
+    fn encode_decode_round_trips_absent_gate_as_zeroed() {
+        use crate::account_space_tests::encode_escrow;
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        let bytes = encode_escrow(&e);
+        assert_eq!(&bytes[bytes.len() - PRICE_GATE_LEN..], &[0u8; PRICE_GATE_LEN]);
+        let d = decode_vault_account(&with_discriminator(&bytes)).expect("decodes");
+        assert_eq!(d.price_gate(), None);
+    }
+
+    #[test]
+    fn decode_rejects_an_unknown_direction_byte() {
+        use crate::account_space_tests::encode_escrow;
+        let e = gated_escrow(floor_gate());
+        let bytes = encode_escrow(&e);
+        let mut account = with_discriminator(&bytes);
+        // Corrupt the direction byte (offset 1 inside the tail region).
+        let dir_at = 8 + bytes.len() - PRICE_GATE_LEN + 1;
+        account[dir_at] = 0xFF;
+        assert_eq!(
+            decode_vault_account(&account),
+            Err(AccountDecodeError::InvalidPriceGateDiscriminant(0xFF))
+        );
+    }
+
+    #[test]
+    fn initialize_price_gate_maps_direction_target_staleness_params() {
+        // IDL: initialize_price_gate(direction: u8, target: u64,
+        // max_staleness_secs: u64) — mirrors the InstructionSpec: the
+        // three params populate the price_gate tail region.
+        let direction = PriceDirection::AtOrBelow as u8;
+        let e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_price_gate(PriceGate {
+                direction: if direction == 0 {
+                    PriceDirection::AtOrAbove
+                } else {
+                    PriceDirection::AtOrBelow
+                },
+                target: 50_000,
+                max_staleness_secs: 600,
+            })
+            .unwrap();
+        assert_eq!(
+            e.price_gate(),
+            Some(PriceGate {
+                direction: PriceDirection::AtOrBelow,
+                target: 50_000,
+                max_staleness_secs: 600,
+            })
+        );
+        // Documented failure mode: zero target.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+                .unwrap()
+                .with_price_gate(PriceGate {
+                    direction: PriceDirection::AtOrAbove,
+                    target: 0,
+                    max_staleness_secs: 600,
+                }),
+            Err(EscrowError::InvalidPriceGate)
+        );
+    }
+
+    #[test]
+    fn initialize_price_gate_discriminator_is_pinned() {
+        // IDL: sha256("global:initialize_price_gate")[..8] — the Anchor
+        // instruction discriminator, pinned here and in the generated
+        // escrow_vault.json.
+        assert_eq!(
+            crate::discriminator::instruction_discriminator("initialize_price_gate"),
+            [0x25, 0x64, 0x84, 0x26, 0x9b, 0x61, 0x45, 0x15]
+        );
+        // And the INSTRUCTIONS table carries the spec.
+        let names: Vec<&&str> = crate::anchor_idl_tests::INSTRUCTIONS
+            .iter()
+            .map(|s| &s.name)
+            .collect();
+        assert!(names.contains(&&"initialize_price_gate"));
     }
 }
 
@@ -29206,7 +29971,7 @@ mod vesting_curve_tests {
         // the AV-96 denylist (130 bytes) plus the AV-97 auction
         // region (19 bytes) trail everything: discriminant 1,
         // tier-count 2, then the two live tiers.
-        let base = ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42 - (1 + VESTING_CURVE_LEN);
+        let base = ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42 - (1 + VESTING_CURVE_LEN);
         assert_eq!(bytes[base], 1, "curve: Some discriminant");
         assert_eq!(bytes[base + 1], 2, "curve: tier count");
         assert_eq!(
@@ -31475,7 +32240,7 @@ mod migrate_schema_tests {
         // region, the slash region and the CPI allowlist trail it);
         // every earlier offset stays stable, and the carry-over is
         // still a byte-prefix copy.
-        let version_at = ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        let version_at = ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         let e = v0_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
@@ -32441,7 +33206,7 @@ mod evidence_merkle_tests {
         // AV-97 auction region (19 bytes) are appended after it now:
         // 1-byte discriminant + 32-byte root, then the leaf-count
         // byte, then the u64-LE disclosure bitmap with bit 0 set.
-        let base = ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42;
+        let base = ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42;
         assert_eq!(bytes[base], 1, "evidence_root: Some discriminant");
         assert_eq!(&bytes[base + 1..base + 33], &root, "evidence_root bytes");
         assert_eq!(bytes[base + 33], 2, "evidence_leaves");
@@ -33070,7 +33835,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) + 37 (AV-104 authority delegation) + 33 (AV-105 atomic swap link) + 33 (AV-106 penalty insurance pool) + 26 (AV-107 interest-bearing tail) + 321 (AV-108 payout split) + 49 (AV-109 dead-man's switch) + 8 (AV-110 rent top-up counter) + 19 (AV-111 tranched-funding tail) + 17 (AV-112 release-cooling tail) bytes");
+        assert_eq!(bytes.len(), 5131, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) + 37 (AV-104 authority delegation) + 33 (AV-105 atomic swap link) + 33 (AV-106 penalty insurance pool) + 26 (AV-107 interest-bearing tail) + 321 (AV-108 payout split) + 49 (AV-109 dead-man's switch) + 8 (AV-110 rent top-up counter) + 19 (AV-111 tranched-funding tail) + 17 (AV-112 release-cooling tail) + 18 (AV-113 oracle price-gate tail) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -33095,7 +33860,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 5113);
+        assert_eq!(bytes.len(), 5131);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -33117,18 +33882,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5121) * 3480 * 2 = 5249 * 6960 = 36_533_040 lamports.
-        assert_eq!(VAULT_SPACE, 5121);
-        assert_eq!(full, 36_533_040);
+        // (128 + 5139) * 3480 * 2 = 5267 * 6960 = 36_658_320 lamports.
+        assert_eq!(VAULT_SPACE, 5139);
+        assert_eq!(full, 36_658_320);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4631) * 3480 * 2 = 4759 * 6960 = 33_122_640 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4631);
-        assert_eq!(no_quorum, 33_122_640);
+        // (128 + 4649) * 3480 * 2 = 4777 * 6960 = 33_247_920 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4649);
+        assert_eq!(no_quorum, 33_247_920);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -33272,7 +34037,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113);
+        assert_eq!(bytes.len(), 5131);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -33287,7 +34052,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 5113);
+        assert_eq!(bytes.len(), 5131);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -33318,18 +34083,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5121) * 3480 * 2 = 5249 * 6960 = 36_533_040 lamports.
-        assert_eq!(VAULT_SPACE, 5121);
-        assert_eq!(full, 36_533_040);
+        // (128 + 5139) * 3480 * 2 = 5267 * 6960 = 36_658_320 lamports.
+        assert_eq!(VAULT_SPACE, 5139);
+        assert_eq!(full, 36_658_320);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4631) * 3480 * 2 = 4759 * 6960 = 33_122_640 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4631);
-        assert_eq!(no_quorum, 33_122_640);
+        // (128 + 4649) * 3480 * 2 = 4777 * 6960 = 33_247_920 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4649);
+        assert_eq!(no_quorum, 33_247_920);
     }
 
     #[test]
@@ -34187,7 +34952,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 5113);
+        assert_eq!(bytes.len(), 5131);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -34362,7 +35127,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 5113, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region, 82 by AV-90 vesting curve, 42 by AV-91 evidence commitment region, 386 by AV-95 basket, 19 by AV-97 auction, 33 by AV-99 transfer hook, 16 by AV-100 streaming fee, 16 by AV-103 appeal bond + 37 by AV-104 authority delegation + 33 by AV-105 atomic swap link + 33 by AV-106 penalty insurance pool + 26 by AV-107 interest-bearing tail + 321 by AV-108 payout split + 49 by AV-109 deadman tail + 8 by AV-110 rent top-up counter + 19 by AV-111 tranched-funding tail + 17 by AV-112 release-cooling tail");
+        assert_eq!(ESCROW_BODY_LEN, 5131, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region, 82 by AV-90 vesting curve, 42 by AV-91 evidence commitment region, 386 by AV-95 basket, 19 by AV-97 auction, 33 by AV-99 transfer hook, 16 by AV-100 streaming fee, 16 by AV-103 appeal bond + 37 by AV-104 authority delegation + 33 by AV-105 atomic swap link + 33 by AV-106 penalty insurance pool + 26 by AV-107 interest-bearing tail + 321 by AV-108 payout split + 49 by AV-109 deadman tail + 8 by AV-110 rent top-up counter + 19 by AV-111 tranched-funding tail + 17 by AV-112 release-cooling tail + 18 by AV-113 oracle price-gate tail");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -34380,23 +35145,23 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 5121) * 3480 * 2 = 5249 * 6960 = 36_533_040 lamports.
+        // (128 + 5139) * 3480 * 2 = 5267 * 6960 = 36_658_320 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            36_533_040
+            36_658_320
         );
-        // (128 + 4631) * 3480 * 2 = 4759 * 6960 = 33_122_640 lamports.
+        // (128 + 4649) * 3480 * 2 = 4777 * 6960 = 33_247_920 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            33_122_640
+            33_247_920
         );
         // 1958 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
@@ -34404,9 +35169,9 @@ mod decimals_tests {
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring +
         // AV-104 authority delegation + AV-105 atomic swap link).
-        assert_eq!(VAULT_SPACE, 5121);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4631);
-        assert!(check_vault_rent_exempt(36_533_040, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 5139);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4649);
+        assert!(check_vault_rent_exempt(36_658_320, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -37237,9 +38002,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) + 37 (AV-104 authority delegation) + 33 (AV-105 atomic swap link) + 33 (AV-106 penalty insurance pool) + 321 (AV-108 payout split) + 49 (AV-109 dead-man's switch) + 8 (AV-110 rent top-up counter) + 19 (AV-111 tranched-funding tail) + 17 (AV-112 release-cooling tail)");
-        assert_eq!(VAULT_SPACE, 5121);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4631);
+        assert_eq!(bytes.len(), 5131, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) + 37 (AV-104 authority delegation) + 33 (AV-105 atomic swap link) + 33 (AV-106 penalty insurance pool) + 321 (AV-108 payout split) + 49 (AV-109 dead-man's switch) + 8 (AV-110 rent top-up counter) + 19 (AV-111 tranched-funding tail) + 17 (AV-112 release-cooling tail) + 18 (AV-113 oracle price-gate tail)");
+        assert_eq!(VAULT_SPACE, 5139);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4649);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -37792,7 +38557,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113);
+        assert_eq!(bytes.len(), 5131);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -38361,7 +39126,7 @@ mod subscription_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113);
+        assert_eq!(bytes.len(), 5131);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -38786,11 +39551,11 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN
         );
     }
 
@@ -38807,7 +39572,7 @@ mod event_history_tests {
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113);
+        assert_eq!(bytes.len(), 5131);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -38835,7 +39600,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103/AV-104/AV-105/AV-106/AV-107/AV-108/AV-109/AV-110/AV-111/AV-112 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103/AV-104/AV-105/AV-106/AV-107/AV-108/AV-109/AV-110/AV-111/AV-112/AV-113 tail");
     }
 
     #[test]
@@ -38850,18 +39615,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5121) * 3480 * 2 = 5249 * 6960 = 36_533_040 lamports.
-        assert_eq!(VAULT_SPACE, 5121);
-        assert_eq!(full, 36_533_040);
+        // (128 + 5139) * 3480 * 2 = 5267 * 6960 = 36_658_320 lamports.
+        assert_eq!(VAULT_SPACE, 5139);
+        assert_eq!(full, 36_658_320);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 4631) * 3480 * 2 = 4759 * 6960 = 33_122_640 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4631);
-        assert_eq!(no_quorum, 33_122_640);
+        // (128 + 4649) * 3480 * 2 = 4777 * 6960 = 33_247_920 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4649);
+        assert_eq!(no_quorum, 33_247_920);
     }
 
     // ----- decode -----
@@ -39571,17 +40336,17 @@ mod fee_cap_tests {
         // authority) + 26 (AV-86 appeal window region) + 82 (AV-90
         // vesting curve) + 42 (AV-91 evidence commitment) + 386
         // (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction).
-        assert_eq!(ESCROW_BODY_LEN, 5113, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 5121, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 4631, "no-quorum Vault account space");
+        assert_eq!(ESCROW_BODY_LEN, 5131, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 5139, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 4649, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            36_533_040,
-            "(128 + 5121) * 3480 * 2 = 5249 * 6960"
+            36_658_320,
+            "(128 + 5139) * 3480 * 2 = 5267 * 6960"
         );
         assert_eq!(
             rent_exempt_minimum_lamports(
@@ -39589,8 +40354,8 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            33_122_640,
-            "(128 + 4631) * 3480 * 2 = 4759 * 6960"
+            33_247_920,
+            "(128 + 4649) * 3480 * 2 = 4777 * 6960"
         );
     }
 
@@ -39602,7 +40367,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113);
+        assert_eq!(bytes.len(), 5131);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -40103,8 +40868,8 @@ mod fee_schedule_tests {
         let e = scheduled_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113);
-        let tail = ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        assert_eq!(bytes.len(), 5131);
+        let tail = ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(bytes[tail], 3, "tier_count at the tail");
         assert_eq!(
             u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
@@ -40144,7 +40909,7 @@ mod fee_schedule_tests {
         // denylist region (130 bytes) and AV-97 the auction region
         // (19 bytes) after the fee schedule, so the schedule no
         // longer sits at the body tail.
-        let tail = ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(
             &bytes[tail..tail + FEE_SCHEDULE_LEN],
             &[0u8; FEE_SCHEDULE_LEN],
@@ -40168,7 +40933,7 @@ mod fee_schedule_tests {
         // denylist region (130 bytes) and AV-97 the auction region
         // (19 bytes) after the fee schedule, so the schedule no
         // longer sits at the body tail.
-        let tail = ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         bytes[tail] = 9;
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
@@ -40501,7 +41266,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113);
+        assert_eq!(bytes.len(), 5131);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -40732,6 +41497,9 @@ mod arbiter_panel_tests {
         assert_eq!(EscrowError::InvalidFundingPlan.code(), 173);
         // AV-112: appended, never renumbered.
         assert_eq!(EscrowError::ReleaseCoolingNotElapsed.code(), 174);
+        // AV-113: appended, never renumbered.
+        assert_eq!(EscrowError::PriceGateNotSatisfied.code(), 175);
+        assert_eq!(EscrowError::InvalidPriceGate.code(), 176);
         // never-renumber: the full table still pins every code, and
         // `all()` covers the new variants (the AV-46 lesson: a missing
         // variant drifts the IDL error pin).
@@ -40770,7 +41538,10 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::InvalidRentTopUp));
         // AV-112: appended, never renumbered.
         assert!(EscrowError::all().contains(&EscrowError::ReleaseCoolingNotElapsed));
-        assert_eq!(EscrowError::all().len(), 75);
+        // AV-113: appended, never renumbered.
+        assert!(EscrowError::all().contains(&EscrowError::PriceGateNotSatisfied));
+        assert!(EscrowError::all().contains(&EscrowError::InvalidPriceGate));
+        assert_eq!(EscrowError::all().len(), 77);
     }
 
     #[test]
@@ -41117,7 +41888,7 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113);
+        assert_eq!(bytes.len(), 5131);
         // AV-91: the evidence-commitment region (33-byte root + 1-byte
         // leaf count + 8-byte disclosure bitmap = 42 bytes) now trails
         // the AV-90 vesting-curve region (82 bytes), which trails the
@@ -41130,7 +41901,7 @@ mod arbiter_panel_tests {
         // trail everything, so the panel region ends 33 + 19 + 130 +
         // 386 + 42 + 82 + 26 + 68 + 258 + 49 + 1 bytes before the end
         // of the buffer.
-        let version_end = bytes.len() - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        let version_end = bytes.len() - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         // The panel region trails the AV-73 per-period amount table
         // (512 bytes), the AV-68 evidence-deadline region (41 bytes) and
         // the AV-66 fee-schedule region (81 bytes):
@@ -41185,7 +41956,7 @@ mod arbiter_panel_tests {
         assert_eq!(panel.2, 595);
         // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103/AV-104/AV-105/AV-106/AV-107/AV-108/AV-109/AV-110/AV-111/AV-112:
         // every earlier field offset stays stable.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 45].0, "fee_schedule");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 46].0, "fee_schedule");
     }
 
     #[test]
@@ -41209,129 +41980,134 @@ mod arbiter_panel_tests {
         // AV-105 the swap-link region: the AV-106 insurance-pool tail
         // (1-byte opt-in flag + four u64 counters) is the new tail
         // (auction moved to len() - 13).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 44].0, "evidence_deadline_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 43].0, "escalated_by");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 42].0, "subscription_amounts");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 41].0, "schema_version");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 40].0, "slash_terms");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].0, "penalty_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].2, 1 + CPI_ALLOWLIST_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 37].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 37].2, 1 + MULTISIG_AUTHORITY_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 36].0, "appeal_window_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 35].0, "appeal_deadline");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 34].0, "appeal_state");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 33].0, "appeal_ballot");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 33].2, APPEAL_BALLOT_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].0, "vesting_curve");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].1, "Option<VestingCurve>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].2, 1 + VESTING_CURVE_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].2, 82);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 31].0, "evidence_root");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 31].1, "Option<[u8; 32]>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 31].2, 33);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 30].0, "evidence_leaves");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 30].2, 1);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 29].0, "evidence_disclosed");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 29].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 29].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 28].0, "basket");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 28].1, "Option<BasketLegs>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 28].2, BASKET_REGION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 28].2, 386);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 27].0, "payout_denylist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 27].1, "Option<PayoutDenylist>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 27].2, 1 + PAYOUT_DENYLIST_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 26].0, "auction");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 26].1, "Option<DutchAuction>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 26].2, 1 + DUTCH_AUCTION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 26].2, 19);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].0, "transfer_hook");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].1, "Option<[u8; 32]>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].2, 33);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 45].0, "evidence_deadline_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 44].0, "escalated_by");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 43].0, "subscription_amounts");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 42].0, "schema_version");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 41].0, "slash_terms");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 40].0, "penalty_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].2, 1 + CPI_ALLOWLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].2, 1 + MULTISIG_AUTHORITY_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 37].0, "appeal_window_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 36].0, "appeal_deadline");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 35].0, "appeal_state");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 34].0, "appeal_ballot");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 34].2, APPEAL_BALLOT_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 33].0, "vesting_curve");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 33].1, "Option<VestingCurve>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 33].2, 1 + VESTING_CURVE_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 33].2, 82);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].0, "evidence_root");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].1, "Option<[u8; 32]>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].2, 33);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 31].0, "evidence_leaves");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 31].2, 1);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 30].0, "evidence_disclosed");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 30].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 30].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 29].0, "basket");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 29].1, "Option<BasketLegs>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 29].2, BASKET_REGION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 29].2, 386);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 28].0, "payout_denylist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 28].1, "Option<PayoutDenylist>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 28].2, 1 + PAYOUT_DENYLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 27].0, "auction");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 27].1, "Option<DutchAuction>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 27].2, 1 + DUTCH_AUCTION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 27].2, 19);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 26].0, "transfer_hook");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 26].1, "Option<[u8; 32]>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 26].2, 33);
         // AV-103: the appeal bond and the locked-bond counter —
         // two plain u64s — and AV-104: the delegation region (37 bytes:
         // 1-byte discriminant + 32-byte operator key + 4-byte scope
         // bitmap) — and AV-105: the swap-link region is the new tail
         // (33 bytes: 1-byte discriminant + 32-byte counterparty
         // escrow id).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 24].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 24].0, "streaming_fees_accrued");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 24].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 24].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].0, "streaming_fees_accrued");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].0, "appeal_bond");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].0, "appeal_bond");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].0, "appeal_bond_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].0, "appeal_bond_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].0, "delegation");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].1, "Option<Delegation>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].2, DELEGATION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "swap_link");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].1, "Option<[u8; 32]>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].2, SWAP_LINK_REGION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].2, 33);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].0, "delegation");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].1, "Option<Delegation>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].2, DELEGATION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].0, "swap_link");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].1, "Option<[u8; 32]>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].2, SWAP_LINK_REGION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].2, 33);
         // AV-106: the penalty insurance pool is the new tail — 1-byte
         // opt-in flag plus four u64 counters.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "insurance_pool");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].1, "bool");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].2, 1);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "pool_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "insurance_pool");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].1, "bool");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].2, 1);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "pool_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "pool_slashed");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "pool_slashed");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "pool_inflow");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "pool_inflow");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "pool_payout_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "pool_payout_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].2, 8);
         // AV-107: the interest-bearing tail is the new tail — 2-byte
         // annual rate in basis points, then the accrual-clock base,
         // the outstanding yield claim, and the cumulative paid
         // counter (26 bytes: INTEREST_REGION_LEN).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "interest_rate_bps");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].1, "u16");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].2, 2);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "interest_rate_bps");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].1, "u16");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].2, 2);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 12].0,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 13].0,
             "interest_accrual_base"
         );
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "interest_accrued");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "interest_accrued");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "interest_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "interest_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, 8);
         // AV-111: the tranched-funding tail — the 8-byte cumulative
         // `funded_total` counter, then the `Option<FundingPlan>`
         // region (1-byte discriminant + 10-byte plan payload); the
-        // AV-110 rent top-up counter trails it, and the AV-112
-        // release-cooling tail is the new absolute tail.
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "release_intent_at");
-        assert_eq!(VAULT_FIELDS.last().unwrap().1, "Option<u64>");
-        assert_eq!(VAULT_FIELDS.last().unwrap().2, 9);
+        // AV-110 rent top-up counter trails it, then the AV-112
+        // release-cooling tail, and the AV-113 oracle price-gate tail
+        // is the new absolute tail.
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "price_gate");
+        assert_eq!(VAULT_FIELDS.last().unwrap().1, "Option<PriceGate>");
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, PRICE_GATE_LEN);
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, 18);
         let n = VAULT_FIELDS.len();
-        assert_eq!(VAULT_FIELDS[n - 2].0, "release_cooling_secs");
-        assert_eq!(VAULT_FIELDS[n - 2].1, "u64");
-        assert_eq!(VAULT_FIELDS[n - 2].2, 8);
-        assert_eq!(VAULT_FIELDS[n - 3].0, "funding_plan");
-        assert_eq!(VAULT_FIELDS[n - 3].1, "Option<FundingPlan>");
-        assert_eq!(VAULT_FIELDS[n - 3].2, FUNDING_PLAN_LEN);
-        assert_eq!(VAULT_FIELDS[n - 4].0, "funded_total");
-        assert_eq!(VAULT_FIELDS[n - 4].1, "u64");
-        assert_eq!(VAULT_FIELDS[n - 4].2, 8);
-        assert_eq!(VAULT_FIELDS[n - 5].0, "rent_topped_up_total"); // AV-110 trails the funding tail
+        assert_eq!(VAULT_FIELDS[n - 2].0, "release_intent_at");
+        assert_eq!(VAULT_FIELDS[n - 2].1, "Option<u64>");
+        assert_eq!(VAULT_FIELDS[n - 2].2, 9);
+        assert_eq!(VAULT_FIELDS[n - 3].0, "release_cooling_secs");
+        assert_eq!(VAULT_FIELDS[n - 3].1, "u64");
+        assert_eq!(VAULT_FIELDS[n - 3].2, 8);
+        assert_eq!(VAULT_FIELDS[n - 4].0, "funding_plan");
+        assert_eq!(VAULT_FIELDS[n - 4].1, "Option<FundingPlan>");
+        assert_eq!(VAULT_FIELDS[n - 4].2, FUNDING_PLAN_LEN);
+        assert_eq!(VAULT_FIELDS[n - 5].0, "funded_total");
+        assert_eq!(VAULT_FIELDS[n - 5].1, "u64");
         assert_eq!(VAULT_FIELDS[n - 5].2, 8);
-        assert_eq!(VAULT_FIELDS[n - 5].2, RENT_TOP_UP_LEN);
+        assert_eq!(VAULT_FIELDS[n - 6].0, "rent_topped_up_total"); // AV-110 trails the funding tail
+        assert_eq!(VAULT_FIELDS[n - 6].2, 8);
+        assert_eq!(VAULT_FIELDS[n - 6].2, RENT_TOP_UP_LEN);
     }
 
     #[test]
@@ -41970,7 +42746,7 @@ mod split_tests {
             .unwrap();
         assert_eq!(e.state(), EscrowState::Split);
         assert_eq!(EscrowState::Split as u8, 8, "Split appended last");
-        assert_eq!(VAULT_SPACE, 5121, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 5139, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -42240,7 +43016,7 @@ mod release_split_tests {
         e.release_split(ALICE, NOW, 1_000_000, None, &[(BOB, 10_000)])
             .unwrap();
         assert_eq!(e.state(), EscrowState::Released);
-        assert_eq!(VAULT_SPACE, 5121, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 5139, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -42556,7 +43332,7 @@ mod slash_tests {
         let e = slashable(1_000_000);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let base = ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
+        let base = ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
         assert_eq!(bytes[base], 3, "schema_version");
         assert_eq!(bytes[base + 1], 1, "slash_terms: Some");
         assert_eq!(&bytes[base + 2..base + 34], &PENALTY, "penalty account");
@@ -42567,8 +43343,8 @@ mod slash_tests {
         );
         assert_eq!(
             u64::from_le_bytes(
-                bytes[ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
-                    ..ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
+                bytes[ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
+                    ..ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
                     .try_into()
                     .unwrap()
             ),
@@ -42979,7 +43755,7 @@ mod appeal_tests {
         e.review_appeal(M1, true).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113);
+        assert_eq!(bytes.len(), 5131);
         // Appeal region: [3820..3846] — window (8), deadline (8), state
         // (1), ballot (9).
         assert_eq!(
@@ -43365,7 +44141,7 @@ mod appeal_bond_tests {
         // The two u64s before the delegation region are the bond region
         // (encode order: appeal_bond, then appeal_bond_paid) — the
         // AV-104 delegation region (37 bytes) trails them.
-        let tail = &full[8 + super::ESCROW_BODY_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - 37 - 16..8 + super::ESCROW_BODY_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - 37];
+        let tail = &full[8 + super::ESCROW_BODY_LEN - super::PRICE_GATE_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - 37 - 16..8 + super::ESCROW_BODY_LEN - super::PRICE_GATE_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - 37];
         assert_eq!(&tail[..8], &BOND.to_le_bytes());
         assert_eq!(&tail[8..], &[0u8; 8], "forfeited bond zeroes the counter");
         let decoded = crate::discriminator::decode_vault_account(&full).unwrap();
@@ -43747,7 +44523,7 @@ mod cpi_allowlist_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113);
+        assert_eq!(bytes.len(), 5131);
         assert_eq!(bytes[3495], 1, "Some discriminant");
         assert_eq!(&bytes[3496..3496 + 32], &DEX);
         assert_eq!(&bytes[3496 + 32..3496 + 64], &LENDING);
@@ -43769,8 +44545,8 @@ mod cpi_allowlist_tests {
         // appeal-bond region after that, AV-104 the delegation region
         // after that, AV-105 the swap-link region after that, AV-106
         // the insurance-pool region after that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].2, 1 + CPI_ALLOWLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].2, 1 + CPI_ALLOWLIST_LEN);
     }
 }
 
@@ -43963,7 +44739,7 @@ mod multisig_tests {
         let e = bound_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5113);
+        assert_eq!(bytes.len(), 5131);
         assert_eq!(bytes[3753], 1, "Some discriminant");
         assert_eq!(&bytes[3754..3754 + 32], &SQUADS_V4_PROGRAM_ID);
         assert_eq!(&bytes[3754 + 32..3754 + 64], &VAULT_PDA);
@@ -43988,8 +44764,8 @@ mod multisig_tests {
         // that, AV-104 the delegation region after that, AV-105 the
         // swap-link region after that, AV-106 the insurance-pool
         // region after that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 37].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 37].2, 1 + MULTISIG_AUTHORITY_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].2, 1 + MULTISIG_AUTHORITY_LEN);
         assert_eq!(MULTISIG_AUTHORITY_LEN, 66);
     }
 
@@ -44202,7 +44978,7 @@ mod streaming_fee_tests {
         let mut e = streaming_escrow(10);
         e.release(ALICE, FUND_AT + 100, 600_000, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        let tail = &bytes[ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN..];
+        let tail = &bytes[ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN..];
         assert_eq!(u64::from_le_bytes(tail[..8].try_into().unwrap()), 10);
         assert_eq!(u64::from_le_bytes(tail[8..16].try_into().unwrap()), 1_000);
         let mut account = vec![0u8; 8 + ESCROW_BODY_LEN];
@@ -44508,7 +45284,7 @@ mod interest_tests {
         assert_eq!(e.claim_interest(BOB, FUND_AT + 3_153_600).unwrap(), 5_000);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let tail = &bytes[ESCROW_BODY_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN..];
+        let tail = &bytes[ESCROW_BODY_LEN - PRICE_GATE_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN..];
         assert_eq!(u16::from_le_bytes(tail[..2].try_into().unwrap()), 500);
         assert_eq!(
             u64::from_le_bytes(tail[2..10].try_into().unwrap()),
@@ -44833,7 +45609,7 @@ mod delegation_tests {
         // The grant sits in the 37 bytes before the trailing 33-byte
         // AV-105 swap-link region: 1-byte Some discriminant, the
         // 32-byte operator key, the u32 bitmap.
-        let tail = &bytes[super::ESCROW_BODY_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - DELEGATION_LEN..];
+        let tail = &bytes[super::ESCROW_BODY_LEN - super::PRICE_GATE_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - DELEGATION_LEN..];
         assert_eq!(tail[0], 1, "Some discriminant");
         assert_eq!(&tail[1..33], &OPERATOR);
         assert_eq!(
@@ -44849,7 +45625,7 @@ mod delegation_tests {
         let plain = funded();
         let plain_bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(
-            &plain_bytes[super::ESCROW_BODY_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - DELEGATION_LEN..super::ESCROW_BODY_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN],
+            &plain_bytes[super::ESCROW_BODY_LEN - super::PRICE_GATE_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - DELEGATION_LEN..super::ESCROW_BODY_LEN - super::PRICE_GATE_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN],
             &[0u8; DELEGATION_LEN]
         );
         let mut account = vec![0u8; 8 + super::ESCROW_BODY_LEN];

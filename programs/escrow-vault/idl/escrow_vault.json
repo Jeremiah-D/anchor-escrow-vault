@@ -855,6 +855,16 @@
       "discriminator": [24, 147, 251, 20, 117, 37, 114, 81],
       "accounts": [],
       "args": []
+    },
+    {
+      "name": "initialize_price_gate",
+      "discriminator": [37, 100, 132, 38, 155, 97, 69, 21],
+      "accounts": [],
+      "args": [
+        {"name": "direction", "type": "u8"},
+        {"name": "target", "type": "u64"},
+        {"name": "max_staleness_secs", "type": "u64"}
+      ]
     }
   ],
   "accounts": [
@@ -953,7 +963,8 @@
           {"name": "funded_total", "type": "u64", "offset": 5085},
           {"name": "funding_plan", "type": {"option": {"defined": "FundingPlan"}}, "offset": 5093},
           {"name": "release_cooling_secs", "type": "u64", "offset": 5104},
-          {"name": "release_intent_at", "type": {"option": "u64"}, "offset": 5112}
+          {"name": "release_intent_at", "type": {"option": "u64"}, "offset": 5112},
+          {"name": "price_gate", "type": {"option": {"defined": "PriceGate"}}, "offset": 5121}
         ]
       }
     }
@@ -1202,6 +1213,17 @@
           {"name": "tranches_used", "type": "u8", "offset": 9}
         ]
       }
+    },
+    {
+      "name": "PriceGate",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "direction", "type": "u8", "offset": 0},
+          {"name": "target", "type": "u64", "offset": 1},
+          {"name": "max_staleness_secs", "type": "u64", "offset": 9}
+        ]
+      }
     }
   ],
   "errors": [
@@ -1279,7 +1301,9 @@
     {"code": 171, "name": "FundingIncomplete"},
     {"code": 172, "name": "FundingTranchesExhausted"},
     {"code": 173, "name": "InvalidFundingPlan"},
-    {"code": 174, "name": "ReleaseCoolingNotElapsed"}
+    {"code": 174, "name": "ReleaseCoolingNotElapsed"},
+    {"code": 175, "name": "PriceGateNotSatisfied"},
+    {"code": 176, "name": "InvalidPriceGate"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

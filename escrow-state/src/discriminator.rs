@@ -173,6 +173,11 @@ pub enum AccountDecodeError {
         end_at: u64,
         reserve_bps: u16,
     },
+    /// A present price gate's direction byte is not a known
+    /// [`PriceDirection`](crate::PriceDirection) discriminant (0–1).
+    /// The mapping is pinned to declaration order (AV-113; AV-32
+    /// panic-free guarantee).
+    InvalidPriceGateDiscriminant(u8),
 }
 
 /// Bounds-checked cursor over the account body. Every read is
@@ -1116,6 +1121,38 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         None
     };
 
+    // AV-113: the oracle price-gate tail, always reserved: the
+    // `Option<PriceGate>` region (1-byte discriminant + 1-byte
+    // direction + 8-byte target + 8-byte staleness bound).
+    // Structural decode only — the target/staleness invariants are
+    // enforced by `Escrow::with_price_gate`, not re-litigated here.
+    // An out-of-range direction byte is a corrupt account
+    // (InvalidPriceGateDiscriminant), never silently normalized.
+    let price_gate = if c.option_present("price_gate")? {
+        let direction_byte = c.u8()?;
+        let direction = match direction_byte {
+            0 => crate::PriceDirection::AtOrAbove,
+            1 => crate::PriceDirection::AtOrBelow,
+            _ => {
+                return Err(crate::AccountDecodeError::InvalidPriceGateDiscriminant(
+                    direction_byte,
+                ));
+            }
+        };
+        let target = c.u64_le()?;
+        let max_staleness_secs = c.u64_le()?;
+        Some(crate::PriceGate {
+            direction,
+            target,
+            max_staleness_secs,
+        })
+    } else {
+        // Absent: skip the reserved 17-byte payload (the encoder
+        // zero-pads it, matching the other `Option` regions).
+        c.skip(crate::PRICE_GATE_LEN - 1)?;
+        None
+    };
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1334,6 +1371,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // persisted tail fields.
         release_cooling_secs,
         release_intent_at,
+        // AV-113: the opt-in oracle price gate decodes like any other
+        // persisted tail field.
+        price_gate,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

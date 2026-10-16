@@ -218,6 +218,10 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         // AV-112: the release-intent timestamp (always present,
         // `None` when no intent is live).
         "Option<u64>" => IdlType::Option(Box::new(IdlType::U64)),
+        // AV-113: opt-in oracle price gate (always present, `None`
+        // when unconfigured; the `Option` discriminant rides the
+        // vault field, not the named type).
+        "Option<PriceGate>" => IdlType::Option(Box::new(IdlType::Named("PriceGate"))),
         // AV-57: the 64 fixed event-history slots.
         "[EventHistorySlot; 64]" => IdlType::Array(ArrayElem::Defined("EventHistorySlot"), 64),
         // AV-73: the 64 live per-period amount slots.
@@ -405,6 +409,15 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
             ("total_amount", IdlType::U64),
             ("max_tranches", IdlType::U8),
             ("tranches_used", IdlType::U8),
+        ],
+        // PriceGate { direction: u8, target: u64, max_staleness_secs: u64 }
+        // (AV-113): the oracle price-gate terms — 17 bytes (the `Option`
+        // discriminant rides the vault field, not the named type).
+        // `direction`: 0 = AtOrAbove, 1 = AtOrBelow (pinned by test).
+        "PriceGate" => vec![
+            ("direction", IdlType::U8),
+            ("target", IdlType::U64),
+            ("max_staleness_secs", IdlType::U64),
         ],
         // CpiAllowlist { addrs: [[u8; 32]; 8], len: u8 } (AV-83).
         // The 8 program ids serialize as 8 consecutive 32-byte pubkeys.
@@ -724,6 +737,8 @@ fn render_idl_json() -> String {
         "PayoutSplitShare",
         // AV-111: the tranched-funding plan type.
         "FundingPlan",
+        // AV-113: the oracle price-gate terms type.
+        "PriceGate",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -933,6 +948,11 @@ fn named_type_sizes_pin_constants() {
     // named type).
     assert_eq!(size("FundingPlan"), FUNDING_PLAN_LEN - 1);
     assert_eq!(size("FundingPlan"), 10);
+    // AV-113: direction u8 + target u64 + max_staleness_secs u64 (the
+    // `Option` discriminant rides the vault field, not the named
+    // type).
+    assert_eq!(size("PriceGate"), PRICE_GATE_LEN - 1);
+    assert_eq!(size("PriceGate"), 17);
 }
 
 #[test]
@@ -1000,7 +1020,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 75, "error variant count drift");
+    assert_eq!(errors.len(), 77, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -1084,6 +1104,9 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::InvalidFundingPlan.code(), 173);
     // AV-112: appended, never renumbered.
     assert_eq!(EscrowError::ReleaseCoolingNotElapsed.code(), 174);
+    // AV-113: appended, never renumbered.
+    assert_eq!(EscrowError::PriceGateNotSatisfied.code(), 175);
+    assert_eq!(EscrowError::InvalidPriceGate.code(), 176);
 }
 
 #[test]
@@ -1159,6 +1182,15 @@ fn max_config_funded_escrow() -> Escrow {
     e = e.with_timelock(VEST_START + 1).unwrap();
     e = e.with_decimals(6).unwrap();
     e = e.with_arbiter(ARB).unwrap();
+    // AV-113: attach the oracle price gate so the new tail bytes are
+    // pinned against the encoder below.
+    e = e
+        .with_price_gate(PriceGate {
+            direction: PriceDirection::AtOrAbove,
+            target: 100_000,
+            max_staleness_secs: 300,
+        })
+        .unwrap();
     e = e
         .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
         .unwrap();
@@ -1271,6 +1303,24 @@ fn idl_field_offsets_pin_borsh_encoder() {
     );
     assert_eq!(u64_at(body_field(&enc, &offsets, "timelock")), VEST_START + 1);
     assert_eq!(body_field(&enc, &offsets, "decimals"), &[6u8]);
+
+    // AV-113: the price-gate tail lands on the IDL-computed offset —
+    // the last field of the account: 1-byte discriminant + 1-byte
+    // direction (0 = AtOrAbove) + 8-byte target + 8-byte staleness
+    // bound.
+    let pg = body_field(&enc, &offsets, "price_gate");
+    assert_eq!(pg.len(), PRICE_GATE_LEN);
+    assert_eq!(pg[0], 1, "price_gate discriminant");
+    assert_eq!(pg[1], 0, "direction AtOrAbove");
+    assert_eq!(u64_at(&pg[2..10]), 100_000, "target");
+    assert_eq!(u64_at(&pg[10..18]), 300, "max_staleness_secs");
+    let (_, pg_offset, pg_len) = offsets
+        .iter()
+        .find(|(n, _, _)| *n == "price_gate")
+        .copied()
+        .expect("price_gate in IDL offsets");
+    assert_eq!(pg_len, PRICE_GATE_LEN);
+    assert_eq!(pg_offset, 8 + ESCROW_BODY_LEN - PRICE_GATE_LEN);
 }
 
 #[test]

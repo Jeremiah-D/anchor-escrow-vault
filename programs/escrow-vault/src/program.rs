@@ -196,15 +196,35 @@ pub mod escrow_vault {
         // an instruction param, so the initializer cannot fast-forward
         // the lock they configured.
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
-        let (payout, fee) = escrow
-            .release(
-                ctx.accounts.initializer.key().to_bytes(),
-                now,
-                amount,
-                vault_token_mint(&ctx.accounts.vault_token_account),
-                ctx.accounts.payout_to.key().to_bytes(),
-            )
-            .map_err(|e| escrow_error(e))?;
+        // AV-113: when a price gate is configured, the release routes
+        // through the gated entry point and the oracle account (first
+        // remaining account) feeds the quote — the program passes it
+        // through to the state machine. Ungated escrows take the plain
+        // path exactly as before.
+        let (payout, fee) = if escrow.price_gate().is_some() {
+            let quote = read_oracle_quote(ctx.remaining_accounts)?;
+            let feed = QuoteFeed(quote);
+            escrow
+                .release_price_gated(
+                    ctx.accounts.initializer.key().to_bytes(),
+                    now,
+                    amount,
+                    vault_token_mint(&ctx.accounts.vault_token_account),
+                    ctx.accounts.payout_to.key().to_bytes(),
+                    &feed,
+                )
+                .map_err(|e| escrow_error(e))?
+        } else {
+            escrow
+                .release(
+                    ctx.accounts.initializer.key().to_bytes(),
+                    now,
+                    amount,
+                    vault_token_mint(&ctx.accounts.vault_token_account),
+                    ctx.accounts.payout_to.key().to_bytes(),
+                )
+                .map_err(|e| escrow_error(e))?
+        };
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // AV-31: settle via `cpi_settle_payout` (`PayoutKind::Release`) —
         // the transfer instruction bytes are built and validated by
@@ -1047,14 +1067,31 @@ pub mod escrow_vault {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
         let from = escrow.state() as u8;
-        let (payout, fee) = escrow
-            .claim(
-                ctx.accounts.taker.key().to_bytes(),
-                now,
-                vault_token_mint(&ctx.accounts.vault_token_account),
-                ctx.accounts.payout_to.key().to_bytes(),
-            )
-            .map_err(|e| escrow_error(e))?;
+        // AV-113: like `release` — a configured price gate routes the
+        // taker's pull through the gated entry point, fed by the
+        // oracle account's quote (see `read_oracle_quote`).
+        let (payout, fee) = if escrow.price_gate().is_some() {
+            let quote = read_oracle_quote(ctx.remaining_accounts)?;
+            let feed = QuoteFeed(quote);
+            escrow
+                .claim_price_gated(
+                    ctx.accounts.taker.key().to_bytes(),
+                    now,
+                    vault_token_mint(&ctx.accounts.vault_token_account),
+                    ctx.accounts.payout_to.key().to_bytes(),
+                    &feed,
+                )
+                .map_err(|e| escrow_error(e))?
+        } else {
+            escrow
+                .claim(
+                    ctx.accounts.taker.key().to_bytes(),
+                    now,
+                    vault_token_mint(&ctx.accounts.vault_token_account),
+                    ctx.accounts.payout_to.key().to_bytes(),
+                )
+                .map_err(|e| escrow_error(e))?
+        };
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // AV-31: settle via `cpi_settle_payout` (`PayoutKind::Claim`) —
         // see `release`: `escrow_state::cpi::payout_plan` builds and
@@ -1451,6 +1488,43 @@ pub mod escrow_vault {
                 Some(ctx.accounts.authority.key()),
             );
         }
+        Ok(())
+    }
+
+    /// Attach an oracle price gate (AV-113; mirrors
+    /// `Escrow::with_price_gate`). `Uninitialized` only — the market
+    /// condition is fixed before any funds move, like the other
+    /// `initialize_*` opt-ins. `target == 0` is `InvalidPriceGate`
+    /// (code 176): a zero threshold is never a deliberate policy.
+    /// Once configured, `release` / `claim` route to the gated entry
+    /// points and require the oracle account's quote (see
+    /// `read_oracle_quote`).
+    pub fn initialize_price_gate(
+        ctx: Context<InitializePriceGate>,
+        direction: u8,
+        target: u64,
+        max_staleness_secs: u64,
+    ) -> Result<()> {
+        let direction = match direction {
+            0 => escrow_state::PriceDirection::AtOrAbove,
+            1 => escrow_state::PriceDirection::AtOrBelow,
+            _ => {
+                return Err(escrow_error(
+                    escrow_state::EscrowError::InvalidPriceGate,
+                ))
+            }
+        };
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .with_price_gate(escrow_state::PriceGate {
+                direction,
+                target,
+                max_staleness_secs,
+            })
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // No indexer event: pre-fund configuration, like the other
+        // `initialize_*` opt-ins.
         Ok(())
     }
 
@@ -6481,6 +6555,17 @@ pub struct VetoRelease<'info> {
     pub clock: AccountInfo<'info>,
 }
 
+/// AV-113: accounts for `initialize_price_gate` — the initializer
+/// fixes the oracle price-gate terms before funding.
+#[derive(Accounts)]
+pub struct InitializePriceGate<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer may fix the release governance; the state
+    /// machine runs the `Uninitialized`-only builder check.
+    pub initializer: Signer<'info>,
+}
+
 #[derive(Accounts)]
 pub struct Claim<'info> {
     #[account(mut)]
@@ -7353,6 +7438,39 @@ fn vault_token_mint(_token_account: &AccountInfo) -> Option<[u8; 32]> {
     unimplemented!("read the SPL token account's mint in the real build; None on the native-SOL path")
 }
 
+/// AV-113: read the oracle price quote for a price-gated `release` /
+/// `claim`. The oracle account travels as the first remaining account;
+/// its data carries the 16-byte quote (`price` u64 LE ++ `observed_at`
+/// u64 LE — the keeper writes the oracle's latest observation there).
+/// A missing account or short data is `PriceGateNotSatisfied` — a dark
+/// oracle fails the gate, never passes silently.
+fn read_oracle_quote(remaining: &[AccountInfo]) -> Result<escrow_state::PriceQuote> {
+    let account = remaining.first().ok_or_else(|| {
+        escrow_error(escrow_state::EscrowError::PriceGateNotSatisfied)
+    })?;
+    let data = account.try_borrow_data()?;
+    if data.len() < 16 {
+        return Err(escrow_error(
+            escrow_state::EscrowError::PriceGateNotSatisfied,
+        ));
+    }
+    let price = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let observed_at = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    Ok(escrow_state::PriceQuote { price, observed_at })
+}
+
+/// AV-113: the [`escrow_state::PriceFeed`] adapter for a single
+/// already-read quote — the program reads the oracle account once
+/// (`read_oracle_quote`) and feeds the fixed observation to the
+/// state machine's gated entry points.
+struct QuoteFeed(escrow_state::PriceQuote);
+
+impl escrow_state::PriceFeed for QuoteFeed {
+    fn quote(&self) -> Option<escrow_state::PriceQuote> {
+        Some(self.0)
+    }
+}
+
 fn write_escrow(_vault: &mut Account<Vault>, _escrow: &escrow_state::Escrow) {
     unimplemented!("serialize escrow_state::Escrow back into the Vault account")
 }
@@ -7756,6 +7874,12 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::ReleaseCoolingNotElapsed => {
             error!(ErrorCode::ReleaseCoolingNotElapsed)
         }
+        escrow_state::EscrowError::PriceGateNotSatisfied => {
+            error!(ErrorCode::PriceGateNotSatisfied)
+        }
+        escrow_state::EscrowError::InvalidPriceGate => {
+            error!(ErrorCode::InvalidPriceGate)
+        }
     }
 }
 
@@ -7905,4 +8029,8 @@ pub enum ErrorCode {
     InvalidFundingPlan,
     #[msg("Release cooling window not elapsed (AV-112): release on a cooling-configured escrow with no live announced intent, or whose intent was announced less than release_cooling_secs ago")]
     ReleaseCoolingNotElapsed,
+    #[msg("Oracle price gate not satisfied (AV-113): gated release/claim with no oracle quote, a stale quote, or a price on the wrong side of the target")]
+    PriceGateNotSatisfied,
+    #[msg("Invalid price gate (AV-113): with_price_gate with target == 0, or an out-of-range direction byte")]
+    InvalidPriceGate,
 }
