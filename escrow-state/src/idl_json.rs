@@ -212,6 +212,9 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "Option<SlashTerms>" => IdlType::Option(Box::new(IdlType::Named("SlashTerms"))),
         // AV-56: periodic subscription release schedule.
         "Option<SubscriptionSchedule>" => IdlType::Option(Box::new(IdlType::Named("SubscriptionSchedule"))),
+        // AV-111: opt-in tranched-funding plan (always present,
+        // `None` when unconfigured).
+        "Option<FundingPlan>" => IdlType::Option(Box::new(IdlType::Named("FundingPlan"))),
         // AV-57: the 64 fixed event-history slots.
         "[EventHistorySlot; 64]" => IdlType::Array(ArrayElem::Defined("EventHistorySlot"), 64),
         // AV-73: the 64 live per-period amount slots.
@@ -390,6 +393,15 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
         "PayoutSplitShare" => vec![
             ("recipient", IdlType::PublicKey),
             ("amount", IdlType::U64),
+        ],
+        // FundingPlan { total_amount: u64, max_tranches: u8,
+        // tranches_used: u8 } (AV-111): the tranched-funding plan —
+        // 10 bytes, always present in the vault account (inside the
+        // `Option<FundingPlan>` region, `None` when unconfigured).
+        "FundingPlan" => vec![
+            ("total_amount", IdlType::U64),
+            ("max_tranches", IdlType::U8),
+            ("tranches_used", IdlType::U8),
         ],
         // CpiAllowlist { addrs: [[u8; 32]; 8], len: u8 } (AV-83).
         // The 8 program ids serialize as 8 consecutive 32-byte pubkeys.
@@ -707,6 +719,8 @@ fn render_idl_json() -> String {
         // the initialize_payout_split instruction's share entry type.
         "PayoutSplit",
         "PayoutSplitShare",
+        // AV-111: the tranched-funding plan type.
+        "FundingPlan",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -911,6 +925,11 @@ fn named_type_sizes_pin_constants() {
     // AV-95: live leg-count byte + 8 fixed 48-byte leg slots.
     assert_eq!(size("BasketLegs"), BASKET_LEGS_LEN);
     assert_eq!(size("BasketLegs"), 385);
+    // AV-111: total_amount u64 + max_tranches u8 + tranches_used u8
+    // (the `Option` discriminant rides the vault field, not the
+    // named type).
+    assert_eq!(size("FundingPlan"), FUNDING_PLAN_LEN - 1);
+    assert_eq!(size("FundingPlan"), 10);
 }
 
 #[test]
@@ -978,7 +997,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 71, "error variant count drift");
+    assert_eq!(errors.len(), 74, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);

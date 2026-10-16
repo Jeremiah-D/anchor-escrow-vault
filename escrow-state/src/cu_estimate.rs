@@ -99,6 +99,11 @@ pub const INSTRUCTION_CU_TABLE: &[(&str, u64, usize)] = &[
     // write that moves no escrow funds — cheaper than the
     // fund-moving unwinds, ranked with the cheap config writes.
     ("top_up_rent", 8_000, 16),
+    // AV-111: tranche_amount:u64 → 8 + 8; a deposit inflow with the
+    // full guard chain (pause, reentrancy, FUND-scoped authority,
+    // plan presence, state, tranche budget, overfund cap) plus
+    // counter writes — ranked with the fund-moving unwinds.
+    ("fund_tranche", 12_000, 16),
 ];
 
 /// Base cost for `instruction`, or `None` when the table has no row —
@@ -271,6 +276,7 @@ mod cu_estimate_tests {
             ("pool_payout", 18_000),
             ("claim_deadman", 10_000),
             ("top_up_rent", 8_000),
+            ("fund_tranche", 12_000),
         ];
         for (name, base) in expected {
             assert_eq!(instruction_cu_base(name), Some(*base), "base drift for {name}");

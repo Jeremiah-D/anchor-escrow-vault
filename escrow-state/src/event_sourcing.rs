@@ -227,6 +227,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // event's `rent_reclaimed` field for indexers, never the
         // fund triple).
         | EscrowEventKind::RentToppedUp => (0, 0, 0),
+        // AV-111: a funding tranche is the fold seed's inflow leg —
+        // the fold seeds the lockup with the deal size at `Funded`
+        // (exactly like `Funded` itself), so the tranche carries no
+        // amount and the fold books nothing.
+        | EscrowEventKind::TrancheFunded => (0, 0, 0),
         // Expiry cancels: `refund` goes to the pinned destination and
         // the AV-24 anti-griefing `penalty` routes to the initializer
         // as compensation — both are initializer receipts, so both
@@ -635,6 +640,10 @@ mod event_sourcing_tests {
                 // AV-110: a rent top-up moves no escrow funds (rent
                 // sits outside the lockup).
                 | EscrowEventKind::RentToppedUp
+                // AV-111: a funding tranche is the fold seed's inflow
+                // leg — the fold seeds the lockup with the deal size
+                // at `Funded`, so the tranche books nothing.
+                | EscrowEventKind::TrancheFunded
                 | EscrowEventKind::Slashed => (0, 0, 0),
             };
             assert_eq!(got, want, "delta for {kind:?} (discriminant {d})");

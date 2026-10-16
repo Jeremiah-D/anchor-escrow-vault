@@ -1284,6 +1284,76 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to tranched funding (AV-111; mirrors
+    /// `Escrow::with_funding_plan`). `Uninitialized` only, like the
+    /// other `initialize_*` opt-ins: the funding schedule is fixed
+    /// before any funds move. `total_amount` must be positive and
+    /// equal the escrow's declared amount (`AmountMismatch`
+    /// otherwise); `max_tranches` must be at least 1
+    /// (`InvalidFundingPlan`, code 173, on zero). Attaching the plan
+    /// moves the deposit path from `fund` to `fund_tranche`.
+    pub fn initialize_funding_plan(
+        ctx: Context<InitializeFundingPlan>,
+        total_amount: u64,
+        max_tranches: u8,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .with_funding_plan(total_amount, max_tranches)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // No indexer event: pre-fund configuration, like the other
+        // `initialize_*` opt-ins.
+        Ok(())
+    }
+
+    /// Deposit one funding tranche (AV-111; mirrors
+    /// `Escrow::fund_tranche`). The initializer or their FUND-scoped
+    /// operator (AV-104 delegation) calls this up to `max_tranches`
+    /// times; each call accumulates `tranche_amount` into
+    /// `funded_total` and consumes one tranche slot. Full check
+    /// sequence — pause → reentrancy → FUND-scoped authority → plan
+    /// presence (`InvalidFundingPlan`, code 173, when no plan is
+    /// attached) → state → positive amount → tranche budget
+    /// (`FundingTranchesExhausted`, code 172) → overfund cap
+    /// (`AmountMismatch`). The first call moves `Uninitialized` →
+    /// `Funded` (`Activated` → `Funded` for dual-sig) and anchors the
+    /// clocks exactly like `fund`.
+    pub fn fund_tranche(ctx: Context<FundTranche>, tranche_amount: u64) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        escrow
+            .fund_tranche(
+                ctx.accounts.authority.key().to_bytes(),
+                tranche_amount,
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `now` doubles as the event's `at`; the on-chain event
+        // carries no amount leg — the tranche is the fold seed's
+        // inflow leg, so the fold seeds the lockup with the deal size
+        // at `Funded` (the off-chain `IndexedEscrow` event carries
+        // `EventAmounts::none`, exactly like `Funded` itself).
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::TrancheFunded,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.authority.key()),
+        );
+        Ok(())
+    }
+
     /// Opt in to dispute arbitration (AV-14; mirrors
     /// `Escrow::with_arbiter`). `Uninitialized` only, like
     /// `initialize_quorum`: the arbiter's identity is fixed before funds
@@ -6212,6 +6282,33 @@ pub struct TopUpRent<'info> {
     pub clock: AccountInfo<'info>,
 }
 
+/// AV-111: accounts for `initialize_funding_plan` — the initializer
+/// opts the escrow into tranched funding before any funds move.
+#[derive(Accounts)]
+pub struct InitializeFundingPlan<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer may fix the funding schedule; the state
+    /// machine runs the `Uninitialized`-only builder check.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-111: accounts for `fund_tranche` — the initializer (or their
+/// FUND-scoped operator) deposits one funding tranche.
+#[derive(Accounts)]
+pub struct FundTranche<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The funding authority — the initializer or their FUND-scoped
+    /// operator (AV-104 delegation); the state machine checks the
+    /// scope. The real build transfers `tranche_amount` from this
+    /// key's wallet / token account into the vault.
+    pub authority: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for `now`/`at` (never
+    /// instruction params).
+    pub clock: AccountInfo<'info>,
+}
+
 #[derive(Accounts)]
 pub struct Claim<'info> {
     #[account(mut)]
@@ -7475,6 +7572,15 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidRentTopUp => {
             error!(ErrorCode::InvalidRentTopUp)
         }
+        escrow_state::EscrowError::FundingIncomplete => {
+            error!(ErrorCode::FundingIncomplete)
+        }
+        escrow_state::EscrowError::FundingTranchesExhausted => {
+            error!(ErrorCode::FundingTranchesExhausted)
+        }
+        escrow_state::EscrowError::InvalidFundingPlan => {
+            error!(ErrorCode::InvalidFundingPlan)
+        }
     }
 }
 
@@ -7616,4 +7722,10 @@ pub enum ErrorCode {
     DeadmanNotElapsed,
     #[msg("Invalid rent top-up (AV-110): top_up_rent with lamports == 0, or the cumulative rent_topped_up_total counter overflowing u64")]
     InvalidRentTopUp,
+    #[msg("Funding incomplete (AV-111): release/claim/release_milestone on a tranched-funding escrow before funded_total reaches the plan's total_amount")]
+    FundingIncomplete,
+    #[msg("Funding tranches exhausted (AV-111): fund_tranche when the plan's tranche budget is spent")]
+    FundingTranchesExhausted,
+    #[msg("Invalid funding plan (AV-111): with_funding_plan with max_tranches == 0; fund_tranche with no plan attached; fund on a plan escrow")]
+    InvalidFundingPlan,
 }

@@ -552,6 +552,25 @@ pub struct EscrowSnapshot {
     /// off-chain indexer can reconcile top-up events against the
     /// vault's counter without replaying the transitions.
     pub rent_topped_up_total: u64,
+    /// AV-111: cumulative amount actually deposited via
+    /// [`Escrow::fund`](crate::Escrow::fund) /
+    /// [`Escrow::fund_tranche`](crate::Escrow::fund_tranche) — the
+    /// "deposited" leg of the conservation identity, so an off-chain
+    /// indexer can reconcile tranche events against the vault's
+    /// counter without replaying the transitions.
+    pub funded_total: u64,
+    /// AV-111: the plan's cumulative funding target (`0` when no
+    /// funding plan is attached).
+    pub funding_total_amount: u64,
+    /// AV-111: the plan's tranche budget (`0` when no funding plan is
+    /// attached).
+    pub funding_max_tranches: u8,
+    /// AV-111: tranches consumed so far.
+    pub funding_tranches_used: u8,
+    /// AV-111: whether taker payouts are ungated by funding — `true`
+    /// when no plan is attached or the plan's `funded_total` reached
+    /// `total_amount` ([`Escrow::is_funding_complete`]).
+    pub funding_complete: bool,
 }
 
 /// AV-82: point-in-time, read-only view of the opt-in slash terms —
@@ -868,6 +887,17 @@ impl Escrow {
             // off-chain indexer can reconcile `RentToppedUp` events
             // against the vault without replaying the transitions.
             rent_topped_up_total: self.rent_topped_up_total(),
+            // AV-111: the funding counters ride the export — the plan
+            // fields are zeroed when no plan is attached, so a plain
+            // escrow's JSON only grows the new keys.
+            funded_total: self.funded_total(),
+            funding_total_amount: self
+                .funding_plan()
+                .map(|p| p.total_amount())
+                .unwrap_or(0),
+            funding_max_tranches: self.funding_plan().map(|p| p.max_tranches()).unwrap_or(0),
+            funding_tranches_used: self.funding_plan().map(|p| p.tranches_used()).unwrap_or(0),
+            funding_complete: self.is_funding_complete(),
         }
     }
 }
@@ -1467,6 +1497,16 @@ impl EscrowSnapshot {
         s.push_str(&self.deadman_eligible.to_string());
         s.push_str(",\"rent_topped_up_total\":");
         s.push_str(&self.rent_topped_up_total.to_string());
+        s.push_str(",\"funded_total\":");
+        s.push_str(&self.funded_total.to_string());
+        s.push_str(",\"funding_total_amount\":");
+        s.push_str(&self.funding_total_amount.to_string());
+        s.push_str(",\"funding_max_tranches\":");
+        s.push_str(&self.funding_max_tranches.to_string());
+        s.push_str(",\"funding_tranches_used\":");
+        s.push_str(&self.funding_tranches_used.to_string());
+        s.push_str(",\"funding_complete\":");
+        s.push_str(&self.funding_complete.to_string());
         s.push('}');
         s
     }
@@ -1534,7 +1574,7 @@ mod snapshot_tests {
              \"pool_payout_eligible\":false,\
              \"interest_rate_bps\":0,\"interest_accrued\":0,\"interest_paid\":0,\"payout_split\":null,\
              \"deadman_inactivity_secs\":0,\"deadman_heir\":null,\"deadman_last_activity\":1700000000,\
-             \"deadman_eligible\":false,\"rent_topped_up_total\":0\
+             \"deadman_eligible\":false,\"rent_topped_up_total\":0,\"funded_total\":1000000,\"funding_total_amount\":0,\"funding_max_tranches\":0,\"funding_tranches_used\":0,\"funding_complete\":true\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),

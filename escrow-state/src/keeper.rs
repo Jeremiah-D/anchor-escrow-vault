@@ -347,6 +347,18 @@ pub enum KeeperActionKind {
     /// the remaining locked amount the call pays the heir;
     /// `refund_to` is the heir (the instruction's destination).
     ClaimDeadman,
+    /// `fund_tranche(authority, tranche_amount, now)` (AV-111): the
+    /// initializer's next funding tranche on a plan escrow. Listed
+    /// when the plan is incomplete and a tranche slot remains — a
+    /// listed call is always executable, never a `Paused`,
+    /// `InvalidFundingPlan`, or `FundingTranchesExhausted` rejection.
+    /// The initializer is the canonical keeper caller
+    /// (`caller_role: "initializer"`); `amount` is the remaining
+    /// unfunded target (`total_amount - funded_total`) — the ceiling
+    /// for the next deposit, not a decided tranche size; and
+    /// `funding_progress` passes the plan's live counters through so
+    /// the operator's dashboard sees the funding state.
+    FundTranche,
 }
 
 impl KeeperActionKind {
@@ -366,6 +378,7 @@ impl KeeperActionKind {
             KeeperActionKind::ExpireAppeal => "expire_appeal",
             KeeperActionKind::PoolPayout => "pool_payout",
             KeeperActionKind::ClaimDeadman => "claim_deadman",
+            KeeperActionKind::FundTranche => "fund_tranche",
         }
     }
 }
@@ -454,11 +467,35 @@ pub struct KeeperAction {
     /// is withholding committed evidence, and the judgment weight
     /// must deduct the undisclosed documents honestly.
     pub evidence_disclosure: Option<(u64, u8)>,
+    /// AV-111: tranched-funding progress — set on `fund_tranche`
+    /// actions, `None` on every other kind. The live plan counters
+    /// (`funded_total`, `total_amount`, `tranches_used`,
+    /// `max_tranches`) pass through to the report so the operator's
+    /// dashboard sees the funding state; `amount` carries the
+    /// remaining unfunded target (`total_amount - funded_total`) as
+    /// the next tranche's ceiling.
+    pub funding_progress: Option<FundingProgress>,
     /// Machine-readable reason: `"expired"`, `"vesting_unlocked"`,
     /// `"disputed"` (AV-38, `resolve` actions; AV-65,
-    /// `submit_panel_judgment` actions), or
-    /// `"subscription_period_due"` (AV-56, `release_period` actions).
+    /// `submit_panel_judgment` actions),
+    /// `"subscription_period_due"` (AV-56, `release_period` actions),
+    /// or `"funding_incomplete"` (AV-111, `fund_tranche` actions).
     pub reason: &'static str,
+}
+
+/// AV-111: the live tranched-funding counters passed through on a
+/// [`KeeperActionKind::FundTranche`] action. `Copy` like the other
+/// small report structs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FundingProgress {
+    /// Cumulative amount deposited so far.
+    pub funded_total: u64,
+    /// The plan's funding target (== the escrow's declared amount).
+    pub total_amount: u64,
+    /// Tranches consumed so far.
+    pub tranches_used: u8,
+    /// The plan's tranche budget.
+    pub max_tranches: u8,
 }
 
 impl KeeperAction {
@@ -572,7 +609,8 @@ impl KeeperReport {
     ///    "refund_to":"...","amount":1000000,"decimals":6,
     ///    "display_amount":"1.000000",
     ///    "reason":"expired","reference":null,"extension_count":0,
-    ///    "multisig_authority":null,"estimated_cu":13814}
+    ///    "multisig_authority":null,"evidence_disclosure":null,
+    ///    "funding_progress":null,"estimated_cu":13814}
     /// ]}
     /// ```
     ///
@@ -718,6 +756,24 @@ impl KeeperReport {
                 }
                 None => s.push_str("null"),
             }
+            // AV-111: tranched-funding progress — `null` unless the
+            // action is a `fund_tranche`, so the operator dashboard
+            // reads the live plan counters at a glance.
+            s.push_str(",\"funding_progress\":");
+            match a.funding_progress {
+                Some(p) => {
+                    s.push_str("{\"funded_total\":");
+                    s.push_str(&p.funded_total.to_string());
+                    s.push_str(",\"total_amount\":");
+                    s.push_str(&p.total_amount.to_string());
+                    s.push_str(",\"tranches_used\":");
+                    s.push_str(&p.tranches_used.to_string());
+                    s.push_str(",\"max_tranches\":");
+                    s.push_str(&p.max_tranches.to_string());
+                    s.push('}');
+                }
+                None => s.push_str("null"),
+            }
             // AV-88: the per-action CU passthrough — the heuristic
             // estimate for this keeper call, same cost model as the
             // execution plan.
@@ -792,6 +848,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                             extension_count: e.extension_count(),
                             multisig_authority: e.multisig_authority,
                             evidence_disclosure: e.evidence_disclosure(),
+                            funding_progress: None,
                             reason: "disputed",
                         });
                     }
@@ -820,11 +877,59 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         extension_count: e.extension_count(),
                         multisig_authority: e.multisig_authority,
                         evidence_disclosure: e.evidence_disclosure(),
+                        funding_progress: None,
                         reason: "disputed",
                     });
                 }
             }
             continue;
+        }
+        // AV-111: a tranched-funding escrow with an incomplete plan
+        // and a remaining tranche slot lists one `fund_tranche`
+        // action per scan — the initializer's keeper bot learns the
+        // next deposit is due, and `funding_progress` passes the live
+        // plan counters through to the operator's dashboard. The
+        // action is listed from `Uninitialized` (non-dual-sig),
+        // `Activated`, and `Funded` — exactly the states
+        // `fund_tranche` accepts — and withheld while paused, so a
+        // listed call is always executable.
+        if let Some(plan) = e.funding_plan() {
+            let tranche_open = e.state() == EscrowState::Funded
+                || e.state() == EscrowState::Activated
+                || (e.state() == EscrowState::Uninitialized && !e.dual_sig_required());
+            if tranche_open
+                && !e.is_paused()
+                && !e.is_funding_complete()
+                && plan.tranches_used() < plan.max_tranches()
+            {
+                let remaining = plan.total_amount().saturating_sub(e.funded_total());
+                if remaining > 0 {
+                    actions.push(KeeperAction {
+                        escrow_id: w.escrow_id,
+                        vault_address: w.vault_address(),
+                        kind: KeeperActionKind::FundTranche,
+                        caller: e.initializer(),
+                        caller_role: "initializer",
+                        mint: e.mint(),
+                        // A tranche is a deposit, not a refund — no
+                        // refund destination applies.
+                        refund_to: None,
+                        amount: remaining,
+                        decimals: e.decimals(),
+                        reference: w.reference,
+                        extension_count: e.extension_count(),
+                        multisig_authority: e.multisig_authority,
+                        evidence_disclosure: None,
+                        funding_progress: Some(FundingProgress {
+                            funded_total: e.funded_total(),
+                            total_amount: plan.total_amount(),
+                            tranches_used: plan.tranches_used(),
+                            max_tranches: plan.max_tranches(),
+                        }),
+                        reason: "funding_incomplete",
+                    });
+                }
+            }
         }
         // Only a live, funded escrow has keeper-executable exits:
         // Uninitialized / Activated escrows are not funded yet, and the
@@ -864,6 +969,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 extension_count: e.extension_count(),
                 multisig_authority: e.multisig_authority,
                 evidence_disclosure: None,
+                funding_progress: None,
                 reason: "expired",
             });
             // AV-48: the permissionless crank — the same expiry exit,
@@ -897,6 +1003,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     extension_count: e.extension_count(),
                     multisig_authority: e.multisig_authority,
                     evidence_disclosure: None,
+                    funding_progress: None,
                     reason: "expired",
                 });
             }
@@ -932,6 +1039,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 extension_count: e.extension_count(),
                 multisig_authority: e.multisig_authority,
                 evidence_disclosure: None,
+                funding_progress: None,
                 reason: "deadman_inactivity_elapsed",
             });
         }
@@ -968,6 +1076,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 extension_count: e.extension_count(),
                 multisig_authority: e.multisig_authority,
                 evidence_disclosure: None,
+                funding_progress: None,
                 // AV-97: the auction window prices the claim, not a
                 // vesting curve — the reason tells the operator which
                 // pricing the amount came from.
@@ -1022,6 +1131,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     extension_count: e.extension_count(),
                     multisig_authority: e.multisig_authority,
                     evidence_disclosure: None,
+                    funding_progress: None,
                     reason: "subscription_period_due",
                 });
             }
@@ -1053,6 +1163,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 extension_count: e.extension_count(),
                 multisig_authority: e.multisig_authority,
                 evidence_disclosure: None,
+                funding_progress: None,
                 reason: "slash_deadline_passed",
             });
             if let Some(arbiter) = e.arbiter() {
@@ -1070,6 +1181,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     extension_count: e.extension_count(),
                     multisig_authority: e.multisig_authority,
                     evidence_disclosure: None,
+                    funding_progress: None,
                     reason: "slash_deadline_passed",
                 });
             }
@@ -1100,6 +1212,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 extension_count: e.extension_count(),
                 multisig_authority: e.multisig_authority,
                 evidence_disclosure: None,
+                funding_progress: None,
                 reason: "appeal_window_open",
             });
         }
@@ -1132,6 +1245,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         extension_count: e.extension_count(),
                         multisig_authority: e.multisig_authority,
                         evidence_disclosure: None,
+                        funding_progress: None,
                         reason: "appeal_filed",
                     });
                 }
@@ -1164,6 +1278,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 extension_count: e.extension_count(),
                 multisig_authority: e.multisig_authority,
                 evidence_disclosure: None,
+                funding_progress: None,
                 reason: "appeal_window_lapsed",
             });
         }
@@ -1202,6 +1317,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     extension_count: e.extension_count(),
                     multisig_authority: e.multisig_authority,
                     evidence_disclosure: None,
+                    funding_progress: None,
                     reason: "pool_payout_available",
                 });
             }
@@ -2256,7 +2372,7 @@ mod keeper_tests {
         let report = scan_keeper_actions(&watched, MID);
         assert_eq!(report.actions[0].evidence_disclosure, None);
         assert!(
-            report.to_json().contains("\"evidence_disclosure\":null"),
+            report.to_json().contains("\"evidence_disclosure\":null,\"funding_progress\":null"),
             "null when no root committed"
         );
     }
@@ -2327,6 +2443,7 @@ mod keeper_tests {
                 // No multisig binding on the watched escrow.
                 multisig_authority: None,
                 evidence_disclosure: None,
+                funding_progress: None,
                 reason: "expired",
             }
         );
@@ -2347,6 +2464,7 @@ mod keeper_tests {
                 extension_count: 0,
                 multisig_authority: None,
                 evidence_disclosure: None,
+                funding_progress: None,
                 reason: "expired",
             }
         );
@@ -2364,7 +2482,7 @@ mod keeper_tests {
         // 3 accounts, 8 data bytes, 1 signer →
         // 10_000 + 3_000 + 3×250 + 8×8 = 13_814 each; total 27_628.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":13814}}]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"estimated_cu\":13814}}]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -2389,7 +2507,7 @@ mod keeper_tests {
         // AV-88: claim with mint, no refund_to: 3 accounts, 8 data
         // bytes, 1 signer → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"estimated_cu\":17814}}]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"estimated_cu\":17814}}]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),
@@ -2507,6 +2625,7 @@ mod keeper_tests {
             extension_count: 0,
             multisig_authority: None,
             evidence_disclosure: None,
+            funding_progress: None,
             reason: "expired",
         };
         assert_eq!(a.estimated_compute_units(), 13_814);
@@ -2528,6 +2647,7 @@ mod keeper_tests {
         let resolve = KeeperAction {
             kind: KeeperActionKind::Resolve,
             caller_role: "arbiter",
+            funding_progress: None,
             reason: "disputed",
             refund_to: None,
             ..a

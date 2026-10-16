@@ -156,6 +156,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_deadman_switch(inactivity_secs, heir)` (AV-109) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the inactivity threshold in seconds and the heir — the only key `claim_deadman` accepts; `inactivity_secs == 0` or the zero address is `InvalidDeadmanConfig`, code 168; the 49-byte tail region is always reserved so the config writes in place — no realloc; emits no event, pre-fund configuration) |
 | `claim_deadman(heir, now)` (AV-109) | `Funded` | `Cancelled` | **the configured heir only** (`Unauthorized` otherwise — the heir is deliberately *not* required to be either party, the orthogonality point with `cancel_expired`); only once `now - deadman_last_activity >= inactivity_secs` (saturating; exactly-equal counts as elapsed — `DeadmanNotElapsed`, code 169, before the window lapses); unconfigured switch is `InvalidDeadmanConfig` (code 168); the pause gate and the AV-105 swap-link refusal apply; `now` <- clock sysvar (never an instruction param); the unsettled AV-107 interest claim is voided like `cancel`; returns the remaining locked amount (refund-family unwind — `released` untouched, the remainder preserved for audit like `cancel`'s); emits `DeadmanClaimed` |
 | `top_up_rent(caller, lamports)` (AV-110) | any except `Closed` | unchanged (no state change) | **permissionless** — anyone may top up (the initializer, the taker, the keeper bot, or a stranger; no authority check, the caller only acts as the event actor); `Closed` is `InvalidStateTransition` (no account left to keep rent-exempt); `lamports == 0` is `InvalidRentTopUp` (code 170); deliberately *not* pause-gated (pausing freezes fund movement, not operational hygiene) and no reentrancy guard (no escrow funds move); accumulates `rent_topped_up_total` only — the state byte and the amount conservation identity are untouched (a top-up is pure lamport bookkeeping on the vault account); emits `RentToppedUp` (`from == to ==` the current state; the topped-up lamports ride the event's `rent_reclaimed` amount field) |
+| `initialize_funding_plan(total_amount, max_tranches)` (AV-111) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the cumulative funding target — must equal the escrow's declared `amount` (`AmountMismatch` otherwise) — and the tranche budget, at least 1 (`InvalidFundingPlan`, code 173, on zero); attaching the plan moves the deposit path from `fund` to `fund_tranche`) |
+| `fund_tranche(authority, tranche_amount, now)` (AV-111) | `Uninitialized` (non-dual-sig) / `Activated` / `Funded` | `Funded` (first tranche; later tranches re-enter `Funded`) | initializer or their FUND-scoped operator (AV-104); `now` <- clock sysvar (never a param); full check sequence — pause → reentrancy → FUND-scoped authority → plan presence (`InvalidFundingPlan`, code 173, when no plan is attached) → state → positive amount (`AmountMismatch` on zero) → tranche budget (`FundingTranchesExhausted`, code 172, when spent) → overfund cap (`AmountMismatch`); each call accumulates `funded_total` and consumes one tranche slot; the first call anchors `fund_at` / the interest clock / the deadman clock exactly like `fund`; emits `TrancheFunded` (`from == to ==` the state after the call; no amount — the fold seeds the lockup with the deal size at `Funded`) |
 | `initialize_reference(reference)` (AV-53) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the 32-byte off-chain correlation id — order id / invoice hash; any 32 bytes accepted — read-only pass-through: never read by a check gate, never cleared, never affects amount conservation) |
 | `split_escrow(initializer, taker, amounts, vesting, quorum, dual_sig, milestones)` (AV-81) | `Funded` | `Split` (new terminal state) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`; degenerate initializer == taker self-escrow authorizes with one key passed twice); `Disputed` is `InvalidStateTransition` (arbitration in flight adjudicates the locked funds) and every terminal state rejects a re-split; the amount table must be non-empty, hold at most 16 entries, contain no zero entry, and sum in `u128` to exactly the parent's remaining lockup (`InvalidSplit`, code 142, otherwise — a partial release before the split shrinks the splittable pool); each child is born `Funded` with the parent's initializer / taker / `expires_at` and the explicitly inherited config — vesting / quorum / dual-sig / per-child milestones are *not* inherited unless named (default-inert, anti-misconfiguration); child *i*'s escrow ID derives as `H(parent_id \|\| i)` (SHA-256, `u64` little-endian index); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in `Funded` — no half-split); emits `EscrowSplit` (`Funded -> Split`, `amounts.payout` = Σ child amounts, the `(child_id, amount)` roster rides the event) |
 | `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` / `Split` (AV-81) | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it); a split parent's funds were re-homed into the children, so its vault carries nothing but the rent deposit — closeable like the other terminals |
@@ -1243,6 +1245,9 @@ program error per variant):
 | `InvalidDeadmanConfig` | 168 | `with_deadman_switch` / `initialize_deadman_switch` (AV-109) with `inactivity_secs == 0` or a zero-address heir, or after funding; `claim_deadman` (AV-109) on an escrow with no dead-man's switch configured |
 | `DeadmanNotElapsed` | 169 | `claim_deadman` (AV-109) before `now - deadman_last_activity >= inactivity_secs` — exactly-equal counts as elapsed |
 | `InvalidRentTopUp` | 170 | `top_up_rent` (AV-110) with `lamports == 0`, or the cumulative `rent_topped_up_total` counter overflowing `u64` |
+| `FundingIncomplete` | 171 | `release` / `claim` / `release_milestone` (AV-111) on a tranched-funding escrow before `funded_total` reaches the plan's `total_amount` |
+| `FundingTranchesExhausted` | 172 | `fund_tranche` (AV-111) when the plan's tranche budget is spent |
+| `InvalidFundingPlan` | 173 | `with_funding_plan` (AV-111) with `max_tranches == 0`; `fund_tranche` with no plan attached; `fund` on a plan escrow |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2322,7 +2327,9 @@ two-way consistency check against the IDL parameter table:
 | deadman_heir | Option<Pubkey> | 33 |
 | deadman_last_activity | u64 | 8 |
 | rent_topped_up_total | u64 | 8 |
-| **total**     |                   | **5077** |
+| funded_total | u64 | 8 |
+| funding_plan | Option<FundingPlan> (1-byte discriminant + total_amount u64 + max_tranches u8 + tranches_used u8) | 11 |
+| **total**     |                   | **5096** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2434,11 +2441,16 @@ zeroed when the escrow is not linked into a swap pair) — and the
 (Option<Pubkey>: 1-byte discriminant + 32-byte heir, zeroed when no
 heir is named) + `deadman_last_activity` (u64, zeroed when the escrow
 was never funded) — and the 8-byte rent top-up tail region (AV-110:
-`rent_topped_up_total` (u64, zeroed when no top-up was ever made)).
-`escrow-state` exposes `VAULT_SPACE` (5085) and
-`VAULT_SPACE_NO_QUORUM` (4595) for the Anchor `space =` constraint, plus a
+`rent_topped_up_total` (u64, zeroed when no top-up was ever made)) —
+and the 19-byte tranched-funding tail region (AV-111:
+`funded_total` (u64, zeroed until the first deposit) +
+`funding_plan` (Option<FundingPlan>: 1-byte discriminant + 10-byte
+plan payload — `total_amount` u64 + `max_tranches` u8 +
+`tranches_used` u8, `None` when no plan is attached)).
+`escrow-state` exposes `VAULT_SPACE` (5104) and
+`VAULT_SPACE_NO_QUORUM` (4614) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **36,282,480 lamports** to be
+mainnet rent parameters the full vault needs **36,414,720 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -3462,7 +3474,11 @@ deadman tail (8-byte threshold + 33-byte `Option<Pubkey>` heir +
 **36,226,800** lamports (AV-110 later grows the layout by a further
 8 bytes: body 5069 → **5077**, `VAULT_SPACE` 5077 → **5085**,
 `VAULT_SPACE_NO_QUORUM` 4587 → **4595**, rent-exempt 36,226,800 →
-**36,282,480** lamports — see the permissionless rent top-up section).
+**36,282,480** lamports — see the permissionless rent top-up section;
+AV-111 then grows it by a further 19 bytes: body 5077 → **5096**,
+`VAULT_SPACE` 5085 → **5104**, `VAULT_SPACE_NO_QUORUM` 4595 →
+**4614**, rent-exempt 36,282,480 → **36,414,720** lamports — see the
+tranched funding section).
 
 **Walkthrough — the heir reclaims a dormant vault.** The initializer
 names a recovery heir at setup; both parties go silent; a year
@@ -3549,6 +3565,90 @@ keeper            stranger          vault
    |                  |   | = 6,960; state still |
    |                  |   | Funded; RentToppedUp |
    |                  |   | emitted              |
+```
+
+## Tranched funding (AV-111)
+
+The problem: some deals are funded in stages — a construction
+escrow draws against milestones, a payroll escrow funds as headcount
+ramps — but a classic escrow takes its whole amount in one `fund`
+call. AV-111 adds an opt-in funding plan: the initializer declares
+the schedule up front, then deposits in tranches.
+
+`with_funding_plan(total_amount, max_tranches)` is a builder on an
+`Uninitialized` escrow (like the other `with_*` opt-ins).
+`total_amount` must be positive *and equal the escrow's declared
+`amount` (`AmountMismatch` otherwise): the plan *schedules* the
+deposit of the deal size, it never redefines it — so milestones,
+vesting curves, and fees keep pricing off `amount`, and the deal the
+taker signed is the deal that gets funded. `max_tranches` must be at
+least 1 (`InvalidFundingPlan`, code 173, on zero). Attaching a plan
+moves the deposit path from `fund` to `fund_tranche` — `fund` on a
+plan escrow is `InvalidFundingPlan`, so a single-shot deposit cannot
+silently bypass the tranche schedule.
+
+`fund_tranche(authority, tranche_amount, now)` runs the full check
+sequence — pause → reentrancy → FUND-scoped authority (AV-104: the
+initializer or their operator) → plan presence (`InvalidFundingPlan`
+when no plan is attached — use `fund`) → state (`Uninitialized`
+non-dual-sig / `Activated` / `Funded`) → positive amount → tranche
+budget (`FundingTranchesExhausted`, code 172, when the budget is
+spent) → overfund cap (`AmountMismatch`). Each call accumulates
+`funded_total` and consumes one tranche slot; the first call moves
+`Uninitialized` → `Funded` (`Activated` → `Funded` for dual-sig)
+and anchors `fund_at` / the interest clock / the deadman clock
+exactly like `fund`.
+
+Two money rules keep partial funding honest. First, taker payouts
+wait for full funding: `release`, `claim`, and `release_milestone`
+refuse with `FundingIncomplete` (code 171) until `funded_total`
+reaches the plan target — the taker is paid the full deal, never a
+partial deposit. Second, every fund-movement cap keys off the
+actually-deposited `funded_total`, never the declared `amount`
+(`remaining_amount`, the release-path caps, the slashable base) —
+so no path can ever move money that never arrived, and the
+conservation identity extends cleanly to
+`funded_total == locked + released + refunded …`. `cancel` /
+`cancel_expired` refund the deposited remainder automatically;
+`cancel_partial` walks the plan back with the refund (shrinking
+`amount`, `funded_total`, and the plan target together, so
+`total_amount == amount` is preserved). Interest accrues on
+`remaining_amount`, so it prices the deposited principal.
+
+The `IndexedEscrow` wrapper emits `TrancheFunded` (`from == to ==`
+the state after the call; the event carries no amount — the tranche
+is the fold seed's inflow leg, so the fold seeds the lockup with the
+deal size at `Funded`, exactly like `Funded` itself). The keeper scan
+lists one `fund_tranche` action per incomplete plan (with the live
+`funded_total` / `total_amount` / `tranches_used` / `max_tranches`
+passed through as `funding_progress` for the operator's dashboard),
+withheld while paused. The Anchor skeleton gains the
+`initialize_funding_plan` and `fund_tranche` handlers plus accounts
+structs and the three error mappings (codes 171–173); the snapshot
+exports the funding counters. Account layout grows by the 19-byte
+tail (`funded_total` u64 + `Option<FundingPlan>` region): body 5077
+→ **5096**, `VAULT_SPACE` 5085 → **5104**,
+`VAULT_SPACE_NO_QUORUM` 4595 → **4614**, rent-exempt 36,282,480 →
+**36,414,720** lamports. The event kind `TrancheFunded` is 58
+(appended after `RentToppedUp`, 0–57 stable).
+
+**Walkthrough — three tranches fund a build.** The initializer plans
+1,000,000 lamports in up to 3 tranches; the taker waits:
+
+```
+initializer                    vault
+   | with_funding_plan(1_000_000, 3) |
+   |-------------------------------->|
+   | fund_tranche(400_000) → Funded    |
+   |-------------------------------->|
+   | fund_tranche(400_000) → Funded    |
+   |-------------------------------->|
+   | release(…) → FundingIncomplete    |
+   |<--------------------------------|
+   | fund_tranche(200_000) → complete  |
+   |-------------------------------->|
+   | release(…) → taker paid           |
+   |<--------------------------------|
 ```
 
 ## Basket escrow (AV-95)

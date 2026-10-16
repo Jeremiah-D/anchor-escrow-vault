@@ -818,6 +818,23 @@
       "args": [
         {"name": "lamports", "type": "u64"}
       ]
+    },
+    {
+      "name": "initialize_funding_plan",
+      "discriminator": [163, 209, 171, 116, 156, 37, 54, 133],
+      "accounts": [],
+      "args": [
+        {"name": "total_amount", "type": "u64"},
+        {"name": "max_tranches", "type": "u8"}
+      ]
+    },
+    {
+      "name": "fund_tranche",
+      "discriminator": [235, 63, 170, 15, 101, 90, 189, 90],
+      "accounts": [],
+      "args": [
+        {"name": "tranche_amount", "type": "u64"}
+      ]
     }
   ],
   "accounts": [
@@ -912,7 +929,9 @@
           {"name": "deadman_inactivity_secs", "type": "u64", "offset": 5028},
           {"name": "deadman_heir", "type": {"option": "publicKey"}, "offset": 5036},
           {"name": "deadman_last_activity", "type": "u64", "offset": 5069},
-          {"name": "rent_topped_up_total", "type": "u64", "offset": 5077}
+          {"name": "rent_topped_up_total", "type": "u64", "offset": 5077},
+          {"name": "funded_total", "type": "u64", "offset": 5085},
+          {"name": "funding_plan", "type": {"option": {"defined": "FundingPlan"}}, "offset": 5093}
         ]
       }
     }
@@ -1150,6 +1169,17 @@
           {"name": "amount", "type": "u64", "offset": 32}
         ]
       }
+    },
+    {
+      "name": "FundingPlan",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "total_amount", "type": "u64", "offset": 0},
+          {"name": "max_tranches", "type": "u8", "offset": 8},
+          {"name": "tranches_used", "type": "u8", "offset": 9}
+        ]
+      }
     }
   ],
   "errors": [
@@ -1223,7 +1253,10 @@
     {"code": 167, "name": "InvalidPayoutSplit"},
     {"code": 168, "name": "InvalidDeadmanConfig"},
     {"code": 169, "name": "DeadmanNotElapsed"},
-    {"code": 170, "name": "InvalidRentTopUp"}
+    {"code": 170, "name": "InvalidRentTopUp"},
+    {"code": 171, "name": "FundingIncomplete"},
+    {"code": 172, "name": "FundingTranchesExhausted"},
+    {"code": 173, "name": "InvalidFundingPlan"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

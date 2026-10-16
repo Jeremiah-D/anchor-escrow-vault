@@ -420,6 +420,8 @@ mod execution_plan_tests {
             multisig_authority: None,
             // AV-91: test actions carry no evidence disclosure.
             evidence_disclosure: None,
+            // AV-111: test actions carry no funding progress.
+            funding_progress: None,
             reason: "test",
         }
     }

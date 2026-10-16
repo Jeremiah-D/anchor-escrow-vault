@@ -230,6 +230,7 @@
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
 //! | DeadmanClaimed (AV-109) | 0 | 0 | remaining locked amount, to the configured heir (the heir is not required to be either party) | 0 |
 //! | RentToppedUp (AV-110) | 0 | 0 | 0 | 0 — the topped-up lamports ride `rent_reclaimed` (the rent-balance leg: added here, reclaimed on `VaultClosed`; direction is read from the kind) |
+//! | TrancheFunded (AV-111) | 0 | 0 | 0 | 0 — a funding tranche landed; the fold seeds the lockup with the deal size at `Funded`, so the tranche carries no amount (exactly like `Funded` itself) |
 //! | ExpiredCranked (AV-48) | 0 | 0 | remainder minus penalty, to the whitelisted destination (the cranker receives nothing) | anti-griefing penalty to the initializer (AV-24; 0 unless the cranker is the taker) |
 //! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
 //! | DefaultJudgment (AV-55) | gross taker share (`default_taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
@@ -756,6 +757,18 @@ pub enum EscrowEventKind {
     /// emitted on success: a zero-lamport call is rejected, so there
     /// is no no-op case.
     RentToppedUp,
+    /// AV-111: one funding tranche landed via
+    /// [`Escrow::fund_tranche`](crate::Escrow::fund_tranche). `from ==
+    /// to ==` the state after the call (a `Funded` state re-entry, not
+    /// a lifecycle move — like
+    /// [`EscrowEventKind::DelegationGranted`]). Pure deposit
+    /// bookkeeping for the off-chain indexer: the tranche is the
+    /// explicit fold seed's inflow leg, so the tranche amount itself
+    /// carries [`EventAmounts::none`] (the fold seeds the lockup with
+    /// the deal size at `Funded`, exactly like `Funded` itself).
+    /// Always emitted on success — a rejected tranche changes
+    /// nothing, so a failed call emits nothing.
+    TrancheFunded,
 }
 
 impl EscrowEventKind {
@@ -893,6 +906,9 @@ impl EscrowEventKind {
             // AV-110: appended after DeadmanClaimed so discriminants
             // 0–56 stay stable for already-serialized histories.
             57 => Self::RentToppedUp,
+            // AV-111: appended after RentToppedUp so discriminants
+            // 0–57 stay stable for already-serialized histories.
+            58 => Self::TrancheFunded,
             _ => return None,
         })
     }
@@ -959,6 +975,7 @@ impl EscrowEventKind {
             Self::SwapLinked => "swap_linked",
             Self::DeadmanClaimed => "deadman_claimed",
             Self::RentToppedUp => "rent_topped_up",
+            Self::TrancheFunded => "tranche_funded",
         }
     }
 
@@ -1026,6 +1043,7 @@ impl EscrowEventKind {
             "swap_linked" => Self::SwapLinked,
             "deadman_claimed" => Self::DeadmanClaimed,
             "rent_topped_up" => Self::RentToppedUp,
+            "tranche_funded" => Self::TrancheFunded,
             _ => return None,
         })
     }
@@ -1903,6 +1921,18 @@ impl IndexedEscrow {
     /// [`Escrow::with_milestones`]). Configuration: emits no event.
     pub fn with_milestones(mut self, plan: MilestonePlan) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_milestones(plan)?;
+        Ok(self)
+    }
+
+    /// Opt in to tranched funding (mirrors
+    /// [`Escrow::with_funding_plan`](crate::Escrow::with_funding_plan),
+    /// AV-111). Configuration: emits no event.
+    pub fn with_funding_plan(
+        mut self,
+        total_amount: u64,
+        max_tranches: u8,
+    ) -> Result<Self, EscrowError> {
+        self.inner.with_funding_plan(total_amount, max_tranches)?;
         Ok(self)
     }
 
@@ -2829,6 +2859,42 @@ impl IndexedEscrow {
             None,
             None,
             Some(caller),
+        );
+        Ok(())
+    }
+
+    /// Deposit one funding tranche (mirrors
+    /// [`Escrow::fund_tranche`](crate::Escrow::fund_tranche), AV-111).
+    /// Emits `TrancheFunded` with `from == to ==` the state after the
+    /// call (a `Funded` re-entry on later tranches — pure deposit
+    /// bookkeeping, not a lifecycle move). The event carries
+    /// [`EventAmounts::none`]: the tranche is the fold seed's inflow
+    /// leg, so the fold seeds the lockup with the deal size at
+    /// `Funded`, exactly like `Funded` itself. `at` is the
+    /// caller-supplied event timestamp (on-chain: the clock sysvar).
+    /// The actor is the funding initializer (or their FUND-scoped
+    /// operator). A rejected tranche changes nothing, so a failed
+    /// call emits nothing.
+    pub fn fund_tranche(
+        &mut self,
+        authority: [u8; 32],
+        tranche_amount: u64,
+        now: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        self.inner.fund_tranche(authority, tranche_amount, now)?;
+        let state = self.inner.state();
+        self.push_event(
+            EscrowEventKind::TrancheFunded,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
         );
         Ok(())
     }
@@ -6260,7 +6326,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(58), None);
+        assert_eq!(EscrowEventKind::from_discriminant(59), None);
     }
 
     #[test]
@@ -6276,7 +6342,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(58), None);
+        assert_eq!(EscrowEventKind::from_discriminant(59), None);
     }
 
     #[test]
@@ -6813,7 +6879,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(58), None);
+        assert_eq!(EscrowEventKind::from_discriminant(59), None);
     }
 
     #[test]
@@ -6828,7 +6894,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(58), None);
+        assert_eq!(EscrowEventKind::from_discriminant(59), None);
     }
 
     #[test]
@@ -6840,7 +6906,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(58), None);
+        assert_eq!(EscrowEventKind::from_discriminant(59), None);
     }
 
     #[test]
@@ -6852,7 +6918,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(58), None);
+        assert_eq!(EscrowEventKind::from_discriminant(59), None);
     }
 
     #[test]
@@ -6864,7 +6930,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(58), None);
+        assert_eq!(EscrowEventKind::from_discriminant(59), None);
     }
 
     #[test]
@@ -6879,7 +6945,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(58), None);
+        assert_eq!(EscrowEventKind::from_discriminant(59), None);
     }
 
     #[test]
@@ -6894,7 +6960,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(58), None);
+        assert_eq!(EscrowEventKind::from_discriminant(59), None);
     }
 
     #[test]
@@ -6906,7 +6972,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(58), None);
+        assert_eq!(EscrowEventKind::from_discriminant(59), None);
     }
 
     #[test]
@@ -6918,7 +6984,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(58), None);
+        assert_eq!(EscrowEventKind::from_discriminant(59), None);
     }
 
     #[test]
@@ -6930,7 +6996,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(58), None);
+        assert_eq!(EscrowEventKind::from_discriminant(59), None);
     }
 
     #[test]

@@ -38,7 +38,7 @@
 use super::{
     sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, CpiAllowlist,
     DefaultJudgment, DutchAuction, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
-    Delegation, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, PayoutSplit, QuorumPolicy,
+    Delegation, FundingPlan, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, PayoutSplit, QuorumPolicy,
     SlashTerms, SubscriptionSchedule, VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
     APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
     DELEGATION_LEN, DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
@@ -1076,6 +1076,29 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // not re-litigated here.
     let rent_topped_up_total = c.u64_le()?;
 
+    // AV-111: the tranched-funding tail, always reserved: the 8-byte
+    // cumulative `funded_total` deposit counter, then the
+    // `Option<FundingPlan>` region (1-byte discriminant + 10-byte
+    // plan payload). Structural decode only — the plan invariants
+    // are enforced by `Escrow::with_funding_plan` /
+    // `Escrow::fund_tranche`, not re-litigated here.
+    let funded_total = c.u64_le()?;
+    let funding_plan = if c.option_present("funding_plan")? {
+        let total_amount = c.u64_le()?;
+        let max_tranches = c.u8()?;
+        let tranches_used = c.u8()?;
+        Some(FundingPlan::from_parts(
+            total_amount,
+            max_tranches,
+            tranches_used,
+        ))
+    } else {
+        // Absent: skip the reserved 10-byte payload (the encoder
+        // zero-pads it, matching the other `Option` regions).
+        c.skip(10)?;
+        None
+    };
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1284,6 +1307,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-110: the cumulative rent top-up counter decodes like any
         // other persisted tail field.
         rent_topped_up_total,
+        // AV-111: the cumulative `funded_total` deposit counter and
+        // the tranched-funding plan decode like any other persisted
+        // tail fields.
+        funded_total,
+        funding_plan,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
