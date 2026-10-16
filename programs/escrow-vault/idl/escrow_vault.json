@@ -767,6 +767,20 @@
         {"name": "beneficiary", "type": "publicKey"},
         {"name": "amount", "type": "u64"}
       ]
+    },
+    {
+      "name": "initialize_interest",
+      "discriminator": [242, 97, 202, 5, 151, 248, 36, 237],
+      "accounts": [],
+      "args": [
+        {"name": "rate_bps", "type": "u16"}
+      ]
+    },
+    {
+      "name": "claim_interest",
+      "discriminator": [62, 142, 132, 209, 206, 8, 79, 175],
+      "accounts": [],
+      "args": []
     }
   ],
   "accounts": [
@@ -852,7 +866,11 @@
           {"name": "pool_paid", "type": "u64", "offset": 4649},
           {"name": "pool_slashed", "type": "u64", "offset": 4657},
           {"name": "pool_inflow", "type": "u64", "offset": 4665},
-          {"name": "pool_payout_paid", "type": "u64", "offset": 4673}
+          {"name": "pool_payout_paid", "type": "u64", "offset": 4673},
+          {"name": "interest_rate_bps", "type": "u16", "offset": 4681},
+          {"name": "interest_accrual_base", "type": "u64", "offset": 4683},
+          {"name": "interest_accrued", "type": "u64", "offset": 4691},
+          {"name": "interest_paid", "type": "u64", "offset": 4699}
         ]
       }
     }
@@ -1136,7 +1154,9 @@
     {"code": 161, "name": "InvalidSwapParties"},
     {"code": 162, "name": "InvalidSwapAmounts"},
     {"code": 163, "name": "SwapLinkActive"},
-    {"code": 164, "name": "InvalidPoolPayout"}
+    {"code": 164, "name": "InvalidPoolPayout"},
+    {"code": 165, "name": "InvalidInterestRate"},
+    {"code": 166, "name": "InterestNotEnabled"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

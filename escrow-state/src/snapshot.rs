@@ -520,6 +520,14 @@ pub struct EscrowSnapshot {
     /// could succeed at [`EscrowSnapshot::at`] — the keeper scan lists
     /// exactly these escrows for `pool_payout`.
     pub pool_payout_eligible: bool,
+    /// AV-107: the configured annual interest rate in basis points
+    /// (`0` when interest is not enabled).
+    pub interest_rate_bps: u16,
+    /// AV-107: the outstanding accrued interest — the taker's
+    /// unsettled yield claim at [`EscrowSnapshot::at`].
+    pub interest_accrued: u64,
+    /// AV-107: cumulative interest paid out to the taker.
+    pub interest_paid: u64,
 }
 
 /// AV-82: point-in-time, read-only view of the opt-in slash terms —
@@ -805,6 +813,14 @@ impl Escrow {
             pool_outflow: self.pool_outflow(),
             pool_payout_paid: self.pool_payout_paid(),
             pool_payout_eligible: self.is_pool_payout_eligible(now),
+            // AV-107: the interest-bearing tail rides the export — the
+            // configured rate, the outstanding yield claim, and the
+            // cumulative paid counter — so an off-chain indexer can
+            // price the taker's yield without replaying the
+            // settlement transitions.
+            interest_rate_bps: self.interest_rate_bps(),
+            interest_accrued: self.interest_accrued(),
+            interest_paid: self.interest_paid(),
         }
     }
 }
@@ -1362,6 +1378,14 @@ impl EscrowSnapshot {
         } else {
             "false"
         });
+        // AV-107: the interest-bearing tail — rate, outstanding claim,
+        // cumulative paid.
+        s.push_str(",\"interest_rate_bps\":");
+        s.push_str(&self.interest_rate_bps.to_string());
+        s.push_str(",\"interest_accrued\":");
+        s.push_str(&self.interest_accrued.to_string());
+        s.push_str(",\"interest_paid\":");
+        s.push_str(&self.interest_paid.to_string());
         s.push('}');
         s
     }
@@ -1426,7 +1450,8 @@ mod snapshot_tests {
              \"delegation\":null,\"swap_link\":null,\
              \"insurance_pool\":false,\"pool_paid\":0,\"pool_slashed\":0,\
              \"pool_inflow\":0,\"pool_outflow\":0,\"pool_payout_paid\":0,\
-             \"pool_payout_eligible\":false\
+             \"pool_payout_eligible\":false,\
+             \"interest_rate_bps\":0,\"interest_accrued\":0,\"interest_paid\":0\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),

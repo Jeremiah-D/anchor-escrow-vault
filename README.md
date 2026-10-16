@@ -149,6 +149,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `file_appeal(taker)` (AV-86) | `Funded` | `Funded` (no state change — filing records the challenge, and locks the configured AV-103 appeal bond) | taker **only** (`Unauthorized` otherwise, checked before state validity); requires an executed slash (`penalty_paid > 0`), a configured window, no appeal filed or resolved yet (one appeal per slash), `now <= appeal_deadline` (a lapsed window is a hard procedural bar), and a configured arbiter panel to review it — any missing gate is `InvalidAppealWindow` (or `InvalidArbiterPanel` for the missing panel); when a bond was configured via `initialize_appeal_bond`, filing locks it automatically into the independent `appeal_bond_paid` counter (never mixed into `released`/`penalty_paid`, never part of the claimable/release base while pending); returns the locked bond (`0` when none) so the transfer can be sized; `now` <- clock sysvar; emits `AppealFiled` (amounts zero) |
 | `review_appeal(member, uphold)` (AV-86) | `Funded` | `Funded` (no state change) | panel member **only** (`Unauthorized` otherwise); one effective vote per member (a re-vote overwrites); the first side to reach the panel threshold resolves — `uphold` keeps the penalty (`Upheld`) and forfeits the locked appeal bond to the initializer (AV-103, the anti-malicious-appeal-delay rule), `overturn` refunds the penalty to the taker (`penalty_paid` → `0`, accumulated in `released` so the conservation invariant stays exact) and refunds the locked bond in full, no fee (never mixed into `released`); a non-resolving vote emits nothing; the resolving vote emits `AppealResolved` (on overturn `payout` = refunded penalty + refunded bond; on uphold `penalty` = forfeited bond); returns `(outcome, penalty_refunded, bond_moved)` — `0` == upheld, `1` == overturned — so both transfers can be sized |
 | `expire_appeal(caller)` (AV-103) | `Funded` | `Funded` (appeal → `Expired`, terminal) | **permissionless** — anyone may crank a lapsed appeal (no authority check; the caller only acts as the event actor); requires a `Filed` appeal and `now > appeal_deadline` (`InvalidAppealWindow` when never filed or already resolved, `AppealExpiryNotDue` code 159 when the window has not lapsed yet); the slash stands (like an upheld appeal) and the locked appeal bond — if any — is forfeited to the initializer; returns the forfeited bond (`0` when none) so the transfer can be sized; `now` <- clock sysvar; emits `AppealExpired` (`penalty` = the forfeited bond) |
+| `initialize_interest(rate_bps)` (AV-107) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the annual interest rate in basis points on the locked principal — `rate_bps` in 0–10000, `InvalidInterestRate` code 165 above; `0` disables the yield, backward compatible; the 26-byte tail region is always reserved so the rate writes in place) |
+| `claim_interest()` (AV-107) | `Funded` | `Funded` (no state change) | taker **only** (`Unauthorized` otherwise, checked before state validity); `now` <- clock sysvar settles the lazy interest clock first, so the harvest is exact to the second; no rate configured is `InterestNotEnabled` (code 166) — a configured-but-unearned escrow returns `Ok(0)`; returns the interest paid and accumulates `interest_paid` (never `released`); emits no event (counter/snapshot-observable) |
 | `initialize_reference(reference)` (AV-53) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the 32-byte off-chain correlation id — order id / invoice hash; any 32 bytes accepted — read-only pass-through: never read by a check gate, never cleared, never affects amount conservation) |
 | `split_escrow(initializer, taker, amounts, vesting, quorum, dual_sig, milestones)` (AV-81) | `Funded` | `Split` (new terminal state) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`; degenerate initializer == taker self-escrow authorizes with one key passed twice); `Disputed` is `InvalidStateTransition` (arbitration in flight adjudicates the locked funds) and every terminal state rejects a re-split; the amount table must be non-empty, hold at most 16 entries, contain no zero entry, and sum in `u128` to exactly the parent's remaining lockup (`InvalidSplit`, code 142, otherwise — a partial release before the split shrinks the splittable pool); each child is born `Funded` with the parent's initializer / taker / `expires_at` and the explicitly inherited config — vesting / quorum / dual-sig / per-child milestones are *not* inherited unless named (default-inert, anti-misconfiguration); child *i*'s escrow ID derives as `H(parent_id \|\| i)` (SHA-256, `u64` little-endian index); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in `Funded` — no half-split); emits `EscrowSplit` (`Funded -> Split`, `amounts.payout` = Σ child amounts, the `(child_id, amount)` roster rides the event) |
 | `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` / `Split` (AV-81) | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it); a split parent's funds were re-homed into the children, so its vault carries nothing but the rent deposit — closeable like the other terminals |
@@ -601,7 +603,7 @@ and `evidence_disclosure`. New vault fields (appended last):
 `evidence_root` (`Option<[u8; 32]>`, 33 bytes) + `evidence_leaves`
 (u8) + `evidence_disclosed` (u64, 8 bytes) — 42 bytes at the time,
 bringing the layout to 3978 bytes (the layout has since grown to
-4640 bytes / 4648 with the discriminator — see the account-space
+4699 bytes / 4707 with the discriminator — see the account-space
 paragraph below). Anchor
 surface: `escalate` gains the two params, plus the new
 `file_evidence` instruction (`doc_hash`, `leaf_index`,
@@ -1229,6 +1231,9 @@ program error per variant):
 | `InvalidSwapParties` | 161 | `link_swap` (AV-105) with a zero or duplicate counterparty escrow id, or with non-mirrored parties (`a.initializer != b.taker` or `a.taker != b.initializer`); also a pair settlement whose cross-link does not match the claimed pair |
 | `InvalidSwapAmounts` | 162 | `link_swap` (AV-105) with a leg amount disagreeing with that leg's locked amount |
 | `SwapLinkActive` | 163 | `link_swap` on an already-linked escrow; any fund-moving *single-side* transition on a live-linked non-terminal escrow (see the refusal list in the AV-105 section); or a pair op on an unlinked escrow (`None` link is this code, not a parties mismatch) |
+| `InvalidPoolPayout` | 164 | `pool_payout` (AV-106) with no pool opted in, by a non-arbiter/non-multisig caller, a zero or over-balance amount, a denied/non-allowlisted beneficiary, on a non-`Funded` escrow, or while the pool is encumbered by a live appeal; or `close_vault` with a non-empty pool |
+| `InvalidInterestRate` | 165 | `with_interest` / `initialize_interest` (AV-107) with `rate_bps > 10000` — above 100% APR |
+| `InterestNotEnabled` | 166 | `claim_interest` (AV-107) on an escrow with no interest rate configured (`interest_rate_bps == 0`) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1238,7 +1243,12 @@ inflow on top of the principal), with
 `amount`/`expires_at` immutable and failed operations state-preserving
 (the fuzz drives full, partial, over-limit, and zero-amount releases, so
 `locked` is recomputed as the unreleased remainder of `Funded` escrows
-and `released` accumulates partial payouts). Property-based tests
+and `released` accumulates partial payouts). AV-107 extends the identity
+with the interest sink: `interest_paid` joins the outflow side as its own
+term (`inflow + yield == locked + released + refunded + interest_paid +
+…`), so principal (`released`) and yield (`interest_paid`) stay
+separately auditable — the interest tests assert it across
+accrue → harvest → release lifecycles. Property-based tests
 (hand-rolled generator, boundary-biased amounts
 `0 / 1 / u64::MAX-1 / u64::MAX` and boundary timestamps) additionally pin
 per-case invariants: initialize amount dichotomy, amount preservation
@@ -2289,7 +2299,16 @@ two-way consistency check against the IDL parameter table:
 | appeal_bond_paid | u64 | 8 |
 | delegation | Option<Delegation> | 37 |
 | swap_link | Option<[u8; 32]> | 33 |
-| **total**     |                   | **4640** |
+| insurance_pool | bool | 1 |
+| pool_paid | u64 | 8 |
+| pool_slashed | u64 | 8 |
+| pool_inflow | u64 | 8 |
+| pool_payout_paid | u64 | 8 |
+| interest_rate_bps | u16 | 2 |
+| interest_accrual_base | u64 | 8 |
+| interest_accrued | u64 | 8 |
+| interest_paid | u64 | 8 |
+| **total**     |                   | **4699** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2396,10 +2415,10 @@ when no bond was configured) — and the 37-byte delegation region
 bitmap, zeroed when no grant is live) — and the 33-byte swap-link
 region (AV-105: 1-byte discriminant + 32-byte counterparty escrow id,
 zeroed when the escrow is not linked into a swap pair).
-`escrow-state` exposes `VAULT_SPACE` (4648) and
-`VAULT_SPACE_NO_QUORUM` (4158) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (4707) and
+`VAULT_SPACE_NO_QUORUM` (4217) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **33,240,960 lamports** to be
+mainnet rent parameters the full vault needs **33,651,600 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -3233,6 +3252,72 @@ exports all five counters. Account layout grows by the 33-byte pool
 region (flag + four u64 counters): body 4640 → **4673**,
 `VAULT_SPACE` 4648 → **4681**, `VAULT_SPACE_NO_QUORUM` 4158 →
 **4191**, rent-exempt 33,240,960 → **33,470,640** lamports.
+
+## Interest-bearing escrow (AV-107)
+
+The problem: escrow locks the initializer's capital for the deal's
+whole lifetime, and the taker waits for settlement — neither side earns
+anything on the locked funds. In payment fintech (and DeFi-style Solana
+programs generally) idle escrowed capital is expected to work: a
+lending-protocol deployment, a staking yield, or simply a time-value
+sweetener the initializer offers to win the deal.
+
+The fix, opt-in via `with_interest(rate_bps)` (`Uninitialized`-only;
+the default stays the pre-AV-107 non-interest behavior): the locked
+principal accrues interest at `rate_bps` APR — `locked * rate_bps *
+elapsed_secs / (10_000 * 31_536_000)` — computed in `u128`, so even a
+`u64::MAX` principal at 100% APR for a century cannot overflow (the
+test pins the saturation). Accrual is lazy: there is no per-block tick
+and no hidden clock — every fund-moving transition settles the clock
+from an explicit `now`, advancing `interest_accrual_base` (anchored at
+`fund_at`) and growing the outstanding claim in `interest_accrued`. The
+accrual base is `remaining_amount` — the principal still locked — so a
+partial release or slash shrinks future accrual and released funds stop
+earning.
+
+The taker harvests the yield two ways: `claim_interest(authority, now)`
+— taker-only (`Unauthorized` for anyone else, mirroring `claim`'s
+strict check, so a compromised operator cannot divert the yield
+stream), `Funded → Funded`, no state change — or bundled with a taker
+payout (`release`, `claim`, the milestone/period/basket legs, and the
+three dispute settlements all sweep the outstanding claim into the
+taker's leg). A dispute freezes the clock at `disputed_at` (AV-55): the
+claim neither grows nor rots while arbitration runs, and the settlement
+pays the frozen claim to the taker. `cancel` / `cancel_expired` void the
+outstanding claim — a cancelled deal unwinds to the pre-deal state, so
+no yield is owed on funds that never settled (`interest_paid` is
+untouched, so the forfeiture stays distinguishable from a payout in the
+audit trail).
+
+The accounting rule that matters: `interest_paid` is the new sink in
+the extended conservation identity — `inflow + yield == locked +
+released + refunded + interest_paid + …`, one term per sink. Interest
+never leaks into `released`: principal and yield stay separately
+auditable, and the tests assert the identity across accrue → harvest →
+release lifecycles. Three deliberate non-couplings: the yield leg is
+fee-free (the AV-17 protocol fee and the AV-100 streaming fee slice the
+*principal* payout only), the AV-49 payout allowlist has nothing to pin
+on `claim_interest` (there is no destination param to redirect — the
+harvest always routes to the taker), and `cancel_partial`'s principal
+reduction takes effect on the accrual base at the next settlement
+(`cancel` takes no `now`, so the base lags by at most one settlement
+window — documented, bounded, and negligible).
+
+Gates on `claim_interest`: the escrow must be `Funded`
+(`InvalidStateTransition` otherwise), the caller must be the taker
+(`Unauthorized` otherwise, checked before state validity), and a rate
+must be configured (`InterestNotEnabled`, code 166, when
+`interest_rate_bps == 0` — distinct from a zero harvest, which returns
+`Ok(0)`). `with_interest` with `rate_bps > 10_000` is
+`InvalidInterestRate` (code 165). The Anchor skeleton gains the
+`initialize_interest(rate_bps)` and `claim_interest` handlers (the
+latter reads `now` from the clock sysvar, never an instruction param),
+the four `Vault` fields, and the two `ErrorCode` mappings; the state
+snapshot exports the rate, the outstanding claim, and the paid counter.
+Account layout grows by the 26-byte interest tail (2-byte rate +
+accrual base + accrued claim + paid counter): body 4673 → **4699**,
+`VAULT_SPACE` 4681 → **4707**, `VAULT_SPACE_NO_QUORUM` 4191 →
+**4217**, rent-exempt 33,470,640 → **33,651,600** lamports.
 
 ## Basket escrow (AV-95)
 

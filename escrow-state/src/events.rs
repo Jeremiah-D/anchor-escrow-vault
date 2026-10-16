@@ -2009,8 +2009,12 @@ impl IndexedEscrow {
         // `ReentryRejected`.
         let result = self.inner.release(authority, at, amount, mint, payout_to);
         let (payout, fee) = self.map_reentrant(result, at)?;
-        // `amount` is the gross payout by construction
+        // `amount` is the gross *principal* payout by construction
         // (`payout + fee == amount`); it cannot overflow u64 addition.
+        // AV-107: when interest is configured the taker's `payout`
+        // additionally carries the bundled yield claim — the event
+        // records the principal legs, and the yield leg is observable
+        // via the `interest_paid` counter / snapshot.
         self.push_event(
             EscrowEventKind::Released,
             from,

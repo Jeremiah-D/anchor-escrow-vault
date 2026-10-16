@@ -1023,6 +1023,16 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     let pool_inflow = c.u64_le()?;
     let pool_payout_paid = c.u64_le()?;
 
+    // AV-107: the interest-bearing tail, always reserved: the 2-byte
+    // annual rate in basis points, the 8-byte accrual-clock base, the
+    // 8-byte outstanding yield claim, and the 8-byte cumulative paid
+    // counter — appended last so every earlier offset above is
+    // unchanged.
+    let interest_rate_bps = c.u16_le()?;
+    let interest_accrual_base = c.u64_le()?;
+    let interest_accrued = c.u64_le()?;
+    let interest_paid = c.u64_le()?;
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1211,6 +1221,13 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         pool_slashed,
         pool_inflow,
         pool_payout_paid,
+        // AV-107: the interest-bearing tail rides the decode so a
+        // decoded escrow settles the lazy clock, bundles the yield
+        // claim, and reports the counters exactly like the live one.
+        interest_rate_bps,
+        interest_accrual_base,
+        interest_accrued,
+        interest_paid,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

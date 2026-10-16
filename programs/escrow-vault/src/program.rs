@@ -1012,6 +1012,27 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt the vault into interest-bearing escrow (AV-107; mirrors
+    /// `Escrow::with_interest`). Uninitialized-only, initializer-only.
+    /// `rate_bps` is the annual rate in basis points (0–10000) on the
+    /// locked principal; above 10000 is `InvalidInterestRate` (code
+    /// 165). The 26-byte tail region is already reserved in the vault
+    /// account (zeroed when no interest is configured), so the rate
+    /// is written in place — no realloc needed in the real build.
+    /// Emits no event (pre-fund configuration, like
+    /// `initialize_streaming_fee`).
+    pub fn initialize_interest(
+        ctx: Context<InitializeInterest>,
+        rate_bps: u16,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_interest(rate_bps)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
     /// Claim the vested-but-unreleased portion (AV-13; mirrors
     /// `Escrow::claim`). Only the taker may call this; `now` comes from
     /// the Solana clock sysvar (never an instruction param — a
@@ -1056,6 +1077,28 @@ pub mod escrow_vault {
             None,
         );
         Ok((payout, fee))
+    }
+
+    /// Harvest the accrued interest without touching the principal
+    /// (AV-107; mirrors `Escrow::claim_interest`). Taker-only; `now`
+    /// comes from the Solana clock sysvar (never an instruction param
+    /// — a caller-supplied timestamp would let anyone fast-forward
+    /// the yield clock). Returns the interest paid so the real build
+    /// can size the taker's yield transfer. No rate configured is
+    /// `InterestNotEnabled` (code 166). The yield always routes to the
+    /// taker — there is no destination param to redirect, so the
+    /// AV-49 allowlist has nothing to pin (unlike `claim`, whose
+    /// `payout_to` is caller-chosen). `vault.interest_paid`
+    /// accumulates the payout in place; the real build funds the
+    /// transfer from the vault's yield holdings.
+    pub fn claim_interest(ctx: Context<ClaimInterest>) -> Result<u64> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let paid = escrow
+            .claim_interest(ctx.accounts.taker.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(paid)
     }
 
     /// Opt in to dispute arbitration (AV-14; mirrors
@@ -4549,6 +4592,23 @@ pub struct Vault {
     /// AV-106: cumulative authorized pool payouts (mirrors
     /// `escrow_state`'s `pool_payout_paid`); the outflow sink.
     pub pool_payout_paid: u64,
+    /// AV-107: opt-in annual interest rate in basis points (mirrors
+    /// `escrow_state`'s `interest_rate_bps`); `0` unless the
+    /// initializer called `initialize_interest` while `Uninitialized`.
+    /// Layout position matches `escrow_state::VAULT_FIELDS`
+    /// (appended last, after the insurance-pool region).
+    pub interest_rate_bps: u16,
+    /// AV-107: Unix timestamp up to which interest has been settled
+    /// (mirrors `escrow_state`'s `interest_accrual_base`); anchored
+    /// at `fund_at` by `fund`.
+    pub interest_accrual_base: u64,
+    /// AV-107: outstanding accrued interest — the taker's unsettled
+    /// yield claim (mirrors `escrow_state`'s `interest_accrued`).
+    pub interest_accrued: u64,
+    /// AV-107: cumulative interest paid out to the taker (mirrors
+    /// `escrow_state`'s `interest_paid`); the new sink in the
+    /// extended conservation identity — never mixed into `released`.
+    pub interest_paid: u64,
 }
 
 /// Skeleton mirror of `escrow_state::SlashTerms`: the opt-in
@@ -5801,6 +5861,39 @@ pub struct InitializeStreamingFee<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-107: accounts for `initialize_interest` — same shape as
+/// `InitializeStreamingFee`: only the initializer fixes the rate.
+#[derive(Accounts)]
+pub struct InitializeInterest<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer fixes the interest rate; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized` (`InvalidStateTransition`). `rate_bps` above
+    /// 10000 is `InvalidInterestRate` (code 165); `0` disables the
+    /// yield.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-107: accounts for `claim_interest` — the taker harvests the
+/// accrued yield; the clock is read from the sysvar (never an
+/// instruction param).
+#[derive(Accounts)]
+pub struct ClaimInterest<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the taker may harvest the yield; the state machine
+    /// rejects anyone else with `Unauthorized`.
+    pub taker: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the lazy interest
+    /// settlement (never an instruction param).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Claim`). The real
+    /// build funds the yield transfer from the vault's holdings;
+    /// unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
+}
+
 #[derive(Accounts)]
 pub struct Claim<'info> {
     #[account(mut)]
@@ -7044,6 +7137,12 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidPoolPayout => {
             error!(ErrorCode::InvalidPoolPayout)
         }
+        escrow_state::EscrowError::InvalidInterestRate => {
+            error!(ErrorCode::InvalidInterestRate)
+        }
+        escrow_state::EscrowError::InterestNotEnabled => {
+            error!(ErrorCode::InterestNotEnabled)
+        }
     }
 }
 
@@ -7173,4 +7272,8 @@ pub enum ErrorCode {
     SwapLinkActive,
     #[msg("Invalid insurance-pool payout (AV-106): pool_payout with no pool opted in, by a non-arbiter/non-multisig caller, a zero or over-balance amount, a denied/non-allowlisted beneficiary, on a non-Funded escrow, or while the pool is encumbered by a live appeal; or close_vault with a non-empty pool")]
     InvalidPoolPayout,
+    #[msg("Invalid interest-rate configuration (AV-107): with_interest with rate_bps above 10000 — above 100% APR")]
+    InvalidInterestRate,
+    #[msg("Interest not enabled (AV-107): claim_interest on an escrow with no interest rate configured (interest_rate_bps == 0)")]
+    InterestNotEnabled,
 }
