@@ -237,6 +237,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // delegation config changes — so the fold books nothing.
         | EscrowEventKind::ReleaseIntentAnnounced
         | EscrowEventKind::ReleaseIntentVetoed => (0, 0, 0),
+        // AV-114: the survivor's lockup grew by the merged-in amount
+        // (the event's `payout` leg). The triple's legs only express
+        // outflows, so `fund_delta` books nothing here — the locked
+        // increment is applied directly in `MaterializedView::apply`
+        // (the only inflow the fold expresses as a locked increment).
+        | EscrowEventKind::EscrowsMerged => (0, 0, 0),
         // Expiry cancels: `refund` goes to the pinned destination and
         // the AV-24 anti-griefing `penalty` routes to the initializer
         // as compensation — both are initializer receipts, so both
@@ -436,7 +442,18 @@ impl MaterializedView {
             }
             let (locked_dec, released_inc, refunded_inc) =
                 fund_delta(event.kind, &event.amounts);
-            self.triple.locked = self.triple.locked.saturating_sub(locked_dec);
+            // AV-114: `EscrowsMerged` is the fold's only inflow — the
+            // survivor absorbed the source's locked funds, so `locked`
+            // grows by the merged-in amount (the event's `payout`
+            // leg) instead of shrinking.
+            if event.kind == EscrowEventKind::EscrowsMerged {
+                self.triple.locked = self
+                    .triple
+                    .locked
+                    .saturating_add(event.amounts.payout);
+            } else {
+                self.triple.locked = self.triple.locked.saturating_sub(locked_dec);
+            }
             self.triple.released = self.triple.released.saturating_add(released_inc);
             self.triple.refunded = self.triple.refunded.saturating_add(refunded_inc);
             want = match want.checked_add(1) {
@@ -653,10 +670,46 @@ mod event_sourcing_tests {
                 // escrow funds.
                 | EscrowEventKind::ReleaseIntentAnnounced
                 | EscrowEventKind::ReleaseIntentVetoed
+                // AV-114: the survivor's locked increment rides the
+                // event's payout leg, applied directly in `apply` —
+                // `fund_delta` books nothing.
+                | EscrowEventKind::EscrowsMerged
                 | EscrowEventKind::Slashed => (0, 0, 0),
             };
             assert_eq!(got, want, "delta for {kind:?} (discriminant {d})");
         }
+    }
+
+    #[test]
+    fn fold_tracks_merge_inflow_and_source_exit() {
+        // AV-114: the survivor's `EscrowsMerged` grows `locked` by the
+        // merged-in amount (the fold's only inflow); the source's
+        // `Cancelled` drops its `locked` to zero.
+        let merged = synth(EscrowEventKind::EscrowsMerged, 0, 400_000, 0, 0, 0);
+        let view =
+            MaterializedView::replay(ID, 1_000_000, &[merged]).unwrap();
+        assert_eq!(
+            view.triple(),
+            FundsTriple {
+                locked: 1_400_000,
+                released: 0,
+                refunded: 0,
+            }
+        );
+        let cancelled = EscrowEvent {
+            kind: EscrowEventKind::Cancelled,
+            ..synth(EscrowEventKind::Cancelled, 0, 0, 0, 400_000, 0)
+        };
+        let view =
+            MaterializedView::replay(ID, 400_000, &[cancelled]).unwrap();
+        assert_eq!(
+            view.triple(),
+            FundsTriple {
+                locked: 0,
+                released: 0,
+                refunded: 400_000,
+            }
+        );
     }
 
     #[test]

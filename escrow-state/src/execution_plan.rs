@@ -423,6 +423,8 @@ mod execution_plan_tests {
             // AV-111: test actions carry no funding progress.
             funding_progress: None,
             reason: "test",
+            // AV-114: test actions carry no merge source.
+            merge_source: None,
         }
     }
 

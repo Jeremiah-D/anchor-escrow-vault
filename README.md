@@ -1254,6 +1254,7 @@ program error per variant):
 | `ReleaseCoolingNotElapsed` | 174 | `release` (AV-112) while cooling is configured and no live intent exists, or before `intent_at + cooling_secs` (stacked after the AV-27 timelock gate) |
 | `PriceGateNotSatisfied` | 175 | `release_price_gated` / `claim_price_gated` (AV-113) with a configured gate when the oracle is dark, the quote is stale (`now - observed_at > max_staleness_secs`), or the price misses the gate's direction condition |
 | `InvalidPriceGate` | 176 | `with_price_gate` / `initialize_price_gate` (AV-113) with `target == 0`, or a vault-account decode hitting an out-of-range direction byte |
+| `MergeIncompatible` | 177 | `merge_escrows` (AV-114) with different parties, mismatched vesting/vesting-curve/milestones/fee_bps/quorum/dual-sig/mint/timelock terms, or an amount counter that would overflow |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -3793,6 +3794,57 @@ initializer              taker                    oracle
    |                     |--------------------------->|
    |                     |   Released                 |
    |                     |<---------------------------|
+```
+
+## Escrow merge (AV-114)
+
+The problem: an initializer who funds per-invoice escrows ends up
+with a fleet of small `Funded` vaults — settling each one separately
+costs a transaction per escrow. AV-114 adds `merge_escrows`: two
+`Funded` escrows with the same parties and identical settlement
+terms collapse into one, so dust escrows consolidate instead of
+settling piecemeal.
+
+`merge_escrows(source, authority)` is initializer-only
+(`Unauthorized` otherwise); both escrows must be `Funded`
+(`InvalidStateTransition` otherwise). Compatibility is checked term
+by term — vesting schedule, vesting curve, milestone plan, fee bps,
+quorum policy, the dual-sig-required bit, mint, and timelock must
+all match, else `MergeIncompatible` (code 177). Accumulation is
+u128-checked: `amount`, `released`, `skipped`, and `fees_paid` each
+sum, and a sum that would overflow `u64` refuses the merge rather
+than wrapping. `expires_at` becomes the earlier of the two
+deadlines — the merged escrow keeps the tighter expiry, so no
+deadline is silently extended. The source moves to `Cancelled` with
+`released := amount` ("released-into-merge" accounting): the
+source's locked funds conceptually release into the survivor, so
+the per-escrow conservation identity holds on both sides.
+
+The `IndexedEscrow` wrapper emits `EscrowsMerged` (61) on the
+survivor (`from == to == Funded`, the merged-in remainder in the
+payout leg) and `Cancelled` on the source. The event-sourced fold
+treats the merge as its only inflow: the survivor's `locked` grows
+by the merged-in amount while the source's drops to zero, so fleet
+rollups keep counting the consolidated funds. The keeper lists one
+`merge_escrows` action per compatible pair per scan — the lower
+`escrow_id` survives, the higher rides `merge_source`; expiry-eligible
+escrows keep their cancel path instead of a merge. The Anchor
+skeleton gains the `merge_escrows` handler (two vault accounts) plus
+the error mapping (code 177). No new persisted fields — the account
+layout is untouched.
+
+**Walkthrough — consolidating two invoices.** The initializer funded
+1,000,000 for invoice A and 500,000 for invoice B, same taker, same
+terms:
+
+```
+initializer              vault A (1M)          vault B (500k)
+   | merge_escrows(B)        |                       |
+   |------------------------>|---------------------->|
+   |                         | amount = 1,500,000    |
+   |                         | EscrowsMerged         |
+   |                         |                       | Cancelled
+   |                         |                       | (released := 500k)
 ```
 
 ## Basket escrow (AV-95)

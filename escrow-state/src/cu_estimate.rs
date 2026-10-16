@@ -115,6 +115,11 @@ pub const INSTRUCTION_CU_TABLE: &[(&str, u64, usize)] = &[
     // AV-112: no params → 8; clearing one timestamp, no fund
     // movement — ranked with the cheap config writes.
     ("veto_release", 8_000, 8),
+    // AV-114: no params → 8 + 0; a two-account consolidation with the
+    // full guard chain (pause × 2, initializer authority, Funded × 2,
+    // term compatibility, u128-checked accumulation) — ranked with
+    // claim, the other initializer/taker fund-moving call.
+    ("merge_escrows", 14_000, 8),
 ];
 
 /// Base cost for `instruction`, or `None` when the table has no row —

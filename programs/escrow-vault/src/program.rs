@@ -1528,6 +1528,63 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Merge the source vault into the target vault (AV-114; mirrors
+    /// `Escrow::merge_escrows`). Both vaults must be `Funded` with the
+    /// same parties and identical settlement terms
+    /// (`MergeIncompatible`, code 177, otherwise); only the
+    /// initializer may merge (`Unauthorized` otherwise). The target
+    /// absorbs the source's locked amount (u128-checked); the source
+    /// vault moves to `Cancelled` with `released := amount`. Emits
+    /// `EscrowsMerged` on the target vault and `Cancelled` on the
+    /// source vault, mirroring the off-chain `IndexedEscrow` wrapper.
+    pub fn merge_escrows(ctx: Context<MergeEscrows>) -> Result<()> {
+        let mut target = read_escrow(&ctx.accounts.vault);
+        let mut source = read_escrow(&ctx.accounts.source_vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let authority = ctx.accounts.authority.key().to_bytes();
+        // The survivor's lockup grows by the source's pre-merge
+        // remainder (not the deal size — see the off-chain
+        // `IndexedEscrow::merge_escrows`).
+        let merged_in = source.remaining_amount();
+        let source_from = source.state() as u8;
+        target
+            .merge_escrows(&mut source, authority)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &target);
+        write_escrow(&mut ctx.accounts.source_vault, &source);
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::EscrowsMerged,
+            escrow_state::EscrowState::Funded as u8,
+            escrow_state::EscrowState::Funded as u8,
+            merged_in,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.authority.key()),
+        );
+        emit_transition(
+            &ctx.accounts.source_vault,
+            escrow_state::EscrowEventKind::Cancelled,
+            source_from,
+            escrow_state::EscrowState::Cancelled as u8,
+            0,
+            0,
+            source.remaining_amount(),
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.authority.key()),
+        );
+        Ok(())
+    }
+
     /// Opt in to dispute arbitration (AV-14; mirrors
     /// `Escrow::with_arbiter`). `Uninitialized` only, like
     /// `initialize_quorum`: the arbiter's identity is fixed before funds
@@ -6566,6 +6623,27 @@ pub struct InitializePriceGate<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-114: accounts for `merge_escrows` — the surviving target vault
+/// and the absorbed source vault, plus the initializer signer (the
+/// only authority that may merge) and the clock sysvar for the event
+/// timestamps.
+#[derive(Accounts)]
+pub struct MergeEscrows<'info> {
+    /// The surviving vault: absorbs the source's locked amount.
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The absorbed vault: moves to `Cancelled` with
+    /// `released := amount`.
+    #[account(mut)]
+    pub source_vault: Account<'info, Vault>,
+    /// Only the initializer may consolidate escrows; the state
+    /// machine rejects anyone else with `Unauthorized`.
+    pub authority: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the event `at` timestamps
+    /// (never an instruction param).
+    pub clock: AccountInfo<'info>,
+}
+
 #[derive(Accounts)]
 pub struct Claim<'info> {
     #[account(mut)]
@@ -7880,6 +7958,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidPriceGate => {
             error!(ErrorCode::InvalidPriceGate)
         }
+        escrow_state::EscrowError::MergeIncompatible => {
+            error!(ErrorCode::MergeIncompatible)
+        }
     }
 }
 
@@ -8033,4 +8114,6 @@ pub enum ErrorCode {
     PriceGateNotSatisfied,
     #[msg("Invalid price gate (AV-113): with_price_gate with target == 0, or an out-of-range direction byte")]
     InvalidPriceGate,
+    #[msg("Escrows incompatible for merge (AV-114): different parties, mismatched settlement terms, or an amount counter that would overflow")]
+    MergeIncompatible,
 }

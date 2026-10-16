@@ -233,6 +233,7 @@
 //! | TrancheFunded (AV-111) | 0 | 0 | 0 | 0 — a funding tranche landed; the fold seeds the lockup with the deal size at `Funded`, so the tranche carries no amount (exactly like `Funded` itself) |
 //! | ReleaseIntentAnnounced (AV-112) | 0 | 0 | 0 | 0 — a release intent was announced (governance signal; the cooling window starts) |
 //! | ReleaseIntentVetoed (AV-112) | 0 | 0 | 0 | 0 — a live release intent was vetoed (governance signal; the announced release is cancelled) |
+//! | EscrowsMerged (AV-114) | the source's locked amount folded into the survivor | 0 | 0 | 0 |
 //! | ExpiredCranked (AV-48) | 0 | 0 | remainder minus penalty, to the whitelisted destination (the cranker receives nothing) | anti-griefing penalty to the initializer (AV-24; 0 unless the cranker is the taker) |
 //! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
 //! | DefaultJudgment (AV-55) | gross taker share (`default_taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
@@ -797,6 +798,17 @@ pub enum EscrowEventKind {
     /// Emitted only on an actual change: vetoing with no live intent
     /// is a no-op success that emits nothing.
     ReleaseIntentVetoed,
+    /// AV-114: two escrows merged
+    /// ([`Escrow::merge_escrows`](crate::Escrow::merge_escrows)) — the
+    /// source escrow's locked funds folded into the surviving escrow.
+    /// `from == to == Funded` on the survivor (the merge is a
+    /// consolidation, not a lifecycle move — like
+    /// [`EscrowEventKind::ReleaseIntentAnnounced`]); the source emits
+    /// [`EscrowEventKind::Cancelled`] separately. The event carries
+    /// the merged-in amount as a payout-shaped amount (the survivor's
+    /// lockup grew by exactly that), so the event-sourced fold keeps
+    /// the conservation identity. The actor is the initializer.
+    EscrowsMerged,
 }
 
 impl EscrowEventKind {
@@ -944,6 +956,10 @@ impl EscrowEventKind {
             // discriminants 0–59 stay stable for
             // already-serialized histories.
             60 => Self::ReleaseIntentVetoed,
+            // AV-114: appended after ReleaseIntentVetoed so
+            // discriminants 0-60 stay stable for
+            // already-serialized histories.
+            61 => Self::EscrowsMerged,
             _ => return None,
         })
     }
@@ -1013,6 +1029,7 @@ impl EscrowEventKind {
             Self::TrancheFunded => "tranche_funded",
             Self::ReleaseIntentAnnounced => "release_intent_announced",
             Self::ReleaseIntentVetoed => "release_intent_vetoed",
+            Self::EscrowsMerged => "escrows_merged",
         }
     }
 
@@ -1083,6 +1100,7 @@ impl EscrowEventKind {
             "tranche_funded" => Self::TrancheFunded,
             "release_intent_announced" => Self::ReleaseIntentAnnounced,
             "release_intent_vetoed" => Self::ReleaseIntentVetoed,
+            "escrows_merged" => Self::EscrowsMerged,
             _ => return None,
         })
     }
@@ -2227,6 +2245,60 @@ impl IndexedEscrow {
             Some(authority),
         );
         Ok((payout, fee))
+    }
+
+    /// Merge `source` into `self` (mirrors
+    /// [`Escrow::merge_escrows`]). Emits `EscrowsMerged` on the
+    /// surviving escrow (`from == to == Funded`, the merged-in amount
+    /// in `amounts.payout`) and `Cancelled` on the source (`Funded` →
+    /// `Cancelled`, the released-into-merge amount in
+    /// `amounts.refund`). `at` doubles as the event timestamp; the
+    /// pure transition takes no clock input. The actor on both events
+    /// is the initializer (the only authority that may merge).
+    ///
+    /// [`Escrow::merge_escrows`]: crate::Escrow::merge_escrows
+    pub fn merge_escrows(
+        &mut self,
+        source: &mut IndexedEscrow,
+        authority: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let source_from = source.inner.state();
+        // Capture before the merge: the source's pre-merge remainder is
+        // the merged-in leg (what the survivor's lockup actually grows
+        // by — the deal-size `amount` overstates it once the source
+        // has partial releases). After the merge the source's
+        // remainder is 0 — the funds moved, they did not vanish — so
+        // the source's `Cancelled` event refunds this same remainder
+        // in the fold.
+        let source_remaining = source.inner.remaining_amount();
+        self.inner.merge_escrows(&mut source.inner, authority)?;
+        self.push_event(
+            EscrowEventKind::EscrowsMerged,
+            from,
+            self.inner.state(),
+            EventAmounts::payout(source_remaining, 0),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        source.push_event(
+            EscrowEventKind::Cancelled,
+            source_from,
+            source.inner.state(),
+            EventAmounts::refund(source_remaining),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(())
     }
 
     /// Release `amount` routed through a third-party program via CPI
@@ -6528,7 +6600,8 @@ mod event_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(59), Some(EscrowEventKind::ReleaseIntentAnnounced));
         assert_eq!(EscrowEventKind::from_discriminant(60), Some(EscrowEventKind::ReleaseIntentVetoed));
-        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+        assert_eq!(EscrowEventKind::from_discriminant(61), Some(EscrowEventKind::EscrowsMerged));
+        assert_eq!(EscrowEventKind::from_discriminant(62), None);
     }
 
     #[test]
@@ -6631,7 +6704,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+        assert_eq!(EscrowEventKind::from_discriminant(62), None);
     }
 
     #[test]
@@ -7168,7 +7241,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+        assert_eq!(EscrowEventKind::from_discriminant(62), None);
     }
 
     #[test]
@@ -7183,7 +7256,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+        assert_eq!(EscrowEventKind::from_discriminant(62), None);
     }
 
     #[test]
@@ -7195,7 +7268,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+        assert_eq!(EscrowEventKind::from_discriminant(62), None);
     }
 
     #[test]
@@ -7207,7 +7280,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+        assert_eq!(EscrowEventKind::from_discriminant(62), None);
     }
 
     #[test]
@@ -7219,7 +7292,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+        assert_eq!(EscrowEventKind::from_discriminant(62), None);
     }
 
     #[test]
@@ -7234,7 +7307,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+        assert_eq!(EscrowEventKind::from_discriminant(62), None);
     }
 
     #[test]
@@ -7249,7 +7322,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+        assert_eq!(EscrowEventKind::from_discriminant(62), None);
     }
 
     #[test]
@@ -7261,7 +7334,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+        assert_eq!(EscrowEventKind::from_discriminant(62), None);
     }
 
     #[test]
@@ -7273,7 +7346,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+        assert_eq!(EscrowEventKind::from_discriminant(62), None);
     }
 
     #[test]
@@ -7285,7 +7358,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+        assert_eq!(EscrowEventKind::from_discriminant(62), None);
     }
 
     #[test]

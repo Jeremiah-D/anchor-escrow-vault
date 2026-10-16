@@ -865,6 +865,12 @@
         {"name": "target", "type": "u64"},
         {"name": "max_staleness_secs", "type": "u64"}
       ]
+    },
+    {
+      "name": "merge_escrows",
+      "discriminator": [107, 14, 126, 41, 132, 158, 212, 191],
+      "accounts": [],
+      "args": []
     }
   ],
   "accounts": [
@@ -1303,7 +1309,8 @@
     {"code": 173, "name": "InvalidFundingPlan"},
     {"code": 174, "name": "ReleaseCoolingNotElapsed"},
     {"code": 175, "name": "PriceGateNotSatisfied"},
-    {"code": 176, "name": "InvalidPriceGate"}
+    {"code": 176, "name": "InvalidPriceGate"},
+    {"code": 177, "name": "MergeIncompatible"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

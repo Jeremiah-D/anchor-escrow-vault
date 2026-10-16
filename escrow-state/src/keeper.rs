@@ -359,6 +359,20 @@ pub enum KeeperActionKind {
     /// `funding_progress` passes the plan's live counters through so
     /// the operator's dashboard sees the funding state.
     FundTranche,
+    /// `merge_escrows(authority)` (AV-114): the initializer's
+    /// consolidation of two merge-compatible `Funded` escrows into
+    /// one. Listed once per compatible pair per scan — the lower
+    /// `escrow_id` survives as the merge target, the higher is the
+    /// source (carried on [`KeeperAction::merge_source`]). A listed
+    /// merge is always executable, never a `Paused`, `Unauthorized`,
+    /// `InvalidStateTransition`, or `MergeIncompatible` rejection:
+    /// the scan only pairs unpaused, unexpired, same-party,
+    /// term-identical escrows (expiry-eligible escrows keep their
+    /// cancel path instead). The initializer is the caller
+    /// (`caller_role: "initializer"`); `amount` is the source's
+    /// locked amount — the merged-in leg the surviving escrow
+    /// absorbs.
+    MergeEscrows,
 }
 
 impl KeeperActionKind {
@@ -379,6 +393,7 @@ impl KeeperActionKind {
             KeeperActionKind::PoolPayout => "pool_payout",
             KeeperActionKind::ClaimDeadman => "claim_deadman",
             KeeperActionKind::FundTranche => "fund_tranche",
+            KeeperActionKind::MergeEscrows => "merge_escrows",
         }
     }
 }
@@ -479,8 +494,16 @@ pub struct KeeperAction {
     /// `"disputed"` (AV-38, `resolve` actions; AV-65,
     /// `submit_panel_judgment` actions),
     /// `"subscription_period_due"` (AV-56, `release_period` actions),
-    /// or `"funding_incomplete"` (AV-111, `fund_tranche` actions).
+    /// `"funding_incomplete"` (AV-111, `fund_tranche` actions), or
+    /// `"mergeable_pair"` (AV-114, `merge_escrows` actions).
     pub reason: &'static str,
+    /// AV-114: the merge source escrow's id — set on
+    /// [`KeeperActionKind::MergeEscrows`] actions (the higher
+    /// `escrow_id` of the pair; the action's own `escrow_id` is the
+    /// surviving target), `None` on every other kind. The Anchor
+    /// `merge_escrows` instruction takes the source vault as its
+    /// second account.
+    pub merge_source: Option<[u8; 32]>,
 }
 
 /// AV-111: the live tranched-funding counters passed through on a
@@ -774,6 +797,19 @@ impl KeeperReport {
                 }
                 None => s.push_str("null"),
             }
+            // AV-114: the merge source escrow id — hex, `null` unless
+            // the action is a `merge_escrows`.
+            s.push_str(",\"merge_source\":");
+            match a.merge_source {
+                Some(id) => {
+                    s.push('"');
+                    for b in id {
+                        s.push_str(&format!("{b:02x}"));
+                    }
+                    s.push('"');
+                }
+                None => s.push_str("null"),
+            }
             // AV-88: the per-action CU passthrough — the heuristic
             // estimate for this keeper call, same cost model as the
             // execution plan.
@@ -850,6 +886,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                             evidence_disclosure: e.evidence_disclosure(),
                             funding_progress: None,
                             reason: "disputed",
+                            merge_source: None,
                         });
                     }
                 }
@@ -879,6 +916,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         evidence_disclosure: e.evidence_disclosure(),
                         funding_progress: None,
                         reason: "disputed",
+                        merge_source: None,
                     });
                 }
             }
@@ -927,6 +965,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                             max_tranches: plan.max_tranches(),
                         }),
                         reason: "funding_incomplete",
+                        merge_source: None,
                     });
                 }
             }
@@ -971,6 +1010,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 evidence_disclosure: None,
                 funding_progress: None,
                 reason: "expired",
+                merge_source: None,
             });
             // AV-48: the permissionless crank — the same expiry exit,
             // callable by anyone. A keeper bot that is party to nothing
@@ -1005,6 +1045,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     evidence_disclosure: None,
                     funding_progress: None,
                     reason: "expired",
+                    merge_source: None,
                 });
             }
         }
@@ -1041,6 +1082,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 evidence_disclosure: None,
                 funding_progress: None,
                 reason: "deadman_inactivity_elapsed",
+                merge_source: None,
             });
         }
         // The taker's pull path: vesting attached (or an AV-97 Dutch
@@ -1085,6 +1127,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 } else {
                     "vesting_unlocked"
                 },
+                merge_source: None,
             });
         }
         // AV-56: the initializer's push path for the next due
@@ -1133,6 +1176,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     evidence_disclosure: None,
                     funding_progress: None,
                     reason: "subscription_period_due",
+                    merge_source: None,
                 });
             }
         }
@@ -1165,6 +1209,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 evidence_disclosure: None,
                 funding_progress: None,
                 reason: "slash_deadline_passed",
+                merge_source: None,
             });
             if let Some(arbiter) = e.arbiter() {
                 actions.push(KeeperAction {
@@ -1183,6 +1228,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     evidence_disclosure: None,
                     funding_progress: None,
                     reason: "slash_deadline_passed",
+                    merge_source: None,
                 });
             }
         }
@@ -1214,6 +1260,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 evidence_disclosure: None,
                 funding_progress: None,
                 reason: "appeal_window_open",
+                merge_source: None,
             });
         }
         if e.is_appeal_under_review() {
@@ -1247,6 +1294,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         evidence_disclosure: None,
                         funding_progress: None,
                         reason: "appeal_filed",
+                        merge_source: None,
                     });
                 }
             }
@@ -1280,6 +1328,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 evidence_disclosure: None,
                 funding_progress: None,
                 reason: "appeal_window_lapsed",
+                merge_source: None,
             });
         }
         // AV-106: the insurance-pool payout. Listed when
@@ -1319,7 +1368,79 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     evidence_disclosure: None,
                     funding_progress: None,
                     reason: "pool_payout_available",
+                    merge_source: None,
                 });
+            }
+        }
+    }
+    // AV-114: merge-pair scan — a second pass over the watched escrows
+    // finds pairs of `Funded` escrows the initializer can consolidate
+    // via `merge_escrows`. Greedy pairing in input order: the lower
+    // `escrow_id` survives as the merge target, the higher is the
+    // source. Each escrow joins at most one pair per scan, so a listed
+    // merge never double-spends a source. A listed merge is always
+    // executable — both sides unpaused, unexpired and `Funded`, same
+    // parties and term-identical via `is_merge_compatible_with` (so
+    // `merge_escrows` cannot refuse it with `MergeIncompatible`), and
+    // the u128-checked accumulation re-verified at call time.
+    {
+        let mut paired = vec![false; watched.len()];
+        for i in 0..watched.len() {
+            if paired[i] {
+                continue;
+            }
+            let a = &watched[i];
+            // An expiry-eligible escrow already lists its cancel path —
+            // merging it would race the cancel, so the scan leaves it
+            // to the expiry exit.
+            if a.escrow.state() != EscrowState::Funded
+                || a.escrow.is_paused()
+                || a.escrow.is_expiry_eligible(now)
+            {
+                continue;
+            }
+            for j in (i + 1)..watched.len() {
+                if paired[j] {
+                    continue;
+                }
+                let b = &watched[j];
+                if b.escrow.state() != EscrowState::Funded
+                    || b.escrow.is_paused()
+                    || b.escrow.is_expiry_eligible(now)
+                {
+                    continue;
+                }
+                if !a.escrow.is_merge_compatible_with(&b.escrow) {
+                    continue;
+                }
+                let (target, source) = if a.escrow_id <= b.escrow_id {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                paired[i] = true;
+                paired[j] = true;
+                actions.push(KeeperAction {
+                    escrow_id: target.escrow_id,
+                    vault_address: target.vault_address(),
+                    kind: KeeperActionKind::MergeEscrows,
+                    caller: target.escrow.initializer(),
+                    caller_role: "initializer",
+                    mint: target.escrow.mint(),
+                    // `merge_escrows` consolidates the lockups — no
+                    // single refund destination applies.
+                    refund_to: None,
+                    amount: source.escrow.remaining_amount(),
+                    decimals: target.escrow.decimals(),
+                    reference: target.reference,
+                    extension_count: target.escrow.extension_count(),
+                    multisig_authority: target.escrow.multisig_authority,
+                    evidence_disclosure: None,
+                    funding_progress: None,
+                    reason: "mergeable_pair",
+                    merge_source: Some(source.escrow_id),
+                });
+                break;
             }
         }
     }
@@ -1916,6 +2037,7 @@ mod keeper_tests {
 
     const ALICE: [u8; 32] = [0xAA; 32]; // initializer
     const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const CAROL: [u8; 32] = [0xCC; 32]; // other taker
     const A1: [u8; 32] = [0xA1; 32]; // attestors
     const A2: [u8; 32] = [0xA2; 32];
     const A3: [u8; 32] = [0xA3; 32];
@@ -2445,6 +2567,7 @@ mod keeper_tests {
                 evidence_disclosure: None,
                 funding_progress: None,
                 reason: "expired",
+                merge_source: None,
             }
         );
         assert_eq!(
@@ -2466,10 +2589,99 @@ mod keeper_tests {
                 evidence_disclosure: None,
                 funding_progress: None,
                 reason: "expired",
+                merge_source: None,
             }
         );
         assert_eq!(report.actions[2].escrow_id, ID2);
         assert_eq!(report.actions[2].kind, KeeperActionKind::Claim);
+    }
+
+    #[test]
+    fn scan_lists_merge_pair_lower_id_survives() {
+        // Two merge-compatible Funded escrows: the scan lists one
+        // merge_escrows action — the lower escrow_id survives as the
+        // target, the higher rides merge_source.
+        let watched = [
+            watch(ID2, funded(AMOUNT, NEVER)),
+            watch(ID1, funded(AMOUNT, NEVER)),
+        ];
+        let report = scan_keeper_actions(&watched, MID);
+        let merges: Vec<_> = report
+            .actions
+            .iter()
+            .filter(|a| a.kind == KeeperActionKind::MergeEscrows)
+            .collect();
+        assert_eq!(merges.len(), 1);
+        let m = merges[0];
+        assert_eq!(m.escrow_id, ID1);
+        assert_eq!(m.merge_source, Some(ID2));
+        assert_eq!(m.caller, ALICE);
+        assert_eq!(m.caller_role, "initializer");
+        assert_eq!(m.amount, AMOUNT);
+        assert_eq!(m.reason, "mergeable_pair");
+    }
+
+    #[test]
+    fn scan_skips_incompatible_and_expired_pairs() {
+        // Different takers: no merge.
+        let mut other_taker = Escrow::initialize(ALICE, CAROL, AMOUNT, NEVER).unwrap();
+        other_taker.fund(ALICE, MID).unwrap();
+        let watched = [watch(ID1, funded(AMOUNT, NEVER)), watch(ID2, other_taker)];
+        let report = scan_keeper_actions(&watched, MID);
+        assert!(!report
+            .actions
+            .iter()
+            .any(|a| a.kind == KeeperActionKind::MergeEscrows));
+        // Expired escrows keep their cancel path, not a merge.
+        let watched = [watch(ID1, funded(AMOUNT, 0)), watch(ID2, funded(AMOUNT, 0))];
+        let report = scan_keeper_actions(&watched, MID);
+        assert!(!report
+            .actions
+            .iter()
+            .any(|a| a.kind == KeeperActionKind::MergeEscrows));
+    }
+
+    #[test]
+    fn scan_pairs_each_escrow_at_most_once() {
+        // Three compatible escrows: exactly one pair, the third stays
+        // unpaired.
+        let id3 = [0x03; 32];
+        let watched = [
+            watch(ID1, funded(AMOUNT, NEVER)),
+            watch(ID2, funded(AMOUNT, NEVER)),
+            watch(id3, funded(AMOUNT, NEVER)),
+        ];
+        let report = scan_keeper_actions(&watched, MID);
+        let merges: Vec<_> = report
+            .actions
+            .iter()
+            .filter(|a| a.kind == KeeperActionKind::MergeEscrows)
+            .collect();
+        assert_eq!(merges.len(), 1);
+        assert_eq!(merges[0].escrow_id, ID1);
+        assert_eq!(merges[0].merge_source, Some(ID2));
+    }
+
+    #[test]
+    fn merge_action_cu_is_pinned() {
+        // AV-114: merge_escrows — no params (8 data bytes); the keeper
+        // plans vault + authority (2 accounts, no refund_to, no mint)
+        // + 1 signer.
+        let watched = [
+            watch(ID1, funded(AMOUNT, NEVER)),
+            watch(ID2, funded(AMOUNT, NEVER)),
+        ];
+        let report = scan_keeper_actions(&watched, MID);
+        let m = report
+            .actions
+            .iter()
+            .find(|a| a.kind == KeeperActionKind::MergeEscrows)
+            .unwrap();
+        // 14_000 base + 3_000/signer + 250/account + 8/data byte.
+        assert_eq!(
+            m.estimated_compute_units(),
+            14_000 + 3_000 + 2 * 250 + 8 * 8
+        );
     }
 
     #[test]
@@ -2482,7 +2694,7 @@ mod keeper_tests {
         // 3 accounts, 8 data bytes, 1 signer →
         // 10_000 + 3_000 + 3×250 + 8×8 = 13_814 each; total 27_628.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"estimated_cu\":13814}}]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"estimated_cu\":13814}}]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -2507,7 +2719,7 @@ mod keeper_tests {
         // AV-88: claim with mint, no refund_to: 3 accounts, 8 data
         // bytes, 1 signer → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"estimated_cu\":17814}}]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"estimated_cu\":17814}}]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),
@@ -2627,6 +2839,7 @@ mod keeper_tests {
             evidence_disclosure: None,
             funding_progress: None,
             reason: "expired",
+            merge_source: None,
         };
         assert_eq!(a.estimated_compute_units(), 13_814);
         // Without refund_to the account drops out of the estimate.
@@ -2649,6 +2862,7 @@ mod keeper_tests {
             caller_role: "arbiter",
             funding_progress: None,
             reason: "disputed",
+            merge_source: None,
             refund_to: None,
             ..a
         };

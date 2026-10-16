@@ -2048,6 +2048,15 @@ pub enum EscrowError {
     /// other `Invalid*` config errors. Never renumbered (see
     /// [`EscrowError::code`]).
     InvalidPriceGate,
+    /// AV-114: escrow merge refused — [`Escrow::merge_escrows`] found
+    /// the two escrows incompatible: different parties, different
+    /// vesting / vesting-curve / milestone / fee / quorum / dual-sig /
+    /// mint / timelock terms, or an amount counter that would overflow
+    /// on accumulation. One code for all incompatibility modes: the
+    /// caller learns the merge was refused, never which term
+    /// mismatched. Both escrows are untouched. Never renumbered (see
+    /// [`EscrowError::code`]).
+    MergeIncompatible,
 }
 
 impl EscrowError {
@@ -2149,6 +2158,7 @@ impl EscrowError {
             // AV-113: appended, never renumbered.
             EscrowError::PriceGateNotSatisfied => 175,
             EscrowError::InvalidPriceGate => 176,
+            EscrowError::MergeIncompatible => 177,
         }
     }
 
@@ -2232,6 +2242,7 @@ impl EscrowError {
             EscrowError::ReleaseCoolingNotElapsed,
             EscrowError::PriceGateNotSatisfied,
             EscrowError::InvalidPriceGate,
+            EscrowError::MergeIncompatible,
         ]
     }
 }
@@ -5574,6 +5585,107 @@ impl Escrow {
     ) -> Result<(u64, u64), EscrowError> {
         self.require_price_gate(feed, now)?;
         self.claim(authority, now, mint, payout_to)
+    }
+
+    /// Whether `other` can merge into `self` via
+    /// [`Escrow::merge_escrows`]: same parties and identical settlement
+    /// terms. The keeper scan uses this to find mergeable pairs
+    /// without attempting the transition.
+    pub fn is_merge_compatible_with(&self, other: &Escrow) -> bool {
+        self.initializer == other.initializer
+            && self.taker == other.taker
+            && self.vesting_schedule() == other.vesting_schedule()
+            && self.vesting_curve() == other.vesting_curve()
+            && self.milestone_plan() == other.milestone_plan()
+            && self.fee_bps == other.fee_bps
+            && self.quorum() == other.quorum()
+            && self.dual_sig_required() == other.dual_sig_required()
+            && self.mint() == other.mint()
+            && self.timelock == other.timelock
+    }
+
+    /// Merge `source` into `self` (AV-114): two `Funded` escrows with
+    /// the same parties and identical settlement terms collapse into
+    /// one — the initializer consolidates dust escrows instead of
+    /// settling each separately. `self` survives with the summed
+    /// amounts; `source` moves to `Cancelled`.
+    ///
+    /// Check order — pause → authority → state → compatibility →
+    /// accumulation — mirrors the other fund-moving transitions: a
+    /// paused escrow fails fast (`Paused`, both sides checked); only
+    /// the initializer may merge (`Unauthorized` otherwise — the
+    /// taker cannot force-consolidate the initializer's escrows);
+    /// both escrows must be `Funded` (`InvalidStateTransition`
+    /// otherwise); any term mismatch is [`EscrowError::MergeIncompatible`]
+    /// (code 177).
+    ///
+    /// Accumulation is u128-checked: `amount`, `released`, `skipped`
+    /// and `fees_paid` each sum, and a sum that would overflow `u64`
+    /// is `MergeIncompatible` (never a wrap). `expires_at` becomes the
+    /// earlier of the two deadlines — the merged escrow keeps the
+    /// tighter expiry, so no deadline is silently extended.
+    ///
+    /// The source is marked `Cancelled` with `released := amount`
+    /// ("released-into-merge" accounting): the source's locked funds
+    /// conceptually release into the surviving escrow, so the
+    /// per-escrow conservation identity (`inflow == locked +
+    /// released + refunded + ...`) still holds on both sides after
+    /// the merge.
+    ///
+    /// The [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits
+    /// [`EscrowEventKind::EscrowsMerged`](crate::EscrowEventKind::EscrowsMerged)
+    /// on the surviving escrow and `Cancelled` on the source.
+    pub fn merge_escrows(
+        &mut self,
+        source: &mut Escrow,
+        authority: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast, on
+        // both sides (merging out of a paused vault would bypass the
+        // pause's fund-freeze).
+        self.require_not_paused()?;
+        source.require_not_paused()?;
+        // Initializer-only: the merge consolidates the initializer's
+        // escrows, so only they may authorize it.
+        self.require_initializer(authority)?;
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        match source.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if !self.is_merge_compatible_with(source) {
+            return Err(EscrowError::MergeIncompatible);
+        }
+        // u128-checked accumulation — a sum that would overflow u64
+        // refuses the merge rather than wrapping.
+        let amount = (self.amount as u128)
+            .checked_add(source.amount as u128)
+            .filter(|&s| s <= u64::MAX as u128)
+            .ok_or(EscrowError::MergeIncompatible)? as u64;
+        let released = (self.released as u128)
+            .checked_add(source.released as u128)
+            .filter(|&s| s <= u64::MAX as u128)
+            .ok_or(EscrowError::MergeIncompatible)? as u64;
+        let skipped = (self.skipped as u128)
+            .checked_add(source.skipped as u128)
+            .filter(|&s| s <= u64::MAX as u128)
+            .ok_or(EscrowError::MergeIncompatible)? as u64;
+        let fees_paid = (self.fees_paid as u128)
+            .checked_add(source.fees_paid as u128)
+            .filter(|&s| s <= u64::MAX as u128)
+            .ok_or(EscrowError::MergeIncompatible)? as u64;
+        self.amount = amount;
+        self.released = released;
+        self.skipped = skipped;
+        self.fees_paid = fees_paid;
+        self.expires_at = self.expires_at.min(source.expires_at);
+        // The source's locked funds release into the surviving escrow.
+        source.released = source.amount;
+        source.state = EscrowState::Cancelled;
+        Ok(())
     }
 
     /// Announce a release intent (AV-112): either party records that a
@@ -18570,6 +18682,17 @@ pub(crate) mod anchor_idl_tests {
             method: "Escrow::with_price_gate",
             input_mapping: "direction/target/max_staleness_secs <- params; authority <- accounts.initializer (signer) — the initializer owns the release governance; Uninitialized only (InvalidStateTransition once funded — the market condition is fixed before any funds move; builder-style like the other initialize_* opt-ins, overwriting is allowed while Uninitialized); target == 0 is InvalidPriceGate (code 176); a paused escrow fails fast (Paused); writes the price_gate tail region in place (see PARAM_FIELD_MAP); no indexer event (pre-fund configuration). The gate itself is enforced by release_price_gated / claim_price_gated: the Anchor release/claim handlers route to the gated entry points when price_gate is Some, feeding the oracle account's quote through",
         },
+        InstructionSpec {
+            // AV-114: the escrow consolidation. IDL:
+            // discriminator = sha256("global:merge_escrows")[..8] =
+            // [0x6b, 0x0e, 0x7e, 0x29, 0x84, 0x9e, 0xd4, 0xbf] — the
+            // Anchor instruction discriminator for the merge_escrows
+            // handler (pinned by the discriminator test below).
+            name: "merge_escrows",
+            params: &[],
+            method: "Escrow::merge_escrows",
+            input_mapping: "no params; authority <- accounts.initializer (signer) — initializer-only (Unauthorized otherwise); accounts.vault is the surviving target, accounts.source_vault the absorbed source; a paused escrow fails fast (Paused, both sides); both Funded (InvalidStateTransition otherwise); same (initializer, taker) and identical vesting/vesting-curve/milestones/fee_bps/quorum/dual-sig/mint/timelock terms (MergeIncompatible, code 177, otherwise); u128-checked accumulation of amount/released/skipped/fees_paid (overflow is MergeIncompatible); expires_at becomes the earlier deadline; the source moves to Cancelled with released := amount; emits the EscrowsMerged indexer event on the target (from == to == Funded) and Cancelled on the source",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -18785,6 +18908,8 @@ pub(crate) mod anchor_idl_tests {
             // AV-113: the oracle price-gate opt-in builder
             // (Uninitialized only).
             "Escrow::with_price_gate",
+            // AV-114: the two-escrow consolidation (Funded only).
+            "Escrow::merge_escrows",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -21683,6 +21808,11 @@ mod error_code_tests {
             EscrowError::InvalidPriceGate,
             176,
             "with_price_gate with target == 0, or an out-of-range direction byte on decode (AV-113)",
+        ),
+        (
+            EscrowError::MergeIncompatible,
+            177,
+            "merge_escrows refused: different (initializer, taker), mismatched vesting/vesting-curve/milestones/fee_bps/quorum/dual-sig/mint/timelock terms, or an amount counter that would overflow (AV-114)",
         ),
     ];
 
@@ -28076,8 +28206,9 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(58), Some(kind));
         assert_eq!(kind.name(), "tranche_funded");
         assert_eq!(EscrowEventKind::from_name("tranche_funded"), Some(kind));
-        // AV-112 claims 59/60 next (append-only, never renumbered).
-        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+        // AV-112 claims 59/60 next, AV-114 claims 61 (append-only,
+        // never renumbered).
+        assert_eq!(EscrowEventKind::from_discriminant(62), None);
     }
 
     #[test]
@@ -28983,6 +29114,279 @@ mod price_gate_tests {
             .map(|s| &s.name)
             .collect();
         assert!(names.contains(&&"initialize_price_gate"));
+    }
+
+    #[test]
+    fn merge_escrows_discriminator_is_pinned() {
+        // IDL: sha256("global:merge_escrows")[..8] — the Anchor
+        // instruction discriminator, pinned here and in the generated
+        // escrow_vault.json.
+        assert_eq!(
+            crate::discriminator::instruction_discriminator("merge_escrows"),
+            [0x6b, 0x0e, 0x7e, 0x29, 0x84, 0x9e, 0xd4, 0xbf]
+        );
+        // And the INSTRUCTIONS table carries the spec.
+        let names: Vec<&&str> = crate::anchor_idl_tests::INSTRUCTIONS
+            .iter()
+            .map(|s| &s.name)
+            .collect();
+        assert!(names.contains(&&"merge_escrows"));
+    }
+}
+
+// ---------- AV-114: escrow merge (merge_escrows) ----------
+#[cfg(test)]
+mod merge_escrows_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const CAROL: [u8; 32] = [0xDD; 32]; // other taker
+    const T0: u64 = 1_700_000_000;
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn funded(amount: u64, expires_at: u64) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, amount, expires_at).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    fn funded_pair() -> (Escrow, Escrow) {
+        (funded(1_000_000, EXPIRES_AT), funded(500_000, EXPIRES_AT))
+    }
+
+    #[test]
+    fn merge_sums_amounts_and_cancels_source() {
+        let (mut target, mut source) = funded_pair();
+        target.merge_escrows(&mut source, ALICE).unwrap();
+        assert_eq!(target.amount(), 1_500_000);
+        assert_eq!(target.state(), EscrowState::Funded);
+        // Source moves to Cancelled with released := amount
+        // (released-into-merge accounting).
+        assert_eq!(source.state(), EscrowState::Cancelled);
+        assert_eq!(source.released_amount(), 500_000);
+        assert_eq!(source.remaining_amount(), 0);
+    }
+
+    #[test]
+    fn merge_requires_initializer_authority() {
+        let (mut target, mut source) = funded_pair();
+        assert_eq!(
+            target.merge_escrows(&mut source, BOB),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            target.merge_escrows(&mut source, MALLORY),
+            Err(EscrowError::Unauthorized)
+        );
+        // Both escrows untouched.
+        assert_eq!(target.state(), EscrowState::Funded);
+        assert_eq!(source.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn merge_requires_both_funded() {
+        let (mut target, mut source) = funded_pair();
+        let mut unfunded =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            target.merge_escrows(&mut unfunded, ALICE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            unfunded.merge_escrows(&mut source, ALICE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn merge_rejects_different_parties() {
+        let (mut target, _) = funded_pair();
+        let mut other_taker = Escrow::initialize(ALICE, CAROL, 500_000, EXPIRES_AT)
+            .unwrap();
+        other_taker.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            target.merge_escrows(&mut other_taker, ALICE),
+            Err(EscrowError::MergeIncompatible)
+        );
+        assert!(!target.is_merge_compatible_with(&other_taker));
+    }
+
+    #[test]
+    fn merge_rejects_term_mismatch() {
+        let (target, _) = funded_pair();
+        // fee_bps mismatch.
+        let mut other = funded(500_000, EXPIRES_AT);
+        other = Escrow::initialize(ALICE, BOB, 500_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(100)
+            .unwrap();
+        other.fund(ALICE, T0).unwrap();
+        assert!(!target.is_merge_compatible_with(&other));
+        // mint mismatch.
+        let mut other = Escrow::initialize(ALICE, BOB, 500_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint([0xD0; 32])
+            .unwrap();
+        other.fund(ALICE, T0).unwrap();
+        assert!(!target.is_merge_compatible_with(&other));
+        // timelock mismatch.
+        let mut other = Escrow::initialize(ALICE, BOB, 500_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(T0 + 100)
+            .unwrap();
+        other.fund(ALICE, T0).unwrap();
+        assert!(!target.is_merge_compatible_with(&other));
+        // vesting mismatch.
+        let schedule = VestingSchedule::new(T0, T0 + 1000).unwrap();
+        let mut other = Escrow::initialize(ALICE, BOB, 500_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(schedule)
+            .unwrap();
+        other.fund(ALICE, T0).unwrap();
+        assert!(!target.is_merge_compatible_with(&other));
+    }
+
+    #[test]
+    fn merge_rejects_quorum_and_dual_sig_mismatch() {
+        let (target, _) = funded_pair();
+        // quorum mismatch.
+        let policy =
+            QuorumPolicy::new(&[ALICE, BOB], &[1, 1], 2).unwrap();
+        let mut other = Escrow::initialize(ALICE, BOB, 500_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(policy)
+            .unwrap();
+        other.fund(ALICE, T0).unwrap();
+        assert!(!target.is_merge_compatible_with(&other));
+        // dual-sig mismatch.
+        let mut other = Escrow::initialize(ALICE, BOB, 500_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        other.activate(ALICE).unwrap();
+        other.activate(BOB).unwrap();
+        other.fund(ALICE, T0).unwrap();
+        assert!(!target.is_merge_compatible_with(&other));
+    }
+
+    #[test]
+    fn merge_rejects_amount_overflow() {
+        let mut target = funded(u64::MAX, EXPIRES_AT);
+        let mut source = funded(1, EXPIRES_AT);
+        assert_eq!(
+            target.merge_escrows(&mut source, ALICE),
+            Err(EscrowError::MergeIncompatible)
+        );
+        // Untouched.
+        assert_eq!(target.amount(), u64::MAX);
+        assert_eq!(source.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn merge_takes_earlier_expiry() {
+        let mut target = funded(1_000_000, EXPIRES_AT);
+        let mut source = funded(500_000, EXPIRES_AT - 100);
+        target.merge_escrows(&mut source, ALICE).unwrap();
+        assert_eq!(target.expires_at(), EXPIRES_AT - 100);
+        // And when the target is earlier, it keeps its own.
+        let mut target = funded(1_000_000, EXPIRES_AT - 200);
+        let mut source = funded(500_000, EXPIRES_AT);
+        target.merge_escrows(&mut source, ALICE).unwrap();
+        assert_eq!(target.expires_at(), EXPIRES_AT - 200);
+    }
+
+    #[test]
+    fn merge_accumulates_counters() {
+        let (mut target, mut source) = funded_pair();
+        // Partial release on the source: released accumulates.
+        source
+            .release(ALICE, T0, 100_000, None, BOB)
+            .unwrap();
+        target.merge_escrows(&mut source, ALICE).unwrap();
+        assert_eq!(target.amount(), 1_500_000);
+        assert_eq!(target.released_amount(), 100_000);
+        // Conservation holds on the survivor: the source's locked
+        // 400_000 joined the target's locked 1_000_000.
+        assert_eq!(target.remaining_amount(), 1_400_000);
+    }
+
+    #[test]
+    fn merge_refuses_paused() {
+        let (mut target, mut source) = funded_pair();
+        let target = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap();
+        let mut target = target;
+        target.fund(ALICE, T0).unwrap();
+        target.pause(ALICE).unwrap();
+        assert_eq!(
+            target.merge_escrows(&mut source, ALICE),
+            Err(EscrowError::Paused)
+        );
+        let (mut target2, mut source2) = funded_pair();
+        let mut source2p = Escrow::initialize(ALICE, BOB, 500_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap();
+        source2p.fund(ALICE, T0).unwrap();
+        source2p.pause(ALICE).unwrap();
+        assert_eq!(
+            target2.merge_escrows(&mut source2p, ALICE),
+            Err(EscrowError::Paused)
+        );
+        let _ = source2;
+    }
+
+    #[test]
+    fn merge_error_code_is_pinned() {
+        assert_eq!(EscrowError::MergeIncompatible.code(), 177);
+    }
+
+    #[test]
+    fn indexed_wrapper_emits_merged_and_cancelled() {
+        use crate::events::IndexedEscrow;
+        let id_a = [0x01; 32];
+        let id_b = [0x02; 32];
+        let mut target =
+            IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, id_a, T0)
+                .unwrap();
+        let mut source =
+            IndexedEscrow::initialize(ALICE, BOB, 500_000, EXPIRES_AT, id_b, T0)
+                .unwrap();
+        target.fund(ALICE, T0).unwrap();
+        source.fund(ALICE, T0).unwrap();
+        target.merge_escrows(&mut source, ALICE, T0 + 10).unwrap();
+        let kinds: Vec<_> = target
+            .events()
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(kinds.contains(&crate::EscrowEventKind::EscrowsMerged));
+        let merged = target
+            .events()
+            .iter()
+            .find(|e| e.kind == crate::EscrowEventKind::EscrowsMerged)
+            .unwrap();
+        assert_eq!(merged.from, EscrowState::Funded);
+        assert_eq!(merged.to, EscrowState::Funded);
+        assert_eq!(merged.amounts.payout, 500_000);
+        let skinds: Vec<_> =
+            source.events().iter().map(|e| e.kind).collect();
+        assert!(skinds.contains(&crate::EscrowEventKind::Cancelled));
+    }
+
+    #[test]
+    fn merge_event_discriminant_and_name_are_pinned() {
+        let kind = crate::EscrowEventKind::EscrowsMerged;
+        assert_eq!(kind.discriminant(), 61);
+        assert_eq!(kind.name(), "escrows_merged");
+        assert_eq!(
+            crate::EscrowEventKind::from_name("escrows_merged"),
+            Some(kind)
+        );
     }
 }
 
@@ -39539,7 +39943,11 @@ mod event_history_tests {
                 "round trip for discriminant {d}"
             );
         }
-        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(61),
+            Some(EscrowEventKind::EscrowsMerged)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(62), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -39678,9 +40086,9 @@ mod event_history_tests {
         // 56 is `DeadmanClaimed` (AV-109), 57 is `RentToppedUp`
         // (AV-110), 58 is `TrancheFunded` (AV-111), 59 is
         // `ReleaseIntentAnnounced` (AV-112), 60 is
-        // `ReleaseIntentVetoed` (AV-112); 61 is the first
-        // still-unknown byte.
-        for bad in [61u8, 62, 255] {
+        // `ReleaseIntentVetoed` (AV-112), 61 is `EscrowsMerged`
+        // (AV-114); 62 is the first still-unknown byte.
+        for bad in [62u8, 63, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -41541,7 +41949,9 @@ mod arbiter_panel_tests {
         // AV-113: appended, never renumbered.
         assert!(EscrowError::all().contains(&EscrowError::PriceGateNotSatisfied));
         assert!(EscrowError::all().contains(&EscrowError::InvalidPriceGate));
-        assert_eq!(EscrowError::all().len(), 77);
+        // AV-114: appended, never renumbered.
+        assert!(EscrowError::all().contains(&EscrowError::MergeIncompatible));
+        assert_eq!(EscrowError::all().len(), 78);
     }
 
     #[test]
