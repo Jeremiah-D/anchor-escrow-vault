@@ -795,6 +795,21 @@
       "discriminator": [237, 47, 58, 238, 37, 185, 245, 101],
       "accounts": [],
       "args": []
+    },
+    {
+      "name": "initialize_deadman_switch",
+      "discriminator": [227, 118, 253, 183, 67, 134, 220, 86],
+      "accounts": [],
+      "args": [
+        {"name": "inactivity_secs", "type": "u64"},
+        {"name": "heir", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "claim_deadman",
+      "discriminator": [179, 124, 46, 54, 34, 232, 80, 77],
+      "accounts": [],
+      "args": []
     }
   ],
   "accounts": [
@@ -885,7 +900,10 @@
           {"name": "interest_accrual_base", "type": "u64", "offset": 4683},
           {"name": "interest_accrued", "type": "u64", "offset": 4691},
           {"name": "interest_paid", "type": "u64", "offset": 4699},
-          {"name": "payout_split", "type": {"defined": "PayoutSplit"}, "offset": 4707}
+          {"name": "payout_split", "type": {"defined": "PayoutSplit"}, "offset": 4707},
+          {"name": "deadman_inactivity_secs", "type": "u64", "offset": 5028},
+          {"name": "deadman_heir", "type": {"option": "publicKey"}, "offset": 5036},
+          {"name": "deadman_last_activity", "type": "u64", "offset": 5069}
         ]
       }
     }
@@ -1193,7 +1211,9 @@
     {"code": 164, "name": "InvalidPoolPayout"},
     {"code": 165, "name": "InvalidInterestRate"},
     {"code": 166, "name": "InterestNotEnabled"},
-    {"code": 167, "name": "InvalidPayoutSplit"}
+    {"code": 167, "name": "InvalidPayoutSplit"},
+    {"code": 168, "name": "InvalidDeadmanConfig"},
+    {"code": 169, "name": "DeadmanNotElapsed"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

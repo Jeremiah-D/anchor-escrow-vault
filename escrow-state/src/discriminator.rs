@@ -1053,6 +1053,23 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         amounts: split_amounts,
     };
 
+    // AV-109: the dead-man's switch tail, always reserved: the 8-byte
+    // inactivity threshold, then the 1-byte heir discriminant +
+    // 32-byte heir key (`Option<Pubkey>`), then the 8-byte
+    // last-activity clock. Structural decode only — the config
+    // invariants are enforced by `Escrow::with_deadman_switch`, not
+    // re-litigated here.
+    let deadman_inactivity_secs = c.u64_le()?;
+    let deadman_heir = if c.option_present("deadman_heir")? {
+        Some(c.pubkey()?)
+    } else {
+        // The 32-byte heir slot is always reserved (zeroed when no
+        // heir is configured), like `arbiter` above.
+        c.skip(PUBKEY_LEN)?;
+        None
+    };
+    let deadman_last_activity = c.u64_le()?;
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1252,6 +1269,12 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // escrow enforces the same declared distribution set the live
         // one had.
         payout_split,
+        // AV-109: the dead-man's switch tail rides the decode so a
+        // decoded escrow enforces the same inactivity threshold, heir
+        // and activity clock the live one had.
+        deadman_inactivity_secs,
+        deadman_heir,
+        deadman_last_activity,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

@@ -91,6 +91,10 @@ pub const INSTRUCTION_CU_TABLE: &[(&str, u64, usize)] = &[
     // fund-moving payout with authority + recipient gates, ranked
     // with slash.
     ("pool_payout", 18_000, 48),
+    // AV-109: no params → 8 + 0; the heir's inactivity reclaim is a
+    // fund-moving unwind like cancel_expired/crank_expired, ranked
+    // with them.
+    ("claim_deadman", 10_000, 8),
 ];
 
 /// Base cost for `instruction`, or `None` when the table has no row —
@@ -180,6 +184,7 @@ mod cu_estimate_tests {
             KeeperActionKind::ReviewAppeal,
             KeeperActionKind::ExpireAppeal,
             KeeperActionKind::PoolPayout,
+            KeeperActionKind::ClaimDeadman,
         ];
         assert_eq!(kinds.len(), INSTRUCTION_CU_TABLE.len());
         for k in kinds {
@@ -251,6 +256,7 @@ mod cu_estimate_tests {
             ("review_appeal", 14_000),
             ("expire_appeal", 10_000),
             ("pool_payout", 18_000),
+            ("claim_deadman", 10_000),
         ];
         for (name, base) in expected {
             assert_eq!(instruction_cu_base(name), Some(*base), "base drift for {name}");

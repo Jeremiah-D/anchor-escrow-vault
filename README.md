@@ -153,6 +153,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `claim_interest()` (AV-107) | `Funded` | `Funded` (no state change) | taker **only** (`Unauthorized` otherwise, checked before state validity); `now` <- clock sysvar settles the lazy interest clock first, so the harvest is exact to the second; no rate configured is `InterestNotEnabled` (code 166) — a configured-but-unearned escrow returns `Ok(0)`; returns the interest paid and accumulates `interest_paid` (never `released`); emits no event (counter/snapshot-observable) |
 | `initialize_payout_split(shares)` (AV-108) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the fixed 1–8 `(recipient, amount)` distribution table — empty / over-8 / zero-address / duplicate-recipient / zero-share / Σ != amount is `InvalidPayoutSplit` code 167; the 321-byte tail region is always reserved so the table writes in place; once configured the table owns the release destination) |
 | `release_payout_split()` (AV-108) | `Funded` | `Released` | initializer, taker, **or** their RELEASE-scoped operator (AV-104); `now` <- clock sysvar (never a param); reuses the exact `release` gate order (pause → reentrancy → scoped authority → Funded → swap-link → mint → per-recipient payout-policy pin → milestones/subscription → quorum → timelock); no table configured is `InvalidPayoutSplit` (code 167); the protocol fee is charged once on the gross, then the net is prorated per leg (`floor(share_i * net / amount)`, dust to the first leg); `released` accumulates the gross; returns the per-recipient `(recipient, net_payout)` legs; emits `ReleasedSplit` (reused event) |
+| `initialize_deadman_switch(inactivity_secs, heir)` (AV-109) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the inactivity threshold in seconds and the heir — the only key `claim_deadman` accepts; `inactivity_secs == 0` or the zero address is `InvalidDeadmanConfig`, code 168; the 49-byte tail region is always reserved so the config writes in place — no realloc; emits no event, pre-fund configuration) |
+| `claim_deadman(heir, now)` (AV-109) | `Funded` | `Cancelled` | **the configured heir only** (`Unauthorized` otherwise — the heir is deliberately *not* required to be either party, the orthogonality point with `cancel_expired`); only once `now - deadman_last_activity >= inactivity_secs` (saturating; exactly-equal counts as elapsed — `DeadmanNotElapsed`, code 169, before the window lapses); unconfigured switch is `InvalidDeadmanConfig` (code 168); the pause gate and the AV-105 swap-link refusal apply; `now` <- clock sysvar (never an instruction param); the unsettled AV-107 interest claim is voided like `cancel`; returns the remaining locked amount (refund-family unwind — `released` untouched, the remainder preserved for audit like `cancel`'s); emits `DeadmanClaimed` |
 | `initialize_reference(reference)` (AV-53) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the 32-byte off-chain correlation id — order id / invoice hash; any 32 bytes accepted — read-only pass-through: never read by a check gate, never cleared, never affects amount conservation) |
 | `split_escrow(initializer, taker, amounts, vesting, quorum, dual_sig, milestones)` (AV-81) | `Funded` | `Split` (new terminal state) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`; degenerate initializer == taker self-escrow authorizes with one key passed twice); `Disputed` is `InvalidStateTransition` (arbitration in flight adjudicates the locked funds) and every terminal state rejects a re-split; the amount table must be non-empty, hold at most 16 entries, contain no zero entry, and sum in `u128` to exactly the parent's remaining lockup (`InvalidSplit`, code 142, otherwise — a partial release before the split shrinks the splittable pool); each child is born `Funded` with the parent's initializer / taker / `expires_at` and the explicitly inherited config — vesting / quorum / dual-sig / per-child milestones are *not* inherited unless named (default-inert, anti-misconfiguration); child *i*'s escrow ID derives as `H(parent_id \|\| i)` (SHA-256, `u64` little-endian index); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in `Funded` — no half-split); emits `EscrowSplit` (`Funded -> Split`, `amounts.payout` = Σ child amounts, the `(child_id, amount)` roster rides the event) |
 | `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` / `Split` (AV-81) | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it); a split parent's funds were re-homed into the children, so its vault carries nothing but the rent deposit — closeable like the other terminals |
@@ -605,7 +607,7 @@ and `evidence_disclosure`. New vault fields (appended last):
 `evidence_root` (`Option<[u8; 32]>`, 33 bytes) + `evidence_leaves`
 (u8) + `evidence_disclosed` (u64, 8 bytes) — 42 bytes at the time,
 bringing the layout to 3978 bytes (the layout has since grown to
-5020 bytes / 5028 with the discriminator — see the account-space
+5069 bytes / 5077 with the discriminator — see the account-space
 paragraph below). Anchor
 surface: `escalate` gains the two params, plus the new
 `file_evidence` instruction (`doc_hash`, `leaf_index`,
@@ -1237,6 +1239,8 @@ program error per variant):
 | `InvalidInterestRate` | 165 | `with_interest` / `initialize_interest` (AV-107) with `rate_bps > 10000` — above 100% APR |
 | `InterestNotEnabled` | 166 | `claim_interest` (AV-107) on an escrow with no interest rate configured (`interest_rate_bps == 0`) |
 | `InvalidPayoutSplit` | 167 | `with_payout_split` / `initialize_payout_split` (AV-108) with an empty table, a zero recipient, a duplicate recipient, a zero share, more than 8 shares, or a share total != amount; `release` / `release_via_cpi` on a split-configured escrow; `release_payout_split` with no table configured |
+| `InvalidDeadmanConfig` | 168 | `with_deadman_switch` / `initialize_deadman_switch` (AV-109) with `inactivity_secs == 0` or a zero-address heir, or after funding; `claim_deadman` (AV-109) on an escrow with no dead-man's switch configured |
+| `DeadmanNotElapsed` | 169 | `claim_deadman` (AV-109) before `now - deadman_last_activity >= inactivity_secs` — exactly-equal counts as elapsed |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2312,7 +2316,10 @@ two-way consistency check against the IDL parameter table:
 | interest_accrued | u64 | 8 |
 | interest_paid | u64 | 8 |
 | payout_split | PayoutSplit (u8 count + 8×[u8;32] recipients + 8×u64 amounts) | 321 |
-| **total**     |                   | **5020** |
+| deadman_inactivity_secs | u64 | 8 |
+| deadman_heir | Option<Pubkey> | 33 |
+| deadman_last_activity | u64 | 8 |
+| **total**     |                   | **5069** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2418,11 +2425,16 @@ when no bond was configured) — and the 37-byte delegation region
 (AV-104: 1-byte discriminant + 32-byte operator key + 4-byte scope
 bitmap, zeroed when no grant is live) — and the 33-byte swap-link
 region (AV-105: 1-byte discriminant + 32-byte counterparty escrow id,
-zeroed when the escrow is not linked into a swap pair).
-`escrow-state` exposes `VAULT_SPACE` (5028) and
-`VAULT_SPACE_NO_QUORUM` (4538) for the Anchor `space =` constraint, plus a
+zeroed when the escrow is not linked into a swap pair) — and the
+49-byte dead-man's switch tail region (AV-109: `deadman_inactivity_secs`
+(u64, zeroed when the switch is not configured) + `deadman_heir`
+(Option<Pubkey>: 1-byte discriminant + 32-byte heir, zeroed when no
+heir is named) + `deadman_last_activity` (u64, zeroed when the escrow
+was never funded).
+`escrow-state` exposes `VAULT_SPACE` (5077) and
+`VAULT_SPACE_NO_QUORUM` (4587) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **35,885,760 lamports** to be
+mainnet rent parameters the full vault needs **36,226,800 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -3362,7 +3374,119 @@ emits per-recipient legs, and the snapshot exports the table.
 Account layout grows by the 321-byte split tail: body 4699 →
 **5020**, `VAULT_SPACE` 4707 → **5028**,
 `VAULT_SPACE_NO_QUORUM` 4217 → **4538**, rent-exempt 33,651,600 →
-**35,885,760** lamports.
+**35,885,760** lamports (AV-109 later grows the layout by a further
+49 bytes: body 5020 → **5069**, `VAULT_SPACE` 5028 → **5077**,
+`VAULT_SPACE_NO_QUORUM` 4538 → **4587**, rent-exempt 35,885,760 →
+**36,226,800** lamports — see the dead-man's switch section).
+
+## Dead-man's switch (AV-109)
+
+The problem: an escrow with no absolute `expires_at` (`u64::MAX` —
+"no timeout") and no live counterparty is a tombstone. `cancel`
+needs the initializer; `cancel_expired` needs an expiry to lapse;
+both refund to the initializer or the whitelisted address. A dormant
+deal — both parties walked away, or one party lost their keys —
+strands the locked funds forever, in a vault nobody can close (the
+rent-exempt deposit goes with it).
+
+The fix, opt-in via `with_deadman_switch(inactivity_secs, heir)`
+(`Uninitialized`-only): the initializer declares an *inactivity*
+threshold in seconds and a single heir. Once the threshold elapses
+with no state transition, the heir — and only the heir — may
+`claim_deadman(heir, now)` the remaining locked funds
+(`Funded -> Cancelled`). The heir is deliberately *not* required to
+be either party: the switch is orthogonal to `cancel_expired`
+(absolute `expires_at` clock, either party may cancel; the switch
+uses the *relative* inactivity clock and only the heir may claim).
+Both may be configured on the same escrow; neither gates the other —
+whichever fires first wins, and the second call finds a terminal
+escrow and is `InvalidStateTransition`.
+
+The inactivity clock is `deadman_last_activity`: `fund` anchors it
+at funding time, and every *successful* state transition that takes a
+`now` parameter resets it (`release` and the whole release family,
+`claim`, `claim_interest`, `slash`, `pool_payout`, `cancel_expired`,
+`escalate`, `file_appeal`, `expire_appeal`, `extend_expiry`,
+`split_escrow`, …) — the window measures funded time since the last
+real activity. A deliberate boundary, stated honestly: transitions
+*without* a clock parameter — `activate`, `cancel`, `attest`,
+`pause`/`unpause`, the `rotate_*` rotations, `review_appeal`,
+`update_quorum`, the allowlist/denylist updaters, `close_vault`, the
+panel judgments — do **not** reset the clock. Widening their
+signatures to take a clock just for the switch would be breaking
+churn on long-stable APIs, and most of them are governance or config
+moves rather than fund activity.
+
+`claim_deadman` runs the familiar gate order: pause (AV-46) →
+reentrancy (AV-36) → the switch config (`InvalidDeadmanConfig`,
+code 168, when never configured — checked before the caller so a
+misconfigured switch reports the config error, not an auth error) →
+the heir check (`Unauthorized` — the heir key must sign; strangers,
+the initializer, and the taker all fail unless they *are* the heir) →
+`Funded` (`InvalidStateTransition`) → the live AV-105 swap-link
+refusal (a linked escrow settles only through the pair path) → the
+inactivity gate `now - deadman_last_activity >= inactivity_secs`
+(saturating, so a clock far in the past cannot underflow;
+exactly-equal counts as elapsed; `DeadmanNotElapsed`, code 169,
+otherwise). Effects mirror the cancel family: the outstanding
+unsettled interest claim is voided (no yield is owed on funds that
+never settled — AV-107), the remaining locked amount routes to the
+heir, the state moves to `Cancelled`, and `released` is untouched —
+a deadman reclaim is a refund-family unwind, not a taker payout, so
+the conservation identity keeps them distinct and the remainder is
+preserved for audit exactly like `cancel`'s. The activity clock is
+stamped with `now` on the way out for a consistent audit trail.
+
+The Anchor skeleton gains `initialize_deadman_switch(inactivity_secs,
+heir)` and `claim_deadman` (the latter reads `now` from the clock
+sysvar, never an instruction param), the two `ClaimDeadman` /
+`InitializeDeadmanSwitch` account structs, the three `Vault` tail
+fields, and the two `ErrorCode` mappings (168/169). The event kind
+`DeadmanClaimed` is 56 (appended after `SwapLinked`, 0–55 stable);
+the event-sourced fold books the reclaim like `Cancelled` (`refund`
+= the heir's payout); the keeper lists one `claim_deadman` action
+per eligible escrow — `caller_role` `"heir"`, `refund_to` the heir —
+and only when the call would succeed (paused, swap-linked and
+zero-remainder escrows are withheld); the snapshot exports the
+threshold, the heir, the clock, and the live `deadman_eligible`
+predicate (the same predicate the keeper scan uses, so a snapshot
+never disagrees with the scan). Account layout grows by the 49-byte
+deadman tail (8-byte threshold + 33-byte `Option<Pubkey>` heir +
+8-byte activity clock, zeroed when unconfigured): body 5020 →
+**5069**, `VAULT_SPACE` 5028 → **5077**,
+`VAULT_SPACE_NO_QUORUM` 4538 → **4587**, rent-exempt 35,885,760 →
+**36,226,800** lamports.
+
+**Walkthrough — the heir reclaims a dormant vault.** The initializer
+names a recovery heir at setup; both parties go silent; a year
+passes; the heir sweeps the funds:
+
+```
+initializer        taker          heir           escrow
+   |  initialize_deadman_switch(1yr, heir)  |                |
+   |-------------------------------------->|  (switch armed, |
+   |                                         still Uninitialized)
+   |  fund(alice, t0)  |                   |                |
+   |-------------------------------------->| Uninitialized→Funded;
+   |                                         clock = t0
+   |               |     // …silence: no clock-bearing        |
+   |               |     // transition for a full year       |
+   |                                 claim_deadman(heir, t0+1yr-1)   |
+   |                                 ---------------------->|
+   |                                          | Err(DeadmanNotElapsed):
+   |                                          | one second early, escrow
+   |                                          | untouched, stays Funded
+   |                                 claim_deadman(heir, t0+1yr)     |
+   |                                 ---------------------->|
+   |                                          | Funded→Cancelled;
+   |                                          | remainder → heir;
+   |                                          | DeadmanClaimed emitted
+```
+
+Had the initializer instead released half at `t0 + 30d`, the clock
+would have reset to `t0 + 30d` and the heir's window would measure
+from there — activity, not the funding date, is what the switch
+watches.
 
 ## Basket escrow (AV-95)
 

@@ -335,6 +335,18 @@ pub enum KeeperActionKind {
     /// exact amount are the drainer's call-time judgment, so
     /// `refund_to` is `None`.
     PoolPayout,
+    /// `claim_deadman(heir, now)` (AV-109): the configured heir's
+    /// inactivity reclaim of a dormant escrow's remaining locked
+    /// funds. Listed when [`Escrow::is_deadman_eligible`] holds at
+    /// scan time — a listed claim is always executable, never a
+    /// `Paused`, `Unauthorized`, `InvalidStateTransition`,
+    /// `SwapLinkActive` or `DeadmanNotElapsed` rejection. The heir is
+    /// the caller (`caller_role: "heir"`); the heir is deliberately
+    /// not required to be either party (orthogonal to
+    /// `cancel_expired`, where either party may cancel). `amount` is
+    /// the remaining locked amount the call pays the heir;
+    /// `refund_to` is the heir (the instruction's destination).
+    ClaimDeadman,
 }
 
 impl KeeperActionKind {
@@ -353,6 +365,7 @@ impl KeeperActionKind {
             KeeperActionKind::ReviewAppeal => "review_appeal",
             KeeperActionKind::ExpireAppeal => "expire_appeal",
             KeeperActionKind::PoolPayout => "pool_payout",
+            KeeperActionKind::ClaimDeadman => "claim_deadman",
         }
     }
 }
@@ -887,6 +900,40 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     reason: "expired",
                 });
             }
+        }
+        // AV-109: the dead-man's switch — a configured, funded escrow
+        // whose inactivity threshold elapsed at scan time lists one
+        // `claim_deadman` action for the heir. The keeper mirrors the
+        // call's own guards so a listed claim is always executable:
+        // not paused (`require_not_paused`), no live swap link
+        // (`require_no_live_swap_link` — a linked escrow settles only
+        // through the pair path), and a non-zero remainder. The heir
+        // need not be either party — `caller_role` is `"heir"`.
+        if e.is_deadman_eligible(now) && e.remaining_amount() > 0 && !e.is_paused() && e.swap_link().is_none() {
+            // `is_deadman_eligible` implies configured, so the heir is
+            // `Some` — the expect documents the invariant.
+            let heir = e
+                .deadman_heir()
+                .expect("AV-109: eligible implies a configured heir");
+            actions.push(KeeperAction {
+                escrow_id: w.escrow_id,
+                vault_address: w.vault_address(),
+                kind: KeeperActionKind::ClaimDeadman,
+                caller: heir,
+                caller_role: "heir",
+                mint: e.mint(),
+                // The claim pays the heir directly — the destination
+                // is pinned to the configured heir, like
+                // `cancel_expired`'s pinned refund destination.
+                refund_to: Some(heir),
+                amount: e.remaining_amount(),
+                decimals: e.decimals(),
+                reference: w.reference,
+                extension_count: e.extension_count(),
+                multisig_authority: e.multisig_authority,
+                evidence_disclosure: None,
+                reason: "deadman_inactivity_elapsed",
+            });
         }
         // The taker's pull path: vesting attached (or an AV-97 Dutch
         // auction — the auction prices `claim` on its own descending

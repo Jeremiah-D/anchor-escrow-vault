@@ -1128,6 +1128,29 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to the dead-man's switch (AV-109; mirrors
+    /// `Escrow::with_deadman_switch`). `Uninitialized` only, like
+    /// `initialize_payout_split`: the inactivity threshold and the
+    /// heir are fixed before funds move. `inactivity_secs == 0` or a
+    /// zero heir address is `InvalidDeadmanConfig` (code 168). The
+    /// vault account already reserves the full 49-byte deadman tail
+    /// (8-byte threshold + 33-byte `Option<Pubkey>` heir + 8-byte
+    /// activity clock, zeroed when unconfigured), so the config is
+    /// written in place — no realloc needed in the real build. Emits
+    /// no event (pre-fund configuration).
+    pub fn initialize_deadman_switch(
+        ctx: Context<InitializeDeadmanSwitch>,
+        inactivity_secs: u64,
+        heir: Pubkey,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_deadman_switch(inactivity_secs, heir.to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
     /// Settle the full lockup across the declared split recipients
     /// (AV-108; mirrors `Escrow::release_payout_split`). The
     /// initializer (or their RELEASE-scoped operator, AV-104) calls
@@ -1172,6 +1195,49 @@ pub mod escrow_vault {
             None,
         );
         Ok(legs)
+    }
+
+    /// Claim the remaining locked funds via the dead-man's switch
+    /// (AV-109; mirrors `Escrow::claim_deadman`). The configured heir
+    /// — and only the heir — calls with the clock sysvar; `now` is
+    /// never an instruction param. `Funded -> Cancelled`: the full
+    /// remaining locked amount routes to the heir. The heir is
+    /// deliberately not required to be either party (the
+    /// orthogonality point with `cancel_expired`, where either party
+    /// may cancel on the absolute `expires_at` clock). Unconfigured
+    /// switch is `InvalidDeadmanConfig` (code 168); the inactivity
+    /// gate not yet lapsed is `DeadmanNotElapsed` (code 169). The
+    /// outstanding unsettled interest claim is voided like `cancel`.
+    /// Returns the heir's payout so the real build can size the
+    /// transfer.
+    pub fn claim_deadman(ctx: Context<ClaimDeadman>) -> Result<u64> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        let heir_payout = escrow
+            .claim_deadman(ctx.accounts.heir.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `now` doubles as the event's `at`; `refund` carries
+        // the heir's payout (the Cancelled shape — the heir is the
+        // refund sink here, not the initializer); `caller` is the
+        // heir.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::DeadmanClaimed,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            heir_payout,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.heir.key()),
+        );
+        Ok(heir_payout)
     }
 
     /// Opt in to dispute arbitration (AV-14; mirrors
@@ -4688,6 +4754,21 @@ pub struct Vault {
     /// Layout position matches `escrow_state::VAULT_FIELDS`
     /// (appended last, after the interest tail).
     pub payout_split: PayoutSplit,
+    /// AV-109: the dead-man's switch inactivity threshold in seconds
+    /// (mirrors `escrow_state`'s `deadman_inactivity_secs`); zero
+    /// unless the initializer called `initialize_deadman_switch`
+    /// while `Uninitialized`. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after the
+    /// payout-split tail).
+    pub deadman_inactivity_secs: u64,
+    /// AV-109: the dead-man's switch heir (mirrors `escrow_state`'s
+    /// `deadman_heir`); `None` unless the switch is configured. The
+    /// heir is not required to be either party.
+    pub deadman_heir: Option<Pubkey>,
+    /// AV-109: the dead-man's switch activity clock (mirrors
+    /// `escrow_state`'s `deadman_last_activity`) — the `now` of the
+    /// most recent successful clock-bearing transition.
+    pub deadman_last_activity: u64,
 }
 
 /// Skeleton mirror of `escrow_state::PayoutSplit`: the opt-in
@@ -6038,6 +6119,39 @@ pub struct ReleasePayoutSplit<'info> {
     pub vault_token_account: AccountInfo<'info>,
 }
 
+/// AV-109: accounts for `initialize_deadman_switch` — same shape as
+/// `InitializePayoutSplit`: only the initializer declares the switch.
+#[derive(Accounts)]
+pub struct InitializeDeadmanSwitch<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer declares the dead-man's switch; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized` (`InvalidStateTransition`). A zero threshold or
+    /// zero heir is `InvalidDeadmanConfig` (code 168).
+    pub initializer: Signer<'info>,
+}
+
+/// AV-109: accounts for `claim_deadman` — the heir claims the
+/// remaining locked funds after the inactivity window lapses.
+#[derive(Accounts)]
+pub struct ClaimDeadman<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The configured heir — the only key `claim_deadman` accepts
+    /// (`Unauthorized` otherwise); the state machine pins it against
+    /// the vault's declared heir. The heir is not required to be
+    /// either party.
+    pub heir: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the inactivity gate
+    /// (never an instruction param).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build funds the heir's transfer from the vault's holdings;
+    /// unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
+}
+
 #[derive(Accounts)]
 pub struct Claim<'info> {
     #[account(mut)]
@@ -7290,6 +7404,13 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidPayoutSplit => {
             error!(ErrorCode::InvalidPayoutSplit)
         }
+        // AV-109: appended, never renumbered.
+        escrow_state::EscrowError::InvalidDeadmanConfig => {
+            error!(ErrorCode::InvalidDeadmanConfig)
+        }
+        escrow_state::EscrowError::DeadmanNotElapsed => {
+            error!(ErrorCode::DeadmanNotElapsed)
+        }
     }
 }
 
@@ -7425,4 +7546,8 @@ pub enum ErrorCode {
     InterestNotEnabled,
     #[msg("Invalid payout-split table (AV-108): with_payout_split with an empty table, a zero recipient, a duplicate recipient, a zero share, more than 8 shares, or a share total != amount; or release/release_via_cpi on a split-configured escrow")]
     InvalidPayoutSplit,
+    #[msg("Invalid dead-man's switch configuration (AV-109): with_deadman_switch with inactivity_secs == 0 or a zero heir address; or claim_deadman on an escrow whose dead-man's switch was never configured")]
+    InvalidDeadmanConfig,
+    #[msg("Dead-man's switch inactivity window not elapsed (AV-109): claim_deadman before now - deadman_last_activity reaches deadman_inactivity_secs")]
+    DeadmanNotElapsed,
 }

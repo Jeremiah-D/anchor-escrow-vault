@@ -213,7 +213,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // AV-95b: one basket leg refunded — the per-leg `Cancelled`.
         EscrowEventKind::Cancelled
         | EscrowEventKind::PartiallyCancelled
-        | EscrowEventKind::BasketCancelled => {
+        // AV-109: the heir's inactivity reclaim books like a
+        // `Cancelled` — the remaining locked amount leaves as the
+        // refund sink (to the heir, not the initializer).
+        | EscrowEventKind::BasketCancelled
+        | EscrowEventKind::DeadmanClaimed => {
             (amounts.refund, 0, amounts.refund)
         }
         // Expiry cancels: `refund` goes to the pinned destination and
@@ -563,7 +567,9 @@ mod event_sourcing_tests {
                 EscrowEventKind::Cancelled
                 | EscrowEventKind::PartiallyCancelled
                 // AV-95b: the per-leg refund books like Cancelled.
-                | EscrowEventKind::BasketCancelled => {
+                // AV-109: the deadman reclaim books like Cancelled.
+                | EscrowEventKind::BasketCancelled
+                | EscrowEventKind::DeadmanClaimed => {
                     (REFUND, 0, REFUND)
                 }
                 EscrowEventKind::ExpiredCancelled

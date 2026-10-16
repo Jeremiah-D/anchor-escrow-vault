@@ -248,6 +248,11 @@ pub struct PayoutAddrs {
 pub enum RefundKind {
     Cancel,
     CancelExpired,
+    /// AV-109: the dead-man's switch reclaim — the refund sink is the
+    /// configured heir, not `escrow.refund_recipient()` (the AV-23
+    /// whitelist / initializer). Pins against
+    /// `escrow.deadman_heir()` instead.
+    DeadmanClaim,
 }
 
 /// Addresses for a refund settlement (`cancel` / `cancel_expired`).
@@ -261,8 +266,12 @@ pub struct RefundAddrs {
     /// Receives the anti-griefing penalty on taker-initiated expiry
     /// cancels (AV-24).
     pub initializer: Pubkey,
-    /// Refund identity, pinned against `escrow.refund_recipient()` (the
-    /// AV-23 whitelist, or the initializer with no whitelist).
+    /// Refund identity: pinned against `escrow.refund_recipient()` (the
+    /// AV-23 whitelist, or the initializer with no whitelist) for
+    /// [`RefundKind::Cancel`] / [`RefundKind::CancelExpired`] — and
+    /// against the configured dead-man's switch heir for
+    /// [`RefundKind::DeadmanClaim`] (AV-109: the heir is the refund
+    /// sink, never the refund policy).
     pub refund_to: Pubkey,
     /// Refund destination account.
     pub refund_leg: Pubkey,
@@ -520,8 +529,27 @@ pub fn refund_plan(
     if addrs.initializer != escrow.initializer() {
         return Err(CpiError::RecipientMismatch);
     }
-    if addrs.refund_to != escrow.refund_recipient() {
-        return Err(CpiError::RecipientMismatch);
+    match kind {
+        RefundKind::Cancel | RefundKind::CancelExpired => {
+            if addrs.refund_to != escrow.refund_recipient() {
+                return Err(CpiError::RecipientMismatch);
+            }
+        }
+        // AV-109: the heir's inactivity reclaim routes to the
+        // configured heir — deliberately not the refund policy.
+        // Pinning `refund_recipient()` here would either reject the
+        // heir or, worse, let a plan pay the initializer the heir's
+        // funds. A deadman reclaim carries no anti-griefing penalty
+        // (the heir is never the taker), so `penalty` must be zero.
+        RefundKind::DeadmanClaim => {
+            let heir = escrow.deadman_heir().ok_or(CpiError::RecipientMismatch)?;
+            if addrs.refund_to != heir {
+                return Err(CpiError::RecipientMismatch);
+            }
+            if penalty != 0 {
+                return Err(CpiError::SettlementMismatch);
+            }
+        }
     }
     require_nonzero(&addrs.source)?;
     require_nonzero(&addrs.vault_authority)?;
@@ -947,6 +975,78 @@ mod cpi_tests {
         );
     }
 
+    // --- AV-109: deadman-claim refund plans -----------------------------------------
+
+    fn deadman_escrow() -> Escrow {
+        let heir = key(9);
+        let mut e = Escrow::initialize(key(1), key(2), 1_000_000, 2_000_000_000)
+            .unwrap()
+            .with_deadman_switch(86_400, heir)
+            .unwrap();
+        e.fund(key(1), FUND_AT).unwrap();
+        e
+    }
+
+    #[test]
+    fn deadman_claim_plan_pays_the_heir() {
+        let mut e = deadman_escrow();
+        let paid = e.claim_deadman(key(9), FUND_AT + 86_400).unwrap();
+        assert_eq!(paid, 1_000_000);
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        let addrs = RefundAddrs {
+            source: key(10),
+            vault_authority: key(10),
+            initializer: key(1),
+            // The refund sink is the heir — not the initializer, not the
+            // AV-23 refund policy.
+            refund_to: key(9),
+            refund_leg: key(9),
+            penalty_leg: key(9),
+            transfer_hook: None,
+        };
+        let plan = refund_plan(RefundKind::DeadmanClaim, &e, &addrs, 1_000_000, 0).unwrap();
+        assert_eq!(plan.transfers.len(), 1);
+        assert_eq!(plan.transfers[0].amount(), Some(1_000_000));
+        assert_eq!(plan.transfers[0].accounts[1].pubkey, key(9));
+    }
+
+    #[test]
+    fn deadman_claim_plan_rejects_misrouted_recipients() {
+        let mut e = deadman_escrow();
+        e.claim_deadman(key(9), FUND_AT + 86_400).unwrap();
+        let addrs = RefundAddrs {
+            source: key(10),
+            vault_authority: key(10),
+            initializer: key(1),
+            refund_to: key(9),
+            refund_leg: key(9),
+            penalty_leg: key(9),
+            transfer_hook: None,
+        };
+        // Routing the heir's funds to the initializer: rejected — this
+        // is exactly the misroute the heir pin exists to prevent.
+        let mut to_init = addrs.clone();
+        to_init.refund_to = key(1);
+        to_init.refund_leg = key(1);
+        assert_eq!(
+            refund_plan(RefundKind::DeadmanClaim, &e, &to_init, 1_000_000, 0),
+            Err(CpiError::RecipientMismatch)
+        );
+        // A penalty on a deadman reclaim: the state machine never
+        // produces one (the heir is never the taker).
+        assert_eq!(
+            refund_plan(RefundKind::DeadmanClaim, &e, &addrs, 999_999, 1),
+            Err(CpiError::SettlementMismatch)
+        );
+        // No switch configured: no heir to pin.
+        let mut plain = funded_escrow(1_000_000);
+        plain.cancel(key(1), None, key(1)).unwrap();
+        assert_eq!(
+            refund_plan(RefundKind::DeadmanClaim, &plain, &addrs, 1_000_000, 0),
+            Err(CpiError::RecipientMismatch)
+        );
+    }
+
     // --- resolve plans ----------------------------------------------------------------
 
     #[test]
@@ -1284,7 +1384,7 @@ mod cpi_tests {
         let bytes = crate::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), crate::ESCROW_BODY_LEN);
         let hook_at =
-            crate::ESCROW_BODY_LEN - crate::PAYOUT_SPLIT_LEN - crate::INTEREST_REGION_LEN - crate::POOL_REGION_LEN - crate::SWAP_LINK_REGION_LEN - crate::APPEAL_BOND_REGION_LEN - crate::DELEGATION_REGION_LEN - crate::STREAMING_FEE_REGION_LEN - 33;
+            crate::ESCROW_BODY_LEN - crate::DEADMAN_REGION_LEN - crate::PAYOUT_SPLIT_LEN - crate::INTEREST_REGION_LEN - crate::POOL_REGION_LEN - crate::SWAP_LINK_REGION_LEN - crate::APPEAL_BOND_REGION_LEN - crate::DELEGATION_REGION_LEN - crate::STREAMING_FEE_REGION_LEN - 33;
         assert_eq!(bytes[hook_at], 1, "Some discriminant");
         assert_eq!(&bytes[hook_at + 1..hook_at + 33], &hook);
         // A hook-less escrow zero-fills the region.

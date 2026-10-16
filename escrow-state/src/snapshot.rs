@@ -533,6 +533,19 @@ pub struct EscrowSnapshot {
     /// gross share)` pairs in payout order, so indexers see the
     /// immutable distribution set without replaying the setup.
     pub payout_split: Option<Vec<([u8; 32], u64)>>,
+    /// AV-109: the dead-man's switch inactivity threshold in seconds
+    /// (`0` when the switch is not configured).
+    pub deadman_inactivity_secs: u64,
+    /// AV-109: the dead-man's switch heir — `None` when the switch is
+    /// not configured.
+    pub deadman_heir: Option<[u8; 32]>,
+    /// AV-109: the `now` of the most recent successful clock-bearing
+    /// state transition (the inactivity clock).
+    pub deadman_last_activity: u64,
+    /// AV-109: whether `claim_deadman` could succeed at
+    /// [`EscrowSnapshot::at`] — the keeper scan lists exactly these
+    /// escrows for `claim_deadman`.
+    pub deadman_eligible: bool,
 }
 
 /// AV-82: point-in-time, read-only view of the opt-in slash terms —
@@ -837,6 +850,14 @@ impl Escrow {
                     None
                 }
             },
+            // AV-109: the dead-man's switch tail rides the export —
+            // the threshold, the heir and the activity clock — so an
+            // off-chain indexer can watch the inactivity window
+            // without replaying the transitions.
+            deadman_inactivity_secs: self.deadman_inactivity_secs(),
+            deadman_heir: self.deadman_heir(),
+            deadman_last_activity: self.deadman_last_activity(),
+            deadman_eligible: self.is_deadman_eligible(now),
         }
     }
 }
@@ -1423,6 +1444,17 @@ impl EscrowSnapshot {
             }
             None => s.push_str("null"),
         }
+        // AV-109: the dead-man's switch tail — zeroed/`null`/`false`
+        // when the switch is not configured, so a plain escrow's JSON
+        // gains only the new keys.
+        s.push_str(",\"deadman_inactivity_secs\":");
+        s.push_str(&self.deadman_inactivity_secs.to_string());
+        s.push_str(",\"deadman_heir\":");
+        write_opt_hex(&mut s, self.deadman_heir);
+        s.push_str(",\"deadman_last_activity\":");
+        s.push_str(&self.deadman_last_activity.to_string());
+        s.push_str(",\"deadman_eligible\":");
+        s.push_str(&self.deadman_eligible.to_string());
         s.push('}');
         s
     }
@@ -1488,7 +1520,9 @@ mod snapshot_tests {
              \"insurance_pool\":false,\"pool_paid\":0,\"pool_slashed\":0,\
              \"pool_inflow\":0,\"pool_outflow\":0,\"pool_payout_paid\":0,\
              \"pool_payout_eligible\":false,\
-             \"interest_rate_bps\":0,\"interest_accrued\":0,\"interest_paid\":0,\"payout_split\":null\
+             \"interest_rate_bps\":0,\"interest_accrued\":0,\"interest_paid\":0,\"payout_split\":null,\
+             \"deadman_inactivity_secs\":0,\"deadman_heir\":null,\"deadman_last_activity\":1700000000,\
+             \"deadman_eligible\":false\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),

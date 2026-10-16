@@ -228,6 +228,7 @@
 //! | Cancelled | 0 | 0 | remainder refunded to the initializer | 0 |
 //! | PartiallyCancelled (AV-60) | 0 | 0 | the partially-cancelled tranche, refunded to the whitelisted destination (the escrow stays `Funded`; the `released` counter is untouched) | 0 |
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
+//! | DeadmanClaimed (AV-109) | 0 | 0 | remaining locked amount, to the configured heir (the heir is not required to be either party) | 0 |
 //! | ExpiredCranked (AV-48) | 0 | 0 | remainder minus penalty, to the whitelisted destination (the cranker receives nothing) | anti-griefing penalty to the initializer (AV-24; 0 unless the cranker is the taker) |
 //! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
 //! | DefaultJudgment (AV-55) | gross taker share (`default_taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
@@ -733,6 +734,15 @@ pub enum EscrowEventKind {
     /// signal. The actor is the linking party. Emitted on each leg
     /// in deterministic A→B order; always emitted on success.
     SwapLinked,
+    /// AV-109: the dead-man's switch fired
+    /// ([`Escrow::claim_deadman`](crate::Escrow::claim_deadman)) — the
+    /// heir claimed the remaining locked amount after the inactivity
+    /// threshold elapsed. `from == Funded`, `to == Cancelled`. Amounts
+    /// follow the `Cancelled` shape (`refund` = the heir's payout; the
+    /// heir is not required to be either party). The actor is the heir.
+    /// Always emitted on success: a successful claim always moves
+    /// funds, so there is no no-op case.
+    DeadmanClaimed,
 }
 
 impl EscrowEventKind {
@@ -864,6 +874,9 @@ impl EscrowEventKind {
             // discriminants 0–54 stay stable for already-serialized
             // histories.
             55 => Self::SwapLinked,
+            // AV-109: appended after SwapLinked so discriminants
+            // 0–55 stay stable for already-serialized histories.
+            56 => Self::DeadmanClaimed,
             _ => return None,
         })
     }
@@ -928,6 +941,7 @@ impl EscrowEventKind {
             Self::DelegationGranted => "delegation_granted",
             Self::DelegationRevoked => "delegation_revoked",
             Self::SwapLinked => "swap_linked",
+            Self::DeadmanClaimed => "deadman_claimed",
         }
     }
 
@@ -993,6 +1007,7 @@ impl EscrowEventKind {
             "delegation_granted" => Self::DelegationGranted,
             "delegation_revoked" => Self::DelegationRevoked,
             "swap_linked" => Self::SwapLinked,
+            "deadman_claimed" => Self::DeadmanClaimed,
             _ => return None,
         })
     }
@@ -6180,7 +6195,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(56), None);
+        assert_eq!(EscrowEventKind::from_discriminant(57), None);
     }
 
     #[test]
@@ -6196,7 +6211,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(56), None);
+        assert_eq!(EscrowEventKind::from_discriminant(57), None);
     }
 
     #[test]
@@ -6733,7 +6748,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(56), None);
+        assert_eq!(EscrowEventKind::from_discriminant(57), None);
     }
 
     #[test]
@@ -6748,7 +6763,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(56), None);
+        assert_eq!(EscrowEventKind::from_discriminant(57), None);
     }
 
     #[test]
@@ -6760,7 +6775,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(56), None);
+        assert_eq!(EscrowEventKind::from_discriminant(57), None);
     }
 
     #[test]
@@ -6772,7 +6787,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(56), None);
+        assert_eq!(EscrowEventKind::from_discriminant(57), None);
     }
 
     #[test]
@@ -6784,7 +6799,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(56), None);
+        assert_eq!(EscrowEventKind::from_discriminant(57), None);
     }
 
     #[test]
@@ -6799,7 +6814,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(56), None);
+        assert_eq!(EscrowEventKind::from_discriminant(57), None);
     }
 
     #[test]
@@ -6814,7 +6829,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(56), None);
+        assert_eq!(EscrowEventKind::from_discriminant(57), None);
     }
 
     #[test]
@@ -6826,7 +6841,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(56), None);
+        assert_eq!(EscrowEventKind::from_discriminant(57), None);
     }
 
     #[test]
@@ -6838,7 +6853,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(56), None);
+        assert_eq!(EscrowEventKind::from_discriminant(57), None);
     }
 
     #[test]
@@ -6850,7 +6865,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(56), None);
+        assert_eq!(EscrowEventKind::from_discriminant(57), None);
     }
 
     #[test]
