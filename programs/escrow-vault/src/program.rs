@@ -1354,6 +1354,106 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to a release cooling period (AV-112; mirrors
+    /// `Escrow::with_release_cooling`). `Uninitialized` only, like the
+    /// other `initialize_*` opt-ins: the window is fixed before any
+    /// funds move. `cooling_secs == 0` means no cooling (unconfigured,
+    /// backward compatible); any other value arms the announce ->
+    /// wait -> release flow (`release` then needs a live announced
+    /// intent whose window has elapsed).
+    pub fn initialize_release_cooling(
+        ctx: Context<InitializeReleaseCooling>,
+        cooling_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .with_release_cooling(cooling_secs)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // No indexer event: pre-fund configuration, like the other
+        // `initialize_*` opt-ins.
+        Ok(())
+    }
+
+    /// Announce a release intent (AV-112; mirrors
+    /// `Escrow::announce_release`). Either party (the initializer or
+    /// the taker — a stranger or an AV-104 operator is `Unauthorized`)
+    /// records `release_intent_at = now`, starting the cooling window;
+    /// `release` then requires `now >= intent_at + cooling_secs`.
+    /// Re-announcing overwrites the timestamp (idempotent — the window
+    /// restarts) and resets the AV-109 dead-man's switch activity
+    /// clock.
+    pub fn announce_release(ctx: Context<AnnounceRelease>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        let before = escrow.release_intent_at();
+        escrow
+            .announce_release(ctx.accounts.authority.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Emit only on an actual change — a same-timestamp re-announce
+        // is a silent idempotent no-op (mirrors the off-chain
+        // `IndexedEscrow` wrapper).
+        if escrow.release_intent_at() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::ReleaseIntentAnnounced,
+                from,
+                escrow.state() as u8,
+                0,
+                0,
+                0,
+                now,
+                None,
+                None,
+                None,
+                None,
+                Some(ctx.accounts.authority.key()),
+            );
+        }
+        Ok(())
+    }
+
+    /// Veto a live release intent (AV-112; mirrors
+    /// `Escrow::veto_release`). Either party (the initializer or the
+    /// taker) clears `release_intent_at`, cancelling the announced
+    /// release — after a veto, `release` is `ReleaseCoolingNotElapsed`
+    /// again until a fresh `announce_release` restarts the window. No
+    /// live intent is a no-op success (nothing cleared, nothing
+    /// emitted).
+    pub fn veto_release(ctx: Context<VetoRelease>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        let had_intent = escrow.release_intent_at().is_some();
+        escrow
+            .veto_release(ctx.accounts.authority.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Emit only when an intent was actually cleared — the
+        // no-intent no-op stays silent (mirrors the off-chain
+        // `IndexedEscrow` wrapper).
+        if had_intent {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::ReleaseIntentVetoed,
+                from,
+                escrow.state() as u8,
+                0,
+                0,
+                0,
+                now,
+                None,
+                None,
+                None,
+                None,
+                Some(ctx.accounts.authority.key()),
+            );
+        }
+        Ok(())
+    }
+
     /// Opt in to dispute arbitration (AV-14; mirrors
     /// `Escrow::with_arbiter`). `Uninitialized` only, like
     /// `initialize_quorum`: the arbiter's identity is fixed before funds
@@ -4883,6 +4983,20 @@ pub struct Vault {
     /// `escrow_state`'s `deadman_last_activity`) — the `now` of the
     /// most recent successful clock-bearing transition.
     pub deadman_last_activity: u64,
+    /// AV-112: opt-in release cooling window in seconds (mirrors
+    /// `escrow_state`'s `release_cooling_secs`); `0` unless the
+    /// initializer called `initialize_release_cooling` while
+    /// `Uninitialized`. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after the
+    /// dead-man's switch tail).
+    pub release_cooling_secs: u64,
+    /// AV-112: Unix timestamp of the most recent `announce_release`
+    /// (mirrors `escrow_state`'s `release_intent_at`); `None` when no
+    /// intent is live (never announced, or vetoed via
+    /// `veto_release`). Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `release_cooling_secs`).
+    pub release_intent_at: Option<u64>,
 }
 
 /// Skeleton mirror of `escrow_state::PayoutSplit`: the opt-in
@@ -5444,6 +5558,16 @@ pub enum EscrowVaultEventKind {
     /// field in table order — the first leg carries the bps-floor dust.
     /// Mirrors `escrow_state::EscrowEventKind::ReleasedSplit`.
     ReleasedSplit,
+    /// AV-112: a release intent was announced by either party
+    /// (`Escrow::announce_release`). `from == to ==` the current
+    /// state; emitted only on an actual change. Mirrors
+    /// `escrow_state::EscrowEventKind::ReleaseIntentAnnounced`.
+    ReleaseIntentAnnounced,
+    /// AV-112: a live release intent was vetoed by either party
+    /// (`Escrow::veto_release`). `from == to ==` the current state;
+    /// emitted only when an intent was actually cleared. Mirrors
+    /// `escrow_state::EscrowEventKind::ReleaseIntentVetoed`.
+    ReleaseIntentVetoed,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -5527,6 +5651,12 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::ReleasedSplit => {
             EscrowVaultEventKind::ReleasedSplit
+        }
+        escrow_state::EscrowEventKind::ReleaseIntentAnnounced => {
+            EscrowVaultEventKind::ReleaseIntentAnnounced
+        }
+        escrow_state::EscrowEventKind::ReleaseIntentVetoed => {
+            EscrowVaultEventKind::ReleaseIntentVetoed
         }
     }
 }
@@ -6303,6 +6433,48 @@ pub struct FundTranche<'info> {
     /// operator (AV-104 delegation); the state machine checks the
     /// scope. The real build transfers `tranche_amount` from this
     /// key's wallet / token account into the vault.
+    pub authority: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for `now`/`at` (never
+    /// instruction params).
+    pub clock: AccountInfo<'info>,
+}
+
+/// AV-112: accounts for `initialize_release_cooling` — the
+/// initializer opts the escrow into the release cooling window
+/// before any funds move.
+#[derive(Accounts)]
+pub struct InitializeReleaseCooling<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer may fix the release governance; the state
+    /// machine runs the `Uninitialized`-only builder check.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-112: accounts for `announce_release` / `veto_release` — either
+/// party records or cancels the release intent.
+#[derive(Accounts)]
+pub struct AnnounceRelease<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The announcing party — the initializer or the taker (party
+    /// power: a stranger or an AV-104 operator is `Unauthorized` in
+    /// the state machine).
+    pub authority: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for `now`/`at` (never
+    /// instruction params).
+    pub clock: AccountInfo<'info>,
+}
+
+/// AV-112: accounts for `veto_release` — either party cancels the
+/// live release intent.
+#[derive(Accounts)]
+pub struct VetoRelease<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The vetoing party — the initializer or the taker (party power:
+    /// a stranger or an AV-104 operator is `Unauthorized` in the
+    /// state machine).
     pub authority: Signer<'info>,
     /// CHECK: Solana clock sysvar, read for `now`/`at` (never
     /// instruction params).
@@ -7581,6 +7753,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidFundingPlan => {
             error!(ErrorCode::InvalidFundingPlan)
         }
+        escrow_state::EscrowError::ReleaseCoolingNotElapsed => {
+            error!(ErrorCode::ReleaseCoolingNotElapsed)
+        }
     }
 }
 
@@ -7728,4 +7903,6 @@ pub enum ErrorCode {
     FundingTranchesExhausted,
     #[msg("Invalid funding plan (AV-111): with_funding_plan with max_tranches == 0; fund_tranche with no plan attached; fund on a plan escrow")]
     InvalidFundingPlan,
+    #[msg("Release cooling window not elapsed (AV-112): release on a cooling-configured escrow with no live announced intent, or whose intent was announced less than release_cooling_secs ago")]
+    ReleaseCoolingNotElapsed,
 }

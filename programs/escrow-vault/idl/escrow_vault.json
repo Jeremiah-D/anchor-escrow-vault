@@ -835,6 +835,26 @@
       "args": [
         {"name": "tranche_amount", "type": "u64"}
       ]
+    },
+    {
+      "name": "initialize_release_cooling",
+      "discriminator": [95, 16, 202, 51, 84, 123, 159, 95],
+      "accounts": [],
+      "args": [
+        {"name": "cooling_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "announce_release",
+      "discriminator": [84, 187, 43, 165, 93, 79, 45, 130],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "veto_release",
+      "discriminator": [24, 147, 251, 20, 117, 37, 114, 81],
+      "accounts": [],
+      "args": []
     }
   ],
   "accounts": [
@@ -931,7 +951,9 @@
           {"name": "deadman_last_activity", "type": "u64", "offset": 5069},
           {"name": "rent_topped_up_total", "type": "u64", "offset": 5077},
           {"name": "funded_total", "type": "u64", "offset": 5085},
-          {"name": "funding_plan", "type": {"option": {"defined": "FundingPlan"}}, "offset": 5093}
+          {"name": "funding_plan", "type": {"option": {"defined": "FundingPlan"}}, "offset": 5093},
+          {"name": "release_cooling_secs", "type": "u64", "offset": 5104},
+          {"name": "release_intent_at", "type": {"option": "u64"}, "offset": 5112}
         ]
       }
     }
@@ -1256,7 +1278,8 @@
     {"code": 170, "name": "InvalidRentTopUp"},
     {"code": 171, "name": "FundingIncomplete"},
     {"code": 172, "name": "FundingTranchesExhausted"},
-    {"code": 173, "name": "InvalidFundingPlan"}
+    {"code": 173, "name": "InvalidFundingPlan"},
+    {"code": 174, "name": "ReleaseCoolingNotElapsed"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

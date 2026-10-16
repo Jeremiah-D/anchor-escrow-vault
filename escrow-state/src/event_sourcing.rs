@@ -232,6 +232,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // (exactly like `Funded` itself), so the tranche carries no
         // amount and the fold books nothing.
         | EscrowEventKind::TrancheFunded => (0, 0, 0),
+        // AV-112: release-intent governance signals move no escrow
+        // funds — pure bookkeeping for the indexer, like the AV-104
+        // delegation config changes — so the fold books nothing.
+        | EscrowEventKind::ReleaseIntentAnnounced
+        | EscrowEventKind::ReleaseIntentVetoed => (0, 0, 0),
         // Expiry cancels: `refund` goes to the pinned destination and
         // the AV-24 anti-griefing `penalty` routes to the initializer
         // as compensation — both are initializer receipts, so both
@@ -644,6 +649,10 @@ mod event_sourcing_tests {
                 // leg — the fold seeds the lockup with the deal size
                 // at `Funded`, so the tranche books nothing.
                 | EscrowEventKind::TrancheFunded
+                // AV-112: release-intent governance signals move no
+                // escrow funds.
+                | EscrowEventKind::ReleaseIntentAnnounced
+                | EscrowEventKind::ReleaseIntentVetoed
                 | EscrowEventKind::Slashed => (0, 0, 0),
             };
             assert_eq!(got, want, "delta for {kind:?} (discriminant {d})");

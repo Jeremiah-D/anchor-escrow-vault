@@ -571,6 +571,20 @@ pub struct EscrowSnapshot {
     /// when no plan is attached or the plan's `funded_total` reached
     /// `total_amount` ([`Escrow::is_funding_complete`]).
     pub funding_complete: bool,
+    /// AV-112: the opt-in release cooling window in seconds (`0`
+    /// when no cooling is configured — backward compatible).
+    pub release_cooling_secs: u64,
+    /// AV-112: the live announced release-intent timestamp (`None`
+    /// when no intent is live — never announced, or vetoed) — the
+    /// governance signal the cooling window is measured from, so an
+    /// off-chain indexer can watch the window without replaying the
+    /// announce/veto transitions.
+    pub release_intent_at: Option<u64>,
+    /// AV-112: whether `release` passes the cooling gate at
+    /// [`EscrowSnapshot::at`] — [`Escrow::is_release_cooling_eligible`],
+    /// the single truth source the state machine itself uses, so the
+    /// snapshot can never disagree with the chain.
+    pub release_cooling_eligible: bool,
 }
 
 /// AV-82: point-in-time, read-only view of the opt-in slash terms —
@@ -898,6 +912,14 @@ impl Escrow {
             funding_max_tranches: self.funding_plan().map(|p| p.max_tranches()).unwrap_or(0),
             funding_tranches_used: self.funding_plan().map(|p| p.tranches_used()).unwrap_or(0),
             funding_complete: self.is_funding_complete(),
+            // AV-112: the cooling window and the live intent ride the
+            // export — the eligibility bit is the state machine's own
+            // predicate (`is_release_cooling_eligible`), the single
+            // truth source, so the snapshot can never disagree with
+            // the chain.
+            release_cooling_secs: self.release_cooling_secs(),
+            release_intent_at: self.release_intent_at(),
+            release_cooling_eligible: self.is_release_cooling_eligible(now),
         }
     }
 }
@@ -911,6 +933,14 @@ fn write_opt_hex(s: &mut String, value: Option<[u8; 32]>) {
             s.push_str(&hex32(&v));
             s.push('"');
         }
+        None => s.push_str("null"),
+    }
+}
+
+/// Write an `Option<u64>` as a decimal integer or `null`.
+fn write_opt_u64(s: &mut String, value: Option<u64>) {
+    match value {
+        Some(v) => s.push_str(&v.to_string()),
         None => s.push_str("null"),
     }
 }
@@ -1507,6 +1537,12 @@ impl EscrowSnapshot {
         s.push_str(&self.funding_tranches_used.to_string());
         s.push_str(",\"funding_complete\":");
         s.push_str(&self.funding_complete.to_string());
+        s.push_str(",\"release_cooling_secs\":");
+        s.push_str(&self.release_cooling_secs.to_string());
+        s.push_str(",\"release_intent_at\":");
+        write_opt_u64(&mut s, self.release_intent_at);
+        s.push_str(",\"release_cooling_eligible\":");
+        s.push_str(&self.release_cooling_eligible.to_string());
         s.push('}');
         s
     }
@@ -1574,7 +1610,8 @@ mod snapshot_tests {
              \"pool_payout_eligible\":false,\
              \"interest_rate_bps\":0,\"interest_accrued\":0,\"interest_paid\":0,\"payout_split\":null,\
              \"deadman_inactivity_secs\":0,\"deadman_heir\":null,\"deadman_last_activity\":1700000000,\
-             \"deadman_eligible\":false,\"rent_topped_up_total\":0,\"funded_total\":1000000,\"funding_total_amount\":0,\"funding_max_tranches\":0,\"funding_tranches_used\":0,\"funding_complete\":true\
+             \"deadman_eligible\":false,\"rent_topped_up_total\":0,\"funded_total\":1000000,\"funding_total_amount\":0,\"funding_max_tranches\":0,\"funding_tranches_used\":0,\"funding_complete\":true,\
+             \"release_cooling_secs\":0,\"release_intent_at\":null,\"release_cooling_eligible\":true\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),

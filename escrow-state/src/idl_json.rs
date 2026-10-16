@@ -215,6 +215,9 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         // AV-111: opt-in tranched-funding plan (always present,
         // `None` when unconfigured).
         "Option<FundingPlan>" => IdlType::Option(Box::new(IdlType::Named("FundingPlan"))),
+        // AV-112: the release-intent timestamp (always present,
+        // `None` when no intent is live).
+        "Option<u64>" => IdlType::Option(Box::new(IdlType::U64)),
         // AV-57: the 64 fixed event-history slots.
         "[EventHistorySlot; 64]" => IdlType::Array(ArrayElem::Defined("EventHistorySlot"), 64),
         // AV-73: the 64 live per-period amount slots.
@@ -997,7 +1000,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 74, "error variant count drift");
+    assert_eq!(errors.len(), 75, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -1075,6 +1078,12 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::DeadmanNotElapsed.code(), 169);
     // AV-110: appended, never renumbered.
     assert_eq!(EscrowError::InvalidRentTopUp.code(), 170);
+    // AV-111: appended, never renumbered.
+    assert_eq!(EscrowError::FundingIncomplete.code(), 171);
+    assert_eq!(EscrowError::FundingTranchesExhausted.code(), 172);
+    assert_eq!(EscrowError::InvalidFundingPlan.code(), 173);
+    // AV-112: appended, never renumbered.
+    assert_eq!(EscrowError::ReleaseCoolingNotElapsed.code(), 174);
 }
 
 #[test]

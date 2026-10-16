@@ -104,6 +104,17 @@ pub const INSTRUCTION_CU_TABLE: &[(&str, u64, usize)] = &[
     // plan presence, state, tranche budget, overfund cap) plus
     // counter writes — ranked with the fund-moving unwinds.
     ("fund_tranche", 12_000, 16),
+    // AV-112: cooling_secs:u64 → 8 + 8; a pre-fund config write
+    // (one u64) with the builder guard chain — cheaper than the
+    // fund-moving unwinds, ranked with the cheap config writes.
+    ("initialize_release_cooling", 8_000, 16),
+    // AV-112: no params → 8; a single-timestamp governance write
+    // that moves no escrow funds — ranked with the cheap config
+    // writes, like top_up_rent.
+    ("announce_release", 8_000, 8),
+    // AV-112: no params → 8; clearing one timestamp, no fund
+    // movement — ranked with the cheap config writes.
+    ("veto_release", 8_000, 8),
 ];
 
 /// Base cost for `instruction`, or `None` when the table has no row —
@@ -277,6 +288,9 @@ mod cu_estimate_tests {
             ("claim_deadman", 10_000),
             ("top_up_rent", 8_000),
             ("fund_tranche", 12_000),
+            ("initialize_release_cooling", 8_000),
+            ("announce_release", 8_000),
+            ("veto_release", 8_000),
         ];
         for (name, base) in expected {
             assert_eq!(instruction_cu_base(name), Some(*base), "base drift for {name}");

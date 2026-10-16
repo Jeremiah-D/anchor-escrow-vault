@@ -1099,6 +1099,23 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         None
     };
 
+    // AV-112: the release-cooling tail, always reserved: the 8-byte
+    // opt-in `release_cooling_secs` window, then the `Option<u64>`
+    // intent timestamp (1-byte discriminant + 8-byte timestamp).
+    // Structural decode only — the window/intent invariants are
+    // enforced by `Escrow::with_release_cooling` /
+    // `Escrow::announce_release` / `Escrow::veto_release`, not
+    // re-litigated here.
+    let release_cooling_secs = c.u64_le()?;
+    let release_intent_at = if c.option_present("release_intent_at")? {
+        Some(c.u64_le()?)
+    } else {
+        // Absent: skip the reserved 8-byte payload (the encoder
+        // zero-pads it, matching the other `Option` regions).
+        c.skip(8)?;
+        None
+    };
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1312,6 +1329,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // tail fields.
         funded_total,
         funding_plan,
+        // AV-112: the opt-in release cooling window and the
+        // announced-intent timestamp decode like any other
+        // persisted tail fields.
+        release_cooling_secs,
+        release_intent_at,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

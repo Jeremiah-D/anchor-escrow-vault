@@ -231,6 +231,8 @@
 //! | DeadmanClaimed (AV-109) | 0 | 0 | remaining locked amount, to the configured heir (the heir is not required to be either party) | 0 |
 //! | RentToppedUp (AV-110) | 0 | 0 | 0 | 0 — the topped-up lamports ride `rent_reclaimed` (the rent-balance leg: added here, reclaimed on `VaultClosed`; direction is read from the kind) |
 //! | TrancheFunded (AV-111) | 0 | 0 | 0 | 0 — a funding tranche landed; the fold seeds the lockup with the deal size at `Funded`, so the tranche carries no amount (exactly like `Funded` itself) |
+//! | ReleaseIntentAnnounced (AV-112) | 0 | 0 | 0 | 0 — a release intent was announced (governance signal; the cooling window starts) |
+//! | ReleaseIntentVetoed (AV-112) | 0 | 0 | 0 | 0 — a live release intent was vetoed (governance signal; the announced release is cancelled) |
 //! | ExpiredCranked (AV-48) | 0 | 0 | remainder minus penalty, to the whitelisted destination (the cranker receives nothing) | anti-griefing penalty to the initializer (AV-24; 0 unless the cranker is the taker) |
 //! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
 //! | DefaultJudgment (AV-55) | gross taker share (`default_taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
@@ -769,6 +771,32 @@ pub enum EscrowEventKind {
     /// Always emitted on success — a rejected tranche changes
     /// nothing, so a failed call emits nothing.
     TrancheFunded,
+    /// AV-112: a release intent was announced
+    /// ([`Escrow::announce_release`](crate::Escrow::announce_release))
+    /// — either party recorded `release_intent_at`, starting the
+    /// cooling window the initializer configured via
+    /// [`Escrow::with_release_cooling`](crate::Escrow::with_release_cooling).
+    /// `from == to ==` the current state (a governance signal, not a
+    /// lifecycle move — like
+    /// [`EscrowEventKind::DelegationGranted`]). Pure governance
+    /// bookkeeping for the off-chain indexer: no funds move, so the
+    /// event carries [`EventAmounts::none`]. The actor is the
+    /// announcing party. Emitted only on an actual change: a
+    /// same-timestamp re-announce is an idempotent no-op that emits
+    /// nothing (paralleling
+    /// [`EscrowEventKind::DelegationGranted`]'s no-op rule).
+    ReleaseIntentAnnounced,
+    /// AV-112: a live release intent was vetoed
+    /// ([`Escrow::veto_release`](crate::Escrow::veto_release)) — either
+    /// party cleared `release_intent_at`, cancelling the announced
+    /// release. `from == to ==` the current state (a governance
+    /// signal, not a lifecycle move — like
+    /// [`EscrowEventKind::DelegationGranted`]). Pure governance
+    /// bookkeeping: no funds move, so the event carries
+    /// [`EventAmounts::none`]. The actor is the vetoing party.
+    /// Emitted only on an actual change: vetoing with no live intent
+    /// is a no-op success that emits nothing.
+    ReleaseIntentVetoed,
 }
 
 impl EscrowEventKind {
@@ -909,6 +937,13 @@ impl EscrowEventKind {
             // AV-111: appended after RentToppedUp so discriminants
             // 0–57 stay stable for already-serialized histories.
             58 => Self::TrancheFunded,
+            // AV-112: appended after TrancheFunded so discriminants
+            // 0–58 stay stable for already-serialized histories.
+            59 => Self::ReleaseIntentAnnounced,
+            // AV-112: appended after ReleaseIntentAnnounced so
+            // discriminants 0–59 stay stable for
+            // already-serialized histories.
+            60 => Self::ReleaseIntentVetoed,
             _ => return None,
         })
     }
@@ -976,6 +1011,8 @@ impl EscrowEventKind {
             Self::DeadmanClaimed => "deadman_claimed",
             Self::RentToppedUp => "rent_topped_up",
             Self::TrancheFunded => "tranche_funded",
+            Self::ReleaseIntentAnnounced => "release_intent_announced",
+            Self::ReleaseIntentVetoed => "release_intent_vetoed",
         }
     }
 
@@ -1044,6 +1081,8 @@ impl EscrowEventKind {
             "deadman_claimed" => Self::DeadmanClaimed,
             "rent_topped_up" => Self::RentToppedUp,
             "tranche_funded" => Self::TrancheFunded,
+            "release_intent_announced" => Self::ReleaseIntentAnnounced,
+            "release_intent_vetoed" => Self::ReleaseIntentVetoed,
             _ => return None,
         })
     }
@@ -2896,6 +2935,85 @@ impl IndexedEscrow {
             None,
             Some(authority),
         );
+        Ok(())
+    }
+
+    /// Announce a release intent (mirrors
+    /// [`Escrow::announce_release`](crate::Escrow::announce_release),
+    /// AV-112). Emits `ReleaseIntentAnnounced` with `from == to ==`
+    /// the current state (a governance signal, not a lifecycle move)
+    /// only when the recorded intent actually changes — a
+    /// same-timestamp re-announce is an idempotent no-op that emits
+    /// nothing (paralleling
+    /// [`EscrowEventKind::DelegationGranted`]'s no-op rule). `at` is
+    /// the caller-supplied event timestamp (on-chain: the clock
+    /// sysvar). The actor is the announcing party. A rejected
+    /// announce changes nothing, so a failed call emits nothing.
+    pub fn announce_release(
+        &mut self,
+        authority: [u8; 32],
+        now: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.release_intent_at();
+        self.inner.announce_release(authority, now)?;
+        let after = self.inner.release_intent_at();
+        // The inner call rejects strangers, wrong states, and paused
+        // escrows, so a changed intent here always means real
+        // governance — and a same-timestamp re-announce stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::ReleaseIntentAnnounced,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                Some(authority),
+            );
+        }
+        Ok(())
+    }
+
+    /// Veto a live release intent (mirrors
+    /// [`Escrow::veto_release`](crate::Escrow::veto_release), AV-112).
+    /// Emits `ReleaseIntentVetoed` with `from == to ==` the current
+    /// state (a governance signal, not a lifecycle move) only when
+    /// an intent was actually cleared — vetoing with no live intent
+    /// is a no-op success that emits nothing. `at` is the
+    /// caller-supplied event timestamp (on-chain: the clock sysvar).
+    /// The actor is the vetoing party. A rejected veto changes
+    /// nothing, so a failed call emits nothing.
+    pub fn veto_release(
+        &mut self,
+        caller: [u8; 32],
+        now: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let had_intent = self.inner.release_intent_at().is_some();
+        self.inner.veto_release(caller, now)?;
+        // The inner call is a no-op success with no live intent, so a
+        // cleared intent here always means a real veto — and the
+        // no-intent no-op stays silent.
+        if had_intent {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::ReleaseIntentVetoed,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                Some(caller),
+            );
+        }
         Ok(())
     }
 
@@ -6326,7 +6444,96 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(59), None);
+        assert_eq!(EscrowEventKind::from_discriminant(59), Some(EscrowEventKind::ReleaseIntentAnnounced));
+        assert_eq!(EscrowEventKind::from_discriminant(60), Some(EscrowEventKind::ReleaseIntentVetoed));
+        assert_eq!(EscrowEventKind::from_discriminant(61), None);
+    }
+
+    #[test]
+    fn release_intent_kinds_round_trip() {
+        // AV-112: discriminants 59/60, appended after TrancheFunded —
+        // 0–58 stay stable for already-serialized histories.
+        let announced = EscrowEventKind::ReleaseIntentAnnounced;
+        assert_eq!(announced.discriminant(), 59);
+        assert_eq!(EscrowEventKind::from_discriminant(59), Some(announced));
+        assert_eq!(announced.name(), "release_intent_announced");
+        assert_eq!(
+            EscrowEventKind::from_name("release_intent_announced"),
+            Some(announced)
+        );
+        let vetoed = EscrowEventKind::ReleaseIntentVetoed;
+        assert_eq!(vetoed.discriminant(), 60);
+        assert_eq!(EscrowEventKind::from_discriminant(60), Some(vetoed));
+        assert_eq!(vetoed.name(), "release_intent_vetoed");
+        assert_eq!(
+            EscrowEventKind::from_name("release_intent_vetoed"),
+            Some(vetoed)
+        );
+    }
+
+    #[test]
+    fn announce_release_emits_only_on_change() {
+        // The IndexedEscrow wrapper emits ReleaseIntentAnnounced only
+        // when the recorded intent actually changes — a same-timestamp
+        // re-announce is a silent idempotent no-op.
+        let mut e = funded(1_000_000);
+        e.announce_release(ALICE, T0, T0).unwrap();
+        e.announce_release(ALICE, T0, T0).unwrap(); // same timestamp: silent
+        e.announce_release(BOB, T0 + 5, T0 + 5).unwrap(); // new timestamp: emits
+        let announced: Vec<_> = e
+            .events()
+            .iter()
+            .filter(|ev| ev.kind == EscrowEventKind::ReleaseIntentAnnounced)
+            .collect();
+        assert_eq!(announced.len(), 2, "two real announces, one silent no-op");
+        // from == to == Funded: a governance signal, not a lifecycle move.
+        for ev in &announced {
+            assert_eq!(ev.from, EscrowState::Funded);
+            assert_eq!(ev.to, EscrowState::Funded);
+        }
+        // The actor rides the event-history ring (first 8 key bytes).
+        let history = e.inner().event_history();
+        let actors: Vec<_> = history
+            .iter()
+            .filter(|h| h.kind == EscrowEventKind::ReleaseIntentAnnounced)
+            .map(|h| h.actor)
+            .collect();
+        assert_eq!(
+            actors,
+            vec![
+                Some(ALICE[..8].try_into().unwrap()),
+                Some(BOB[..8].try_into().unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn veto_release_emits_only_on_actual_veto() {
+        // Vetoing with no live intent is a no-op success that emits
+        // nothing; vetoing a live intent emits ReleaseIntentVetoed.
+        let mut e = funded(1_000_000);
+        e.veto_release(ALICE, T0, T0).unwrap(); // no intent: silent
+        let kinds: Vec<EscrowEventKind> = e.events().iter().map(|ev| ev.kind).collect();
+        assert!(
+            !kinds.contains(&EscrowEventKind::ReleaseIntentVetoed),
+            "no-intent veto emits nothing"
+        );
+        e.announce_release(ALICE, T0, T0).unwrap();
+        e.veto_release(BOB, T0 + 1, T0 + 1).unwrap();
+        let vetoed: Vec<_> = e
+            .events()
+            .iter()
+            .filter(|ev| ev.kind == EscrowEventKind::ReleaseIntentVetoed)
+            .collect();
+        assert_eq!(vetoed.len(), 1);
+        assert_eq!(vetoed[0].from, EscrowState::Funded);
+        assert_eq!(vetoed[0].to, EscrowState::Funded);
+        let history = e.inner().event_history();
+        let entry = history
+            .iter()
+            .find(|h| h.kind == EscrowEventKind::ReleaseIntentVetoed)
+            .expect("veto recorded in the ring");
+        assert_eq!(entry.actor, Some(BOB[..8].try_into().unwrap()));
     }
 
     #[test]
@@ -6342,7 +6549,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(59), None);
+        assert_eq!(EscrowEventKind::from_discriminant(61), None);
     }
 
     #[test]
@@ -6879,7 +7086,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(59), None);
+        assert_eq!(EscrowEventKind::from_discriminant(61), None);
     }
 
     #[test]
@@ -6894,7 +7101,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(59), None);
+        assert_eq!(EscrowEventKind::from_discriminant(61), None);
     }
 
     #[test]
@@ -6906,7 +7113,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(59), None);
+        assert_eq!(EscrowEventKind::from_discriminant(61), None);
     }
 
     #[test]
@@ -6918,7 +7125,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(59), None);
+        assert_eq!(EscrowEventKind::from_discriminant(61), None);
     }
 
     #[test]
@@ -6930,7 +7137,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(59), None);
+        assert_eq!(EscrowEventKind::from_discriminant(61), None);
     }
 
     #[test]
@@ -6945,7 +7152,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(59), None);
+        assert_eq!(EscrowEventKind::from_discriminant(61), None);
     }
 
     #[test]
@@ -6960,7 +7167,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(59), None);
+        assert_eq!(EscrowEventKind::from_discriminant(61), None);
     }
 
     #[test]
@@ -6972,7 +7179,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(59), None);
+        assert_eq!(EscrowEventKind::from_discriminant(61), None);
     }
 
     #[test]
@@ -6984,7 +7191,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(59), None);
+        assert_eq!(EscrowEventKind::from_discriminant(61), None);
     }
 
     #[test]
@@ -6996,7 +7203,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(59), None);
+        assert_eq!(EscrowEventKind::from_discriminant(61), None);
     }
 
     #[test]

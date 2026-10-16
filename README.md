@@ -158,6 +158,9 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `top_up_rent(caller, lamports)` (AV-110) | any except `Closed` | unchanged (no state change) | **permissionless** — anyone may top up (the initializer, the taker, the keeper bot, or a stranger; no authority check, the caller only acts as the event actor); `Closed` is `InvalidStateTransition` (no account left to keep rent-exempt); `lamports == 0` is `InvalidRentTopUp` (code 170); deliberately *not* pause-gated (pausing freezes fund movement, not operational hygiene) and no reentrancy guard (no escrow funds move); accumulates `rent_topped_up_total` only — the state byte and the amount conservation identity are untouched (a top-up is pure lamport bookkeeping on the vault account); emits `RentToppedUp` (`from == to ==` the current state; the topped-up lamports ride the event's `rent_reclaimed` amount field) |
 | `initialize_funding_plan(total_amount, max_tranches)` (AV-111) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the cumulative funding target — must equal the escrow's declared `amount` (`AmountMismatch` otherwise) — and the tranche budget, at least 1 (`InvalidFundingPlan`, code 173, on zero); attaching the plan moves the deposit path from `fund` to `fund_tranche`) |
 | `fund_tranche(authority, tranche_amount, now)` (AV-111) | `Uninitialized` (non-dual-sig) / `Activated` / `Funded` | `Funded` (first tranche; later tranches re-enter `Funded`) | initializer or their FUND-scoped operator (AV-104); `now` <- clock sysvar (never a param); full check sequence — pause → reentrancy → FUND-scoped authority → plan presence (`InvalidFundingPlan`, code 173, when no plan is attached) → state → positive amount (`AmountMismatch` on zero) → tranche budget (`FundingTranchesExhausted`, code 172, when spent) → overfund cap (`AmountMismatch`); each call accumulates `funded_total` and consumes one tranche slot; the first call anchors `fund_at` / the interest clock / the deadman clock exactly like `fund`; emits `TrancheFunded` (`from == to ==` the state after the call; no amount — the fold seeds the lockup with the deal size at `Funded`) |
+| `with_release_cooling(cooling_secs)` (AV-112) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; builder-style like the other `with_*` opt-ins); `cooling_secs = 0` means unconfigured — `release` is ungated, exactly like AV-21's grace-period convention |
+| `announce_release(authority, now)` (AV-112) | `Funded` | `Funded` | initializer or taker (either party, no delegation); full check sequence — pause → authority → state; stamps `release_intent_at = now` (re-announce overwrites — idempotent); touches the AV-109 deadman clock (party liveness); emits `ReleaseIntentAnnounced` |
+| `veto_release(caller, now)` (AV-112) | any non-`Closed` | unchanged | initializer or taker (either party); full check sequence — pause → authority → state; clears `release_intent_at`; no intent is a no-op success; touches the deadman clock; emits `ReleaseIntentVetoed` |
 | `initialize_reference(reference)` (AV-53) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the 32-byte off-chain correlation id — order id / invoice hash; any 32 bytes accepted — read-only pass-through: never read by a check gate, never cleared, never affects amount conservation) |
 | `split_escrow(initializer, taker, amounts, vesting, quorum, dual_sig, milestones)` (AV-81) | `Funded` | `Split` (new terminal state) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`; degenerate initializer == taker self-escrow authorizes with one key passed twice); `Disputed` is `InvalidStateTransition` (arbitration in flight adjudicates the locked funds) and every terminal state rejects a re-split; the amount table must be non-empty, hold at most 16 entries, contain no zero entry, and sum in `u128` to exactly the parent's remaining lockup (`InvalidSplit`, code 142, otherwise — a partial release before the split shrinks the splittable pool); each child is born `Funded` with the parent's initializer / taker / `expires_at` and the explicitly inherited config — vesting / quorum / dual-sig / per-child milestones are *not* inherited unless named (default-inert, anti-misconfiguration); child *i*'s escrow ID derives as `H(parent_id \|\| i)` (SHA-256, `u64` little-endian index); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in `Funded` — no half-split); emits `EscrowSplit` (`Funded -> Split`, `amounts.payout` = Σ child amounts, the `(child_id, amount)` roster rides the event) |
 | `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` / `Split` (AV-81) | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it); a split parent's funds were re-homed into the children, so its vault carries nothing but the rent deposit — closeable like the other terminals |
@@ -1248,6 +1251,7 @@ program error per variant):
 | `FundingIncomplete` | 171 | `release` / `claim` / `release_milestone` (AV-111) on a tranched-funding escrow before `funded_total` reaches the plan's `total_amount` |
 | `FundingTranchesExhausted` | 172 | `fund_tranche` (AV-111) when the plan's tranche budget is spent |
 | `InvalidFundingPlan` | 173 | `with_funding_plan` (AV-111) with `max_tranches == 0`; `fund_tranche` with no plan attached; `fund` on a plan escrow |
+| `ReleaseCoolingNotElapsed` | 174 | `release` (AV-112) while cooling is configured and no live intent exists, or before `intent_at + cooling_secs` (stacked after the AV-27 timelock gate) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2329,7 +2333,9 @@ two-way consistency check against the IDL parameter table:
 | rent_topped_up_total | u64 | 8 |
 | funded_total | u64 | 8 |
 | funding_plan | Option<FundingPlan> (1-byte discriminant + total_amount u64 + max_tranches u8 + tranches_used u8) | 11 |
-| **total**     |                   | **5096** |
+| release_cooling_secs | u64 | 8 |
+| release_intent_at | Option<u64> (1-byte discriminant + 8-byte stamp) | 9 |
+| **total**     |                   | **5113** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2446,11 +2452,15 @@ and the 19-byte tranched-funding tail region (AV-111:
 `funded_total` (u64, zeroed until the first deposit) +
 `funding_plan` (Option<FundingPlan>: 1-byte discriminant + 10-byte
 plan payload — `total_amount` u64 + `max_tranches` u8 +
-`tranches_used` u8, `None` when no plan is attached)).
-`escrow-state` exposes `VAULT_SPACE` (5104) and
-`VAULT_SPACE_NO_QUORUM` (4614) for the Anchor `space =` constraint, plus a
+`tranches_used` u8, `None` when no plan is attached)) — and the
+17-byte release-cooling tail region (AV-112:
+`release_cooling_secs` (u64, 0 = unconfigured) +
+`release_intent_at` (Option<u64>: 1-byte discriminant + 8-byte
+stamp, `None` when no intent is live)).
+`escrow-state` exposes `VAULT_SPACE` (5121) and
+`VAULT_SPACE_NO_QUORUM` (4631) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **36,414,720 lamports** to be
+mainnet rent parameters the full vault needs **36,533,040 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -3478,7 +3488,10 @@ deadman tail (8-byte threshold + 33-byte `Option<Pubkey>` heir +
 AV-111 then grows it by a further 19 bytes: body 5077 → **5096**,
 `VAULT_SPACE` 5085 → **5104**, `VAULT_SPACE_NO_QUORUM` 4595 →
 **4614**, rent-exempt 36,282,480 → **36,414,720** lamports — see the
-tranched funding section).
+tranched funding section; AV-112 then grows it by a further 17
+bytes: body 5096 → **5113**, `VAULT_SPACE` 5104 → **5121**,
+`VAULT_SPACE_NO_QUORUM` 4614 → **4631**, rent-exempt 36,414,720 →
+**36,533,040** lamports — see the release-cooling section).
 
 **Walkthrough — the heir reclaims a dormant vault.** The initializer
 names a recovery heir at setup; both parties go silent; a year
@@ -3649,6 +3662,73 @@ initializer                    vault
    |-------------------------------->|
    | release(…) → taker paid           |
    |<--------------------------------|
+```
+
+## Release cooling with veto (AV-112)
+
+The problem: once a quorum or dual signature approves a release,
+nothing stops one party from racing the payout through before the
+other side can react — the classic "approved, then rug-pulled"
+governance failure. AV-112 adds an opt-in cooling window between the
+*intent* to release and the release itself, with a veto either party
+can pull inside the window.
+
+`with_release_cooling(cooling_secs)` is a builder on an
+`Uninitialized` escrow (like the other `with_*` opt-ins).
+`cooling_secs = 0` means unconfigured — `release` is ungated,
+exactly like AV-21's grace-period convention.
+
+`announce_release(authority, now)` records the intent: the check
+sequence is pause → authority → state (`Funded`), and the caller
+must be the initializer or the taker themselves — no delegation
+(mirroring `delegate_authority`'s party-only rule). It stamps
+`release_intent_at = now`; re-announcing overwrites the stamp, so
+the call is idempotent. `veto_release(caller, now)` clears the
+intent; with no live intent it is a no-op success. Both touch the
+AV-109 deadman clock (they are party-liveness signals) and both
+emit indexer events (`ReleaseIntentAnnounced` / `ReleaseIntentVetoed`,
+emitted only on an actual change).
+
+`release` gains a second gate, stacked *after* the AV-27 fixed
+timelock: when cooling is configured, the release is refused with
+`ReleaseCoolingNotElapsed` (code 174) unless an intent is live and
+`now >= intent_at + cooling_secs` (`saturating_add` — no overflow
+path). The two gates are orthogonal and compose: a release must
+clear both the timelock and the cooling window. `release_via_cpi`
+inherits the gate (it delegates to `release`); `release_milestone`
+and `claim` are out of scope — only plain `release` is gated.
+Neither announce nor veto moves funds, so the conservation
+identity is untouched.
+
+The `IndexedEscrow` wrapper emits `ReleaseIntentAnnounced` (59) and
+`ReleaseIntentVetoed` (60) — appended after `TrancheFunded` (58),
+0–58 stable. The keeper reads the intent through the same truth
+source (`is_release_cooling_eligible`) that gates `release`, and
+the snapshot exports `release_cooling_secs` / `release_intent_at`
+/ `release_cooling_eligible`. The Anchor skeleton gains the
+`initialize_release_cooling`, `announce_release`, and `veto_release`
+handlers plus accounts structs and the error mapping (code 174).
+Account layout grows by the 17-byte tail (`release_cooling_secs`
+u64 + `release_intent_at` Option<u64>): body 5096 → **5113**,
+`VAULT_SPACE` 5104 → **5121**, `VAULT_SPACE_NO_QUORUM` 4614 →
+**4631**, rent-exempt 36,414,720 → **36,533,040** lamports.
+
+**Walkthrough — the veto that stopped a rug-pull.** The initializer
+configures a 1-hour cooling window; the taker announces a release
+at noon, planning to sweep the funds before the initializer
+notices:
+
+```
+initializer                  taker                      vault
+   | with_release_cooling(3600)    |                       |
+   |------------------------------>|---------------------->|
+   |                               | announce_release(noon)|
+   |                               |---------------------->|
+   | veto_release(12:30)           |                       |
+   |------------------------------>|---------------------->|
+   |                               | release(12:45) →      |
+   |                               |   ReleaseCoolingNotElapsed
+   |                               |<----------------------|
 ```
 
 ## Basket escrow (AV-95)

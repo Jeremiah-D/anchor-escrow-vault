@@ -2879,6 +2879,36 @@ mod keeper_tests {
         let report = scan_keeper_actions(&watched, sub_due_at(SUB_PERIODS - 1));
         assert!(report.is_empty());
     }
+
+    #[test]
+    fn watched_cooling_intent_is_readable_via_the_same_truth_source() {
+        // AV-112: the keeper never lists `release` (the initializer
+        // calls it), but the watched escrow's cooling window and live
+        // intent are readable off-chain through the state machine's
+        // own predicate — the single truth source `release` itself
+        // uses — so an operator's dashboard can never disagree with
+        // the chain about whether a release would clear the gate.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_release_cooling(3_600)
+            .unwrap();
+        e.fund(ALICE, MID).unwrap();
+        let w = watch(ID1, e);
+        assert_eq!(w.escrow.release_cooling_secs(), 3_600);
+        assert_eq!(w.escrow.release_intent_at(), None);
+        assert!(!w.escrow.is_release_cooling_eligible(MID + 3_600));
+
+        let mut e2 = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_release_cooling(3_600)
+            .unwrap();
+        e2.fund(ALICE, MID).unwrap();
+        e2.announce_release(ALICE, MID).unwrap();
+        let w2 = watch(ID2, e2);
+        assert_eq!(w2.escrow.release_intent_at(), Some(MID));
+        assert!(!w2.escrow.is_release_cooling_eligible(MID + 3_599));
+        assert!(w2.escrow.is_release_cooling_eligible(MID + 3_600));
+    }
 }
 
 #[cfg(test)]
@@ -4964,6 +4994,7 @@ mod rent_health_tests {
             );
         }
     }
+
 }
 
 #[cfg(test)]
