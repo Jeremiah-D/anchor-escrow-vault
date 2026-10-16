@@ -546,6 +546,12 @@ pub struct EscrowSnapshot {
     /// [`EscrowSnapshot::at`] — the keeper scan lists exactly these
     /// escrows for `claim_deadman`.
     pub deadman_eligible: bool,
+    /// AV-110: cumulative lamports ever topped up into this vault's
+    /// rent balance via [`Escrow::top_up_rent`](crate::Escrow::top_up_rent)
+    /// — the on-chain half of the AV-43 rent-health story, so an
+    /// off-chain indexer can reconcile top-up events against the
+    /// vault's counter without replaying the transitions.
+    pub rent_topped_up_total: u64,
 }
 
 /// AV-82: point-in-time, read-only view of the opt-in slash terms —
@@ -858,6 +864,10 @@ impl Escrow {
             deadman_heir: self.deadman_heir(),
             deadman_last_activity: self.deadman_last_activity(),
             deadman_eligible: self.is_deadman_eligible(now),
+            // AV-110: the rent top-up counter rides the export so an
+            // off-chain indexer can reconcile `RentToppedUp` events
+            // against the vault without replaying the transitions.
+            rent_topped_up_total: self.rent_topped_up_total(),
         }
     }
 }
@@ -1455,6 +1465,8 @@ impl EscrowSnapshot {
         s.push_str(&self.deadman_last_activity.to_string());
         s.push_str(",\"deadman_eligible\":");
         s.push_str(&self.deadman_eligible.to_string());
+        s.push_str(",\"rent_topped_up_total\":");
+        s.push_str(&self.rent_topped_up_total.to_string());
         s.push('}');
         s
     }
@@ -1522,7 +1534,7 @@ mod snapshot_tests {
              \"pool_payout_eligible\":false,\
              \"interest_rate_bps\":0,\"interest_accrued\":0,\"interest_paid\":0,\"payout_split\":null,\
              \"deadman_inactivity_secs\":0,\"deadman_heir\":null,\"deadman_last_activity\":1700000000,\
-             \"deadman_eligible\":false\
+             \"deadman_eligible\":false,\"rent_topped_up_total\":0\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),

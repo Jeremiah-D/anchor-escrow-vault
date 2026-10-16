@@ -155,6 +155,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `release_payout_split()` (AV-108) | `Funded` | `Released` | initializer, taker, **or** their RELEASE-scoped operator (AV-104); `now` <- clock sysvar (never a param); reuses the exact `release` gate order (pause → reentrancy → scoped authority → Funded → swap-link → mint → per-recipient payout-policy pin → milestones/subscription → quorum → timelock); no table configured is `InvalidPayoutSplit` (code 167); the protocol fee is charged once on the gross, then the net is prorated per leg (`floor(share_i * net / amount)`, dust to the first leg); `released` accumulates the gross; returns the per-recipient `(recipient, net_payout)` legs; emits `ReleasedSplit` (reused event) |
 | `initialize_deadman_switch(inactivity_secs, heir)` (AV-109) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the inactivity threshold in seconds and the heir — the only key `claim_deadman` accepts; `inactivity_secs == 0` or the zero address is `InvalidDeadmanConfig`, code 168; the 49-byte tail region is always reserved so the config writes in place — no realloc; emits no event, pre-fund configuration) |
 | `claim_deadman(heir, now)` (AV-109) | `Funded` | `Cancelled` | **the configured heir only** (`Unauthorized` otherwise — the heir is deliberately *not* required to be either party, the orthogonality point with `cancel_expired`); only once `now - deadman_last_activity >= inactivity_secs` (saturating; exactly-equal counts as elapsed — `DeadmanNotElapsed`, code 169, before the window lapses); unconfigured switch is `InvalidDeadmanConfig` (code 168); the pause gate and the AV-105 swap-link refusal apply; `now` <- clock sysvar (never an instruction param); the unsettled AV-107 interest claim is voided like `cancel`; returns the remaining locked amount (refund-family unwind — `released` untouched, the remainder preserved for audit like `cancel`'s); emits `DeadmanClaimed` |
+| `top_up_rent(caller, lamports)` (AV-110) | any except `Closed` | unchanged (no state change) | **permissionless** — anyone may top up (the initializer, the taker, the keeper bot, or a stranger; no authority check, the caller only acts as the event actor); `Closed` is `InvalidStateTransition` (no account left to keep rent-exempt); `lamports == 0` is `InvalidRentTopUp` (code 170); deliberately *not* pause-gated (pausing freezes fund movement, not operational hygiene) and no reentrancy guard (no escrow funds move); accumulates `rent_topped_up_total` only — the state byte and the amount conservation identity are untouched (a top-up is pure lamport bookkeeping on the vault account); emits `RentToppedUp` (`from == to ==` the current state; the topped-up lamports ride the event's `rent_reclaimed` amount field) |
 | `initialize_reference(reference)` (AV-53) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the 32-byte off-chain correlation id — order id / invoice hash; any 32 bytes accepted — read-only pass-through: never read by a check gate, never cleared, never affects amount conservation) |
 | `split_escrow(initializer, taker, amounts, vesting, quorum, dual_sig, milestones)` (AV-81) | `Funded` | `Split` (new terminal state) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`; degenerate initializer == taker self-escrow authorizes with one key passed twice); `Disputed` is `InvalidStateTransition` (arbitration in flight adjudicates the locked funds) and every terminal state rejects a re-split; the amount table must be non-empty, hold at most 16 entries, contain no zero entry, and sum in `u128` to exactly the parent's remaining lockup (`InvalidSplit`, code 142, otherwise — a partial release before the split shrinks the splittable pool); each child is born `Funded` with the parent's initializer / taker / `expires_at` and the explicitly inherited config — vesting / quorum / dual-sig / per-child milestones are *not* inherited unless named (default-inert, anti-misconfiguration); child *i*'s escrow ID derives as `H(parent_id \|\| i)` (SHA-256, `u64` little-endian index); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in `Funded` — no half-split); emits `EscrowSplit` (`Funded -> Split`, `amounts.payout` = Σ child amounts, the `(child_id, amount)` roster rides the event) |
 | `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` / `Split` (AV-81) | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it); a split parent's funds were re-homed into the children, so its vault carries nothing but the rent deposit — closeable like the other terminals |
@@ -607,7 +608,7 @@ and `evidence_disclosure`. New vault fields (appended last):
 `evidence_root` (`Option<[u8; 32]>`, 33 bytes) + `evidence_leaves`
 (u8) + `evidence_disclosed` (u64, 8 bytes) — 42 bytes at the time,
 bringing the layout to 3978 bytes (the layout has since grown to
-5069 bytes / 5077 with the discriminator — see the account-space
+5077 bytes / 5085 with the discriminator — see the account-space
 paragraph below). Anchor
 surface: `escalate` gains the two params, plus the new
 `file_evidence` instruction (`doc_hash`, `leaf_index`,
@@ -1241,6 +1242,7 @@ program error per variant):
 | `InvalidPayoutSplit` | 167 | `with_payout_split` / `initialize_payout_split` (AV-108) with an empty table, a zero recipient, a duplicate recipient, a zero share, more than 8 shares, or a share total != amount; `release` / `release_via_cpi` on a split-configured escrow; `release_payout_split` with no table configured |
 | `InvalidDeadmanConfig` | 168 | `with_deadman_switch` / `initialize_deadman_switch` (AV-109) with `inactivity_secs == 0` or a zero-address heir, or after funding; `claim_deadman` (AV-109) on an escrow with no dead-man's switch configured |
 | `DeadmanNotElapsed` | 169 | `claim_deadman` (AV-109) before `now - deadman_last_activity >= inactivity_secs` — exactly-equal counts as elapsed |
+| `InvalidRentTopUp` | 170 | `top_up_rent` (AV-110) with `lamports == 0`, or the cumulative `rent_topped_up_total` counter overflowing `u64` |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2319,7 +2321,8 @@ two-way consistency check against the IDL parameter table:
 | deadman_inactivity_secs | u64 | 8 |
 | deadman_heir | Option<Pubkey> | 33 |
 | deadman_last_activity | u64 | 8 |
-| **total**     |                   | **5069** |
+| rent_topped_up_total | u64 | 8 |
+| **total**     |                   | **5077** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2430,11 +2433,12 @@ zeroed when the escrow is not linked into a swap pair) — and the
 (u64, zeroed when the switch is not configured) + `deadman_heir`
 (Option<Pubkey>: 1-byte discriminant + 32-byte heir, zeroed when no
 heir is named) + `deadman_last_activity` (u64, zeroed when the escrow
-was never funded).
-`escrow-state` exposes `VAULT_SPACE` (5077) and
-`VAULT_SPACE_NO_QUORUM` (4587) for the Anchor `space =` constraint, plus a
+was never funded) — and the 8-byte rent top-up tail region (AV-110:
+`rent_topped_up_total` (u64, zeroed when no top-up was ever made)).
+`escrow-state` exposes `VAULT_SPACE` (5085) and
+`VAULT_SPACE_NO_QUORUM` (4595) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **36,226,800 lamports** to be
+mainnet rent parameters the full vault needs **36,282,480 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -3455,7 +3459,10 @@ deadman tail (8-byte threshold + 33-byte `Option<Pubkey>` heir +
 8-byte activity clock, zeroed when unconfigured): body 5020 →
 **5069**, `VAULT_SPACE` 5028 → **5077**,
 `VAULT_SPACE_NO_QUORUM` 4538 → **4587**, rent-exempt 35,885,760 →
-**36,226,800** lamports.
+**36,226,800** lamports (AV-110 later grows the layout by a further
+8 bytes: body 5069 → **5077**, `VAULT_SPACE` 5077 → **5085**,
+`VAULT_SPACE_NO_QUORUM` 4587 → **4595**, rent-exempt 36,226,800 →
+**36,282,480** lamports — see the permissionless rent top-up section).
 
 **Walkthrough — the heir reclaims a dormant vault.** The initializer
 names a recovery heir at setup; both parties go silent; a year
@@ -3487,6 +3494,62 @@ Had the initializer instead released half at `t0 + 30d`, the clock
 would have reset to `t0 + 30d` and the heir's window would measure
 from there — activity, not the funding date, is what the switch
 watches.
+
+## Permissionless rent top-up (AV-110)
+
+The problem: a Solana account that drops below the rent-exempt
+minimum starts being charged rent — and a vault whose layout grew
+across upgrades (each appended tail region raises the exempt
+minimum) can drift underfunded without anyone noticing. The AV-43
+keeper scan (`scan_rent_health`) already *reports* underfunded
+vaults with the exact top-up amount; AV-110 adds the on-chain
+instruction that actually moves the lamports.
+
+`top_up_rent(caller, lamports)` is permissionless: the initializer,
+the taker, the keeper bot, or a complete stranger may call it, in
+any state except `Closed` (`InvalidStateTransition` — a closed vault
+no longer exists). It accumulates `lamports` into the new
+`rent_topped_up_total` vault counter and changes nothing else: the
+state byte is untouched, and the amount conservation identity is
+untouched — a top-up is pure lamport bookkeeping on the vault
+*account*, not on the escrow lockup.
+
+Two deliberate non-gates: the call is *not* pause-gated (pausing
+freezes fund movement, not operational hygiene — refusing top-ups
+while paused could let a paused vault drift into rent collection),
+and it carries no reentrancy guard (it moves no escrow funds and
+touches exactly one counter). `lamports == 0` is `InvalidRentTopUp`
+(code 170) — a top-up must move a positive amount.
+
+The `IndexedEscrow` wrapper emits `RentToppedUp` (`from == to ==`
+the current state; the topped-up lamports ride the event's
+`rent_reclaimed` amount field — the rent-balance leg, direction read
+from the kind); the event-sourced fold books it as zero (rent sits
+outside the lockup, like a close's `rent_reclaimed`). The Anchor
+skeleton gains the `top_up_rent` handler, the `TopUpRent` accounts
+struct (vault + permissionless caller signer + clock sysvar for the
+event's `at`), and the `InvalidRentTopUp` error mapping (code 170);
+the snapshot exports the counter so indexers can reconcile top-up
+events against the vault. Account layout grows by the 8-byte
+counter: body 5069 → **5077**, `VAULT_SPACE` 5077 → **5085**,
+`VAULT_SPACE_NO_QUORUM` 4587 → **4595**, rent-exempt 36,226,800 →
+**36,282,480** lamports. The event kind `RentToppedUp` is 57
+(appended after `DeadmanClaimed`, 0–56 stable).
+
+**Walkthrough — the keeper keeps a vault rent-exempt.** The vault's
+layout grew; the keeper scan flags it 6,960 lamports short:
+
+```
+keeper            stranger          vault
+   |  scan_rent_health → top_up 6,960 lamports   |
+   |-------------------------------------------->|
+   |                  |  top_up_rent(anyone, 6960)|
+   |                  |------------------------->|
+   |                  |   | rent_topped_up_total |
+   |                  |   | = 6,960; state still |
+   |                  |   | Funded; RentToppedUp |
+   |                  |   | emitted              |
+```
 
 ## Basket escrow (AV-95)
 

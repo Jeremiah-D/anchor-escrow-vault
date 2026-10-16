@@ -220,6 +220,13 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         | EscrowEventKind::DeadmanClaimed => {
             (amounts.refund, 0, amounts.refund)
         }
+        // AV-110: a rent top-up moves lamports into the vault
+        // *account*, not the escrow lockup — rent sits outside the
+        // lockup exactly like a close's `rent_reclaimed`, so the
+        // fold books nothing (the topped-up lamports ride the
+        // event's `rent_reclaimed` field for indexers, never the
+        // fund triple).
+        | EscrowEventKind::RentToppedUp => (0, 0, 0),
         // Expiry cancels: `refund` goes to the pinned destination and
         // the AV-24 anti-griefing `penalty` routes to the initializer
         // as compensation — both are initializer receipts, so both
@@ -625,6 +632,9 @@ mod event_sourcing_tests {
                 | EscrowEventKind::DelegationRevoked
                 // AV-105: a config change — no fund movement.
                 | EscrowEventKind::SwapLinked
+                // AV-110: a rent top-up moves no escrow funds (rent
+                // sits outside the lockup).
+                | EscrowEventKind::RentToppedUp
                 | EscrowEventKind::Slashed => (0, 0, 0),
             };
             assert_eq!(got, want, "delta for {kind:?} (discriminant {d})");

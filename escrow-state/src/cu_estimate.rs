@@ -95,6 +95,10 @@ pub const INSTRUCTION_CU_TABLE: &[(&str, u64, usize)] = &[
     // fund-moving unwind like cancel_expired/crank_expired, ranked
     // with them.
     ("claim_deadman", 10_000, 8),
+    // AV-110: lamports:u64 → 8 + 8; a permissionless single-counter
+    // write that moves no escrow funds — cheaper than the
+    // fund-moving unwinds, ranked with the cheap config writes.
+    ("top_up_rent", 8_000, 16),
 ];
 
 /// Base cost for `instruction`, or `None` when the table has no row —
@@ -186,7 +190,16 @@ mod cu_estimate_tests {
             KeeperActionKind::PoolPayout,
             KeeperActionKind::ClaimDeadman,
         ];
-        assert_eq!(kinds.len(), INSTRUCTION_CU_TABLE.len());
+        assert_eq!(kinds.len(), 12, "keeper action kind count drift");
+        // The table may carry rows beyond the keeper kinds (AV-110:
+        // `top_up_rent` is permissionless and keeper-executable but is
+        // reported through `scan_rent_health`'s `TopUpAction`, not as a
+        // `KeeperActionKind`) — every keeper kind must have a row, the
+        // converse is not required.
+        assert!(
+            INSTRUCTION_CU_TABLE.len() >= kinds.len(),
+            "CU table lost keeper-kind coverage"
+        );
         for k in kinds {
             let name = k.as_str();
             assert!(
@@ -257,6 +270,7 @@ mod cu_estimate_tests {
             ("expire_appeal", 10_000),
             ("pool_payout", 18_000),
             ("claim_deadman", 10_000),
+            ("top_up_rent", 8_000),
         ];
         for (name, base) in expected {
             assert_eq!(instruction_cu_base(name), Some(*base), "base drift for {name}");

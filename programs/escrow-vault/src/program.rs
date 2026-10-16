@@ -1240,6 +1240,50 @@ pub mod escrow_vault {
         Ok(heir_payout)
     }
 
+    /// Top up the vault account's lamport balance so it stays
+    /// rent-exempt (AV-110; mirrors `Escrow::top_up_rent`).
+    /// Permissionless: the initializer, the taker, the keeper bot or a
+    /// stranger may call — the state machine takes the caller only as
+    /// the event actor and runs no authority check. Any state except
+    /// `Closed` (`InvalidStateTransition` on a closed vault); `lamports
+    /// == 0` is `InvalidRentTopUp` (code 170). The state byte is
+    /// untouched and the amount conservation identity is untouched —
+    /// the real build transfers `lamports` from the caller's wallet
+    /// into the vault account alongside the state-machine call; the
+    /// `rent_topped_up_total` counter is the on-chain receipt.
+    pub fn top_up_rent(ctx: Context<TopUpRent>, lamports: u64) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        escrow
+            .top_up_rent(ctx.accounts.caller.key().to_bytes(), lamports)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `now` doubles as the event's `at`; the on-chain event
+        // shape carries no rent leg (payout/fee/refund stay zero) —
+        // the topped-up lamports are visible in the vault account's
+        // lamport balance and the `rent_topped_up_total` counter, and
+        // the off-chain `IndexedEscrow` event rides them in its
+        // `rent_reclaimed` amount field. `caller` is the topping-up
+        // key.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::RentToppedUp,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.caller.key()),
+        );
+        Ok(())
+    }
+
     /// Opt in to dispute arbitration (AV-14; mirrors
     /// `Escrow::with_arbiter`). `Uninitialized` only, like
     /// `initialize_quorum`: the arbiter's identity is fixed before funds
@@ -6152,6 +6196,22 @@ pub struct ClaimDeadman<'info> {
     pub vault_token_account: AccountInfo<'info>,
 }
 
+/// AV-110: accounts for `top_up_rent` — anyone tops up the vault's
+/// lamport balance so it stays rent-exempt.
+#[derive(Accounts)]
+pub struct TopUpRent<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The topping-up caller — permissionless, so any signer works;
+    /// the state machine records it only as the event actor. The
+    /// real build transfers `lamports` from this key's wallet into
+    /// the vault account.
+    pub caller: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the event's `at`
+    /// (never an instruction param).
+    pub clock: AccountInfo<'info>,
+}
+
 #[derive(Accounts)]
 pub struct Claim<'info> {
     #[account(mut)]
@@ -7411,6 +7471,10 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::DeadmanNotElapsed => {
             error!(ErrorCode::DeadmanNotElapsed)
         }
+        // AV-110: appended, never renumbered.
+        escrow_state::EscrowError::InvalidRentTopUp => {
+            error!(ErrorCode::InvalidRentTopUp)
+        }
     }
 }
 
@@ -7550,4 +7614,6 @@ pub enum ErrorCode {
     InvalidDeadmanConfig,
     #[msg("Dead-man's switch inactivity window not elapsed (AV-109): claim_deadman before now - deadman_last_activity reaches deadman_inactivity_secs")]
     DeadmanNotElapsed,
+    #[msg("Invalid rent top-up (AV-110): top_up_rent with lamports == 0, or the cumulative rent_topped_up_total counter overflowing u64")]
+    InvalidRentTopUp,
 }

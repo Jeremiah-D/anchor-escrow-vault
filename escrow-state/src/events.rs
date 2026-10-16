@@ -229,6 +229,7 @@
 //! | PartiallyCancelled (AV-60) | 0 | 0 | the partially-cancelled tranche, refunded to the whitelisted destination (the escrow stays `Funded`; the `released` counter is untouched) | 0 |
 //! | ExpiredCancelled | 0 | 0 | remainder minus penalty, to the whitelisted destination | anti-griefing penalty to the initializer (AV-24; 0 unless taker-initiated with `penalty_bps > 0`) |
 //! | DeadmanClaimed (AV-109) | 0 | 0 | remaining locked amount, to the configured heir (the heir is not required to be either party) | 0 |
+//! | RentToppedUp (AV-110) | 0 | 0 | 0 | 0 — the topped-up lamports ride `rent_reclaimed` (the rent-balance leg: added here, reclaimed on `VaultClosed`; direction is read from the kind) |
 //! | ExpiredCranked (AV-48) | 0 | 0 | remainder minus penalty, to the whitelisted destination (the cranker receives nothing) | anti-griefing penalty to the initializer (AV-24; 0 unless the cranker is the taker) |
 //! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
 //! | DefaultJudgment (AV-55) | gross taker share (`default_taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
@@ -743,6 +744,18 @@ pub enum EscrowEventKind {
     /// Always emitted on success: a successful claim always moves
     /// funds, so there is no no-op case.
     DeadmanClaimed,
+    /// AV-110: rent was topped up
+    /// ([`Escrow::top_up_rent`](crate::Escrow::top_up_rent)) — a
+    /// permissionless caller added lamports to the vault's rent
+    /// balance. `from == to ==` the current state (pure lamport
+    /// bookkeeping, not a lifecycle move — like
+    /// [`EscrowEventKind::DelegationGranted`]). The topped-up lamports
+    /// ride [`EventAmounts::rent_reclaimed`] (the rent-balance leg;
+    /// direction is read from the kind — added here, reclaimed on
+    /// `VaultClosed`). The actor is the topping-up caller. Always
+    /// emitted on success: a zero-lamport call is rejected, so there
+    /// is no no-op case.
+    RentToppedUp,
 }
 
 impl EscrowEventKind {
@@ -877,6 +890,9 @@ impl EscrowEventKind {
             // AV-109: appended after SwapLinked so discriminants
             // 0–55 stay stable for already-serialized histories.
             56 => Self::DeadmanClaimed,
+            // AV-110: appended after DeadmanClaimed so discriminants
+            // 0–56 stay stable for already-serialized histories.
+            57 => Self::RentToppedUp,
             _ => return None,
         })
     }
@@ -942,6 +958,7 @@ impl EscrowEventKind {
             Self::DelegationRevoked => "delegation_revoked",
             Self::SwapLinked => "swap_linked",
             Self::DeadmanClaimed => "deadman_claimed",
+            Self::RentToppedUp => "rent_topped_up",
         }
     }
 
@@ -1008,6 +1025,7 @@ impl EscrowEventKind {
             "delegation_revoked" => Self::DelegationRevoked,
             "swap_linked" => Self::SwapLinked,
             "deadman_claimed" => Self::DeadmanClaimed,
+            "rent_topped_up" => Self::RentToppedUp,
             _ => return None,
         })
     }
@@ -1101,6 +1119,21 @@ impl EventAmounts {
     /// [`EscrowEventKind::VaultsBatchClosed`] summary event.
     pub(crate) fn batch_close(total_rent: u64) -> Self {
         Self::close(total_rent)
+    }
+
+    /// A permissionless rent top-up (AV-110): the topped-up `lamports`
+    /// ride `rent_reclaimed` — the rent-balance leg (added to the
+    /// vault's balance here; the direction is read from the event
+    /// kind, which is `RentToppedUp`, not `VaultClosed`). Rides the
+    /// [`EscrowEventKind::RentToppedUp`] event.
+    pub(crate) fn rent_top_up(lamports: u64) -> Self {
+        Self {
+            payout: 0,
+            fee: 0,
+            refund: 0,
+            penalty: 0,
+            rent_reclaimed: lamports,
+        }
     }
 
     /// An escrow split (AV-81): the Σ child amounts re-locked into the
@@ -2764,6 +2797,38 @@ impl IndexedEscrow {
             None,
             None,
             Some(authority),
+        );
+        Ok(())
+    }
+
+    /// Top up the vault's rent balance (mirrors
+    /// [`Escrow::top_up_rent`], AV-110). Emits `RentToppedUp` with
+    /// `from == to ==` the current state (pure lamport bookkeeping,
+    /// not a lifecycle move — like `Paused`); the topped-up lamports
+    /// ride the event's `rent_reclaimed` amount field. `at` is the
+    /// caller-supplied event timestamp (on-chain: the clock sysvar).
+    /// The actor is the permissionless caller. A zero-lamport call is
+    /// rejected by the state machine, so a successful call always
+    /// emits — there is no no-op case.
+    pub fn top_up_rent(
+        &mut self,
+        caller: [u8; 32],
+        lamports: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        self.inner.top_up_rent(caller, lamports)?;
+        let state = self.inner.state();
+        self.push_event(
+            EscrowEventKind::RentToppedUp,
+            state,
+            state,
+            EventAmounts::rent_top_up(lamports),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(caller),
         );
         Ok(())
     }
@@ -6195,7 +6260,7 @@ mod event_tests {
             EscrowEventKind::from_name("bundle_partially_executed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(57), None);
+        assert_eq!(EscrowEventKind::from_discriminant(58), None);
     }
 
     #[test]
@@ -6211,7 +6276,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(57), None);
+        assert_eq!(EscrowEventKind::from_discriminant(58), None);
     }
 
     #[test]
@@ -6748,7 +6813,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(57), None);
+        assert_eq!(EscrowEventKind::from_discriminant(58), None);
     }
 
     #[test]
@@ -6763,7 +6828,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(57), None);
+        assert_eq!(EscrowEventKind::from_discriminant(58), None);
     }
 
     #[test]
@@ -6775,7 +6840,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(57), None);
+        assert_eq!(EscrowEventKind::from_discriminant(58), None);
     }
 
     #[test]
@@ -6787,7 +6852,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(57), None);
+        assert_eq!(EscrowEventKind::from_discriminant(58), None);
     }
 
     #[test]
@@ -6799,7 +6864,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(57), None);
+        assert_eq!(EscrowEventKind::from_discriminant(58), None);
     }
 
     #[test]
@@ -6814,7 +6879,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(57), None);
+        assert_eq!(EscrowEventKind::from_discriminant(58), None);
     }
 
     #[test]
@@ -6829,7 +6894,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(57), None);
+        assert_eq!(EscrowEventKind::from_discriminant(58), None);
     }
 
     #[test]
@@ -6841,7 +6906,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(57), None);
+        assert_eq!(EscrowEventKind::from_discriminant(58), None);
     }
 
     #[test]
@@ -6853,7 +6918,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(57), None);
+        assert_eq!(EscrowEventKind::from_discriminant(58), None);
     }
 
     #[test]
@@ -6865,7 +6930,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(57), None);
+        assert_eq!(EscrowEventKind::from_discriminant(58), None);
     }
 
     #[test]

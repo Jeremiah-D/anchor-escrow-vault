@@ -978,7 +978,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 70, "error variant count drift");
+    assert_eq!(errors.len(), 71, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -1054,6 +1054,8 @@ fn idl_errors_pin_enum() {
     // AV-109: the dead-man's switch codes extend the table — never renumbered.
     assert_eq!(EscrowError::InvalidDeadmanConfig.code(), 168);
     assert_eq!(EscrowError::DeadmanNotElapsed.code(), 169);
+    // AV-110: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidRentTopUp.code(), 170);
 }
 
 #[test]

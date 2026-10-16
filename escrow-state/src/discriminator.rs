@@ -1070,6 +1070,12 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     };
     let deadman_last_activity = c.u64_le()?;
 
+    // AV-110: the rent top-up tail, always reserved: the 8-byte
+    // cumulative top-up counter. Structural decode only — the
+    // counter invariants are enforced by `Escrow::top_up_rent`,
+    // not re-litigated here.
+    let rent_topped_up_total = c.u64_le()?;
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1275,6 +1281,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         deadman_inactivity_secs,
         deadman_heir,
         deadman_last_activity,
+        // AV-110: the cumulative rent top-up counter decodes like any
+        // other persisted tail field.
+        rent_topped_up_total,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

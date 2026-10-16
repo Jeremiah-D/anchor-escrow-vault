@@ -3998,7 +3998,9 @@ pub struct WatchedEscrowWithBalance {
 }
 
 /// One executable `top_up` action: everything needed to fund the vault
-/// back to rent exemption, nothing more.
+/// back to rent exemption, nothing more. Executed on-chain via the
+/// AV-110 `top_up_rent` instruction (permissionless — the listed
+/// `caller` is the canonical funder, but any key may submit it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TopUpAction {
     /// Which escrow's vault this action tops up.

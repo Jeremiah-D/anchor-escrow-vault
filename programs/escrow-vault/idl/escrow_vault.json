@@ -810,6 +810,14 @@
       "discriminator": [179, 124, 46, 54, 34, 232, 80, 77],
       "accounts": [],
       "args": []
+    },
+    {
+      "name": "top_up_rent",
+      "discriminator": [228, 107, 203, 188, 137, 169, 152, 122],
+      "accounts": [],
+      "args": [
+        {"name": "lamports", "type": "u64"}
+      ]
     }
   ],
   "accounts": [
@@ -903,7 +911,8 @@
           {"name": "payout_split", "type": {"defined": "PayoutSplit"}, "offset": 4707},
           {"name": "deadman_inactivity_secs", "type": "u64", "offset": 5028},
           {"name": "deadman_heir", "type": {"option": "publicKey"}, "offset": 5036},
-          {"name": "deadman_last_activity", "type": "u64", "offset": 5069}
+          {"name": "deadman_last_activity", "type": "u64", "offset": 5069},
+          {"name": "rent_topped_up_total", "type": "u64", "offset": 5077}
         ]
       }
     }
@@ -1213,7 +1222,8 @@
     {"code": 166, "name": "InterestNotEnabled"},
     {"code": 167, "name": "InvalidPayoutSplit"},
     {"code": 168, "name": "InvalidDeadmanConfig"},
-    {"code": 169, "name": "DeadmanNotElapsed"}
+    {"code": 169, "name": "DeadmanNotElapsed"},
+    {"code": 170, "name": "InvalidRentTopUp"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
