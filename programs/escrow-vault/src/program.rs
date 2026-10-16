@@ -1101,6 +1101,79 @@ pub mod escrow_vault {
         Ok(paid)
     }
 
+    /// Declare the multi-recipient payout-split table (AV-108; mirrors
+    /// `Escrow::with_payout_split`). `Uninitialized` only, like
+    /// `initialize_interest`: the distribution is fixed before funds
+    /// move. Takes 1–8 `(recipient, amount)` shares; empty / over-8 /
+    /// zero-address / duplicate-recipient / zero-share input, or a
+    /// share Σ != the escrow amount, is `InvalidPayoutSplit` (code
+    /// 167). The vault account already reserves the full 321-byte
+    /// split tail (1-byte live count + eight 32-byte recipient slots
+    /// + eight 8-byte share slots, zeroed when unconfigured), so the
+    /// table is written in place — no realloc needed in the real
+    /// build. Emits no event (pre-fund configuration).
+    pub fn initialize_payout_split(
+        ctx: Context<InitializePayoutSplit>,
+        shares: Vec<PayoutSplitShare>,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let table: Vec<([u8; 32], u64)> = shares
+            .iter()
+            .map(|s| (s.recipient, s.amount))
+            .collect();
+        let escrow = escrow
+            .with_payout_split(&table)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
+    /// Settle the full lockup across the declared split recipients
+    /// (AV-108; mirrors `Escrow::release_payout_split`). The
+    /// initializer (or their RELEASE-scoped operator, AV-104) calls
+    /// with the clock sysvar; `now` is never an instruction param.
+    /// Reuses the exact `release` check order (pause → reentrancy →
+    /// scoped authority → Funded → swap-link → mint → per-recipient
+    /// payout-policy pin → milestones/subscription → quorum →
+    /// timelock) and splits the post-fee net per leg as
+    /// `floor(share_i * net / amount)` with the rounding dust on the
+    /// first recipient. Returns the per-recipient `(recipient,
+    /// net_payout)` legs so the real build can size each transfer and
+    /// the protocol fee (AV-17). No table configured is
+    /// `InvalidPayoutSplit` (code 167). The per-leg transfers ride
+    /// `remaining_accounts` in table order (like `ReleaseSplit`'s leg
+    /// wiring); the real build executes them via
+    /// `escrow_state::cpi::payout_plan` per leg.
+    pub fn release_payout_split(ctx: Context<ReleasePayoutSplit>) -> Result<Vec<([u8; 32], u64)>> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        let legs = escrow
+            .release_payout_split(
+                ctx.accounts.authority.key().to_bytes(),
+                now,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::ReleasedSplit,
+            from,
+            escrow.state() as u8,
+            escrow.released_amount(),
+            escrow.fees_paid(),
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(legs)
+    }
+
     /// Opt in to dispute arbitration (AV-14; mirrors
     /// `Escrow::with_arbiter`). `Uninitialized` only, like
     /// `initialize_quorum`: the arbiter's identity is fixed before funds
@@ -4609,6 +4682,44 @@ pub struct Vault {
     /// `escrow_state`'s `interest_paid`); the new sink in the
     /// extended conservation identity — never mixed into `released`.
     pub interest_paid: u64,
+    /// AV-108: the opt-in multi-recipient payout-split table (mirrors
+    /// `escrow_state`'s `payout_split`); zeroed unless the initializer
+    /// called `initialize_payout_split` while `Uninitialized`.
+    /// Layout position matches `escrow_state::VAULT_FIELDS`
+    /// (appended last, after the interest tail).
+    pub payout_split: PayoutSplit,
+}
+
+/// Skeleton mirror of `escrow_state::PayoutSplit`: the opt-in
+/// multi-recipient payout-split table (AV-108) — the initializer's
+/// declared distribution of the locked amount across 1–8 fixed
+/// recipients. The share Σ is pinned to the escrow amount at
+/// declaration; the table owns the release destination, so plain
+/// `release` / `release_via_cpi` become `InvalidPayoutSplit` (code
+/// 167) once it is configured and the full lockup settles through
+/// `release_payout_split` only.
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, Debug, PartialEq, Eq,
+)]
+pub struct PayoutSplit {
+    /// Number of live shares (1–8); `0` means no table configured.
+    pub split_count: u8,
+    /// Fixed recipient slots; unused slots are zero-filled.
+    pub recipients: [[u8; 32]; 8],
+    /// Fixed share-amount slots (lamports); unused slots are zero.
+    pub amounts: [u64; 8],
+}
+
+/// Skeleton mirror of `escrow_state::PayoutSplitShare`: one
+/// (recipient, amount) leg of the `initialize_payout_split` table.
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, Debug, PartialEq, Eq,
+)]
+pub struct PayoutSplitShare {
+    /// The leg's recipient (never the zero address).
+    pub recipient: [u8; 32],
+    /// The leg's fixed share (lamports, never zero).
+    pub amount: u64,
 }
 
 /// Skeleton mirror of `escrow_state::SlashTerms`: the opt-in
@@ -5894,6 +6005,39 @@ pub struct ClaimInterest<'info> {
     pub vault_token_account: AccountInfo<'info>,
 }
 
+/// AV-108: accounts for `initialize_payout_split` — same shape as
+/// `InitializeInterest`: only the initializer declares the table.
+#[derive(Accounts)]
+pub struct InitializePayoutSplit<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer declares the split table; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized` (`InvalidStateTransition`). A bad table is
+    /// `InvalidPayoutSplit` (code 167).
+    pub initializer: Signer<'info>,
+}
+
+/// AV-108: accounts for `release_payout_split` — the per-leg payout
+/// accounts ride `remaining_accounts` in table order, mirroring
+/// `ReleaseSplit`'s leg wiring.
+#[derive(Accounts)]
+pub struct ReleasePayoutSplit<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The initializer, the taker, or their RELEASE-scoped operator
+    /// (AV-104); the state machine enforces the scope
+    /// (`Unauthorized` otherwise).
+    pub authority: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the timelock/quorum
+    /// gates (never an instruction param).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build funds the per-leg transfers from the vault's holdings;
+    /// unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
+}
+
 #[derive(Accounts)]
 pub struct Claim<'info> {
     #[account(mut)]
@@ -7143,6 +7287,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InterestNotEnabled => {
             error!(ErrorCode::InterestNotEnabled)
         }
+        escrow_state::EscrowError::InvalidPayoutSplit => {
+            error!(ErrorCode::InvalidPayoutSplit)
+        }
     }
 }
 
@@ -7276,4 +7423,6 @@ pub enum ErrorCode {
     InvalidInterestRate,
     #[msg("Interest not enabled (AV-107): claim_interest on an escrow with no interest rate configured (interest_rate_bps == 0)")]
     InterestNotEnabled,
+    #[msg("Invalid payout-split table (AV-108): with_payout_split with an empty table, a zero recipient, a duplicate recipient, a zero share, more than 8 shares, or a share total != amount; or release/release_via_cpi on a split-configured escrow")]
+    InvalidPayoutSplit,
 }

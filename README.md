@@ -151,6 +151,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `expire_appeal(caller)` (AV-103) | `Funded` | `Funded` (appeal → `Expired`, terminal) | **permissionless** — anyone may crank a lapsed appeal (no authority check; the caller only acts as the event actor); requires a `Filed` appeal and `now > appeal_deadline` (`InvalidAppealWindow` when never filed or already resolved, `AppealExpiryNotDue` code 159 when the window has not lapsed yet); the slash stands (like an upheld appeal) and the locked appeal bond — if any — is forfeited to the initializer; returns the forfeited bond (`0` when none) so the transfer can be sized; `now` <- clock sysvar; emits `AppealExpired` (`penalty` = the forfeited bond) |
 | `initialize_interest(rate_bps)` (AV-107) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the annual interest rate in basis points on the locked principal — `rate_bps` in 0–10000, `InvalidInterestRate` code 165 above; `0` disables the yield, backward compatible; the 26-byte tail region is always reserved so the rate writes in place) |
 | `claim_interest()` (AV-107) | `Funded` | `Funded` (no state change) | taker **only** (`Unauthorized` otherwise, checked before state validity); `now` <- clock sysvar settles the lazy interest clock first, so the harvest is exact to the second; no rate configured is `InterestNotEnabled` (code 166) — a configured-but-unearned escrow returns `Ok(0)`; returns the interest paid and accumulates `interest_paid` (never `released`); emits no event (counter/snapshot-observable) |
+| `initialize_payout_split(shares)` (AV-108) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the fixed 1–8 `(recipient, amount)` distribution table — empty / over-8 / zero-address / duplicate-recipient / zero-share / Σ != amount is `InvalidPayoutSplit` code 167; the 321-byte tail region is always reserved so the table writes in place; once configured the table owns the release destination) |
+| `release_payout_split()` (AV-108) | `Funded` | `Released` | initializer, taker, **or** their RELEASE-scoped operator (AV-104); `now` <- clock sysvar (never a param); reuses the exact `release` gate order (pause → reentrancy → scoped authority → Funded → swap-link → mint → per-recipient payout-policy pin → milestones/subscription → quorum → timelock); no table configured is `InvalidPayoutSplit` (code 167); the protocol fee is charged once on the gross, then the net is prorated per leg (`floor(share_i * net / amount)`, dust to the first leg); `released` accumulates the gross; returns the per-recipient `(recipient, net_payout)` legs; emits `ReleasedSplit` (reused event) |
 | `initialize_reference(reference)` (AV-53) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the 32-byte off-chain correlation id — order id / invoice hash; any 32 bytes accepted — read-only pass-through: never read by a check gate, never cleared, never affects amount conservation) |
 | `split_escrow(initializer, taker, amounts, vesting, quorum, dual_sig, milestones)` (AV-81) | `Funded` | `Split` (new terminal state) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`; degenerate initializer == taker self-escrow authorizes with one key passed twice); `Disputed` is `InvalidStateTransition` (arbitration in flight adjudicates the locked funds) and every terminal state rejects a re-split; the amount table must be non-empty, hold at most 16 entries, contain no zero entry, and sum in `u128` to exactly the parent's remaining lockup (`InvalidSplit`, code 142, otherwise — a partial release before the split shrinks the splittable pool); each child is born `Funded` with the parent's initializer / taker / `expires_at` and the explicitly inherited config — vesting / quorum / dual-sig / per-child milestones are *not* inherited unless named (default-inert, anti-misconfiguration); child *i*'s escrow ID derives as `H(parent_id \|\| i)` (SHA-256, `u64` little-endian index); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in `Funded` — no half-split); emits `EscrowSplit` (`Funded -> Split`, `amounts.payout` = Σ child amounts, the `(child_id, amount)` roster rides the event) |
 | `close_vault(authority)`                    | `Cancelled` / `Released` / `Settled` / `Split` (AV-81) | `Closed` | initializer **only** (`Unauthorized` otherwise, checked before state validity); reclaims the rent-exempt deposit — `Disputed` cannot be closed, `Closed` is the deepest terminal (no transition leaves it); a split parent's funds were re-homed into the children, so its vault carries nothing but the rent deposit — closeable like the other terminals |
@@ -603,7 +605,7 @@ and `evidence_disclosure`. New vault fields (appended last):
 `evidence_root` (`Option<[u8; 32]>`, 33 bytes) + `evidence_leaves`
 (u8) + `evidence_disclosed` (u64, 8 bytes) — 42 bytes at the time,
 bringing the layout to 3978 bytes (the layout has since grown to
-4699 bytes / 4707 with the discriminator — see the account-space
+5020 bytes / 5028 with the discriminator — see the account-space
 paragraph below). Anchor
 surface: `escalate` gains the two params, plus the new
 `file_evidence` instruction (`doc_hash`, `leaf_index`,
@@ -1234,6 +1236,7 @@ program error per variant):
 | `InvalidPoolPayout` | 164 | `pool_payout` (AV-106) with no pool opted in, by a non-arbiter/non-multisig caller, a zero or over-balance amount, a denied/non-allowlisted beneficiary, on a non-`Funded` escrow, or while the pool is encumbered by a live appeal; or `close_vault` with a non-empty pool |
 | `InvalidInterestRate` | 165 | `with_interest` / `initialize_interest` (AV-107) with `rate_bps > 10000` — above 100% APR |
 | `InterestNotEnabled` | 166 | `claim_interest` (AV-107) on an escrow with no interest rate configured (`interest_rate_bps == 0`) |
+| `InvalidPayoutSplit` | 167 | `with_payout_split` / `initialize_payout_split` (AV-108) with an empty table, a zero recipient, a duplicate recipient, a zero share, more than 8 shares, or a share total != amount; `release` / `release_via_cpi` on a split-configured escrow; `release_payout_split` with no table configured |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2308,7 +2311,8 @@ two-way consistency check against the IDL parameter table:
 | interest_accrual_base | u64 | 8 |
 | interest_accrued | u64 | 8 |
 | interest_paid | u64 | 8 |
-| **total**     |                   | **4699** |
+| payout_split | PayoutSplit (u8 count + 8×[u8;32] recipients + 8×u64 amounts) | 321 |
+| **total**     |                   | **5020** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2415,10 +2419,10 @@ when no bond was configured) — and the 37-byte delegation region
 bitmap, zeroed when no grant is live) — and the 33-byte swap-link
 region (AV-105: 1-byte discriminant + 32-byte counterparty escrow id,
 zeroed when the escrow is not linked into a swap pair).
-`escrow-state` exposes `VAULT_SPACE` (4707) and
-`VAULT_SPACE_NO_QUORUM` (4217) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (5028) and
+`VAULT_SPACE_NO_QUORUM` (4538) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **33,651,600 lamports** to be
+mainnet rent parameters the full vault needs **35,885,760 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -3318,6 +3322,47 @@ Account layout grows by the 26-byte interest tail (2-byte rate +
 accrual base + accrued claim + paid counter): body 4673 → **4699**,
 `VAULT_SPACE` 4681 → **4707**, `VAULT_SPACE_NO_QUORUM` 4191 →
 **4217**, rent-exempt 33,470,640 → **33,651,600** lamports.
+
+## Multi-recipient payout split (AV-108)
+
+The problem: a single escrow often settles to several parties — a
+marketplace sale splits between seller, referrer, and platform; a
+payroll escrow fans out to the team. The AV-93 `release_split`
+instruction splits by per-call basis-point weights, but the weights
+are caller-supplied at release time: the initializer cannot lock in
+the distribution up front, and there is no on-chain record of who was
+promised what.
+
+The fix, opt-in via `with_payout_split(shares)` (`Uninitialized`-only):
+the initializer declares a fixed table of 1–8 `(recipient, amount)`
+shares whose Σ must equal the escrow amount exactly (u128
+accumulation, no overflow). The table is persisted in a 321-byte tail
+region (1-byte live count + eight 32-byte recipient slots + eight
+8-byte share slots, zero-filled) and owns the release destination:
+once configured, plain `release` and `release_via_cpi` become
+`InvalidPayoutSplit` (code 167) — the full lockup settles through
+`release_payout_split` only, which reuses the exact `release` gate
+order (pause → reentrancy → scoped RELEASE authority → Funded →
+swap-link → mint → per-recipient payout-policy pin → milestones /
+subscription → quorum → timelock). The AV-96 denylist is always
+checked per recipient (`PayoutDenied`); the AV-49 allowlist, when
+configured, must contain every split recipient
+(`PayoutNotAllowlisted`). Fees follow AV-17: the protocol fee is
+charged once on the gross amount, then the net is prorated per leg as
+`floor(share_i * net / amount)` (u128 math) with the rounding dust
+(≤7 lamports) landing on the first recipient — Σ legs + fee ==
+amount, and `released` accumulates the gross amount so the
+conservation identity is untouched. The Anchor skeleton gains the
+`initialize_payout_split(shares)` and `release_payout_split` handlers
+(the latter reads `now` from the clock sysvar and returns the
+per-recipient legs for transfer sizing), the `PayoutSplit` /
+`PayoutSplitShare` structs, the `Vault.payout_split` field, and the
+`ErrorCode::InvalidPayoutSplit` mapping; the keeper release action
+emits per-recipient legs, and the snapshot exports the table.
+Account layout grows by the 321-byte split tail: body 4699 →
+**5020**, `VAULT_SPACE` 4707 → **5028**,
+`VAULT_SPACE_NO_QUORUM` 4217 → **4538**, rent-exempt 33,651,600 →
+**35,885,760** lamports.
 
 ## Basket escrow (AV-95)
 

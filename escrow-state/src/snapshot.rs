@@ -528,6 +528,11 @@ pub struct EscrowSnapshot {
     pub interest_accrued: u64,
     /// AV-107: cumulative interest paid out to the taker.
     pub interest_paid: u64,
+    /// AV-108: the declared multi-recipient payout-split table —
+    /// `None` when no split is configured, else the `(recipient,
+    /// gross share)` pairs in payout order, so indexers see the
+    /// immutable distribution set without replaying the setup.
+    pub payout_split: Option<Vec<([u8; 32], u64)>>,
 }
 
 /// AV-82: point-in-time, read-only view of the opt-in slash terms —
@@ -821,6 +826,17 @@ impl Escrow {
             interest_rate_bps: self.interest_rate_bps(),
             interest_accrued: self.interest_accrued(),
             interest_paid: self.interest_paid(),
+            // AV-108: the declared split table rides the export —
+            // `None` when unconfigured, so a plain escrow's JSON is
+            // unchanged.
+            payout_split: {
+                let split = self.payout_split();
+                if split.is_configured() {
+                    Some(split.as_slice())
+                } else {
+                    None
+                }
+            },
         }
     }
 }
@@ -1386,6 +1402,27 @@ impl EscrowSnapshot {
         s.push_str(&self.interest_accrued.to_string());
         s.push_str(",\"interest_paid\":");
         s.push_str(&self.interest_paid.to_string());
+        // AV-108: declared split table — `null` when none is
+        // configured, else the (recipient, share) pairs in payout
+        // order with recipients as hex strings.
+        s.push_str(",\"payout_split\":");
+        match &self.payout_split {
+            Some(shares) => {
+                s.push('[');
+                for (i, (recipient, amount)) in shares.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push_str("{\"recipient\":\"");
+                    s.push_str(&hex32(recipient));
+                    s.push_str("\",\"amount\":");
+                    s.push_str(&amount.to_string());
+                    s.push('}');
+                }
+                s.push(']');
+            }
+            None => s.push_str("null"),
+        }
         s.push('}');
         s
     }
@@ -1451,7 +1488,7 @@ mod snapshot_tests {
              \"insurance_pool\":false,\"pool_paid\":0,\"pool_slashed\":0,\
              \"pool_inflow\":0,\"pool_outflow\":0,\"pool_payout_paid\":0,\
              \"pool_payout_eligible\":false,\
-             \"interest_rate_bps\":0,\"interest_accrued\":0,\"interest_paid\":0\
+             \"interest_rate_bps\":0,\"interest_accrued\":0,\"interest_paid\":0,\"payout_split\":null\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),

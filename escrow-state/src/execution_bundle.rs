@@ -128,6 +128,7 @@ fn program_instruction_name(kind: BatchActionKind) -> &'static str {
         BatchActionKind::Initialize => "initialize",
         BatchActionKind::Fund => "fund",
         BatchActionKind::Release => "release",
+        BatchActionKind::ReleasePayoutSplit => "release_payout_split",
     }
 }
 
@@ -197,6 +198,9 @@ pub struct BundledAction {
     /// `release`: the expected protocol fee sliced from the payout;
     /// informational; `0` for `initialize` / `fund`.
     pub fee: u64,
+    /// `release_payout_split` (AV-108): the per-recipient net legs in
+    /// split-table order (`Σ == payout`); `None` for every other kind.
+    pub payout_legs: Option<Vec<([u8; 32], u64)>>,
     /// Logical accounts, in program-declared order.
     pub accounts: Vec<BundledAccount>,
     /// Machine-readable reason the scan listed the call: `"not_created"`,
@@ -235,6 +239,35 @@ impl BundledAction {
                 s.push_str(&self.payout.to_string());
                 s.push_str(",\"fee\":");
                 s.push_str(&self.fee.to_string());
+            }
+            // AV-108: the split release renders like `release` plus
+            // the per-recipient net legs the keeper wires as
+            // remaining_accounts.
+            BatchActionKind::ReleasePayoutSplit => {
+                s.push_str("\"amount\":");
+                s.push_str(&self.amount.to_string());
+                s.push_str(",\"payout\":");
+                s.push_str(&self.payout.to_string());
+                s.push_str(",\"fee\":");
+                s.push_str(&self.fee.to_string());
+                s.push_str(",\"payout_legs\":");
+                match &self.payout_legs {
+                    Some(legs) => {
+                        s.push('[');
+                        for (i, (recipient, net)) in legs.iter().enumerate() {
+                            if i > 0 {
+                                s.push(',');
+                            }
+                            s.push_str("{\"recipient\":\"");
+                            s.push_str(&hex32(recipient));
+                            s.push_str("\",\"net\":");
+                            s.push_str(&net.to_string());
+                            s.push('}');
+                        }
+                        s.push(']');
+                    }
+                    None => s.push_str("null"),
+                }
             }
         }
         s.push('}');
@@ -630,6 +663,7 @@ pub fn bundle_execution(report: &BatchReport) -> Vec<ExecutionBundle> {
             amount: a.amount,
             payout: a.payout,
             fee: a.fee,
+            payout_legs: a.payout_legs.clone(),
             accounts: a.accounts.iter().map(|acc| BundledAccount::from(*acc)).collect(),
             reason: a.reason,
         }
@@ -1058,6 +1092,18 @@ fn simulate_one(
             let payout_to = work.inner().taker();
             work.release(bundle.caller, action.amount, bundle.mint, payout_to, at)
         }
+        // AV-108: the split release settles the full lockup across
+        // the declared table — no destination param, no amount param.
+        BatchActionKind::ReleasePayoutSplit => {
+            match work.release_payout_split(bundle.caller, bundle.mint, at) {
+                Ok(legs) => {
+                    let payout: u64 = legs.iter().map(|(_, net)| *net).sum();
+                    let fee = work.inner().protocol_fee_for(work.inner().amount());
+                    Ok((payout, fee))
+                }
+                Err(e) => Err(e),
+            }
+        }
     };
 
     let (payout, fee) = match result {
@@ -1187,9 +1233,11 @@ mod execution_bundle_tests {
     /// agreement check (the scan stamps it on the action).
     fn a_kind_mint(a: &BundledAction) -> Option<[u8; 32]> {
         match a.kind {
-            BatchActionKind::Release => {
+            BatchActionKind::Release | BatchActionKind::ReleasePayoutSplit => {
                 // The release action's mint account is the third account
-                // when the SPL path is bound.
+                // when the SPL path is bound — the split release carries
+                // the same vault/initializer/mint account prefix (its
+                // per-recipient legs travel as remaining_accounts).
                 a.accounts
                     .iter()
                     .find(|acc| acc.role == "mint")
@@ -1686,6 +1734,7 @@ mod execution_bundle_tests {
                     amount: AMOUNT,
                     payout: 0,
                     fee: 0,
+                    payout_legs: None,
                     accounts: vec![],
                     reason: "unfunded",
                 },
@@ -1700,6 +1749,7 @@ mod execution_bundle_tests {
                     amount: AMOUNT,
                     payout: 0,
                     fee: 0,
+                    payout_legs: None,
                     accounts: vec![],
                     reason: "releasable",
                 },

@@ -781,6 +781,20 @@
       "discriminator": [62, 142, 132, 209, 206, 8, 79, 175],
       "accounts": [],
       "args": []
+    },
+    {
+      "name": "initialize_payout_split",
+      "discriminator": [165, 22, 40, 62, 191, 161, 250, 138],
+      "accounts": [],
+      "args": [
+        {"name": "shares", "type": {"vec": {"defined": "PayoutSplitShare"}}}
+      ]
+    },
+    {
+      "name": "release_payout_split",
+      "discriminator": [237, 47, 58, 238, 37, 185, 245, 101],
+      "accounts": [],
+      "args": []
     }
   ],
   "accounts": [
@@ -870,7 +884,8 @@
           {"name": "interest_rate_bps", "type": "u16", "offset": 4681},
           {"name": "interest_accrual_base", "type": "u64", "offset": 4683},
           {"name": "interest_accrued", "type": "u64", "offset": 4691},
-          {"name": "interest_paid", "type": "u64", "offset": 4699}
+          {"name": "interest_paid", "type": "u64", "offset": 4699},
+          {"name": "payout_split", "type": {"defined": "PayoutSplit"}, "offset": 4707}
         ]
       }
     }
@@ -1087,6 +1102,27 @@
           {"name": "scopes", "type": "u32", "offset": 32}
         ]
       }
+    },
+    {
+      "name": "PayoutSplit",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "split_count", "type": "u8", "offset": 0},
+          {"name": "recipients", "type": {"array": ["publicKey", 8]}, "offset": 1},
+          {"name": "amounts", "type": {"array": ["u64", 8]}, "offset": 257}
+        ]
+      }
+    },
+    {
+      "name": "PayoutSplitShare",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "recipient", "type": "publicKey", "offset": 0},
+          {"name": "amount", "type": "u64", "offset": 32}
+        ]
+      }
     }
   ],
   "errors": [
@@ -1156,7 +1192,8 @@
     {"code": 163, "name": "SwapLinkActive"},
     {"code": 164, "name": "InvalidPoolPayout"},
     {"code": 165, "name": "InvalidInterestRate"},
-    {"code": 166, "name": "InterestNotEnabled"}
+    {"code": 166, "name": "InterestNotEnabled"},
+    {"code": 167, "name": "InvalidPayoutSplit"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

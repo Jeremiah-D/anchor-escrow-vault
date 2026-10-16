@@ -192,6 +192,11 @@ pub fn instruction_for_action(
             // INSTRUCTIONS spec: release(amount: u64).
             data.extend_from_slice(&action.amount.to_le_bytes());
         }
+        BatchActionKind::ReleasePayoutSplit => {
+            // INSTRUCTIONS spec: release_payout_split() — params: [].
+            // The per-recipient legs travel as remaining_accounts, not
+            // instruction params.
+        }
     }
     // Logical accounts in program-declared order, flags translated 1:1.
     let accounts = action
@@ -1042,6 +1047,9 @@ mod tx_message_tests {
             BatchActionKind::Initialize => 0,
             BatchActionKind::Fund => 1,
             BatchActionKind::Release => 2,
+            // AV-108: the split release is the lifecycle's release
+            // step on split-configured escrows — same position.
+            BatchActionKind::ReleasePayoutSplit => 2,
         });
         actions
     }
@@ -1091,6 +1099,9 @@ mod tx_message_tests {
                     assert_eq!(ix.data.len(), 16, "disc + u64");
                     assert_eq!(&ix.data[8..16], &a.amount.to_le_bytes());
                     assert_eq!(a.amount, AMOUNT, "scan releases the full remainder");
+                }
+                BatchActionKind::ReleasePayoutSplit => {
+                    assert_eq!(ix.data.len(), 8, "split release takes no params");
                 }
             }
         }
@@ -1336,6 +1347,9 @@ mod tx_message_tests {
                         assert!(json.contains(&format!("\"amount\":{AMOUNT}")));
                         assert_eq!(u64::from_le_bytes(ix.data[8..16].try_into().unwrap()), AMOUNT);
                     }
+                    BatchActionKind::ReleasePayoutSplit => {
+                        assert_eq!(ix.data.len(), 8, "split release takes no params");
+                    }
                 }
             }
         }
@@ -1447,6 +1461,7 @@ mod tx_message_tests {
             amount: AMOUNT,
             payout: 0,
             fee: 0,
+            payout_legs: None,
             accounts,
             reason: "test",
         };
@@ -1604,6 +1619,7 @@ mod tx_message_tests {
             amount: AMOUNT,
             payout: 0,
             fee: 0,
+            payout_legs: None,
             accounts: vec![
                 BundledAccount {
                     pubkey: ALICE,

@@ -2152,6 +2152,74 @@ impl IndexedEscrow {
         Ok((legs, fee))
     }
 
+    /// Release the full lockup across the initializer-declared
+    /// payout-split table (mirrors [`Escrow::release_payout_split`],
+    /// AV-108). Emits `ReleasedSplit` — the existing AV-93 event kind
+    /// is reused (no new event kind, no `EventAmounts` change): the
+    /// amounts follow the `Released` shape (`payout` = the gross
+    /// amount, `fee` = the AV-17 protocol fee charged on the gross
+    /// before the split), and the per-recipient `(recipient,
+    /// net_share)` legs are stamped on the event's `release_split`
+    /// field in table order, so indexers and the AV-94 fold read the
+    /// Anchor layer's exact transfer sizes from the log. Returns the
+    /// legs like the inner method. `at` is both the event timestamp
+    /// and the state machine's `now` (so the AV-27 timelock gate sees
+    /// the same clock the event log records).
+    ///
+    /// [`Escrow::release_payout_split`]: super::Escrow::release_payout_split
+    pub fn release_payout_split(
+        &mut self,
+        authority: [u8; 32],
+        mint: Option<[u8; 32]>,
+        at: u64,
+    ) -> Result<Vec<([u8; 32], u64)>, EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        // (The inner result is bound first so its `&mut` borrow ends
+        // before `map_reentrant` reborrows `self`.)
+        let result = self.inner.release_payout_split(authority, at, mint);
+        let legs = self.map_reentrant(result, at)?;
+        // The gross amount is the escrow's locked amount by
+        // construction (the split table's Σ == amount); the fee is
+        // re-derived from the same `charge_protocol_fee` point the
+        // inner call used, so the event's amounts match the transition
+        // exactly.
+        let amount = self.inner.amount();
+        let fee = self.inner.protocol_fee_for(amount);
+        self.push_event(
+            EscrowEventKind::ReleasedSplit,
+            from,
+            self.inner.state(),
+            EventAmounts::payout(amount, fee),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        // Stamp the legs after the push (the AV-81 `split_children`
+        // precedent): the roster cannot overflow — the inner call
+        // validated `split_count <= MAX_RELEASE_SPLIT_RECIPIENTS`
+        // before any leg existed, and the legs are in table order.
+        let mut roster = [ReleaseShare {
+            recipient: [0u8; 32],
+            net_share: 0,
+        }; crate::MAX_RELEASE_SPLIT_RECIPIENTS];
+        for (i, (recipient, net_share)) in legs.iter().enumerate() {
+            roster[i] = ReleaseShare {
+                recipient: *recipient,
+                net_share: *net_share,
+            };
+        }
+        self.events
+            .last_mut()
+            .expect("ReleasedSplit event just pushed")
+            .release_split = Some((roster, legs.len() as u8));
+        Ok(legs)
+    }
+
     /// Cancel the escrow and return funds (mirrors [`Escrow::cancel`]).
     /// Emits `Cancelled` with the refunded remainder in
     /// `amounts.refund`. `refund_to` is the refund destination, pinned

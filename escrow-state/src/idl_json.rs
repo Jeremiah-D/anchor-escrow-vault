@@ -205,6 +205,9 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         // AV-66: opt-in tiered protocol-fee schedule (always present,
         // zeroed when unconfigured — `tier_count == 0`).
         "FeeSchedule" => IdlType::Named("FeeSchedule"),
+        // AV-108: opt-in multi-recipient payout-split table (always
+        // present, zeroed when unconfigured — `split_count == 0`).
+        "PayoutSplit" => IdlType::Named("PayoutSplit"),
         // AV-82: opt-in default-penalty (slash) terms.
         "Option<SlashTerms>" => IdlType::Option(Box::new(IdlType::Named("SlashTerms"))),
         // AV-56: periodic subscription release schedule.
@@ -246,6 +249,11 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         // AV-95b: the initialize_basket instruction's (mint, amount)
         // leg table.
         "Vec<BasketLeg>" => IdlType::Vec(Box::new(IdlType::Named("BasketLeg"))),
+        // AV-108: the initialize_payout_split instruction's
+        // (recipient, amount) share table.
+        "Vec<PayoutSplitShare>" => {
+            IdlType::Vec(Box::new(IdlType::Named("PayoutSplitShare")))
+        }
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         // AV-68: the dispute-evidence disclosure commitment
         // (non-optional — disclosure always carries a hash).
@@ -360,6 +368,28 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
                 IdlType::Array(ArrayElem::Defined("BasketLeg"), MAX_BASKET_LEGS),
             ),
             ("len", IdlType::U8),
+        ],
+        // PayoutSplit { split_count: u8, recipients: [[u8; 32]; 8],
+        // amounts: [u64; 8] } (AV-108): the multi-recipient
+        // payout-split table — 321 bytes, always present in the vault
+        // account (zeroed when unconfigured).
+        "PayoutSplit" => vec![
+            ("split_count", IdlType::U8),
+            (
+                "recipients",
+                IdlType::Array(ArrayElem::PublicKey, MAX_RELEASE_SPLIT_RECIPIENTS),
+            ),
+            (
+                "amounts",
+                IdlType::Array(ArrayElem::U64, MAX_RELEASE_SPLIT_RECIPIENTS),
+            ),
+        ],
+        // PayoutSplitShare { recipient: Pubkey, amount: u64 }
+        // (AV-108): one entry of the initialize_payout_split
+        // instruction's share table — 40 bytes.
+        "PayoutSplitShare" => vec![
+            ("recipient", IdlType::PublicKey),
+            ("amount", IdlType::U64),
         ],
         // CpiAllowlist { addrs: [[u8; 32]; 8], len: u8 } (AV-83).
         // The 8 program ids serialize as 8 consecutive 32-byte pubkeys.
@@ -673,6 +703,10 @@ fn render_idl_json() -> String {
         "DutchAuction",
         // AV-104: the delegated operator grant type.
         "Delegation",
+        // AV-108: the multi-recipient payout-split table type, plus
+        // the initialize_payout_split instruction's share entry type.
+        "PayoutSplit",
+        "PayoutSplitShare",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -944,7 +978,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 67, "error variant count drift");
+    assert_eq!(errors.len(), 68, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -1012,6 +1046,11 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::SwapLinkActive.code(), 163);
     // AV-106: appended, never renumbered.
     assert_eq!(EscrowError::InvalidPoolPayout.code(), 164);
+    // AV-107: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidInterestRate.code(), 165);
+    assert_eq!(EscrowError::InterestNotEnabled.code(), 166);
+    // AV-108: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidPayoutSplit.code(), 167);
 }
 
 #[test]

@@ -134,6 +134,11 @@ pub enum BatchActionKind {
     /// remainder; partial releases are an operator decision, not a
     /// batch default.
     Release,
+    /// `release_payout_split(initializer, now, mint)` (AV-108) — the
+    /// full lockup across the escrow's declared multi-recipient split
+    /// table; listed instead of `Release` once a split table is
+    /// attached (plain `release` is a config error there).
+    ReleasePayoutSplit,
 }
 
 impl BatchActionKind {
@@ -142,6 +147,7 @@ impl BatchActionKind {
             BatchActionKind::Initialize => "initialize",
             BatchActionKind::Fund => "fund",
             BatchActionKind::Release => "release",
+            BatchActionKind::ReleasePayoutSplit => "release_payout_split",
         }
     }
 }
@@ -203,6 +209,10 @@ pub struct BatchLifecycleAction {
     /// `release`: the protocol fee sliced from the payout
     /// ([`Escrow::protocol_fee_for`]); `0` for `initialize` / `fund`.
     pub fee: u64,
+    /// `release_payout_split` (AV-108): the per-recipient net legs in
+    /// split-table order (`Σ == payout`); `None` for every other kind.
+    /// The keeper builds one transfer per leg from this table.
+    pub payout_legs: Option<Vec<([u8; 32], u64)>>,
     /// Logical accounts, in program-declared order.
     pub accounts: Vec<BatchAccount>,
     /// Machine-readable reason this call is listed: `"not_created"`,
@@ -448,6 +458,7 @@ fn scan_one(item: &BatchWatchItem, now: u64) -> BatchItemOutcome {
             amount: p.amount,
             payout: 0,
             fee: 0,
+            payout_legs: None,
             accounts: vec![
                 BatchAccount {
                     pubkey: item.escrow_id,
@@ -490,6 +501,7 @@ fn scan_one(item: &BatchWatchItem, now: u64) -> BatchItemOutcome {
                 amount: e.amount(),
                 payout: 0,
                 fee: 0,
+                payout_legs: None,
                 accounts: vec![
                     BatchAccount {
                         pubkey: item.escrow_id,
@@ -524,6 +536,7 @@ fn scan_one(item: &BatchWatchItem, now: u64) -> BatchItemOutcome {
             amount: e.amount(),
             payout: 0,
             fee: 0,
+            payout_legs: None,
             accounts: vec![
                 BatchAccount {
                     pubkey: item.escrow_id,
@@ -598,6 +611,43 @@ fn scan_one(item: &BatchWatchItem, now: u64) -> BatchItemOutcome {
                     alt_index: None,
                 });
             }
+            // AV-108: a configured split table owns the release
+            // destination — the scan lists `release_payout_split`
+            // (not `release`) with the per-recipient net legs, so the
+            // keeper builds one transfer per leg. The split always
+            // settles the full locked amount in one call: a shortfall
+            // (e.g. an AV-82 slash shrank the releasable pool) would
+            // fail on-chain with `ReleaseExceedsLocked`, so it is
+            // `Blocked` here — a listed split release is always
+            // executable.
+            if e.payout_split().is_configured() {
+                if remaining != e.amount() {
+                    return BatchItemOutcome::Blocked {
+                        reason: "split_amount_shortfall",
+                    };
+                }
+                let net = remaining - fee;
+                let legs = e.payout_split().net_legs(net);
+                return BatchItemOutcome::Action(BatchLifecycleAction {
+                    escrow_id: item.escrow_id,
+                    vault_address: item.vault_address(),
+                    kind: BatchActionKind::ReleasePayoutSplit,
+                    caller: e.initializer(),
+                    caller_role: "initializer",
+                    mint: e.mint(),
+                    taker: None,
+                    expires_at: 0,
+                    amount: remaining,
+                    // `Σ legs == payout` by construction
+                    // (`net_legs` floors per leg and lands the dust on
+                    // the first recipient).
+                    payout: net,
+                    fee,
+                    payout_legs: Some(legs),
+                    accounts,
+                    reason: "releasable",
+                });
+            }
             BatchItemOutcome::Action(BatchLifecycleAction {
                 escrow_id: item.escrow_id,
                 vault_address: item.vault_address(),
@@ -614,6 +664,7 @@ fn scan_one(item: &BatchWatchItem, now: u64) -> BatchItemOutcome {
                 // one is configured).
                 payout: remaining - fee,
                 fee,
+                payout_legs: None,
                 accounts,
                 reason: "releasable",
             })

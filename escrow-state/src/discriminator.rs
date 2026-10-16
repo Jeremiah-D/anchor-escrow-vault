@@ -38,12 +38,12 @@
 use super::{
     sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, CpiAllowlist,
     DefaultJudgment, DutchAuction, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
-    Delegation, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, QuorumPolicy,
+    Delegation, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, PayoutSplit, QuorumPolicy,
     SlashTerms, SubscriptionSchedule, VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
     APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
     DELEGATION_LEN, DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
     MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS,
-    MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
+    MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_RELEASE_SPLIT_RECIPIENTS, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
     MILESTONE_PLAN_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN,
     PAYOUT_DENYLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN,
     SWAP_LINK_REGION_LEN, VAULT_SPACE, VESTING_CURVE_LEN,
@@ -1033,6 +1033,26 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     let interest_accrued = c.u64_le()?;
     let interest_paid = c.u64_le()?;
 
+    // AV-108: the multi-recipient payout-split tail, always reserved:
+    // the 1-byte live split count, then the 8 fixed 32-byte recipient
+    // slots, then the 8 fixed 8-byte share-amount slots. Structural
+    // decode only — the table invariants are enforced by
+    // `PayoutSplit::new`, not re-litigated here.
+    let split_count = c.u8()?;
+    let mut split_recipients = [[0u8; 32]; MAX_RELEASE_SPLIT_RECIPIENTS];
+    for recipient in split_recipients.iter_mut() {
+        *recipient = c.pubkey()?;
+    }
+    let mut split_amounts = [0u64; MAX_RELEASE_SPLIT_RECIPIENTS];
+    for amount in split_amounts.iter_mut() {
+        *amount = c.u64_le()?;
+    }
+    let payout_split = PayoutSplit {
+        split_count,
+        recipients: split_recipients,
+        amounts: split_amounts,
+    };
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1228,6 +1248,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         interest_accrual_base,
         interest_accrued,
         interest_paid,
+        // AV-108: the payout-split table rides the decode so a decoded
+        // escrow enforces the same declared distribution set the live
+        // one had.
+        payout_split,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

@@ -404,6 +404,16 @@ fn check_transfer_hook(
 /// Build the transfers for a taker payout after `release` / `claim` /
 /// `release_milestone` returned `(payout, fee)`.
 ///
+/// AV-108: this plan is single-recipient by construction — it covers
+/// the plain-`release` payout shape, not the multi-leg
+/// `release_payout_split` (whose per-recipient legs the Anchor
+/// `release_payout_split` handler wires as `remaining_accounts`
+/// directly). A payout-split escrow and CPI routing are mutually
+/// exclusive: `release_via_cpi` delegates to `release`, which refuses
+/// a split-configured escrow with
+/// [`super::EscrowError::InvalidPayoutSplit`] (code 167) — never a
+/// silent single-leg payout of a declared split.
+///
 /// Consistency checks against the state machine:
 /// - the escrow is `Funded` (partial payout) or `Released` (full payout);
 /// - `payout + fee` cannot exceed `escrow.released_amount()` — the machine
@@ -1274,7 +1284,7 @@ mod cpi_tests {
         let bytes = crate::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), crate::ESCROW_BODY_LEN);
         let hook_at =
-            crate::ESCROW_BODY_LEN - crate::INTEREST_REGION_LEN - crate::POOL_REGION_LEN - crate::SWAP_LINK_REGION_LEN - crate::APPEAL_BOND_REGION_LEN - crate::DELEGATION_REGION_LEN - crate::STREAMING_FEE_REGION_LEN - 33;
+            crate::ESCROW_BODY_LEN - crate::PAYOUT_SPLIT_LEN - crate::INTEREST_REGION_LEN - crate::POOL_REGION_LEN - crate::SWAP_LINK_REGION_LEN - crate::APPEAL_BOND_REGION_LEN - crate::DELEGATION_REGION_LEN - crate::STREAMING_FEE_REGION_LEN - 33;
         assert_eq!(bytes[hook_at], 1, "Some discriminant");
         assert_eq!(&bytes[hook_at + 1..hook_at + 33], &hook);
         // A hook-less escrow zero-fills the region.
