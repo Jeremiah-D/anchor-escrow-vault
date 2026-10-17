@@ -426,6 +426,22 @@ pub use report_signing::{
     verify_signed_report_json, ReportSignature, SignableReport,
 };
 
+// AV-118: keeper action push notifications — opt-in `KeeperNotifier`
+// trait (the caller implements HTTP delivery; the core stays
+// dependency-free, EB-51 bridge / LG-74 provider convention), the AV-118
+// notification subset of keeper actions (cancel_expired, claim, rent
+// top-up, appeal windows), HMAC-SHA256 `x-keeper-signature` delivery
+// signing, a bounded-retry dispatcher with a separate pump interface so
+// the scan path never blocks, and AV-101 signable-bundle references on
+// every payload. Pure logic, zero dependencies.
+mod keeper_notify;
+pub use keeper_notify::{
+    hmac_sha256, parse_signature_header, sign_delivery, signature_header_value, verify_delivery,
+    KeeperDelivery, KeeperNotificationEvent, KeeperNotifier, KeeperNotifyStats, NotifyConfig,
+    NotifyConfigError, NotifyDispatcher, NotifyError, NotifyEventKind, RecordingNotifier,
+    RetryPolicy, KEEPER_SIGNATURE_HEADER,
+};
+
 // AV-78: escrow aggregate statistics view — read-only fleet rollup
 // (per-state counts, amount histogram, escrow durations, locked totals)
 // with deterministic JSON export. Purely additive.
