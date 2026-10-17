@@ -42,7 +42,10 @@
 //! The snapshot is a pure read: it borrows the escrow, emits no events,
 //! and advances no state — a dry run by construction.
 
-use crate::{format_amount, AppealState, Escrow, EscrowState, EventHistoryEntry, MultisigAuthority};
+use crate::{
+    format_amount, AppealState, Escrow, EscrowState, EventHistoryEntry, MultisigAuthority,
+    StateSummary,
+};
 
 /// Render 32 bytes as 64 lowercase hex characters (same convention as
 /// [`crate::keeper`]'s serializer).
@@ -1662,6 +1665,59 @@ impl EscrowSnapshot {
         s.push('}');
         s
     }
+
+    /// AV-125: build the canonical attestation summary this snapshot
+    /// attests to at chain slot `slot` — byte-identical to
+    /// [`Escrow::state_summary`](crate::Escrow::state_summary) for the
+    /// same vault and slot, so a keeper holding only snapshots can
+    /// recompute the exact bytes a [`StateAttestation`](crate::StateAttestation)
+    /// signature covers and verify it offline, with no chain node.
+    ///
+    /// `slot` must come from the chain clock (AV-27 rule: measured
+    /// on-chain) — the slot the snapshot's view came from, same as the
+    /// signer used.
+    ///
+    /// Returns `None` only when [`Self::state`] is not one of the
+    /// canonical names `state_name` produces — unreachable through
+    /// [`Escrow::snapshot`](crate::Escrow::snapshot); only a
+    /// hand-constructed snapshot with a bogus state name hits it. The
+    /// summary is canonical by construction (fixed field order,
+    /// little-endian — see [`StateSummary::canonical_bytes`]).
+    pub fn attestation_summary(&self, slot: u64) -> Option<StateSummary> {
+        // The snapshot carries the state as the canonical name; map
+        // it back to the Borsh-stable `EscrowState` discriminant the
+        // summary encodes.
+        let state = match self.state {
+            "uninitialized" => EscrowState::Uninitialized as u8,
+            "funded" => EscrowState::Funded as u8,
+            "released" => EscrowState::Released as u8,
+            "cancelled" => EscrowState::Cancelled as u8,
+            "activated" => EscrowState::Activated as u8,
+            "disputed" => EscrowState::Disputed as u8,
+            "settled" => EscrowState::Settled as u8,
+            "closed" => EscrowState::Closed as u8,
+            "split" => EscrowState::Split as u8,
+            "declined" => EscrowState::Declined as u8,
+            "counter_offered" => EscrowState::CounterOffered as u8,
+            _ => return None,
+        };
+        // Same derived-refunded rule as `Escrow::state_summary`: the
+        // audit-preserved `remaining` is the initializer's refund on
+        // the terminal refund states; `0` everywhere else.
+        let refunded = match self.state {
+            "cancelled" | "settled" | "closed" => self.remaining,
+            _ => 0,
+        };
+        Some(StateSummary {
+            state,
+            amount: self.amount,
+            released: self.released,
+            refunded,
+            penalty_paid: self.penalty_paid,
+            schema_version: self.schema_version,
+            slot,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2235,4 +2291,34 @@ mod snapshot_tests {
         );
     }
 
+    // ---------- AV-125: attestation summary export ----------
+
+    #[test]
+    fn attestation_summary_agrees_with_escrow_state_summary() {
+        // The snapshot export must be byte-identical to
+        // `Escrow::state_summary` for the same vault and slot — the
+        // keeper recomputes the exact bytes a signature covers.
+        const SLOT: u64 = 312_456_789;
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, VEST_END).unwrap();
+        e.fund(ALICE, VEST_END - 3_600).unwrap();
+        let snap = e.snapshot(MID);
+        let from_snap = snap.attestation_summary(SLOT).expect("known state");
+        assert_eq!(from_snap, e.state_summary(SLOT));
+        assert_eq!(from_snap.slot, SLOT);
+    }
+
+    #[test]
+    fn attestation_summary_carries_derived_refunded_on_cancelled() {
+        // Same derived-refunded rule as `Escrow::state_summary`: the
+        // audit-preserved remainder on a cancelled vault.
+        const SLOT: u64 = 312_456_789;
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, VEST_END).unwrap();
+        e.fund(ALICE, VEST_END - 3_600).unwrap();
+        e.cancel(ALICE, None, ALICE).unwrap();
+        let snap = e.snapshot(MID);
+        let from_snap = snap.attestation_summary(SLOT).expect("known state");
+        assert_eq!(from_snap, e.state_summary(SLOT));
+        assert_eq!(from_snap.refunded, AMOUNT);
+        assert_eq!(from_snap.state, EscrowState::Cancelled as u8);
+    }
 }

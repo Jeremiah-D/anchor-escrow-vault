@@ -82,6 +82,12 @@ mod report_signing;
 // the canonical encoding / sign / verify primitive. The nonce and
 // expiry bookkeeping live on `Escrow` (persisted layout).
 mod release_intent;
+// AV-125: off-chain state attestation — the signed `StateSummary`
+// envelope (`StateAttestation`) the initializer signs so keepers and
+// indexers can verify vault state offline, plus the `Escrow::state_summary`
+// / `Escrow::attest_state` builders and the stateless verifier. Purely
+// off-chain: no layout, rent, or IDL change.
+mod state_attestation;
 // AV-72: escrow configuration templates — one-call constructors for the
 // four canonical escrow compositions (auction, milestone-plan,
 // subscription, arbitrated-dispute) with template-level combination
@@ -436,6 +442,16 @@ pub use report_signing::{
 pub use release_intent::{
     sign_release_intent, verify_release_intent, ReleaseIntent, SignedReleaseIntent,
     RELEASE_INTENT_DOMAIN, RELEASE_INTENT_MSG_LEN,
+};
+
+// AV-125: off-chain state attestation — the signed `StateSummary`
+// envelope (`StateAttestation`) the initializer signs so keepers and
+// indexers can verify vault state offline, plus the `Escrow::state_summary`
+// / `Escrow::attest_state` builders and the stateless verifier. Purely
+// off-chain: no layout, rent, or IDL change.
+pub use state_attestation::{
+    sign_state_attestation, verify_state_attestation, StateAttestation, StateSummary,
+    STATE_ATTESTATION_DOMAIN, STATE_SUMMARY_MSG_LEN,
 };
 
 // AV-118: keeper action push notifications — opt-in `KeeperNotifier`

@@ -2397,6 +2397,39 @@ diffing numbers while operators read whole tokens.
  "slash_terms":null,"penalty_paid":0,"slash_eligible":false, "event_history":{"capacity":64,"total":0,"count":0,"entries":[]}}
 ```
 
+## State attestation (AV-125)
+
+Honest scope note first: this is a **purely off-chain protocol**. There is
+no Anchor instruction, no IDL entry, no account-layout change, and no rent
+change — the vault layout table below is untouched. An attestation never
+executes on-chain; it is a signed claim about chain state that a keeper
+relays and anyone can check.
+
+The problem it solves: a keeper or indexer that forges vault state — e.g.
+reports a vault as `Funded` when the chain says `Cancelled` — is normally
+undetectable off-chain. `escrow.attest_state(escrow_id, slot, signing_key)`
+has the *initializer* sign a canonical `StateSummary` (state discriminant /
+`amount` / `released` / `refunded` / `penalty_paid` / `schema_version` /
+`slot`) with their Ed25519 key (the same authority the AV-123 release-intent
+channel trusts, signed with the hand-rolled RFC 8032 signer from AV-101),
+producing a `StateAttestation{escrow_id, summary, signature}` envelope.
+Keepers verify the detached signature against the initializer's public key —
+`verify_state_attestation` needs no chain access, and the domain separator
+`b"ESCROW-STATE-ATTEST-v1"` keeps the signature from verifying as any other
+envelope in this crate (release intent, keeper report, multisig ballot).
+
+The encoding is fixed-field-order, little-endian integers, no length
+prefixes — 64 bytes per summary, byte-identical for equal state at equal
+slot — so a keeper holding only snapshots can recompute the exact signed
+bytes via `EscrowSnapshot::attestation_summary(slot)` and verify offline.
+`slot` must come from the chain clock (the AV-27 rule: measured on-chain,
+never an instruction param), so a stale attestation is detectable by
+construction. The `refunded` leg is derived, not persisted — this crate keeps
+no cumulative refunded counter (only the event-sourced `FundsTriple`
+rebuilds it from the log, never fabricated): on `Cancelled` / `Settled` /
+`Closed` it is the audit-preserved remainder (the initializer's refund), `0`
+elsewhere. The call is a pure read: it emits no events and mutates nothing.
+
 ## Account space & rent
 
 The `Vault` account layout is pinned in `escrow-state` (`VAULT_FIELDS`;
