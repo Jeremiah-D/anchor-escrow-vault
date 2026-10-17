@@ -442,6 +442,20 @@ pub use keeper_notify::{
     RetryPolicy, KEEPER_SIGNATURE_HEADER,
 };
 
+// AV-120: incremental keeper-report diffs — `compute_diff` turns a
+// fresh scan's actions into a `ReportDiff` against a persisted
+// `ReportWatermark` (per-vault FNV-1a action-set fingerprints +
+// sequence-number replay guard), with deterministic watermark JSON
+// persistence (`to_json` / `from_json`) and an RFC 4180 incremental
+// CSV export (`report_diff_to_csv` / `csv_to_report_diff`, the
+// incremental complement to the AV-74 event CSV). Purely additive,
+// read-only, zero dependencies.
+mod report_diff;
+pub use report_diff::{
+    canonical_reason, compute_diff, csv_to_report_diff, diff_report, report_diff_to_csv,
+    DiffCsvError, ReportDiff, ReportWatermark, VaultChange, VaultChangeKind, WatermarkError,
+};
+
 // AV-78: escrow aggregate statistics view — read-only fleet rollup
 // (per-state counts, amount histogram, escrow durations, locked totals)
 // with deterministic JSON export. Purely additive.

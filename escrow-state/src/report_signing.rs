@@ -277,7 +277,9 @@ mod report_signing_tests {
         assert!(envelope.contains(&canonical));
         assert!(envelope.ends_with("}}"));
         // Unsigned output is untouched by the signing feature.
-        assert_eq!(canonical, "{\"at\":1000,\"scanned\":0,\"total_estimated_cu\":0,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[]}");
+        // AV-120: the stamped report sequence rides the canonical
+        // bytes (`null` when the operator stamped nothing).
+        assert_eq!(canonical, "{\"at\":1000,\"scanned\":0,\"total_estimated_cu\":0,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[],\"report_seq\":null}");
     }
 
     #[test]

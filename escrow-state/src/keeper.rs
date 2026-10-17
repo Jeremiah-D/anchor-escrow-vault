@@ -601,6 +601,13 @@ pub struct KeeperReport {
     /// (`pool_inflow - pool_balance`: overturn restitution plus
     /// authorized payouts).
     pub pool_outflow: u64,
+    /// AV-120: the operator-stamped report sequence number for
+    /// incremental diffing ([`crate::compute_diff`]) — `None` on
+    /// legacy full reports, which keeps the old "every scan is a full
+    /// report" semantics. Stamped via
+    /// [`with_report_seq`](KeeperReport::with_report_seq); the scan
+    /// itself leaves it `None`.
+    pub report_seq: Option<u64>,
 }
 
 impl KeeperReport {
@@ -639,6 +646,16 @@ impl KeeperReport {
         Ok(self)
     }
 
+    /// AV-120: stamp the report sequence number onto the report
+    /// (builder style — [`scan_keeper_actions`] leaves it `None`; the
+    /// keeper stamps the next sequence before diffing with
+    /// [`crate::compute_diff`]). A `None` report keeps the legacy
+    /// full-report semantics.
+    pub fn with_report_seq(mut self, seq: u64) -> Self {
+        self.report_seq = Some(seq);
+        self
+    }
+
     /// Hand-serialized JSON (the crate is dependency-free). Deterministic
     /// field order; keys are 64-char lowercase hex; `mint` is a hex
     /// string or `null`.
@@ -656,8 +673,13 @@ impl KeeperReport {
     ///    "multisig_authority":null,"evidence_disclosure":null,
     ///    "funding_progress":null,"merge_source":null,
     ///    "penalty_estimate":0,"slot_unlock_at":null,"estimated_cu":13814}
-    /// ]}
+    ///  ],
+    ///  "report_seq":null}
     /// ```
+    ///
+    /// AV-120: `report_seq` rides last — the operator-stamped sequence
+    /// number for incremental diffing ([`crate::compute_diff`]),
+    /// `null` on legacy full reports.
     ///
     /// AV-28: every action also carries `decimals` (the escrow's token
     /// decimal metadata, `0` when none is declared) and `display_amount`
@@ -855,7 +877,15 @@ impl KeeperReport {
             s.push_str(&a.estimated_compute_units().to_string());
             s.push_str("}");
         }
-        s.push_str("]}");
+        s.push(']');
+        // AV-120: the stamped sequence number, last — `null` on legacy
+        // full reports.
+        s.push_str(",\"report_seq\":");
+        match self.report_seq {
+            Some(seq) => s.push_str(&seq.to_string()),
+            None => s.push_str("null"),
+        }
+        s.push('}');
         s
     }
 }
@@ -1551,6 +1581,9 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         pool_balance,
         pool_inflow,
         pool_outflow: pool_inflow.saturating_sub(pool_balance),
+        // AV-120: the operator stamps the report sequence number via
+        // `with_report_seq` — the scan itself stays sequence-free.
+        report_seq: None,
     }
 }
 
@@ -2185,7 +2218,23 @@ mod keeper_tests {
         let report = scan_keeper_actions(&[], MID);
         assert!(report.is_empty());
         assert_eq!(report.scanned, 0);
-        assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"total_estimated_cu":0,"jito_tip":null,"pool_balance":0,"pool_inflow":0,"pool_outflow":0,"actions":[]}"#);
+        assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"total_estimated_cu":0,"jito_tip":null,"pool_balance":0,"pool_inflow":0,"pool_outflow":0,"actions":[],"report_seq":null}"#);
+    }
+
+    #[test]
+    fn report_seq_stamps_onto_json() {
+        // AV-120: the scan itself stays sequence-free; the operator
+        // stamps the next sequence before diffing.
+        let legacy = scan_keeper_actions(&[], MID);
+        assert_eq!(legacy.report_seq, None);
+        assert!(legacy.to_json().ends_with(",\"report_seq\":null}"));
+        let stamped = scan_keeper_actions(&[], MID).with_report_seq(9);
+        assert_eq!(stamped.report_seq, Some(9));
+        assert!(stamped.to_json().ends_with(",\"report_seq\":9}"));
+        // The stamp is last and fixed-order: pin the tail bytes.
+        assert!(stamped
+            .to_json()
+            .ends_with("\"actions\":[],\"report_seq\":9}"));
     }
 
     #[test]
@@ -2856,7 +2905,7 @@ mod keeper_tests {
         // 3 accounts, 8 data bytes, 1 signer →
         // 10_000 + 3_000 + 3×250 + 8×8 = 13_814 each; total 27_628.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":13814}}]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":13814}}],\"report_seq\":null}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -2881,7 +2930,7 @@ mod keeper_tests {
         // AV-88: claim with mint, no refund_to: 3 accounts, 8 data
         // bytes, 1 signer → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":17814}}]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":17814}}],\"report_seq\":null}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),

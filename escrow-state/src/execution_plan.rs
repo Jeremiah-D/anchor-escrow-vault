@@ -443,6 +443,8 @@ mod execution_plan_tests {
             pool_balance: 0,
             pool_inflow: 0,
             pool_outflow: 0,
+            // AV-120: execution-plan tests never stamp a sequence.
+            report_seq: None,
         }
     }
 
