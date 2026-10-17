@@ -1160,6 +1160,13 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     let penalty_escalation_rate_bps = c.u16_le()?;
     let penalty_escalation_cap_bps = c.u16_le()?;
 
+    // AV-116: the slot-based relative timelock tail — the 8-byte
+    // opt-in slot duration plus the 8-byte funding slot anchor.
+    // Structural decode only — the mutual-exclusion invariant is
+    // enforced by `Escrow::with_slot_timelock`, not re-litigated here.
+    let slot_timelock_slots = c.u64_le()?;
+    let fund_slot = c.u64_le()?;
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1385,6 +1392,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // any other persisted tail field.
         penalty_escalation_rate_bps,
         penalty_escalation_cap_bps,
+        // AV-116: the slot-based relative timelock tail decodes like
+        // any other persisted tail field.
+        slot_timelock_slots,
+        fund_slot,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

@@ -407,6 +407,14 @@ pub struct EscrowSnapshot {
     /// Unix timestamp at which the escrow was funded, or `0` when never
     /// funded (AV-64): the origin the relative timelock is measured from.
     pub fund_at: u64,
+    /// AV-116: slot-based relative timelock duration in slots, or `0`
+    /// when no slot timelock is configured: payouts unlock at
+    /// `fund_slot + slot_timelock_slots`.
+    pub slot_timelock_slots: u64,
+    /// AV-116: Solana slot at which the escrow was funded, or `0` when
+    /// never funded: the origin the slot-based relative timelock is
+    /// measured from.
+    pub fund_slot: u64,
     /// Payout destination allowlist, or `None` when no allowlist is
     /// configured (AV-49). When `Some`, every fund-moving transition
     /// requires its `payout_to` to be a member.
@@ -833,6 +841,12 @@ impl Escrow {
             // unlock time the chain's payout gates enforce.
             relative_timelock_secs: self.relative_timelock_secs(),
             fund_at: self.fund_at(),
+            // AV-116: the slot-based relative lock and its funding-slot
+            // origin ride the export, so an off-chain indexer can
+            // compute the same unlock slot the chain's payout gates
+            // enforce.
+            slot_timelock_slots: self.slot_timelock_slots(),
+            fund_slot: self.fund_slot(),
             // AV-82: the slash terms ride the export — `None` when no
             // slash clause is configured — plus the cumulative slashed
             // amount and the at-`now` slash eligibility the keeper
@@ -1262,6 +1276,12 @@ impl EscrowSnapshot {
         s.push_str(&self.relative_timelock_secs.to_string());
         s.push_str(",\"fund_at\":");
         s.push_str(&self.fund_at.to_string());
+        // AV-116: slot-based relative timelock duration and the
+        // funding slot it is measured from.
+        s.push_str(",\"slot_timelock_slots\":");
+        s.push_str(&self.slot_timelock_slots.to_string());
+        s.push_str(",\"fund_slot\":");
+        s.push_str(&self.fund_slot.to_string());
         // AV-49: payout destination allowlist — `null` when none is
         // configured, else the allowlisted addresses as hex strings.
         s.push_str(",\"payout_allowlist\":");
@@ -1609,7 +1629,7 @@ mod snapshot_tests {
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"evidence_root\":null,\"evidence_disclosure\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
-             \"penalty_bps\":0,\"penalty_escalation_rate_bps\":0,\"penalty_escalation_cap_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"payout_allowlist\":null,\"payout_denylist\":null,\"cpi_allowlist\":null,\"multisig_authority\":null,\
+             \"penalty_bps\":0,\"penalty_escalation_rate_bps\":0,\"penalty_escalation_cap_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"slot_timelock_slots\":0,\"fund_slot\":0,\"payout_allowlist\":null,\"payout_denylist\":null,\"cpi_allowlist\":null,\"multisig_authority\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
              \"max_extension_secs\":0,\"extension_count\":0,\"arbiter_panel\":null,\

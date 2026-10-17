@@ -264,6 +264,27 @@ a misconfigured lock can never trap funds forever. The dual-signed
 The snapshot exposes `relative_timelock_secs` / `fund_at` for indexers, so
 they compute the same unlock time the chain enforces.
 
+**Slot-based relative timelock.** An escrow can instead opt into a
+*slot-based* relative timelock (`with_slot_timelock(slots)`, once, before
+funding; `slots` is a duration in slots, `0` = no lock). After that, every
+taker payout path — `release`, `claim`, and `release_milestone` — requires
+`slot >= fund_slot + slots` (`TimelockNotReached`, code 118, otherwise),
+where `fund_slot` is the clock sysvar's slot `fund` recorded and `slot` is
+the sysvar's slot at the payout call (never an instruction param — a
+caller-supplied slot would let the initializer fast-forward the lock they
+configured). The lock is measured in slots, not seconds: chain slot
+progression is the one clock no validator can skew, so a slot lock is
+immune to the wall-clock drift the second-based locks inherit from
+`unix_timestamp`. The three locks are mutually exclusive — one clock per
+escrow: a nonzero slot lock together with either second-based lock is
+`InvalidTimelock`, code 135, in either builder order. Like the other locks,
+the slot lock gates only *payouts*: `cancel`, `cancel_expired`, and the
+arbiter's `resolve` are deliberately not gated. The pure-logic side takes
+a pluggable `SlotClock` (tests inject a deterministic `StaticSlotClock`);
+the snapshot exposes `slot_timelock_slots` / `fund_slot` and the keeper
+report discloses the unlock slot (`slot_unlock_at`) so operators compare
+it against the chain tip.
+
 **Emergency timelock unlock.** An escrow can additionally opt into
 dual-signed emergency governance (`with_emergency_unlock()`, once, before
 funding). When both parties agree the lock has outlived its purpose — a
@@ -2360,7 +2381,9 @@ two-way consistency check against the IDL parameter table:
 | price_gate | Option<PriceGate> (1-byte discriminant + 1-byte direction + 8-byte target + 8-byte max_staleness_secs) | 18 |
 | penalty_escalation_rate_bps | u16 | 2 |
 | penalty_escalation_cap_bps | u16 | 2 |
-| **total**     |                   | **5135** |
+| slot_timelock_slots | u64 | 8 |
+| fund_slot | u64 | 8 |
+| **total**     |                   | **5151** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2482,10 +2505,10 @@ plan payload — `total_amount` u64 + `max_tranches` u8 +
 `release_cooling_secs` (u64, 0 = unconfigured) +
 `release_intent_at` (Option<u64>: 1-byte discriminant + 8-byte
 stamp, `None` when no intent is live)).
-`escrow-state` exposes `VAULT_SPACE` (5143) and
-`VAULT_SPACE_NO_QUORUM` (4653) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (5159) and
+`VAULT_SPACE_NO_QUORUM` (4669) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **36,686,160 lamports** to be
+mainnet rent parameters the full vault needs **36,797,520 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)

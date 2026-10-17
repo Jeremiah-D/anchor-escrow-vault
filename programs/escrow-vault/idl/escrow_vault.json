@@ -546,6 +546,14 @@
       ]
     },
     {
+      "name": "initialize_slot_timelock",
+      "discriminator": [59, 167, 173, 199, 125, 77, 142, 103],
+      "accounts": [],
+      "args": [
+        {"name": "slots", "type": "u64"}
+      ]
+    },
+    {
       "name": "initialize_evidence_deadline",
       "discriminator": [204, 4, 240, 39, 232, 161, 251, 234],
       "accounts": [],
@@ -981,7 +989,9 @@
           {"name": "release_intent_at", "type": {"option": "u64"}, "offset": 5112},
           {"name": "price_gate", "type": {"option": {"defined": "PriceGate"}}, "offset": 5121},
           {"name": "penalty_escalation_rate_bps", "type": "u16", "offset": 5139},
-          {"name": "penalty_escalation_cap_bps", "type": "u16", "offset": 5141}
+          {"name": "penalty_escalation_cap_bps", "type": "u16", "offset": 5141},
+          {"name": "slot_timelock_slots", "type": "u64", "offset": 5143},
+          {"name": "fund_slot", "type": "u64", "offset": 5151}
         ]
       }
     }

@@ -153,8 +153,13 @@ pub mod escrow_vault {
         // AV-64: `fund_at` anchors the relative timelock at funding
         // time — the clock sysvar, like the AV-27 gate's `now`.
         let now = Clock::get()?.unix_timestamp as u64;
+        // AV-116: `fund_slot` anchors the slot-based relative timelock
+        // at the funding slot — the clock sysvar's `slot`, never an
+        // instruction param (a caller-supplied slot would let the
+        // initializer fast-forward the lock they configured).
+        let slot = Clock::get()?.slot;
         escrow
-            .fund(ctx.accounts.initializer.key().to_bytes(), now)
+            .fund_with_slot(ctx.accounts.initializer.key().to_bytes(), now, slot)
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // AV-18: one indexer event per state transition (mirrors
@@ -196,6 +201,14 @@ pub mod escrow_vault {
         // an instruction param, so the initializer cannot fast-forward
         // the lock they configured.
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        // AV-116: the slot-based relative timelock gates the payout on
+        // the clock sysvar's slot — never an instruction param, same
+        // rule. Evaluated before the AV-113 price-gate routing so the
+        // two gates compose; a no-op when no slot lock is configured.
+        let slot = Clock::get()?.slot;
+        if !escrow.is_slot_unlock_eligible(slot) {
+            return Err(escrow_error(escrow_state::EscrowError::TimelockNotReached));
+        }
         // AV-113: when a price gate is configured, the release routes
         // through the gated entry point and the oracle account (first
         // remaining account) feeds the quote — the program passes it
@@ -1067,6 +1080,15 @@ pub mod escrow_vault {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
         let from = escrow.state() as u8;
+        // AV-116: the slot-based relative timelock gates the payout on
+        // the clock sysvar's slot — never an instruction param, same
+        // rule as the AV-27 gate. Evaluated before the AV-113
+        // price-gate routing so the two gates compose; a no-op when no
+        // slot lock is configured.
+        let slot = Clock::get()?.slot;
+        if !escrow.is_slot_unlock_eligible(slot) {
+            return Err(escrow_error(escrow_state::EscrowError::TimelockNotReached));
+        }
         // AV-113: like `release` — a configured price gate routes the
         // taker's pull through the gated entry point, fed by the
         // oracle account's quote (see `read_oracle_quote`).
@@ -2151,6 +2173,13 @@ pub mod escrow_vault {
         // AV-27: the timelock gate reads the Solana clock sysvar (see
         // `release`).
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        // AV-116: the slot-based relative timelock gates the payout on
+        // the clock sysvar's slot — never an instruction param, same
+        // rule; a no-op when no slot lock is configured.
+        let slot = Clock::get()?.slot;
+        if !escrow.is_slot_unlock_eligible(slot) {
+            return Err(escrow_error(escrow_state::EscrowError::TimelockNotReached));
+        }
         let (payout, fee) = escrow
             .release_milestone(
                 ctx.accounts.initializer.key().to_bytes(),
@@ -2524,6 +2553,34 @@ pub mod escrow_vault {
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // `vault.relative_timelock_secs` is always present (8 bytes,
+        // zeroed by default), so the duration is written in place — no
+        // realloc needed in the real build.
+        Ok(())
+    }
+
+    /// Declare the slot-based relative timelock (AV-116; mirrors
+    /// `Escrow::with_slot_timelock`): after this, `release` / `claim` /
+    /// `release_milestone` require the Solana slot to have passed
+    /// `fund_slot + slots` (`TimelockNotReached` otherwise), where
+    /// `fund_slot` is the clock sysvar's slot `fund` recorded.
+    /// `slots == 0` means no lock (the default). Slot-measured, so the
+    /// lock is immune to validator wall-clock drift. Mutually exclusive
+    /// with the AV-27 absolute timelock and the AV-64 second-relative
+    /// timelock — a nonzero `slots` together with either is
+    /// `InvalidTimelock` (code 135), in either builder order.
+    /// `Uninitialized` only. `cancel` / `cancel_expired` / `resolve` are
+    /// deliberately NOT gated, so a misconfigured lock can never trap
+    /// funds forever.
+    pub fn initialize_slot_timelock(
+        ctx: Context<InitializeSlotTimelock>,
+        slots: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_slot_timelock(slots)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.slot_timelock_slots` is always present (8 bytes,
         // zeroed by default), so the duration is written in place — no
         // realloc needed in the real build.
         Ok(())
@@ -7095,6 +7152,18 @@ pub struct InitializeRelativeTimelock<'info> {
     /// machine rejects re-configuration once the escrow leaves
     /// `Uninitialized`, and rejects a nonzero duration together with a
     /// nonzero AV-27 absolute timelock (`InvalidTimelock`).
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeSlotTimelock<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer declares the slot-based relative timelock;
+    /// the state machine rejects re-configuration once the escrow
+    /// leaves `Uninitialized`, and rejects a nonzero slot duration
+    /// together with a nonzero AV-27 absolute timelock or AV-64
+    /// relative timelock (`InvalidTimelock`).
     pub initializer: Signer<'info>,
 }
 

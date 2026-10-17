@@ -1321,9 +1321,10 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .expect("price_gate in IDL offsets");
     assert_eq!(pg_len, PRICE_GATE_LEN);
     // AV-115 appended the escalation tail after price_gate, so the
-    // gate no longer sits at the body's end.
-    assert_eq!(pg_offset, 8 + ESCROW_BODY_LEN - PRICE_GATE_LEN - 4);
-    // AV-115: the escalation tail is the last 4 bytes of the body.
+    // gate no longer sits at the body's end. AV-116 appended the
+    // slot-timelock tail after the escalation tail.
+    assert_eq!(pg_offset, 8 + ESCROW_BODY_LEN - PRICE_GATE_LEN - 4 - SLOT_TIMELOCK_TAIL_LEN);
+    // AV-115: the escalation tail sits just before the AV-116 tail.
     let rate = body_field(&enc, &offsets, "penalty_escalation_rate_bps");
     assert_eq!(rate.len(), 2);
     let (_, rate_offset, _) = offsets
@@ -1331,7 +1332,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "penalty_escalation_rate_bps")
         .copied()
         .expect("penalty_escalation_rate_bps in IDL offsets");
-    assert_eq!(rate_offset, 8 + ESCROW_BODY_LEN - 4);
+    assert_eq!(rate_offset, 8 + ESCROW_BODY_LEN - 4 - SLOT_TIMELOCK_TAIL_LEN);
     let cap = body_field(&enc, &offsets, "penalty_escalation_cap_bps");
     assert_eq!(cap.len(), 2);
     let (_, cap_offset, _) = offsets
@@ -1339,7 +1340,24 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "penalty_escalation_cap_bps")
         .copied()
         .expect("penalty_escalation_cap_bps in IDL offsets");
-    assert_eq!(cap_offset, 8 + ESCROW_BODY_LEN - 2);
+    assert_eq!(cap_offset, 8 + ESCROW_BODY_LEN - 2 - SLOT_TIMELOCK_TAIL_LEN);
+    // AV-116: the slot-timelock tail is the last 16 bytes of the body.
+    let slots = body_field(&enc, &offsets, "slot_timelock_slots");
+    assert_eq!(slots.len(), 8);
+    let (_, slots_offset, _) = offsets
+        .iter()
+        .find(|(n, _, _)| *n == "slot_timelock_slots")
+        .copied()
+        .expect("slot_timelock_slots in IDL offsets");
+    assert_eq!(slots_offset, 8 + ESCROW_BODY_LEN - 16);
+    let fslot = body_field(&enc, &offsets, "fund_slot");
+    assert_eq!(fslot.len(), 8);
+    let (_, fslot_offset, _) = offsets
+        .iter()
+        .find(|(n, _, _)| *n == "fund_slot")
+        .copied()
+        .expect("fund_slot in IDL offsets");
+    assert_eq!(fslot_offset, 8 + ESCROW_BODY_LEN - 8);
 }
 
 #[test]
