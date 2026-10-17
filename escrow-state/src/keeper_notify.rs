@@ -745,6 +745,8 @@ mod keeper_notify_tests {
             merge_source: None,
             penalty_estimate: 0,
             slot_unlock_at: None,
+            bounty_lamports: 0,
+            bounty_unprofitable: false,
         }
     }
 

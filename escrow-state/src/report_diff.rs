@@ -903,6 +903,8 @@ pub fn csv_to_report_diff(csv: &str) -> Result<ReportDiff, DiffCsvError> {
                     merge_source: None,
                     penalty_estimate: 0,
                     slot_unlock_at: None,
+                    bounty_lamports: 0,
+                    bounty_unprofitable: false,
                 });
             }
         }
@@ -1173,6 +1175,8 @@ mod report_diff_tests {
             merge_source: None,
             penalty_estimate: 0,
             slot_unlock_at: None,
+            bounty_lamports: 0,
+            bounty_unprofitable: false,
         }
     }
 

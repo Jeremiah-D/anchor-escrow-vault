@@ -234,7 +234,7 @@
 //! | ReleaseIntentAnnounced (AV-112) | 0 | 0 | 0 | 0 — a release intent was announced (governance signal; the cooling window starts) |
 //! | ReleaseIntentVetoed (AV-112) | 0 | 0 | 0 | 0 — a live release intent was vetoed (governance signal; the announced release is cancelled) |
 //! | EscrowsMerged (AV-114) | the source's locked amount folded into the survivor | 0 | 0 | 0 |
-//! | ExpiredCranked (AV-48) | 0 | 0 | remainder minus penalty, to the whitelisted destination (the cranker receives nothing) | anti-griefing penalty to the initializer (AV-24; 0 unless the cranker is the taker; AV-115 escalation grows the rate with days past the expiry gate) |
+//! | ExpiredCranked (AV-48) | 0 | 0 | remainder minus penalty, to the whitelisted destination (the cranker receives nothing — unless the vault opted into the AV-124 keeper bounty, paid via `KeeperBountyPaid`) | anti-griefing penalty to the initializer (AV-24; 0 unless the cranker is the taker; AV-115 escalation grows the rate with days past the expiry gate) |
 //! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's principal share of the split (AV-119: the initializer's dispute-interest share rides the refund transfer — tracked in `dispute_interest`, the event keeps the principal leg) | 0 |
 //! | DefaultJudgment (AV-55) | gross taker share (`default_taker_amount`) | protocol fee on the taker's share | initializer's principal share of the split (AV-119: same dispute-interest rule as `Resolved`) | 0 |
 //! | PanelResolved (AV-65) | gross taker share (the winning vote's `taker_amount`) | protocol fee on the taker's share | initializer's principal share of the split (AV-119: same dispute-interest rule as `Resolved`) | 0 |
@@ -845,6 +845,19 @@ pub enum EscrowEventKind {
     /// transaction is not a party to the escrow and is deliberately
     /// not recorded.
     ReleaseViaIntent,
+    /// AV-124: the keeper bounty paid to a permissionless crank
+    /// caller ([`Escrow::crank_expired`]). Emitted alongside
+    /// [`EscrowEventKind::ExpiredCranked`] when the crank actually
+    /// paid a bounty (`from == to == Cancelled` — the unwind is
+    /// already final; the bounty settles it, it does not gate it).
+    /// Amounts follow the `Released` shape (`payout` = the bounty
+    /// paid, `fee` = 0); the caller is the crank signer (carried by
+    /// the event's `caller` field, like `ExpiredCranked`), and
+    /// `bounty_pool_remaining` carries the pool balance after the
+    /// debit so indexers track pool exhaustion without a second
+    /// account read. Emitted only when the bounty is non-zero — a
+    /// zero-bounty crank emits `ExpiredCranked` alone.
+    KeeperBountyPaid,
 }
 
 impl EscrowEventKind {
@@ -1006,6 +1019,9 @@ impl EscrowEventKind {
             // discriminants 0-65 stay stable for already-serialized
             // histories.
             66 => Self::ReleaseViaIntent,
+            // AV-124: appended after ReleaseViaIntent so discriminants
+            // 0-66 stay stable for already-serialized histories.
+            67 => Self::KeeperBountyPaid,
             _ => return None,
         })
     }
@@ -1083,6 +1099,9 @@ impl EscrowEventKind {
             Self::CounterOfferAccepted => "counter_offer_accepted",
             Self::CounterOfferRejected => "counter_offer_rejected",
             Self::ReleaseViaIntent => "release_via_intent",
+            // AV-124: appended after release_via_intent so the name
+            // table stays stable for already-serialized histories.
+            Self::KeeperBountyPaid => "keeper_bounty_paid",
         }
     }
 
@@ -1164,6 +1183,9 @@ impl EscrowEventKind {
             // name table stays stable for already-serialized
             // histories.
             "release_via_intent" => Self::ReleaseViaIntent,
+            // AV-124: appended after release_via_intent so the name
+            // table stays stable for already-serialized histories.
+            "keeper_bounty_paid" => Self::KeeperBountyPaid,
             _ => return None,
         })
     }
@@ -1300,6 +1322,23 @@ impl EventAmounts {
             fee: 0,
             refund: 0,
             penalty,
+            rent_reclaimed: 0,
+        }
+    }
+
+    /// A keeper-bounty payout (AV-124): the `bounty` paid to the
+    /// permissionless crank caller rides `payout` — the caller is
+    /// neither party, so it is neither a taker payout nor an
+    /// initializer refund, and the direction is read from the event
+    /// kind. The pool balance *after* the debit rides the event's
+    /// `bounty_pool_remaining`, not the amounts. Rides the
+    /// [`EscrowEventKind::KeeperBountyPaid`] event.
+    pub(crate) fn keeper_bounty(bounty: u64) -> Self {
+        Self {
+            payout: bounty,
+            fee: 0,
+            refund: 0,
+            penalty: 0,
             rent_reclaimed: 0,
         }
     }
@@ -1524,6 +1563,15 @@ pub struct EscrowEvent {
     /// event carries the tamper-proof record. `None` on every other
     /// kind, and on settlements with no committed root.
     pub evidence_disclosure: Option<(u64, u8)>,
+    /// AV-124: the keeper-bounty pool balance *after* the crank's
+    /// debit ([`crate::Escrow::keeper_bounty_pool`]), carried by
+    /// [`EscrowEventKind::KeeperBountyPaid`] (`None` on every other
+    /// kind — like `evidence_root`, which rides only the dispute
+    /// kinds). Read from the escrow at emit time (never a
+    /// `push_event` parameter), so the log always agrees with the
+    /// account — indexers track pool exhaustion from the event
+    /// stream alone.
+    pub bounty_pool_remaining: Option<u64>,
 }
 
 /// One split child on an [`EscrowEventKind::EscrowSplit`] event's
@@ -1802,6 +1850,19 @@ impl IndexedEscrow {
             } else {
                 None
             },
+            // AV-124: the post-debit bounty pool rides the
+            // KeeperBountyPaid event — read from the escrow at emit
+            // time (never a push_event parameter), like
+            // evidence_defaulted, so the log always agrees with the
+            // account.
+            bounty_pool_remaining: if matches!(
+                kind,
+                EscrowEventKind::KeeperBountyPaid
+            ) {
+                Some(self.inner.keeper_bounty_pool())
+            } else {
+                None
+            },
         };
         self.next_seq += 1;
         self.events.push(event);
@@ -1923,6 +1984,20 @@ impl IndexedEscrow {
     /// [`Escrow::with_dual_sig`]). Configuration: emits no event.
     pub fn with_dual_sig(mut self) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_dual_sig()?;
+        Ok(self)
+    }
+
+    /// Opt into the permissionless-crank keeper bounty (mirrors
+    /// [`Escrow::with_keeper_bounty`], AV-124). Configuration: emits
+    /// no event.
+    pub fn with_keeper_bounty(
+        mut self,
+        pool_lamports: u64,
+        per_crank_lamports: u64,
+    ) -> Result<Self, EscrowError> {
+        self.inner = self
+            .inner
+            .with_keeper_bounty(pool_lamports, per_crank_lamports)?;
         Ok(self)
     }
 
@@ -2824,19 +2899,25 @@ impl IndexedEscrow {
     /// AV-48). Emits `ExpiredCranked` (carrying the crank `caller` —
     /// the one event kind where the caller is neither party) with the
     /// same [`EventAmounts::expired_cancel`] shape as the party-signed
-    /// path; `now` doubles as the event's `at`. Returns the `(refund,
-    /// penalty)` split: only a taker cranker pays the AV-24 penalty.
+    /// path; `now` doubles as the event's `at`. AV-124: when the crank
+    /// paid a keeper bounty, a second `KeeperBountyPaid` event follows
+    /// (`from == to == Cancelled` — the unwind is already final; the
+    /// event carries the bounty in `payout`, the caller, and the
+    /// post-debit pool balance). Returns the `(refund, penalty,
+    /// bounty)` triple: only a taker cranker pays the AV-24 penalty,
+    /// and the bounty is `0` when no bounty is configured or the pool
+    /// is exhausted.
     pub fn crank_expired(
         &mut self,
         caller: [u8; 32],
         now: u64,
         mint: Option<[u8; 32]>,
-    ) -> Result<(u64, u64), EscrowError> {
+    ) -> Result<(u64, u64, u64), EscrowError> {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected` (`now` doubles as the event's `at`).
         let result = self.inner.crank_expired(caller, now, mint);
-        let (refund, penalty) = self.map_reentrant(result, now)?;
+        let (refund, penalty, bounty) = self.map_reentrant(result, now)?;
         let to = self.inner.state();
         self.push_event(
             EscrowEventKind::ExpiredCranked,
@@ -2850,7 +2931,26 @@ impl IndexedEscrow {
             Some(caller),
             Some(caller),
         );
-        Ok((refund, penalty))
+        // AV-124: the bounty settles the already-finalized unwind —
+        // its event rides `from == to ==` the post-crank state, and it
+        // is emitted only when a bounty was actually paid (a
+        // zero-bounty crank emits `ExpiredCranked` alone, keeping the
+        // AV-48 event shape for unbountied escrows).
+        if bounty > 0 {
+            self.push_event(
+                EscrowEventKind::KeeperBountyPaid,
+                to,
+                to,
+                EventAmounts::keeper_bounty(bounty),
+                now,
+                None,
+                None,
+                None,
+                Some(caller),
+                Some(caller),
+            );
+        }
+        Ok((refund, penalty, bounty))
     }
 
     /// Settle one basket leg to the taker (mirrors
@@ -5510,7 +5610,7 @@ mod event_tests {
         // (not `ExpiredCancelled`) carrying the crank caller's key —
         // the one event kind where the caller is neither party.
         let mut e = funded(1_000_000);
-        let (refund, penalty) = e.crank_expired(MALLORY, EXPIRES_AT, None).unwrap();
+        let (refund, penalty, _) = e.crank_expired(MALLORY, EXPIRES_AT, None).unwrap();
         assert_eq!((refund, penalty), (1_000_000, 0));
         let event = last(&e);
         assert_eq!(event.kind, EscrowEventKind::ExpiredCranked);
@@ -5520,6 +5620,68 @@ mod event_tests {
         assert_eq!(event.amounts.penalty, 0);
         assert_eq!(event.caller, Some(MALLORY), "the crank caller is recorded");
         assert_eq!(event.at, EXPIRES_AT, "now doubles as at");
+    }
+
+    #[test]
+    fn crank_with_bounty_emits_keeper_bounty_paid() {
+        // AV-124: a bounty-paying crank emits `ExpiredCranked`
+        // followed by `KeeperBountyPaid` — the bounty settles the
+        // already-finalized unwind (`from == to == Cancelled`), the
+        // caller and the paid amount ride the event, and
+        // `bounty_pool_remaining` carries the post-debit pool so
+        // indexers track exhaustion without a second account read.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_keeper_bounty(50_000, 10_000)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        let (refund, penalty, bounty) = e.crank_expired(MALLORY, EXPIRES_AT, None).unwrap();
+        assert_eq!((refund, penalty, bounty), (1_000_000, 0, 10_000));
+        let events = e.events();
+        assert_eq!(events.len(), 4, "Initialized + Funded + ExpiredCranked + KeeperBountyPaid");
+        let paid = &events[3];
+        assert_eq!(paid.kind, EscrowEventKind::KeeperBountyPaid);
+        assert_eq!(paid.from, EscrowState::Cancelled);
+        assert_eq!(paid.to, EscrowState::Cancelled);
+        assert_eq!(paid.amounts.payout, 10_000, "the bounty rides payout");
+        assert_eq!(paid.caller, Some(MALLORY), "the crank caller is recorded");
+        assert_eq!(
+            paid.bounty_pool_remaining,
+            Some(40_000),
+            "post-debit pool balance"
+        );
+    }
+
+    #[test]
+    fn crank_without_bounty_emits_no_bounty_event() {
+        // AV-124: a zero-bounty crank emits `ExpiredCranked` alone —
+        // the AV-48 event shape is unchanged for unbountied escrows.
+        let mut e = funded(1_000_000);
+        let (_, _, bounty) = e.crank_expired(MALLORY, EXPIRES_AT, None).unwrap();
+        assert_eq!(bounty, 0);
+        let events = e.events();
+        assert_eq!(events.len(), 3, "Initialized + Funded + ExpiredCranked only");
+        assert_eq!(events[2].kind, EscrowEventKind::ExpiredCranked);
+    }
+
+    #[test]
+    fn keeper_bounty_paid_csv_round_trip() {
+        // AV-124: the bounty event survives the CSV projection — the
+        // kind and the payout amount round-trip; the pool-remaining
+        // extra takes its documented `None` on import (like the other
+        // kind-specific extras).
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_keeper_bounty(50_000, 10_000)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.crank_expired(MALLORY, EXPIRES_AT, None).unwrap();
+        let csv = crate::event_csv::events_to_csv(e.events());
+        assert!(csv.contains("keeper_bounty_paid"));
+        let back = crate::event_csv::csv_to_events(&csv).unwrap();
+        let paid = back.iter().find(|ev| ev.kind == EscrowEventKind::KeeperBountyPaid).unwrap();
+        assert_eq!(paid.amounts.payout, 10_000);
+        assert_eq!(paid.bounty_pool_remaining, None, "not carried by the CSV projection");
     }
 
     #[test]
@@ -5539,7 +5701,7 @@ mod event_tests {
         // carries the exact (refund, penalty) split.
         let mut e = indexed(1_000_000).with_penalty_bps(250).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        let (refund, penalty) = e.crank_expired(BOB, EXPIRES_AT, None).unwrap();
+        let (refund, penalty, _) = e.crank_expired(BOB, EXPIRES_AT, None).unwrap();
         assert_eq!((refund, penalty), (975_000, 25_000));
         let event = last(&e);
         assert_eq!(event.kind, EscrowEventKind::ExpiredCranked);
@@ -6867,7 +7029,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(59), Some(EscrowEventKind::ReleaseIntentAnnounced));
         assert_eq!(EscrowEventKind::from_discriminant(60), Some(EscrowEventKind::ReleaseIntentVetoed));
         assert_eq!(EscrowEventKind::from_discriminant(61), Some(EscrowEventKind::EscrowsMerged));
-        assert_eq!(EscrowEventKind::from_discriminant(67), None);
+        assert_eq!(EscrowEventKind::from_discriminant(68), None);
     }
 
     #[test]
@@ -6970,7 +7132,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(67), None);
+        assert_eq!(EscrowEventKind::from_discriminant(68), None);
     }
 
     #[test]
@@ -7507,7 +7669,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(67), None);
+        assert_eq!(EscrowEventKind::from_discriminant(68), None);
     }
 
     #[test]
@@ -7522,7 +7684,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(67), None);
+        assert_eq!(EscrowEventKind::from_discriminant(68), None);
     }
 
     #[test]
@@ -7534,7 +7696,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(67), None);
+        assert_eq!(EscrowEventKind::from_discriminant(68), None);
     }
 
     #[test]
@@ -7546,7 +7708,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(67), None);
+        assert_eq!(EscrowEventKind::from_discriminant(68), None);
     }
 
     #[test]
@@ -7558,7 +7720,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(67), None);
+        assert_eq!(EscrowEventKind::from_discriminant(68), None);
     }
 
     #[test]
@@ -7573,7 +7735,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(67), None);
+        assert_eq!(EscrowEventKind::from_discriminant(68), None);
     }
 
     #[test]
@@ -7588,7 +7750,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(67), None);
+        assert_eq!(EscrowEventKind::from_discriminant(68), None);
     }
 
     #[test]
@@ -7600,7 +7762,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(67), None);
+        assert_eq!(EscrowEventKind::from_discriminant(68), None);
     }
 
     #[test]
@@ -7612,7 +7774,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(67), None);
+        assert_eq!(EscrowEventKind::from_discriminant(68), None);
     }
 
     #[test]
@@ -7624,7 +7786,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(67), None);
+        assert_eq!(EscrowEventKind::from_discriminant(68), None);
     }
 
     #[test]
@@ -7636,7 +7798,19 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(67), None);
+        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+    }
+
+    #[test]
+    fn keeper_bounty_paid_kind_round_trips() {
+        // AV-124: discriminant 67, appended after ReleaseViaIntent —
+        // 0–66 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::KeeperBountyPaid;
+        assert_eq!(kind.discriminant(), 67);
+        assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
+        assert_eq!(kind.name(), "keeper_bounty_paid");
+        assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
+        assert_eq!(EscrowEventKind::from_discriminant(68), None);
     }
 
     #[test]

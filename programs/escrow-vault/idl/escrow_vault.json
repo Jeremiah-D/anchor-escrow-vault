@@ -8,7 +8,9 @@
       "accounts": [],
       "args": [
         {"name": "amount", "type": "u64"},
-        {"name": "expires_at", "type": "u64"}
+        {"name": "expires_at", "type": "u64"},
+        {"name": "keeper_bounty_pool", "type": "u64"},
+        {"name": "keeper_bounty_per_crank", "type": "u64"}
       ]
     },
     {
@@ -1051,7 +1053,9 @@
           {"name": "claim_cooldown_slots", "type": "u64", "offset": 5176},
           {"name": "last_claim_slot", "type": {"option": "u64"}, "offset": 5184},
           {"name": "counter_offer", "type": {"option": {"defined": "CounterOffer"}}, "offset": 5193},
-          {"name": "last_intent_nonce", "type": "u64", "offset": 5210}
+          {"name": "last_intent_nonce", "type": "u64", "offset": 5210},
+          {"name": "keeper_bounty_pool", "type": "u64", "offset": 5218},
+          {"name": "keeper_bounty_per_crank", "type": "u64", "offset": 5226}
         ]
       }
     }

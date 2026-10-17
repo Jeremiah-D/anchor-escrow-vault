@@ -32,7 +32,8 @@
 //!
 //! The CSV carries only the nine columns above. `from` / `to`,
 //! `evidence_hash`, `rationale_hash`, `cpi`, `caller`, `reference`,
-//! `template_params_hash` and `evidence_defaulted` are *not* exported.
+//! `template_params_hash`, `evidence_defaulted` and
+//! `bounty_pool_remaining` are *not* exported.
 //! [`csv_to_events`] reconstructs the carried fields exactly and fills
 //! the rest with documented zero-values: `from == to == Uninitialized`
 //! (the explicit "not carried by this projection" marker — the event's
@@ -224,6 +225,10 @@ pub fn csv_to_events(csv: &str) -> Result<Vec<EscrowEvent>, CsvError> {
             // projection either — `None` on import, like the other
             // kind-specific extras.
             release_split: None,
+            // AV-124: the post-debit bounty pool is not carried by
+            // the CSV projection either — `None` on import, like the
+            // other kind-specific extras.
+            bounty_pool_remaining: None,
         });
     }
     Ok(events)

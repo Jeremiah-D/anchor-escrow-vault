@@ -141,7 +141,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `cancel(authority, refund_to)`               | `Funded`       | `Cancelled` | initializer; AV-104: a live CANCEL-scoped operator may call for the initializer instead (the `refund_to` pin is unchanged — delegation never reroutes funds); `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise |
 | `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); AV-104: a live CANCEL-scoped operator may also call (either party's grant — the refund routing is unchanged); the refund still goes to the whitelisted address even when the taker calls; returns `(refund, penalty)` — a taker-initiated cancel with `penalty_bps > 0` slices an anti-griefing penalty for the initializer (see below) |
 | `cancel_partial(authority, amount, refund_to)` (AV-60) | `Funded` | `Funded` (no state change) | initializer; Funded-only; the initializer's counterpart to AV-11's partial release — reclaims a tranche of the lockup instead of streaming it to the taker; `amount == 0` is `AmountMismatch`, `amount` above the still-locked remainder is `ReleaseExceedsLocked`; the `released` counter is untouched and the locked total shrinks; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise; quorum / timelock / vesting do **not** gate it (same as `cancel`); emits `PartiallyCancelled`; returns the refunded amount |
-| `crank_expired(caller, now)` (AV-48) | `Funded` | `Cancelled` | **anyone** — permissionless crank (Solana crank pattern), only when `now >= expires_at + grace_period`; no counterparty signature needed, so a keeper bot that is party to nothing can sweep timed-out vaults; the refund follows the same pinned refund policy (whitelisted address, or the initializer) — the cranker receives nothing (anti-MEV); a taker cranker still pays the anti-griefing penalty; rejected with `Paused` while the escrow is paused |
+| `crank_expired(caller, now)` (AV-48) | `Funded` | `Cancelled` | **anyone** — permissionless crank (Solana crank pattern), only when `now >= expires_at + grace_period`; no counterparty signature needed, so a keeper bot that is party to nothing can sweep timed-out vaults; the refund follows the same pinned refund policy (whitelisted address, or the initializer) — anti-MEV; AV-124: when the initializer opted into the keeper bounty, the crank additionally pays `min(keeper_bounty_per_crank, keeper_bounty_pool)` (saturating) to the caller — without the bounty the cranker receives nothing; returns `(refund, penalty, bounty)`; a taker cranker still pays the anti-griefing penalty; rejected with `Paused` while the escrow is paused |
 | `initialize_payout_allowlist(allowlist)` (AV-49) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–4 live payout-destination addresses; empty / over-long / zero-address input is `InvalidPayoutAllowlist`); the payout policy gates every fund-moving transition's `payout_to` |
 | `update_payout_allowlist(initializer, taker, allowlist)` (AV-49) | `Uninitialized` / `Funded` | same (no state change) | dual-signature governance — both initializer and taker on a dual-sig escrow, initializer alone on a plain escrow (`Unauthorized` otherwise); empty clears the allowlist (back to taker-only payouts); emits `PayoutAllowlistUpdated` only on an actual change |
 | `initialize_payout_denylist(addrs)` (AV-96) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–4 live addresses — empty / over-long / zero-address input is `InvalidPayoutDenylist`, code 154); deny takes precedence over the AV-49 allowlist — a destination on both lists is rejected with `PayoutDenied` (code 153) |
@@ -1788,13 +1788,13 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82), `CpiAllowlistUpdated` (AV-83), `AppealFiled` (AV-86), `AppealResolved` (AV-86), `EvidenceFiled` (AV-91), `ReleasedSplit` (AV-93), `Declined` (AV-122), `CounterOfferProposed` (AV-122), `CounterOfferAccepted` (AV-122), `CounterOfferRejected` (AV-122) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `KeeperBountyPaid` (AV-124), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82), `CpiAllowlistUpdated` (AV-83), `AppealFiled` (AV-86), `AppealResolved` (AV-86), `EvidenceFiled` (AV-91), `ReleasedSplit` (AV-93), `Declined` (AV-122), `CounterOfferProposed` (AV-122), `CounterOfferAccepted` (AV-122), `CounterOfferRejected` (AV-122) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
 | `amounts` | one struct for every kind: `payout` (gross taker amount before the fee split), `fee` (AV-17 protocol fee), `refund` (initializer's refund), `penalty` (AV-24 anti-griefing penalty on a taker-initiated `cancel_expired` / taker crank), `rent_reclaimed` (AV-34 rent-exempt deposit reclaimed on `VaultClosed`); zeroed when the kind moves no such value |
 | `at` | caller-supplied Unix-seconds timestamp (`cancel_expired` / `crank_expired` / `escalate` / `claim` reuse their `now`) |
-| `caller` | AV-48: the permissionless crank caller's key, carried by `ExpiredCranked` only (`None` on every other kind) |
+| `caller` | AV-48: the permissionless crank caller's key, carried by `ExpiredCranked` (and by `KeeperBountyPaid`, AV-124) only (`None` on every other kind) |
 | `evidence_defaulted` | AV-68: whether the escalating party's evidence disclosure had defaulted at judgment time — `true` only on the settlement kinds (`Resolved`, `DefaultJudgment`, `PanelResolved`) when a disclosure deadline was configured, it had lapsed at the event's `at` timestamp, and no evidence was on record; the judgment-time adverse-inference signal biasing the absent-evidence weight toward the non-escalating party (`false` on every other kind) |
 
 **Emission rule.** Exactly one event per *successful* call that changes
@@ -1837,6 +1837,13 @@ successful calls that change nothing observable:
   `(refund, penalty)` split in `amounts` (AV-24): a taker-initiated
   cancel carries the penalty earmarked for the initializer, an
   initializer-initiated cancel carries `penalty == 0`.
+- `crank_expired` emits `ExpiredCranked` with the crank caller's key in
+  `caller` (AV-48); when the vault opted into the keeper bounty, the
+  state machine additionally emits `KeeperBountyPaid` (`from == to ==
+  Cancelled` — the unwind is already final; AV-124) carrying the paid
+  bounty in `amounts.payout`, the caller in `caller`, and the
+  post-debit pool in `bounty_pool_remaining`. A zero-bounty crank emits
+  `ExpiredCranked` alone.
 - `cancel_partial` (AV-60) emits `PartiallyCancelled` with
   `from == to == Funded` and `amounts.refund` carrying the refunded
   tranche — the refund stream's mirror of a partial `Released` event.
@@ -2017,7 +2024,7 @@ returns a `KeeperReport` of immediately executable calls:
 | action | listed when | caller | `amount` |
 |--------|-------------|--------|----------|
 | `cancel_expired(authority, now, mint, refund_to)` | `Funded`, `now >= expires_at + grace_period` (grace-aware: the keeper never lists a call the chain would reject as `NotExpired`), remainder > 0 | initializer (canonical; the taker may also call) | refundable remainder (never fee'd) |
-| `crank_expired(caller, now, mint)` (AV-48) | `Funded`, `now >= expires_at + grace_period`, remainder > 0, **not paused** (the crank fails on a paused escrow, so it is only listed when executable) | `"anyone"` — permissionless; the keeper substitutes its own key (serialized as the zero key) | refundable remainder (never fee'd); the refund goes to the same pinned `refund_to` as the party path — the cranker receives nothing |
+| `crank_expired(caller, now, mint)` (AV-48) | `Funded`, `now >= expires_at + grace_period`, remainder > 0, **not paused** (the crank fails on a paused escrow, so it is only listed when executable) | `"anyone"` — permissionless; the keeper substitutes its own key (serialized as the zero key) | refundable remainder (never fee'd); the refund goes to the same pinned `refund_to` as the party path — the cranker receives nothing (anti-MEV) unless the vault opted into the AV-124 keeper bounty, in which case the action carries `bounty_lamports = min(per_crank, pool)` and a `bounty_unprofitable` flag (true when the bounty does not cover the estimated `crank_expired` execution cost) |
 | `claim(taker, now, mint)` | `Funded`, vesting attached, no milestone plan, vested − released > 0, quorum satisfied if configured, timelock unlocked (`now >= unlock_at` (AV-27) / `now >= fund_at + secs` (AV-64)) | taker | gross vested-but-unreleased (`payout + fee == amount`) |
 | `resolve(arbiter, taker_amount, mint, rationale_hash)` (AV-38) | `Disputed`, arbiter configured, remainder > 0 | arbiter | remaining locked amount the arbiter's split divides (the split itself and the rationale-document commitment are the arbiter's call-time judgment) |
 | `submit_panel_judgment(member, taker_amount, mint, rationale_hash)` (AV-65) | `Disputed`, panel configured, remainder > 0 — one action **per panel member** | panel member (`caller_role: "panel_member"`) | remaining locked amount the member's voted split divides (the split and the rationale commitment are the member's call-time judgment; the panel settles itself once M votes agree) |
@@ -2503,7 +2510,9 @@ two-way consistency check against the IDL parameter table:
 | last_claim_slot | Option<u64> (1-byte discriminant + 8-byte slot) | 9 |
 | counter_offer | Option<CounterOffer> (1-byte discriminant + 8-byte amount + 8-byte expiry) | 17 |
 | last_intent_nonce | u64 | 8 |
-| **total**     |                   | **5210** |
+| keeper_bounty_pool | u64 | 8 |
+| keeper_bounty_per_crank | u64 | 8 |
+| **total**     |                   | **5226** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2624,11 +2633,14 @@ plan payload — `total_amount` u64 + `max_tranches` u8 +
 17-byte release-cooling tail region (AV-112:
 `release_cooling_secs` (u64, 0 = unconfigured) +
 `release_intent_at` (Option<u64>: 1-byte discriminant + 8-byte
-stamp, `None` when no intent is live)).
-`escrow-state` exposes `VAULT_SPACE` (5218) and
-`VAULT_SPACE_NO_QUORUM` (4728) for the Anchor `space =` constraint, plus a
+stamp, `None` when no intent is live)) — and the 16-byte
+keeper-bounty tail region (AV-124: `keeper_bounty_pool` +
+`keeper_bounty_per_crank` (u64 each), zeroed when the vault never
+opted into the keeper bounty).
+`escrow-state` exposes `VAULT_SPACE` (5234) and
+`VAULT_SPACE_NO_QUORUM` (4744) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **37,208,160 lamports** to be
+mainnet rent parameters the full vault needs **37,319,520 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -4116,6 +4128,52 @@ the effective parameters' canonical encoding
 auditors can verify exactly which parameters took effect. Like the AV-72
 templates, presets are client-side composition: the vault layout and the
 Anchor program are untouched.
+
+## Keeper bounty for permissionless crank (AV-124)
+
+The AV-48 permissionless crank ("the cranker receives nothing") made
+timed-out vaults sweepable by any keeper, but it paid the keeper nothing —
+a keeper running on real infrastructure (RPC, compute, transaction fees)
+cranked at a loss. AV-124 adds an opt-in keeper bounty funded by the
+initializer at vault creation:
+
+- `initialize` accepts `keeper_bounty_pool` and `keeper_bounty_per_crank`
+  (lamports). `Escrow::with_keeper_bounty(pool, per_crank)` applies them
+  builder-style (Uninitialized-only, like `with_quorum` / `with_vesting`).
+  `0` / `0` (the default) leaves the bounty disabled and keeps the AV-48
+  unpaid-crank semantics — the pool is a bookkeeping number on the vault,
+  not an on-chain transfer.
+- A successful `crank_expired` pays `min(per_crank, pool)` to the caller
+  (saturating — a pool smaller than the configured rate pays out the
+  remainder) and debits the pool with `saturating_sub`. The return type is
+  `(refund, penalty, bounty)`, following the `release` convention of
+  returning payout-shaped tuples so the Anchor layer can size the
+  lamport transfer; the Anchor `crank_expired` handler emits
+  `KeeperBountyPaid` (`from == to == Cancelled`, `amounts.payout` is the
+  bounty, `caller` is the cranker) when the bounty is non-zero.
+- The bounty is paid only on the success path, after the unwind is final
+  (the state is already `Cancelled` and all guards passed) — a failed
+  guard debits nothing. When the pool is empty, `bounty == 0` and the
+  crank falls back to the unpaid AV-48 behavior automatically.
+- The bounty pool is additional inflow outside the principal (the AV-103
+  appeal-bond precedent): the event-sourcing fold books
+  `KeeperBountyPaid` as a no-op, so the `(locked, released, refunded)`
+  triple is untouched by the payout.
+- `scan_keeper_actions` annotates every crank action with
+  `bounty_lamports` (the same `keeper_bounty_payable` the state machine
+  pays) and a `bounty_unprofitable` flag. The flag compares the bounty
+  against the estimated `crank_expired` execution cost: the crate's
+  `cu_estimate` instruction estimate priced at the 10,000
+  micro-lamports-per-CU planning assumption plus the 5,000-lamport base
+  signature fee — for the canonical 3-account crank (vault + authority +
+  refund_to, no mint, 1 signer) that is 13,814 CU → ⌈138.14⌉ = 139
+  lamports priority fee + 5,000 = **5,139 lamports**. A bounty below the
+  estimate is flagged unprofitable — the keeper may still crank at a
+  loss (e.g. to clear its own watch list), but it does so informed.
+- Orthogonal to the AV-103 appeal bond, the AV-122 dispute state machine,
+  and AV-123 gasless intents: the check order (pause → reentrancy → …
+  → expiry) is unchanged, and the bounty settles only after the state
+  is final.
 
 ## Run the tests
 

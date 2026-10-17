@@ -1223,6 +1223,13 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // not re-litigated here.
     let last_intent_nonce = c.u64_le()?;
 
+    // AV-124: the keeper-bounty tail — the 8-byte remaining bounty
+    // pool plus the 8-byte fixed per-crank bounty. Structural decode
+    // only — the pool debit is enforced by `Escrow::crank_expired`,
+    // not re-litigated here.
+    let keeper_bounty_pool = c.u64_le()?;
+    let keeper_bounty_per_crank = c.u64_le()?;
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1469,6 +1476,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-123: the gasless-release intent nonce tail decodes like
         // any other persisted tail field.
         last_intent_nonce,
+        // AV-124: the keeper-bounty tail decodes like any other
+        // persisted tail field.
+        keeper_bounty_pool,
+        keeper_bounty_per_crank,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

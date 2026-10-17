@@ -278,7 +278,10 @@ pub enum KeeperActionKind {
     /// timed-out vaults — the caller is `"anyone"` (see
     /// [`KeeperAction::caller`]), never the escrow's parties. The
     /// refund destination is the same pinned address as the party
-    /// path's; the cranker receives nothing.
+    /// path's; AV-124: when the initializer opted into the keeper
+    /// bounty the cranker additionally receives
+    /// [`KeeperAction::bounty_lamports`] — without the bounty the
+    /// cranker receives nothing (the AV-48 behavior).
     CrankExpired,
     /// `claim(taker, now, mint)`.
     Claim,
@@ -550,6 +553,28 @@ pub struct KeeperAction {
     /// chain to have reached this slot, so the operator watches the
     /// slot gate here rather than guessing from the wall clock.
     pub slot_unlock_at: Option<u64>,
+    /// AV-124: the keeper bounty a successful `crank_expired` would
+    /// pay the caller right now, in lamports
+    /// ([`Escrow::keeper_bounty_payable`](crate::Escrow::keeper_bounty_payable)
+    /// at scan time — `min(per_crank, pool)`). Set only on
+    /// [`KeeperActionKind::CrankExpired`] actions; `0` on every other
+    /// kind, and `0` on crank actions when no bounty is configured
+    /// or the pool is exhausted (the AV-48 unpaid-crank case).
+    /// Informational: it is never an instruction input and never
+    /// affects which actions are listed — the operator (or their bot)
+    /// reads the incentive before deciding to crank.
+    pub bounty_lamports: u64,
+    /// AV-124: true when the crank's bounty does not cover its
+    /// estimated execution cost (`bounty_lamports <
+    /// [`KeeperAction::estimated_execution_cost_lamports`]`). Set
+    /// only on [`KeeperActionKind::CrankExpired`] actions; `false`
+    /// on every other kind. An `unprofitable` crank is still listed
+    /// — the scan lists every executable action, and the keeper may
+    /// crank at a loss (altruistic sweep, or the bounty is only part
+    /// of the incentive) — but the flag tells the operator the bounty
+    /// alone does not pay for the transaction. Informational, like
+    /// `bounty_lamports`.
+    pub bounty_unprofitable: bool,
 }
 
 /// AV-111: the live tranched-funding counters passed through on a
@@ -594,7 +619,49 @@ impl KeeperAction {
             // real scans; the expect guards a hand-built kind.
             .expect("AV-88: CU table covers every keeper instruction kind")
     }
+
+    /// AV-124: the estimated on-chain cost of executing this action,
+    /// in lamports — the AV-88 compute-unit estimate priced at the
+    /// planning-assumption priority fee (see
+    /// [`KEEPER_ASSUMED_MICRO_LAMPORTS_PER_CU`]) plus the fixed base
+    /// signature fee ([`KEEPER_BASE_SIGNATURE_FEE_LAMPORTS`]).
+    /// Saturates instead of wrapping. A planning number, not a
+    /// measured cost: the real inclusion price depends on the
+    /// leader's current fee market, so the profitability annotation
+    /// ([`KeeperAction::bounty_unprofitable`]) flags only the
+    /// clear-cut case — a bounty below this estimate does not pay
+    /// for the transaction under the assumed fee regime.
+    pub fn estimated_execution_cost_lamports(&self) -> u64 {
+        super::priority_fee::fee_budget_lamports(
+            self.estimated_compute_units(),
+            KEEPER_ASSUMED_MICRO_LAMPORTS_PER_CU,
+        )
+        .saturating_add(KEEPER_BASE_SIGNATURE_FEE_LAMPORTS)
+    }
 }
+
+/// AV-124: the fixed Solana base fee per signature, in lamports —
+/// the network's protocol constant (every transaction pays this for
+/// its first signature, on top of any priority fee). The crank
+/// transaction carries the caller's single signature, so the
+/// profitability annotation charges it exactly once. Not a
+/// heuristic: unlike the compute-unit price, this number does not
+/// move with congestion.
+pub const KEEPER_BASE_SIGNATURE_FEE_LAMPORTS: u64 = 5_000;
+
+/// AV-124: the assumed price of compute for the keeper-bounty
+/// profitability annotation, in micro-lamports per compute unit.
+/// This is the crate's own priority-fee planning fallback
+/// ([`super::priority_fee::DEFAULT_FALLBACK_MICRO_LAMPORTS_PER_CU`])
+/// — the price the keeper assumes before it has a live recent-fee
+/// feed — so the annotation and the
+/// [`PriorityFeeOracle`](super::priority_fee::PriorityFeeOracle)
+/// price compute identically by construction. A planning
+/// assumption, not a measurement: an operator with a live fee feed
+/// re-prices the comparison themselves; the scan only needs a
+/// documented, reproducible baseline.
+pub const KEEPER_ASSUMED_MICRO_LAMPORTS_PER_CU: u64 =
+    super::priority_fee::DEFAULT_FALLBACK_MICRO_LAMPORTS_PER_CU;
 
 /// AV-123: one scanned escrow carrying a signed, unsubmitted
 /// gasless-release intent — the keeper-scan annotation for the
@@ -733,7 +800,9 @@ impl KeeperReport {
     ///    "reason":"expired","reference":null,"extension_count":0,
     ///    "multisig_authority":null,"evidence_disclosure":null,
     ///    "funding_progress":null,"merge_source":null,
-    ///    "penalty_estimate":0,"slot_unlock_at":null,"estimated_cu":13814}
+    ///    "penalty_estimate":0,"slot_unlock_at":null,
+    ///    "bounty_lamports":0,"bounty_unprofitable":false,
+    ///    "estimated_cu":13814}
     ///  ],
     ///  "report_seq":null}
     /// ```
@@ -948,6 +1017,18 @@ impl KeeperReport {
                 Some(slot) => s.push_str(&slot.to_string()),
                 None => s.push_str("null"),
             }
+            // AV-124: the keeper bounty a successful crank would pay
+            // right now — `0` unless the action is a `crank_expired`
+            // on a bounty-configured escrow with a non-empty pool.
+            // The operator reads the incentive before deciding to
+            // crank.
+            s.push_str(",\"bounty_lamports\":");
+            s.push_str(&a.bounty_lamports.to_string());
+            // AV-124: whether the bounty covers the estimated
+            // execution cost — `true` means the bounty alone does not
+            // pay for the transaction under the assumed fee regime.
+            s.push_str(",\"bounty_unprofitable\":");
+            s.push_str(if a.bounty_unprofitable { "true" } else { "false" });
             // AV-88: the per-action CU passthrough — the heuristic
             // estimate for this keeper call, same cost model as the
             // execution plan.
@@ -1072,6 +1153,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                             // AV-115: the penalty estimate is zero on non-cancel actions.
                             penalty_estimate: 0,
                             slot_unlock_at: slot_unlock_opt(e),
+                            bounty_lamports: 0,
+                            bounty_unprofitable: false,
                         });
                     }
                 }
@@ -1105,6 +1188,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         // AV-115: the penalty estimate is zero on non-cancel actions.
                         penalty_estimate: 0,
                         slot_unlock_at: slot_unlock_opt(e),
+                        bounty_lamports: 0,
+                        bounty_unprofitable: false,
                     });
                 }
             }
@@ -1157,6 +1242,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         // AV-115: the penalty estimate is zero on non-cancel actions.
                         penalty_estimate: 0,
                         slot_unlock_at: slot_unlock_opt(e),
+                        bounty_lamports: 0,
+                        bounty_unprofitable: false,
                     });
                 }
             }
@@ -1205,6 +1292,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 // AV-115: the taker-initiated penalty estimate at scan time.
                 penalty_estimate: e.expiry_cancel_penalty_at(e.remaining_amount(), now),
                 slot_unlock_at: slot_unlock_opt(e),
+                bounty_lamports: 0,
+                bounty_unprofitable: false,
             });
             // AV-48: the permissionless crank — the same expiry exit,
             // callable by anyone. A keeper bot that is party to nothing
@@ -1217,7 +1306,21 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
             // the pause feature and does not filter on it; left
             // untouched.)
             if !e.is_paused() {
-                actions.push(KeeperAction {
+                // AV-124: the keeper-bounty annotation — the bounty a
+                // successful crank would pay right now
+                // (`Escrow::keeper_bounty_payable`: `min(per_crank,
+                // pool)`, `0` when the bounty is not configured or the
+                // pool is exhausted), and whether it covers the
+                // estimated execution cost. `bounty < cost` marks the
+                // crank `unprofitable`: the bounty alone does not pay
+                // for the transaction under the assumed fee regime —
+                // the crank is still listed (the scan lists every
+                // executable action; the keeper may crank at a loss),
+                // but the operator sees the economics before signing.
+                // The scan and the state machine read the same
+                // `keeper_bounty_payable`, so the preview and the
+                // payout can never disagree.
+                let mut crank = KeeperAction {
                     escrow_id: w.escrow_id,
                     vault_address: w.vault_address(),
                     kind: KeeperActionKind::CrankExpired,
@@ -1227,7 +1330,9 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     caller_role: "anyone",
                     mint: e.mint(),
                     // The crank refunds to the same pinned destination
-                    // as the party path; the cranker receives nothing.
+                    // as the party path; AV-124: without the bounty the
+                    // cranker receives nothing (the AV-48 behavior) —
+                    // with it, the bounty rides `bounty_lamports`.
                     refund_to: Some(e.refund_recipient()),
                     amount: e.remaining_amount(),
                     decimals: e.decimals(),
@@ -1243,7 +1348,14 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     // AV-115: the taker-initiated penalty estimate at scan time.
                     penalty_estimate: e.expiry_cancel_penalty_at(e.remaining_amount(), now),
                     slot_unlock_at: slot_unlock_opt(e),
-                });
+                    bounty_lamports: 0,
+                    bounty_unprofitable: false,
+                };
+                let bounty = e.keeper_bounty_payable();
+                crank.bounty_lamports = bounty;
+                crank.bounty_unprofitable =
+                    bounty < crank.estimated_execution_cost_lamports();
+                actions.push(crank);
             }
         }
         // AV-109: the dead-man's switch — a configured, funded escrow
@@ -1283,6 +1395,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 // AV-115: the penalty estimate is zero on non-cancel actions.
                 penalty_estimate: 0,
                 slot_unlock_at: slot_unlock_opt(e),
+                bounty_lamports: 0,
+                bounty_unprofitable: false,
             });
         }
         // The taker's pull path: vesting attached (or an AV-97 Dutch
@@ -1331,6 +1445,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 // AV-115: the penalty estimate is zero on non-cancel actions.
                 penalty_estimate: 0,
                 slot_unlock_at: slot_unlock_opt(e),
+                bounty_lamports: 0,
+                bounty_unprofitable: false,
             });
         }
         // AV-56: the initializer's push path for the next due
@@ -1383,6 +1499,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     // AV-115: the penalty estimate is zero on non-cancel actions.
                     penalty_estimate: 0,
                     slot_unlock_at: slot_unlock_opt(e),
+                    bounty_lamports: 0,
+                    bounty_unprofitable: false,
                 });
             }
         }
@@ -1419,6 +1537,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 // AV-115: the penalty estimate is zero on non-cancel actions.
                 penalty_estimate: 0,
                 slot_unlock_at: slot_unlock_opt(e),
+                bounty_lamports: 0,
+                bounty_unprofitable: false,
             });
             if let Some(arbiter) = e.arbiter() {
                 actions.push(KeeperAction {
@@ -1441,6 +1561,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     // AV-115: the penalty estimate is zero on non-cancel actions.
                     penalty_estimate: 0,
                     slot_unlock_at: slot_unlock_opt(e),
+                    bounty_lamports: 0,
+                    bounty_unprofitable: false,
                 });
             }
         }
@@ -1476,6 +1598,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 // AV-115: the penalty estimate is zero on non-cancel actions.
                 penalty_estimate: 0,
                 slot_unlock_at: slot_unlock_opt(e),
+                bounty_lamports: 0,
+                bounty_unprofitable: false,
             });
         }
         if e.is_appeal_under_review() {
@@ -1513,6 +1637,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         // AV-115: the penalty estimate is zero on non-cancel actions.
                         penalty_estimate: 0,
                         slot_unlock_at: slot_unlock_opt(e),
+                        bounty_lamports: 0,
+                        bounty_unprofitable: false,
                     });
                 }
             }
@@ -1550,6 +1676,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 // AV-115: the penalty estimate is zero on non-cancel actions.
                 penalty_estimate: 0,
                 slot_unlock_at: slot_unlock_opt(e),
+                bounty_lamports: 0,
+                bounty_unprofitable: false,
             });
         }
         // AV-106: the insurance-pool payout. Listed when
@@ -1593,6 +1721,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     // AV-115: the penalty estimate is zero on non-cancel actions.
                     penalty_estimate: 0,
                     slot_unlock_at: slot_unlock_opt(e),
+                    bounty_lamports: 0,
+                    bounty_unprofitable: false,
                 });
             }
         }
@@ -1666,6 +1796,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     // AV-115: the penalty estimate is zero on non-cancel actions.
                     penalty_estimate: 0,
                     slot_unlock_at: slot_unlock_opt(&target.escrow),
+                    bounty_lamports: 0,
+                    bounty_unprofitable: false,
                 });
                 break;
             }
@@ -2881,6 +3013,8 @@ mod keeper_tests {
                 // AV-115: the penalty estimate is zero on non-cancel actions.
                 penalty_estimate: 0,
                 slot_unlock_at: slot_unlock_opt(&e1),
+                bounty_lamports: 0,
+                bounty_unprofitable: false,
             }
         );
         assert_eq!(
@@ -2906,6 +3040,11 @@ mod keeper_tests {
                 // AV-115: the penalty estimate is zero on non-cancel actions.
                 penalty_estimate: 0,
                 slot_unlock_at: slot_unlock_opt(&e1),
+                // AV-124: no bounty configured — `bounty_lamports` is
+                // 0 and `0 < estimated cost` marks the crank
+                // unprofitable (the classic unpaid AV-48 crank).
+                bounty_lamports: 0,
+                bounty_unprofitable: true,
             }
         );
         assert_eq!(report.actions[2].escrow_id, ID2);
@@ -3010,7 +3149,7 @@ mod keeper_tests {
         // 3 accounts, 8 data bytes, 1 signer →
         // 10_000 + 3_000 + 3×250 + 8×8 = 13_814 each; total 27_628.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":13814}}],\"report_seq\":null}}",
+            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":false,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":true,\"estimated_cu\":13814}}],\"report_seq\":null}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -3035,12 +3174,102 @@ mod keeper_tests {
         // AV-88: claim with mint, no refund_to: 3 accounts, 8 data
         // bytes, 1 signer → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":17814}}],\"report_seq\":null}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":false,\"estimated_cu\":17814}}],\"report_seq\":null}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),
         );
         assert_eq!(report.to_json(), expected);
+    }
+
+    // ---------- keeper bounty annotation (AV-124) ----------
+
+    fn bounty_funded(pool: u64, per_crank: u64) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, 0)
+            .unwrap()
+            .with_keeper_bounty(pool, per_crank)
+            .unwrap();
+        e.fund(ALICE, MID).unwrap();
+        e
+    }
+
+    fn crank_action(report: &KeeperReport) -> &KeeperAction {
+        report
+            .actions
+            .iter()
+            .find(|a| a.kind == KeeperActionKind::CrankExpired)
+            .expect("expired escrow lists the permissionless crank")
+    }
+
+    #[test]
+    fn scan_annotates_bounty_on_crank_actions() {
+        // The scan carries the payable bounty onto the crank action —
+        // the same `keeper_bounty_payable` the state machine pays, so
+        // the preview and the payout agree.
+        let watched = [watch(ID1, bounty_funded(50_000, 10_000))];
+        let report = scan_keeper_actions(&watched, 1_000_000);
+        let crank = crank_action(&report);
+        assert_eq!(crank.bounty_lamports, 10_000);
+        // A pool smaller than the per-crank amount annotates the
+        // saturating payout, not the configured rate.
+        let watched = [watch(ID1, bounty_funded(7_000, 10_000))];
+        let report = scan_keeper_actions(&watched, 1_000_000);
+        assert_eq!(crank_action(&report).bounty_lamports, 7_000);
+        // Non-crank actions carry no bounty annotation.
+        let cancel = report
+            .actions
+            .iter()
+            .find(|a| a.kind == KeeperActionKind::CancelExpired)
+            .unwrap();
+        assert_eq!(cancel.bounty_lamports, 0);
+        assert!(!cancel.bounty_unprofitable);
+    }
+
+    #[test]
+    fn scan_marks_bounty_profitability_against_estimated_cost() {
+        // The cost model: crank_expired with 3 accounts (vault +
+        // authority + refund_to), no mint, 1 signer → 10_000 + 3_000 +
+        // 3×250 + 8×8 = 13_814 CU; priced at the 10_000
+        // micro-lamports/CU planning assumption → ⌈138.14⌉ = 139
+        // lamports priority fee + the 5_000-lamport base signature fee
+        // = 5_139 lamports.
+        let watched = [watch(ID1, bounty_funded(50_000, 10_000))];
+        let report = scan_keeper_actions(&watched, 1_000_000);
+        let crank = crank_action(&report);
+        assert_eq!(crank.estimated_execution_cost_lamports(), 5_139);
+        assert_eq!(crank.bounty_lamports, 10_000);
+        assert!(
+            !crank.bounty_unprofitable,
+            "10_000-lamport bounty covers the 5_139-lamport estimate"
+        );
+        // A bounty below the estimate is flagged unprofitable.
+        let watched = [watch(ID1, bounty_funded(50_000, 1_000))];
+        let report = scan_keeper_actions(&watched, 1_000_000);
+        let crank = crank_action(&report);
+        assert_eq!(crank.bounty_lamports, 1_000);
+        assert!(
+            crank.bounty_unprofitable,
+            "1_000-lamport bounty does not cover the 5_139-lamport estimate"
+        );
+        // No bounty configured: the annotation is zero and the
+        // classic unpaid AV-48 crank reads unprofitable (no bounty
+        // covers its cost) — the keeper may still crank at a loss.
+        let watched = [watch(ID1, funded(AMOUNT, 0))];
+        let report = scan_keeper_actions(&watched, 1_000_000);
+        let crank = crank_action(&report);
+        assert_eq!(crank.bounty_lamports, 0);
+        assert!(crank.bounty_unprofitable);
+    }
+
+    #[test]
+    fn bounty_annotation_rides_the_report_json() {
+        // The JSON carries the bounty economics per crank action so
+        // the operator's dashboard reads them without recomputing.
+        let watched = [watch(ID1, bounty_funded(50_000, 10_000))];
+        let report = scan_keeper_actions(&watched, 1_000_000);
+        let json = report.to_json();
+        assert!(json.contains("\"bounty_lamports\":10000"));
+        assert!(json.contains("\"bounty_unprofitable\":false"));
     }
 
     /// AV-98: the keeper report annotates the operator's intended Jito
@@ -3221,6 +3450,8 @@ mod keeper_tests {
             // AV-115: the penalty estimate is zero on non-cancel actions.
             penalty_estimate: 0,
             slot_unlock_at: None,
+            bounty_lamports: 0,
+            bounty_unprofitable: false,
         };
         assert_eq!(a.estimated_compute_units(), 13_814);
         // Without refund_to the account drops out of the estimate.
@@ -3247,6 +3478,8 @@ mod keeper_tests {
             // AV-115: the penalty estimate is zero on non-cancel actions.
             penalty_estimate: 0,
             slot_unlock_at: None,
+            bounty_lamports: 0,
+            bounty_unprofitable: false,
             refund_to: None,
             ..a
         };
@@ -3293,7 +3526,8 @@ mod keeper_tests {
             "the instruction must name the whitelisted destination"
         );
         // AV-48: the crank carries the same pinned destination — the
-        // cranker receives nothing.
+        // cranker receives nothing (the AV-124 keeper bounty is paid as
+        // a separate bookkeeping transfer, not via `refund_to`).
         let crank = &report.actions[1];
         assert_eq!(crank.kind, KeeperActionKind::CrankExpired);
         assert_eq!(crank.caller_role, "anyone");

@@ -64,13 +64,30 @@ pub mod escrow_vault {
 
     /// Create the vault account and record initializer / taker / amount /
     /// expiry. Pass `u64::MAX` as `expires_at` for no timeout.
-    pub fn initialize(ctx: Context<Initialize>, amount: u64, expires_at: u64) -> Result<()> {
+    /// AV-124: `keeper_bounty_pool` / `keeper_bounty_per_crank` are the
+    /// opt-in keeper-bounty terms (lamports) — the pre-funded bounty
+    /// pool plus the fixed per-crank bounty (see
+    /// `escrow_state::Escrow::with_keeper_bounty`). `0` / `0` (the
+    /// default) leaves the bounty disabled and keeps the AV-48
+    /// unpaid-crank semantics.
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        amount: u64,
+        expires_at: u64,
+        keeper_bounty_pool: u64,
+        keeper_bounty_per_crank: u64,
+    ) -> Result<()> {
         let escrow = escrow_state::Escrow::initialize(
             ctx.accounts.initializer.key().to_bytes(),
             ctx.accounts.taker.key().to_bytes(),
             amount,
             expires_at,
         )
+        .map_err(|e| escrow_error(e))?
+        // AV-124: the bounty terms are fixed at vault creation, like
+        // the other `with_*` builders — `0` / `0` is a no-op by the
+        // `keeper_bounty_enabled` predicate.
+        .with_keeper_bounty(keeper_bounty_pool, keeper_bounty_per_crank)
         .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // AV-18: the constructor has no prior state — from == to ==
@@ -693,9 +710,13 @@ pub mod escrow_vault {
     /// the funds. `accounts.refund_to` is asserted here against the
     /// vault's pinned refund policy (the AV-23 whitelist address when
     /// configured, otherwise the initializer — the state machine pins
-    /// it internally too), and the cranker receives nothing. AV-24: a
-    /// taker cranker still pays the anti-griefing penalty to the
-    /// initializer; every other caller returns `(remaining, 0)`.
+    /// it internally too). AV-124: when the initializer opted into the
+    /// keeper bounty, the cranker additionally receives
+    /// `min(keeper_bounty_per_crank, keeper_bounty_pool)` (saturating)
+    /// — without the bounty the cranker receives nothing (the AV-48
+    /// behavior). AV-24: a taker cranker still pays the anti-griefing
+    /// penalty to the initializer; every other caller returns
+    /// `(remaining, 0, bounty)`.
     /// A paused escrow rejects with `Paused` (AV-46).
     pub fn crank_expired(ctx: Context<CrankExpired>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
@@ -713,7 +734,7 @@ pub mod escrow_vault {
             ErrorCode::RefundAddressMismatch
         );
         let from = escrow.state() as u8;
-        let (refund, _penalty) = escrow
+        let (refund, _penalty, bounty) = escrow
             .crank_expired(
                 ctx.accounts.cranker.key().to_bytes(),
                 now,
@@ -727,6 +748,10 @@ pub mod escrow_vault {
         // (non-zero only when the cranker is the taker, AV-24) to the
         // initializer. The real build executes the validated plan once
         // the token accounts are wired up.
+        // AV-124: the real build additionally transfers `bounty`
+        // lamports from the vault to the cranker, sized by the
+        // returned triple — the state machine already debited the
+        // pool, so the transfer cannot overpay.
         // AV-18: `now` doubles as the event's `at`, mirroring
         // `IndexedEscrow::crank_expired`; the `caller` field carries the
         // crank signer's key so the indexer sees who cranked without a
@@ -746,6 +771,27 @@ pub mod escrow_vault {
             None,
             Some(ctx.accounts.cranker.key()),
         );
+        // AV-124: a bounty-paying crank emits `KeeperBountyPaid`
+        // (`from == to == Cancelled` — the unwind is already final),
+        // mirroring `IndexedEscrow::crank_expired`; a zero-bounty crank
+        // emits `ExpiredCranked` alone.
+        if bounty > 0 {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::KeeperBountyPaid,
+                escrow.state() as u8,
+                escrow.state() as u8,
+                bounty,
+                0,
+                0,
+                now,
+                None,
+                None,
+                None,
+                None,
+                Some(ctx.accounts.cranker.key()),
+            );
+        }
         Ok(())
     }
     /// (`Uninitialized` only; mirrors `Escrow::with_quorum`). After

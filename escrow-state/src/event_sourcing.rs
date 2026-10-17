@@ -48,6 +48,11 @@
 //!     taker-supplied funds the fold never booked (the bond is
 //!     additional inflow outside the principal) — so it is the
 //!     symmetric no-op too.
+//!   - `KeeperBountyPaid` (AV-124): the bounty pool is
+//!     initializer-supplied funds the fold never booked (the pool is
+//!     additional inflow outside the principal, the AV-103
+//!     appeal-bond precedent) — so the payout is the symmetric
+//!     no-op too.
 //!   - `MilestoneSkipped`: the tranche stays in the lockup (it joins
 //!     the refundable remainder — `remaining_amount()` still counts
 //!     it), so the fold books nothing now; the tranche is counted
@@ -199,6 +204,15 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // outside the principal) — so it is the symmetric no-op too.
         | EscrowEventKind::AppealResolved
         | EscrowEventKind::AppealExpired => (0, 0, 0),
+        // AV-124: a keeper-bounty payout — the bounty pool is
+        // initializer-supplied funds the fold never booked (the pool
+        // is additional inflow outside the principal, the AV-103
+        // appeal-bond precedent), so the payout is the symmetric
+        // no-op: the fold's `locked` stays `remaining_amount() +
+        // penalty_paid()` and the conservation identity is untouched.
+        // Indexers that need the pool balance read the event's
+        // `bounty_pool_remaining`.
+        EscrowEventKind::KeeperBountyPaid => (0, 0, 0),
         // Taker payouts, gross (AV-17: the fee is an internal routing
         // slice of the gross — `payout` already includes it, matching
         // `Escrow::released_amount`). `ReleasedSplit` (AV-93) likewise
@@ -556,6 +570,7 @@ mod event_sourcing_tests {
             appeal_outcome: None,
             evidence_root: None,
             evidence_disclosure: None,
+            bounty_pool_remaining: None,
         }
     }
 
@@ -694,6 +709,11 @@ mod event_sourcing_tests {
                 // event's payout leg, applied directly in `apply` —
                 // `fund_delta` books nothing.
                 | EscrowEventKind::EscrowsMerged
+                // AV-124: the bounty pool is additional inflow outside
+                // the principal (the AV-103 appeal-bond precedent), so
+                // the payout books nothing — like Slashed's parked
+                // penalty outflow.
+                | EscrowEventKind::KeeperBountyPaid
                 | EscrowEventKind::Slashed => (0, 0, 0),
             };
             assert_eq!(got, want, "delta for {kind:?} (discriminant {d})");
@@ -729,6 +749,24 @@ mod event_sourcing_tests {
                 released: 0,
                 refunded: 400_000,
             }
+        );
+    }
+
+    #[test]
+    fn fold_books_keeper_bounty_as_noop() {
+        // AV-124: the bounty pool is additional inflow outside the
+        // principal (the AV-103 appeal-bond precedent) — the fold
+        // never booked it, so the payout moves nothing in the triple.
+        let bounty = synth(EscrowEventKind::KeeperBountyPaid, 0, 10_000, 0, 0, 0);
+        let view = MaterializedView::replay(ID, 1_000_000, &[bounty]).unwrap();
+        assert_eq!(
+            view.triple(),
+            FundsTriple {
+                locked: 1_000_000,
+                released: 0,
+                refunded: 0,
+            },
+            "bounty payout leaves the fold triple untouched"
         );
     }
 

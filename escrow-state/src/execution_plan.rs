@@ -201,7 +201,9 @@ fn plan_instruction(a: &KeeperAction) -> PlannedInstruction {
         // The scan always sets `refund_to` for `cancel_expired` /
         // `crank_expired` — the refund recipient the state machine pins
         // (AV-23 anti-phishing; the AV-48 crank refunds to the same
-        // pinned destination, the cranker receives nothing).
+        // pinned destination, the cranker receives nothing — unless
+        // the vault opted into the AV-124 keeper bounty, which the
+        // state machine pays as a separate bookkeeping transfer).
         // Guarded anyway: a plan must never name a wrong destination,
         // and must never panic on a hand-built report either.
         if let Some(r) = a.refund_to {
@@ -426,6 +428,8 @@ mod execution_plan_tests {
             penalty_estimate: 0,
             // AV-116: test actions carry no slot-unlock slot.
             slot_unlock_at: None,
+            bounty_lamports: 0,
+            bounty_unprofitable: false,
             reason: "test",
             // AV-114: test actions carry no merge source.
             merge_source: None,

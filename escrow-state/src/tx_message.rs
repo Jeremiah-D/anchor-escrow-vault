@@ -1070,7 +1070,7 @@ mod tx_message_tests {
         // The byte-exact core: data == sha256("global:<name>")[..8] ||
         // Borsh(spec params), with the spec table as the oracle for the
         // param name/type/order on each kind.
-        assert_eq!(spec_params("initialize"), [("amount", "u64"), ("expires_at", "u64")]);
+        assert_eq!(spec_params("initialize"), [("amount", "u64"), ("expires_at", "u64"), ("keeper_bounty_pool", "u64"), ("keeper_bounty_per_crank", "u64")]);
         assert_eq!(spec_params("fund"), []);
         assert_eq!(spec_params("release"), [("amount", "u64")]);
 

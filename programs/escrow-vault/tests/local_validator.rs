@@ -72,9 +72,12 @@ const ATTESTOR_3: [u8; 32] = [0xA3; 32];
 const AMOUNT: u64 = 1_000_000;
 const EXPIRES_AT: u64 = 1_800_000_000;
 
-/// Drive the `initialize(amount, expires_at)` call the way the program's
-/// `initialize` handler does: `initializer`/`taker` from the account
-/// signers, `amount`/`expires_at` from the instruction params.
+/// Drive the `initialize(amount, expires_at, keeper_bounty_pool,
+/// keeper_bounty_per_crank)` call the way the program's `initialize`
+/// handler does: `initializer`/`taker` from the account signers,
+/// `amount`/`expires_at`/bounty terms from the instruction params
+/// (the bounty params are opt-in — absent means `0`, the disabled
+/// default).
 fn apply_initialize(call: &InstructionCall, initializer: [u8; 32], taker: [u8; 32]) -> Escrow {
     assert_eq!(call.name, "initialize");
     assert!(call.signers.contains(&initializer));
@@ -90,8 +93,25 @@ fn apply_initialize(call: &InstructionCall, initializer: [u8; 32], taker: [u8; 3
         .find(|(n, _)| *n == "expires_at")
         .map(|(_, v)| *v)
         .expect("initialize must carry an `expires_at` param");
+    // AV-124: the opt-in keeper-bounty terms ride the instruction
+    // params; absent params mean `0` (disabled), mirroring the
+    // handler's default.
+    let bounty_pool = call
+        .params
+        .iter()
+        .find(|(n, _)| *n == "keeper_bounty_pool")
+        .map(|(_, v)| *v)
+        .unwrap_or(0);
+    let bounty_per_crank = call
+        .params
+        .iter()
+        .find(|(n, _)| *n == "keeper_bounty_per_crank")
+        .map(|(_, v)| *v)
+        .unwrap_or(0);
     Escrow::initialize(initializer, taker, amount, expires_at)
         .expect("initialize with amount > 0 must succeed")
+        .with_keeper_bounty(bounty_pool, bounty_per_crank)
+        .expect("bounty terms are Uninitialized-only")
 }
 
 /// Happy path: `initialize -> fund -> release`. Asserts the vault reaches
