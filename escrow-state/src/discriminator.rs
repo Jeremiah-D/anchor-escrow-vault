@@ -39,13 +39,13 @@ use super::{
     sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, CounterOffer, CpiAllowlist,
     DefaultJudgment, DutchAuction, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
     Delegation, FundingPlan, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, PayoutSplit, QuorumPolicy,
-    SlashTerms, SubscriptionSchedule, VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
+    SlashTerms, SlashLadder, SlashRung, SubscriptionSchedule, VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
     APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, COUNTER_OFFER_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
     DELEGATION_LEN, DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
     MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS,
-    MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_RELEASE_SPLIT_RECIPIENTS, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
+    MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_RELEASE_SPLIT_RECIPIENTS, MAX_SLASH_LADDER_RUNGS, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
     MILESTONE_PLAN_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN,
-    PAYOUT_DENYLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN,
+    PAYOUT_DENYLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_LADDER_LEN, SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN,
     SWAP_LINK_REGION_LEN, VAULT_SPACE, VESTING_CURVE_LEN,
 };
 
@@ -178,6 +178,14 @@ pub enum AccountDecodeError {
     /// The mapping is pinned to declaration order (AV-113; AV-32
     /// panic-free guarantee).
     InvalidPriceGateDiscriminant(u8),
+    /// A present slash ladder's live-rung count is outside `1..=8`
+    /// ([`MAX_SLASH_LADDER_RUNGS`](crate::MAX_SLASH_LADDER_RUNGS)).
+    /// The count byte is part of the field's layout — an out-of-range
+    /// count would make the ladder accessors read past the live rung
+    /// slots, so the decoder rejects it rather than decoding a value
+    /// the accessors cannot safely read (AV-126; AV-32 panic-free
+    /// guarantee).
+    InvalidSlashLadderLen(u8),
 }
 
 /// Bounds-checked cursor over the account body. Every read is
@@ -1230,6 +1238,44 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     let keeper_bounty_pool = c.u64_le()?;
     let keeper_bounty_per_crank = c.u64_le()?;
 
+    // AV-126: the tiered default-penalty ladder — the 1-byte
+    // discriminant plus the 32-byte penalty account, the eight fixed
+    // 10-byte rung slots (deadline u64 + bps u16), and the live
+    // rung-count byte. A present ladder with a rung count outside
+    // `1..=8` is rejected (an out-of-range count would make the
+    // ladder accessors read past the live slots — the AV-95 basket
+    // precedent). Structural decode only — the escalation schedule
+    // is enforced by `Escrow::with_slash_ladder` / `Escrow::slash`,
+    // not re-litigated here.
+    let slash_ladder = if c.option_present("slash_ladder")? {
+        let penalty_account = c.pubkey()?;
+        let mut rungs = [SlashRung {
+            deadline: 0,
+            bps: 0,
+        }; MAX_SLASH_LADDER_RUNGS];
+        for rung in rungs.iter_mut() {
+            rung.deadline = c.u64_le()?;
+            rung.bps = c.u16_le()?;
+        }
+        let rung_count = c.u8()?;
+        if rung_count == 0 || rung_count as usize > MAX_SLASH_LADDER_RUNGS {
+            return Err(AccountDecodeError::InvalidSlashLadderLen(rung_count));
+        }
+        Some(SlashLadder {
+            penalty_account,
+            rungs,
+            rung_count,
+        })
+    } else {
+        c.skip(SLASH_LADDER_LEN)?;
+        None
+    };
+    // AV-126: the consumed-rung cursor — the index of the rung the
+    // next `slash` draws on (zeroed when no ladder is configured or
+    // no rung was consumed yet). Structural decode only — the cursor
+    // advance is enforced by `Escrow::slash`, not re-litigated here.
+    let slash_ladder_index = c.u8()?;
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1480,6 +1526,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // persisted tail field.
         keeper_bounty_pool,
         keeper_bounty_per_crank,
+        // AV-126: the slash-ladder tail decodes like any other
+        // persisted tail field.
+        slash_ladder,
+        slash_ladder_index,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

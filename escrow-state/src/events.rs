@@ -243,7 +243,7 @@
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
-//! | Slashed (AV-82) | 0 | 0 | 0 | the slashed amount, routed to the penalty account (the escrow stays `Funded`; from == to == `Funded`) |
+//! | Slashed (AV-82) | 0 | 0 | 0 | the slashed amount, routed to the penalty account (the escrow stays `Funded`; from == to == `Funded`) — on a ladder escrow (AV-126) the consumed rung rides the event's `slash_ladder_index` |
 //! | AppealFiled (AV-86) | 0 | 0 | 0 | 0 — the taker filed the appeal inside the window; no funds move (from == to == `Funded`) — with an AV-103 bond the taker locks the bond into `appeal_bond_paid` at filing (read from the vault, not the event) |
 //! | AppealResolved (AV-86) | the penalty refunded to the taker on overturn — a restitution, no fee — plus the refunded appeal bond (AV-103; the taker's full restitution) (0 on uphold; from == to == `Funded`) | 0 | 0 | the appeal bond forfeited to the initializer on uphold (AV-103; 0 when no bond was locked) |
 //! | AppealExpired (AV-103) | 0 | 0 | 0 | the appeal bond forfeited to the initializer when the window lapsed unresolved (0 when no bond was locked; from == to == `Funded`) |
@@ -1445,6 +1445,13 @@ pub struct CpiRouteAudit {
 /// bps-floor dust, so the legs sum to the net payout exactly. It is
 /// `None` on every other kind — the event log never invents legs.
 ///
+/// `slash_ladder_index` (AV-126) carries the rung the slash consumed
+/// on the `Slashed` event: the pre-slash cursor, stamped by the
+/// emitter after the push (the state machine advances the cursor
+/// during the slash). It is `None` on every other kind — and on
+/// single-level slashes, which have no ladder — the event log never
+/// invents a rung.
+///
 /// [`IndexedEscrow::release_via_cpi`]: IndexedEscrow::release_via_cpi
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EscrowEvent {
@@ -1572,6 +1579,16 @@ pub struct EscrowEvent {
     /// account — indexers track pool exhaustion from the event
     /// stream alone.
     pub bounty_pool_remaining: Option<u64>,
+    /// AV-126: the rung the slash consumed
+    /// ([`crate::Escrow::slash_ladder_index`] *before* the slash
+    /// advanced it), carried by [`EscrowEventKind::Slashed`] (`None`
+    /// on every other kind — and on single-level slashes, which have
+    /// no ladder — like `bounty_pool_remaining`, which rides only
+    /// `KeeperBountyPaid`). Stamped by the `Slashed` emitter after the
+    /// push (see `push_event`), mirroring the `appeal_outcome` /
+    /// `split_children` precedent — never a `push_event` parameter —
+    /// so the log records exactly the tier that priced the penalty.
+    pub slash_ladder_index: Option<u8>,
 }
 
 /// One split child on an [`EscrowEventKind::EscrowSplit`] event's
@@ -1863,6 +1880,12 @@ impl IndexedEscrow {
             } else {
                 None
             },
+            // AV-126: the consumed rung rides the Slashed event —
+            // stamped by the `slash` emitter after the push (the
+            // pre-slash cursor, which the state machine advances
+            // during the slash), so `push_event` leaves it `None`
+            // here — never a push_event parameter (see above).
+            slash_ladder_index: None,
         };
         self.next_seq += 1;
         self.events.push(event);
@@ -2142,6 +2165,18 @@ impl IndexedEscrow {
         self.inner = self
             .inner
             .with_slash_terms(penalty_account, slash_deadline)?;
+        Ok(self)
+    }
+
+    /// Opt in to the tiered default-penalty (slash) ladder (mirrors
+    /// [`Escrow::with_slash_ladder`], AV-126). Configuration: emits no
+    /// event.
+    pub fn with_slash_ladder(
+        mut self,
+        penalty_account: [u8; 32],
+        rungs: &[(u64, u16)],
+    ) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_slash_ladder(penalty_account, rungs)?;
         Ok(self)
     }
 
@@ -4703,6 +4738,11 @@ impl IndexedEscrow {
     /// so the caller can size the transfer to the penalty account.
     /// `at` is both the event timestamp and the state machine's `now`.
     ///
+    /// AV-126: on a ladder escrow the event's `slash_ladder_index`
+    /// carries the rung this slash consumed (the pre-slash cursor —
+    /// the state machine advances the cursor during the slash, so it
+    /// is captured before the call); `None` on a single-level slash.
+    ///
     /// [`Escrow::slash`]: super::Escrow::slash
     pub fn slash(
         &mut self,
@@ -4712,6 +4752,10 @@ impl IndexedEscrow {
         at: u64,
     ) -> Result<u64, EscrowError> {
         let from = self.inner.state();
+        // AV-126: the rung this slash is about to consume — the
+        // pre-slash cursor. Captured before the state machine runs
+        // because a successful slash advances it.
+        let consumed_rung = self.inner.slash_ladder_index();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
         let result = self.inner.slash(authority, amount, mint, at);
@@ -4728,6 +4772,16 @@ impl IndexedEscrow {
             None,
             Some(authority),
         );
+        // AV-126: stamp the consumed rung on the Slashed event after
+        // the push (the appeal_outcome / split_children precedent) —
+        // never a push_event parameter. Only ladder escrows carry a
+        // rung; single-level slashes stay `None`.
+        if self.inner.slash_ladder().is_some() {
+            self.events
+                .last_mut()
+                .expect("Slashed event just pushed")
+                .slash_ladder_index = Some(consumed_rung);
+        }
         Ok(slashed)
     }
 

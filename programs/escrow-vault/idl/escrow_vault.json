@@ -662,6 +662,15 @@
       ]
     },
     {
+      "name": "initialize_slash_ladder",
+      "discriminator": [88, 71, 75, 39, 135, 169, 163, 32],
+      "accounts": [],
+      "args": [
+        {"name": "penalty_account", "type": "publicKey"},
+        {"name": "rungs", "type": {"vec": {"defined": "SlashRung"}}}
+      ]
+    },
+    {
       "name": "initialize_appeal_window",
       "discriminator": [2, 177, 162, 186, 74, 115, 177, 120],
       "accounts": [],
@@ -1055,7 +1064,9 @@
           {"name": "counter_offer", "type": {"option": {"defined": "CounterOffer"}}, "offset": 5193},
           {"name": "last_intent_nonce", "type": "u64", "offset": 5210},
           {"name": "keeper_bounty_pool", "type": "u64", "offset": 5218},
-          {"name": "keeper_bounty_per_crank", "type": "u64", "offset": 5226}
+          {"name": "keeper_bounty_per_crank", "type": "u64", "offset": 5226},
+          {"name": "slash_ladder", "type": {"option": {"defined": "SlashLadder"}}, "offset": 5234},
+          {"name": "slash_ladder_index", "type": "u8", "offset": 5348}
         ]
       }
     }
@@ -1411,7 +1422,8 @@
     {"code": 180, "name": "InvalidCounterOffer"},
     {"code": 181, "name": "InvalidReleaseIntent"},
     {"code": 182, "name": "IntentNonceReused"},
-    {"code": 183, "name": "IntentExpired"}
+    {"code": 183, "name": "IntentExpired"},
+    {"code": 184, "name": "InvalidSlashLadder"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

@@ -210,6 +210,10 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "PayoutSplit" => IdlType::Named("PayoutSplit"),
         // AV-82: opt-in default-penalty (slash) terms.
         "Option<SlashTerms>" => IdlType::Option(Box::new(IdlType::Named("SlashTerms"))),
+        // AV-126: opt-in tiered default-penalty (slash) ladder (always
+        // present, `None` when unconfigured; the `Option`
+        // discriminant rides the vault field, not the named type).
+        "Option<SlashLadder>" => IdlType::Option(Box::new(IdlType::Named("SlashLadder"))),
         // AV-56: periodic subscription release schedule.
         "Option<SubscriptionSchedule>" => IdlType::Option(Box::new(IdlType::Named("SubscriptionSchedule"))),
         // AV-111: opt-in tranched-funding plan (always present,
@@ -268,6 +272,9 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         "Vec<PayoutSplitShare>" => {
             IdlType::Vec(Box::new(IdlType::Named("PayoutSplitShare")))
         }
+        // AV-126: the initialize_slash_ladder instruction's
+        // (deadline, bps) rung table.
+        "Vec<SlashRung>" => IdlType::Vec(Box::new(IdlType::Named("SlashRung"))),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         // AV-68: the dispute-evidence disclosure commitment
         // (non-optional — disclosure always carries a hash).
@@ -504,6 +511,25 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
         "SlashTerms" => vec![
             ("penalty_account", IdlType::PublicKey),
             ("slash_deadline", IdlType::U64),
+        ],
+        // SlashRung { deadline: u64, bps: u16 } (AV-126: 10 bytes —
+        // one escalation tier; the IDL has no tuple type, so the
+        // rung is a named struct).
+        "SlashRung" => vec![
+            ("deadline", IdlType::U64),
+            ("bps", IdlType::U16),
+        ],
+        // SlashLadder { penalty_account: Pubkey, rungs: [SlashRung;
+        // 8], rung_count: u8 } (AV-126: 113 bytes — the penalty sink
+        // plus the 8 fixed rung slots and the live rung-count byte;
+        // wrapped in `Option` on the vault).
+        "SlashLadder" => vec![
+            ("penalty_account", IdlType::PublicKey),
+            (
+                "rungs",
+                IdlType::Array(ArrayElem::Defined("SlashRung"), MAX_SLASH_LADDER_RUNGS),
+            ),
+            ("rung_count", IdlType::U8),
         ],
         // AppealBallot { voted: u8, votes: [u8; 8] } (AV-86: 9 bytes —
         // the voter bitmask plus the 8 fixed vote slots; always
@@ -947,6 +973,12 @@ fn named_type_sizes_pin_constants() {
     // AV-82: penalty account + slash deadline.
     assert_eq!(size("SlashTerms"), SLASH_TERMS_LEN);
     assert_eq!(size("SlashTerms"), 40);
+    // AV-126: deadline u64 + bps u16.
+    assert_eq!(size("SlashRung"), 10);
+    // AV-126: 32-byte penalty account + 8 fixed 10-byte rung slots +
+    // the live rung-count byte.
+    assert_eq!(size("SlashLadder"), SLASH_LADDER_LEN);
+    assert_eq!(size("SlashLadder"), 113);
     // AV-86: voter bitmask + 8 vote slots.
     assert_eq!(size("AppealBallot"), APPEAL_BALLOT_LEN);
     assert_eq!(size("AppealBallot"), 9);
@@ -1037,7 +1069,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 84, "error variant count drift");
+    assert_eq!(errors.len(), 85, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -1354,8 +1386,10 @@ fn idl_field_offsets_pin_borsh_encoder() {
     // appended the dispute-interest tail after the compound tail.
     // AV-124 appended the keeper-bounty tail after the intent tail,
     // so every earlier tail now sits 16 bytes further from the body's
-    // end than at AV-123.
-    assert_eq!(pg_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - 4 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN);
+    // end than at AV-123. AV-126 appended the slash-ladder tail after
+    // the keeper-bounty tail, so every earlier tail now sits 115
+    // bytes further from the body's end than at AV-124.
+    assert_eq!(pg_offset, 8 + ESCROW_BODY_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - 4 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN);
     // AV-115: the escalation tail sits just before the AV-116 tail.
     let rate = body_field(&enc, &offsets, "penalty_escalation_rate_bps");
     assert_eq!(rate.len(), 2);
@@ -1364,7 +1398,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "penalty_escalation_rate_bps")
         .copied()
         .expect("penalty_escalation_rate_bps in IDL offsets");
-    assert_eq!(rate_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - 4 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN);
+    assert_eq!(rate_offset, 8 + ESCROW_BODY_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - 4 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN);
     let cap = body_field(&enc, &offsets, "penalty_escalation_cap_bps");
     assert_eq!(cap.len(), 2);
     let (_, cap_offset, _) = offsets
@@ -1372,7 +1406,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "penalty_escalation_cap_bps")
         .copied()
         .expect("penalty_escalation_cap_bps in IDL offsets");
-    assert_eq!(cap_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - 2 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN);
+    assert_eq!(cap_offset, 8 + ESCROW_BODY_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - 2 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN);
     // AV-116: the slot-timelock tail is the last 16 bytes of the body.
     let slots = body_field(&enc, &offsets, "slot_timelock_slots");
     assert_eq!(slots.len(), 8);
@@ -1381,7 +1415,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "slot_timelock_slots")
         .copied()
         .expect("slot_timelock_slots in IDL offsets");
-    assert_eq!(slots_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN);
+    assert_eq!(slots_offset, 8 + ESCROW_BODY_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN);
     let fslot = body_field(&enc, &offsets, "fund_slot");
     assert_eq!(fslot.len(), 8);
     let (_, fslot_offset, _) = offsets
@@ -1389,7 +1423,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "fund_slot")
         .copied()
         .expect("fund_slot in IDL offsets");
-    assert_eq!(fslot_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - 8);
+    assert_eq!(fslot_offset, 8 + ESCROW_BODY_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - 8);
     // AV-117: the compound-interest tail sits just before the AV-119
     // dispute-interest tail (the absolute tail).
     let (_, ci_offset, _) = offsets
@@ -1397,13 +1431,13 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "compound_interest")
         .copied()
         .expect("compound_interest in IDL offsets");
-    assert_eq!(ci_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN);
+    assert_eq!(ci_offset, 8 + ESCROW_BODY_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN);
     let (_, ic_offset, _) = offsets
         .iter()
         .find(|(n, _, _)| *n == "interest_compounded")
         .copied()
         .expect("interest_compounded in IDL offsets");
-    assert_eq!(ic_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - 8);
+    assert_eq!(ic_offset, 8 + ESCROW_BODY_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - 8);
     // AV-119: the dispute-interest tail (no longer the absolute
     // tail since AV-121).
     let di = body_field(&enc, &offsets, "dispute_interest");
@@ -1413,7 +1447,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "dispute_interest")
         .copied()
         .expect("dispute_interest in IDL offsets");
-    assert_eq!(di_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN);
+    assert_eq!(di_offset, 8 + ESCROW_BODY_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN);
     // AV-121: the claim-cooldown tail (no longer the absolute tail
     // since AV-122) — the 8-byte opt-in duration plus the 9-byte
     // last-claim slot anchor.
@@ -1424,7 +1458,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "claim_cooldown_slots")
         .copied()
         .expect("claim_cooldown_slots in IDL offsets");
-    assert_eq!(ccd_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN);
+    assert_eq!(ccd_offset, 8 + ESCROW_BODY_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN);
     let lcs = body_field(&enc, &offsets, "last_claim_slot");
     assert_eq!(lcs.len(), 9);
     let (_, lcs_offset, _) = offsets
@@ -1432,7 +1466,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "last_claim_slot")
         .copied()
         .expect("last_claim_slot in IDL offsets");
-    assert_eq!(lcs_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN + 8);
+    assert_eq!(lcs_offset, 8 + ESCROW_BODY_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN + 8);
     // AV-122: the counter-offer tail — the 1-byte `Option`
     // discriminant plus the 16-byte live terms — trails the AV-121
     // claim-cooldown tail (AV-124: the keeper-bounty tail is the new
@@ -1444,7 +1478,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "counter_offer")
         .copied()
         .expect("counter_offer in IDL offsets");
-    assert_eq!(co_offset, 8 + ESCROW_BODY_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN);
+    assert_eq!(co_offset, 8 + ESCROW_BODY_LEN - SLASH_LADDER_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN);
 }
 
 #[test]

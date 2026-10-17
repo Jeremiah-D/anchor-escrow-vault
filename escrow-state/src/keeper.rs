@@ -47,6 +47,11 @@
 //!   is listed as a second action (`caller_role: "arbiter"`). The
 //!   enforcement size is the caller's decision — the action carries
 //!   the slashable remainder (`amount`), not a decided slash.
+//!   AV-126: on a ladder escrow the deadline is the current rung's and
+//!   the one-shot gate is bypassed — the ladder is the repeated-slash
+//!   path, so a listed ladder slash stays listed after each rung is
+//!   consumed (each rung is a separate enforcement, capped at the top
+//!   rung once exhausted).
 //! - `file_appeal` (AV-86): the taker appeals the executed slash inside
 //!   the opt-in window (see [`Escrow::is_appeal_eligible`]) — the taker
 //!   is the caller (`caller_role: "taker"`). Filing opens the panel's

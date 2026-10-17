@@ -571,6 +571,10 @@ mod event_sourcing_tests {
             evidence_root: None,
             evidence_disclosure: None,
             bounty_pool_remaining: None,
+            // AV-126: the consumed slash-ladder rung is a live-emit
+            // extra, not part of the synth projection — `None` here,
+            // like the other kind-specific extras.
+            slash_ladder_index: None,
         }
     }
 

@@ -3992,6 +3992,36 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to the tiered default-penalty (slash) ladder (AV-126;
+    /// mirrors `Escrow::with_slash_ladder`). `Uninitialized` only,
+    /// like `initialize_slash_terms`: the penalty account and the
+    /// rung table are fixed before funds move. The 114-byte
+    /// slash-ladder region (1-byte discriminant + 113-byte ladder)
+    /// is always reserved on the vault account, so the ladder writes
+    /// in place — no realloc needed in the real build. Emits no
+    /// event (pre-fund configuration). Validation failures are
+    /// `InvalidSlashLadder` (code 184) — empty or over-long rung
+    /// table, a zero bps rung, bps above 10_000, non-strictly
+    /// ascending deadlines or bps, a zero penalty account, or an
+    /// escrow that already carries single-level slash terms
+    /// (mutually exclusive).
+    pub fn initialize_slash_ladder(
+        ctx: Context<InitializeSlashLadder>,
+        penalty_account: Pubkey,
+        rungs: Vec<SlashRungArg>,
+    ) -> Result<()> {
+        let rung_tuples: Vec<(u64, u16)> = rungs
+            .iter()
+            .map(|r| (r.deadline, r.bps))
+            .collect();
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_slash_ladder(penalty_account.to_bytes(), &rung_tuples)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
     /// Slash the defaulting taker (AV-82; mirrors `Escrow::slash`):
     /// `Funded -> Funded` — the escrow stays live, the taker can still
     /// earn the remainder by performing late. The initializer or the
@@ -4008,23 +4038,36 @@ pub mod escrow_vault {
     /// `IndexedEscrow::slash` — the skeleton's `emit_transition`
     /// carries payout/fee/refund only, so the real build stamps
     /// `amounts.penalty = slashed` on the event (see
-    /// `escrow_state::EventAmounts::slashed`).
+    /// `escrow_state::EventAmounts::slashed`). For a ladder escrow
+    /// the pin below uses the ladder's penalty account (terms and
+    /// ladder are mutually exclusive, so exactly one is present);
+    /// repeated slashes are allowed for ladder escrows, each
+    /// consuming the current rung. The real build must also stamp
+    /// the consumed rung index on `EscrowSlashed`: the state
+    /// machine's `IndexedEscrow::slash` stamps `slash_ladder_index`
+    /// on the event, but the skeleton's `emit_transition` carries
+    /// payout/fee/refund only — read
+    /// `escrow.slash_ladder_index()` after the slash and stamp the
+    /// event field itself.
     pub fn slash(ctx: Context<Slash>, amount: u64) -> Result<u64> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
         let from = escrow.state() as u8;
-        // Pin the penalty destination to the terms: the skeleton's
-        // state machine takes no destination param (the terms fix it),
+        // AV-82 / AV-126: the penalty destination is fixed at setup
+        // — either the single-level terms or the ladder (mutually
+        // exclusive, enforced by the state machine's constructors);
+        // the skeleton's state machine takes no destination param,
         // so the account constraint is enforced here, before the
         // state machine runs. AV-106: when the insurance pool is
         // opted in the slash routes to the pool (no penalty-account
-        // transfer), so the pin is skipped — the state machine's
-        // `slash` already refuses a second slash.
-        let terms = escrow
+        // transfer), so the pin is skipped.
+        let penalty_account = escrow
             .slash_terms()
+            .map(|t| t.penalty_account)
+            .or_else(|| escrow.slash_ladder().map(|l| l.penalty_account))
             .ok_or(error!(ErrorCode::SlashNotEligible))?;
         if !escrow.insurance_pool()
-            && ctx.accounts.penalty_account.key().to_bytes() != terms.penalty_account
+            && ctx.accounts.penalty_account.key().to_bytes() != penalty_account
         {
             return Err(error!(ErrorCode::SlashNotEligible));
         }
@@ -5593,6 +5636,21 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `release_cooling_secs`).
     pub release_intent_at: Option<u64>,
+    /// AV-126: the opt-in tiered default-penalty ladder (mirrors
+    /// `escrow_state`'s `slash_ladder`); `None` for escrows without a
+    /// ladder. The account always reserves the full 114-byte region —
+    /// 1-byte discriminant + 113-byte ladder (32-byte penalty account
+    /// + 8 fixed 10-byte (deadline u64, bps u16) rung slots +
+    /// rung-count byte), zeroed when `None` — so
+    /// `initialize_slash_ladder` writes in place. Layout position
+    /// matches `escrow_state::VAULT_FIELDS` (appended last).
+    pub slash_ladder: Option<SlashLadder>,
+    /// AV-126: the consumed-rung cursor (mirrors `escrow_state`'s
+    /// `slash_ladder_index`), 1 byte, zeroed when no rung consumed;
+    /// each slash consumes the current rung. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `slash_ladder`).
+    pub slash_ladder_index: u8,
 }
 
 /// Skeleton mirror of `escrow_state::PayoutSplit`: the opt-in
@@ -5638,6 +5696,40 @@ pub struct PayoutSplitShare {
 pub struct SlashTerms {
     pub penalty_account: Pubkey,
     pub slash_deadline: u64,
+}
+
+/// Skeleton mirror of `escrow_state::SlashRung`: one tier of the
+/// AV-126 default-penalty ladder — the Unix-seconds deadline after
+/// which this rung becomes the active slash tier, plus the per-slash
+/// cap in basis points of the slashable remainder.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct SlashRung {
+    pub deadline: u64,
+    pub bps: u16,
+}
+
+/// Skeleton mirror of `escrow_state::SlashLadder`: the opt-in tiered
+/// default-penalty ladder (AV-126) — the penalty sink plus up to 8
+/// strictly-ascending (deadline, bps) rungs;
+/// `rungs[rung_count..]` are zero-filled. Serialized size is pinned
+/// by `escrow_state::SLASH_LADDER_LEN` (113 bytes: 32-byte penalty
+/// account + 8 fixed 10-byte rung slots + rung-count byte); on the
+/// vault it rides a 1-byte `Option` discriminant.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct SlashLadder {
+    pub penalty_account: Pubkey,
+    pub rungs: [SlashRung; 8],
+    pub rung_count: u8,
+}
+
+/// Skeleton mirror of one `escrow_state::SlashRung` as an instruction
+/// argument (AV-126): the `initialize_slash_ladder` handler converts
+/// `Vec<SlashRungArg>` to the `Vec<(u64, u16)>` the state machine's
+/// [`escrow_state::Escrow::with_slash_ladder`] validates.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct SlashRungArg {
+    pub deadline: u64,
+    pub bps: u16,
 }
 
 /// Skeleton mirror of one `escrow_state::BasketLeg` as an instruction
@@ -7313,6 +7405,18 @@ pub struct InitializeSlashTerms<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-126: opt in to the tiered default-penalty (slash) ladder at
+/// initialize time (mirrors `Escrow::with_slash_ladder`).
+#[derive(Accounts)]
+pub struct InitializeSlashLadder<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer opts into the slash ladder; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
 /// AV-82: slash the defaulting taker.
 #[derive(Accounts)]
 pub struct Slash<'info> {
@@ -8567,6 +8671,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::IntentExpired => {
             error!(ErrorCode::IntentExpired)
         }
+        escrow_state::EscrowError::InvalidSlashLadder => {
+            error!(ErrorCode::InvalidSlashLadder)
+        }
     }
 }
 
@@ -8771,4 +8878,6 @@ pub enum ErrorCode {
     IntentExpired,
     #[msg("Ed25519 precompile program instruction missing (AV-123): release_via_intent requires the Ed25519 precompile program to have executed in this transaction — the on-chain double-insurance for the state machine's own signature check")]
     Ed25519ProgramInstructionMissing,
+    #[msg("Invalid slash ladder (AV-126): with_slash_ladder with an empty or over-long rung table, a zero bps rung, bps above 10_000, non-strictly-ascending deadlines or bps, a zero penalty account, or on an escrow that already carries single-level slash terms (mutually exclusive)")]
+    InvalidSlashLadder,
 }
