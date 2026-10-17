@@ -1066,6 +1066,25 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to compound-interest mode (AV-117; mirrors
+    /// `Escrow::with_compound_interest`). `Uninitialized` only, like
+    /// `initialize_interest`. After this, the accrued yield compounds
+    /// into the principal at every claim/settlement instead of being
+    /// paid out as a separate yield leg — and the standalone
+    /// `claim_interest` harvest is refused (`CompoundInterestActive`,
+    /// code 178). Inert while no interest rate is configured.
+    pub fn initialize_compound_interest(ctx: Context<InitializeCompoundInterest>) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_compound_interest()
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.compound_interest` is always present (1 byte, zeroed
+        // by default), so the flag is written in place — no realloc
+        // needed in the real build.
+        Ok(())
+    }
+
     /// Claim the vested-but-unreleased portion (AV-13; mirrors
     /// `Escrow::claim`). Only the taker may call this; `now` comes from
     /// the Solana clock sysvar (never an instruction param — a
@@ -6524,6 +6543,16 @@ pub struct InitializeInterest<'info> {
     /// `Uninitialized` (`InvalidStateTransition`). `rate_bps` above
     /// 10000 is `InvalidInterestRate` (code 165); `0` disables the
     /// yield.
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeCompoundInterest<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer opts in to compound-interest mode; the
+    /// state machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized` (`InvalidStateTransition`).
     pub initializer: Signer<'info>,
 }
 

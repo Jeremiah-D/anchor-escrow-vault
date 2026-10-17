@@ -285,6 +285,25 @@ the snapshot exposes `slot_timelock_slots` / `fund_slot` and the keeper
 report discloses the unlock slot (`slot_unlock_at`) so operators compare
 it against the chain tip.
 
+**Compound-interest accrual.** An interest-bearing escrow can opt into
+*compound* mode (`with_compound_interest()`, once, before funding). When
+on, the accrued yield folds into the principal at every claim/settlement
+— `release`, `claim`, `release_milestone`, and the dispute settlements —
+instead of being paid out as a separate yield leg: `amount +=
+interest_accrued`, `interest_compounded += interest_accrued`, the claim
+zeroes, and the next accrual prices the grown principal (interest earns
+interest, computed in `u128` with a `checked_add` backstop — a wrapping
+principal is a hard failure, never a wrap). The mode is mutually exclusive
+with the standalone harvest: `claim_interest` on a compound escrow is
+`CompoundInterestActive`, code 178 — a separate harvest would double-count
+yield earmarked for the principal. The cumulative folded yield lives in
+`interest_compounded`, so the extended conservation identity
+(`inflow + yield == locked + released + refunded + interest_paid`, with
+`yield == interest_accrued + interest_paid + interest_compounded`) stays
+exact, and the snapshot exposes `compound_interest` / `interest_compounded`
+for indexers. Builder order is irrelevant: opting in before `with_interest`
+is accepted but inert while the rate is zero (nothing to compound).
+
 **Emergency timelock unlock.** An escrow can additionally opt into
 dual-signed emergency governance (`with_emergency_unlock()`, once, before
 funding). When both parties agree the lock has outlived its purpose — a
@@ -2383,7 +2402,9 @@ two-way consistency check against the IDL parameter table:
 | penalty_escalation_cap_bps | u16 | 2 |
 | slot_timelock_slots | u64 | 8 |
 | fund_slot | u64 | 8 |
-| **total**     |                   | **5151** |
+| compound_interest | bool | 1 |
+| interest_compounded | u64 | 8 |
+| **total**     |                   | **5160** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2505,10 +2526,10 @@ plan payload — `total_amount` u64 + `max_tranches` u8 +
 `release_cooling_secs` (u64, 0 = unconfigured) +
 `release_intent_at` (Option<u64>: 1-byte discriminant + 8-byte
 stamp, `None` when no intent is live)).
-`escrow-state` exposes `VAULT_SPACE` (5159) and
-`VAULT_SPACE_NO_QUORUM` (4669) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (5168) and
+`VAULT_SPACE_NO_QUORUM` (4678) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **36,797,520 lamports** to be
+mainnet rent parameters the full vault needs **36,860,160 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)

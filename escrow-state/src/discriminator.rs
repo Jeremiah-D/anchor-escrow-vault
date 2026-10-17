@@ -1167,6 +1167,14 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     let slot_timelock_slots = c.u64_le()?;
     let fund_slot = c.u64_le()?;
 
+    // AV-117: the compound-interest tail — the 1-byte opt-in flag
+    // plus the 8-byte cumulative compounded-yield counter. Structural
+    // decode only — the mode is enforced by
+    // `Escrow::with_compound_interest` / `Escrow::claim_interest`,
+    // not re-litigated here.
+    let compound_interest = c.u8()? != 0;
+    let interest_compounded = c.u64_le()?;
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1396,6 +1404,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // any other persisted tail field.
         slot_timelock_slots,
         fund_slot,
+        // AV-117: the compound-interest tail decodes like any other
+        // persisted tail field.
+        compound_interest,
+        interest_compounded,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

@@ -542,6 +542,13 @@ pub struct EscrowSnapshot {
     pub interest_accrued: u64,
     /// AV-107: cumulative interest paid out to the taker.
     pub interest_paid: u64,
+    /// AV-117: whether compound-interest mode is on — the accrued
+    /// yield compounds into the principal at claim/settlement instead
+    /// of being harvested separately.
+    pub compound_interest: bool,
+    /// AV-117: cumulative yield folded into the principal via
+    /// compounding.
+    pub interest_compounded: u64,
     /// AV-108: the declared multi-recipient payout-split table —
     /// `None` when no split is configured, else the `(recipient,
     /// gross share)` pairs in payout order, so indexers see the
@@ -900,6 +907,8 @@ impl Escrow {
             interest_rate_bps: self.interest_rate_bps(),
             interest_accrued: self.interest_accrued(),
             interest_paid: self.interest_paid(),
+            compound_interest: self.compound_interest(),
+            interest_compounded: self.interest_compounded(),
             // AV-108: the declared split table rides the export —
             // `None` when unconfigured, so a plain escrow's JSON is
             // unchanged.
@@ -1525,6 +1534,12 @@ impl EscrowSnapshot {
         s.push_str(&self.interest_accrued.to_string());
         s.push_str(",\"interest_paid\":");
         s.push_str(&self.interest_paid.to_string());
+        // AV-117: compound-interest mode flag and the cumulative
+        // compounded yield.
+        s.push_str(",\"compound_interest\":");
+        s.push_str(if self.compound_interest { "true" } else { "false" });
+        s.push_str(",\"interest_compounded\":");
+        s.push_str(&self.interest_compounded.to_string());
         // AV-108: declared split table — `null` when none is
         // configured, else the (recipient, share) pairs in payout
         // order with recipients as hex strings.
@@ -1640,7 +1655,7 @@ mod snapshot_tests {
              \"insurance_pool\":false,\"pool_paid\":0,\"pool_slashed\":0,\
              \"pool_inflow\":0,\"pool_outflow\":0,\"pool_payout_paid\":0,\
              \"pool_payout_eligible\":false,\
-             \"interest_rate_bps\":0,\"interest_accrued\":0,\"interest_paid\":0,\"payout_split\":null,\
+             \"interest_rate_bps\":0,\"interest_accrued\":0,\"interest_paid\":0,\"compound_interest\":false,\"interest_compounded\":0,\"payout_split\":null,\
              \"deadman_inactivity_secs\":0,\"deadman_heir\":null,\"deadman_last_activity\":1700000000,\
              \"deadman_eligible\":false,\"rent_topped_up_total\":0,\"funded_total\":1000000,\"funding_total_amount\":0,\"funding_max_tranches\":0,\"funding_tranches_used\":0,\"funding_complete\":true,\
              \"release_cooling_secs\":0,\"release_intent_at\":null,\"release_cooling_eligible\":true\

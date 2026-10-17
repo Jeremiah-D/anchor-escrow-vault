@@ -800,6 +800,12 @@
       "args": []
     },
     {
+      "name": "initialize_compound_interest",
+      "discriminator": [178, 122, 174, 98, 7, 63, 5, 238],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "initialize_payout_split",
       "discriminator": [165, 22, 40, 62, 191, 161, 250, 138],
       "accounts": [],
@@ -991,7 +997,9 @@
           {"name": "penalty_escalation_rate_bps", "type": "u16", "offset": 5139},
           {"name": "penalty_escalation_cap_bps", "type": "u16", "offset": 5141},
           {"name": "slot_timelock_slots", "type": "u64", "offset": 5143},
-          {"name": "fund_slot", "type": "u64", "offset": 5151}
+          {"name": "fund_slot", "type": "u64", "offset": 5151},
+          {"name": "compound_interest", "type": "bool", "offset": 5159},
+          {"name": "interest_compounded", "type": "u64", "offset": 5160}
         ]
       }
     }
@@ -1331,7 +1339,8 @@
     {"code": 174, "name": "ReleaseCoolingNotElapsed"},
     {"code": 175, "name": "PriceGateNotSatisfied"},
     {"code": 176, "name": "InvalidPriceGate"},
-    {"code": 177, "name": "MergeIncompatible"}
+    {"code": 177, "name": "MergeIncompatible"},
+    {"code": 178, "name": "CompoundInterestActive"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
