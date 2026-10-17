@@ -1185,6 +1185,7 @@ mod report_diff_tests {
             escrow: e,
             reference,
             vault_derivation: None,
+            pending_intent: None,
         }
     }
 
@@ -1502,6 +1503,8 @@ mod report_diff_tests {
             actions,
             jito_tip: None,
             pool_balance: 0,
+            // AV-123: no intent annotations in tests.
+            intent_releases: Vec::new(),
             pool_inflow: 0,
             pool_outflow: 0,
             report_seq: Some(7),

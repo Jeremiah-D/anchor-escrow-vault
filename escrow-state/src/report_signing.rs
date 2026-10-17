@@ -258,6 +258,7 @@ mod report_signing_tests {
             escrow,
             reference: None,
             vault_derivation: None,
+            pending_intent: None,
         }
     }
     fn funded_escrow() -> Escrow {
@@ -279,7 +280,9 @@ mod report_signing_tests {
         // Unsigned output is untouched by the signing feature.
         // AV-120: the stamped report sequence rides the canonical
         // bytes (`null` when the operator stamped nothing).
-        assert_eq!(canonical, "{\"at\":1000,\"scanned\":0,\"total_estimated_cu\":0,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[],\"report_seq\":null}");
+        // AV-123: the gasless-intent annotations ride the canonical
+        // bytes (`[]` when no watched escrow carries an intent).
+        assert_eq!(canonical, "{\"at\":1000,\"scanned\":0,\"total_estimated_cu\":0,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[],\"report_seq\":null}");
     }
 
     #[test]

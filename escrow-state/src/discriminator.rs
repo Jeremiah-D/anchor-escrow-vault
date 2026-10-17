@@ -1217,6 +1217,12 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         None
     };
 
+    // AV-123: the gasless-release intent nonce tail — the 8-byte
+    // highest consumed intent nonce. Structural decode only — the
+    // nonce bookkeeping is enforced by `Escrow::release_via_intent`,
+    // not re-litigated here.
+    let last_intent_nonce = c.u64_le()?;
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1460,6 +1466,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-122: the counter-offer tail decodes like any other
         // persisted tail field.
         counter_offer,
+        // AV-123: the gasless-release intent nonce tail decodes like
+        // any other persisted tail field.
+        last_intent_nonce,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

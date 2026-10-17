@@ -755,6 +755,8 @@ mod keeper_notify_tests {
             actions,
             jito_tip: None,
             pool_balance: 0,
+            // AV-123: no intent annotations in tests.
+            intent_releases: Vec::new(),
             pool_inflow: 0,
             pool_outflow: 0,
             // AV-120: keeper-notify tests never stamp a sequence.

@@ -265,6 +265,96 @@ pub mod escrow_vault {
         Ok((payout, fee))
     }
 
+    /// Gasless release via the initializer's off-chain Ed25519 intent
+    /// (AV-123 — the Solana meta-transaction pattern, payment fintech:
+    /// the paymaster model). The relayer (`ctx.accounts.relayer`,
+    /// any fee payer) submits the initializer's intent (`amount`,
+    /// `payout_to`, `nonce`, `expiry_slot`) plus the 64-byte Ed25519
+    /// signature over the intent's canonical bytes
+    /// (`ESCROW-RELEASE-v1` domain).
+    ///
+    /// Double insurance on the authorization:
+    ///
+    /// 1. The transaction must carry an Ed25519 precompile program
+    ///    instruction (`Ed25519Program1111111111111111111111111111111111`),
+    ///    verified by introspecting the Instructions sysvar — the
+    ///    Solana-native check that the runtime executed the
+    ///    signature verification as part of this transaction
+    ///    (`Ed25519ProgramInstructionMissing` when absent).
+    /// 2. The state machine re-verifies the detached signature
+    ///    against the escrow's initializer key over the canonical
+    ///    intent bytes (`InvalidReleaseIntent`, code 181, on
+    ///    failure) — the self-contained check that needs no
+    ///    precompile.
+    ///
+    /// Either check failing aborts before any state moves. The
+    /// nonce (`IntentNonceReused`, code 182) and expiry (`IntentExpired`,
+    /// code 183) gates follow, then the entire `release` guard chain
+    /// runs with the authority pinned to the initializer — a gasless
+    /// release is a release, never a bypass. Only success advances
+    /// `last_intent_nonce`.
+    ///
+    /// The vault account is *not* a signer and the initializer does
+    /// not sign this transaction: that is the point — the
+    /// initializer's authorization rides the intent, not the signer
+    /// set. Emits `ReleaseViaIntent` with the gross amount and the
+    /// fee (actor == the initializer, never the relayer).
+    pub fn release_via_intent(
+        ctx: Context<ReleaseViaIntent>,
+        amount: u64,
+        payout_to: Pubkey,
+        nonce: u64,
+        expiry_slot: u64,
+        signature: Vec<u8>,
+    ) -> Result<(u64, u64)> {
+        // AV-123 (1): the Ed25519 precompile program must have
+        // executed in this transaction — introspect the Instructions
+        // sysvar for its program id. The runtime pre-verifies the
+        // signature; this pins the precompile's presence to the
+        // transaction the intent rides in.
+        assert_ed25519_precompile_present(&ctx.accounts.instructions)?;
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        // AV-123: the expiry gate reads the clock sysvar's slot —
+        // never an instruction param, so a relayer cannot
+        // fast-forward an intent's life (the AV-27 rule).
+        let slot = Clock::get()?.slot;
+        let intent = escrow_state::ReleaseIntent::new(
+            ctx.accounts.vault.key().to_bytes(),
+            amount,
+            payout_to.to_bytes(),
+            nonce,
+            expiry_slot,
+        );
+        let sig: [u8; 64] = signature
+            .try_into()
+            .map_err(|_| escrow_error(escrow_state::EscrowError::InvalidReleaseIntent))?;
+        let (payout, fee) = escrow
+            .release_via_intent(&intent, &sig, now, slot, vault_token_mint(&ctx.accounts.vault_token_account))
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-31: settle via `cpi_settle_payout` (`PayoutKind::Release`) —
+        // like `release`, the real build executes the validated plan
+        // once the token accounts are wired up.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::ReleaseViaIntent,
+            from,
+            escrow.state() as u8,
+            payout + fee,
+            fee,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok((payout, fee))
+    }
+
     /// Release `amount` split across several recipients by basis-point
     /// weights (AV-93 — Solana / payment fintech: the initializer's
     /// multi-party payout — a revenue share, a creator royalty split,
@@ -6233,6 +6323,40 @@ pub struct Release<'info> {
     pub vault_token_account: AccountInfo<'info>,
 }
 
+/// AV-123: gasless release via a signed Ed25519 intent. The relayer
+/// is any fee payer — the initializer's authorization rides the
+/// intent's signature, not the transaction's signer set, so the
+/// initializer is deliberately *not* a signer account here.
+#[derive(Accounts)]
+pub struct ReleaseViaIntent<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// CHECK: the relayer submitting the intent — any fee payer, no
+    /// authority check (the initializer's authorization is the
+    /// intent's Ed25519 signature, verified by the state machine).
+    pub relayer: AccountInfo<'info>,
+    /// CHECK: beneficiary of the release; receives the funds.
+    pub taker: AccountInfo<'info>,
+    /// CHECK: explicit payout destination (AV-49) — bound by the
+    /// intent's signature and pinned by the state machine against
+    /// the escrow's payout policy (`PayoutNotAllowlisted`, code 127,
+    /// otherwise).
+    pub payout_to: AccountInfo<'info>,
+    /// CHECK: Solana clock sysvar — the AV-27 timelock gate and the
+    /// AV-123 intent-expiry gate both read it (never instruction
+    /// params, so a relayer cannot fast-forward an intent's life).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the Instructions sysvar — introspected for the Ed25519
+    /// precompile program instruction (the on-chain double-insurance
+    /// for the state machine's own signature check).
+    pub instructions: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account. The real build reads this
+    /// account's `mint` and the state machine requires it to equal the
+    /// bound `vault.mint` (`MintMismatch` otherwise). Unused on the
+    /// native-SOL path — the state machine then requires `None`.
+    pub vault_token_account: AccountInfo<'info>,
+}
+
 #[derive(Accounts)]
 pub struct ReleaseSplit<'info> {
     #[account(mut)]
@@ -8388,7 +8512,57 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::MergeIncompatible => {
             error!(ErrorCode::MergeIncompatible)
         }
+        escrow_state::EscrowError::InvalidReleaseIntent => {
+            error!(ErrorCode::InvalidReleaseIntent)
+        }
+        escrow_state::EscrowError::IntentNonceReused => {
+            error!(ErrorCode::IntentNonceReused)
+        }
+        escrow_state::EscrowError::IntentExpired => {
+            error!(ErrorCode::IntentExpired)
+        }
     }
+}
+
+/// AV-123: the Ed25519 precompile program id
+/// (`Ed25519Program1111111111111111111111111111111111`) — the
+/// Solana-native signature verification program. `release_via_intent`
+/// requires its instruction to be present in the transaction: the
+/// runtime executes the signature check, and this introspection pins
+/// the precompile's presence to the transaction the intent rides in
+/// (the second, self-contained check is the state machine's own
+/// `verify_release_intent`, which needs no precompile).
+const ED25519_PROGRAM_ID: &str = "Ed25519Program1111111111111111111111111111111111";
+
+/// AV-123: assert the Ed25519 precompile program executed in this
+/// transaction — the on-chain double-insurance for the state
+/// machine's own signature check in `Escrow::release_via_intent`.
+/// Introspects the Instructions sysvar for an instruction whose
+/// program id is the Ed25519 precompile program. `get_instruction_relative`
+/// walks the sysvar backwards from the current instruction
+/// (`release_via_intent` itself sits at index 0); any load failure
+/// or a scan with no precompile instruction is
+/// `Ed25519ProgramInstructionMissing`.
+fn assert_ed25519_precompile_present(instructions: &AccountInfo) -> Result<()> {
+    let ed25519_program: Pubkey = ED25519_PROGRAM_ID
+        .parse()
+        .map_err(|_| error!(ErrorCode::Ed25519ProgramInstructionMissing))?;
+    let mut idx: i16 = -1;
+    loop {
+        match anchor_lang::solana_program::sysvar::instructions::get_instruction_relative(
+            idx,
+            instructions,
+        ) {
+            Ok(ix) => {
+                if ix.program_id == ed25519_program {
+                    return Ok(());
+                }
+                idx -= 1;
+            }
+            Err(_) => break,
+        }
+    }
+    Err(error!(ErrorCode::Ed25519ProgramInstructionMissing))
 }
 
 #[error_code]
@@ -8543,4 +8717,12 @@ pub enum ErrorCode {
     InvalidPriceGate,
     #[msg("Escrows incompatible for merge (AV-114): different parties, mismatched settlement terms, or an amount counter that would overflow")]
     MergeIncompatible,
+    #[msg("Invalid gasless-release intent (AV-123): release_via_intent with a signature that does not verify against the initializer key over the intent's canonical bytes, or a malformed signature")]
+    InvalidReleaseIntent,
+    #[msg("Gasless-release intent nonce reused (AV-123): release_via_intent with intent.nonce <= last_intent_nonce — a replayed intent")]
+    IntentNonceReused,
+    #[msg("Gasless-release intent expired (AV-123): release_via_intent with now_slot >= intent.expiry_slot")]
+    IntentExpired,
+    #[msg("Ed25519 precompile program instruction missing (AV-123): release_via_intent requires the Ed25519 precompile program to have executed in this transaction — the on-chain double-insurance for the state machine's own signature check")]
+    Ed25519ProgramInstructionMissing,
 }

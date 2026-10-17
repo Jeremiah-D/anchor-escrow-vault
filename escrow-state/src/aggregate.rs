@@ -335,6 +335,7 @@ mod aggregate_tests {
             escrow,
             reference: None,
             vault_derivation: None,
+            pending_intent: None,
         }
     }
 

@@ -170,7 +170,8 @@
 
 use crate::{
     aggregate::EscrowAggregateView, format_amount, vault_close_rent_reclaimed, Escrow, EscrowError,
-    EscrowState, IndexedEscrow, MultisigAuthority, SchemaFieldDelta, VaultDerivation,
+    EscrowState, IndexedEscrow, MultisigAuthority, SchemaFieldDelta, SignedReleaseIntent,
+    VaultDerivation,
 };
 use super::cpi::{AccountMeta, Pubkey};
 use super::discriminator::instruction_discriminator;
@@ -218,6 +219,15 @@ pub struct WatchedEscrow {
     /// Solana PDAs never store their seeds on-chain, so this stays
     /// off-chain by design; the [`Escrow`] layout is untouched.
     pub vault_derivation: Option<VaultDerivation>,
+    /// AV-123: the signed, unsubmitted gasless-release intent the
+    /// keeper holds for this escrow (see
+    /// [`WatchedEscrow::with_pending_intent`]). Off-chain by design:
+    /// a submitted intent lives only in the transaction, never in
+    /// the vault account — the keeper records the intent it is
+    /// holding here, and [`scan_keeper_actions`] annotates the
+    /// escrow as intent-release-ready on the report. `None` when the
+    /// keeper holds no intent for this escrow.
+    pub pending_intent: Option<SignedReleaseIntent>,
 }
 
 impl WatchedEscrow {
@@ -239,6 +249,21 @@ impl WatchedEscrow {
     /// practically impossible).
     pub fn vault_address(&self) -> Option<[u8; 32]> {
         self.vault_derivation.and_then(|d| d.address())
+    }
+
+    /// AV-123: record the signed, unsubmitted gasless-release intent
+    /// the keeper is holding for this escrow (the initializer's
+    /// off-chain signature over the intent's canonical bytes — see
+    /// [`ReleaseIntent`]). Off-chain metadata, like
+    /// [`WatchedEscrow::with_vault_seeds`]: the signature is
+    /// re-verified at scan time ([`scan_keeper_actions`] annotates
+    /// only intents that verify against the escrow's initializer
+    /// key and carry a fresh nonce) and again at submit time by
+    /// [`Escrow::release_via_intent`](crate::Escrow::release_via_intent)
+    /// — recording here never confers authority.
+    pub fn with_pending_intent(mut self, signed: SignedReleaseIntent) -> Self {
+        self.pending_intent = Some(signed);
+        self
     }
 }
 
@@ -571,6 +596,33 @@ impl KeeperAction {
     }
 }
 
+/// AV-123: one scanned escrow carrying a signed, unsubmitted
+/// gasless-release intent — the keeper-scan annotation for the
+/// meta-transaction path. The relayer submits
+/// [`Escrow::release_via_intent`](crate::Escrow::release_via_intent)
+/// with any fee payer instead of waiting for a party-signed
+/// `release`: the initializer's signature is already embedded in
+/// the intent, not the transaction.
+///
+/// The scan verifies the intent's signature against the escrow's
+/// initializer key and requires a fresh nonce (`nonce >
+/// last_intent_nonce`) before annotating — an unverifiable or
+/// replayed intent is not annotated. The expiry slot is disclosed,
+/// not evaluated (the keeper scan's clock is wall time, not slots —
+/// the AV-97 `slot_unlock_opt` precedent): the operator compares it
+/// against the chain tip before submitting. The submit-time guards
+/// (pause, state, mint, payout policy, quorum, timelock, …) still
+/// run inside `release_via_intent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntentReleaseAnnotation {
+    /// The escrow the intent authorizes a release from.
+    pub escrow_id: [u8; 32],
+    /// The intent's replay nonce (fresh at scan time).
+    pub nonce: u64,
+    /// The intent's expiry slot — disclosed, not evaluated.
+    pub expiry_slot: u64,
+}
+
 /// The scan result: every executable keeper call at [`KeeperReport::at`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeeperReport {
@@ -590,6 +642,14 @@ pub struct KeeperReport {
     /// `None` unless stamped via
     /// [`with_jito_tip`](KeeperReport::with_jito_tip).
     pub jito_tip: Option<JitoTipConfig>,
+    /// AV-123: escrows carrying a signed, unsubmitted gasless-release
+    /// intent (see [`IntentReleaseAnnotation`]) — populated by
+    /// [`scan_keeper_actions`] from
+    /// [`WatchedEscrow::pending_intent`]. Annotation only: the
+    /// relayer still submits `release_via_intent` through the state
+    /// machine's full guard chain. Empty when no watched escrow
+    /// carries a verifiable intent.
+    pub intent_releases: Vec<IntentReleaseAnnotation>,
     /// AV-106: total insurance-pool balance across the scanned
     /// escrows — the neutral penalties held fleet-wide. Saturates
     /// instead of wrapping.
@@ -663,6 +723,7 @@ impl KeeperReport {
     /// ```json
     /// {"at":1000000,"scanned":1,"total_estimated_cu":13814,
     ///  "jito_tip":{"lamports":10000,"recipient":"ee…"},
+    ///  "intent_releases":[{"escrow_id":"...","nonce":3,"expiry_slot":99999}],
     ///  "pool_balance":0,"pool_inflow":0,"pool_outflow":0,
     ///  "actions":[
     ///   {"escrow_id":"...","vault_address":"...","action":"cancel_expired","caller":"...",
@@ -711,6 +772,23 @@ impl KeeperReport {
             }
             None => s.push_str("null"),
         }
+        // AV-123: the gasless-release intent annotations — escrows
+        // carrying a signed, unsubmitted release intent the relayer
+        // can submit as `release_via_intent` with any fee payer.
+        s.push_str(",\"intent_releases\":[");
+        for (i, r) in self.intent_releases.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"escrow_id\":\"");
+            s.push_str(&hex32(&r.escrow_id));
+            s.push_str("\",\"nonce\":");
+            s.push_str(&r.nonce.to_string());
+            s.push_str(",\"expiry_slot\":");
+            s.push_str(&r.expiry_slot.to_string());
+            s.push('}');
+        }
+        s.push(']');
         // AV-106: the fleet-wide insurance-pool lines — balance,
         // cumulative inflow, and outflow (`inflow - balance`).
         s.push_str(",\"pool_balance\":");
@@ -917,6 +995,9 @@ fn slot_unlock_opt(e: &Escrow) -> Option<u64> {
 /// keeper with the party path.
 pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport {
     let mut actions = Vec::new();
+    // AV-123: escrows carrying a signed, unsubmitted gasless-release
+    // intent — annotation only (see `IntentReleaseAnnotation`).
+    let mut intent_releases = Vec::new();
     // AV-106: fleet-wide insurance-pool lines — saturating sums over
     // the scanned escrows.
     let mut pool_balance = 0u64;
@@ -925,6 +1006,26 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         let e = &w.escrow;
         pool_balance = pool_balance.saturating_add(e.pool_paid());
         pool_inflow = pool_inflow.saturating_add(e.pool_inflow());
+        // AV-123: annotate escrows carrying a signed, unsubmitted
+        // gasless-release intent. The intent verifies against the
+        // escrow's initializer key and must carry a fresh nonce
+        // (`nonce > last_intent_nonce`) — an unverifiable or
+        // replayed intent is not annotated. The expiry slot is
+        // disclosed, not evaluated: the scan's clock is wall time,
+        // not slots (the `slot_unlock_opt` precedent), so the
+        // operator compares it against the chain tip before the
+        // relayer submits `release_via_intent`.
+        if let Some(signed) = w.pending_intent {
+            if signed.verify(&e.initializer())
+                && signed.intent.nonce > e.last_intent_nonce()
+            {
+                intent_releases.push(IntentReleaseAnnotation {
+                    escrow_id: w.escrow_id,
+                    nonce: signed.intent.nonce,
+                    expiry_slot: signed.intent.expiry_slot,
+                });
+            }
+        }
         // AV-38: a disputed escrow has exactly one keeper-executable
         // call — the arbiter's `resolve`. The unilateral exits stay
         // locked, so nothing else is listed; the taker/initializer split
@@ -1577,6 +1678,9 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         // AV-98: the operator stamps the intended Jito tip via
         // `with_jito_tip` — the scan itself stays tip-free.
         jito_tip: None,
+        // AV-123: the gasless-release intent annotations collected
+        // above.
+        intent_releases,
         // AV-106: the fleet-wide pool lines.
         pool_balance,
         pool_inflow,
@@ -2190,6 +2294,7 @@ mod keeper_tests {
             escrow,
             reference,
             vault_derivation: None,
+            pending_intent: None,
         }
     }
 
@@ -2218,7 +2323,7 @@ mod keeper_tests {
         let report = scan_keeper_actions(&[], MID);
         assert!(report.is_empty());
         assert_eq!(report.scanned, 0);
-        assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"total_estimated_cu":0,"jito_tip":null,"pool_balance":0,"pool_inflow":0,"pool_outflow":0,"actions":[],"report_seq":null}"#);
+        assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"total_estimated_cu":0,"jito_tip":null,"intent_releases":[],"pool_balance":0,"pool_inflow":0,"pool_outflow":0,"actions":[],"report_seq":null}"#);
     }
 
     #[test]
@@ -2905,7 +3010,7 @@ mod keeper_tests {
         // 3 accounts, 8 data bytes, 1 signer →
         // 10_000 + 3_000 + 3×250 + 8×8 = 13_814 each; total 27_628.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":13814}}],\"report_seq\":null}}",
+            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":13814}}],\"report_seq\":null}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -2930,7 +3035,7 @@ mod keeper_tests {
         // AV-88: claim with mint, no refund_to: 3 accounts, 8 data
         // bytes, 1 signer → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":17814}}],\"report_seq\":null}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"estimated_cu\":17814}}],\"report_seq\":null}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),
@@ -2971,6 +3076,68 @@ mod keeper_tests {
             scan_keeper_actions(&watched, MID).with_jito_tip(1_000, [0u8; 32]).unwrap_err(),
             TipConfigError::ZeroRecipient
         );
+    }
+
+    #[test]
+    fn scan_annotates_verified_intent_release() {
+        // AV-123: a watched escrow carrying a signed, unsubmitted
+        // release intent is annotated on the report — the relayer
+        // submits `release_via_intent` with any fee payer instead of
+        // waiting for a party-signed release.
+        use crate::SigningKey;
+        use crate::{sign_release_intent, ReleaseIntent};
+        let key = SigningKey::from_seed([0x11; 32]);
+        let mut e = Escrow::initialize(key.public_key(), BOB, AMOUNT, MID + 3_600).unwrap();
+        e.fund(key.public_key(), MID).unwrap();
+        let intent = ReleaseIntent::new(ID1, 100_000, BOB, 1, 9_999_999);
+        let signed = SignedReleaseIntent::new(intent, sign_release_intent(&key, &intent));
+        let watched = [watch(ID1, e).with_pending_intent(signed)];
+        let report = scan_keeper_actions(&watched, MID);
+        assert_eq!(report.intent_releases.len(), 1);
+        let ann = &report.intent_releases[0];
+        assert_eq!(ann.escrow_id, ID1);
+        assert_eq!(ann.nonce, 1);
+        assert_eq!(ann.expiry_slot, 9_999_999);
+        // The annotation renders on the report JSON.
+        let json = report.to_json();
+        assert!(
+            json.contains(&format!(
+                "\"intent_releases\":[{{\"escrow_id\":\"{}\",\"nonce\":1,\"expiry_slot\":9999999}}]",
+                hex_of(0x01)
+            )),
+            "intent line missing: {json}"
+        );
+    }
+
+    #[test]
+    fn scan_skips_unverifiable_or_replayed_intent() {
+        // AV-123: an intent that does not verify against the
+        // escrow's initializer key — or one whose nonce is not
+        // fresh — is not annotated.
+        use crate::SigningKey;
+        use crate::{sign_release_intent, ReleaseIntent};
+        let key = SigningKey::from_seed([0x11; 32]);
+        let other = SigningKey::from_seed([0x22; 32]);
+        let mut e = Escrow::initialize(key.public_key(), BOB, AMOUNT, MID + 3_600).unwrap();
+        e.fund(key.public_key(), MID).unwrap();
+        // Wrong-key signature: not annotated.
+        let intent = ReleaseIntent::new(ID1, 100_000, BOB, 1, 9_999_999);
+        let bad = SignedReleaseIntent::new(intent, sign_release_intent(&other, &intent));
+        let watched = [watch(ID1, e.clone()).with_pending_intent(bad)];
+        assert!(scan_keeper_actions(&watched, MID).intent_releases.is_empty());
+        // Consumed nonce: a replayed intent is not annotated.
+        e.release_via_intent(&intent, &sign_release_intent(&key, &intent), MID, 100, None)
+            .unwrap();
+        let replayed = SignedReleaseIntent::new(intent, sign_release_intent(&key, &intent));
+        let watched = [watch(ID1, e).with_pending_intent(replayed)];
+        assert!(scan_keeper_actions(&watched, MID).intent_releases.is_empty());
+        // No pending intent at all: no annotation, empty array.
+        let mut plain = Escrow::initialize(key.public_key(), BOB, AMOUNT, MID + 3_600).unwrap();
+        plain.fund(key.public_key(), MID).unwrap();
+        let watched = [watch(ID1, plain)];
+        let report = scan_keeper_actions(&watched, MID);
+        assert!(report.intent_releases.is_empty());
+        assert!(report.to_json().contains("\"intent_releases\":[]"));
     }
 
     #[test]
@@ -3372,6 +3539,7 @@ mod close_keeper_tests {
             escrow,
             reference,
             vault_derivation: None,
+            pending_intent: None,
         }
     }
 
@@ -4271,6 +4439,7 @@ mod keeper_milestone_tests {
             escrow,
             reference,
             vault_derivation: None,
+            pending_intent: None,
         }
     }
 
@@ -5149,6 +5318,7 @@ mod schema_migration_tests {
             escrow,
             reference,
             vault_derivation: None,
+            pending_intent: None,
         }
     }
 

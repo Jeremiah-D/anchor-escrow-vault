@@ -206,6 +206,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // `payout - fee`, they are not additional movement.
         EscrowEventKind::Released
         | EscrowEventKind::ReleasedSplit
+        // AV-123: an intent-driven release books exactly like the
+        // party-signed `Released` — same lifecycle move, same gross
+        // accounting; the event kind distinguishes the authorization
+        // path, the fund triple does not.
+        | EscrowEventKind::ReleaseViaIntent
         | EscrowEventKind::Claimed
         | EscrowEventKind::MilestoneReleased
         | EscrowEventKind::SubscriptionPeriodReleased
@@ -591,7 +596,7 @@ mod event_sourcing_tests {
         const FEE: u64 = 100;
         const REFUND: u64 = 700;
         const PENALTY: u64 = 50;
-        for d in 0..=51u8 {
+        for d in 0..=66u8 {
             let kind = EscrowEventKind::from_discriminant(d)
                 .unwrap_or_else(|| panic!("missing discriminant {d}"));
             let event = synth(kind, 0, PAYOUT, FEE, REFUND, PENALTY);
@@ -601,6 +606,8 @@ mod event_sourcing_tests {
             let want: (u64, u64, u64) = match kind {
                 EscrowEventKind::Released
                 | EscrowEventKind::ReleasedSplit
+                // AV-123: an intent-driven release books like Released.
+                | EscrowEventKind::ReleaseViaIntent
                 | EscrowEventKind::Claimed
                 | EscrowEventKind::MilestoneReleased
                 | EscrowEventKind::SubscriptionPeriodReleased

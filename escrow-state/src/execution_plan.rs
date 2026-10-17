@@ -439,6 +439,8 @@ mod execution_plan_tests {
             actions,
             // AV-98: execution-plan tests never stamp a tip.
             jito_tip: None,
+            // AV-123: no intent annotations in tests.
+            intent_releases: Vec::new(),
             // AV-106: execution-plan tests carry no pool lines.
             pool_balance: 0,
             pool_inflow: 0,
@@ -594,6 +596,7 @@ mod execution_plan_tests {
             // AV-53: no reference memo on this escrow.
             reference: None,
             vault_derivation: None,
+            pending_intent: None,
         }];
         let plan = plan_execution(&scan_keeper_actions(&watched, MID));
         assert_eq!(plan.scanned, 1);

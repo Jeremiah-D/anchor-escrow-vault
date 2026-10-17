@@ -124,6 +124,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_dutch_auction(start_at, end_at, reserve_bps)` (AV-97) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the descending-price settlement window: `start_at < end_at`, `reserve_bps` in 0–10000 — `InvalidAuctionParams`, code 155, otherwise); the taker's pull path becomes the auction cap `max(amount * (end_at - now) / (end_at - start_at), amount * reserve_bps / 10000)` inside the window — early claimers keep more, the `reserve_bps` floor is the initializer's guaranteed keep; mutually exclusive with the AV-13/AV-90 unlock paths (last-wins) and with dispute arbitration while the window is live (`escalate` is refused with `AuctionNotActive`, code 156) |
 | `fund(authority, now)`                      | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer (`now` <- clock sysvar, recorded as `fund_at` — the origin the AV-64 relative timelock measures from); AV-104: a live FUND-scoped operator may call for the initializer instead (same checks, operator pays nothing — delegation covers transition rights only) |
 | `release(authority, now, amount, payout_to)` (AV-49)                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); AV-104: a live RELEASE-scoped operator may call for the initializer instead (all other gates identical; delegation covers transition rights only); cumulative releases ≤ locked amount; `payout_to` must satisfy the payout policy — the taker, or a member of the payout allowlist when one is configured (`PayoutNotAllowlisted` otherwise) |
+| `release_via_intent(intent, signature, now, now_slot, mint)` (AV-123) | `Funded` | `Funded` (partial) / `Released` (cumulative full) | **gasless / meta-transaction release** — any relayer (permissionless) may submit; the initializer's Ed25519 signature over the canonical `ReleaseIntent{escrow, amount, payout_to, nonce, expiry_slot}` bytes (prefixed with the `b"ESCROW-RELEASE-v1"` domain separator, verified with the hand-rolled RFC 8032 verifier from AV-101) is the authority; check order — pause → signature (`InvalidReleaseIntent`, code 181 — deliberately not `Unauthorized`: the submitter is permissionless, the signature is the authorization) → nonce strictly increasing against the persisted `last_intent_nonce` watermark (`IntentNonceReused`, code 182 — replays are dead) → expiry (`now_slot >= expiry_slot` is `IntentExpired`, code 183) → the full `release` guard chain (reentrancy / state / mint / payout-policy / funding-complete / quorum / timelock) with the initializer as authority; `payout_to` is pinned against the AV-49 payout policy like `release`; `released` accumulates the gross; the intent's `escrow` field binds the signature to the vault (the Anchor handler reconstructs the intent with the vault account's own key, so a signed intent cannot be retargeted at another vault); emits `ReleaseViaIntent` |
 | `release_split(authority, now, amount, recipients, bps)` (AV-93) | `Funded` | `Funded` (partial) / `Released` (cumulative full) | initializer; the check order mirrors `release` — authority → state → mint → the share-table shape (non-empty, ≤ 8 recipients, no zero address, no zero weight, weights summing to exactly 10_000 bps — `InvalidReleaseSplit`, code 150, otherwise) → every recipient pinned against the AV-49 payout policy (`PayoutNotAllowlisted` otherwise; with no allowlist only the taker passes, so a multi-recipient split is the allowlist's declared distribution set) → milestones / subscription / quorum / timelock gates → amount math (`AmountMismatch` on 0, `ReleaseExceedsLocked` past the remainder); the AV-17 protocol fee is charged on the gross amount first, then the net splits — each leg `floor(net * bps / 10_000)`, the dust landing on the first recipient, so the legs sum to the net exactly; `released` accumulates the gross, so the conservation invariant is untouched; returns the `(recipient, net_share)` legs (sizing the program's transfers) plus the fee; emits `ReleasedSplit` with the legs stamped on the event |
 | `slash(authority, amount)` (AV-82) | `Funded` | `Funded` (no state change — the escrow stays live, the taker can still earn the remainder) | initializer **or** the configured arbiter (the neutral enforcer — one party's griefing cannot burn the other's stake); `now` <- clock sysvar; requires the AV-82 slash terms (`Uninitialized`-time opt-in), `now >= slash_deadline`, and the amount ≤ the slashable remainder (`amount - released - penalty_paid`); **one-shot** (a second slash is `SlashNotEligible`); `Disputed` is locked (`SlashNotEligible` — arbitration owns the funds) and milestone/subscription-scheduled escrows reject slash (the schedule owns the release path); on a dual-sig escrow both activation bits must be set; the slashed amount moves to the fixed penalty account and accumulates in `penalty_paid` (never in `released` — the audit trail distinguishes a default penalty from a taker payout); emits `Slashed` (`amounts.penalty` = the slashed amount) |
 | `initialize_basket(legs)` (AV-95) | `Uninitialized` | `Uninitialized` | initializer (once, before funding); `legs` is 1–8 `(mint, amount)` pairs — non-empty, no zero mint, no zero amount, no duplicate mint (one leg per mint), Σ fitting in `u64` (`InvalidBasket`, code 152, otherwise); the escrow-level `amount` becomes the Σ over the legs, so fleet aggregation, snapshots and the event fold keep their single-amount semantics |
@@ -1380,6 +1381,12 @@ program error per variant):
 | `PriceGateNotSatisfied` | 175 | `release_price_gated` / `claim_price_gated` (AV-113) with a configured gate when the oracle is dark, the quote is stale (`now - observed_at > max_staleness_secs`), or the price misses the gate's direction condition |
 | `InvalidPriceGate` | 176 | `with_price_gate` / `initialize_price_gate` (AV-113) with `target == 0`, or a vault-account decode hitting an out-of-range direction byte |
 | `MergeIncompatible` | 177 | `merge_escrows` (AV-114) with different parties, mismatched vesting/vesting-curve/milestones/fee_bps/quorum/dual-sig/mint/timelock terms, or an amount counter that would overflow |
+| `CompoundInterestActive` | 178 | fund-moving transitions while the AV-117 compound-interest tail is live and uncompounded |
+| `InvalidClaimCooldown` | 179 | `claim` (AV-121) while the claim-cooldown tail has not elapsed since the last claim |
+| `InvalidCounterOffer` | 180 | `propose_counter_offer` (AV-122) with a zero amount or a non-future expiry |
+| `InvalidReleaseIntent` | 181 | `release_via_intent` (AV-123) with an Ed25519 signature that does not verify against the initializer key over the canonical intent bytes (bad signature, wrong key, wrong domain, or a retargeted `escrow` field); deliberately not `Unauthorized` — the relayer is permissionless, the signature is the authorization |
+| `IntentNonceReused` | 182 | `release_via_intent` (AV-123) with a `nonce` not strictly greater than the persisted `last_intent_nonce` watermark (replay) |
+| `IntentExpired` | 183 | `release_via_intent` (AV-123) with `now_slot >= expiry_slot` |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1863,6 +1870,13 @@ successful calls that change nothing observable:
   legs ride the event's `release_split` field in table order — the first
   leg carries the bps-floor dust, so an indexer re-derives the exact
   transfer sizes from the one event).
+- `release_via_intent` (AV-123) emits `ReleaseViaIntent` (`from ==
+  Funded`, `to == Funded` on a partial release, `to == Released` on the
+  closing one — the same lifecycle shape as `Released`; `amounts.payout`
+  is the gross amount, `amounts.fee` the AV-17 protocol fee; the intent's
+  `nonce` and `expiry_slot` ride the event's intent fields, and the
+  event's actor is the initializer — the permissionless relayer never
+  appears in the audit trail, the signed intent is the authorization).
 - `release_basket` / `cancel_basket` / `cancel_expired_basket` (AV-95b)
   emit `BasketReleased` / `BasketCancelled` / `BasketExpiredCancelled`
   per settled leg (`from == Funded`, `to == Funded` while legs remain,
@@ -2041,6 +2055,19 @@ amount + recipient; the tip instruction itself is assembled when the
 execution bundle is stamped (the payer is the operator's key, not any
 single action's caller), and the tip always comes out of the operator's
 own pocket, never out of escrowed funds.
+Gasless-intent annotation (AV-123): a `WatchedEscrow` may carry a
+`pending_intent` (`SignedReleaseIntent` — the initializer's signed
+`ReleaseIntent` awaiting relay). When the intent's signature verifies
+against the escrow's initializer key and its nonce is fresh (strictly
+greater than the persisted `last_intent_nonce`), the scan annotates the
+report with an `intent_releases` entry — `escrow_id`, the intent's
+`amount` / `payout_to` / `nonce` / `expiry_slot`, and
+`signature_valid: true` — so the keeper's dry-run preview shows the
+gasless release awaiting relay. The annotation discloses the intent's
+claimed expiry without evaluating it against the clock (the chain
+rejects an expired intent at submission time with `IntentExpired`); it
+is an annotation, not an executable action — the relay path is the
+`release_via_intent` instruction, not the keeper's call list.
 
 ```json
 {"at":1750000000,"scanned":1,"actions":[
@@ -2475,7 +2502,8 @@ two-way consistency check against the IDL parameter table:
 | claim_cooldown_slots | u64 | 8 |
 | last_claim_slot | Option<u64> (1-byte discriminant + 8-byte slot) | 9 |
 | counter_offer | Option<CounterOffer> (1-byte discriminant + 8-byte amount + 8-byte expiry) | 17 |
-| **total**     |                   | **5185** |
+| last_intent_nonce | u64 | 8 |
+| **total**     |                   | **5210** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2597,10 +2625,10 @@ plan payload — `total_amount` u64 + `max_tranches` u8 +
 `release_cooling_secs` (u64, 0 = unconfigured) +
 `release_intent_at` (Option<u64>: 1-byte discriminant + 8-byte
 stamp, `None` when no intent is live)).
-`escrow-state` exposes `VAULT_SPACE` (5193) and
-`VAULT_SPACE_NO_QUORUM` (4703) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (5218) and
+`VAULT_SPACE_NO_QUORUM` (4728) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **37,034,160 lamports** to be
+mainnet rent parameters the full vault needs **37,208,160 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)

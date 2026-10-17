@@ -26,6 +26,18 @@
       ]
     },
     {
+      "name": "release_via_intent",
+      "discriminator": [158, 25, 49, 55, 26, 145, 15, 117],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"},
+        {"name": "payout_to", "type": "publicKey"},
+        {"name": "nonce", "type": "u64"},
+        {"name": "expiry_slot", "type": "u64"},
+        {"name": "signature", "type": {"vec": "u8"}}
+      ]
+    },
+    {
       "name": "release_split",
       "discriminator": [51, 139, 250, 190, 137, 198, 127, 246],
       "accounts": [],
@@ -1038,7 +1050,8 @@
           {"name": "dispute_interest", "type": "u64", "offset": 5168},
           {"name": "claim_cooldown_slots", "type": "u64", "offset": 5176},
           {"name": "last_claim_slot", "type": {"option": "u64"}, "offset": 5184},
-          {"name": "counter_offer", "type": {"option": {"defined": "CounterOffer"}}, "offset": 5193}
+          {"name": "counter_offer", "type": {"option": {"defined": "CounterOffer"}}, "offset": 5193},
+          {"name": "last_intent_nonce", "type": "u64", "offset": 5210}
         ]
       }
     }
@@ -1391,7 +1404,10 @@
     {"code": 177, "name": "MergeIncompatible"},
     {"code": 178, "name": "CompoundInterestActive"},
     {"code": 179, "name": "InvalidClaimCooldown"},
-    {"code": 180, "name": "InvalidCounterOffer"}
+    {"code": 180, "name": "InvalidCounterOffer"},
+    {"code": 181, "name": "InvalidReleaseIntent"},
+    {"code": 182, "name": "IntentNonceReused"},
+    {"code": 183, "name": "IntentExpired"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

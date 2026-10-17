@@ -265,6 +265,7 @@ use crate::{Escrow, EscrowError, EscrowState, MilestonePlan, PriceFeed, QuorumPo
 use crate::{AppealOutcome, BasketSettlement, OverrideValue, TemplatePreset};
 use crate::cpi::CpiError;
 use crate::cpi_call::{CpiInvocation, CpiReceipt};
+use crate::release_intent::ReleaseIntent;
 
 /// What kind of state change an [`EscrowEvent`] records.
 ///
@@ -833,6 +834,17 @@ pub enum EscrowEventKind {
     /// `to == Funded`; the terms are unchanged. The actor is the
     /// initializer.
     CounterOfferRejected,
+    /// AV-123: a gasless release executed through a signed Ed25519
+    /// intent ([`Escrow::release_via_intent`]). The same lifecycle
+    /// shape as [`EscrowEventKind::Released`] (`from == Funded`, `to
+    /// == Funded` on a partial release, `to == Released` when the
+    /// intent drained the lockup); amounts follow the `Released`
+    /// shape (`payout` = the gross intent amount, `fee` = the
+    /// protocol fee). The actor is the initializer — their signature
+    /// authorized the payout; the relayer that submitted the
+    /// transaction is not a party to the escrow and is deliberately
+    /// not recorded.
+    ReleaseViaIntent,
 }
 
 impl EscrowEventKind {
@@ -990,6 +1002,10 @@ impl EscrowEventKind {
             63 => Self::CounterOfferProposed,
             64 => Self::CounterOfferAccepted,
             65 => Self::CounterOfferRejected,
+            // AV-123: appended after CounterOfferRejected so
+            // discriminants 0-65 stay stable for already-serialized
+            // histories.
+            66 => Self::ReleaseViaIntent,
             _ => return None,
         })
     }
@@ -1066,6 +1082,7 @@ impl EscrowEventKind {
             Self::CounterOfferProposed => "counter_offer_proposed",
             Self::CounterOfferAccepted => "counter_offer_accepted",
             Self::CounterOfferRejected => "counter_offer_rejected",
+            Self::ReleaseViaIntent => "release_via_intent",
         }
     }
 
@@ -1143,6 +1160,10 @@ impl EscrowEventKind {
             "counter_offer_proposed" => Self::CounterOfferProposed,
             "counter_offer_accepted" => Self::CounterOfferAccepted,
             "counter_offer_rejected" => Self::CounterOfferRejected,
+            // AV-123: appended after counter_offer_rejected so the
+            // name table stays stable for already-serialized
+            // histories.
+            "release_via_intent" => Self::ReleaseViaIntent,
             _ => return None,
         })
     }
@@ -2203,6 +2224,54 @@ impl IndexedEscrow {
             None,
             None,
             Some(authority),
+        );
+        Ok((payout, fee))
+    }
+
+    /// Release through a signed Ed25519 intent (mirrors
+    /// [`Escrow::release_via_intent`], AV-123 — the gasless /
+    /// meta-transaction path). Emits
+    /// [`EscrowEventKind::ReleaseViaIntent`] (not `Released`) so
+    /// indexers can distinguish an intent-driven payout from a
+    /// party-signed one — the amounts follow the `Released` shape
+    /// (`payout` = the gross intent amount, `fee` = the protocol
+    /// fee). The event actor is the initializer: their signature
+    /// authorized the payout; the relayer that submitted the
+    /// transaction is not a party to the escrow. `at` doubles as the
+    /// state machine's `now` and the event timestamp; `slot` is the
+    /// current Solana slot (the clock sysvar on-chain, never an
+    /// instruction param).
+    ///
+    /// [`Escrow::release_via_intent`]: crate::Escrow::release_via_intent
+    pub fn release_via_intent(
+        &mut self,
+        intent: &ReleaseIntent,
+        signature: &[u8; 64],
+        at: u64,
+        slot: u64,
+        mint: Option<[u8; 32]>,
+    ) -> Result<(u64, u64), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`. A failed intent check (bad signature,
+        // replayed nonce, expired intent) is not a reentrant entry
+        // and emits nothing.
+        let result = self
+            .inner
+            .release_via_intent(intent, signature, at, slot, mint);
+        let (payout, fee) = self.map_reentrant(result, at)?;
+        let initializer = self.inner.initializer();
+        self.push_event(
+            EscrowEventKind::ReleaseViaIntent,
+            from,
+            self.inner.state(),
+            EventAmounts::payout(intent.amount, fee),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(initializer),
         );
         Ok((payout, fee))
     }
@@ -6798,7 +6867,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(59), Some(EscrowEventKind::ReleaseIntentAnnounced));
         assert_eq!(EscrowEventKind::from_discriminant(60), Some(EscrowEventKind::ReleaseIntentVetoed));
         assert_eq!(EscrowEventKind::from_discriminant(61), Some(EscrowEventKind::EscrowsMerged));
-        assert_eq!(EscrowEventKind::from_discriminant(66), None);
+        assert_eq!(EscrowEventKind::from_discriminant(67), None);
     }
 
     #[test]
@@ -6901,7 +6970,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(66), None);
+        assert_eq!(EscrowEventKind::from_discriminant(67), None);
     }
 
     #[test]
@@ -7438,7 +7507,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(66), None);
+        assert_eq!(EscrowEventKind::from_discriminant(67), None);
     }
 
     #[test]
@@ -7453,7 +7522,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(66), None);
+        assert_eq!(EscrowEventKind::from_discriminant(67), None);
     }
 
     #[test]
@@ -7465,7 +7534,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(66), None);
+        assert_eq!(EscrowEventKind::from_discriminant(67), None);
     }
 
     #[test]
@@ -7477,7 +7546,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(66), None);
+        assert_eq!(EscrowEventKind::from_discriminant(67), None);
     }
 
     #[test]
@@ -7489,7 +7558,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(66), None);
+        assert_eq!(EscrowEventKind::from_discriminant(67), None);
     }
 
     #[test]
@@ -7504,7 +7573,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(66), None);
+        assert_eq!(EscrowEventKind::from_discriminant(67), None);
     }
 
     #[test]
@@ -7519,7 +7588,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(66), None);
+        assert_eq!(EscrowEventKind::from_discriminant(67), None);
     }
 
     #[test]
@@ -7531,7 +7600,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(66), None);
+        assert_eq!(EscrowEventKind::from_discriminant(67), None);
     }
 
     #[test]
@@ -7543,7 +7612,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(66), None);
+        assert_eq!(EscrowEventKind::from_discriminant(67), None);
     }
 
     #[test]
@@ -7555,7 +7624,19 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(66), None);
+        assert_eq!(EscrowEventKind::from_discriminant(67), None);
+    }
+
+    #[test]
+    fn release_via_intent_kind_round_trips() {
+        // AV-123: discriminant 66, appended after CounterOfferRejected —
+        // 0–65 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::ReleaseViaIntent;
+        assert_eq!(kind.discriminant(), 66);
+        assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
+        assert_eq!(kind.name(), "release_via_intent");
+        assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
+        assert_eq!(EscrowEventKind::from_discriminant(67), None);
     }
 
     #[test]
