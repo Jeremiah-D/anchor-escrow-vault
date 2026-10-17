@@ -558,7 +558,7 @@ impl Runner {
             }
             ValidOp::Resolve(taker_amount) => {
                 let (payout, fee, refund) = Self::expect_ok(
-                    s.escrow.resolve(ARB, taker_amount, s.mint, None, BOB),
+                    s.escrow.resolve(ARB, taker_amount, now, s.mint, None, BOB),
                     "resolve",
                     ctx,
                     idx,
@@ -684,7 +684,7 @@ impl Runner {
             if state == EscrowState::Disputed {
                 cands.push(Probe {
                     name: "stranger resolve",
-                    run: |s, _| s.escrow.resolve(MALLORY, 0, s.mint, None, BOB).map(|_| ()),
+                    run: |s, now| s.escrow.resolve(MALLORY, 0, now, s.mint, None, BOB).map(|_| ()),
                     expected: EscrowError::Unauthorized,
                 });
             }

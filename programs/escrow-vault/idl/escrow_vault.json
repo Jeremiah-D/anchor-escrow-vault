@@ -999,7 +999,8 @@
           {"name": "slot_timelock_slots", "type": "u64", "offset": 5143},
           {"name": "fund_slot", "type": "u64", "offset": 5151},
           {"name": "compound_interest", "type": "bool", "offset": 5159},
-          {"name": "interest_compounded", "type": "u64", "offset": 5160}
+          {"name": "interest_compounded", "type": "u64", "offset": 5160},
+          {"name": "dispute_interest", "type": "u64", "offset": 5168}
         ]
       }
     }

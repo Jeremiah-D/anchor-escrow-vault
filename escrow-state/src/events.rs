@@ -235,9 +235,9 @@
 //! | ReleaseIntentVetoed (AV-112) | 0 | 0 | 0 | 0 — a live release intent was vetoed (governance signal; the announced release is cancelled) |
 //! | EscrowsMerged (AV-114) | the source's locked amount folded into the survivor | 0 | 0 | 0 |
 //! | ExpiredCranked (AV-48) | 0 | 0 | remainder minus penalty, to the whitelisted destination (the cranker receives nothing) | anti-griefing penalty to the initializer (AV-24; 0 unless the cranker is the taker; AV-115 escalation grows the rate with days past the expiry gate) |
-//! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
-//! | DefaultJudgment (AV-55) | gross taker share (`default_taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
-//! | PanelResolved (AV-65) | gross taker share (the winning vote's `taker_amount`) | protocol fee on the taker's share | initializer's share of the split | 0 |
+//! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's principal share of the split (AV-119: the initializer's dispute-interest share rides the refund transfer — tracked in `dispute_interest`, the event keeps the principal leg) | 0 |
+//! | DefaultJudgment (AV-55) | gross taker share (`default_taker_amount`) | protocol fee on the taker's share | initializer's principal share of the split (AV-119: same dispute-interest rule as `Resolved`) | 0 |
+//! | PanelResolved (AV-65) | gross taker share (the winning vote's `taker_amount`) | protocol fee on the taker's share | initializer's principal share of the split (AV-119: same dispute-interest rule as `Resolved`) | 0 |
 //! | PanelJudgment (AV-65) | the voted split (`taker_amount`) | 0 | 0 | 0 |
 //! | MilestoneSkipped | 0 | 0 | skipped tranche (the initializer's refund) | 0 |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
@@ -3641,14 +3641,27 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
-        let result = self.inner.resolve(authority, taker_amount, mint, rationale_hash, payout_to);
+        // AV-119: the event's `at` doubles as the settlement time —
+        // the dispute window `[disputed_at, at]` accrues at the AV-107
+        // rate inside `resolve`. Capture the pre-settlement remainder
+        // so the event records the principal legs (the AV-107
+        // convention: the yield legs ride the transfers and stay
+        // observable via the `interest_paid` / `dispute_interest`
+        // counters and the snapshot).
+        let remaining = self.inner.remaining_amount();
+        let result =
+            self.inner
+                .resolve(authority, taker_amount, at, mint, rationale_hash, payout_to);
         let (payout, fee, refund) = self.map_reentrant(result, at)?;
         // `taker_amount` is the gross taker share by construction
-        // (`payout + fee == taker_amount`).
+        // (`payout + fee == taker_amount`); the refund leg is the
+        // principal refund — the initializer's dispute-interest share
+        // rides the transfer (see the returned `refund`) but the event
+        // keeps the principal leg, like the taker side.
         let amounts = EventAmounts {
             payout: taker_amount,
             fee,
-            refund,
+            refund: remaining.saturating_sub(taker_amount),
             penalty: 0,
             rent_reclaimed: 0,
         };
@@ -3697,16 +3710,31 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
+        // AV-119: the inner settlement already ran the dispute-window
+        // yield through the shared helper with `now` as `resolved_at`.
+        // Capture the pre-settlement remainder so the event records
+        // the principal refund leg (the AV-107 convention — see
+        // `resolve` above).
+        let remaining = self.inner.remaining_amount();
         let result = self
             .inner
             .trigger_default_judgment(caller, now, mint, payout_to);
         let (payout, fee, refund) = self.map_reentrant(result, at)?;
         // `default_taker_amount` is the gross taker share by construction
-        // (`payout + fee == default_taker_amount`).
+        // (`payout + fee == default_taker_amount`); the event's refund
+        // leg is the principal refund — read the pre-agreed taker
+        // amount off the judgment (the returned `payout` already
+        // carries the taker's dispute-interest share, which stays on
+        // the transfer, not the event).
+        let taker_amount = self
+            .inner
+            .default_judgment()
+            .map(|j| j.default_taker_amount)
+            .unwrap_or(0);
         let amounts = EventAmounts {
             payout: payout + fee,
             fee,
-            refund,
+            refund: remaining.saturating_sub(taker_amount),
             penalty: 0,
             rent_reclaimed: 0,
         };
@@ -3754,9 +3782,20 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
-        let result = self
-            .inner
-            .submit_panel_judgment(member, taker_amount, mint, rationale_hash, payout_to);
+        // AV-119: the vote's `at` doubles as the settling vote's
+        // settlement time — the dispute window accrues to it inside
+        // `submit_panel_judgment`. Capture the pre-settlement
+        // remainder so the `PanelResolved` event records the principal
+        // legs (the AV-107 convention — see `resolve` above).
+        let remaining = self.inner.remaining_amount();
+        let result = self.inner.submit_panel_judgment(
+            member,
+            taker_amount,
+            at,
+            mint,
+            rationale_hash,
+            payout_to,
+        );
         let settled = self.map_reentrant(result, at)?;
         // Every submission is recorded, settled or not: the vote is
         // the audit trail.
@@ -3778,15 +3817,16 @@ impl IndexedEscrow {
             None,
             Some(member),
         );
-        if let Some((_payout, fee, refund)) = settled {
+        if let Some((_payout, fee, _refund)) = settled {
             // The M-th matching vote settled the escrow: emit the
             // settlement after the vote event. `taker_amount` is the
             // gross taker share by construction
-            // (`payout + fee == taker_amount`).
+            // (`payout + fee == taker_amount`); the refund leg is the
+            // principal refund (see `resolve` above).
             let amounts = EventAmounts {
                 payout: taker_amount,
                 fee,
-                refund,
+                refund: remaining.saturating_sub(taker_amount),
                 penalty: 0,
                 rent_reclaimed: 0,
             };

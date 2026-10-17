@@ -1889,6 +1889,16 @@ pub mod escrow_vault {
     /// compatible). Never cleared — `Settled` keeps it as the audit
     /// trail of the arbitration, following the AV-22 `evidence_hash`
     /// convention.
+    /// AV-119: the dispute window `[disputed_at, resolved_at]`
+    /// accrues interest on the locked remainder at the AV-107 rate,
+    /// and the settlement attributes the whole outstanding yield claim
+    /// pro-rata by `taker_amount / remaining` — the taker's share rides
+    /// the taker payout (into `interest_paid`), the initializer's share
+    /// rides the refund (into `dispute_interest`); `resolved_at` comes
+    /// from the clock sysvar (never an instruction param, like
+    /// `release_milestone`'s `now`). On a compound-interest escrow the
+    /// yield folds into the principal instead (AV-117 mutual
+    /// exclusion).
     pub fn resolve(
         ctx: Context<Resolve>,
         taker_amount: u64,
@@ -1896,10 +1906,20 @@ pub mod escrow_vault {
     ) -> Result<(u64, u64, u64)> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let from = escrow.state() as u8;
+        // AV-119: the settlement time doubles as the dispute window's
+        // end — the clock sysvar, never an instruction param (the
+        // `release_milestone` convention). Capture the pre-settlement
+        // remainder so the event records the principal legs (the
+        // AV-107 convention: the yield legs ride the transfers and stay
+        // observable via the `interest_paid` / `dispute_interest`
+        // counters and the snapshot).
+        let resolved_at = Clock::get()?.unix_timestamp as u64;
+        let remaining = escrow.remaining_amount();
         let (payout, fee, refund) = escrow
             .resolve(
                 ctx.accounts.arbiter.key().to_bytes(),
                 taker_amount,
+                resolved_at,
                 vault_token_mint(&ctx.accounts.vault_token_account),
                 rationale_hash,
                 ctx.accounts.payout_to.key().to_bytes(),
@@ -1924,6 +1944,9 @@ pub mod escrow_vault {
         // judgment-time adverse-inference signal favoring the
         // non-escalating party (computed by `emit_transition` from the
         // vault's escrow at emit time).
+        // AV-119: the event records the principal legs — the refund leg
+        // is the principal refund (the initializer's dispute-interest
+        // share rides the transfer, tracked in `dispute_interest`).
         emit_transition(
             &ctx.accounts.vault,
             escrow_state::EscrowEventKind::Resolved,
@@ -1931,8 +1954,8 @@ pub mod escrow_vault {
             escrow.state() as u8,
             taker_amount,
             fee,
-            refund,
-            Clock::get()?.unix_timestamp as u64,
+            remaining.saturating_sub(taker_amount),
+            resolved_at,
             escrow.evidence_hash(),
             rationale_hash,
             None,
@@ -1970,10 +1993,20 @@ pub mod escrow_vault {
     ) -> Result<Option<(u64, u64, u64)>> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let from = escrow.state() as u8;
+        // AV-18: `now` doubles as the event's `at`, mirroring
+        // `IndexedEscrow::submit_panel_judgment`. AV-119: it also
+        // doubles as the settling vote's settlement time — the dispute
+        // window accrues to it inside `submit_panel_judgment` (the
+        // clock sysvar, never an instruction param). Capture the
+        // pre-settlement remainder so the `PanelResolved` event records
+        // the principal legs (the AV-107 convention — see `resolve`).
+        let now = Clock::get()?.unix_timestamp as u64;
+        let remaining = escrow.remaining_amount();
         let settled = escrow
             .submit_panel_judgment(
                 ctx.accounts.member.key().to_bytes(),
                 taker_amount,
+                now,
                 vault_token_mint(&ctx.accounts.vault_token_account),
                 rationale_hash,
                 ctx.accounts.payout_to.key().to_bytes(),
@@ -1985,7 +2018,6 @@ pub mod escrow_vault {
         // emits PanelJudgment (the vote is the audit trail); the
         // settling vote additionally emits PanelResolved with the
         // `Resolved` amounts shape.
-        let now = Clock::get()?.unix_timestamp as u64;
         emit_transition(
             &ctx.accounts.vault,
             escrow_state::EscrowEventKind::PanelJudgment,
@@ -2001,7 +2033,7 @@ pub mod escrow_vault {
             None,
             Some(ctx.accounts.member.key()),
         );
-        if let Some((payout, fee, refund)) = settled {
+        if let Some((_payout, fee, _refund)) = settled {
             emit_transition(
                 &ctx.accounts.vault,
                 escrow_state::EscrowEventKind::PanelResolved,
@@ -2009,7 +2041,7 @@ pub mod escrow_vault {
                 escrow.state() as u8,
                 taker_amount,
                 fee,
-                refund,
+                remaining.saturating_sub(taker_amount),
                 now,
                 escrow.evidence_hash(),
                 rationale_hash,
@@ -2085,6 +2117,16 @@ pub mod escrow_vault {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let now = read_clock_unix_timestamp(&ctx.accounts.clock);
         let from = escrow.state() as u8;
+        // AV-119: the inner settlement already ran the dispute-window
+        // yield through the shared helper with `now` as `resolved_at`.
+        // Capture the pre-settlement remainder and the pre-agreed taker
+        // amount so the event records the principal legs (the AV-107
+        // convention — see `resolve`).
+        let remaining = escrow.remaining_amount();
+        let taker_amount = escrow
+            .default_judgment()
+            .map(|j| j.default_taker_amount)
+            .unwrap_or(0);
         let (payout, fee, refund) = escrow
             .trigger_default_judgment(
                 ctx.accounts.caller.key().to_bytes(),
@@ -2099,6 +2141,9 @@ pub mod escrow_vault {
         // carries the dispute evidence hash the escrow still holds —
         // the fallback settlement references the evidence the (absent)
         // arbiter never reviewed; rationale is None (no arbiter ruled).
+        // AV-119: the refund leg is the principal refund (the
+        // initializer's dispute-interest share rides the transfer,
+        // tracked in `dispute_interest`).
         emit_transition(
             &ctx.accounts.vault,
             escrow_state::EscrowEventKind::DefaultJudgment,
@@ -2106,7 +2151,7 @@ pub mod escrow_vault {
             escrow.state() as u8,
             payout + fee,
             fee,
-            refund,
+            remaining.saturating_sub(taker_amount),
             now,
             escrow.evidence_hash(),
             None,

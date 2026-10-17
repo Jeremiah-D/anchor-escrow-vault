@@ -549,6 +549,11 @@ pub struct EscrowSnapshot {
     /// AV-117: cumulative yield folded into the principal via
     /// compounding.
     pub interest_compounded: u64,
+    /// AV-119: cumulative interest attributed to the initializer via
+    /// dispute settlement — the initializer's pro-rata share of
+    /// dispute settlements' yield claims (the taker's share lands in
+    /// `interest_paid`).
+    pub dispute_interest: u64,
     /// AV-108: the declared multi-recipient payout-split table —
     /// `None` when no split is configured, else the `(recipient,
     /// gross share)` pairs in payout order, so indexers see the
@@ -909,6 +914,11 @@ impl Escrow {
             interest_paid: self.interest_paid(),
             compound_interest: self.compound_interest(),
             interest_compounded: self.interest_compounded(),
+            // AV-119: the dispute-interest sink rides the export — the
+            // initializer's share of dispute settlements' yield, so an
+            // off-chain indexer can audit the winner attribution
+            // without replaying the settlement transitions.
+            dispute_interest: self.dispute_interest(),
             // AV-108: the declared split table rides the export —
             // `None` when unconfigured, so a plain escrow's JSON is
             // unchanged.
@@ -1540,6 +1550,9 @@ impl EscrowSnapshot {
         s.push_str(if self.compound_interest { "true" } else { "false" });
         s.push_str(",\"interest_compounded\":");
         s.push_str(&self.interest_compounded.to_string());
+        // AV-119: the dispute-interest sink.
+        s.push_str(",\"dispute_interest\":");
+        s.push_str(&self.dispute_interest.to_string());
         // AV-108: declared split table — `null` when none is
         // configured, else the (recipient, share) pairs in payout
         // order with recipients as hex strings.
@@ -1655,7 +1668,7 @@ mod snapshot_tests {
              \"insurance_pool\":false,\"pool_paid\":0,\"pool_slashed\":0,\
              \"pool_inflow\":0,\"pool_outflow\":0,\"pool_payout_paid\":0,\
              \"pool_payout_eligible\":false,\
-             \"interest_rate_bps\":0,\"interest_accrued\":0,\"interest_paid\":0,\"compound_interest\":false,\"interest_compounded\":0,\"payout_split\":null,\
+             \"interest_rate_bps\":0,\"interest_accrued\":0,\"interest_paid\":0,\"compound_interest\":false,\"interest_compounded\":0,\"dispute_interest\":0,\"payout_split\":null,\
              \"deadman_inactivity_secs\":0,\"deadman_heir\":null,\"deadman_last_activity\":1700000000,\
              \"deadman_eligible\":false,\"rent_topped_up_total\":0,\"funded_total\":1000000,\"funding_total_amount\":0,\"funding_max_tranches\":0,\"funding_tranches_used\":0,\"funding_complete\":true,\
              \"release_cooling_secs\":0,\"release_intent_at\":null,\"release_cooling_eligible\":true\
@@ -1899,7 +1912,7 @@ mod snapshot_tests {
         e.fund(ALICE, VEST_START).unwrap();
         e.escalate(BOB, MID, None, None, 0).unwrap();
         assert_eq!(e.snapshot(MID).rationale_hash, None);
-        e.resolve(ARBITER, 400_000, None, Some(RATIONALE), BOB).unwrap();
+        e.resolve(ARBITER, 400_000, MID, None, Some(RATIONALE), BOB).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.state, "settled");
         assert_eq!(snap.rationale_hash, Some(RATIONALE));

@@ -3353,7 +3353,7 @@ mod close_keeper_tests {
             .unwrap();
         e.fund(ALICE, MID).unwrap();
         e.escalate(ALICE, MID, None, None, 0).unwrap();
-        e.resolve(ARBITER, 400_000, None, None, BOB).unwrap();
+        e.resolve(ARBITER, 400_000, MID, None, None, BOB).unwrap();
         assert_eq!(e.state(), EscrowState::Settled);
         e
     }
@@ -5438,7 +5438,7 @@ mod stale_sweep_tests {
             .unwrap();
         e.fund(initializer, NOW).unwrap();
         e.escalate(initializer, NOW, None, None, 0).unwrap();
-        e.resolve(ARBITER, 400_000, None, None, BOB).unwrap();
+        e.resolve(ARBITER, 400_000, NOW, None, None, BOB).unwrap();
         assert_eq!(e.state(), EscrowState::Settled);
         e
     }

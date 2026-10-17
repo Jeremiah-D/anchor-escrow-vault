@@ -590,10 +590,15 @@ pub fn refund_plan(
 ///
 /// Consistency checks:
 /// - the escrow is `Settled`;
-/// - `taker_payout + fee` cannot exceed `released_amount()` (the taker's
-///   share enters the `released` counter, AV-14/AV-17);
-/// - `refund` equals the post-settlement remainder
-///   (`amount - released_amount()`);
+/// - `taker_payout + fee` cannot exceed `released_amount()` plus the
+///   cumulative taker-attributed yield (`interest_paid`, AV-107/AV-119:
+///   the taker's share of a dispute settlement's yield claim rides the
+///   taker payout, so the gross legitimately exceeds the released
+///   principal by at most the yield ever paid to the taker);
+/// - `refund` cannot exceed the post-settlement remainder
+///   (`amount - released_amount()`) plus the cumulative
+///   initializer-attributed dispute yield (`dispute_interest`, AV-119:
+///   the initializer's share of the yield claim rides the refund);
 /// - taker / initializer identities pinned; native-path legs go to the
 ///   pinned wallets;
 /// - `addrs.fee_leg` equals the escrow's pinned fee recipient when one
@@ -617,11 +622,27 @@ pub fn resolve_plan(
     if taker_gross == 0 && refund == 0 {
         return Err(CpiError::ZeroAmount);
     }
-    if taker_gross > escrow.released_amount() {
+    // AV-119: the taker's gross may exceed the released principal by
+    // the yield attributed to the taker — bounded above by the
+    // cumulative `interest_paid` sink (sound upper bound: it includes
+    // this settlement's taker share plus any earlier harvests, all of
+    // which legitimately went to the taker).
+    let taker_ceiling = escrow
+        .released_amount()
+        .checked_add(escrow.interest_paid())
+        .ok_or(CpiError::ArithmeticOverflow)?;
+    if taker_gross > taker_ceiling {
         return Err(CpiError::SettlementMismatch);
     }
     let remainder = escrow.amount().saturating_sub(escrow.released_amount());
-    if refund != remainder {
+    // AV-119: the refund may exceed the principal remainder by the
+    // yield attributed to the initializer — bounded above by the
+    // cumulative `dispute_interest` sink (sound upper bound, same
+    // reasoning as the taker leg).
+    let refund_ceiling = remainder
+        .checked_add(escrow.dispute_interest())
+        .ok_or(CpiError::ArithmeticOverflow)?;
+    if refund > refund_ceiling {
         return Err(CpiError::SettlementMismatch);
     }
     if addrs.taker != escrow.taker() {
@@ -1060,7 +1081,7 @@ mod cpi_tests {
             .unwrap();
         e.fund(init, FUND_AT).unwrap();
         e.escalate(taker, 0, None, None, 0).unwrap();
-        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None, key(2)).unwrap();
+        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, 0, None, None, key(2)).unwrap();
         assert_eq!(fee, 0);
         assert_eq!(taker_payout + refund, 1_000_000);
         let addrs = ResolveAddrs {
@@ -1085,6 +1106,64 @@ mod cpi_tests {
         );
     }
 
+    // AV-119: the CPI plan must accept the dispute-interest triple —
+    // the taker leg carries the taker's yield share and the refund leg
+    // carries the initializer's yield share, so both legitimately exceed
+    // their principal-only bounds.
+    #[test]
+    fn resolve_plan_accepts_dispute_interest_legs() {
+        let init = key(1);
+        let taker = key(2);
+        let arbiter = key(5);
+        let mut e = Escrow::initialize(init, taker, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_arbiter(arbiter)
+            .unwrap()
+            .with_interest(500) // 5% p.a.
+            .unwrap();
+        e.fund(init, FUND_AT).unwrap();
+        // 36.5 days to the dispute: 5_000 of yield; one full dispute year
+        // adds 50_000 more — total claim 55_000.
+        let disputed_at = FUND_AT + 3_153_600;
+        e.escalate(taker, disputed_at, None, None, 0).unwrap();
+        // Partial ruling: 600k to the taker, 400k refunded.
+        let (taker_payout, fee, refund) = e
+            .resolve(arbiter, 600_000, disputed_at + 31_536_000, None, None, key(2))
+            .unwrap();
+        assert_eq!(fee, 0);
+        assert_eq!(e.interest_paid(), 33_000, "taker's 60% of the claim");
+        assert_eq!(
+            e.dispute_interest(),
+            22_000,
+            "initializer's 40% of the claim"
+        );
+        assert_eq!(taker_payout, 600_000 + 33_000);
+        assert_eq!(refund, 400_000 + 22_000);
+        let addrs = ResolveAddrs {
+            source: key(10),
+            vault_authority: key(10),
+            taker,
+            taker_leg: taker,
+            fee_leg: key(9),
+            initializer: init,
+            refund_leg: init,
+            transfer_hook: None,
+        };
+        // Both legs exceed their principal-only bounds (600k / 400k)
+        // and must still validate.
+        let plan = resolve_plan(&e, &addrs, taker_payout, fee, refund).unwrap();
+        assert_eq!(plan.total_amount(), 1_000_000 + 55_000);
+        // But an inflated leg beyond the yield sinks is still caught.
+        assert_eq!(
+            resolve_plan(&e, &addrs, taker_payout, fee, refund + 1),
+            Err(CpiError::SettlementMismatch)
+        );
+        assert_eq!(
+            resolve_plan(&e, &addrs, taker_payout + 1, fee, refund),
+            Err(CpiError::SettlementMismatch)
+        );
+    }
+
     #[test]
     fn resolve_plan_with_protocol_fee_emits_three_legs() {
         let init = key(1);
@@ -1098,7 +1177,7 @@ mod cpi_tests {
             .unwrap();
         e.fund(init, FUND_AT).unwrap();
         e.escalate(taker, 0, None, None, 0).unwrap();
-        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None, key(2)).unwrap();
+        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, 0, None, None, key(2)).unwrap();
         assert!(fee > 0);
         let addrs = ResolveAddrs {
             source: key(10),
@@ -1163,7 +1242,7 @@ mod cpi_tests {
             .unwrap();
         e.fund(init, FUND_AT).unwrap();
         e.escalate(taker, 0, None, None, 0).unwrap();
-        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, None, None, key(2)).unwrap();
+        let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, 0, None, None, key(2)).unwrap();
         // 2% of 600_000 = 12_000 fee; the initializer is refunded the rest.
         assert_eq!((taker_payout, fee, refund), (588_000, 12_000, 400_000));
 
@@ -1384,7 +1463,7 @@ mod cpi_tests {
         let bytes = crate::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), crate::ESCROW_BODY_LEN);
         let hook_at =
-            crate::ESCROW_BODY_LEN - crate::PRICE_GATE_LEN - crate::PENALTY_ESCALATION_TAIL_LEN - crate::COMPOUND_INTEREST_TAIL_LEN - crate::SLOT_TIMELOCK_TAIL_LEN - crate::RELEASE_COOLING_TAIL_LEN - crate::FUNDING_TAIL_LEN - crate::RENT_TOP_UP_LEN - crate::DEADMAN_REGION_LEN - crate::PAYOUT_SPLIT_LEN - crate::INTEREST_REGION_LEN - crate::POOL_REGION_LEN - crate::SWAP_LINK_REGION_LEN - crate::APPEAL_BOND_REGION_LEN - crate::DELEGATION_REGION_LEN - crate::STREAMING_FEE_REGION_LEN - 33;
+            crate::ESCROW_BODY_LEN - crate::DISPUTE_INTEREST_LEN - crate::PRICE_GATE_LEN - crate::PENALTY_ESCALATION_TAIL_LEN - crate::COMPOUND_INTEREST_TAIL_LEN - crate::SLOT_TIMELOCK_TAIL_LEN - crate::RELEASE_COOLING_TAIL_LEN - crate::FUNDING_TAIL_LEN - crate::RENT_TOP_UP_LEN - crate::DEADMAN_REGION_LEN - crate::PAYOUT_SPLIT_LEN - crate::INTEREST_REGION_LEN - crate::POOL_REGION_LEN - crate::SWAP_LINK_REGION_LEN - crate::APPEAL_BOND_REGION_LEN - crate::DELEGATION_REGION_LEN - crate::STREAMING_FEE_REGION_LEN - 33;
         assert_eq!(bytes[hook_at], 1, "Some discriminant");
         assert_eq!(&bytes[hook_at + 1..hook_at + 33], &hook);
         // A hook-less escrow zero-fills the region.

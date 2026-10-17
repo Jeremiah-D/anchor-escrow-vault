@@ -70,11 +70,11 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_slash_terms(penalty_account, slash_deadline)` (AV-82) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; the zero penalty account is rejected — the penalty sink must be a real identity, `SlashNotEligible` code 143) |
 | `initialize_arbiter_panel(members, threshold)` (AV-65) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opt-in multisig arbitration: 1–8 member keys, threshold 1..=N, zero/duplicate keys rejected as `InvalidArbiterPanel`, code 136; mutually exclusive with the single arbiter — last-wins in both directions; `rotate_arbiter` is `InvalidStateTransition` in panel mode) |
 | `escalate(authority, now, evidence_hash, evidence_root, evidence_leaves)` (AV-91) | `Funded`       | `Disputed` | initializer **or** taker, only when `now < expires_at` (locks `release`/`cancel`/`cancel_expired`/`claim`); `evidence_hash` is the optional 32-byte off-chain-evidence commitment, persisted; `evidence_root` is the optional SHA-256 Merkle root over the evidence-document set and `evidence_leaves` the committed leaf count (`0` iff the root is `None`, `1..=64` iff `Some` — `InvalidEvidenceProof`, code 148, on a count that does not describe the root); the root/leaves/zeroed disclosure bitmap are persisted and never cleared; refused with `AuctionNotActive` (code 156) while an AV-97 Dutch-auction window is live — price discovery and arbitration are mutually exclusive settlement paths |
-| `resolve(authority, taker_amount, rationale_hash)` | `Disputed`     | `Settled` | arbiter only; atomic split of the remainder (taker payout / initializer refund); `rationale_hash` is the optional 32-byte commitment to the arbiter's off-chain rationale document, persisted in `Settled` (never cleared); **disabled in panel mode** (`PanelResolveDisabled`, code 137 — the panel's multisig judgment is the only settlement path once a panel is configured) |
-| `submit_panel_judgment(member, taker_amount, rationale_hash)` (AV-65) | `Disputed` | `Disputed` (vote recorded) / `Settled` (M matching votes) | panel member only (`Unauthorized` for a stranger); one effective vote per member — a re-vote overwrites the earlier vote (the `PanelJudgment` event keeps the audit trail); the first M votes agreeing on the same `(taker_amount, rationale_hash)` pair settle the escrow automatically (`Settled`, settlement identical to `resolve` — fee slices the taker's share, gross lands in the `released` counter, the initializer is refunded the remainder); non-matching votes stay recorded for audit; the settling vote emits `PanelResolved` after its `PanelJudgment`; `InvalidArbiterPanel` (code 136) with no panel configured |
+| `resolve(authority, taker_amount, rationale_hash)` | `Disputed`     | `Settled` | arbiter only; atomic split of the remainder (taker payout / initializer refund); `rationale_hash` is the optional 32-byte commitment to the arbiter's off-chain rationale document, persisted in `Settled` (never cleared); AV-119: the dispute window `[disputed_at, resolved_at]` (resolved_at from the clock sysvar) accrues interest on the locked remainder at the AV-107 rate, and the whole outstanding yield claim splits pro-rata by `taker_amount / remaining` — the taker's share rides the taker payout (into `interest_paid`), the initializer's share rides the refund (into `dispute_interest`); on a compound-interest escrow the yield folds into the principal instead (AV-117 mutual exclusion); **disabled in panel mode** (`PanelResolveDisabled`, code 137 — the panel's multisig judgment is the only settlement path once a panel is configured) |
+| `submit_panel_judgment(member, taker_amount, rationale_hash)` (AV-65) | `Disputed` | `Disputed` (vote recorded) / `Settled` (M matching votes) | panel member only (`Unauthorized` for a stranger); one effective vote per member — a re-vote overwrites the earlier vote (the `PanelJudgment` event keeps the audit trail); the first M votes agreeing on the same `(taker_amount, rationale_hash)` pair settle the escrow automatically (`Settled`, settlement identical to `resolve` — fee slices the taker's share, gross lands in the `released` counter, the initializer is refunded the remainder; AV-119: the settling vote's time is the dispute window's `resolved_at`, and the yield attribution follows the same pro-rata rule via the shared helper); non-matching votes stay recorded for audit; the settling vote emits `PanelResolved` after its `PanelJudgment`; `InvalidArbiterPanel` (code 136) with no panel configured |
 | `initialize_default_judgment(deadline_secs, default_taker_amount)` (AV-55) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — and only after `initialize_arbiter`; the arbiter must be configured first); declares the fallback split applied when the arbiter never resolves: `deadline_secs` seconds in `Disputed` before the judgment becomes triggerable (must be non-zero — `DefaultJudgmentNotDue` otherwise), `default_taker_amount` the taker's share of the remainder (must be ≤ the locked amount — `ReleaseExceedsLocked` otherwise); the initializer proposes the terms, the taker must still countersign (dual-signed agreement) |
 | `confirm_default_judgment()` (AV-55) | `Uninitialized` / `Funded` | — (no state change; sets the confirmation bit) | **taker only** (`Unauthorized` for a stranger or the initializer); no judgment configured is `DefaultJudgmentNotDue`; idempotent (re-confirming is `Ok`) |
-| `trigger_default_judgment(caller, now, payout_to)` (AV-55) | `Disputed` | `Settled` | **initializer or taker** (either party — a liveness backstop, not a power grant); only once `now >= disputed_at + deadline_secs` (the judgment's due time, `DefaultJudgmentNotDue` otherwise); settles on the pre-agreed split — fee slices the taker's share like `resolve`, quorum/vesting/timelock do *not* gate (same as `resolve`); the arbiter's `resolve` is unchanged and keeps priority — after the deadline either the arbiter resolves or a party triggers, first writer wins; in AV-65 panel mode the default judgment stays available (same deadline rules) and races the panel's M-vote settlement instead; emits `DefaultJudgment` |
+| `trigger_default_judgment(caller, now, payout_to)` (AV-55) | `Disputed` | `Settled` | **initializer or taker** (either party — a liveness backstop, not a power grant); only once `now >= disputed_at + deadline_secs` (the judgment's due time, `DefaultJudgmentNotDue` otherwise); settles on the pre-agreed split — fee slices the taker's share like `resolve`, quorum/vesting/timelock do *not* gate (same as `resolve`); AV-119: `now` doubles as the dispute window's `resolved_at`, and the yield attribution follows the same pro-rata rule as `resolve` via the shared helper; the arbiter's `resolve` is unchanged and keeps priority — after the deadline either the arbiter resolves or a party triggers, first writer wins; in AV-65 panel mode the default judgment stays available (same deadline rules) and races the panel's M-vote settlement instead; emits `DefaultJudgment` |
 | `initialize_evidence_deadline(deadline_secs)` (AV-68) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — and only after the arbiter/panel is configured, `InvalidArbiter` otherwise); declares the window the escalating party gets to disclose the dispute evidence, measured from `disputed_at`; must be non-zero (`InvalidEvidenceDeadline`, code 138, otherwise) |
 | `submit_evidence(authority, evidence_hash, now)` (AV-68) | `Disputed` | `Disputed` (commitment recorded) | **escalating party only** (the party `escalate` recorded — a stranger or the counterparty is `Unauthorized`); overwrites any previously attached hash (a within-deadline submission may always refine the bundle); at or past the disclosure deadline the submission is rejected (`EvidenceDisclosureLate`, code 139) — the deadline is a hard bar, so a missed deadline locks in the judgment-time adverse inference; with no deadline configured disclosure is accepted at any time while `Disputed`; emits `EvidenceSubmitted` |
 | `file_evidence(authority, doc_hash, leaf_index, proof, now)` (AV-91) | `Disputed` | `Disputed` (bitmap bit flipped) | **escalating party only** (mirrors `submit_evidence`); discloses one document against the committed Merkle root — `proof` must carry exactly the siblings the tree shape demands (leaf = `H(0x00 \|\| doc)`, node = `H(0x01 \|\| left \|\| right)`, odd-layer last node promotes unchanged); `InvalidEvidenceProof` (code 148) on no committed root, a past-end leaf index, a wrong-length proof, or a non-verifying proof; the AV-68 deadline bar applies (`EvidenceDisclosureLate` past the window); re-filing is an idempotent no-op; emits `EvidenceFiled` |
@@ -298,11 +298,39 @@ with the standalone harvest: `claim_interest` on a compound escrow is
 `CompoundInterestActive`, code 178 — a separate harvest would double-count
 yield earmarked for the principal. The cumulative folded yield lives in
 `interest_compounded`, so the extended conservation identity
-(`inflow + yield == locked + released + refunded + interest_paid`, with
-`yield == interest_accrued + interest_paid + interest_compounded`) stays
+(`inflow + yield == locked + released + refunded + interest_paid +
+dispute_interest`, with `yield == interest_accrued + interest_paid +
+interest_compounded + dispute_interest`) stays
 exact, and the snapshot exposes `compound_interest` / `interest_compounded`
 for indexers. Builder order is irrelevant: opting in before `with_interest`
 is accepted but inert while the rate is zero (nothing to compound).
+
+**Dispute-interest attribution.** When a dispute settles, the locked funds
+kept earning while arbitration ran: the dispute window
+`[disputed_at, resolved_at]` accrues interest on the locked remainder at
+the AV-107 rate (`resolved_at` comes from the clock sysvar — never an
+instruction param, like `release_milestone`'s `now`). The *entire*
+outstanding yield claim — the frozen pre-dispute claim plus the window
+accrual — is then attributed to the ruling's winner, pro-rata by the
+taker's principal share `taker_amount / remaining`: a taker full win takes
+interest + principal (the pre-AV-119 behavior, unchanged), an initializer
+full win refunds the whole claim with the principal, and a partial ruling
+splits it (`taker_share = total * taker_amount / remaining`, floor
+division; the initializer takes the remainder, so no lamport is created
+or destroyed). The taker's share rides the taker payout into
+`interest_paid` (fee-free, the AV-107 taker sink — its meaning is
+unchanged); the initializer's share rides the refund into the new
+`dispute_interest` audit sink, extending the conservation identity to
+`inflow + yield == locked + released + refunded + interest_paid +
+dispute_interest` (with `yield == interest_accrued + interest_paid +
+interest_compounded + dispute_interest`). All three settlement paths —
+`resolve`, the panel's settling vote, and `trigger_default_judgment` —
+run the same shared helper, so the attribution cannot fork between them;
+on a compound-interest escrow the yield folds into the principal instead
+(the AV-117 mutual exclusion, `CompoundInterestActive` code 178) and both
+legs are zero. The settlement events keep recording the principal legs —
+the yield attribution stays observable via the counters and the snapshot
+(`dispute_interest` is exported there).
 
 **Emergency timelock unlock.** An escrow can additionally opt into
 dual-signed emergency governance (`with_emergency_unlock()`, once, before
@@ -1326,7 +1354,8 @@ inflow on top of the principal), with
 and `released` accumulates partial payouts). AV-107 extends the identity
 with the interest sink: `interest_paid` joins the outflow side as its own
 term (`inflow + yield == locked + released + refunded + interest_paid +
-…`), so principal (`released`) and yield (`interest_paid`) stay
+dispute_interest`), so principal (`released`) and yield (`interest_paid` /
+`dispute_interest`) stay
 separately auditable — the interest tests assert it across
 accrue → harvest → release lifecycles. Property-based tests
 (hand-rolled generator, boundary-biased amounts
@@ -2404,7 +2433,8 @@ two-way consistency check against the IDL parameter table:
 | fund_slot | u64 | 8 |
 | compound_interest | bool | 1 |
 | interest_compounded | u64 | 8 |
-| **total**     |                   | **5160** |
+| dispute_interest | u64 | 8 |
+| **total**     |                   | **5168** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2526,10 +2556,10 @@ plan payload — `total_amount` u64 + `max_tranches` u8 +
 `release_cooling_secs` (u64, 0 = unconfigured) +
 `release_intent_at` (Option<u64>: 1-byte discriminant + 8-byte
 stamp, `None` when no intent is live)).
-`escrow-state` exposes `VAULT_SPACE` (5168) and
-`VAULT_SPACE_NO_QUORUM` (4678) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (5176) and
+`VAULT_SPACE_NO_QUORUM` (4686) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **36,860,160 lamports** to be
+mainnet rent parameters the full vault needs **36,915,840 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -3391,10 +3421,14 @@ The taker harvests the yield two ways: `claim_interest(authority, now)`
 strict check, so a compromised operator cannot divert the yield
 stream), `Funded → Funded`, no state change — or bundled with a taker
 payout (`release`, `claim`, the milestone/period/basket legs, and the
-three dispute settlements all sweep the outstanding claim into the
-taker's leg). A dispute freezes the clock at `disputed_at` (AV-55): the
-claim neither grows nor rots while arbitration runs, and the settlement
-pays the frozen claim to the taker. `cancel` / `cancel_expired` void the
+taker's share of the three dispute settlements). A dispute freezes the
+pre-dispute clock at `disputed_at` (AV-55); AV-119 additionally accrues
+the dispute window `[disputed_at, resolved_at]` on the locked remainder,
+and the settlement attributes the whole outstanding claim pro-rata by
+`taker_amount / remaining` — the taker's share into `interest_paid`,
+the initializer's share into the new `dispute_interest` sink (a taker
+full win keeps the pre-AV-119 behavior; an initializer full win refunds
+the whole claim). `cancel` / `cancel_expired` void the
 outstanding claim — a cancelled deal unwinds to the pre-deal state, so
 no yield is owed on funds that never settled (`interest_paid` is
 untouched, so the forfeiture stays distinguishable from a payout in the
@@ -3402,7 +3436,9 @@ audit trail).
 
 The accounting rule that matters: `interest_paid` is the new sink in
 the extended conservation identity — `inflow + yield == locked +
-released + refunded + interest_paid + …`, one term per sink. Interest
+released + refunded + interest_paid + dispute_interest`, one term per
+sink: the taker's share of a dispute settlement's yield lands in
+`interest_paid`, the initializer's share in `dispute_interest`. Interest
 never leaks into `released`: principal and yield stay separately
 auditable, and the tests assert the identity across accrue → harvest →
 release lifecycles. Three deliberate non-couplings: the yield leg is

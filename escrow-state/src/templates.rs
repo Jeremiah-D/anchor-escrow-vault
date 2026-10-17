@@ -1078,7 +1078,7 @@ mod template_tests {
         assert_eq!(e.evidence_deadline_secs(), 7_200);
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         e.escalate(ALICE, EXPIRES_AT - 1_000, None, None, 0).unwrap();
-        let (payout, _fee, refund) = e.resolve(ARBITER, 600_000, None, None, BOB).unwrap();
+        let (payout, _fee, refund) = e.resolve(ARBITER, 600_000, EXPIRES_AT - 1_000, None, None, BOB).unwrap();
         assert_eq!(payout, 600_000);
         assert_eq!(refund, 400_000);
     }

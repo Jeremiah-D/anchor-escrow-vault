@@ -657,7 +657,7 @@ mod swap_tests {
         b.fund(BOB, T0).unwrap();
         a.escalate(ALICE, T0 + 1, None, None, 0).unwrap();
         assert_eq!(
-            a.resolve(MALLORY, 600, None, None, BOB),
+            a.resolve(MALLORY, 600, T0 + 1, None, None, BOB),
             Err(EscrowError::SwapLinkActive)
         );
         let (mut c, _) = funded_pair();
