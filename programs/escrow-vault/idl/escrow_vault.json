@@ -554,6 +554,14 @@
       ]
     },
     {
+      "name": "initialize_claim_cooldown",
+      "discriminator": [142, 108, 223, 48, 74, 229, 128, 30],
+      "accounts": [],
+      "args": [
+        {"name": "slots", "type": "u64"}
+      ]
+    },
+    {
       "name": "initialize_evidence_deadline",
       "discriminator": [204, 4, 240, 39, 232, 161, 251, 234],
       "accounts": [],
@@ -1000,7 +1008,9 @@
           {"name": "fund_slot", "type": "u64", "offset": 5151},
           {"name": "compound_interest", "type": "bool", "offset": 5159},
           {"name": "interest_compounded", "type": "u64", "offset": 5160},
-          {"name": "dispute_interest", "type": "u64", "offset": 5168}
+          {"name": "dispute_interest", "type": "u64", "offset": 5168},
+          {"name": "claim_cooldown_slots", "type": "u64", "offset": 5176},
+          {"name": "last_claim_slot", "type": {"option": "u64"}, "offset": 5184}
         ]
       }
     }
@@ -1341,7 +1351,8 @@
     {"code": 175, "name": "PriceGateNotSatisfied"},
     {"code": 176, "name": "InvalidPriceGate"},
     {"code": 177, "name": "MergeIncompatible"},
-    {"code": 178, "name": "CompoundInterestActive"}
+    {"code": 178, "name": "CompoundInterestActive"},
+    {"code": 179, "name": "InvalidClaimCooldown"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

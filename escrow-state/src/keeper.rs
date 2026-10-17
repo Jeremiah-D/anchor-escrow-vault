@@ -4563,6 +4563,154 @@ mod keeper_milestone_tests {
 // fixed field order, 64-char lowercase hex keys, lamports as plain
 // integers (the exact unit the top-up transfer moves).
 
+/// One not-yet-executable taker `claim`: the escrow, and why the
+/// keeper must wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimCooldownBlocked {
+    /// Which escrow this item belongs to.
+    pub escrow_id: [u8; 32],
+    /// Always `"claim"` today: the taker's pull path is the only
+    /// cooldown-gated call.
+    pub action: &'static str,
+    /// Always `"claim_cooldown"`: the AV-121 per-taker cooldown has
+    /// not elapsed at the scan slot.
+    pub reason: &'static str,
+    /// The first slot at which the taker's next claim is eligible
+    /// ([`Escrow::claim_cooldown_eligible_at`]) — the operator
+    /// compares against the chain tip, like
+    /// [`KeeperAction::slot_unlock_at`].
+    pub eligible_at: u64,
+}
+
+/// The claim-cooldown scan result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimCooldownReport {
+    /// The `now` (Unix seconds) the scan ran at.
+    pub at: u64,
+    /// The Solana slot the scan ran at.
+    pub slot: u64,
+    /// How many escrows were scanned.
+    pub scanned: usize,
+    /// Cooldown-blocked `claim` items, in the input's order.
+    pub blocked: Vec<ClaimCooldownBlocked>,
+}
+
+impl ClaimCooldownReport {
+    /// True when the scan found no cooldown-blocked claim.
+    pub fn is_empty(&self) -> bool {
+        self.blocked.is_empty()
+    }
+
+    /// Hand-serialized JSON (the crate is dependency-free).
+    /// Deterministic field order; keys are 64-char lowercase hex.
+    ///
+    /// ```json
+    /// {"at":1000000,"slot":270000000,"scanned":1,"blocked":[
+    ///   {"escrow_id":"...","action":"claim",
+    ///    "reason":"claim_cooldown","eligible_at":270000100}
+    /// ]}
+    /// ```
+    pub fn to_json(&self) -> String {
+        let mut s = String::with_capacity(64 + self.blocked.len() * 160);
+        s.push_str("{\"at\":");
+        s.push_str(&self.at.to_string());
+        s.push_str(",\"slot\":");
+        s.push_str(&self.slot.to_string());
+        s.push_str(",\"scanned\":");
+        s.push_str(&self.scanned.to_string());
+        s.push_str(",\"blocked\":[");
+        for (i, b) in self.blocked.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"escrow_id\":\"");
+            s.push_str(&hex32(&b.escrow_id));
+            s.push_str("\",\"action\":\"");
+            s.push_str(b.action);
+            s.push_str("\",\"reason\":\"");
+            s.push_str(b.reason);
+            s.push_str("\",\"eligible_at\":");
+            s.push_str(&b.eligible_at.to_string());
+            s.push('}');
+        }
+        s.push_str("]}");
+        s
+    }
+}
+
+/// Scan `watched` at (`now`, `slot`) and return every taker `claim`
+/// the AV-121 per-taker cooldown blocks. Pure read over the
+/// snapshots: zero side effects, deterministic output in input
+/// order.
+///
+/// A blocked item is a claim the chain would reject with
+/// [`EscrowError::InvalidClaimCooldown`](crate::EscrowError::InvalidClaimCooldown)
+/// and nothing else: `Funded`, the taker's pull path attached
+/// (vesting or AV-97 Dutch auction, no milestone plan — the plan
+/// owns the release schedule and disables `claim`), a positive
+/// claimable amount at `now`, any configured quorum satisfied and
+/// the AV-27/AV-64 timelock unlocked (mirroring
+/// [`scan_keeper_actions`]' claim listing), a nonzero cooldown
+/// configured, a previous claim recorded — and the cooldown gate
+/// not yet eligible at `slot`.
+///
+/// Unlike [`scan_keeper_actions`] this scan takes the chain slot:
+/// the cooldown is slot-measured (AV-116 slot semantics), so only
+/// a slot-bearing scan can evaluate it. The main scan keeps its
+/// wall-clock signature and never lists a claim it cannot prove
+/// executable; the cooldown-blocked items land here instead of
+/// vanishing silently.
+pub fn scan_claim_cooldown(
+    watched: &[WatchedEscrow],
+    now: u64,
+    slot: u64,
+) -> ClaimCooldownReport {
+    let mut blocked = Vec::new();
+    for w in watched {
+        let e = &w.escrow;
+        if e.state() != EscrowState::Funded {
+            continue;
+        }
+        // The taker's pull path only: vesting or auction prices the
+        // claim, and a milestone plan disables it (mirrors the
+        // `claim` listing in `scan_keeper_actions`).
+        if (e.vesting_schedule().is_none() && e.auction().is_none()) || e.milestone_plan().is_some() {
+            continue;
+        }
+        if e.claimable_amount(now) == 0 {
+            continue;
+        }
+        if !e.quorum().map(|q| q.is_satisfied()).unwrap_or(true) {
+            continue;
+        }
+        if !e.is_unlock_eligible(now) {
+            continue;
+        }
+        // Everything the chain would accept is in place — except the
+        // cooldown: configured, previously claimed, and not yet
+        // eligible at the scan slot.
+        let eligible_at = match e.claim_cooldown_eligible_at() {
+            Some(at) => at,
+            None => continue,
+        };
+        if slot >= eligible_at {
+            continue;
+        }
+        blocked.push(ClaimCooldownBlocked {
+            escrow_id: w.escrow_id,
+            action: "claim",
+            reason: "claim_cooldown",
+            eligible_at,
+        });
+    }
+    ClaimCooldownReport {
+        at: now,
+        slot,
+        scanned: watched.len(),
+        blocked,
+    }
+}
+
 /// One watched vault with its measured on-chain lamports balance: the
 /// caller-supplied identity, the read-only state snapshot, and the vault
 /// account's *actual* lamports as observed off-chain (e.g. via

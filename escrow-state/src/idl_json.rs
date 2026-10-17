@@ -1020,7 +1020,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 79, "error variant count drift");
+    assert_eq!(errors.len(), 80, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -1109,6 +1109,8 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::InvalidPriceGate.code(), 176);
     // AV-117: appended, never renumbered.
     assert_eq!(EscrowError::CompoundInterestActive.code(), 178);
+    // AV-121: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidClaimCooldown.code(), 179);
 }
 
 #[test]
@@ -1328,7 +1330,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
     // the compound-interest tail after the slot-timelock tail. AV-119
     // appended the dispute-interest tail after the compound tail, so
     // every earlier tail now sits 8 bytes further from the body's end.
-    assert_eq!(pg_offset, 8 + ESCROW_BODY_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - 4 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN);
+    assert_eq!(pg_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - 4 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN);
     // AV-115: the escalation tail sits just before the AV-116 tail.
     let rate = body_field(&enc, &offsets, "penalty_escalation_rate_bps");
     assert_eq!(rate.len(), 2);
@@ -1337,7 +1339,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "penalty_escalation_rate_bps")
         .copied()
         .expect("penalty_escalation_rate_bps in IDL offsets");
-    assert_eq!(rate_offset, 8 + ESCROW_BODY_LEN - DISPUTE_INTEREST_LEN - 4 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN);
+    assert_eq!(rate_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - DISPUTE_INTEREST_LEN - 4 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN);
     let cap = body_field(&enc, &offsets, "penalty_escalation_cap_bps");
     assert_eq!(cap.len(), 2);
     let (_, cap_offset, _) = offsets
@@ -1345,7 +1347,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "penalty_escalation_cap_bps")
         .copied()
         .expect("penalty_escalation_cap_bps in IDL offsets");
-    assert_eq!(cap_offset, 8 + ESCROW_BODY_LEN - DISPUTE_INTEREST_LEN - 2 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN);
+    assert_eq!(cap_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - DISPUTE_INTEREST_LEN - 2 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN);
     // AV-116: the slot-timelock tail is the last 16 bytes of the body.
     let slots = body_field(&enc, &offsets, "slot_timelock_slots");
     assert_eq!(slots.len(), 8);
@@ -1354,7 +1356,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "slot_timelock_slots")
         .copied()
         .expect("slot_timelock_slots in IDL offsets");
-    assert_eq!(slots_offset, 8 + ESCROW_BODY_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN);
+    assert_eq!(slots_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN);
     let fslot = body_field(&enc, &offsets, "fund_slot");
     assert_eq!(fslot.len(), 8);
     let (_, fslot_offset, _) = offsets
@@ -1362,7 +1364,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "fund_slot")
         .copied()
         .expect("fund_slot in IDL offsets");
-    assert_eq!(fslot_offset, 8 + ESCROW_BODY_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - 8);
+    assert_eq!(fslot_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - 8);
     // AV-117: the compound-interest tail sits just before the AV-119
     // dispute-interest tail (the absolute tail).
     let (_, ci_offset, _) = offsets
@@ -1370,14 +1372,15 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "compound_interest")
         .copied()
         .expect("compound_interest in IDL offsets");
-    assert_eq!(ci_offset, 8 + ESCROW_BODY_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN);
+    assert_eq!(ci_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN);
     let (_, ic_offset, _) = offsets
         .iter()
         .find(|(n, _, _)| *n == "interest_compounded")
         .copied()
         .expect("interest_compounded in IDL offsets");
-    assert_eq!(ic_offset, 8 + ESCROW_BODY_LEN - DISPUTE_INTEREST_LEN - 8);
-    // AV-119: the dispute-interest tail is the absolute tail.
+    assert_eq!(ic_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - DISPUTE_INTEREST_LEN - 8);
+    // AV-119: the dispute-interest tail (no longer the absolute
+    // tail since AV-121).
     let di = body_field(&enc, &offsets, "dispute_interest");
     assert_eq!(di.len(), 8);
     let (_, di_offset, _) = offsets
@@ -1385,7 +1388,25 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "dispute_interest")
         .copied()
         .expect("dispute_interest in IDL offsets");
-    assert_eq!(di_offset, 8 + ESCROW_BODY_LEN - DISPUTE_INTEREST_LEN);
+    assert_eq!(di_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN - DISPUTE_INTEREST_LEN);
+    // AV-121: the claim-cooldown tail is the absolute tail — the
+    // 8-byte opt-in duration plus the 9-byte last-claim slot anchor.
+    let ccd = body_field(&enc, &offsets, "claim_cooldown_slots");
+    assert_eq!(ccd.len(), 8);
+    let (_, ccd_offset, _) = offsets
+        .iter()
+        .find(|(n, _, _)| *n == "claim_cooldown_slots")
+        .copied()
+        .expect("claim_cooldown_slots in IDL offsets");
+    assert_eq!(ccd_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN);
+    let lcs = body_field(&enc, &offsets, "last_claim_slot");
+    assert_eq!(lcs.len(), 9);
+    let (_, lcs_offset, _) = offsets
+        .iter()
+        .find(|(n, _, _)| *n == "last_claim_slot")
+        .copied()
+        .expect("last_claim_slot in IDL offsets");
+    assert_eq!(lcs_offset, 8 + ESCROW_BODY_LEN - CLAIM_COOLDOWN_TAIL_LEN + 8);
 }
 
 #[test]

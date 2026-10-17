@@ -285,6 +285,23 @@ the snapshot exposes `slot_timelock_slots` / `fund_slot` and the keeper
 report discloses the unlock slot (`slot_unlock_at`) so operators compare
 it against the chain tip.
 
+**Per-taker claim cooldown.** An escrow can opt into a *claim cooldown*
+(`with_claim_cooldown(slots)`, once, before funding; `slots` is the minimum
+slot distance between two taker `claim` calls, `0` = no cooldown). After
+that, the taker's second and later claims require `slot >= last_claim_slot
++ slots` (`InvalidClaimCooldown`, code 179, inside the window), where
+`last_claim_slot` is the clock sysvar's slot the previous successful claim
+recorded and `slot` is the sysvar's slot at the claim call (never an
+instruction param — a caller-supplied slot would let the taker
+fast-forward the cooldown). The first claim is always eligible. The
+cooldown is measured in slots, the same slot semantics as the AV-116 slot
+timelock — the point is anti-spam: a taker cannot machine-gun `claim`
+instructions to grief the initializer with priority-fee bidding wars. The
+keeper's cooldown scan (`scan_claim_cooldown`) reports claims stuck inside
+the window as blocked with reason `claim_cooldown` and the eligible slot,
+so operators see exactly when the next claim unlocks. The snapshot exposes
+`claim_cooldown_slots` / `last_claim_slot` for indexers.
+
 **Compound-interest accrual.** An interest-bearing escrow can opt into
 *compound* mode (`with_compound_interest()`, once, before funding). When
 on, the accrued yield folds into the principal at every claim/settlement
@@ -2434,7 +2451,9 @@ two-way consistency check against the IDL parameter table:
 | compound_interest | bool | 1 |
 | interest_compounded | u64 | 8 |
 | dispute_interest | u64 | 8 |
-| **total**     |                   | **5168** |
+| claim_cooldown_slots | u64 | 8 |
+| last_claim_slot | Option<u64> (1-byte discriminant + 8-byte slot) | 9 |
+| **total**     |                   | **5185** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2556,10 +2575,10 @@ plan payload — `total_amount` u64 + `max_tranches` u8 +
 `release_cooling_secs` (u64, 0 = unconfigured) +
 `release_intent_at` (Option<u64>: 1-byte discriminant + 8-byte
 stamp, `None` when no intent is live)).
-`escrow-state` exposes `VAULT_SPACE` (5176) and
-`VAULT_SPACE_NO_QUORUM` (4686) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (5193) and
+`VAULT_SPACE_NO_QUORUM` (4703) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **36,915,840 lamports** to be
+mainnet rent parameters the full vault needs **37,034,160 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)

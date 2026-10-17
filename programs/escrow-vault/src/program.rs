@@ -1108,6 +1108,15 @@ pub mod escrow_vault {
         if !escrow.is_slot_unlock_eligible(slot) {
             return Err(escrow_error(escrow_state::EscrowError::TimelockNotReached));
         }
+        // AV-121: the per-taker claim cooldown gates the payout on
+        // the clock sysvar's slot — never an instruction param, same
+        // rule as the AV-116 slot lock. Evaluated after the
+        // slot-timelock gate so the two gates compose; a no-op when
+        // no cooldown is configured, and the taker's first claim is
+        // always eligible.
+        if !escrow.is_claim_cooldown_eligible(slot) {
+            return Err(escrow_error(escrow_state::EscrowError::InvalidClaimCooldown));
+        }
         // AV-113: like `release` — a configured price gate routes the
         // taker's pull through the gated entry point, fed by the
         // oracle account's quote (see `read_oracle_quote`).
@@ -1133,6 +1142,11 @@ pub mod escrow_vault {
                 )
                 .map_err(|e| escrow_error(e))?
         };
+        // AV-121: anchor the cooldown window at this claim's slot —
+        // the next claim is eligible at `slot +
+        // claim_cooldown_slots`. Written in place (`vault.last_claim_slot`
+        // is always present, 9 bytes, `None`-zeroed by default).
+        escrow.record_claim_slot(slot);
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // AV-31: settle via `cpi_settle_payout` (`PayoutKind::Claim`) —
         // see `release`: `escrow_state::cpi::payout_plan` builds and
@@ -2645,6 +2659,31 @@ pub mod escrow_vault {
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // `vault.slot_timelock_slots` is always present (8 bytes,
+        // zeroed by default), so the duration is written in place — no
+        // realloc needed in the real build.
+        Ok(())
+    }
+
+    /// Opt in to the per-taker claim cooldown (AV-121; mirrors
+    /// `Escrow::with_claim_cooldown`). `Uninitialized` only, like
+    /// `initialize_slot_timelock`: the minimum slot distance between
+    /// two taker `claim` calls is fixed before funds move. After
+    /// this, the taker's second and later claims require `slot >=
+    /// last_claim_slot + slots` (`InvalidClaimCooldown`, code 179,
+    /// inside the window) — the cooldown is measured in Solana
+    /// slots, the same slot semantics as AV-116. The first claim is
+    /// always eligible. Emits no event (pre-fund configuration, like
+    /// `initialize_slot_timelock`).
+    pub fn initialize_claim_cooldown(
+        ctx: Context<InitializeClaimCooldown>,
+        slots: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_claim_cooldown(slots)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // `vault.claim_cooldown_slots` is always present (8 bytes,
         // zeroed by default), so the duration is written in place — no
         // realloc needed in the real build.
         Ok(())
@@ -7238,6 +7277,16 @@ pub struct InitializeSlotTimelock<'info> {
     /// leaves `Uninitialized`, and rejects a nonzero slot duration
     /// together with a nonzero AV-27 absolute timelock or AV-64
     /// relative timelock (`InvalidTimelock`).
+    pub initializer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeClaimCooldown<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer opts into the per-taker claim cooldown;
+    /// the state machine rejects re-configuration once the escrow
+    /// leaves `Uninitialized`.
     pub initializer: Signer<'info>,
 }
 

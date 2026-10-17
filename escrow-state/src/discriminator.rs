@@ -1181,6 +1181,21 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // `Escrow::settle_dispute_interest`, not re-litigated here.
     let dispute_interest = c.u64_le()?;
 
+    // AV-121: the claim-cooldown tail — the 8-byte opt-in
+    // per-taker cooldown duration plus the last-claim slot anchor
+    // (1-byte discriminant + 8-byte slot). Structural decode only
+    // — the cooldown is enforced by
+    // `Escrow::claim_cooldown_gated`, not re-litigated here.
+    let claim_cooldown_slots = c.u64_le()?;
+    let last_claim_slot = if c.option_present("last_claim_slot")? {
+        Some(c.u64_le()?)
+    } else {
+        // Absent: skip the reserved 8-byte payload (the encoder
+        // zero-pads it, matching the other `Option` regions).
+        c.skip(8)?;
+        None
+    };
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1417,6 +1432,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-119: the dispute-interest tail decodes like any other
         // persisted tail field.
         dispute_interest,
+        // AV-121: the claim-cooldown tail decodes like any other
+        // persisted tail field.
+        claim_cooldown_slots,
+        last_claim_slot,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
