@@ -157,6 +157,14 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         | EscrowEventKind::DelegationRevoked
         // AV-105: a config change — no fund movement.
         | EscrowEventKind::SwapLinked
+        // AV-122: negotiation state flips — no fund movement. The
+        // `CounterOfferProposed` payout is the *proposed* amount, not
+        // an executed transfer, so booking it would invent a payout
+        // (the PanelJudgment rule).
+        | EscrowEventKind::Declined
+        | EscrowEventKind::CounterOfferProposed
+        | EscrowEventKind::CounterOfferAccepted
+        | EscrowEventKind::CounterOfferRejected
         // A panel vote moves no funds — and `PanelJudgment`'s `payout`
         // is the *voted* split, not an executed one, so booking it
         // would invent a payout; only the settling `PanelResolved`
@@ -650,6 +658,11 @@ mod event_sourcing_tests {
                 | EscrowEventKind::TemplateApplied
                 | EscrowEventKind::VaultsBatchClosed
                 | EscrowEventKind::CpiAllowlistUpdated
+                // AV-122: negotiation state flips — no fund movement.
+                | EscrowEventKind::Declined
+                | EscrowEventKind::CounterOfferProposed
+                | EscrowEventKind::CounterOfferAccepted
+                | EscrowEventKind::CounterOfferRejected
                 | EscrowEventKind::AppealFiled
                 | EscrowEventKind::AppealResolved
                 | EscrowEventKind::AppealExpired

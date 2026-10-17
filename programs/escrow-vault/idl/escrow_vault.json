@@ -137,6 +137,33 @@
       "args": []
     },
     {
+      "name": "decline_escrow",
+      "discriminator": [111, 167, 119, 192, 35, 99, 36, 84],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "propose_counter_offer",
+      "discriminator": [61, 70, 107, 218, 131, 161, 227, 247],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"},
+        {"name": "expiry", "type": "u64"}
+      ]
+    },
+    {
+      "name": "accept_counter_offer",
+      "discriminator": [94, 106, 245, 253, 116, 96, 27, 165],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "reject_counter_offer",
+      "discriminator": [15, 233, 114, 177, 34, 171, 222, 60],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "attest",
       "discriminator": [83, 148, 120, 119, 144, 139, 117, 160],
       "accounts": [],
@@ -1010,7 +1037,8 @@
           {"name": "interest_compounded", "type": "u64", "offset": 5160},
           {"name": "dispute_interest", "type": "u64", "offset": 5168},
           {"name": "claim_cooldown_slots", "type": "u64", "offset": 5176},
-          {"name": "last_claim_slot", "type": {"option": "u64"}, "offset": 5184}
+          {"name": "last_claim_slot", "type": {"option": "u64"}, "offset": 5184},
+          {"name": "counter_offer", "type": {"option": {"defined": "CounterOffer"}}, "offset": 5193}
         ]
       }
     }
@@ -1270,6 +1298,16 @@
           {"name": "max_staleness_secs", "type": "u64", "offset": 9}
         ]
       }
+    },
+    {
+      "name": "CounterOffer",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "amount", "type": "u64", "offset": 0},
+          {"name": "expiry", "type": "u64", "offset": 8}
+        ]
+      }
     }
   ],
   "errors": [
@@ -1352,7 +1390,8 @@
     {"code": 176, "name": "InvalidPriceGate"},
     {"code": 177, "name": "MergeIncompatible"},
     {"code": 178, "name": "CompoundInterestActive"},
-    {"code": 179, "name": "InvalidClaimCooldown"}
+    {"code": 179, "name": "InvalidClaimCooldown"},
+    {"code": 180, "name": "InvalidCounterOffer"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

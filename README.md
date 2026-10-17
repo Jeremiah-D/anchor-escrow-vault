@@ -117,6 +117,10 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `activate(authority)`                       | `Uninitialized`| `Uninitialized` (one party) / `Activated` (both parties) | initializer **or** taker (dual-sig escrows only) |
 | `initialize_vesting(start, end, cliff)`     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `start < end`; `cliff` 0 = no cliff, else `cliff <= end`) |
 | `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); with an AV-97 Dutch auction attached, `claim` prices through the descending auction cap inside `[start_at, end_at]` instead of the vesting curve (`AuctionNotActive`, code 156, outside the window) — the gross lands in the same `released` counter and the initializer reclaims the remainder via `cancel` / `cancel_partial` |
+| `decline_escrow(authority, now)` (AV-122) | `Funded` | `Declined` | taker only, only before any claim (`released == 0` — a taker who already claimed accepted the deal); terminal for fund movements — only `close_vault` retires the vault; resets the deadman clock; emits `Declined` |
+| `propose_counter_offer(authority, amount, expiry, now)` (AV-122) | `Funded` | `CounterOffered` | taker only, only before any claim; `amount` must be nonzero and `expiry` in the future (`InvalidCounterOffer`, code 180, otherwise); stores the offer — fund movements and `escalate` frozen until the initializer answers; resets the deadman clock; emits `CounterOfferProposed` |
+| `accept_counter_offer(authority, now)` (AV-122) | `CounterOffered` | `Funded` | initializer only; atomically re-sets `amount`/`expires_at` to the offered terms (terms-only — no funds move); resets the deadman clock; emits `CounterOfferAccepted` |
+| `reject_counter_offer(authority, now)` (AV-122) | `CounterOffered` | `Funded` | initializer only; drops the offer, terms unchanged; resets the deadman clock; emits `CounterOfferRejected` |
 | `initialize_dutch_auction(start_at, end_at, reserve_bps)` (AV-97) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the descending-price settlement window: `start_at < end_at`, `reserve_bps` in 0–10000 — `InvalidAuctionParams`, code 155, otherwise); the taker's pull path becomes the auction cap `max(amount * (end_at - now) / (end_at - start_at), amount * reserve_bps / 10000)` inside the window — early claimers keep more, the `reserve_bps` floor is the initializer's guaranteed keep; mutually exclusive with the AV-13/AV-90 unlock paths (last-wins) and with dispute arbitration while the window is live (`escalate` is refused with `AuctionNotActive`, code 156) |
 | `fund(authority, now)`                      | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer (`now` <- clock sysvar, recorded as `fund_at` — the origin the AV-64 relative timelock measures from); AV-104: a live FUND-scoped operator may call for the initializer instead (same checks, operator pays nothing — delegation covers transition rights only) |
 | `release(authority, now, amount, payout_to)` (AV-49)                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); AV-104: a live RELEASE-scoped operator may call for the initializer instead (all other gates identical; delegation covers transition rights only); cumulative releases ≤ locked amount; `payout_to` must satisfy the payout policy — the taker, or a member of the payout allowlist when one is configured (`PayoutNotAllowlisted` otherwise) |
@@ -301,6 +305,23 @@ keeper's cooldown scan (`scan_claim_cooldown`) reports claims stuck inside
 the window as blocked with reason `claim_cooldown` and the eligible slot,
 so operators see exactly when the next claim unlocks. The snapshot exposes
 `claim_cooldown_slots` / `last_claim_slot` for indexers.
+
+**Taker decline + counter-offer negotiation.** Before any claim, the taker
+can walk away (`decline_escrow`, taker-only) — the escrow moves to the
+terminal `Declined` state and the initializer retires the vault via
+`close_vault` to reclaim the rent. Alternatively the taker can propose new
+deal terms (`propose_counter_offer`, taker-only, params `amount` +
+`expiry`): a zero amount or a non-future expiry is `InvalidCounterOffer`
+(code 180), otherwise the offer is stored and the escrow moves to
+`CounterOffered`. While the offer is live, fund movements and `escalate`
+are frozen — the initializer must answer: `accept_counter_offer`
+(initializer-only) atomically re-sets `amount`/`expires_at` to the offered
+terms and returns to `Funded`, or `reject_counter_offer` (initializer-only)
+drops the offer and returns to `Funded` with the original terms. The
+four transitions emit `Declined` / `CounterOfferProposed` /
+`CounterOfferAccepted` / `CounterOfferRejected` (discriminants 62–65). The
+negotiation is orthogonal to the AV-103 appeal bond and the dispute flow —
+a `CounterOffered` escrow cannot be disputed.
 
 **Compound-interest accrual.** An interest-bearing escrow can opt into
 *compound* mode (`with_compound_interest()`, once, before funding). When
@@ -1760,7 +1781,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82), `CpiAllowlistUpdated` (AV-83), `AppealFiled` (AV-86), `AppealResolved` (AV-86), `EvidenceFiled` (AV-91), `ReleasedSplit` (AV-93) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82), `CpiAllowlistUpdated` (AV-83), `AppealFiled` (AV-86), `AppealResolved` (AV-86), `EvidenceFiled` (AV-91), `ReleasedSplit` (AV-93), `Declined` (AV-122), `CounterOfferProposed` (AV-122), `CounterOfferAccepted` (AV-122), `CounterOfferRejected` (AV-122) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -2453,6 +2474,7 @@ two-way consistency check against the IDL parameter table:
 | dispute_interest | u64 | 8 |
 | claim_cooldown_slots | u64 | 8 |
 | last_claim_slot | Option<u64> (1-byte discriminant + 8-byte slot) | 9 |
+| counter_offer | Option<CounterOffer> (1-byte discriminant + 8-byte amount + 8-byte expiry) | 17 |
 | **total**     |                   | **5185** |
 
 The quorum region is always reserved (zeroed when `None`), so

@@ -676,14 +676,23 @@ fn scan_one(item: &BatchWatchItem, now: u64) -> BatchItemOutcome {
         EscrowState::Disputed => BatchItemOutcome::Blocked {
             reason: "disputed",
         },
+        // AV-122: a live counter-offer negotiation freezes the
+        // lifecycle — the initializer must accept or reject before
+        // the batch can release, so it is `Blocked`, not `Done`.
+        EscrowState::CounterOffered => BatchItemOutcome::Blocked {
+            reason: "counter_offered",
+        },
         // Terminal states: nothing to do. AV-81: a split parent's funds
         // were re-homed into the child escrows — the parent's lifecycle
-        // is finished, so it is `Done`, not `Blocked`.
+        // is finished, so it is `Done`, not `Blocked`. AV-122: a
+        // declined escrow's lifecycle is finished too — the taker
+        // walked away, so it is `Done`.
         EscrowState::Released
         | EscrowState::Cancelled
         | EscrowState::Settled
         | EscrowState::Closed
-        | EscrowState::Split => BatchItemOutcome::Done,
+        | EscrowState::Split
+        | EscrowState::Declined => BatchItemOutcome::Done,
     }
 }
 

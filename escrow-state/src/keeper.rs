@@ -4849,6 +4849,8 @@ fn rent_health_state_name(state: EscrowState) -> &'static str {
         EscrowState::Settled => "settled",
         EscrowState::Closed => "closed",
         EscrowState::Split => "split",
+        EscrowState::Declined => "declined",
+        EscrowState::CounterOffered => "counter_offered",
     }
 }
 

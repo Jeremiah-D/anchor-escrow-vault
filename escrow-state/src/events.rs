@@ -809,6 +809,30 @@ pub enum EscrowEventKind {
     /// lockup grew by exactly that), so the event-sourced fold keeps
     /// the conservation identity. The actor is the initializer.
     EscrowsMerged,
+    /// AV-122: the taker declined the escrow
+    /// ([`Escrow::decline_escrow`]) before any claim. `from ==
+    /// Funded`, `to == Declined`; amounts are zero — the decline is
+    /// a refusal, not a settlement, so no funds moved. The actor is
+    /// the taker.
+    Declined,
+    /// AV-122: the taker proposed a counter-offer
+    /// ([`Escrow::propose_counter_offer`]). `from == Funded`, `to ==
+    /// CounterOffered`; `amounts.payout` carries the proposed amount
+    /// (no funds moved — the offer is terms, not a transfer), and the
+    /// proposed expiry is read from the vault's `counter_offer`. The
+    /// actor is the taker.
+    CounterOfferProposed,
+    /// AV-122: the initializer accepted the taker's counter-offer
+    /// ([`Escrow::accept_counter_offer`]), atomically re-setting the
+    /// escrow's amount and expiry. `from == CounterOffered`, `to ==
+    /// Funded`; the new terms are read from the vault. The actor is
+    /// the initializer.
+    CounterOfferAccepted,
+    /// AV-122: the initializer rejected the taker's counter-offer
+    /// ([`Escrow::reject_counter_offer`]). `from == CounterOffered`,
+    /// `to == Funded`; the terms are unchanged. The actor is the
+    /// initializer.
+    CounterOfferRejected,
 }
 
 impl EscrowEventKind {
@@ -960,6 +984,12 @@ impl EscrowEventKind {
             // discriminants 0-60 stay stable for
             // already-serialized histories.
             61 => Self::EscrowsMerged,
+            // AV-122: appended after EscrowsMerged so discriminants
+            // 0-61 stay stable for already-serialized histories.
+            62 => Self::Declined,
+            63 => Self::CounterOfferProposed,
+            64 => Self::CounterOfferAccepted,
+            65 => Self::CounterOfferRejected,
             _ => return None,
         })
     }
@@ -1030,6 +1060,12 @@ impl EscrowEventKind {
             Self::ReleaseIntentAnnounced => "release_intent_announced",
             Self::ReleaseIntentVetoed => "release_intent_vetoed",
             Self::EscrowsMerged => "escrows_merged",
+            // AV-122: appended after escrows_merged so the name table
+            // stays stable.
+            Self::Declined => "declined",
+            Self::CounterOfferProposed => "counter_offer_proposed",
+            Self::CounterOfferAccepted => "counter_offer_accepted",
+            Self::CounterOfferRejected => "counter_offer_rejected",
         }
     }
 
@@ -1101,6 +1137,12 @@ impl EscrowEventKind {
             "release_intent_announced" => Self::ReleaseIntentAnnounced,
             "release_intent_vetoed" => Self::ReleaseIntentVetoed,
             "escrows_merged" => Self::EscrowsMerged,
+            // AV-122: appended after escrows_merged so the name table
+            // stays stable for already-serialized histories.
+            "declined" => Self::Declined,
+            "counter_offer_proposed" => Self::CounterOfferProposed,
+            "counter_offer_accepted" => Self::CounterOfferAccepted,
+            "counter_offer_rejected" => Self::CounterOfferRejected,
             _ => return None,
         })
     }
@@ -2245,6 +2287,121 @@ impl IndexedEscrow {
             Some(authority),
         );
         Ok((payout, fee))
+    }
+
+    /// The taker declines the escrow (mirrors
+    /// [`Escrow::decline_escrow`], AV-122).
+    ///
+    /// Emits `Declined` (`Funded -> Declined`) with zero amounts —
+    /// the decline is a refusal, not a settlement. The actor is the
+    /// taker.
+    pub fn decline_escrow(&mut self, authority: [u8; 32], at: u64) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.decline_escrow(authority, at);
+        self.map_reentrant(result, at)?;
+        self.push_event(
+            EscrowEventKind::Declined,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(())
+    }
+
+    /// The taker proposes a counter-offer (mirrors
+    /// [`Escrow::propose_counter_offer`], AV-122).
+    ///
+    /// Emits `CounterOfferProposed` (`Funded -> CounterOffered`);
+    /// `amounts.payout` carries the proposed amount (no funds moved
+    /// — the offer is terms, not a transfer), and the proposed expiry
+    /// is read from the vault's `counter_offer`. The actor is the
+    /// taker.
+    pub fn propose_counter_offer(
+        &mut self,
+        authority: [u8; 32],
+        amount: u64,
+        expiry: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.propose_counter_offer(authority, amount, expiry, at);
+        self.map_reentrant(result, at)?;
+        self.push_event(
+            EscrowEventKind::CounterOfferProposed,
+            from,
+            self.inner.state(),
+            EventAmounts::payout(amount, 0),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(())
+    }
+
+    /// The initializer accepts the taker's live counter-offer
+    /// (mirrors [`Escrow::accept_counter_offer`], AV-122).
+    ///
+    /// Emits `CounterOfferAccepted` (`CounterOffered -> Funded`);
+    /// the re-set amount/expiry are read from the vault. The actor
+    /// is the initializer.
+    pub fn accept_counter_offer(&mut self, authority: [u8; 32], at: u64) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.accept_counter_offer(authority, at);
+        self.map_reentrant(result, at)?;
+        self.push_event(
+            EscrowEventKind::CounterOfferAccepted,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(())
+    }
+
+    /// The initializer rejects the taker's live counter-offer
+    /// (mirrors [`Escrow::reject_counter_offer`], AV-122).
+    ///
+    /// Emits `CounterOfferRejected` (`CounterOffered -> Funded`);
+    /// the terms are unchanged. The actor is the initializer.
+    pub fn reject_counter_offer(&mut self, authority: [u8; 32], at: u64) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.reject_counter_offer(authority, at);
+        self.map_reentrant(result, at)?;
+        self.push_event(
+            EscrowEventKind::CounterOfferRejected,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(())
     }
 
     /// Merge `source` into `self` (mirrors
@@ -6641,7 +6798,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(59), Some(EscrowEventKind::ReleaseIntentAnnounced));
         assert_eq!(EscrowEventKind::from_discriminant(60), Some(EscrowEventKind::ReleaseIntentVetoed));
         assert_eq!(EscrowEventKind::from_discriminant(61), Some(EscrowEventKind::EscrowsMerged));
-        assert_eq!(EscrowEventKind::from_discriminant(62), None);
+        assert_eq!(EscrowEventKind::from_discriminant(66), None);
     }
 
     #[test]
@@ -6744,7 +6901,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(62), None);
+        assert_eq!(EscrowEventKind::from_discriminant(66), None);
     }
 
     #[test]
@@ -7281,7 +7438,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(62), None);
+        assert_eq!(EscrowEventKind::from_discriminant(66), None);
     }
 
     #[test]
@@ -7296,7 +7453,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(62), None);
+        assert_eq!(EscrowEventKind::from_discriminant(66), None);
     }
 
     #[test]
@@ -7308,7 +7465,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(62), None);
+        assert_eq!(EscrowEventKind::from_discriminant(66), None);
     }
 
     #[test]
@@ -7320,7 +7477,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(62), None);
+        assert_eq!(EscrowEventKind::from_discriminant(66), None);
     }
 
     #[test]
@@ -7332,7 +7489,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(62), None);
+        assert_eq!(EscrowEventKind::from_discriminant(66), None);
     }
 
     #[test]
@@ -7347,7 +7504,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(62), None);
+        assert_eq!(EscrowEventKind::from_discriminant(66), None);
     }
 
     #[test]
@@ -7362,7 +7519,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(62), None);
+        assert_eq!(EscrowEventKind::from_discriminant(66), None);
     }
 
     #[test]
@@ -7374,7 +7531,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(62), None);
+        assert_eq!(EscrowEventKind::from_discriminant(66), None);
     }
 
     #[test]
@@ -7386,7 +7543,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(62), None);
+        assert_eq!(EscrowEventKind::from_discriminant(66), None);
     }
 
     #[test]
@@ -7398,7 +7555,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(62), None);
+        assert_eq!(EscrowEventKind::from_discriminant(66), None);
     }
 
     #[test]

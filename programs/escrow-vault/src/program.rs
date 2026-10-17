@@ -1171,7 +1171,148 @@ pub mod escrow_vault {
         Ok((payout, fee))
     }
 
-    /// Harvest the accrued interest without touching the principal
+    /// The taker declines the escrow before any claim (AV-122;
+    /// mirrors `Escrow::decline_escrow`). Taker-only; `now` comes
+    /// from the Solana clock sysvar (never an instruction param).
+    /// Moves to Declined (terminal for fund movements — only
+    /// `close_vault` retires the vault) and resets the deadman clock.
+    pub fn decline_escrow(ctx: Context<DeclineEscrow>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        escrow
+            .decline_escrow(ctx.accounts.taker.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `now` doubles as the event's `at`, mirroring
+        // `IndexedEscrow::decline_escrow`.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::Declined,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
+    /// The taker proposes a counter-offer: new amount + expiry terms
+    /// (AV-122; mirrors `Escrow::propose_counter_offer`). Taker-only;
+    /// `now` comes from the Solana clock sysvar (never an instruction
+    /// param). Stores the offer and moves to CounterOffered (fund
+    /// movements frozen until the initializer answers); resets the
+    /// deadman clock.
+    pub fn propose_counter_offer(
+        ctx: Context<ProposeCounterOffer>,
+        amount: u64,
+        expiry: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        escrow
+            .propose_counter_offer(
+                ctx.accounts.taker.key().to_bytes(),
+                amount,
+                expiry,
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `now` doubles as the event's `at`, mirroring
+        // `IndexedEscrow::propose_counter_offer` (the proposed amount
+        // rides `amounts.payout`).
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::CounterOfferProposed,
+            from,
+            escrow.state() as u8,
+            amount,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
+    /// The initializer accepts the taker's live counter-offer (AV-122;
+    /// mirrors `Escrow::accept_counter_offer`). `now` comes from the
+    /// Solana clock sysvar (never an instruction param). Atomically
+    /// re-sets amount/expiry to the offered terms and returns to
+    /// Funded; resets the deadman clock.
+    pub fn accept_counter_offer(ctx: Context<AcceptCounterOffer>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        escrow
+            .accept_counter_offer(ctx.accounts.initializer.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `now` doubles as the event's `at`, mirroring
+        // `IndexedEscrow::accept_counter_offer`.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::CounterOfferAccepted,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
+    /// The initializer rejects the taker's live counter-offer
+    /// (AV-122; mirrors `Escrow::reject_counter_offer`). `now` comes
+    /// from the Solana clock sysvar (never an instruction param).
+    /// Drops the offer, terms unchanged, returns to Funded; resets
+    /// the deadman clock.
+    pub fn reject_counter_offer(ctx: Context<RejectCounterOffer>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        escrow
+            .reject_counter_offer(ctx.accounts.initializer.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `now` doubles as the event's `at`, mirroring
+        // `IndexedEscrow::reject_counter_offer`.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::CounterOfferRejected,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
     /// (AV-107; mirrors `Escrow::claim_interest`). Taker-only; `now`
     /// comes from the Solana clock sysvar (never an instruction param
     /// — a caller-supplied timestamp would let anyone fast-forward
@@ -6859,6 +7000,62 @@ pub struct Claim<'info> {
     /// build reads its `mint` for the state machine's `MintMismatch`
     /// check; unused on the native-SOL path.
     pub vault_token_account: AccountInfo<'info>,
+}
+
+/// AV-122: accounts for `decline_escrow` — the taker walks away
+/// before any claim.
+#[derive(Accounts)]
+pub struct DeclineEscrow<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the taker may decline; the state machine rejects anyone
+    /// else with `Unauthorized`.
+    pub taker: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the deadman reset (never
+    /// an instruction param).
+    pub clock: AccountInfo<'info>,
+}
+
+/// AV-122: accounts for `propose_counter_offer` — the taker proposes
+/// new amount/expiry terms.
+#[derive(Accounts)]
+pub struct ProposeCounterOffer<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the taker may propose; the state machine rejects anyone
+    /// else with `Unauthorized`.
+    pub taker: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the offer-expiry check
+    /// and the deadman reset (never an instruction param).
+    pub clock: AccountInfo<'info>,
+}
+
+/// AV-122: accounts for `accept_counter_offer` — the initializer
+/// accepts the live counter-offer.
+#[derive(Accounts)]
+pub struct AcceptCounterOffer<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer may accept; the state machine rejects
+    /// anyone else with `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the deadman reset (never
+    /// an instruction param).
+    pub clock: AccountInfo<'info>,
+}
+
+/// AV-122: accounts for `reject_counter_offer` — the initializer
+/// rejects the live counter-offer.
+#[derive(Accounts)]
+pub struct RejectCounterOffer<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer may reject; the state machine rejects
+    /// anyone else with `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the deadman reset (never
+    /// an instruction param).
+    pub clock: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]

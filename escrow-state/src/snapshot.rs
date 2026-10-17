@@ -80,6 +80,8 @@ pub(crate) fn state_name(state: EscrowState) -> &'static str {
         EscrowState::Settled => "settled",
         EscrowState::Closed => "closed",
         EscrowState::Split => "split",
+        EscrowState::Declined => "declined",
+        EscrowState::CounterOffered => "counter_offered",
     }
 }
 
@@ -424,6 +426,9 @@ pub struct EscrowSnapshot {
     /// `None` when the taker never claimed: the origin the claim
     /// cooldown is measured from.
     pub last_claim_slot: Option<u64>,
+    /// AV-122: the taker's live counter-offer terms, or `None` when
+    /// no counter-offer is live.
+    pub counter_offer: Option<CounterOfferSnapshot>,
     /// Payout destination allowlist, or `None` when no allowlist is
     /// configured (AV-49). When `Some`, every fund-moving transition
     /// requires its `payout_to` to be a member.
@@ -630,6 +635,16 @@ pub struct SlashTermsSnapshot {
     pub penalty_account: [u8; 32],
     /// Unix seconds after which `slash` becomes eligible.
     pub slash_deadline: u64,
+}
+
+/// AV-122: the taker's live counter-offer terms for the snapshot
+/// export (`None` when no counter-offer is live).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CounterOfferSnapshot {
+    /// The taker's proposed escrow amount.
+    pub amount: u64,
+    /// The taker's proposed expiry (Unix seconds).
+    pub expiry: u64,
 }
 
 impl Escrow {
@@ -874,6 +889,12 @@ impl Escrow {
             // claim gate enforces.
             claim_cooldown_slots: self.claim_cooldown_slots(),
             last_claim_slot: self.last_claim_slot(),
+            // AV-122: the live counter-offer terms ride the export so
+            // an off-chain indexer sees the negotiation state.
+            counter_offer: self.counter_offer().map(|o| CounterOfferSnapshot {
+                amount: o.amount,
+                expiry: o.expiry,
+            }),
             // AV-82: the slash terms ride the export — `None` when no
             // slash clause is configured — plus the cumulative slashed
             // amount and the at-`now` slash eligibility the keeper
@@ -1323,6 +1344,19 @@ impl EscrowSnapshot {
         s.push_str(&self.claim_cooldown_slots.to_string());
         s.push_str(",\"last_claim_slot\":");
         write_opt_u64(&mut s, self.last_claim_slot);
+        // AV-122: the live counter-offer terms (`null` when none is
+        // live).
+        s.push_str(",\"counter_offer\":");
+        match &self.counter_offer {
+            Some(o) => {
+                s.push_str("{\"amount\":");
+                s.push_str(&o.amount.to_string());
+                s.push_str(",\"expiry\":");
+                s.push_str(&o.expiry.to_string());
+                s.push('}');
+            }
+            None => s.push_str("null"),
+        }
         // AV-49: payout destination allowlist — `null` when none is
         // configured, else the allowlisted addresses as hex strings.
         s.push_str(",\"payout_allowlist\":");
@@ -1679,7 +1713,7 @@ mod snapshot_tests {
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"evidence_root\":null,\"evidence_disclosure\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
-             \"penalty_bps\":0,\"penalty_escalation_rate_bps\":0,\"penalty_escalation_cap_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"slot_timelock_slots\":0,\"fund_slot\":0,\"claim_cooldown_slots\":0,\"last_claim_slot\":null,\"payout_allowlist\":null,\"payout_denylist\":null,\"cpi_allowlist\":null,\"multisig_authority\":null,\
+             \"penalty_bps\":0,\"penalty_escalation_rate_bps\":0,\"penalty_escalation_cap_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"slot_timelock_slots\":0,\"fund_slot\":0,\"claim_cooldown_slots\":0,\"last_claim_slot\":null,\"counter_offer\":null,\"payout_allowlist\":null,\"payout_denylist\":null,\"cpi_allowlist\":null,\"multisig_authority\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
              \"max_extension_secs\":0,\"extension_count\":0,\"arbiter_panel\":null,\

@@ -36,11 +36,11 @@
 //! the result.
 
 use super::{
-    sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, CpiAllowlist,
+    sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, CounterOffer, CpiAllowlist,
     DefaultJudgment, DutchAuction, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
     Delegation, FundingPlan, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, PayoutSplit, QuorumPolicy,
     SlashTerms, SubscriptionSchedule, VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
-    APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
+    APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, COUNTER_OFFER_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
     DELEGATION_LEN, DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
     MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS,
     MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_RELEASE_SPLIT_RECIPIENTS, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
@@ -279,6 +279,9 @@ fn state_from_discriminant(d: u8) -> Result<EscrowState, AccountDecodeError> {
         7 => Ok(EscrowState::Closed),
         // AV-81: appended after Closed — discriminants 0–7 stay stable.
         8 => Ok(EscrowState::Split),
+        // AV-122: appended after Split — discriminants 0–8 stay stable.
+        9 => Ok(EscrowState::Declined),
+        10 => Ok(EscrowState::CounterOffered),
         other => Err(AccountDecodeError::InvalidStateDiscriminant(other)),
     }
 }
@@ -1196,6 +1199,24 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         None
     };
 
+    // AV-122: the counter-offer tail — the 1-byte `Option`
+    // discriminant plus the 16-byte live terms. Structural decode
+    // only — the negotiation is enforced by
+    // `Escrow::propose_counter_offer` /
+    // `Escrow::accept_counter_offer` /
+    // `Escrow::reject_counter_offer`, not re-litigated here.
+    let counter_offer = if c.option_present("counter_offer")? {
+        Some(CounterOffer {
+            amount: c.u64_le()?,
+            expiry: c.u64_le()?,
+        })
+    } else {
+        // Absent: skip the reserved 16-byte payload (the encoder
+        // zero-pads it, matching the other `Option` regions).
+        c.skip(COUNTER_OFFER_LEN)?;
+        None
+    };
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1436,6 +1457,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // persisted tail field.
         claim_cooldown_slots,
         last_claim_slot,
+        // AV-122: the counter-offer tail decodes like any other
+        // persisted tail field.
+        counter_offer,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
@@ -1492,6 +1516,10 @@ mod discriminator_tests {
         // stable for already-serialized vaults.
         assert_eq!(EscrowState::Split as u8, 8);
         assert_eq!(state_from_discriminant(8).unwrap(), EscrowState::Split);
+        // AV-122: appended after Split so discriminants 0–8 stay
+        // stable for already-serialized vaults.
+        assert_eq!(EscrowState::Declined as u8, 9);
+        assert_eq!(EscrowState::CounterOffered as u8, 10);
     }
 
     #[test]
@@ -1675,9 +1703,10 @@ mod discriminator_tests {
         // `state` sits at offset 8 + 32 + 32 + 8 + 8 + 8 = 96.
         let state_off = ANCHOR_DISCRIMINATOR_LEN + 32 + 32 + 8 + 8 + 8;
         // AV-34: discriminant 7 is now valid (`Closed`); AV-81:
-        // discriminant 8 is now valid (`Split`); the first invalid
-        // byte is 9.
-        for bad in [9u8, 42, 255] {
+        // discriminant 8 is now valid (`Split`); AV-122: discriminants
+        // 9 and 10 are now valid (`Declined`, `CounterOffered`); the
+        // first invalid byte is 11.
+        for bad in [11u8, 42, 255] {
             let mut b = base.clone();
             b[state_off] = bad;
             assert_eq!(
