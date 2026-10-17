@@ -79,6 +79,14 @@
       ]
     },
     {
+      "name": "partial_refund",
+      "discriminator": [159, 106, 64, 137, 77, 16, 94, 133],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"}
+      ]
+    },
+    {
       "name": "crank_expired",
       "discriminator": [242, 214, 197, 141, 189, 175, 150, 24],
       "accounts": [],
@@ -1066,7 +1074,8 @@
           {"name": "keeper_bounty_pool", "type": "u64", "offset": 5218},
           {"name": "keeper_bounty_per_crank", "type": "u64", "offset": 5226},
           {"name": "slash_ladder", "type": {"option": {"defined": "SlashLadder"}}, "offset": 5234},
-          {"name": "slash_ladder_index", "type": "u8", "offset": 5348}
+          {"name": "slash_ladder_index", "type": "u8", "offset": 5348},
+          {"name": "refunded", "type": "u64", "offset": 5349}
         ]
       }
     }
@@ -1423,7 +1432,8 @@
     {"code": 181, "name": "InvalidReleaseIntent"},
     {"code": 182, "name": "IntentNonceReused"},
     {"code": 183, "name": "IntentExpired"},
-    {"code": 184, "name": "InvalidSlashLadder"}
+    {"code": 184, "name": "InvalidSlashLadder"},
+    {"code": 185, "name": "PartialRefundExceedsLocked"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

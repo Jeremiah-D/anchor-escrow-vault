@@ -1275,6 +1275,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // no rung was consumed yet). Structural decode only — the cursor
     // advance is enforced by `Escrow::slash`, not re-litigated here.
     let slash_ladder_index = c.u8()?;
+    // AV-127: the cumulative partial-refund counter — 8 bytes,
+    // appended last so every earlier offset above is unchanged.
+    let refunded = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1530,6 +1533,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // persisted tail field.
         slash_ladder,
         slash_ladder_index,
+        // AV-127: the partial-refund tail decodes like any other
+        // persisted tail field.
+        refunded,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

@@ -196,10 +196,13 @@ impl Escrow {
     /// on-chain, never an instruction param) — the slot the keeper's
     /// view of this vault came from.
     ///
-    /// The `refunded` leg is *derived*, not persisted: this crate
-    /// keeps no cumulative refunded counter (only the event-sourced
-    /// [`crate::FundsTriple`] rebuilds it from the log — never
-    /// fabricated, per the AV-26 snapshot rule). After `cancel`,
+    /// The `refunded` leg is *derived*, not persisted: the summary
+    /// reports the terminal transition's refund (the event-sourced
+    /// [`crate::FundsTriple`] rebuilds the full history from the log
+    /// — never fabricated, per the AV-26 snapshot rule). The
+    /// persisted cumulative partial-refund counter
+    /// ([`Escrow::refunded_amount`], AV-127) is available separately
+    /// for keepers that need the on-chain audit trail. After `cancel`,
     /// `cancel_expired`, or `resolve` the escrow is terminal and the
     /// audit-preserved [`Escrow::remaining_amount`] *is* the
     /// initializer's refund (the taker's share of `resolve` rides in

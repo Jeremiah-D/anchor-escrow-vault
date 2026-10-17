@@ -142,6 +142,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `cancel(authority, refund_to)`               | `Funded`       | `Cancelled` | initializer; AV-104: a live CANCEL-scoped operator may call for the initializer instead (the `refund_to` pin is unchanged — delegation never reroutes funds); `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise |
 | `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); AV-104: a live CANCEL-scoped operator may also call (either party's grant — the refund routing is unchanged); the refund still goes to the whitelisted address even when the taker calls; returns `(refund, penalty)` — a taker-initiated cancel with `penalty_bps > 0` slices an anti-griefing penalty for the initializer (see below) |
 | `cancel_partial(authority, amount, refund_to)` (AV-60) | `Funded` | `Funded` (no state change) | initializer; Funded-only; the initializer's counterpart to AV-11's partial release — reclaims a tranche of the lockup instead of streaming it to the taker; `amount == 0` is `AmountMismatch`, `amount` above the still-locked remainder is `ReleaseExceedsLocked`; the `released` counter is untouched and the locked total shrinks; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise; quorum / timelock / vesting do **not** gate it (same as `cancel`); emits `PartiallyCancelled`; returns the refunded amount |
+| `partial_refund(authority, amount, refund_to)` (AV-127) | `Funded` | `Funded` (no state change) | initializer-only (no delegation scope); Funded-only; the audited counterpart to AV-60's `cancel_partial` — reclaims a tranche of the lockup and accumulates it in the persisted `refunded` counter (`refunded_amount()`), so the refund audit trail survives serialization; `amount == 0` is `AmountMismatch`, `amount` above the still-locked remainder is the dedicated `PartialRefundExceedsLocked` (code 185); the `released` counter is untouched and the locked total shrinks; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise; quorum / timelock / vesting do **not** gate it (same as `cancel`); emits `PartialRefunded`; returns the refunded amount |
 | `crank_expired(caller, now)` (AV-48) | `Funded` | `Cancelled` | **anyone** — permissionless crank (Solana crank pattern), only when `now >= expires_at + grace_period`; no counterparty signature needed, so a keeper bot that is party to nothing can sweep timed-out vaults; the refund follows the same pinned refund policy (whitelisted address, or the initializer) — anti-MEV; AV-124: when the initializer opted into the keeper bounty, the crank additionally pays `min(keeper_bounty_per_crank, keeper_bounty_pool)` (saturating) to the caller — without the bounty the cranker receives nothing; returns `(refund, penalty, bounty)`; a taker cranker still pays the anti-griefing penalty; rejected with `Paused` while the escrow is paused |
 | `initialize_payout_allowlist(allowlist)` (AV-49) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–4 live payout-destination addresses; empty / over-long / zero-address input is `InvalidPayoutAllowlist`); the payout policy gates every fund-moving transition's `payout_to` |
 | `update_payout_allowlist(initializer, taker, allowlist)` (AV-49) | `Uninitialized` / `Funded` | same (no state change) | dual-signature governance — both initializer and taker on a dual-sig escrow, initializer alone on a plain escrow (`Unauthorized` otherwise); empty clears the allowlist (back to taker-only payouts); emits `PayoutAllowlistUpdated` only on an actual change |
@@ -1306,7 +1307,7 @@ program error per variant):
 |-------|------|---------|
 | `Unauthorized` | 100 | caller is not the transition authority (checked before state validity) |
 | `InvalidStateTransition` | 101 | transition illegal from the current state (double fund, release before fund, …) |
-| `AmountMismatch` | 102 | `initialize` with `amount == 0`; `release` / `cancel_partial` with `amount == 0` |
+| `AmountMismatch` | 102 | `initialize` with `amount == 0`; `release` / `cancel_partial` / `partial_refund` with `amount == 0` |
 | `NotExpired` | 103 | `cancel_expired` with `now < expires_at + grace_period` |
 | `InvalidQuorum` | 104 | bad quorum policy config, or `attest` with no quorum configured |
 | `QuorumNotReached` | 105 | `release` before the quorum threshold is reached |
@@ -1389,6 +1390,7 @@ program error per variant):
 | `IntentNonceReused` | 182 | `release_via_intent` (AV-123) with a `nonce` not strictly greater than the persisted `last_intent_nonce` watermark (replay) |
 | `IntentExpired` | 183 | `release_via_intent` (AV-123) with `now_slot >= expiry_slot` |
 | `InvalidSlashLadder` | 184 | `with_slash_ladder` (AV-126) with an empty or over-8 rung table, a zero-bps rung, a bps above 10_000, non-ascending deadlines or bps, the zero penalty account, or when the AV-82 `with_slash_terms` are already configured (and configuring the slash terms when a ladder is already set is the same error) |
+| `PartialRefundExceedsLocked` | 185 | `partial_refund` (AV-127) with `amount` above the still-locked remainder |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1850,6 +1852,10 @@ successful calls that change nothing observable:
 - `cancel_partial` (AV-60) emits `PartiallyCancelled` with
   `from == to == Funded` and `amounts.refund` carrying the refunded
   tranche — the refund stream's mirror of a partial `Released` event.
+- `partial_refund` (AV-127) emits `PartialRefunded` with
+  `from == to == Funded` and `amounts.refund` carrying the refunded
+  tranche — like `PartiallyCancelled`, but the tranche also
+  accumulates in the vault's persisted `refunded` counter.
 - `close_vault` emits `VaultClosed` with `from` the terminal state the
   escrow was in (`Cancelled` / `Released` / `Settled` / `Split` — AV-81)
   and `to == Closed`; `amounts.rent_reclaimed` carries the reclaimed

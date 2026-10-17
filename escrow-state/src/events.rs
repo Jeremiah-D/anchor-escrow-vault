@@ -858,6 +858,16 @@ pub enum EscrowEventKind {
     /// account read. Emitted only when the bounty is non-zero — a
     /// zero-bounty crank emits `ExpiredCranked` alone.
     KeeperBountyPaid,
+    /// AV-127: the escrow was partially refunded
+    /// ([`Escrow::partial_refund`]) — the initializer reclaimed a
+    /// tranche of their locked funds. `from == to == Funded`; amounts
+    /// follow the refund shape (`refund` = the refunded tranche, the
+    /// same shape as [`EscrowEventKind::PartiallyCancelled`]). The
+    /// actor is the initializer. Unlike
+    /// [`EscrowEventKind::PartiallyCancelled`], the refunded tranche
+    /// also accumulates in the vault's persisted `refunded` counter
+    /// (see `Escrow::refunded_amount`).
+    PartialRefunded,
 }
 
 impl EscrowEventKind {
@@ -1022,6 +1032,9 @@ impl EscrowEventKind {
             // AV-124: appended after ReleaseViaIntent so discriminants
             // 0-66 stay stable for already-serialized histories.
             67 => Self::KeeperBountyPaid,
+            // AV-127: appended after KeeperBountyPaid so discriminants
+            // 0-67 stay stable for already-serialized histories.
+            68 => Self::PartialRefunded,
             _ => return None,
         })
     }
@@ -1102,6 +1115,9 @@ impl EscrowEventKind {
             // AV-124: appended after release_via_intent so the name
             // table stays stable for already-serialized histories.
             Self::KeeperBountyPaid => "keeper_bounty_paid",
+            // AV-127: appended after keeper_bounty_paid so the name
+            // table stays stable for already-serialized histories.
+            Self::PartialRefunded => "partial_refunded",
         }
     }
 
@@ -1186,6 +1202,9 @@ impl EscrowEventKind {
             // AV-124: appended after release_via_intent so the name
             // table stays stable for already-serialized histories.
             "keeper_bounty_paid" => Self::KeeperBountyPaid,
+            // AV-127: appended after keeper_bounty_paid so the name
+            // table stays stable for already-serialized histories.
+            "partial_refunded" => Self::PartialRefunded,
             _ => return None,
         })
     }
@@ -2882,6 +2901,44 @@ impl IndexedEscrow {
         let to = self.inner.state();
         self.push_event(
             EscrowEventKind::PartiallyCancelled,
+            from,
+            to,
+            EventAmounts::refund(refund),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(refund)
+    }
+
+    /// Partially refund the escrow (mirrors [`Escrow::partial_refund`],
+    /// AV-127). Emits `PartialRefunded` with `from == to == Funded` and
+    /// `amounts.refund` carrying the refunded tranche; `refund_to` is
+    /// the refund destination, pinned against the escrow's refund
+    /// policy (AV-23). Returns the refunded amount. The refunded
+    /// tranche also accumulates in the vault's persisted `refunded`
+    /// counter (see `Escrow::refunded_amount`) — unlike
+    /// [`IndexedEscrow::cancel_partial`], whose audit trail is the
+    /// event log alone.
+    pub fn partial_refund(
+        &mut self,
+        authority: [u8; 32],
+        amount: u64,
+        mint: Option<[u8; 32]>,
+        refund_to: [u8; 32],
+        at: u64,
+    ) -> Result<u64, EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        let result = self.inner.partial_refund(authority, amount, mint, refund_to);
+        let refund = self.map_reentrant(result, at)?;
+        let to = self.inner.state();
+        self.push_event(
+            EscrowEventKind::PartialRefunded,
             from,
             to,
             EventAmounts::refund(refund),
@@ -7083,7 +7140,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(59), Some(EscrowEventKind::ReleaseIntentAnnounced));
         assert_eq!(EscrowEventKind::from_discriminant(60), Some(EscrowEventKind::ReleaseIntentVetoed));
         assert_eq!(EscrowEventKind::from_discriminant(61), Some(EscrowEventKind::EscrowsMerged));
-        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
     }
 
     #[test]
@@ -7186,7 +7243,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
     }
 
     #[test]
@@ -7723,7 +7780,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
     }
 
     #[test]
@@ -7738,7 +7795,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
     }
 
     #[test]
@@ -7750,7 +7807,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
     }
 
     #[test]
@@ -7762,7 +7819,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
     }
 
     #[test]
@@ -7774,7 +7831,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
     }
 
     #[test]
@@ -7789,7 +7846,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
     }
 
     #[test]
@@ -7804,7 +7861,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
     }
 
     #[test]
@@ -7816,7 +7873,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
     }
 
     #[test]
@@ -7828,7 +7885,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
     }
 
     #[test]
@@ -7840,7 +7897,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
     }
 
     #[test]
@@ -7852,7 +7909,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
     }
 
     #[test]
@@ -7864,7 +7921,19 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(68), None);
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+    }
+
+    #[test]
+    fn partial_refunded_kind_round_trips() {
+        // AV-127: discriminant 68, appended after KeeperBountyPaid —
+        // 0–67 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::PartialRefunded;
+        assert_eq!(kind.discriminant(), 68);
+        assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
+        assert_eq!(kind.name(), "partial_refunded");
+        assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
+        assert_eq!(EscrowEventKind::from_discriminant(69), None);
     }
 
     #[test]

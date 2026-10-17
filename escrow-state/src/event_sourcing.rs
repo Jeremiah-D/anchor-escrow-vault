@@ -20,7 +20,8 @@
 //!   slice of the gross (`payout` already includes it), matching the
 //!   state machine's `released` counter bit-for-bit.
 //! * Initializer refunds (`Cancelled`, `PartiallyCancelled`,
-//!   `ExpiredCancelled`, `ExpiredCranked`) book `refunded`. The AV-24
+//!   `PartialRefunded`, `ExpiredCancelled`, `ExpiredCranked`) book
+//!   `refunded`. The AV-24
 //!   anti-griefing penalty on a taker-initiated expiry cancel routes
 //!   to the initializer as compensation, so it books as `refunded`
 //!   too (`refund + penalty == remaining` by construction).
@@ -235,11 +236,15 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
             (amounts.payout, amounts.payout, 0)
         }
         // Initializer refunds. `Cancelled` refunds the remainder;
-        // `PartiallyCancelled` refunds the tranche (the state machine
-        // shrinks `amount`, so `locked` drops by the same).
+        // `PartiallyCancelled` / `PartialRefunded` refund the tranche
+        // (the state machine shrinks `amount`, so `locked` drops by
+        // the same).
         // AV-95b: one basket leg refunded — the per-leg `Cancelled`.
         EscrowEventKind::Cancelled
         | EscrowEventKind::PartiallyCancelled
+        // AV-127: the audited partial-refund path books like
+        // `PartiallyCancelled` — the initializer's receipt.
+        | EscrowEventKind::PartialRefunded
         // AV-109: the heir's inactivity reclaim books like a
         // `Cancelled` — the remaining locked amount leaves as the
         // refund sink (to the heir, not the initializer).
@@ -615,7 +620,7 @@ mod event_sourcing_tests {
         const FEE: u64 = 100;
         const REFUND: u64 = 700;
         const PENALTY: u64 = 50;
-        for d in 0..=66u8 {
+        for d in 0..=67u8 {
             let kind = EscrowEventKind::from_discriminant(d)
                 .unwrap_or_else(|| panic!("missing discriminant {d}"));
             let event = synth(kind, 0, PAYOUT, FEE, REFUND, PENALTY);
@@ -636,8 +641,11 @@ mod event_sourcing_tests {
                 | EscrowEventKind::PartiallyCancelled
                 // AV-95b: the per-leg refund books like Cancelled.
                 // AV-109: the deadman reclaim books like Cancelled.
+                // AV-127: the audited partial-refund tranche books like
+                // PartiallyCancelled.
                 | EscrowEventKind::BasketCancelled
-                | EscrowEventKind::DeadmanClaimed => {
+                | EscrowEventKind::DeadmanClaimed
+                | EscrowEventKind::PartialRefunded => {
                     (REFUND, 0, REFUND)
                 }
                 EscrowEventKind::ExpiredCancelled
