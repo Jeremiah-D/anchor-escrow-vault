@@ -2415,6 +2415,113 @@ pub fn assemble_cpi_invocation(
     Ok(inv)
 }
 
+/// Errors from the keeper's off-chain CPI quote lock (AV-132).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpiQuoteError {
+    /// The off-chain quote estimated a zero payout — nothing to lock.
+    ZeroQuote,
+    /// The slippage tolerance exceeds 10_000 bps (100%).
+    InvalidSlippageBps,
+    /// Post-execution assertion: the reported actual came back below
+    /// the locked `min_payout` floor — the execution deviated from the
+    /// quote beyond tolerance, rejected off-chain.
+    SlippageExceeded,
+    /// Post-execution assertion: the quote was older than the
+    /// keeper's maximum quote age at execution time — the market may
+    /// have moved since the lock, so the execution is rejected even
+    /// when the floor held.
+    QuoteStale,
+}
+
+/// The keeper's off-chain CPI quote lock (AV-132 — Solana/DeFi).
+///
+/// Before submitting a `release_via_cpi`, the keeper fetches an
+/// off-chain quote for the third-party leg (a DEX aggregator quote,
+/// a lending protocol's deposit preview, a streaming splitter's
+/// estimate) and *locks* it at bundle-signing time: the quoted payout
+/// and the derived `min_payout` floor are committed alongside the
+/// signature, so the on-chain instruction carries the floor the quote
+/// justified. The state machine enforces that floor after execution
+/// ([`Escrow::release_via_cpi`] →
+/// [`EscrowError::SlippageExceeded`](crate::EscrowError::SlippageExceeded));
+/// the keeper additionally asserts the execution against the locked
+/// quote itself ([`CpiQuote::verify_execution`]) — a deviation beyond
+/// the floor, or a quote gone stale, is rejected off-chain even when
+/// the chain accepted the floor.
+///
+/// Pure data + checked arithmetic: no I/O, no oracle reads. The
+/// keeper operator supplies the quote; this type only locks it and
+/// judges the outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpiQuote {
+    /// The off-chain estimated taker-leg payout (lamports / tokens).
+    pub quoted_payout: u64,
+    /// The slippage floor derived at lock time — the `min_payout`
+    /// the keeper stamps on the `release_via_cpi` instruction.
+    pub min_payout: u64,
+    /// Unix seconds when the quote was locked (bundle signing time).
+    pub locked_at: u64,
+    /// The quote provider's identifier / commitment — opaque to the
+    /// state machine; the keeper joins it to its own records.
+    pub quote_id: [u8; 32],
+}
+
+impl CpiQuote {
+    /// Lock a quote: validate the estimate and derive the `min_payout`
+    /// floor as `quoted_payout * (10_000 - max_slippage_bps) / 10_000`
+    /// (floor division, like the protocol-fee math). A zero quote or a
+    /// tolerance above 100% is rejected — the keeper never signs a
+    /// floor it cannot justify.
+    pub fn lock(
+        quoted_payout: u64,
+        max_slippage_bps: u16,
+        locked_at: u64,
+        quote_id: [u8; 32],
+    ) -> Result<Self, CpiQuoteError> {
+        if quoted_payout == 0 {
+            return Err(CpiQuoteError::ZeroQuote);
+        }
+        if max_slippage_bps > 10_000 {
+            return Err(CpiQuoteError::InvalidSlippageBps);
+        }
+        let keep_bps = 10_000u64 - max_slippage_bps as u64;
+        let min_payout = quoted_payout
+            .checked_mul(keep_bps)
+            .map(|v| v / 10_000)
+            .ok_or(CpiQuoteError::InvalidSlippageBps)?;
+        Ok(Self {
+            quoted_payout,
+            min_payout,
+            locked_at,
+            quote_id,
+        })
+    }
+
+    /// Post-execution assertion: judge the reported `actual_payout`
+    /// against the locked quote. Rejects when the actual falls below
+    /// the locked floor ([`CpiQuoteError::SlippageExceeded`] — the
+    /// execution deviated from the quote beyond tolerance) or when the
+    /// quote is older than `max_quote_age_secs` at `executed_at`
+    /// ([`CpiQuoteError::QuoteStale`] — the market may have moved since
+    /// the lock). An execution exactly at the floor with a fresh quote
+    /// passes.
+    pub fn verify_execution(
+        &self,
+        actual_payout: u64,
+        executed_at: u64,
+        max_quote_age_secs: u64,
+    ) -> Result<(), CpiQuoteError> {
+        if actual_payout < self.min_payout {
+            return Err(CpiQuoteError::SlippageExceeded);
+        }
+        let age = executed_at.saturating_sub(self.locked_at);
+        if age > max_quote_age_secs {
+            return Err(CpiQuoteError::QuoteStale);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod keeper_tests {
     use super::*;
@@ -6295,5 +6402,70 @@ mod stale_sweep_tests {
                 &instruction_discriminator("close_vault")
             );
         }
+    }
+
+    // ---------- AV-132: CpiQuote lock + post-execution assertion ----------
+    //
+    // The keeper locks the off-chain quote at bundle-signing time
+    // (deriving the min_payout floor it stamps on release_via_cpi)
+    // and asserts the execution against the locked quote afterwards:
+    // a deviation beyond the floor, or a stale quote, is rejected
+    // off-chain.
+
+    const QUOTE_ID: [u8; 32] = [0x71; 32];
+
+    #[test]
+    fn cpi_quote_lock_derives_the_floor() {
+        // 1_000_000 quoted with 100 bps tolerance → 990_000 floor.
+        let q = CpiQuote::lock(1_000_000, 100, 1_700_000_000, QUOTE_ID).unwrap();
+        assert_eq!(q.quoted_payout, 1_000_000);
+        assert_eq!(q.min_payout, 990_000);
+        assert_eq!(q.locked_at, 1_700_000_000);
+        assert_eq!(q.quote_id, QUOTE_ID);
+        // Zero tolerance: the floor is the quote itself.
+        let q = CpiQuote::lock(1_000_000, 0, 1_700_000_000, QUOTE_ID).unwrap();
+        assert_eq!(q.min_payout, 1_000_000);
+        // Full tolerance: the floor is zero (no protection).
+        let q = CpiQuote::lock(1_000_000, 10_000, 1_700_000_000, QUOTE_ID).unwrap();
+        assert_eq!(q.min_payout, 0);
+    }
+
+    #[test]
+    fn cpi_quote_lock_rejects_bad_inputs() {
+        assert_eq!(
+            CpiQuote::lock(0, 100, 1_700_000_000, QUOTE_ID),
+            Err(CpiQuoteError::ZeroQuote)
+        );
+        assert_eq!(
+            CpiQuote::lock(1_000_000, 10_001, 1_700_000_000, QUOTE_ID),
+            Err(CpiQuoteError::InvalidSlippageBps)
+        );
+    }
+
+    #[test]
+    fn cpi_quote_verify_execution_matrix() {
+        let q = CpiQuote::lock(1_000_000, 100, 1_700_000_000, QUOTE_ID).unwrap();
+        // At the floor, fresh quote: passes.
+        assert_eq!(q.verify_execution(990_000, 1_700_000_100, 300), Ok(()));
+        // Above the floor: passes.
+        assert_eq!(q.verify_execution(995_000, 1_700_000_100, 300), Ok(()));
+        // Below the floor: rejected — the execution deviated from the
+        // quote beyond tolerance.
+        assert_eq!(
+            q.verify_execution(989_999, 1_700_000_100, 300),
+            Err(CpiQuoteError::SlippageExceeded)
+        );
+        // Fresh floor but stale quote: rejected — the market may have
+        // moved since the lock.
+        assert_eq!(
+            q.verify_execution(995_000, 1_700_000_301, 300),
+            Err(CpiQuoteError::QuoteStale)
+        );
+        // Slippage takes precedence over staleness (the deviation is
+        // the sharper signal).
+        assert_eq!(
+            q.verify_execution(989_999, 1_700_000_301, 300),
+            Err(CpiQuoteError::SlippageExceeded)
+        );
     }
 }

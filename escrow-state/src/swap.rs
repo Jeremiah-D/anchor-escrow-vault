@@ -618,7 +618,7 @@ mod swap_tests {
             Err(EscrowError::SwapLinkActive)
         );
         assert_eq!(
-            a.release_via_cpi(ALICE, T0, 1_000, None, BOB, &cpi_invocation(), |_| Ok(())),
+            a.release_via_cpi(ALICE, T0, 1_000, None, BOB, 0, &cpi_invocation(), |_| Ok(1_000)),
             Err(EscrowError::SwapLinkActive)
         );
         assert_eq!(a.cancel(ALICE, None, ALICE), Err(EscrowError::SwapLinkActive));

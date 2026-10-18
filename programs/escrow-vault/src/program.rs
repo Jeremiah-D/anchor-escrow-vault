@@ -492,12 +492,17 @@ pub mod escrow_vault {
     /// `release` gates, validates the invocation shape, and — on
     /// executor failure — rolls the whole release back, mirroring the
     /// chain's CPI atomicity. The protocol fee still settles to the fee
-    /// account through the normal payout path. Returns
-    /// `(taker_payout, fee)`; the CPI audit (`cpi_target` +
-    /// `cpi_accounts_hash`) rides on the `Released` event.
+    /// account through the normal payout path. AV-132: `min_payout` is
+    /// the slippage floor — the executor reports the actual
+    /// post-execution taker-leg amount and an actual below the floor
+    /// rolls back with `SlippageExceeded` (code 195); `0` disables the
+    /// floor. Returns `(taker_payout, fee)`; the CPI audit
+    /// (`cpi_target` + `cpi_accounts_hash`) rides on the `Released`
+    /// event.
     pub fn release_via_cpi(
         ctx: Context<ReleaseViaCpi>,
         amount: u64,
+        min_payout: u64,
         cpi_data: Vec<u8>,
     ) -> Result<(u64, u64)> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
@@ -518,13 +523,20 @@ pub mod escrow_vault {
                 amount,
                 vault_token_mint(&ctx.accounts.vault_token_account),
                 ctx.accounts.payout_to.key().to_bytes(),
+                min_payout,
                 &invocation,
                 // The execution seam: the real build invokes the target
-                // program here via `cpi_invoke_target` below. A failed
+                // program here via `cpi_invoke_target` below and returns
+                // the actual post-execution taker-leg amount (the DEX
+                // swap's output tokens, measured as the taker-leg
+                // account's balance delta across the invoke). A failed
                 // invoke aborts the transaction, so no state change
                 // persists — the state machine's rollback models exactly
-                // this. AV-36: the state machine arms its reentrancy
-                // lock around this closure (see
+                // this. AV-132: an actual below `min_payout` rolls the
+                // release back with `SlippageExceeded`
+                // (`ErrorCode::SlippageExceeded`) — same atomicity, no
+                // receipt, no event. AV-36: the state machine arms its
+                // reentrancy lock around this closure (see
                 // `escrow_state::Escrow::release_via_cpi`), so a hostile
                 // target that CPIs back into this program mid-invoke is
                 // rejected with `ReentrantCall` (`ErrorCode::ReentrantCall`)
@@ -8915,8 +8927,8 @@ fn cpi_invocation_from_remaining_accounts(
 fn cpi_invoke_target(
     _ctx: &Context<ReleaseViaCpi>,
     _invocation: &escrow_state::CpiInvocation,
-) -> std::result::Result<(), escrow_state::CpiError> {
-    unimplemented!("invoke the target program via CPI with the vault PDA as signer in the real build")
+) -> std::result::Result<u64, escrow_state::CpiError> {
+    unimplemented!("invoke the target program via CPI with the vault PDA as signer in the real build; return the actual post-execution taker-leg amount (the taker-leg account's balance delta across the invoke) so the state machine can enforce the AV-132 min_payout slippage floor")
 }
 
 /// AV-31: settlement CPI wiring (reference — not compiled by CI).
@@ -9222,6 +9234,10 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::DisputedAmountLocked => {
             error!(ErrorCode::DisputedAmountLocked)
         }
+        // AV-132: appended, never renumbered.
+        escrow_state::EscrowError::SlippageExceeded => {
+            error!(ErrorCode::SlippageExceeded)
+        }
     }
 }
 
@@ -9442,4 +9458,6 @@ pub enum ErrorCode {
     InvalidDisputeAmount,
     #[msg("Disputed amount locked (AV-131): release names an amount that reaches into the contested pool — release only the undisputed remainder or wait for resolve")]
     DisputedAmountLocked,
+    #[msg("Slippage exceeded (AV-132): release_via_cpi post-execution taker-leg amount below the min_payout floor — the whole release rolled back")]
+    SlippageExceeded,
 }

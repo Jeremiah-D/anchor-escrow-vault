@@ -109,6 +109,12 @@ pub enum CpiError {
     /// The escrow is not in a state that produces this settlement
     /// (e.g. a release plan for a `Cancelled` escrow).
     UnexpectedState,
+    /// AV-132: the caller's slippage floor exceeds the quoted payout —
+    /// the plan is never built, so the executor never runs. The
+    /// off-chain counterpart of
+    /// [`super::EscrowError::SlippageExceeded`]: the plan gate rejects
+    /// before execution, the state machine rejects after it.
+    SlippageExceeded,
 }
 
 fn require_nonzero(key: &Pubkey) -> Result<(), CpiError> {
@@ -437,12 +443,19 @@ fn check_transfer_hook(
 ///   declared hook binding exactly (mismatch →
 ///   [`CpiError::SettlementMismatch`); the plan annotates the hook
 ///   program and its extra accounts.
+/// - AV-132: when `min_payout` is `Some`, the slippage floor must not
+///   exceed the quoted `payout` — a floor above the quote fails the
+///   plan with [`CpiError::SlippageExceeded`] *before* the executor
+///   ever runs, so a keeper never submits a CPI whose own quote
+///   already violates the floor. `None` disables the check (the
+///   pre-AV-132 behavior).
 pub fn payout_plan(
     kind: PayoutKind,
     escrow: &Escrow,
     addrs: &PayoutAddrs,
     payout: u64,
     fee: u64,
+    min_payout: Option<u64>,
 ) -> Result<SettlementPlan, CpiError> {
     let _ = kind; // The money movement is identical for all payout kinds;
     // the kind is carried for audit clarity at the call site.
@@ -459,6 +472,16 @@ pub fn payout_plan(
     // transition results.
     if gross > escrow.released_amount() {
         return Err(CpiError::SettlementMismatch);
+    }
+    // AV-132: the slippage pre-check runs with the other amount
+    // validations — a floor the quote cannot satisfy is a plan
+    // construction error, not an execution outcome. It sits after the
+    // machine-reconciliation check so a tampered payout still reports
+    // SettlementMismatch first.
+    if let Some(floor) = min_payout {
+        if floor > payout {
+            return Err(CpiError::SlippageExceeded);
+        }
     }
     if addrs.taker != escrow.taker() {
         return Err(CpiError::RecipientMismatch);
@@ -796,7 +819,7 @@ mod cpi_tests {
         let (payout, fee) = e.release(init, 0, 500_000, None, key(2)).unwrap();
         assert_eq!((payout, fee), (495_000, 5_000));
 
-        let plan = payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout, fee).unwrap();
+        let plan = payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout, fee, None).unwrap();
         assert_eq!(plan.transfers.len(), 2);
         assert_eq!(plan.transfers[0].amount(), Some(495_000));
         assert_eq!(plan.transfers[0].accounts[1].pubkey, key(2)); // taker
@@ -812,7 +835,7 @@ mod cpi_tests {
         let mut e = funded_escrow(1_000_000);
         let (payout, fee) = e.release(key(1), 0, 1_000_000, None, key(2)).unwrap();
         assert_eq!(fee, 0);
-        let plan = payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout, fee).unwrap();
+        let plan = payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout, fee, None).unwrap();
         assert_eq!(plan.transfers.len(), 1);
         assert_eq!(plan.transfers[0].amount(), Some(1_000_000));
     }
@@ -823,13 +846,13 @@ mod cpi_tests {
         let (payout, fee) = e.release(key(1), 0, 400_000, None, key(2)).unwrap();
         // Attacker inflates the payout by 1: gross exceeds released_amount().
         assert_eq!(
-            payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout + 1, fee),
+            payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout + 1, fee, None),
             Err(CpiError::SettlementMismatch)
         );
         // Stale results from a *different* escrow: released is 0 here.
         let fresh = funded_escrow(1_000_000);
         assert_eq!(
-            payout_plan(PayoutKind::Release, &fresh, &payout_addrs_native(), payout, fee),
+            payout_plan(PayoutKind::Release, &fresh, &payout_addrs_native(), payout, fee, None),
             Err(CpiError::SettlementMismatch)
         );
     }
@@ -841,13 +864,13 @@ mod cpi_tests {
         let mut addrs = payout_addrs_native();
         addrs.taker = key(77); // not the escrow's taker
         assert_eq!(
-            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee),
+            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee, None),
             Err(CpiError::RecipientMismatch)
         );
         let mut addrs = payout_addrs_native();
         addrs.taker_leg = key(78); // native path must pay the taker wallet
         assert_eq!(
-            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee),
+            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee, None),
             Err(CpiError::RecipientMismatch)
         );
     }
@@ -859,7 +882,7 @@ mod cpi_tests {
         let mut e = funded_escrow(1_000_000);
         e.cancel(key(1), None, key(1)).unwrap();
         assert_eq!(
-            payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), 1_000_000, 0),
+            payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), 1_000_000, 0, None),
             Err(CpiError::UnexpectedState)
         );
     }
@@ -876,7 +899,7 @@ mod cpi_tests {
         // Half vested at t=1500.
         let (payout, fee) = e.claim(taker, 1500, None, key(2)).unwrap();
         assert_eq!((payout, fee), (500_000, 0));
-        let plan = payout_plan(PayoutKind::Claim, &e, &payout_addrs_native(), payout, fee).unwrap();
+        let plan = payout_plan(PayoutKind::Claim, &e, &payout_addrs_native(), payout, fee, None).unwrap();
         assert_eq!(plan.transfers.len(), 1);
         assert_eq!(plan.transfers[0].amount(), Some(500_000));
     }
@@ -904,7 +927,7 @@ mod cpi_tests {
             fee_leg: key(9),
             transfer_hook: None,
         };
-        let plan = payout_plan(PayoutKind::Release, &e, &addrs, payout, fee).unwrap();
+        let plan = payout_plan(PayoutKind::Release, &e, &addrs, payout, fee, None).unwrap();
         assert_eq!(plan.transfers.len(), 1);
         let ix = &plan.transfers[0];
         assert_eq!(ix.program_id, spl_token_program_id());
@@ -1215,12 +1238,12 @@ mod cpi_tests {
         let mut addrs = payout_addrs_native();
         addrs.fee_leg = key(8);
         assert_eq!(
-            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee),
+            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee, None),
             Err(CpiError::RecipientMismatch)
         );
         // The pinned recipient builds, and the fee leg points at it.
         addrs.fee_leg = recipient;
-        let plan = payout_plan(PayoutKind::Release, &e, &addrs, payout, fee).unwrap();
+        let plan = payout_plan(PayoutKind::Release, &e, &addrs, payout, fee, None).unwrap();
         assert_eq!(plan.transfers.len(), 2);
         assert_eq!(plan.transfers[1].amount(), Some(5_000));
         assert_eq!(plan.transfers[1].accounts[1].pubkey, recipient);
@@ -1281,7 +1304,7 @@ mod cpi_tests {
             .unwrap();
         e.fund(init, FUND_AT).unwrap();
         let (payout, fee) = e.release(init, 0, 500_000, None, key(2)).unwrap();
-        let plan = payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout, fee).unwrap();
+        let plan = payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout, fee, None).unwrap();
         assert_eq!(plan.transfers.len(), 2);
         assert_eq!(plan.transfers[1].accounts[1].pubkey, key(9));
     }
@@ -1370,7 +1393,7 @@ mod cpi_tests {
         let (mut e, hook) = hook_escrow();
         let mint = [0xD0; 32];
         let (payout, fee) = e.release(key(1), 0, 1_000_000, Some(mint), key(2)).unwrap();
-        let plan = payout_plan(PayoutKind::Release, &e, &hook_payout_addrs(hook), payout, fee).unwrap();
+        let plan = payout_plan(PayoutKind::Release, &e, &hook_payout_addrs(hook), payout, fee, None).unwrap();
         assert_eq!(plan.transfer_hook_program, Some(hook));
         assert_eq!(plan.transfer_hook_accounts.len(), 2);
         assert_eq!(plan.transfer_hook_accounts[0].pubkey, key(20));
@@ -1389,14 +1412,14 @@ mod cpi_tests {
         let mut addrs = hook_payout_addrs(hook);
         addrs.transfer_hook = None;
         assert_eq!(
-            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee),
+            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee, None),
             Err(CpiError::SettlementMismatch)
         );
         // Escrow declares a hook, plan names a different program →
         // SettlementMismatch (a swapped hook is never built).
         let mut addrs = hook_payout_addrs([0x78; 32]);
         assert_eq!(
-            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee),
+            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee, None),
             Err(CpiError::SettlementMismatch)
         );
         // Escrow declares no hook, plan names one → SettlementMismatch
@@ -1406,14 +1429,95 @@ mod cpi_tests {
         let mut addrs2 = payout_addrs_native();
         addrs2.transfer_hook = Some(hook_plan(hook));
         assert_eq!(
-            payout_plan(PayoutKind::Release, &e2, &addrs2, payout2, fee2),
+            payout_plan(PayoutKind::Release, &e2, &addrs2, payout2, fee2, None),
             Err(CpiError::SettlementMismatch)
         );
         // No hook on either side → clean plan, empty annotation.
         let addrs3 = payout_addrs_native();
-        let plan = payout_plan(PayoutKind::Release, &e2, &addrs3, payout2, fee2).unwrap();
+        let plan = payout_plan(PayoutKind::Release, &e2, &addrs3, payout2, fee2, None).unwrap();
         assert_eq!(plan.transfer_hook_program, None);
         assert!(plan.transfer_hook_accounts.is_empty());
+    }
+
+    // ---------- AV-132: payout_plan slippage pre-check ----------
+    //
+    // The plan gate rejects before the executor ever runs: a min_payout
+    // floor above the quoted payout fails plan construction with
+    // CpiError::SlippageExceeded, so a keeper never submits a CPI whose
+    // own quote already violates the floor.
+
+    #[test]
+    fn slippage_floor_above_quote_rejects_the_plan() {
+        let mut e = funded_escrow(1_000_000);
+        let (payout, fee) = e.release(key(1), 0, 1_000_000, None, key(2)).unwrap();
+        assert_eq!((payout, fee), (1_000_000, 0));
+        // Floor above the quote: the plan is never built.
+        assert_eq!(
+            payout_plan(
+                PayoutKind::Release,
+                &e,
+                &payout_addrs_native(),
+                payout,
+                fee,
+                Some(1_000_001)
+            ),
+            Err(CpiError::SlippageExceeded)
+        );
+        // Floor at the quote: the boundary passes.
+        let plan = payout_plan(
+            PayoutKind::Release,
+            &e,
+            &payout_addrs_native(),
+            payout,
+            fee,
+            Some(1_000_000),
+        )
+        .unwrap();
+        assert_eq!(plan.transfers.len(), 1);
+        // Floor below the quote: passes.
+        let plan = payout_plan(
+            PayoutKind::Release,
+            &e,
+            &payout_addrs_native(),
+            payout,
+            fee,
+            Some(990_000),
+        )
+        .unwrap();
+        assert_eq!(plan.transfers.len(), 1);
+        // None: the pre-AV-132 behavior, no floor.
+        let plan =
+            payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), payout, fee, None)
+                .unwrap();
+        assert_eq!(plan.transfers.len(), 1);
+    }
+
+    #[test]
+    fn slippage_precheck_runs_with_the_amount_validations() {
+        // A floor above the quote fails even when every other check
+        // passes — and a tampered payout still fails as
+        // SettlementMismatch first (amount validation precedes the
+        // slippage gate).
+        let mut e = funded_escrow(1_000_000);
+        let (payout, fee) = e.release(key(1), 0, 1_000_000, None, key(2)).unwrap();
+        assert_eq!(
+            payout_plan(
+                PayoutKind::Release,
+                &e,
+                &payout_addrs_native(),
+                payout + 1,
+                fee,
+                Some(payout + 2)
+            ),
+            Err(CpiError::SettlementMismatch)
+        );
+        // Zero floor on a zero payout: the ZeroAmount gate still fires
+        // (the slippage check cannot bless an empty plan).
+        let mut e2 = funded_escrow(1_000_000);
+        assert_eq!(
+            payout_plan(PayoutKind::Release, &e2, &payout_addrs_native(), 0, 0, Some(0)),
+            Err(CpiError::ZeroAmount)
+        );
     }
 
     #[test]

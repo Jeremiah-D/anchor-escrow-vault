@@ -55,6 +55,7 @@
       "accounts": [],
       "args": [
         {"name": "amount", "type": "u64"},
+        {"name": "min_payout", "type": "u64"},
         {"name": "cpi_data", "type": {"vec": "u8"}}
       ]
     },
@@ -1514,7 +1515,8 @@
     {"code": 191, "name": "DualControlExpired"},
     {"code": 192, "name": "DualControlRequired"},
     {"code": 193, "name": "InvalidDisputeAmount"},
-    {"code": 194, "name": "DisputedAmountLocked"}
+    {"code": 194, "name": "DisputedAmountLocked"},
+    {"code": 195, "name": "SlippageExceeded"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

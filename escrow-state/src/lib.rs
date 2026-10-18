@@ -2518,6 +2518,15 @@ pub enum EscrowError {
     /// pool on a fully-disputed escrow. Never renumbered (see
     /// [`EscrowError::code`]).
     DisputedAmountLocked,
+    /// AV-132: [`Escrow::release_via_cpi`] whose post-execution
+    /// taker-leg amount came back below the caller's `min_payout`
+    /// slippage floor — the DEX swap / lending-protocol deposit moved
+    /// less than the quoted minimum, so the whole release rolls back
+    /// exactly like [`EscrowError::CpiExecutionFailed`] (the CPI
+    /// atomicity convention): `released`, `fees_paid`, `state` and the
+    /// dead-man's-switch clock are restored, no event fires. Never
+    /// renumbered (see [`EscrowError::code`]).
+    SlippageExceeded,
 }
 
 impl EscrowError {
@@ -2646,6 +2655,8 @@ impl EscrowError {
             // AV-131: appended, never renumbered.
             EscrowError::InvalidDisputeAmount => 193,
             EscrowError::DisputedAmountLocked => 194,
+            // AV-132: appended, never renumbered.
+            EscrowError::SlippageExceeded => 195,
         }
     }
 
@@ -2756,6 +2767,8 @@ impl EscrowError {
             // AV-131: appended, never renumbered.
             EscrowError::InvalidDisputeAmount,
             EscrowError::DisputedAmountLocked,
+            // AV-132: appended, never renumbered.
+            EscrowError::SlippageExceeded,
         ]
     }
 }
@@ -8223,6 +8236,18 @@ let fee = self.charge_protocol_fee(amount)?;
     /// changes on failure: no event fires (see
     /// [`IndexedEscrow::release_via_cpi`]), no counter moves.
     ///
+    /// AV-132: `min_payout` is the caller's slippage floor for the
+    /// third-party leg — the executor returns the *actual*
+    /// post-execution taker-leg amount (a DEX swap's output tokens, a
+    /// lending protocol's minted receipt value), and when that actual
+    /// comes back below `min_payout` the whole release rolls back
+    /// with [`EscrowError::SlippageExceeded`], exactly like
+    /// `CpiExecutionFailed` (same snapshot, same "nothing observable
+    /// changes"). `min_payout == 0` disables the floor — the release
+    /// keeps the pre-AV-132 semantics. The floor is checked after the
+    /// executor reports success but before the receipt is cut, so a
+    /// slipped execution never produces a receipt.
+    ///
     /// Returns `(taker_payout, fee, receipt)` like `release`, plus the
     /// [`CpiReceipt`] audit record: `cpi_target` and the SHA-256
     /// `accounts_hash` over the canonical invocation encoding, so an
@@ -8238,11 +8263,12 @@ let fee = self.charge_protocol_fee(amount)?;
         amount: u64,
         mint: Option<[u8; 32]>,
         payout_to: [u8; 32],
+        min_payout: u64,
         cpi: &CpiInvocation,
         execute_cpi: F,
     ) -> Result<(u64, u64, CpiReceipt), EscrowError>
     where
-        F: FnOnce(&CpiInvocation) -> Result<(), CpiError>,
+        F: FnOnce(&CpiInvocation) -> Result<u64, CpiError>,
     {
         // AV-36: reentrancy guard first (see `require_not_reentrant`) —
         // the executor window below is the one place untrusted code
@@ -8309,7 +8335,17 @@ let fee = self.charge_protocol_fee(amount)?;
         let outcome = execute_cpi(cpi);
         self.reentrancy_lock = false;
         match outcome {
-            Ok(()) => {
+            Ok(actual) => {
+                // AV-132: the slippage floor — the executor reports the
+                // actual post-execution taker-leg amount (the DEX
+                // swap's output, the lending receipt's value). Below
+                // the caller's min_payout the whole release rolls back
+                // with SlippageExceeded: same snapshot restore as
+                // CpiExecutionFailed, no receipt, no event.
+                if actual < min_payout {
+                    rollback(self);
+                    return Err(EscrowError::SlippageExceeded);
+                }
                 self.touch_deadman_clock(now);
                 Ok((payout, fee, cpi_call::cpi_receipt(cpi, payout, fee)))
             }
@@ -19724,11 +19760,12 @@ pub(crate) mod anchor_idl_tests {
             name: "release_via_cpi",
             params: &[
                 ("amount", "u64", "instruction param"),
+                ("min_payout", "u64", "instruction param: AV-132 slippage floor — the executor's reported post-execution taker-leg amount below this rolls the whole release back with SlippageExceeded (code 195); 0 disables the floor"),
                 ("cpi_data", "Vec<u8>", "instruction param: opaque target-instruction data"),
             ],
             method: "Escrow::release_via_cpi",
             input_mapping: "authority <- accounts.initializer (signer); \
-                            amount, cpi_data <- params; now <- clock sysvar (NOT an \
+                            amount, min_payout, cpi_data <- params; now <- clock sysvar (NOT an \
                             instruction param — see module docs); the third-party \
                             invocation is built from accounts.remaining_accounts: \
                             [0] is the target program id, [1..] are the target \
@@ -19739,7 +19776,11 @@ pub(crate) mod anchor_idl_tests {
                             empty account list, or zero account key), and rolls \
                             the whole release back when the injected executor \
                             reports failure (CpiExecutionFailed — on-chain the \
-                            failed CPI aborts the transaction); returns \
+                            failed CPI aborts the transaction); AV-132: the \
+                            executor returns the actual post-execution taker-leg \
+                            amount and an actual below min_payout rolls back \
+                            with SlippageExceeded (code 195) — same atomicity, \
+                            no receipt, no event; returns \
                             (taker_payout, fee) plus the CpiReceipt audit \
                             (cpi_target + accounts_hash), which the `Released` \
                             event carries for the indexer",
@@ -23369,8 +23410,8 @@ pub(crate) mod anchor_idl_tests {
 
     #[test]
     fn release_via_cpi_maps_params_and_remaining_accounts() {
-        // IDL: release_via_cpi(amount: u64, cpi_data: Vec<u8>) —
-        // authority <- accounts.initializer; amount, cpi_data <- params;
+        // IDL: release_via_cpi(amount: u64, min_payout: u64, cpi_data: Vec<u8>) —
+        // authority <- accounts.initializer; amount, min_payout, cpi_data <- params;
         // now <- clock sysvar; the third-party invocation is built from
         // accounts.remaining_accounts ([0] = target program, [1..] its
         // instruction accounts). Executed against the real machine with
@@ -23386,7 +23427,7 @@ pub(crate) mod anchor_idl_tests {
         };
         let mut e = funded_escrow();
         let (payout, fee, receipt) = e
-            .release_via_cpi(ALICE, 1_750_000_000, 1_000_000, None, BOB, &inv, |_| Ok(()))
+            .release_via_cpi(ALICE, 1_750_000_000, 1_000_000, None, BOB, 0, &inv, |_| Ok(1_000_000))
             .unwrap();
         assert_eq!((payout, fee), (1_000_000, 0));
         assert_eq!(e.state(), EscrowState::Released);
@@ -23396,7 +23437,7 @@ pub(crate) mod anchor_idl_tests {
         // release rolls back (on-chain the CPI aborts the transaction).
         let mut e = funded_escrow();
         assert_eq!(
-            e.release_via_cpi(ALICE, 1_750_000_000, 1_000_000, None, BOB, &inv, |_| {
+            e.release_via_cpi(ALICE, 1_750_000_000, 1_000_000, None, BOB, 0, &inv, |_| {
                 Err(CpiError::ZeroAddress)
             }),
             Err(EscrowError::CpiExecutionFailed)
@@ -23408,7 +23449,7 @@ pub(crate) mod anchor_idl_tests {
         let mut e = funded_escrow();
         let bad = CpiInvocation { program_id: [0u8; 32], ..inv.clone() };
         assert_eq!(
-            e.release_via_cpi(ALICE, 1_750_000_000, 100, None, BOB, &bad, |_| Ok(())),
+            e.release_via_cpi(ALICE, 1_750_000_000, 100, None, BOB, 0, &bad, |_| Ok(100)),
             Err(EscrowError::InvalidCpiTarget)
         );
         assert_eq!(e.released_amount(), 0);
@@ -24257,6 +24298,11 @@ pub(crate) mod anchor_idl_tests {
         // transaction and authorizes nothing persistent — the `Released`
         // event's CPI audit (not the vault) is where it is recorded.
         ("release_via_cpi", "cpi_data"),
+        // AV-132: the slippage floor is a per-call execution guard —
+        // consumed by the executor window and never persisted (the
+        // keeper's locked CpiQuote, not the vault, is where the floor
+        // is recorded).
+        ("release_via_cpi", "min_payout"),
         // AV-81: the split params birth *child* vaults — each entry
         // persists as a field of a new child vault account (`amount`,
         // `vesting`, `quorum`, the activation bit, `milestones`), never
@@ -25822,6 +25868,11 @@ mod error_code_tests {
             194,
             "release naming an amount inside the locked dispute pool, or a claim fully swallowed by it (AV-131)",
         ),
+        (
+            EscrowError::SlippageExceeded,
+            195,
+            "release_via_cpi post-execution taker-leg amount below the min_payout slippage floor (AV-132)",
+        ),
     ];
 
     #[test]
@@ -26443,7 +26494,7 @@ mod error_code_tests {
             data: vec![9],
         };
         let raw: *mut Escrow = std::ptr::addr_of_mut!(e);
-        let result = e.release_via_cpi(ALICE, 1_750_000_000, 1_000_000, None, BOB, &inv, |_| {
+        let result = e.release_via_cpi(ALICE, 1_750_000_000, 1_000_000, None, BOB, 0, &inv, |_| {
             // Every fund-moving transition rejects the nested entry —
             // before its authority check, so even the correctly-signed
             // reentrant calls fail.
@@ -26460,7 +26511,7 @@ mod error_code_tests {
                 nested.fund(ALICE, EXPIRES_AT - 3_600),
                 Err(EscrowError::ReentrantCall)
             );
-            Ok(())
+            Ok(1_000_000)
         });
         assert!(result.is_ok(), "the outer release must complete normally");
         // The nested attempts changed nothing: one clean full release.
@@ -26471,7 +26522,7 @@ mod error_code_tests {
         // wedged.
         let mut e2 = escrow();
         e2.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        let err = e2.release_via_cpi(ALICE, 1_750_000_000, 1_000_000, None, BOB, &inv, |_| {
+        let err = e2.release_via_cpi(ALICE, 1_750_000_000, 1_000_000, None, BOB, 0, &inv, |_| {
             Err(CpiError::ZeroAddress)
         });
         assert_eq!(err, Err(EscrowError::CpiExecutionFailed));
@@ -26620,7 +26671,7 @@ mod reentrancy_fuzz_tests {
                 0 => nested.fund(authority, NOW).map(|_| ()),
                 1 => nested.release(authority, NOW, 1, mint, BOB).map(|_| ()),
                 2 => nested
-                    .release_via_cpi(authority, NOW, 1, mint, BOB, inv, |_| Ok(()))
+                    .release_via_cpi(authority, NOW, 1, mint, BOB, 0, inv, |_| Ok(1))
                     .map(|_| ()),
                 3 => nested.release_milestone(authority, NOW, 0, mint, BOB).map(|_| ()),
                 // BOB is the claim authority; ALICE/MALLORY are both
@@ -26653,10 +26704,10 @@ mod reentrancy_fuzz_tests {
             let inv = dex_invocation();
             let burst_seed = rng.next();
             let raw: *mut Escrow = std::ptr::addr_of_mut!(e);
-            let result = e.release_via_cpi(ALICE, NOW, amount - partial, mint, BOB, &inv, |_| {
+            let result = e.release_via_cpi(ALICE, NOW, amount - partial, mint, BOB, 0, &inv, |_| {
                 let nested = unsafe { &mut *raw };
                 reentrant_burst(nested, mint, &inv, burst_seed);
-                Ok(())
+                Ok(amount - partial)
             });
             assert!(result.is_ok(), "seed {s}: outer release must complete");
             // Bit-identical to a benign control run: the hostile
@@ -26668,7 +26719,7 @@ mod reentrancy_fuzz_tests {
             control.release(ALICE, NOW, partial, mint, BOB).unwrap();
             let inv2 = dex_invocation();
             control
-                .release_via_cpi(ALICE, NOW, amount - partial, mint, BOB, &inv2, |_| Ok(()))
+                .release_via_cpi(ALICE, NOW, amount - partial, mint, BOB, 0, &inv2, |_| Ok(amount - partial))
                 .unwrap();
             assert_eq!(e, control, "seed {s}: hostile run diverged from control");
             assert!(!e.is_reentrancy_locked(), "seed {s}: lock not cleared");
@@ -26685,7 +26736,7 @@ mod reentrancy_fuzz_tests {
             let inv = dex_invocation();
             let burst_seed = rng.next();
             let raw: *mut Escrow = std::ptr::addr_of_mut!(e);
-            let err = e.release_via_cpi(ALICE, NOW, e.amount(), mint, BOB, &inv, |_| {
+            let err = e.release_via_cpi(ALICE, NOW, e.amount(), mint, BOB, 0, &inv, |_| {
                 let nested = unsafe { &mut *raw };
                 reentrant_burst(nested, mint, &inv, burst_seed);
                 Err(CpiError::ZeroAddress)
@@ -31580,7 +31631,7 @@ mod payout_split_tests {
             data: vec![9],
         };
         assert_eq!(
-            e.release_via_cpi(ALICE, NOW, AMOUNT, None, BOB, &inv, |_| Ok(())),
+            e.release_via_cpi(ALICE, NOW, AMOUNT, None, BOB, 0, &inv, |_| Ok(AMOUNT)),
             Err(EscrowError::InvalidPayoutSplit)
         );
         assert_eq!(e.released_amount(), 0);
@@ -32954,11 +33005,11 @@ mod release_cooling_tests {
         let mut e = funded_cooling_escrow();
         e.announce_release(ALICE, T0).unwrap();
         assert_eq!(
-            e.release_via_cpi(ALICE, T0 + 1, AMOUNT, None, BOB, &inv, |_| Ok(())),
+            e.release_via_cpi(ALICE, T0 + 1, AMOUNT, None, BOB, 0, &inv, |_| Ok(AMOUNT)),
             Err(EscrowError::ReleaseCoolingNotElapsed)
         );
         let (payout, fee, _) = e
-            .release_via_cpi(ALICE, T0 + COOLING, AMOUNT, None, BOB, &inv, |_| Ok(()))
+            .release_via_cpi(ALICE, T0 + COOLING, AMOUNT, None, BOB, 0, &inv, |_| Ok(AMOUNT))
             .unwrap();
         assert_eq!((payout, fee), (AMOUNT, 0));
     }
@@ -41050,7 +41101,7 @@ mod cpi_release_tests {
         let mut e = funded();
         let inv = dex_invocation();
         let (payout, fee, receipt) = e
-            .release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, &inv, |_| Ok(()))
+            .release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, 0, &inv, |_| Ok(1_000_000))
             .unwrap();
         assert_eq!((payout, fee), (1_000_000, 0));
         assert_eq!(receipt.cpi_target, DEX);
@@ -41065,12 +41116,12 @@ mod cpi_release_tests {
         let mut e = funded();
         let inv = dex_invocation();
         let (payout, fee, _) = e
-            .release_via_cpi(ALICE, NOW, 400_000, None, BOB, &inv, |_| Ok(()))
+            .release_via_cpi(ALICE, NOW, 400_000, None, BOB, 0, &inv, |_| Ok(400_000))
             .unwrap();
         assert_eq!((payout, fee), (400_000, 0));
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!(e.released_amount(), 400_000);
-        e.release_via_cpi(ALICE, NOW, 600_000, None, BOB, &inv, |_| Ok(()))
+        e.release_via_cpi(ALICE, NOW, 600_000, None, BOB, 0, &inv, |_| Ok(600_000))
             .unwrap();
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(e.released_amount(), 1_000_000);
@@ -41083,19 +41134,19 @@ mod cpi_release_tests {
         // a plain one.
         let mut e = funded();
         assert_eq!(
-            e.release_via_cpi(MALLORY, NOW, 100, None, BOB, &inv, |_| Ok(())),
+            e.release_via_cpi(MALLORY, NOW, 100, None, BOB, 0, &inv, |_| Ok(100)),
             Err(EscrowError::Unauthorized)
         );
         // State: release before fund.
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         assert_eq!(
-            e.release_via_cpi(ALICE, NOW, 100, None, BOB, &inv, |_| Ok(())),
+            e.release_via_cpi(ALICE, NOW, 100, None, BOB, 0, &inv, |_| Ok(100)),
             Err(EscrowError::InvalidStateTransition)
         );
         // Amount: zero is AmountMismatch, not a CPI error.
         let mut e = funded();
         assert_eq!(
-            e.release_via_cpi(ALICE, NOW, 0, None, BOB, &inv, |_| Ok(())),
+            e.release_via_cpi(ALICE, NOW, 0, None, BOB, 0, &inv, |_| Ok(0)),
             Err(EscrowError::AmountMismatch)
         );
         // Quorum: unattested quorum blocks CPI-routed releases too.
@@ -41105,7 +41156,7 @@ mod cpi_release_tests {
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         assert_eq!(
-            e.release_via_cpi(ALICE, NOW, 100, None, BOB, &inv, |_| Ok(())),
+            e.release_via_cpi(ALICE, NOW, 100, None, BOB, 0, &inv, |_| Ok(100)),
             Err(EscrowError::QuorumNotReached)
         );
         // Timelock: now < unlock_at blocks the CPI path as well.
@@ -41113,7 +41164,7 @@ mod cpi_release_tests {
         e = e.with_timelock(NOW + 1_000).unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         assert_eq!(
-            e.release_via_cpi(ALICE, NOW, 100, None, BOB, &inv, |_| Ok(())),
+            e.release_via_cpi(ALICE, NOW, 100, None, BOB, 0, &inv, |_| Ok(100)),
             Err(EscrowError::TimelockNotReached)
         );
         // Mint: the gate runs before any CPI validation.
@@ -41127,7 +41178,7 @@ mod cpi_release_tests {
         let mut bad_inv = dex_invocation();
         bad_inv.program_id = [0u8; 32];
         assert_eq!(
-            e.release_via_cpi(ALICE, NOW, 100, None, BOB, &bad_inv, |_| Ok(())),
+            e.release_via_cpi(ALICE, NOW, 100, None, BOB, 0, &bad_inv, |_| Ok(100)),
             Err(EscrowError::MintMismatch),
             "gates run before CPI-shape validation"
         );
@@ -41147,7 +41198,7 @@ mod cpi_release_tests {
         for inv in &cases {
             let mut e = funded();
             assert_eq!(
-                e.release_via_cpi(ALICE, NOW, 100, None, BOB, inv, |_| Ok(())),
+                e.release_via_cpi(ALICE, NOW, 100, None, BOB, 0, inv, |_| Ok(100)),
                 Err(EscrowError::InvalidCpiTarget)
             );
             // Rolled back: the release never happened.
@@ -41161,7 +41212,7 @@ mod cpi_release_tests {
     fn executor_failure_rolls_back_the_whole_release() {
         let mut e = funded();
         let inv = dex_invocation();
-        let err = e.release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, &inv, |_| {
+        let err = e.release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, 0, &inv, |_| {
             Err(CpiError::ZeroAddress)
         });
         assert_eq!(err, Err(EscrowError::CpiExecutionFailed));
@@ -41176,10 +41227,10 @@ mod cpi_release_tests {
     fn executor_failure_after_partial_release_restores_the_partial() {
         let mut e = funded();
         let inv = dex_invocation();
-        e.release_via_cpi(ALICE, NOW, 400_000, None, BOB, &inv, |_| Ok(()))
+        e.release_via_cpi(ALICE, NOW, 400_000, None, BOB, 0, &inv, |_| Ok(400_000))
             .unwrap();
         assert_eq!(e.released_amount(), 400_000);
-        let err = e.release_via_cpi(ALICE, NOW, 600_000, None, BOB, &inv, |_| {
+        let err = e.release_via_cpi(ALICE, NOW, 600_000, None, BOB, 0, &inv, |_| {
             Err(CpiError::ZeroAddress)
         });
         assert_eq!(err, Err(EscrowError::CpiExecutionFailed));
@@ -41187,7 +41238,7 @@ mod cpi_release_tests {
         assert_eq!(e.released_amount(), 400_000);
         // And the escrow still works: a retry with a healthy executor
         // completes the release.
-        e.release_via_cpi(ALICE, NOW, 600_000, None, BOB, &inv, |_| Ok(()))
+        e.release_via_cpi(ALICE, NOW, 600_000, None, BOB, 0, &inv, |_| Ok(600_000))
             .unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
@@ -41199,7 +41250,7 @@ mod cpi_release_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let inv = dex_invocation();
         let (payout, fee, receipt) = e
-            .release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, &inv, |_| Ok(()))
+            .release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, 0, &inv, |_| Ok(975_000))
             .unwrap();
         // 250 bps of 1_000_000.
         assert_eq!((payout, fee), (975_000, 25_000));
@@ -41215,11 +41266,11 @@ mod cpi_release_tests {
         let mut e = funded();
         let inv = dex_invocation();
         let expected = inv.clone();
-        e.release_via_cpi(ALICE, NOW, 100, None, BOB, &inv, |seen| {
+        e.release_via_cpi(ALICE, NOW, 100, None, BOB, 0, &inv, |seen| {
             assert_eq!(seen.program_id, expected.program_id);
             assert_eq!(seen.accounts, expected.accounts);
             assert_eq!(seen.data, expected.data);
-            Ok(())
+            Ok(100)
         })
         .unwrap();
     }
@@ -41229,7 +41280,7 @@ mod cpi_release_tests {
         let mut e = funded();
         let inv = dex_invocation();
         let (_, _, receipt) = e
-            .release_via_cpi(ALICE, NOW, 100, None, BOB, &inv, |_| Ok(()))
+            .release_via_cpi(ALICE, NOW, 100, None, BOB, 0, &inv, |_| Ok(100))
             .unwrap();
         assert_eq!(receipt.accounts_hash, cpi_accounts_hash(&inv));
         // A tampered invocation (same program, one flag flipped) hashes
@@ -41237,6 +41288,146 @@ mod cpi_release_tests {
         let mut tampered = inv.clone();
         tampered.accounts[1].is_signer = true;
         assert_ne!(cpi_accounts_hash(&tampered), receipt.accounts_hash);
+    }
+
+    // ---------- AV-132: slippage protection matrix ----------
+    //
+    // The executor reports the actual post-execution taker-leg amount;
+    // below the caller's min_payout the whole release rolls back with
+    // SlippageExceeded (code 195) — the CpiExecutionFailed atomicity
+    // convention. Matrix: native-SOL path (Solana), SPL-token path
+    // (DeFi/DEX swap), and the streaming-payment leg, each with
+    // above-floor / at-floor / below-floor outcomes.
+
+    fn funded_token() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint([0xD0; 32])
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn slippage_matrix_native_sol_path() {
+        let inv = dex_invocation();
+        // Above the floor: the release settles normally.
+        let mut e = funded();
+        let (payout, fee, _) = e
+            .release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, 990_000, &inv, |_| {
+                Ok(995_000)
+            })
+            .unwrap();
+        assert_eq!((payout, fee), (1_000_000, 0));
+        assert_eq!(e.state(), EscrowState::Released);
+        // Below the floor: SlippageExceeded, full rollback.
+        let mut e = funded();
+        assert_eq!(
+            e.release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, 990_000, &inv, |_| {
+                Ok(989_999)
+            }),
+            Err(EscrowError::SlippageExceeded)
+        );
+        assert_eq!(EscrowError::SlippageExceeded.code(), 195);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.fees_paid(), 0);
+    }
+
+    #[test]
+    fn slippage_matrix_spl_token_dex_path() {
+        let inv = dex_invocation();
+        // At the floor exactly: the boundary passes.
+        let mut e = funded_token();
+        let (payout, _, _) = e
+            .release_via_cpi(
+                ALICE,
+                NOW,
+                1_000_000,
+                Some([0xD0; 32]),
+                BOB,
+                950_000,
+                &inv,
+                |_| Ok(950_000),
+            )
+            .unwrap();
+        assert_eq!(payout, 1_000_000);
+        // One lamport under the floor: rollback, nothing moved.
+        let mut e = funded_token();
+        assert_eq!(
+            e.release_via_cpi(
+                ALICE,
+                NOW,
+                1_000_000,
+                Some([0xD0; 32]),
+                BOB,
+                950_000,
+                &inv,
+                |_| Ok(949_999),
+            ),
+            Err(EscrowError::SlippageExceeded)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn slippage_matrix_payment_splitter_path() {
+        // The streaming-payment splitter leg: a partial release whose
+        // executor reports the streamed amount; the floor guards the
+        // stream's minimum viable tranche.
+        let inv = dex_invocation();
+        let mut e = funded();
+        let (payout, _, _) = e
+            .release_via_cpi(ALICE, NOW, 400_000, None, BOB, 400_000, &inv, |_| {
+                Ok(400_000)
+            })
+            .unwrap();
+        assert_eq!(payout, 400_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 400_000);
+        // A short-streamed tranche rolls back: the partial release is
+        // unwound, not left half-settled.
+        assert_eq!(
+            e.release_via_cpi(ALICE, NOW, 400_000, None, BOB, 200_000, &inv, |_| {
+                Ok(199_999)
+            }),
+            Err(EscrowError::SlippageExceeded)
+        );
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn slippage_floor_zero_disables_the_check() {
+        // min_payout == 0 keeps the pre-AV-132 semantics: any reported
+        // actual settles, even a total-loss execution.
+        let inv = dex_invocation();
+        let mut e = funded();
+        let (payout, _, _) = e
+            .release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, 0, &inv, |_| Ok(0))
+            .unwrap();
+        assert_eq!(payout, 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn slippage_rollback_restores_the_deadman_clock() {
+        // The rollback covers the same snapshot as CpiExecutionFailed:
+        // released, fees_paid, state, and the dead-man's-switch
+        // activity clock.
+        let inv = dex_invocation();
+        let mut e = funded();
+        let clock_before = e.deadman_last_activity();
+        assert_eq!(
+            e.release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, 1_000_000, &inv, |_| {
+                Ok(999_999)
+            }),
+            Err(EscrowError::SlippageExceeded)
+        );
+        assert_eq!(e.deadman_last_activity(), clock_before);
+        assert_eq!(e.state(), EscrowState::Funded);
     }
 }
 
@@ -41586,7 +41777,7 @@ mod pause_tests {
             data: vec![9],
         };
         let err = e
-            .release_via_cpi(ALICE, NOW, 100, None, BOB, &inv, |_| {
+            .release_via_cpi(ALICE, NOW, 100, None, BOB, 0, &inv, |_| {
                 panic!("the executor must never run on a paused escrow")
             })
             .unwrap_err();
@@ -48694,6 +48885,8 @@ mod arbiter_panel_tests {
         // AV-131: appended, never renumbered.
         assert_eq!(EscrowError::InvalidDisputeAmount.code(), 193);
         assert_eq!(EscrowError::DisputedAmountLocked.code(), 194);
+        // AV-132: appended, never renumbered.
+        assert_eq!(EscrowError::SlippageExceeded.code(), 195);
         // never-renumber: the full table still pins every code, and
         // `all()` covers the new variants (the AV-46 lesson: a missing
         // variant drifts the IDL error pin).
@@ -48768,7 +48961,10 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::InvalidDisputeAmount));
         assert_eq!(EscrowError::DisputedAmountLocked.code(), 194);
         assert!(EscrowError::all().contains(&EscrowError::DisputedAmountLocked));
-        assert_eq!(EscrowError::all().len(), 95);
+        // AV-132: the CPI slippage error.
+        assert_eq!(EscrowError::SlippageExceeded.code(), 195);
+        assert!(EscrowError::all().contains(&EscrowError::SlippageExceeded));
+        assert_eq!(EscrowError::all().len(), 96);
     }
 
     #[test]
@@ -51977,7 +52173,7 @@ mod cpi_allowlist_tests {
         let mut e = funded_with_allowlist();
         let inv = dex_invocation();
         let (payout, fee, receipt) = e
-            .release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, &inv, |_| Ok(()))
+            .release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, 0, &inv, |_| Ok(1_000_000))
             .unwrap();
         assert_eq!((payout, fee), (1_000_000, 0));
         assert_eq!(receipt.cpi_target, DEX);
@@ -51990,7 +52186,7 @@ mod cpi_allowlist_tests {
         let mut inv = dex_invocation();
         inv.program_id = EVIL;
         let err = e
-            .release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, &inv, |_| Ok(()))
+            .release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, 0, &inv, |_| Ok(1_000_000))
             .unwrap_err();
         // Deliberately the shape-rejection code (120), not the config
         // code (144): one code for every invocation/target rejection.
@@ -52012,7 +52208,7 @@ mod cpi_allowlist_tests {
         assert!(e.cpi_target_allowed(&EVIL));
         let mut inv = dex_invocation();
         inv.program_id = EVIL;
-        e.release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, &inv, |_| Ok(()))
+        e.release_via_cpi(ALICE, NOW, 1_000_000, None, BOB, 0, &inv, |_| Ok(1_000_000))
             .unwrap();
         assert_eq!(e.state(), EscrowState::Released);
     }
@@ -52025,7 +52221,7 @@ mod cpi_allowlist_tests {
         let mut inv = dex_invocation();
         inv.program_id = [0u8; 32]; // malformed AND non-allowlisted
         assert_eq!(
-            e.release_via_cpi(ALICE, NOW, 100, None, BOB, &inv, |_| Ok(()))
+            e.release_via_cpi(ALICE, NOW, 100, None, BOB, 0, &inv, |_| Ok(100))
                 .unwrap_err(),
             EscrowError::InvalidCpiTarget
         );

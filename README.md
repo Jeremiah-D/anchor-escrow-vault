@@ -1417,6 +1417,7 @@ program error per variant):
 | `PartialRefundExceedsLocked` | 185 | `partial_refund` (AV-127) with `amount` above the still-locked remainder |
 | `TwapGateNotSatisfied` | 186 | `release_twap_gated` / `claim_twap_gated` (AV-128) with a configured gate when the oracle is dark, the latest quote is stale, the history does not cover the full TWAP window, or the time-weighted average misses the gate's direction condition |
 | `InvalidTwapGate` | 187 | `with_twap_gate` / `initialize_twap_gate` (AV-128) with `window_slots == 0` or `target == 0`, or a vault-account decode hitting an out-of-range direction byte |
+| `SlippageExceeded` | 195 | `release_via_cpi` (AV-132) whose executor-reported post-execution taker-leg amount came back below the `min_payout` floor — the whole release rolled back (same atomicity as `CpiExecutionFailed`) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2858,7 +2859,7 @@ becomes a leg of a larger composed transaction:
 
 - **Invocation as data**: `CpiInvocation { program_id, accounts,
   data }` is the inner instruction the vault authorizes. The Anchor
-  skeleton's `release_via_cpi(amount, cpi_data)` instruction builds it
+  skeleton's `release_via_cpi(amount, min_payout, cpi_data)` instruction builds it
   from `remaining_accounts` (`[0]` = target program, `[1..]` its
   instruction accounts) via `cpi_invocation_from_remaining_accounts`;
   `cpi_invoke_target` is the stub where the real build performs the
@@ -2879,6 +2880,22 @@ becomes a leg of a larger composed transaction:
   transaction and no state change persists; the pure-logic model
   mirrors that atomicity. Nothing observable changes on failure: no
   event fires, no counter moves.
+- **Slippage protection (AV-132)**: `release_via_cpi` takes a
+  `min_payout` floor — the executor returns the *actual*
+  post-execution taker-leg amount (a DEX swap's output tokens, a
+  lending protocol's receipt value), and an actual below the floor
+  rolls the whole release back with `SlippageExceeded` (code 195):
+  same snapshot restore as `CpiExecutionFailed`, no receipt, no event.
+  `min_payout == 0` disables the floor (the pre-AV-132 semantics).
+  Two more layers guard the quote: `cpi::payout_plan` takes an optional
+  `min_payout` and refuses to build the plan when the floor exceeds
+  the quoted payout (`CpiError::SlippageExceeded` — the executor never
+  runs on a quote that already violates the floor), and the keeper's
+  `CpiQuote` locks the off-chain estimate at bundle-signing time
+  (deriving the floor from a max-slippage bps tolerance) and asserts
+  the execution against the locked quote afterwards — a deviation
+  beyond the floor, or a stale quote, is rejected off-chain even when
+  the chain accepted the floor.
 - **Reentrancy guard (AV-36)**: the state machine arms a runtime
   reentrancy lock around the injected executor — the one point where
   untrusted code runs while a transition is mid-flight. Every

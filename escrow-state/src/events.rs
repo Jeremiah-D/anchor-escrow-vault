@@ -2837,19 +2837,25 @@ impl IndexedEscrow {
         amount: u64,
         mint: Option<[u8; 32]>,
         payout_to: [u8; 32],
+        min_payout: u64,
         at: u64,
         cpi: &CpiInvocation,
         execute_cpi: F,
     ) -> Result<(u64, u64, CpiReceipt), EscrowError>
     where
-        F: FnOnce(&CpiInvocation) -> Result<(), CpiError>,
+        F: FnOnce(&CpiInvocation) -> Result<u64, CpiError>,
     {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
+        // AV-132: `min_payout` passes straight through to the state
+        // machine — the executor reports the actual post-execution
+        // taker-leg amount and an actual below the floor rolls back
+        // with `SlippageExceeded` (no event, like every other failed
+        // transition).
         let result = self
             .inner
-            .release_via_cpi(authority, at, amount, mint, payout_to, cpi, execute_cpi);
+            .release_via_cpi(authority, at, amount, mint, payout_to, min_payout, cpi, execute_cpi);
         let (payout, fee, receipt) = self.map_reentrant(result, at)?;
         // `amount` is the gross payout by construction
         // (`payout + fee == amount`); it cannot overflow u64 addition.
@@ -6962,7 +6968,7 @@ mod event_tests {
         let mut e = funded(1_000_000);
         let inv = dex_invocation();
         let (payout, fee, receipt) = e
-            .release_via_cpi(ALICE, 1_000_000, None, BOB, T0 + 2, &inv, |_| Ok(()))
+            .release_via_cpi(ALICE, 1_000_000, None, BOB, 0, T0 + 2, &inv, |_| Ok(1_000_000))
             .unwrap();
         assert_eq!((payout, fee), (1_000_000, 0));
         let event = last(&e);
@@ -6990,7 +6996,7 @@ mod event_tests {
         let inv = dex_invocation();
         let events_before = e.event_count();
         assert_eq!(
-            e.release_via_cpi(ALICE, 1_000_000, None, BOB, T0 + 2, &inv, |_| {
+            e.release_via_cpi(ALICE, 1_000_000, None, BOB, 0, T0 + 2, &inv, |_| {
                 Err(CpiError::ZeroAddress)
             }),
             Err(EscrowError::CpiExecutionFailed)
@@ -6998,9 +7004,33 @@ mod event_tests {
         assert_eq!(e.event_count(), events_before);
         // The next successful release still gets the next seq — the
         // failed one left no gap in the event log.
-        e.release_via_cpi(ALICE, 1_000_000, None, BOB, T0 + 3, &inv, |_| Ok(()))
+        e.release_via_cpi(ALICE, 1_000_000, None, BOB, 0, T0 + 3, &inv, |_| Ok(1_000_000))
             .unwrap();
         assert_eq!(last(&e).seq, events_before as u64);
+    }
+
+    #[test]
+    fn slippage_exceeded_emits_nothing() {
+        // AV-132: a below-floor execution rolls back with
+        // SlippageExceeded and emits no event — same as the executor-
+        // failure path. The next successful release still gets the
+        // next seq.
+        let mut e = funded(1_000_000);
+        let inv = dex_invocation();
+        let events_before = e.event_count();
+        assert_eq!(
+            e.release_via_cpi(ALICE, 1_000_000, None, BOB, 990_000, T0 + 2, &inv, |_| {
+                Ok(989_999)
+            }),
+            Err(EscrowError::SlippageExceeded)
+        );
+        assert_eq!(e.event_count(), events_before);
+        e.release_via_cpi(ALICE, 1_000_000, None, BOB, 990_000, T0 + 3, &inv, |_| {
+            Ok(995_000)
+        })
+        .unwrap();
+        assert_eq!(last(&e).seq, events_before as u64);
+        assert_eq!(last(&e).kind, EscrowEventKind::Released);
     }
 
     #[test]
@@ -7039,13 +7069,13 @@ mod event_tests {
         let events_before = e.event_count();
         let inv = cpi_invocation();
         let raw: *mut IndexedEscrow = std::ptr::addr_of_mut!(e);
-        e.release_via_cpi(ALICE, 1_000_000, None, BOB, T0 + 2, &inv, |_| {
+        e.release_via_cpi(ALICE, 1_000_000, None, BOB, 0, T0 + 2, &inv, |_| {
             let nested = unsafe { &mut *raw };
             assert_eq!(
                 nested.release(ALICE, 100, None, BOB, T0 + 2),
                 Err(EscrowError::ReentrantCall)
             );
-            Ok(())
+            Ok(1_000_000)
         })
         .unwrap();
         // The rejection emitted exactly one event: from == to == the

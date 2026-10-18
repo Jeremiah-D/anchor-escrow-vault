@@ -1120,7 +1120,7 @@ fn idl_errors_pin_enum() {
             e.code()
         );
     }
-    assert_eq!(errors.len(), 95, "error variant count drift");
+    assert_eq!(errors.len(), 96, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -1230,6 +1230,11 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::DualControlNotInitiated.code(), 190);
     assert_eq!(EscrowError::DualControlExpired.code(), 191);
     assert_eq!(EscrowError::DualControlRequired.code(), 192);
+    // AV-131: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidDisputeAmount.code(), 193);
+    assert_eq!(EscrowError::DisputedAmountLocked.code(), 194);
+    // AV-132: appended, never renumbered.
+    assert_eq!(EscrowError::SlippageExceeded.code(), 195);
 }
 
 #[test]
