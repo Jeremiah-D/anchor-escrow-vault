@@ -130,6 +130,25 @@ pub use swap::{link_swap, cancel_swap, cancel_swap_expired, release_swap, SWAP_L
 // SHA-256 (hand-rolled, zero dependencies).
 // ---------------------------------------------------------------------------
 
+/// The AV-137 blind-vote commitment: `SHA-256(taker_amount ||
+/// rationale_hash || salt)` with fixed-width little-endian encoding
+/// (`taker_amount` as 8 bytes LE, a missing rationale as 32 zero
+/// bytes, `salt` as 32 bytes — 72 bytes total). The single
+/// construction both [`Escrow::submit_judgment_commit`] documents
+/// and [`Escrow::reveal_judgment`] verifies, so the commit and the
+/// reveal can never disagree on the preimage layout.
+pub(crate) fn blind_commitment(
+    taker_amount: u64,
+    rationale_hash: Option<[u8; 32]>,
+    salt: [u8; 32],
+) -> [u8; 32] {
+    let mut preimage = [0u8; 72];
+    preimage[..8].copy_from_slice(&taker_amount.to_le_bytes());
+    preimage[8..40].copy_from_slice(&rationale_hash.unwrap_or([0u8; 32]));
+    preimage[40..72].copy_from_slice(&salt);
+    sha256(&preimage)
+}
+
 /// SHA-256 over `message`, FIPS 180-4. Crate-level primitive shared by
 /// the Anchor discriminator constructors (`account:` / `global:`
 /// namespaces, AV-32) and the test-only IDL pipeline (AV-29). The
@@ -1084,7 +1103,7 @@ pub struct Escrow {
     /// [`Escrow::resolve`] is disabled in panel mode
     /// ([`EscrowError::PanelResolveDisabled`]). Set once on an
     /// `Uninitialized` escrow, like the other `with_*` builders.
-    /// Persisted as 595 bytes in the vault account (a 1-byte
+    /// Persisted as 996 bytes in the vault account (a 1-byte
     /// discriminant plus [`ARBITER_PANEL_LEN`] bytes) so the committee
     /// and its votes survive serialization. Appended last, so every
     /// earlier field offset stays stable.
@@ -2598,6 +2617,47 @@ pub enum EscrowError {
     /// adjudication-fee term. Never renumbered (see
     /// [`EscrowError::code`]).
     InvalidArbiterFee,
+    /// AV-137: [`Escrow::submit_judgment_commit`] with a zero
+    /// commitment — a meaningless blind commitment (no preimage can
+    /// ever reveal against it, so the member's vote would be locked
+    /// forever). Commit a real `SHA-256(taker_amount ||
+    /// rationale_hash || salt)` instead. Never renumbered (see
+    /// [`EscrowError::code`]).
+    BlindInvalidCommitment,
+    /// AV-137: [`Escrow::reveal_judgment`] whose recomputed
+    /// `SHA-256(taker_amount || rationale_hash || salt)` does not
+    /// match the stored commitment — the revealed judgment is not
+    /// the committed one. Never renumbered (see
+    /// [`EscrowError::code`]).
+    BlindCommitMismatch,
+    /// AV-137: [`Escrow::reveal_judgment`] for a commit that was
+    /// already revealed — each commit reveals exactly once; commit
+    /// again to change the judgment. Never renumbered (see
+    /// [`EscrowError::code`]).
+    BlindDuplicateReveal,
+    /// AV-137: [`Escrow::reveal_judgment`] after the member's reveal
+    /// window (`committed_at + reveal_window_secs`) lapsed — a slow
+    /// member cannot stall the arbitration; the AV-55 default
+    /// judgment remains the fallback. Never renumbered (see
+    /// [`EscrowError::code`]).
+    BlindRevealWindowClosed,
+    /// AV-137: [`Escrow::reveal_judgment`] whose commit no longer
+    /// matches the escrow's dispute snapshot (`disputed_at` moved or
+    /// the escrow left `Disputed`) — the stale commit is cleared and
+    /// can never resurrect an outdated vote. Never renumbered (see
+    /// [`EscrowError::code`]).
+    BlindCommitStale,
+    /// AV-137: [`Escrow::reveal_judgment`] with no active commitment
+    /// from this member — commit first via
+    /// [`Escrow::submit_judgment_commit`]. Never renumbered (see
+    /// [`EscrowError::code`]).
+    BlindNoCommit,
+    /// AV-137: [`Escrow::submit_panel_judgment`] on a blind-mode
+    /// panel — direct votes are disabled in blind mode (they would
+    /// leak judgments before the reveal and defeat the commit-reveal
+    /// scheme); vote via commit + reveal instead. Never renumbered
+    /// (see [`EscrowError::code`]).
+    BlindVoteMustReveal,
 }
 
 impl EscrowError {
@@ -2733,6 +2793,20 @@ impl EscrowError {
             EscrowError::AmountOutOfBounds => 197,
             // AV-135: appended, never renumbered.
             EscrowError::InvalidArbiterFee => 198,
+            // AV-137: appended, never renumbered.
+            EscrowError::BlindInvalidCommitment => 199,
+            // AV-137: appended, never renumbered.
+            EscrowError::BlindCommitMismatch => 200,
+            // AV-137: appended, never renumbered.
+            EscrowError::BlindDuplicateReveal => 201,
+            // AV-137: appended, never renumbered.
+            EscrowError::BlindRevealWindowClosed => 202,
+            // AV-137: appended, never renumbered.
+            EscrowError::BlindCommitStale => 203,
+            // AV-137: appended, never renumbered.
+            EscrowError::BlindNoCommit => 204,
+            // AV-137: appended, never renumbered.
+            EscrowError::BlindVoteMustReveal => 205,
         }
     }
 
@@ -2850,6 +2924,20 @@ impl EscrowError {
             EscrowError::AmountOutOfBounds,
             // AV-135: appended, never renumbered.
             EscrowError::InvalidArbiterFee,
+            // AV-137: appended, never renumbered.
+            EscrowError::BlindInvalidCommitment,
+            // AV-137: appended, never renumbered.
+            EscrowError::BlindCommitMismatch,
+            // AV-137: appended, never renumbered.
+            EscrowError::BlindDuplicateReveal,
+            // AV-137: appended, never renumbered.
+            EscrowError::BlindRevealWindowClosed,
+            // AV-137: appended, never renumbered.
+            EscrowError::BlindCommitStale,
+            // AV-137: appended, never renumbered.
+            EscrowError::BlindNoCommit,
+            // AV-137: appended, never renumbered.
+            EscrowError::BlindVoteMustReveal,
         ]
     }
 }
@@ -4028,8 +4116,18 @@ pub const PANEL_VOTE_LEN: usize = 8 + 1 + 32;
 /// (`u8`), the judgment threshold (`u8`), the 8 fixed member-key slots
 /// (`8 * 32` bytes), the 8 fixed vote slots (`8 * `[`PANEL_VOTE_LEN`]
 /// bytes), and the voted bitmask (`u64`) — `1 + 1 + 256 + 328 + 8`.
+/// AV-137 appends the blind-vote region: the blind flag (`u8`), the
+/// reveal window (`u64`), the 8 fixed commitment slots (`8 * 32`
+/// bytes), the 8 commit timestamps (`8 * 8` bytes), the 8 commit
+/// dispute snapshots (`8 * 8` bytes), and the revealed bitmask
+/// (`u64`) — `1 + 8 + 256 + 64 + 64 + 8` — for a total of
+/// `594 + 401 = 995`.
 pub const ARBITER_PANEL_LEN: usize =
-    1 + 1 + MAX_PANEL_MEMBERS * PUBKEY_LEN + MAX_PANEL_MEMBERS * PANEL_VOTE_LEN + 8;
+    1 + 1 + MAX_PANEL_MEMBERS * PUBKEY_LEN + MAX_PANEL_MEMBERS * PANEL_VOTE_LEN + 8
+    // AV-137 blind-vote region.
+    + 1 + 8 + MAX_PANEL_MEMBERS * PUBKEY_LEN + MAX_PANEL_MEMBERS * 8
+    + MAX_PANEL_MEMBERS * 8
+    + 8;
 
 /// One panel member's current judgment vote (AV-65): the split the
 /// member voted for, as the taker's share of the remaining locked
@@ -4075,7 +4173,7 @@ pub struct PanelVote {
 /// escrow, mutually exclusive with the single arbiter
 /// ([`Escrow::with_arbiter`]): the two builders are last-wins —
 /// configuring one clears the other — so an escrow always has at most
-/// one arbitration mechanism. Persisted (595 bytes in the vault
+/// one arbitration mechanism. Persisted (996 bytes in the vault
 /// account: 1-byte `Option` discriminant + [`ARBITER_PANEL_LEN`]
 /// bytes) so the committee and its votes survive serialization;
 /// appended last so every earlier field offset stays stable.
@@ -4110,6 +4208,35 @@ pub struct ArbiterPanel {
     /// Bitmask of members who have voted — bit `i` set once member
     /// `i` submitted a judgment (re-votes keep the bit set).
     pub voted: u64,
+    /// AV-137: blind (commit-reveal) voting mode. When set, members
+    /// must commit a judgment hash via
+    /// [`Escrow::submit_judgment_commit`] and reveal it via
+    /// [`Escrow::reveal_judgment`] inside the reveal window — plain
+    /// [`Escrow::submit_panel_judgment`] is rejected, so no member
+    /// can front-run or herd on another member's visible vote.
+    pub blind: bool,
+    /// AV-137: per-member reveal window in seconds, measured from
+    /// each member's own `committed_at`. `0` unless blind mode.
+    pub reveal_window_secs: u64,
+    /// AV-137: the blind commitments in slot order — `commitments[i]`
+    /// is member `i`'s `SHA-256(taker_amount || rationale_hash ||
+    /// salt)`; a zeroed slot means "no active commit".
+    pub commitments: [[u8; 32]; MAX_PANEL_MEMBERS],
+    /// AV-137: `committed_at[i]` is when member `i`'s current commit
+    /// was recorded (the reveal window runs from here).
+    pub committed_at: [u64; MAX_PANEL_MEMBERS],
+    /// AV-137: the dispute snapshot each commit binds to —
+    /// `commit_disputed_at[i]` is the escrow's `disputed_at` when
+    /// member `i` committed. A reveal whose snapshot no longer
+    /// matches is auto-invalidated (the commit is cleared), so a
+    /// state change after the commit (settlement, default judgment)
+    /// can never resurrect a stale vote.
+    pub commit_disputed_at: [u64; MAX_PANEL_MEMBERS],
+    /// AV-137: bitmask of members whose current commit was revealed —
+    /// bit `i` set by [`Escrow::reveal_judgment`], cleared by a fresh
+    /// [`Escrow::submit_judgment_commit`]. A set bit rejects a second
+    /// reveal of the same commit (`BlindDuplicateReveal`).
+    pub revealed: u64,
 }
 
 impl ArbiterPanel {
@@ -4141,6 +4268,14 @@ impl ArbiterPanel {
                 rationale_hash: None,
             }; MAX_PANEL_MEMBERS],
             voted: 0,
+            // AV-137: plain (non-blind) panel by default; blind mode
+            // is opted in via `Escrow::with_blind_panel`.
+            blind: false,
+            reveal_window_secs: 0,
+            commitments: [[0u8; 32]; MAX_PANEL_MEMBERS],
+            committed_at: [0u64; MAX_PANEL_MEMBERS],
+            commit_disputed_at: [0u64; MAX_PANEL_MEMBERS],
+            revealed: 0,
         };
         out.members[..members.len()].copy_from_slice(members);
         Ok(out)
@@ -15330,6 +15465,13 @@ let fee = self.charge_protocol_fee(taker_amount)?;
         let slot = panel
             .member_index(&member)
             .ok_or(EscrowError::Unauthorized)?;
+        // AV-137: blind-mode panels reject direct votes — a visible
+        // vote would leak the member's judgment before the reveal and
+        // defeat the commit-reveal scheme (front-running / herding).
+        // Vote via `submit_judgment_commit` + `reveal_judgment`.
+        if panel.blind {
+            return Err(EscrowError::BlindVoteMustReveal);
+        }
         match self.state {
             EscrowState::Disputed => {}
             _ => return Err(EscrowError::InvalidStateTransition),
@@ -15338,17 +15480,52 @@ let fee = self.charge_protocol_fee(taker_amount)?;
         // `resolve` — a vote naming more than `disputed_amount` is
         // `ReleaseExceedsLocked` (the existing error), whether or not
         // it settles. The same conservation gate as `resolve`.
-        let remaining = self.remaining_amount();
         if taker_amount > self.disputed_amount {
             return Err(EscrowError::ReleaseExceedsLocked);
         }
         // Record the vote (overwriting any previous vote by this
-        // member), then tally the member's *current effective* vote.
-        let mut panel = panel;
-        let vote = PanelVote {
-            taker_amount,
-            rationale_hash,
-        };
+        // member), then tally the member's *current effective* vote —
+        // the shared AV-137 helper, so the blind reveal path settles
+        // under identical rules.
+        self.record_panel_vote_and_maybe_settle(
+            slot,
+            PanelVote {
+                taker_amount,
+                rationale_hash,
+            },
+            resolved_at,
+            mint,
+            payout_to,
+        )
+    }
+
+    /// Record one panel member's vote and settle when the M-th
+    /// matching vote arrives (AV-65 / AV-137 shared path).
+    ///
+    /// Both [`Escrow::submit_panel_judgment`] (plain panels) and
+    /// [`Escrow::reveal_judgment`] (blind panels) funnel through here,
+    /// so the threshold tally and the settlement (mint check, payout
+    /// policy, protocol/streaming/arbiter fees, dispute-interest
+    /// settlement, `released` accounting) cannot fork between the two
+    /// voting modes. Callers perform their own guards (pause,
+    /// reentrancy, membership, blind-mode routing, state) before
+    /// entering; the conservation gate (`taker_amount <=
+    /// disputed_amount`) is the caller's responsibility too, so a
+    /// revealed vote is checked exactly like a plain vote.
+    fn record_panel_vote_and_maybe_settle(
+        &mut self,
+        slot: usize,
+        vote: PanelVote,
+        resolved_at: u64,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+    ) -> Result<Option<(u64, u64, u64)>, EscrowError> {
+        let taker_amount = vote.taker_amount;
+        let rationale_hash = vote.rationale_hash;
+        let remaining = self.remaining_amount();
+        let mut panel = self
+            .arbiter_panel
+            .ok_or(EscrowError::InvalidArbiterPanel)?;
         panel.record_vote(slot, taker_amount, rationale_hash);
         self.arbiter_panel = Some(panel);
         if !panel.threshold_reached(&vote) {
@@ -15396,6 +15573,226 @@ let fee = self.charge_protocol_fee(taker_amount)?;
             .checked_add(initializer_interest)
             .ok_or(EscrowError::ReleaseExceedsLocked)?;
         Ok(Some((taker_payout, fee, initializer_refund)))
+    }
+
+    /// Opt in to blind (commit-reveal) panel voting (AV-137 — Solana
+    /// governance / payment anti-single-point-of-failure): the panel
+    /// configured here tallies judgments exactly like
+    /// [`Escrow::with_arbiter_panel`], except members vote in two
+    /// phases — first [`Escrow::submit_judgment_commit`], then
+    /// [`Escrow::reveal_judgment`] inside their reveal window.
+    ///
+    /// Why: on a plain panel every vote is visible the moment it
+    /// lands, so a later voter can simply copy the emerging majority
+    /// (herding) or race to be the M-th vote on a judgment they did
+    /// not independently reach (front-running). Commit-reveal hides
+    /// every judgment until the reveal: members commit to a judgment
+    /// they cannot change without re-committing, and the tally only
+    /// sees revealed votes.
+    ///
+    /// Builder-style: only valid on an `Uninitialized` escrow, like
+    /// [`Escrow::with_arbiter_panel`] — the voting mode is fixed
+    /// before any funds move. `reveal_window_secs` must be non-zero
+    /// ([`EscrowError::InvalidArbiterPanel`] otherwise — a zero window
+    /// would make every reveal instantly late). Mutually exclusive
+    /// with the single arbiter ([`Escrow::with_arbiter`]): last-wins,
+    /// so an escrow always has at most one arbitration mechanism.
+    ///
+    /// Check order is the initializer-governance convention: pause,
+    /// then state, then the panel/member/window validation — a
+    /// stranger learns nothing.
+    pub fn with_blind_panel(
+        mut self,
+        members: &[[u8; 32]],
+        threshold: u8,
+        reveal_window_secs: u64,
+    ) -> Result<Self, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast, even
+        // for pre-fund configuration.
+        self.require_not_paused()?;
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if reveal_window_secs == 0 {
+            return Err(EscrowError::InvalidArbiterPanel);
+        }
+        let mut panel = ArbiterPanel::new(members, threshold)?;
+        panel.blind = true;
+        panel.reveal_window_secs = reveal_window_secs;
+        self.arbiter_panel = Some(panel);
+        // Mutually exclusive with the single arbiter — last-wins: the
+        // panel replaces any single arbiter set earlier.
+        self.arbiter = None;
+        Ok(self)
+    }
+
+    /// Whether this escrow's panel (if any) votes blind
+    /// (commit-reveal). `false` for plain panels and for
+    /// single-arbiter / arbiter-less escrows.
+    pub fn panel_blind(&self) -> bool {
+        self.arbiter_panel.map(|p| p.blind).unwrap_or(false)
+    }
+
+    /// Commit one panel member's blind judgment (AV-137): record
+    /// `commitment = SHA-256(taker_amount || rationale_hash ||
+    /// salt)` without revealing the judgment itself.
+    ///
+    /// The member later reveals via [`Escrow::reveal_judgment`], which
+    /// recomputes the hash and rejects a mismatch — the commit binds
+    /// the member to a judgment they cannot silently change. A second
+    /// commit before the reveal overwrites the first (last-wins, and
+    /// the reveal window restarts from the new `committed_at`), so a
+    /// fat-fingered commitment is recoverable; the overwritten commit
+    /// stays in the event log as the audit trail.
+    ///
+    /// The commit binds to the escrow's dispute snapshot
+    /// (`disputed_at` at commit time): a reveal after the dispute
+    /// moved on is auto-invalidated (see
+    /// [`Escrow::reveal_judgment`]).
+    ///
+    /// Check order: pause, then panel/blind configuration, then
+    /// membership, then state, then the commitment value — a
+    /// stranger learns nothing, and a mis-stepped call fails before
+    /// any state is touched. [`EscrowError::BlindInvalidCommitment`]
+    /// on a zero commitment: no preimage can ever reveal against
+    /// it, so the member's vote would be locked forever.
+    pub fn submit_judgment_commit(
+        &mut self,
+        member: [u8; 32],
+        commitment: [u8; 32],
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        let panel = self.arbiter_panel.ok_or(EscrowError::InvalidArbiterPanel)?;
+        if !panel.blind {
+            return Err(EscrowError::InvalidArbiterPanel);
+        }
+        let slot = panel
+            .member_index(&member)
+            .ok_or(EscrowError::Unauthorized)?;
+        match self.state {
+            EscrowState::Disputed => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if commitment == [0u8; 32] {
+            return Err(EscrowError::BlindInvalidCommitment);
+        }
+        let mut panel = panel;
+        panel.commitments[slot] = commitment;
+        panel.committed_at[slot] = now;
+        panel.commit_disputed_at[slot] = self.disputed_at;
+        // A fresh commit re-arms the reveal: committing again after a
+        // reveal starts a new commit-reveal round for this member.
+        panel.revealed &= !(1 << slot);
+        self.arbiter_panel = Some(panel);
+        Ok(())
+    }
+
+    /// Reveal one panel member's blind judgment (AV-137):
+    /// `taker_amount` and `rationale_hash` are checked against the
+    /// member's commitment from [`Escrow::submit_judgment_commit`]
+    /// (`SHA-256(taker_amount || rationale_hash || salt)` must match
+    /// byte-for-byte), then the vote enters the panel tally exactly
+    /// like a plain [`Escrow::submit_panel_judgment`] vote — the
+    /// shared [`Escrow::record_panel_vote_and_maybe_settle`] helper,
+    /// so the AV-65 threshold semantics, the mint check, the payout
+    /// policy, and the fee/interest settlement are identical.
+    ///
+    /// Each commit reveals exactly once ([`EscrowError::BlindDuplicateReveal`]
+    /// on a second reveal of the same commit). The reveal must land
+    /// inside the member's window (`committed_at +
+    /// reveal_window_secs`, [`EscrowError::BlindRevealWindowClosed`]
+    /// otherwise — a slow member cannot stall the arbitration; the
+    /// AV-55 default judgment remains the fallback). The commit's
+    /// dispute snapshot must still match
+    /// ([`EscrowError::BlindCommitStale`], and the stale commit is
+    /// cleared — a state change after the commit can never resurrect
+    /// an outdated vote).
+    ///
+    /// Check order: pause, reentrancy (the reveal can settle and move
+    /// funds), panel/blind configuration, membership, state, commit
+    /// presence, duplicate reveal, snapshot, window, and finally the
+    /// commitment preimage — a stranger learns nothing, and each
+    /// failure is reported before any state is touched. Returns
+    /// `(taker_payout, fee, initializer_refund)` on the settling
+    /// reveal (for transfer sizing), `None` otherwise.
+    pub fn reveal_judgment(
+        &mut self,
+        member: [u8; 32],
+        taker_amount: u64,
+        rationale_hash: Option<[u8; 32]>,
+        salt: [u8; 32],
+        now: u64,
+        resolved_at: u64,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+    ) -> Result<Option<(u64, u64, u64)>, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // AV-36: reentrancy guard before the authority check — the
+        // reveal can settle and move funds.
+        self.require_not_reentrant()?;
+        let panel = self.arbiter_panel.ok_or(EscrowError::InvalidArbiterPanel)?;
+        if !panel.blind {
+            return Err(EscrowError::InvalidArbiterPanel);
+        }
+        let slot = panel
+            .member_index(&member)
+            .ok_or(EscrowError::Unauthorized)?;
+        match self.state {
+            EscrowState::Disputed => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if panel.commitments[slot] == [0u8; 32] {
+            return Err(EscrowError::BlindNoCommit);
+        }
+        if panel.revealed & (1 << slot) != 0 {
+            return Err(EscrowError::BlindDuplicateReveal);
+        }
+        // The commit binds to the dispute snapshot: a state change
+        // after the commit auto-invalidates it — clear the stale
+        // commit so it can never be revealed later.
+        if panel.commit_disputed_at[slot] != self.disputed_at {
+            let mut panel = panel;
+            panel.commitments[slot] = [0u8; 32];
+            panel.committed_at[slot] = 0;
+            panel.commit_disputed_at[slot] = 0;
+            self.arbiter_panel = Some(panel);
+            return Err(EscrowError::BlindCommitStale);
+        }
+        let deadline = panel.committed_at[slot].saturating_add(panel.reveal_window_secs);
+        if now > deadline {
+            return Err(EscrowError::BlindRevealWindowClosed);
+        }
+        // AV-131: the panel adjudicates the disputed pool, like
+        // `resolve` — a vote naming more than `disputed_amount` is
+        // `ReleaseExceedsLocked`, whether or not it settles. The same
+        // conservation gate as `resolve` (and as the plain panel
+        // path): a revealed vote is checked exactly like a plain vote.
+        if taker_amount > self.disputed_amount {
+            return Err(EscrowError::ReleaseExceedsLocked);
+        }
+        if blind_commitment(taker_amount, rationale_hash, salt) != panel.commitments[slot] {
+            return Err(EscrowError::BlindCommitMismatch);
+        }
+        let mut panel = panel;
+        panel.revealed |= 1 << slot;
+        self.arbiter_panel = Some(panel);
+        // The revealed vote enters the tally exactly like a plain
+        // vote — the shared helper, so blind and plain panels settle
+        // under identical rules.
+        self.record_panel_vote_and_maybe_settle(
+            slot,
+            PanelVote {
+                taker_amount,
+                rationale_hash,
+            },
+            resolved_at,
+            mint,
+            payout_to,
+        )
     }
 
     /// Update the arbiter panel's judgment threshold by dual-signed
@@ -17492,10 +17889,13 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // AV-65: opt-in arbiter panel (see `Escrow::with_arbiter_panel`):
     // one discriminant byte, then the fixed `ARBITER_PANEL_LEN`-byte
     // panel (member count + threshold + 8 member keys + 8 vote slots +
-    // voted bitmask — see `ArbiterPanel`). The region is always
-    // reserved (zeroed when `None`) so `with_arbiter_panel` writes in
-    // place — same treatment as `arbiter` / `mint` / `reference`.
-    // Appended last so every earlier field offset stays stable.
+    // voted bitmask + AV-137 blind-vote region: blind flag + reveal
+    // window + 8 commitments + 8 commit timestamps + 8 commit dispute
+    // snapshots + revealed bitmask — see `ArbiterPanel`). The region
+    // is always reserved (zeroed when `None`) so `with_arbiter_panel`
+    // / `with_blind_panel` write in place — same treatment as
+    // `arbiter` / `mint` / `reference`. Appended last so every earlier
+    // field offset stays stable.
     ("arbiter_panel", "Option<ArbiterPanel>", 1 + ARBITER_PANEL_LEN),
     // AV-66: opt-in tiered protocol-fee schedule (see
     // `Escrow::with_fee_schedule`): one live-tier-count byte, then the
@@ -18024,7 +18424,7 @@ pub const VAULT_SPACE: usize = ANCHOR_DISCRIMINATOR_LEN + ESCROW_BODY_LEN;
 /// `disputed_amount` counter (zeroed when the escrow was never
 /// disputed).
 pub const VAULT_SPACE_NO_QUORUM: usize =
-    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + 321 + 49 + 8 + 8 + 11 + 8 + 9 + PRICE_GATE_LEN + 2 + 2 + SLOT_TIMELOCK_TAIL_LEN + COMPOUND_INTEREST_TAIL_LEN + DISPUTE_INTEREST_LEN + CLAIM_COOLDOWN_TAIL_LEN + COUNTER_OFFER_TAIL_LEN + RELEASE_INTENT_TAIL_LEN + KEEPER_BOUNTY_TAIL_LEN + SLASH_LADDER_TAIL_LEN + 8 + TWAP_GATE_LEN
+    ANCHOR_DISCRIMINATOR_LEN + PUBKEY_LEN + PUBKEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 996 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + 321 + 49 + 8 + 8 + 11 + 8 + 9 + PRICE_GATE_LEN + 2 + 2 + SLOT_TIMELOCK_TAIL_LEN + COMPOUND_INTEREST_TAIL_LEN + DISPUTE_INTEREST_LEN + CLAIM_COOLDOWN_TAIL_LEN + COUNTER_OFFER_TAIL_LEN + RELEASE_INTENT_TAIL_LEN + KEEPER_BOUNTY_TAIL_LEN + SLASH_LADDER_TAIL_LEN + 8 + TWAP_GATE_LEN
     // AV-130: the dual-control (maker-checker) tail — the 33-byte
     // `dual_control_checker` region plus the 1-byte `Option`
     // discriminant and the `DUAL_CONTROL_INTENT_LEN`-byte intent
@@ -18727,7 +19127,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 39_539_760, "from {state:?}");
+            assert_eq!(rent, 42_330_720, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -18825,9 +19225,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 39_539_760 by
+        // VAULT_SPACE — pinned at 42_330_720 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 39_539_760);
+        assert_eq!(rent, 42_330_720);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -18995,11 +19395,11 @@ mod tests {
     fn release_and_close_adds_no_fields_and_keeps_space() {
         // AV-50 touches no persisted field: the release leg moves the
         // `released` / `fees_paid` counters and the state byte, and
-        // then the account is closed. VAULT_SPACE stays 5553 — re-asserted
+        // then the account is closed. VAULT_SPACE stays 5954 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 5553, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 39_539_760);
+        assert_eq!(VAULT_SPACE, 5954, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 42_330_720);
     }
 
     #[test]
@@ -19015,10 +19415,10 @@ mod tests {
         // 26 (dispute timestamp + default judgment + confirmation
         // bit), and AV-63 by 8 (absolute protocol-fee ceiling), AV-64
         // by 16 (relative timelock + funding timestamp), and AV-65 by
-        // 595 (arbiter panel), and AV-68 by 41 (evidence-disclosure
+        // 996 (arbiter panel: 595 AV-65 + 401 AV-137), and AV-68 by 41 (evidence-disclosure
         // deadline + escalating party), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 5553, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 5954, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -21451,7 +21851,7 @@ pub(crate) mod anchor_idl_tests {
                             / over-long / zero-address / duplicate \\
                             member input, a zero threshold, or a \\
                             threshold above the member count is \\
-                            InvalidArbiterPanel (code 136); the 595-byte \\
+                            InvalidArbiterPanel (code 136); the 995-byte \\
                             region is always reserved (zeroed when None) \\
                             so the opt-in writes in place without \\
                             reallocating; emits no event (pre-fund \\
@@ -21514,6 +21914,136 @@ pub(crate) mod anchor_idl_tests {
                             per submission (from == to == Disputed) and \\
                             PanelResolved on the settling vote \\
                             (Disputed -> Settled)",
+        },
+        InstructionSpec {
+            // AV-137: opt in to blind (commit-reveal) panel voting at
+            // initialize time (replaces the single arbiter, like
+            // initialize_arbiter_panel).
+            name: "initialize_blind_panel",
+            params: &[
+                (
+                    "members",
+                    "Vec<Pubkey>",
+                    "instruction param; the panel member keys (1-8 \\
+                     live addresses)",
+                ),
+                (
+                    "threshold",
+                    "u8",
+                    "instruction param; the M-vote judgment threshold \\
+                     (1 <= M <= member count) - the first split to \\
+                     collect M matching revealed votes settles the \\
+                     escrow automatically",
+                ),
+                (
+                    "reveal_window_secs",
+                    "u64",
+                    "instruction param; each member's reveal window in \\
+                     seconds, measured from their own commitment time \\
+                     (must be non-zero - a zero window would make \\
+                     every reveal instantly late)",
+                ),
+            ],
+            method: "Escrow::with_blind_panel",
+            input_mapping: "members <- param (Vec<Pubkey> -> Vec<[u8; \\
+                            32]> conversion); threshold <- param; \\
+                            reveal_window_secs <- param; authority <- \\
+                            accounts.initializer (signer), enforced by \\
+                            the Anchor account constraint, not the state \\
+                            machine; Uninitialized only, like \\
+                            initialize_arbiter_panel; empty / over-long \\
+                            / zero-address / duplicate member input, a \\
+                            zero threshold, a threshold above the member \\
+                            count, or a zero reveal window is \\
+                            InvalidArbiterPanel (code 136); the \\
+                            995-byte region is always reserved (zeroed \\
+                            when None) so the opt-in writes in place \\
+                            without reallocating; emits no event \\
+                            (pre-fund configuration)",
+        },
+        InstructionSpec {
+            // AV-137: a panel member commits their blind judgment on a
+            // disputed escrow; the reveal follows inside the window.
+            name: "submit_judgment_commit",
+            params: &[(
+                "commitment",
+                "[u8; 32]",
+                "instruction param; SHA-256(taker_amount || \\
+                 rationale_hash || salt) - the judgment stays \\
+                 hidden until the reveal",
+            )],
+            method: "Escrow::submit_judgment_commit",
+            input_mapping: "commitment <- param; authority <- \\
+                            accounts.member (signer) - must be one of \\
+                            the panel's member keys (a stranger is \\
+                            Unauthorized); no panel / non-blind panel \\
+                            is InvalidArbiterPanel (code 136); Disputed \\
+                            only (InvalidStateTransition otherwise); a \\
+                            zero commitment is BlindInvalidCommitment \\
+                            (code 199) - no preimage can ever reveal \\
+                            against it; a second commit before the \\
+                            reveal overwrites the first (last-wins, the \\
+                            window restarts); the commit binds to the \\
+                            escrow's disputed_at snapshot; emits \\
+                            JudgmentCommitted (from == to == Disputed)",
+        },
+        InstructionSpec {
+            // AV-137: a panel member reveals their blind judgment; the
+            // revealed vote enters the panel tally exactly like a
+            // plain vote, and the M-th matching reveal auto-settles.
+            name: "reveal_judgment",
+            params: &[
+                (
+                    "taker_amount",
+                    "u64",
+                    "instruction param; the taker's share of the \\
+                     remaining locked funds under this member's \\
+                     judgment - must equal the committed preimage \\
+                     (BlindCommitMismatch otherwise) and be <= the \\
+                     disputed pool (ReleaseExceedsLocked otherwise)",
+                ),
+                (
+                    "rationale_hash",
+                    "Option<[u8; 32]>",
+                    "instruction param; the member's optional 32-byte \\
+                     commitment to the off-chain rationale document \\
+                     (AV-38 convention) - part of the committed \\
+                     preimage",
+                ),
+                (
+                    "salt",
+                    "[u8; 32]",
+                    "instruction param; the member's 32-byte blinding \\
+                     salt - part of the committed preimage",
+                ),
+            ],
+            method: "Escrow::reveal_judgment",
+            input_mapping: "taker_amount, rationale_hash, salt <- \\
+                            params; authority <- accounts.member \\
+                            (signer) - must be one of the panel's \\
+                            member keys (a stranger is Unauthorized); \\
+                            no panel / non-blind panel is \\
+                            InvalidArbiterPanel (code 136); Disputed \\
+                            only (InvalidStateTransition otherwise); \\
+                            no active commitment is BlindNoCommit \\
+                            (code 204); an already-revealed commit is \\
+                            BlindDuplicateReveal (code 201); a commit \\
+                            whose disputed_at snapshot no longer \\
+                            matches is cleared and rejected as \\
+                            BlindCommitStale (code 203); a reveal past \\
+                            committed_at + reveal_window_secs is \\
+                            BlindRevealWindowClosed (code 202); the \\
+                            recomputed SHA-256(taker_amount || \\
+                            rationale_hash || salt) must equal the \\
+                            commitment (BlindCommitMismatch, code 200 \\
+                            otherwise); the revealed vote then settles \\
+                            exactly like submit_panel_judgment (mint \\
+                            and payout policy checked before mutating \\
+                            state; AV-119 resolved_at is the clock \\
+                            sysvar, NOT an instruction param); emits \\
+                            JudgmentRevealed per reveal (from == to == \\
+                            Disputed) and PanelResolved on the settling \\
+                            reveal (Disputed -> Settled)",
         },
         InstructionSpec {
             // AV-49: set the payout destination allowlist at
@@ -23041,6 +23571,10 @@ pub(crate) mod anchor_idl_tests {
             // AV-65: arbiter-panel multisig judgment.
             "Escrow::with_arbiter_panel",
             "Escrow::submit_panel_judgment",
+            // AV-137: blind (commit-reveal) panel voting.
+            "Escrow::with_blind_panel",
+            "Escrow::submit_judgment_commit",
+            "Escrow::reveal_judgment",
             "Escrow::with_payout_allowlist",
             "Escrow::update_payout_allowlist",
             // AV-96: payout destination denylist — the compliance veto,
@@ -23283,6 +23817,10 @@ pub(crate) mod anchor_idl_tests {
                 &"rotate_fee_recipient",
                 &"initialize_arbiter_panel",
                 &"submit_panel_judgment",
+                // AV-137: blind (commit-reveal) panel voting.
+                &"initialize_blind_panel",
+                &"submit_judgment_commit",
+                &"reveal_judgment",
                 &"initialize_payout_allowlist",
                 &"update_payout_allowlist",
                 &"initialize_payout_denylist",
@@ -24947,6 +25485,11 @@ pub(crate) mod anchor_idl_tests {
         ("initiate_release", "mint"),
         ("initiate_release", "payout_to"),
         ("initiate_release", "intent_ttl_secs"),
+        // AV-137: the blinding salt is consumed at call time
+        // (commitment verification) and never persisted — only the
+        // commitment hash itself persists, in the panel's commitments
+        // array (see PARAM_FIELD_MAP).
+        ("reveal_judgment", "salt"),
     ];
     const PARAM_FIELD_MAP: &[(&str, &str, &str)] = &[
         ("initialize", "amount", "amount"),
@@ -25030,6 +25573,24 @@ pub(crate) mod anchor_idl_tests {
         // populates `rationale_hash` on the settling vote (AV-38
         // convention).
         ("submit_panel_judgment", "rationale_hash", "rationale_hash"),
+        // AV-137: the blind panel's member keys / threshold / reveal
+        // window populate the panel region, like
+        // initialize_arbiter_panel's params above.
+        ("initialize_blind_panel", "members", "arbiter_panel"),
+        ("initialize_blind_panel", "threshold", "arbiter_panel"),
+        ("initialize_blind_panel", "reveal_window_secs", "arbiter_panel"),
+        // AV-137: the blind commitment populates the panel's
+        // per-member commitments array.
+        ("submit_judgment_commit", "commitment", "arbiter_panel"),
+        // AV-137: a revealed vote's taker share accumulates in
+        // `released` on the settling reveal — the same dual-writing
+        // the direction-2 note allows for submit_panel_judgment's
+        // taker_amount.
+        ("reveal_judgment", "taker_amount", "released"),
+        // AV-137: the revealed vote's rationale-document commitment
+        // param populates `rationale_hash` on the settling reveal
+        // (AV-38 convention).
+        ("reveal_judgment", "rationale_hash", "rationale_hash"),
         // The arbiter's split awards the taker `taker_amount` out of the
         // remaining funds; the taker's share accumulates in `released`,
         // like `release`'s amount param.
@@ -26476,6 +27037,41 @@ mod error_code_tests {
             EscrowError::InvalidArbiterFee,
             198,
             "with_arbiter_fee with fee_bps > 10_000 — a rate above 100% (AV-135)",
+        ),
+        (
+            EscrowError::BlindInvalidCommitment,
+            199,
+            "submit_judgment_commit with a zero commitment — no preimage can ever reveal against it (AV-137)",
+        ),
+        (
+            EscrowError::BlindCommitMismatch,
+            200,
+            "reveal_judgment whose recomputed SHA-256(taker_amount || rationale_hash || salt) does not match the stored commitment (AV-137)",
+        ),
+        (
+            EscrowError::BlindDuplicateReveal,
+            201,
+            "reveal_judgment for a commit that was already revealed — each commit reveals exactly once (AV-137)",
+        ),
+        (
+            EscrowError::BlindRevealWindowClosed,
+            202,
+            "reveal_judgment after committed_at + reveal_window_secs lapsed (AV-137)",
+        ),
+        (
+            EscrowError::BlindCommitStale,
+            203,
+            "reveal_judgment whose commit no longer matches the escrow's dispute snapshot — auto-invalidated (AV-137)",
+        ),
+        (
+            EscrowError::BlindNoCommit,
+            204,
+            "reveal_judgment with no active commitment from this member (AV-137)",
+        ),
+        (
+            EscrowError::BlindVoteMustReveal,
+            205,
+            "submit_panel_judgment on a blind-mode panel — direct votes are disabled, vote via commit + reveal (AV-137)",
         ),
     ];
 
@@ -28146,11 +28742,12 @@ mod account_space_tests {
         // every earlier offset above is unchanged.
         out.extend_from_slice(&e.fund_at.to_le_bytes());
         // AV-65: opt-in arbiter panel, always reserved like `quorum`:
-        // the `None` discriminant followed by the zeroed 594-byte
+        // the `None` discriminant followed by the zeroed 995-byte
         // panel region (member count + threshold + 8 member keys + 8
-        // vote slots + voted bitmask), so `with_arbiter_panel` writes
-        // in place without reallocating; appended last so every earlier
-        // offset above is unchanged.
+        // vote slots + voted bitmask + AV-137 blind-vote region), so
+        // `with_arbiter_panel` / `with_blind_panel` write in place
+        // without reallocating; appended last so every earlier offset
+        // above is unchanged.
         match e.arbiter_panel {
             None => {
                 out.push(0);
@@ -28177,6 +28774,20 @@ mod account_space_tests {
                     }
                 }
                 out.extend_from_slice(&p.voted.to_le_bytes());
+                // AV-137: blind-vote region, appended after the voted
+                // bitmask so every earlier panel offset stays stable.
+                out.push(u8::from(p.blind));
+                out.extend_from_slice(&p.reveal_window_secs.to_le_bytes());
+                for commitment in p.commitments.iter() {
+                    out.extend_from_slice(commitment);
+                }
+                for t in p.committed_at.iter() {
+                    out.extend_from_slice(&t.to_le_bytes());
+                }
+                for t in p.commit_disputed_at.iter() {
+                    out.extend_from_slice(&t.to_le_bytes());
+                }
+                out.extend_from_slice(&p.revealed.to_le_bytes());
             }
         }
         // AV-66: opt-in tiered protocol-fee schedule, always reserved
@@ -28880,9 +29491,9 @@ mod account_space_tests {
         assert_eq!(SLASH_LADDER_TAIL_LEN, 115);
         // + 9 (AV-133 scheduled pause auto-recovery: 1-byte `Option`
         // discriminant + 8-byte `auto_unpause_at` timestamp).
-        assert_eq!(ESCROW_BODY_LEN, 5545, "escrow payload bytes");
+        assert_eq!(ESCROW_BODY_LEN, 5946, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 5553, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 5954, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -29030,10 +29641,10 @@ mod account_space_tests {
         // bps rate, zeroed when no fee is configured).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + 321 + 49 + 8 + 8 + 11 + 8 + 9 + 18 + 2 + 2 + 8 + 8 + 1 + 8 + 8 + 8 + 9 + 17 + 8 + 8 + 8 + 114 + 1 + 8 + 26 + 123 + 8 + 9 + 9 + 9 + 9 + 3,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 996 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + 321 + 49 + 8 + 8 + 11 + 8 + 9 + 18 + 2 + 2 + 8 + 8 + 1 + 8 + 8 + 8 + 9 + 17 + 8 + 8 + 8 + 114 + 1 + 8 + 26 + 123 + 8 + 9 + 9 + 9 + 9 + 3,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5063);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5464);
     }
 
     #[test]
@@ -29443,16 +30054,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5553) * 3480 * 2 = 5681 * 6960 = 39_539_760 lamports.
-        assert_eq!(full, 39_539_760);
+        // (128 + 5954) * 3480 * 2 = 6082 * 6960 = 42_330_720 lamports.
+        assert_eq!(full, 42_330_720);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5063) * 3480 * 2 = 5191 * 6960 = 36_129_360 lamports.
-        assert_eq!(no_quorum, 36_129_360);
+        // (128 + 5464) * 3480 * 2 = 5592 * 6960 = 38_920_320 lamports.
+        assert_eq!(no_quorum, 38_920_320);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -29496,25 +30107,25 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(39_539_760, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(42_330_720, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
             check_vault_rent_exempt(37_326_479, params.0, params.1),
             Err(RentShortfall {
-                required: 39_539_760,
+                required: 42_330_720,
                 provided: 37_326_479,
             })
         );
         // Generous funding: exempt.
         assert_eq!(
-            check_vault_rent_exempt(40_000_000, params.0, params.1),
+            check_vault_rent_exempt(43_000_000, params.0, params.1),
             Ok(())
         );
         // Zero lamports: the full minimum is the shortfall.
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 39_539_760,
+                required: 42_330_720,
                 provided: 0,
             })
         );
@@ -31561,7 +32172,7 @@ mod dutch_auction_tests {
         plain.fund(ALICE, START - 3_600).unwrap();
         let bytes = encode_escrow(&plain);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         let tail = ESCROW_BODY_LEN - ARBITER_FEE_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
         assert_eq!(bytes[tail], 0, "auction: None discriminant");
         assert_eq!(
@@ -33264,7 +33875,7 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_name("tranche_funded"), Some(kind));
         // AV-112 claims 59/60 next, AV-114 claims 61, AV-124 claims 67,
         // AV-127 claims 68 (append-only, never renumbered).
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -33712,7 +34323,7 @@ mod release_cooling_tests {
         e.announce_release(ALICE, T0).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         let tail_at = ESCROW_BODY_LEN - ARBITER_FEE_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN;
         assert_eq!(RELEASE_COOLING_TAIL_LEN, 17);
         assert_eq!(
@@ -33740,7 +34351,7 @@ mod release_cooling_tests {
         let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
         e.fund(ALICE, T0).unwrap();
         let bytes = encode_escrow(&e);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         // The cooling tail now sits before the AV-113 price-gate tail.
         let cooling_at = ESCROW_BODY_LEN - ARBITER_FEE_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN;
         assert_eq!(
@@ -39453,19 +40064,19 @@ mod evidence_deadline_tests {
 
     #[test]
     fn deadline_and_escalator_persist_in_serialized_layout_tail() {
-        // Appended last: the deadline u64 sits at 2892 and the
+        // Appended last: the deadline u64 sits at 3293 and the
         // escalating-party region (1-byte discriminant + 32-byte key)
-        // at 2900 — every earlier offset is stable.
+        // at 3301 — every earlier offset is stable.
         let (e, _) = disputed_by(BOB);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         assert_eq!(
-            u64::from_le_bytes(bytes[2892..2900].try_into().unwrap()),
+            u64::from_le_bytes(bytes[3293..3301].try_into().unwrap()),
             DEADLINE,
             "evidence_deadline_secs offset"
         );
-        assert_eq!(bytes[2900], 1, "escalated_by: Some discriminant");
-        assert_eq!(&bytes[2901..2933], &BOB, "escalated_by key");
+        assert_eq!(bytes[3301], 1, "escalated_by: Some discriminant");
+        assert_eq!(&bytes[3302..3334], &BOB, "escalated_by key");
         // The structural decoder round-trips both fields.
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
@@ -39479,8 +40090,8 @@ mod evidence_deadline_tests {
     fn unset_deadline_and_never_disputed_encode_zeroed() {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(&bytes[2892..2900], &[0u8; 8], "deadline zeroed");
-        assert_eq!(bytes[2900], 0, "escalated_by: None discriminant");
+        assert_eq!(&bytes[3293..3301], &[0u8; 8], "deadline zeroed");
+        assert_eq!(bytes[3301], 0, "escalated_by: None discriminant");
         assert_eq!(&bytes[2901..2933], &[0u8; 32], "escalated_by zeroed");
     }
 }
@@ -39675,11 +40286,11 @@ mod dispute_amount_tests {
     #[test]
     fn disputed_amount_layout_is_pinned() {
         assert_eq!(DISPUTED_AMOUNT_TAIL_LEN, 8);
-        assert_eq!(ESCROW_BODY_LEN, 5545, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 5553, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5063, "no-quorum Vault account space");
-        // (128 + 5553) * 3480 * 2 = 5681 * 6960 = 39_539_760 lamports.
-        assert_eq!(vault_close_rent_reclaimed(), 39_539_760);
+        assert_eq!(ESCROW_BODY_LEN, 5946, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 5954, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5464, "no-quorum Vault account space");
+        // (128 + 5954) * 3480 * 2 = 6082 * 6960 = 42_330_720 lamports.
+        assert_eq!(vault_close_rent_reclaimed(), 42_330_720);
     }
 }
 
@@ -39893,6 +40504,322 @@ mod panel_threshold_tests {
     }
 }
 
+// ---------- AV-137: blind (commit-reveal) panel voting ----------
+//
+// The panel tallies judgments exactly like AV-65, except members vote
+// in two phases — commit a SHA-256 judgment hash, then reveal inside
+// their window — so no member can front-run or herd on a visible vote.
+mod blind_panel_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const M1: [u8; 32] = [0xC1; 32];
+    const M2: [u8; 32] = [0xC2; 32];
+    const M3: [u8; 32] = [0xC3; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+    const WINDOW: u64 = 86_400;
+
+    fn blind_escrow(threshold: u8) -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_blind_panel(&[M1, M2, M3], threshold, WINDOW)
+            .unwrap()
+    }
+
+    fn disputed(e: &mut Escrow) {
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.escalate(ALICE, T0, 1_000_000, None, None, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+    }
+
+    fn commit_of(taker_amount: u64, salt: [u8; 32]) -> [u8; 32] {
+        crate::blind_commitment(taker_amount, None, salt)
+    }
+
+    #[test]
+    fn with_blind_panel_enables_blind_mode() {
+        let e = blind_escrow(2);
+        let panel = e.arbiter_panel().expect("panel configured");
+        assert!(panel.blind);
+        assert!(e.panel_blind());
+        assert_eq!(panel.reveal_window_secs, WINDOW);
+        assert_eq!(panel.threshold, 2);
+    }
+
+    #[test]
+    fn with_blind_panel_rejects_zero_window() {
+        let r = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_blind_panel(&[M1, M2], 2, 0);
+        assert_eq!(r.unwrap_err(), EscrowError::InvalidArbiterPanel);
+    }
+
+    #[test]
+    fn with_blind_panel_rejects_non_uninitialized() {
+        let mut e = blind_escrow(2);
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let r = e.with_blind_panel(&[M1, M2], 2, WINDOW);
+        assert_eq!(r.unwrap_err(), EscrowError::InvalidStateTransition);
+    }
+
+    #[test]
+    fn with_blind_panel_clears_single_arbiter() {
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter([0xA8; 32])
+            .unwrap()
+            .with_blind_panel(&[M1, M2], 2, WINDOW)
+            .unwrap();
+        assert!(e.arbiter_panel().is_some());
+    }
+
+    #[test]
+    fn commit_records_and_reveal_settles_on_m_matching() {
+        let mut e = blind_escrow(2);
+        disputed(&mut e);
+        let s1 = [0x11; 32];
+        let s2 = [0x22; 32];
+        // M1 commits + reveals (1 of 2 — no settlement yet).
+        e.submit_judgment_commit(M1, commit_of(600_000, s1), T0)
+            .unwrap();
+        let r = e
+            .reveal_judgment(M1, 600_000, None, s1, T0 + 10, T0 + 10, None, BOB)
+            .unwrap();
+        assert!(r.is_none());
+        assert_eq!(e.state(), EscrowState::Disputed);
+        // M2 commits + reveals the same split — the M-th matching
+        // reveal settles with resolve semantics.
+        e.submit_judgment_commit(M2, commit_of(600_000, s2), T0 + 20)
+            .unwrap();
+        let settled = e
+            .reveal_judgment(M2, 600_000, None, s2, T0 + 30, T0 + 30, None, BOB)
+            .unwrap()
+            .expect("M-th matching reveal settles");
+        assert_eq!(e.state(), EscrowState::Settled);
+        // Taker got 600k gross minus fees; initializer refunded the rest.
+        assert!(settled.0 > 0);
+        assert_eq!(e.released_amount(), 600_000);
+    }
+
+    #[test]
+    fn reveal_rejects_wrong_preimage() {
+        let mut e = blind_escrow(2);
+        disputed(&mut e);
+        e.submit_judgment_commit(M1, commit_of(600_000, [0x11; 32]), T0)
+            .unwrap();
+        let r = e.reveal_judgment(M1, 600_000, None, [0x99; 32], T0 + 10, T0 + 10, None, BOB);
+        assert_eq!(r.unwrap_err(), EscrowError::BlindCommitMismatch);
+        // The failed reveal changes nothing — the commit stands and
+        // the escrow stays Disputed.
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(
+            e.reveal_judgment(M1, 600_000, None, [0x11; 32], T0 + 10, T0 + 10, None, BOB)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn reveal_rejects_duplicate_reveal() {
+        let mut e = blind_escrow(2);
+        disputed(&mut e);
+        e.submit_judgment_commit(M1, commit_of(600_000, [0x11; 32]), T0)
+            .unwrap();
+        e.reveal_judgment(M1, 600_000, None, [0x11; 32], T0 + 10, T0 + 10, None, BOB)
+            .unwrap();
+        let r = e.reveal_judgment(M1, 600_000, None, [0x11; 32], T0 + 20, T0 + 20, None, BOB);
+        assert_eq!(r.unwrap_err(), EscrowError::BlindDuplicateReveal);
+    }
+
+    #[test]
+    fn reveal_without_commit_is_rejected() {
+        let mut e = blind_escrow(2);
+        disputed(&mut e);
+        let r = e.reveal_judgment(M1, 600_000, None, [0x11; 32], T0 + 10, T0 + 10, None, BOB);
+        assert_eq!(r.unwrap_err(), EscrowError::BlindNoCommit);
+    }
+
+    #[test]
+    fn reveal_after_window_is_rejected() {
+        let mut e = blind_escrow(2);
+        disputed(&mut e);
+        e.submit_judgment_commit(M1, commit_of(600_000, [0x11; 32]), T0)
+            .unwrap();
+        let r = e.reveal_judgment(
+            M1, 600_000, None, [0x11; 32], T0 + WINDOW + 1, T0 + WINDOW + 1, None, BOB,
+        );
+        assert_eq!(r.unwrap_err(), EscrowError::BlindRevealWindowClosed);
+        // Exactly at the deadline still works (inclusive edge).
+        e.reveal_judgment(M1, 600_000, None, [0x11; 32], T0 + WINDOW, T0 + WINDOW, None, BOB)
+            .unwrap();
+    }
+
+    #[test]
+    fn direct_vote_rejected_on_blind_panel() {
+        let mut e = blind_escrow(2);
+        disputed(&mut e);
+        let r = e.submit_panel_judgment(M1, 600_000, T0, None, None, BOB);
+        assert_eq!(r.unwrap_err(), EscrowError::BlindVoteMustReveal);
+    }
+
+    #[test]
+    fn commit_rejected_for_stranger_and_non_member_states() {
+        let mut e = blind_escrow(2);
+        disputed(&mut e);
+        // Stranger learns nothing.
+        let r = e.submit_judgment_commit(MALLORY, commit_of(1, [7u8; 32]), T0);
+        assert_eq!(r.unwrap_err(), EscrowError::Unauthorized);
+        // Zero commitment is meaningless.
+        let r = e.submit_judgment_commit(M1, [0u8; 32], T0);
+        assert_eq!(r.unwrap_err(), EscrowError::BlindInvalidCommitment);
+        // Commit on a plain (non-blind) panel.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2], 2)
+            .unwrap();
+        plain.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        plain.escalate(ALICE, T0, 1_000_000, None, None, 0).unwrap();
+        let r = plain.submit_judgment_commit(M1, commit_of(1, [7u8; 32]), T0);
+        assert_eq!(r.unwrap_err(), EscrowError::InvalidArbiterPanel);
+        // Commit before the dispute starts.
+        let mut early = blind_escrow(2);
+        early.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let r = early.submit_judgment_commit(M1, commit_of(1, [7u8; 32]), T0);
+        assert_eq!(r.unwrap_err(), EscrowError::InvalidStateTransition);
+    }
+
+    #[test]
+    fn recommit_overwrites_and_restarts_window() {
+        let mut e = blind_escrow(2);
+        disputed(&mut e);
+        e.submit_judgment_commit(M1, commit_of(600_000, [0x11; 32]), T0)
+            .unwrap();
+        // Fat-fingered commitment: re-commit with the corrected one —
+        // last-wins, and the window restarts from the new commit.
+        e.submit_judgment_commit(M1, commit_of(500_000, [0x22; 32]), T0 + 50)
+            .unwrap();
+        // The old preimage no longer matches.
+        let r = e.reveal_judgment(M1, 600_000, None, [0x11; 32], T0 + 60, T0 + 60, None, BOB);
+        assert_eq!(r.unwrap_err(), EscrowError::BlindCommitMismatch);
+        // The new one reveals fine — even past the first commit's
+        // window, because the window restarted.
+        e.reveal_judgment(
+            M1, 500_000, None, [0x22; 32], T0 + 50 + WINDOW, T0 + 50 + WINDOW, None, BOB,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reveal_after_recommit_allows_second_reveal() {
+        let mut e = blind_escrow(2);
+        disputed(&mut e);
+        e.submit_judgment_commit(M1, commit_of(600_000, [0x11; 32]), T0)
+            .unwrap();
+        e.reveal_judgment(M1, 600_000, None, [0x11; 32], T0 + 10, T0 + 10, None, BOB)
+            .unwrap();
+        // A fresh commit re-arms the reveal for a changed judgment
+        // (mirrors the plain path's re-vote overwrite).
+        e.submit_judgment_commit(M1, commit_of(400_000, [0x33; 32]), T0 + 20)
+            .unwrap();
+        e.reveal_judgment(M1, 400_000, None, [0x33; 32], T0 + 30, T0 + 30, None, BOB)
+            .unwrap();
+        let panel = e.arbiter_panel().unwrap();
+        assert_eq!(panel.votes[0].taker_amount, 400_000);
+    }
+
+    #[test]
+    fn blind_settlement_matches_plain_settlement() {
+        // The same votes settle to the same amounts whether they
+        // arrive blind or plain — the shared settle helper cannot
+        // fork.
+        fn settle_plain() -> (u64, u64, u64) {
+            let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter_panel(&[M1, M2, M3], 2)
+                .unwrap();
+            e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+            e.escalate(ALICE, T0, 1_000_000, None, None, 0).unwrap();
+            e.submit_panel_judgment(M1, 600_000, T0 + 10, None, None, BOB)
+                .unwrap();
+            e.submit_panel_judgment(M2, 600_000, T0 + 20, None, None, BOB)
+                .unwrap()
+                .expect("settles")
+        }
+        fn settle_blind() -> (u64, u64, u64) {
+            let mut e = blind_escrow(2);
+            disputed(&mut e);
+            for (m, salt, at) in [(M1, [0x11; 32], T0 + 10), (M2, [0x22; 32], T0 + 20)] {
+                e.submit_judgment_commit(m, commit_of(600_000, salt), at).unwrap();
+                if let Some(out) =
+                    e.reveal_judgment(m, 600_000, None, salt, at + 1, at + 1, None, BOB).unwrap()
+                {
+                    return out;
+                }
+            }
+            panic!("blind path did not settle");
+        }
+        assert_eq!(settle_plain(), settle_blind());
+    }
+
+    #[test]
+    fn blind_fields_survive_encode_decode_roundtrip() {
+        let mut e = blind_escrow(2);
+        disputed(&mut e);
+        e.submit_judgment_commit(M1, commit_of(600_000, [0x11; 32]), T0)
+            .unwrap();
+        e.reveal_judgment(M1, 600_000, None, [0x11; 32], T0 + 10, T0 + 10, None, BOB)
+            .unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        let mut full = crate::discriminator::vault_account_discriminator().to_vec();
+        full.extend_from_slice(&bytes);
+        let decoded = crate::discriminator::decode_vault_account(&full).unwrap();
+        let before = e.arbiter_panel().unwrap();
+        let after = decoded.arbiter_panel().unwrap();
+        assert_eq!(before, after);
+        assert!(after.blind);
+        assert_eq!(after.commitments[0], commit_of(600_000, [0x11; 32]));
+        assert_eq!(after.committed_at[0], T0);
+        assert_eq!(after.revealed & 1, 1);
+    }
+
+    #[test]
+    fn blind_error_codes_are_pinned() {
+        assert_eq!(EscrowError::BlindInvalidCommitment.code(), 199);
+        assert_eq!(EscrowError::BlindCommitMismatch.code(), 200);
+        assert_eq!(EscrowError::BlindDuplicateReveal.code(), 201);
+        assert_eq!(EscrowError::BlindRevealWindowClosed.code(), 202);
+        assert_eq!(EscrowError::BlindCommitStale.code(), 203);
+        assert_eq!(EscrowError::BlindNoCommit.code(), 204);
+        assert_eq!(EscrowError::BlindVoteMustReveal.code(), 205);
+    }
+
+    #[test]
+    fn stale_commit_auto_invalidates() {
+        // The commit binds to the dispute snapshot: once the escrow
+        // leaves Disputed, the reveal is rejected on the state gate —
+        // and the snapshot check is the belt-and-braces second layer
+        // for any future path that could move the dispute.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_blind_panel(&[M1, M2], 1, WINDOW)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.escalate(ALICE, T0, 1_000_000, None, None, 0).unwrap();
+        e.submit_judgment_commit(M1, commit_of(600_000, [0x11; 32]), T0)
+            .unwrap();
+        // Single-member panel (M=1): the reveal settles immediately.
+        let out = e
+            .reveal_judgment(M1, 600_000, None, [0x11; 32], T0 + 5, T0 + 5, None, BOB)
+            .unwrap()
+            .expect("M=1 settles on first reveal");
+        assert_eq!(e.state(), EscrowState::Settled);
+        assert!(out.0 > 0);
+    }
+}
+
 // ---------- AV-38: arbiter's rationale-document hash ----------
 //
 // `resolve` takes an optional 32-byte commitment to the arbiter's
@@ -40003,7 +40930,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, 0, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) + 37 (AV-104 authority delegation) + 33 (AV-105 atomic swap link) + 33 (AV-106 penalty insurance pool) + 26 (AV-107 interest-bearing tail) + 321 (AV-108 payout split) + 49 (AV-109 dead-man's switch) + 8 (AV-110 rent top-up counter) + 19 (AV-111 tranched-funding tail) + 17 (AV-112 release-cooling tail) + 18 (AV-113 oracle price-gate tail) + 4 (AV-115 penalty escalation tail) + 16 (AV-116 slot timelock tail) + 8 (AV-119 dispute-interest tail) + 17 (AV-121 claim-cooldown tail) + 17 (AV-122 counter-offer tail) + 8 (AV-123 gasless intent nonce) + 16 (AV-124 keeper-bounty tail) + 115 (AV-126 slash-ladder tail) + 8 (AV-127 refunded counter) + 26 (AV-128 TWAP-gate tail) + 123 (AV-130 dual-control tail) + 8 (AV-131 disputed-amount tail) + 9 (AV-133 auto-unpause tail) + 18 (AV-134 funding-bounds tail) + 12 (AV-135 arbiter-fee tail) bytes");
+        assert_eq!(bytes.len(), 5946, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) + 37 (AV-104 authority delegation) + 33 (AV-105 atomic swap link) + 33 (AV-106 penalty insurance pool) + 26 (AV-107 interest-bearing tail) + 321 (AV-108 payout split) + 49 (AV-109 dead-man's switch) + 8 (AV-110 rent top-up counter) + 19 (AV-111 tranched-funding tail) + 17 (AV-112 release-cooling tail) + 18 (AV-113 oracle price-gate tail) + 4 (AV-115 penalty escalation tail) + 16 (AV-116 slot timelock tail) + 8 (AV-119 dispute-interest tail) + 17 (AV-121 claim-cooldown tail) + 17 (AV-122 counter-offer tail) + 8 (AV-123 gasless intent nonce) + 16 (AV-124 keeper-bounty tail) + 115 (AV-126 slash-ladder tail) + 8 (AV-127 refunded counter) + 26 (AV-128 TWAP-gate tail) + 123 (AV-130 dual-control tail) + 8 (AV-131 disputed-amount tail) + 9 (AV-133 auto-unpause tail) + 18 (AV-134 funding-bounds tail) + 12 (AV-135 arbiter-fee tail) + 401 (AV-137 blind-vote region) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -40028,7 +40955,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, 0, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -40050,18 +40977,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5553) * 3480 * 2 = 5681 * 6960 = 39_539_760 lamports.
-        assert_eq!(VAULT_SPACE, 5553);
-        assert_eq!(full, 39_539_760);
+        // (128 + 5954) * 3480 * 2 = 6082 * 6960 = 42_330_720 lamports.
+        assert_eq!(VAULT_SPACE, 5954);
+        assert_eq!(full, 42_330_720);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5063) * 3480 * 2 = 5191 * 6960 = 36_129_360 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5063);
-        assert_eq!(no_quorum, 36_129_360);
+        // (128 + 5464) * 3480 * 2 = 5592 * 6960 = 38_920_320 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5464);
+        assert_eq!(no_quorum, 38_920_320);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -40205,7 +41132,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -40220,7 +41147,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -40251,18 +41178,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5553) * 3480 * 2 = 5681 * 6960 = 39_539_760 lamports.
-        assert_eq!(VAULT_SPACE, 5553);
-        assert_eq!(full, 39_539_760);
+        // (128 + 5954) * 3480 * 2 = 6082 * 6960 = 42_330_720 lamports.
+        assert_eq!(VAULT_SPACE, 5954);
+        assert_eq!(full, 42_330_720);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5063) * 3480 * 2 = 5191 * 6960 = 36_129_360 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5063);
-        assert_eq!(no_quorum, 36_129_360);
+        // (128 + 5464) * 3480 * 2 = 5592 * 6960 = 38_920_320 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5464);
+        assert_eq!(no_quorum, 38_920_320);
     }
 
     #[test]
@@ -40900,16 +41827,16 @@ mod escalation_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         // The tail grew by exactly 4 bytes: rate at [5131..5133], cap
         // at [5133..5135].
         assert_eq!(
-            u16::from_le_bytes(bytes[5131..5133].try_into().unwrap()),
+            u16::from_le_bytes(bytes[5532..5534].try_into().unwrap()),
             321,
             "penalty_escalation_rate_bps tail offset"
         );
         assert_eq!(
-            u16::from_le_bytes(bytes[5133..5135].try_into().unwrap()),
+            u16::from_le_bytes(bytes[5534..5536].try_into().unwrap()),
             4_567,
             "penalty_escalation_cap_bps tail offset"
         );
@@ -41356,7 +42283,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -41531,7 +42458,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 5545, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region, 82 by AV-90 vesting curve, 42 by AV-91 evidence commitment region, 386 by AV-95 basket, 19 by AV-97 auction, 33 by AV-99 transfer hook, 16 by AV-100 streaming fee, 16 by AV-103 appeal bond + 37 by AV-104 authority delegation + 33 by AV-105 atomic swap link + 33 by AV-106 penalty insurance pool + 26 by AV-107 interest-bearing tail + 321 by AV-108 payout split + 49 by AV-109 deadman tail + 8 by AV-110 rent top-up counter + 19 by AV-111 tranched-funding tail + 17 by AV-112 release-cooling tail + 18 by AV-113 oracle price-gate tail + 4 by AV-115 penalty escalation tail + 16 by AV-116 slot-timelock tail + 9 by AV-117 compound-interest tail + 8 by AV-119 dispute-interest tail + 17 by AV-121 claim-cooldown tail + 17 by AV-122 counter-offer tail + 8 by AV-123 gasless intent nonce + 16 by AV-124 keeper-bounty tail + 115 by AV-126 slash-ladder tail + 8 by AV-127 refunded counter) + 26 by AV-128 TWAP-gate tail + 123 by AV-130 dual-control tail + 8 by AV-131 disputed-amount tail + 9 by AV-133 auto-unpause tail + 18 by AV-134 funding-bounds tail");
+        assert_eq!(ESCROW_BODY_LEN, 5946, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region, 82 by AV-90 vesting curve, 42 by AV-91 evidence commitment region, 386 by AV-95 basket, 19 by AV-97 auction, 33 by AV-99 transfer hook, 16 by AV-100 streaming fee, 16 by AV-103 appeal bond + 37 by AV-104 authority delegation + 33 by AV-105 atomic swap link + 33 by AV-106 penalty insurance pool + 26 by AV-107 interest-bearing tail + 321 by AV-108 payout split + 49 by AV-109 deadman tail + 8 by AV-110 rent top-up counter + 19 by AV-111 tranched-funding tail + 17 by AV-112 release-cooling tail + 18 by AV-113 oracle price-gate tail + 4 by AV-115 penalty escalation tail + 16 by AV-116 slot-timelock tail + 9 by AV-117 compound-interest tail + 8 by AV-119 dispute-interest tail + 17 by AV-121 claim-cooldown tail + 17 by AV-122 counter-offer tail + 8 by AV-123 gasless intent nonce + 16 by AV-124 keeper-bounty tail + 115 by AV-126 slash-ladder tail + 8 by AV-127 refunded counter) + 26 by AV-128 TWAP-gate tail + 123 by AV-130 dual-control tail + 8 by AV-131 disputed-amount tail + 9 by AV-133 auto-unpause tail + 18 by AV-134 funding-bounds tail");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -41549,23 +42476,23 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 5553) * 3480 * 2 = 5681 * 6960 = 39_539_760 lamports.
+        // (128 + 5954) * 3480 * 2 = 6082 * 6960 = 42_330_720 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            39_539_760
+            42_330_720
         );
-        // (128 + 5063) * 3480 * 2 = 5191 * 6960 = 36_129_360 lamports.
+        // (128 + 5464) * 3480 * 2 = 5592 * 6960 = 38_920_320 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            36_129_360
+            38_920_320
         );
         // 1983 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
@@ -41574,9 +42501,9 @@ mod decimals_tests {
         // AV-56 subscription schedule + AV-57 event-history ring +
         // AV-104 authority delegation + AV-105 atomic swap link +
         // AV-124 keeper-bounty tail).
-        assert_eq!(VAULT_SPACE, 5553);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5063);
-        assert!(check_vault_rent_exempt(39_539_760, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 5954);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5464);
+        assert!(check_vault_rent_exempt(42_330_720, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -44629,9 +45556,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) + 37 (AV-104 authority delegation) + 33 (AV-105 atomic swap link) + 33 (AV-106 penalty insurance pool) + 321 (AV-108 payout split) + 49 (AV-109 dead-man's switch) + 8 (AV-110 rent top-up counter) + 19 (AV-111 tranched-funding tail) + 17 (AV-112 release-cooling tail) + 18 (AV-113 oracle price-gate tail) + 4 (AV-115 penalty escalation tail) + 16 (AV-116 slot timelock tail) + 9 (AV-117 compound-interest tail) + 8 (AV-119 dispute-interest tail) + 17 (AV-121 claim-cooldown tail) + 17 (AV-122 counter-offer tail) + 8 (AV-123 gasless intent nonce) + 16 (AV-124 keeper-bounty tail) + 115 (AV-126 slash-ladder tail) + 8 (AV-127 refunded counter) + 26 (AV-128 TWAP-gate tail) + 123 (AV-130 dual-control tail) + 8 (AV-131 disputed-amount tail) + 9 (AV-133 auto-unpause tail) + 18 (AV-134 funding-bounds tail) + 12 (AV-135 arbiter-fee tail)");
-        assert_eq!(VAULT_SPACE, 5553);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5063);
+        assert_eq!(bytes.len(), 5946, "body 2216 + 996 (AV-65 arbiter panel + AV-137 blind-vote region) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) + 37 (AV-104 authority delegation) + 33 (AV-105 atomic swap link) + 33 (AV-106 penalty insurance pool) + 321 (AV-108 payout split) + 49 (AV-109 dead-man's switch) + 8 (AV-110 rent top-up counter) + 19 (AV-111 tranched-funding tail) + 17 (AV-112 release-cooling tail) + 18 (AV-113 oracle price-gate tail) + 4 (AV-115 penalty escalation tail) + 16 (AV-116 slot timelock tail) + 9 (AV-117 compound-interest tail) + 8 (AV-119 dispute-interest tail) + 17 (AV-121 claim-cooldown tail) + 17 (AV-122 counter-offer tail) + 8 (AV-123 gasless intent nonce) + 16 (AV-124 keeper-bounty tail) + 115 (AV-126 slash-ladder tail) + 8 (AV-127 refunded counter) + 26 (AV-128 TWAP-gate tail) + 123 (AV-130 dual-control tail) + 8 (AV-131 disputed-amount tail) + 9 (AV-133 auto-unpause tail) + 18 (AV-134 funding-bounds tail) + 12 (AV-135 arbiter-fee tail) + 401 (AV-137 blind-vote region)");
+        assert_eq!(VAULT_SPACE, 5954);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5464);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -45184,7 +46111,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -45753,7 +46680,7 @@ mod subscription_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -45778,27 +46705,27 @@ mod subscription_tests {
         // uniform `per_period`; slots past `periods` stay zero.
         for i in 0..PERIODS as usize {
             assert_eq!(
-                u64::from_le_bytes(bytes[2933 + i * 8..2941 + i * 8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[3334 + i * 8..3342 + i * 8].try_into().unwrap()),
                 PER_PERIOD,
                 "subscription_amounts[{i}]: seeded from per_period"
             );
         }
         assert_eq!(
-            &bytes[2933 + PERIODS as usize * 8..3445],
-            &vec![0u8; 3445 - 2933 - PERIODS as usize * 8][..],
+            &bytes[3334 + PERIODS as usize * 8..3846],
+            &vec![0u8; 3846 - 3334 - PERIODS as usize * 8][..],
             "subscription_amounts: tail slots zeroed"
         );
         // AV-75: the schema-version byte sits at its long-stable offset
         // (new vaults are born at `SCHEMA_VERSION`); AV-82 appends the
         // slash region after it, so it is no longer the tail byte.
-        assert_eq!(bytes[3445], 3, "schema_version: born current (v3)");
+        assert_eq!(bytes[3846], 3, "schema_version: born current (v3)");
         assert_eq!(
-            &bytes[3446..3487],
+            &bytes[3847..3888],
             &[0u8; 41],
             "slash_terms: None discriminant + zeroed region"
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[3487..3495].try_into().unwrap()),
+            u64::from_le_bytes(bytes[3888..3896].try_into().unwrap()),
             0,
             "penalty_paid: zero"
         );
@@ -46246,7 +47173,16 @@ mod event_history_tests {
             EscrowEventKind::from_discriminant(71),
             Some(EscrowEventKind::DualControlCancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        // AV-137: the blind (commit-reveal) panel voting events.
+        assert_eq!(
+            EscrowEventKind::from_discriminant(72),
+            Some(EscrowEventKind::JudgmentCommitted)
+        );
+        assert_eq!(
+            EscrowEventKind::from_discriminant(73),
+            Some(EscrowEventKind::JudgmentRevealed)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -46258,11 +47194,11 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN + PENALTY_ESCALATION_TAIL_LEN + SLOT_TIMELOCK_TAIL_LEN + COMPOUND_INTEREST_TAIL_LEN + DISPUTE_INTEREST_LEN + CLAIM_COOLDOWN_TAIL_LEN + COUNTER_OFFER_TAIL_LEN + RELEASE_INTENT_TAIL_LEN + KEEPER_BOUNTY_TAIL_LEN + SLASH_LADDER_TAIL_LEN + REFUNDED_TAIL_LEN + TWAP_GATE_LEN + DUAL_CONTROL_TAIL_LEN + DISPUTED_AMOUNT_TAIL_LEN + AUTO_UNPAUSE_TAIL_LEN + AMOUNT_BOUNDS_TAIL_LEN + ARBITER_FEE_TAIL_LEN);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 996 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN + PENALTY_ESCALATION_TAIL_LEN + SLOT_TIMELOCK_TAIL_LEN + COMPOUND_INTEREST_TAIL_LEN + DISPUTE_INTEREST_LEN + CLAIM_COOLDOWN_TAIL_LEN + COUNTER_OFFER_TAIL_LEN + RELEASE_INTENT_TAIL_LEN + KEEPER_BOUNTY_TAIL_LEN + SLASH_LADDER_TAIL_LEN + REFUNDED_TAIL_LEN + TWAP_GATE_LEN + DUAL_CONTROL_TAIL_LEN + DISPUTED_AMOUNT_TAIL_LEN + AUTO_UNPAUSE_TAIL_LEN + AMOUNT_BOUNDS_TAIL_LEN + ARBITER_FEE_TAIL_LEN);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN + PENALTY_ESCALATION_TAIL_LEN + SLOT_TIMELOCK_TAIL_LEN + COMPOUND_INTEREST_TAIL_LEN + DISPUTE_INTEREST_LEN + CLAIM_COOLDOWN_TAIL_LEN + COUNTER_OFFER_TAIL_LEN + RELEASE_INTENT_TAIL_LEN + KEEPER_BOUNTY_TAIL_LEN + SLASH_LADDER_TAIL_LEN + REFUNDED_TAIL_LEN + TWAP_GATE_LEN + DUAL_CONTROL_TAIL_LEN + DISPUTED_AMOUNT_TAIL_LEN + AUTO_UNPAUSE_TAIL_LEN + AMOUNT_BOUNDS_TAIL_LEN + ARBITER_FEE_TAIL_LEN
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 996 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN + PENALTY_ESCALATION_TAIL_LEN + SLOT_TIMELOCK_TAIL_LEN + COMPOUND_INTEREST_TAIL_LEN + DISPUTE_INTEREST_LEN + CLAIM_COOLDOWN_TAIL_LEN + COUNTER_OFFER_TAIL_LEN + RELEASE_INTENT_TAIL_LEN + KEEPER_BOUNTY_TAIL_LEN + SLASH_LADDER_TAIL_LEN + REFUNDED_TAIL_LEN + TWAP_GATE_LEN + DUAL_CONTROL_TAIL_LEN + DISPUTED_AMOUNT_TAIL_LEN + AUTO_UNPAUSE_TAIL_LEN + AMOUNT_BOUNDS_TAIL_LEN + ARBITER_FEE_TAIL_LEN
         );
     }
 
@@ -46279,7 +47215,7 @@ mod event_history_tests {
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -46307,7 +47243,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN + PENALTY_ESCALATION_TAIL_LEN + SLOT_TIMELOCK_TAIL_LEN + COMPOUND_INTEREST_TAIL_LEN + DISPUTE_INTEREST_LEN + CLAIM_COOLDOWN_TAIL_LEN + COUNTER_OFFER_TAIL_LEN + RELEASE_INTENT_TAIL_LEN + KEEPER_BOUNTY_TAIL_LEN + SLASH_LADDER_TAIL_LEN + REFUNDED_TAIL_LEN + TWAP_GATE_LEN + DUAL_CONTROL_TAIL_LEN + DISPUTED_AMOUNT_TAIL_LEN + AUTO_UNPAUSE_TAIL_LEN + AMOUNT_BOUNDS_TAIL_LEN + ARBITER_FEE_TAIL_LEN, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103/AV-104/AV-105/AV-106/AV-107/AV-108/AV-109/AV-110/AV-111/AV-112/AV-113/AV-115/AV-116/AV-117/AV-119/AV-121/AV-122/AV-124/AV-126/AV-127/AV-128/AV-130/AV-131/AV-133/AV-134/AV-135 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 996 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN + PENALTY_ESCALATION_TAIL_LEN + SLOT_TIMELOCK_TAIL_LEN + COMPOUND_INTEREST_TAIL_LEN + DISPUTE_INTEREST_LEN + CLAIM_COOLDOWN_TAIL_LEN + COUNTER_OFFER_TAIL_LEN + RELEASE_INTENT_TAIL_LEN + KEEPER_BOUNTY_TAIL_LEN + SLASH_LADDER_TAIL_LEN + REFUNDED_TAIL_LEN + TWAP_GATE_LEN + DUAL_CONTROL_TAIL_LEN + DISPUTED_AMOUNT_TAIL_LEN + AUTO_UNPAUSE_TAIL_LEN + AMOUNT_BOUNDS_TAIL_LEN + ARBITER_FEE_TAIL_LEN, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103/AV-104/AV-105/AV-106/AV-107/AV-108/AV-109/AV-110/AV-111/AV-112/AV-113/AV-115/AV-116/AV-117/AV-119/AV-121/AV-122/AV-124/AV-126/AV-127/AV-128/AV-130/AV-131/AV-133/AV-134/AV-135 tail");
     }
 
     #[test]
@@ -46322,18 +47258,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5553) * 3480 * 2 = 5681 * 6960 = 39_539_760 lamports.
-        assert_eq!(VAULT_SPACE, 5553);
-        assert_eq!(full, 39_539_760);
+        // (128 + 5954) * 3480 * 2 = 6082 * 6960 = 42_330_720 lamports.
+        assert_eq!(VAULT_SPACE, 5954);
+        assert_eq!(full, 42_330_720);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5063) * 3480 * 2 = 5191 * 6960 = 36_129_360 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5063);
-        assert_eq!(no_quorum, 36_129_360);
+        // (128 + 5464) * 3480 * 2 = 5592 * 6960 = 38_920_320 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5464);
+        assert_eq!(no_quorum, 38_920_320);
     }
 
     // ----- decode -----
@@ -46394,9 +47330,10 @@ mod event_history_tests {
         // (AV-124), 68 is `PartialRefunded` (AV-127), 69 is
         // `DualControlInitiated` (AV-130), 70 is
         // `DualControlConfirmed` (AV-130), 71 is
-        // `DualControlCancelled` (AV-130); 72 is the first
-        // still-unknown byte.
-        for bad in [72u8, 73, 255] {
+        // `DualControlCancelled` (AV-130), 72 is
+        // `JudgmentCommitted` (AV-137), 73 is `JudgmentRevealed`
+        // (AV-137); 74 is the first still-unknown byte.
+        for bad in [74u8, 75, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -47333,17 +48270,17 @@ mod fee_cap_tests {
         // authority) + 26 (AV-86 appeal window region) + 82 (AV-90
         // vesting curve) + 42 (AV-91 evidence commitment) + 386
         // (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction).
-        assert_eq!(ESCROW_BODY_LEN, 5545, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 5553, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5063, "no-quorum Vault account space");
+        assert_eq!(ESCROW_BODY_LEN, 5946, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 5954, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5464, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            39_539_760,
-            "(128 + 5553) * 3480 * 2 = 5681 * 6960"
+            42_330_720,
+            "(128 + 5954) * 3480 * 2 = 6082 * 6960"
         );
         assert_eq!(
             rent_exempt_minimum_lamports(
@@ -47351,8 +48288,8 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            36_129_360,
-            "(128 + 5063) * 3480 * 2 = 5191 * 6960"
+            38_920_320,
+            "(128 + 5464) * 3480 * 2 = 5592 * 6960"
         );
     }
 
@@ -47364,7 +48301,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -47866,7 +48803,7 @@ mod fee_schedule_tests {
         let e = scheduled_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         let tail = ESCROW_BODY_LEN - ARBITER_FEE_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(bytes[tail], 3, "tier_count at the tail");
         assert_eq!(
@@ -48264,7 +49201,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -49581,12 +50518,16 @@ mod arbiter_panel_tests {
         assert_eq!(PANEL_VOTE_LEN, 41, "8 + 1 + 32");
         assert_eq!(
             ARBITER_PANEL_LEN,
-            594,
-            "1 + 1 + 8*32 + 8*41 + 8"
+            995,
+            "1 + 1 + 8*32 + 8*41 + 8 + 1 + 8 + 8*32 + 8*8 + 8*8 + 8"
         );
         assert_eq!(
             ARBITER_PANEL_LEN,
             1 + 1 + MAX_PANEL_MEMBERS * 32 + MAX_PANEL_MEMBERS * PANEL_VOTE_LEN + 8
+                + 1 + 8 + MAX_PANEL_MEMBERS * 32
+                + MAX_PANEL_MEMBERS * 8
+                + MAX_PANEL_MEMBERS * 8
+                + 8
         );
     }
 
@@ -49739,7 +50680,22 @@ mod arbiter_panel_tests {
         // AV-135: the arbiter adjudication-fee config error.
         assert_eq!(EscrowError::InvalidArbiterFee.code(), 198);
         assert!(EscrowError::all().contains(&EscrowError::InvalidArbiterFee));
-        assert_eq!(EscrowError::all().len(), 99);
+        // AV-137: the blind (commit-reveal) panel voting errors.
+        assert_eq!(EscrowError::BlindInvalidCommitment.code(), 199);
+        assert!(EscrowError::all().contains(&EscrowError::BlindInvalidCommitment));
+        assert_eq!(EscrowError::BlindCommitMismatch.code(), 200);
+        assert!(EscrowError::all().contains(&EscrowError::BlindCommitMismatch));
+        assert_eq!(EscrowError::BlindDuplicateReveal.code(), 201);
+        assert!(EscrowError::all().contains(&EscrowError::BlindDuplicateReveal));
+        assert_eq!(EscrowError::BlindRevealWindowClosed.code(), 202);
+        assert!(EscrowError::all().contains(&EscrowError::BlindRevealWindowClosed));
+        assert_eq!(EscrowError::BlindCommitStale.code(), 203);
+        assert!(EscrowError::all().contains(&EscrowError::BlindCommitStale));
+        assert_eq!(EscrowError::BlindNoCommit.code(), 204);
+        assert!(EscrowError::all().contains(&EscrowError::BlindNoCommit));
+        assert_eq!(EscrowError::BlindVoteMustReveal.code(), 205);
+        assert!(EscrowError::all().contains(&EscrowError::BlindVoteMustReveal));
+        assert_eq!(EscrowError::all().len(), 106);
     }
 
     #[test]
@@ -50086,7 +51042,7 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545);
+        assert_eq!(bytes.len(), 5946);
         // AV-91: the evidence-commitment region (33-byte root + 1-byte
         // leaf count + 8-byte disclosure bitmap = 42 bytes) now trails
         // the AV-90 vesting-curve region (82 bytes), which trails the
@@ -50103,8 +51059,8 @@ mod arbiter_panel_tests {
         // The panel region trails the AV-73 per-period amount table
         // (512 bytes), the AV-68 evidence-deadline region (41 bytes) and
         // the AV-66 fee-schedule region (81 bytes):
-        // 1-byte discriminant + 594-byte panel.
-        let tail = &bytes[version_end - SUBSCRIPTION_AMOUNTS_LEN - 41 - FEE_SCHEDULE_LEN - 595
+        // 1-byte discriminant + 995-byte panel.
+        let tail = &bytes[version_end - SUBSCRIPTION_AMOUNTS_LEN - 41 - FEE_SCHEDULE_LEN - 996
             ..version_end - SUBSCRIPTION_AMOUNTS_LEN - 41 - FEE_SCHEDULE_LEN];
         assert_eq!(tail[0], 1, "panel discriminant");
         assert_eq!(tail[1], 3, "n");
@@ -50151,7 +51107,7 @@ mod arbiter_panel_tests {
             .unwrap();
         assert_eq!(panel.1, "Option<ArbiterPanel>");
         assert_eq!(panel.2, 1 + ARBITER_PANEL_LEN);
-        assert_eq!(panel.2, 595);
+        assert_eq!(panel.2, 996);
         // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103/AV-104/AV-105/AV-106/AV-107/AV-108/AV-109/AV-110/AV-111/AV-112/AV-113/AV-115/AV-116/AV-117/AV-119/AV-121/AV-122/AV-123/AV-124/AV-126/AV-127/AV-128/AV-130/AV-131/AV-133/AV-134:
         // every earlier field offset stays stable.
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - (67+4)].0, "fee_schedule");
@@ -51020,7 +51976,7 @@ mod split_tests {
             .unwrap();
         assert_eq!(e.state(), EscrowState::Split);
         assert_eq!(EscrowState::Split as u8, 8, "Split appended last");
-        assert_eq!(VAULT_SPACE, 5553, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 5954, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -51290,7 +52246,7 @@ mod release_split_tests {
         e.release_split(ALICE, NOW, 1_000_000, None, &[(BOB, 10_000)])
             .unwrap();
         assert_eq!(e.state(), EscrowState::Released);
-        assert_eq!(VAULT_SPACE, 5553, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 5954, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -52388,19 +53344,19 @@ mod appeal_tests {
         e.review_appeal(M1, true).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545);
-        // Appeal region: [3820..3846] — window (8), deadline (8), state
+        assert_eq!(bytes.len(), 5946);
+        // Appeal region: [4221..4247] — window (8), deadline (8), state
         // (1), ballot (9).
         assert_eq!(
-            u64::from_le_bytes(bytes[3820..3828].try_into().unwrap()),
+            u64::from_le_bytes(bytes[4221..4229].try_into().unwrap()),
             WINDOW
         );
         assert_eq!(
-            u64::from_le_bytes(bytes[3828..3836].try_into().unwrap()),
+            u64::from_le_bytes(bytes[4229..4237].try_into().unwrap()),
             DEADLINE + WINDOW
         );
-        assert_eq!(bytes[3836], 1, "AppealState::Filed == 1");
-        assert_eq!(bytes[3837], 1, "one vote cast");
+        assert_eq!(bytes[4237], 1, "AppealState::Filed == 1");
+        assert_eq!(bytes[4238], 1, "one vote cast");
         // Full-state decode (AV-75 decoder path) preserves the region —
         // the decoder expects the 8-byte discriminator + body.
         let mut full = crate::discriminator::vault_account_discriminator().to_vec();
@@ -52413,10 +53369,10 @@ mod appeal_tests {
         // A vault that never opted in zero-fills the region.
         let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&plain);
-        assert_eq!(&bytes[3820..3846], &[0u8; 26]);
+        assert_eq!(&bytes[4221..4247], &[0u8; 26]);
         // Unknown appeal-state discriminants are rejected by the decoder.
         let mut bad = full.clone();
-        bad[8 + 3836] = 7;
+        bad[8 + 4237] = 7;
         assert!(crate::discriminator::decode_vault_account(&bad).is_err());
     }
 
@@ -53158,16 +54114,16 @@ mod cpi_allowlist_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545);
-        assert_eq!(bytes[3495], 1, "Some discriminant");
-        assert_eq!(&bytes[3496..3496 + 32], &DEX);
-        assert_eq!(&bytes[3496 + 32..3496 + 64], &LENDING);
-        assert_eq!(&bytes[3496 + 64..3496 + 256], &[0u8; 192]);
-        assert_eq!(bytes[3496 + 256], 2, "count byte");
+        assert_eq!(bytes.len(), 5946);
+        assert_eq!(bytes[3896], 1, "Some discriminant");
+        assert_eq!(&bytes[3897..3897 + 32], &DEX);
+        assert_eq!(&bytes[3897 + 32..3897 + 64], &LENDING);
+        assert_eq!(&bytes[3897 + 64..3897 + 256], &[0u8; 192]);
+        assert_eq!(bytes[3897 + 256], 2, "count byte");
         // A vault without the opt-in zero-fills the region.
         let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&plain);
-        assert_eq!(bytes[3495], 0, "None discriminant");
+        assert_eq!(bytes[3896], 0, "None discriminant");
         assert_eq!(&bytes[3496..3496 + 257], &[0u8; 257]);
         // The field name is the twenty-seventh-from-last VAULT_FIELDS entry
         // (AV-84 appended the multisig region after it, AV-86 the
@@ -53384,20 +54340,20 @@ mod multisig_tests {
         let e = bound_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5545);
-        assert_eq!(bytes[3753], 1, "Some discriminant");
-        assert_eq!(&bytes[3754..3754 + 32], &SQUADS_V4_PROGRAM_ID);
-        assert_eq!(&bytes[3754 + 32..3754 + 64], &VAULT_PDA);
+        assert_eq!(bytes.len(), 5946);
+        assert_eq!(bytes[4154], 1, "Some discriminant");
+        assert_eq!(&bytes[4155..4155 + 32], &SQUADS_V4_PROGRAM_ID);
+        assert_eq!(&bytes[4155 + 32..4155 + 64], &VAULT_PDA);
         assert_eq!(
-            u16::from_le_bytes(bytes[3754 + 64..3754 + 66].try_into().unwrap()),
+            u16::from_le_bytes(bytes[4155 + 64..4155 + 66].try_into().unwrap()),
             2,
             "threshold"
         );
         // A vault without the binding zero-fills the region.
         let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&plain);
-        assert_eq!(bytes[3753], 0, "None discriminant");
-        assert_eq!(&bytes[3754..3820], &[0u8; 66]);
+        assert_eq!(bytes[4154], 0, "None discriminant");
+        assert_eq!(&bytes[4155..4221], &[0u8; 66]);
         // The field name is the twenty-sixth-from-last VAULT_FIELDS entry
         // (AV-86 appended the 4-field appeal region after it, AV-90
         // the vesting-curve region after that, AV-91 the 3-field
@@ -53424,7 +54380,7 @@ mod multisig_tests {
         assert_eq!(decoded.multisig_authority(), Some(bound()));
         // A bad option discriminant is rejected, not misread.
         let mut bad = full.clone();
-        bad[8 + 3753] = 7;
+        bad[8 + 4154] = 7;
         assert!(decode_vault_account(&bad).is_err());
     }
 
@@ -55174,10 +56130,10 @@ mod dual_control_tests {
         assert_eq!(DUAL_CONTROL_INTENT_LEN, 89);
         assert_eq!(DUAL_CONTROL_TAIL_LEN, 33 + (1 + 89));
         assert_eq!(DUAL_CONTROL_TAIL_LEN, 123);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5063);
-        assert_eq!(VAULT_SPACE, 5553);
-        assert_eq!(ESCROW_BODY_LEN, 5545);
-        assert_eq!(vault_close_rent_reclaimed(), 39_539_760);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5464);
+        assert_eq!(VAULT_SPACE, 5954);
+        assert_eq!(ESCROW_BODY_LEN, 5946);
+        assert_eq!(vault_close_rent_reclaimed(), 42_330_720);
         let n = VAULT_FIELDS.len();
         assert_eq!(VAULT_FIELDS[n - 8].0, "dual_control_checker");
         assert_eq!(VAULT_FIELDS[n - 8].1, "Option<Pubkey>");
@@ -55521,14 +56477,14 @@ mod amount_bounds_tests {
     #[test]
     fn amount_bounds_tail_layout_is_pinned() {
         assert_eq!(AMOUNT_BOUNDS_TAIL_LEN, 18);
-        assert_eq!(ESCROW_BODY_LEN, 5545);
-        assert_eq!(VAULT_SPACE, 5553);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5063);
-        // (128 + 5553) * 3480 * 2 = 5681 * 6960 — the main formula,
+        assert_eq!(ESCROW_BODY_LEN, 5946);
+        assert_eq!(VAULT_SPACE, 5954);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5464);
+        // (128 + 5954) * 3480 * 2 = 6082 * 6960 — the main formula,
         // recomputed for the grown account.
-        assert_eq!(vault_close_rent_reclaimed(), 39_539_760);
+        assert_eq!(vault_close_rent_reclaimed(), 42_330_720);
         assert_eq!(
-            check_vault_rent_exempt(39_539_760, MAINNET_LAMPORTS_PER_BYTE_YEAR, MAINNET_EXEMPTION_THRESHOLD_YEARS),
+            check_vault_rent_exempt(42_330_720, MAINNET_LAMPORTS_PER_BYTE_YEAR, MAINNET_EXEMPTION_THRESHOLD_YEARS),
             Ok(())
         );
         let n = VAULT_FIELDS.len();
@@ -55540,7 +56496,7 @@ mod amount_bounds_tests {
         // after it, not before (body offset — the IDL's 5514 includes
         // the 8-byte discriminator).
         let auto_unpause_offset: usize = VAULT_FIELDS[..n - 5].iter().map(|f| f.2).sum();
-        assert_eq!(auto_unpause_offset, 5506);
+        assert_eq!(auto_unpause_offset, 5907);
     }
 
     #[test]

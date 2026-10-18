@@ -73,6 +73,9 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `escalate(authority, now, evidence_hash, evidence_root, evidence_leaves)` (AV-91) | `Funded`       | `Disputed` | initializer **or** taker, only when `now < expires_at` (locks `release`/`cancel`/`cancel_expired`/`claim`); `evidence_hash` is the optional 32-byte off-chain-evidence commitment, persisted; `evidence_root` is the optional SHA-256 Merkle root over the evidence-document set and `evidence_leaves` the committed leaf count (`0` iff the root is `None`, `1..=64` iff `Some` — `InvalidEvidenceProof`, code 148, on a count that does not describe the root); the root/leaves/zeroed disclosure bitmap are persisted and never cleared; refused with `AuctionNotActive` (code 156) while an AV-97 Dutch-auction window is live — price discovery and arbitration are mutually exclusive settlement paths |
 | `resolve(authority, taker_amount, rationale_hash)` | `Disputed`     | `Settled` | arbiter only; atomic split of the remainder (taker payout / initializer refund); `rationale_hash` is the optional 32-byte commitment to the arbiter's off-chain rationale document, persisted in `Settled` (never cleared); AV-119: the dispute window `[disputed_at, resolved_at]` (resolved_at from the clock sysvar) accrues interest on the locked remainder at the AV-107 rate, and the whole outstanding yield claim splits pro-rata by `taker_amount / remaining` — the taker's share rides the taker payout (into `interest_paid`), the initializer's share rides the refund (into `dispute_interest`); on a compound-interest escrow the yield folds into the principal instead (AV-117 mutual exclusion); **disabled in panel mode** (`PanelResolveDisabled`, code 137 — the panel's multisig judgment is the only settlement path once a panel is configured) |
 | `submit_panel_judgment(member, taker_amount, rationale_hash)` (AV-65) | `Disputed` | `Disputed` (vote recorded) / `Settled` (M matching votes) | panel member only (`Unauthorized` for a stranger); one effective vote per member — a re-vote overwrites the earlier vote (the `PanelJudgment` event keeps the audit trail); the first M votes agreeing on the same `(taker_amount, rationale_hash)` pair settle the escrow automatically (`Settled`, settlement identical to `resolve` — fee slices the taker's share, gross lands in the `released` counter, the initializer is refunded the remainder; AV-119: the settling vote's time is the dispute window's `resolved_at`, and the yield attribution follows the same pro-rata rule via the shared helper); non-matching votes stay recorded for audit; the settling vote emits `PanelResolved` after its `PanelJudgment`; `InvalidArbiterPanel` (code 136) with no panel configured |
+| `initialize_blind_panel(members, threshold, reveal_window_secs)` (AV-137) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; opt-in blind commit-reveal panel voting: 1–8 member keys, threshold 1..=N, `reveal_window_secs` non-zero; same validation as `initialize_arbiter_panel` plus the window; mutually exclusive with the single arbiter — last-wins in both directions; the 995-byte panel region is always reserved so the opt-in writes in place) |
+| `submit_judgment_commit(member, commitment)` (AV-137) | `Disputed` | `Disputed` (commit recorded) | panel member only (`Unauthorized` for a stranger); `commitment = SHA-256(taker_amount \|\| rationale_hash \|\| salt)` — the judgment stays hidden; zero commitment is `BlindInvalidCommitment` (code 199); a second commit before the reveal overwrites the first (last-wins, window restarts); the commit binds to the escrow's `disputed_at` snapshot; emits `JudgmentCommitted` |
+| `reveal_judgment(member, taker_amount, rationale_hash, salt)` (AV-137) | `Disputed` | `Disputed` (vote recorded) / `Settled` (M matching reveals) | panel member only; the recomputed commitment must match (`BlindCommitMismatch`, code 200); each commit reveals once (`BlindDuplicateReveal`, code 201; `BlindNoCommit`, code 204 with no commit); late reveals rejected (`BlindRevealWindowClosed`, code 202); stale snapshots auto-invalidated (`BlindCommitStale`, code 203); the revealed vote settles exactly like `submit_panel_judgment` (mint/payout-policy/fee/interest identical via the shared helper); plain `submit_panel_judgment` is rejected in blind mode (`BlindVoteMustReveal`, code 205); emits `JudgmentRevealed` per reveal and `PanelResolved` on the settling reveal |
 | `initialize_default_judgment(deadline_secs, default_taker_amount)` (AV-55) | `Uninitialized` | `Uninitialized` | initializer (once, before funding — and only after `initialize_arbiter`; the arbiter must be configured first); declares the fallback split applied when the arbiter never resolves: `deadline_secs` seconds in `Disputed` before the judgment becomes triggerable (must be non-zero — `DefaultJudgmentNotDue` otherwise), `default_taker_amount` the taker's share of the remainder (must be ≤ the locked amount — `ReleaseExceedsLocked` otherwise); the initializer proposes the terms, the taker must still countersign (dual-signed agreement) |
 | `confirm_default_judgment()` (AV-55) | `Uninitialized` / `Funded` | — (no state change; sets the confirmation bit) | **taker only** (`Unauthorized` for a stranger or the initializer); no judgment configured is `DefaultJudgmentNotDue`; idempotent (re-confirming is `Ok`) |
 | `trigger_default_judgment(caller, now, payout_to)` (AV-55) | `Disputed` | `Settled` | **initializer or taker** (either party — a liveness backstop, not a power grant); only once `now >= disputed_at + deadline_secs` (the judgment's due time, `DefaultJudgmentNotDue` otherwise); settles on the pre-agreed split — fee slices the taker's share like `resolve`, quorum/vesting/timelock do *not* gate (same as `resolve`); AV-119: `now` doubles as the dispute window's `resolved_at`, and the yield attribution follows the same pro-rata rule as `resolve` via the shared helper; the arbiter's `resolve` is unchanged and keeps priority — after the deadline either the arbiter resolves or a party triggers, first writer wins; in AV-65 panel mode the default judgment stays available (same deadline rules) and races the panel's M-vote settlement instead; emits `DefaultJudgment` |
@@ -680,6 +683,40 @@ the panel (members, threshold, current votes). New vault field
 1-byte discriminant + N u8 + M u8 + 8×32-byte member keys +
 8×(u64 taker_amount + 1+32-byte rationale) votes + u64 voted bitmask)
 — the full vault is now 2811 bytes / 20,511,120 lamports rent-exempt.
+
+**Blind panel voting — commit-reveal (AV-137).** A plain panel vote is
+visible the moment it lands, so a later voter can copy the emerging
+majority (herding) or race to cast the M-th vote on a judgment they
+never independently reached (front-running). The opt-in blind mode
+(`with_blind_panel(members, threshold, reveal_window_secs)` /
+`initialize_blind_panel`, `Uninitialized` only, `reveal_window_secs`
+non-zero) keeps every judgment hidden until the reveal: each member
+first commits `SHA-256(taker_amount || rationale_hash || salt)` via
+`submit_judgment_commit` (member-signed, `Disputed` only; a zero
+commitment is `BlindInvalidCommitment`, code 199 — no preimage could
+ever reveal against it), then reveals the preimage via
+`reveal_judgment` inside their own window (`committed_at +
+reveal_window_secs`; a late reveal is `BlindRevealWindowClosed`, code
+202 — a slow member cannot stall the arbitration, and the AV-55
+default judgment remains the fallback). The reveal recomputes the
+hash and rejects a mismatch (`BlindCommitMismatch`, code 200); each
+commit reveals exactly once (`BlindDuplicateReveal`, code 201; commit
+again to change the judgment — last-wins, and the window restarts).
+The commit binds to the escrow's `disputed_at` snapshot: a reveal
+after the dispute moved on is auto-invalidated (`BlindCommitStale`,
+code 203, and the stale commit is cleared). In blind mode plain
+`submit_panel_judgment` is rejected (`BlindVoteMustReveal`, code
+205) — votes enter the tally only through the reveal, which settles
+via the shared helper, so the AV-65 threshold semantics, the mint
+check, the payout policy, and the fee/interest settlement are
+identical to the plain path (a dedicated test pins
+blind-settles-identically-to-plain). `IndexedEscrow` emits
+`JudgmentCommitted` per commit and `JudgmentRevealed` per reveal
+(plus `PanelResolved` on the M-th matching reveal). The blind-vote
+region (blind flag + reveal window + 8 commitments + 8 commit
+timestamps + 8 dispute snapshots + revealed bitmask, 401 bytes) is
+appended to the `arbiter_panel` region, which grows 595 → 995
+bytes; see "Account space & rent" for the new vault totals.
 
 **Evidence-disclosure deadline (AV-68).** Arbitration stalls when the
 escalating party never produces the evidence their claim rests on —
@@ -1423,6 +1460,13 @@ program error per variant):
 | `InvalidAmountBounds` | 196 | `with_amount_bounds` / `initialize_amount_bounds` (AV-134) with `min_amount > max_amount` — an inverted funding window |
 | `AmountOutOfBounds` | 197 | `fund` / `fund_tranche` (AV-134) with a deposit below `min_funding_amount` or above `max_funding_amount` — the deposit is rejected before any state moves |
 | `InvalidArbiterFee` | 198 | `with_arbiter_fee` / `initialize_arbiter_fee` (AV-135) with `fee_bps > 10_000` — an invalid arbiter fee schedule |
+| `BlindInvalidCommitment` | 199 | `submit_judgment_commit` (AV-137) with a zero commitment — no preimage can ever reveal against it |
+| `BlindCommitMismatch` | 200 | `reveal_judgment` (AV-137) whose recomputed `SHA-256(taker_amount \|\| rationale_hash \|\| salt)` does not match the stored commitment |
+| `BlindDuplicateReveal` | 201 | `reveal_judgment` (AV-137) for a commit that was already revealed — each commit reveals exactly once |
+| `BlindRevealWindowClosed` | 202 | `reveal_judgment` (AV-137) after `committed_at + reveal_window_secs` lapsed |
+| `BlindCommitStale` | 203 | `reveal_judgment` (AV-137) whose commit no longer matches the escrow's dispute snapshot — auto-invalidated |
+| `BlindNoCommit` | 204 | `reveal_judgment` (AV-137) with no active commitment from this member |
+| `BlindVoteMustReveal` | 205 | `submit_panel_judgment` on a blind-mode panel (AV-137) — direct votes are disabled, vote via commit + reveal |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2564,7 +2608,7 @@ two-way consistency check against the IDL parameter table:
 | fee_cap | u64 | 8 |
 | relative_timelock_secs | u64 | 8 |
 | fund_at | u64 | 8 |
-| arbiter_panel | Option<ArbiterPanel> | 595 |
+| arbiter_panel | Option<ArbiterPanel> | 996 |
 | fee_schedule | FeeSchedule | 81 |
 | evidence_deadline_secs | u64 | 8 |
 | escalated_by | Option<Pubkey> | 33 |
@@ -2702,8 +2746,9 @@ and the 8-byte absolute protocol-fee ceiling (AV-63: zeroed = uncapped
 when no ceiling is configured) — and the 8-byte relative timelock duration
 (AV-64: zeroed when no relative timelock is configured) — and the 8-byte
 funding timestamp (AV-64: zeroed when the escrow was never funded) —
-and the 595-byte arbiter panel region (AV-65: 1-byte `Option`
-discriminant + 594-byte panel, zeroed when no panel is configured) —
+and the 996-byte arbiter panel region (AV-65: 1-byte `Option`
+discriminant + 995-byte panel — 594-byte AV-65 vote region + 401-byte
+AV-137 blind-vote region, zeroed when no panel is configured) —
 and the 81-byte tiered protocol-fee schedule region (AV-66: 1-byte
 live-tier count + 8 fixed 10-byte tier slots, zeroed when no schedule
 is configured) — and the 8-byte dispute-evidence disclosure deadline
@@ -2767,10 +2812,10 @@ discriminant + 113-byte region — 32-byte penalty account + 8 fixed
 zeroed when no ladder is configured) + the 1-byte
 `slash_ladder_index` rung cursor, zeroed when no ladder is
 configured).
-`escrow-state` exposes `VAULT_SPACE` (5553) and
-`VAULT_SPACE_NO_QUORUM` (5063) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (5954) and
+`VAULT_SPACE_NO_QUORUM` (5464) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **39,539,760 lamports** to be
+mainnet rent parameters the full vault needs **42,330,720 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)

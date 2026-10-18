@@ -2335,6 +2335,32 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to blind (commit-reveal) panel voting (AV-137; mirrors
+    /// `Escrow::with_blind_panel`): the panel tallies judgments exactly
+    /// like `initialize_arbiter_panel`, except members vote in two
+    /// phases — `submit_judgment_commit`, then `reveal_judgment` inside
+    /// their reveal window — so no member can front-run or herd on a
+    /// visible vote. `Uninitialized` only; mutually exclusive with the
+    /// single arbiter (last-wins). `reveal_window_secs` must be
+    /// non-zero (`InvalidArbiterPanel` otherwise).
+    pub fn initialize_blind_panel(
+        ctx: Context<InitializeBlindPanel>,
+        members: Vec<Pubkey>,
+        threshold: u8,
+        reveal_window_secs: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let member_keys: Vec<[u8; 32]> = members.iter().map(|m| m.to_bytes()).collect();
+        let escrow = escrow
+            .with_blind_panel(&member_keys, threshold, reveal_window_secs)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the full 995-byte panel
+        // region (zeroed when `None`), so the opt-in writes in place —
+        // no realloc needed in the real build.
+        Ok(())
+    }
+
     /// Escalate the escrow into arbitration (AV-14; mirrors
     /// `Escrow::escalate`): `Funded -> Disputed`. Either the initializer
     /// or the taker signs; `now` comes from the Solana clock sysvar (never
@@ -2691,6 +2717,120 @@ pub mod escrow_vault {
         emit_transition(
             &ctx.accounts.vault,
             escrow_state::EscrowEventKind::PanelJudgment,
+            from,
+            escrow.state() as u8,
+            taker_amount,
+            0,
+            0,
+            now,
+            None,
+            rationale_hash,
+            None,
+            None,
+            Some(ctx.accounts.member.key()),
+        );
+        if let Some((_payout, fee, _refund)) = settled {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::PanelResolved,
+                from,
+                escrow.state() as u8,
+                taker_amount,
+                fee,
+                remaining.saturating_sub(taker_amount),
+                now,
+                escrow.evidence_hash(),
+                rationale_hash,
+                None,
+                None,
+                Some(ctx.accounts.member.key()),
+            );
+        }
+        Ok(settled)
+    }
+
+    /// Commit one panel member's blind judgment (AV-137; mirrors
+    /// `Escrow::submit_judgment_commit`): records the
+    /// `SHA-256(taker_amount || rationale_hash || salt)` commitment
+    /// without revealing the judgment. `Disputed` only; only a panel
+    /// member signs. A zero commitment is `BlindInvalidCommitment`; a
+    /// second commit before the reveal overwrites the first
+    /// (last-wins, window restarts). Emits `JudgmentCommitted`.
+    pub fn submit_judgment_commit(
+        ctx: Context<SubmitPanelJudgment>,
+        commitment: [u8; 32],
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = Clock::get()?.unix_timestamp as u64;
+        let from = escrow.state() as u8;
+        escrow
+            .submit_judgment_commit(ctx.accounts.member.key().to_bytes(), commitment, now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `now` doubles as the event's `at`, mirroring
+        // `IndexedEscrow::submit_judgment_commit`.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::JudgmentCommitted,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.member.key()),
+        );
+        Ok(())
+    }
+
+    /// Reveal one panel member's blind judgment (AV-137; mirrors
+    /// `Escrow::reveal_judgment`): the recomputed
+    /// `SHA-256(taker_amount || rationale_hash || salt)` must match the
+    /// stored commitment, then the revealed vote enters the panel tally
+    /// exactly like a plain vote — the M-th matching reveal settles
+    /// with `resolve` semantics. `now` comes from the Solana clock
+    /// sysvar (never an instruction param). Only a panel member signs;
+    /// the state machine rejects strangers with `Unauthorized`,
+    /// non-`Disputed` escrows with `InvalidStateTransition`, late
+    /// reveals with `BlindRevealWindowClosed`, and mismatched preimages
+    /// with `BlindCommitMismatch`. Emits `JudgmentRevealed` per reveal
+    /// and `PanelResolved` on the settling reveal (mirroring
+    /// `IndexedEscrow::reveal_judgment`).
+    pub fn reveal_judgment(
+        ctx: Context<SubmitPanelJudgment>,
+        taker_amount: u64,
+        rationale_hash: Option<[u8; 32]>,
+        salt: [u8; 32],
+    ) -> Result<Option<(u64, u64, u64)>> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        // AV-18: `now` doubles as the event's `at`, mirroring
+        // `IndexedEscrow::reveal_judgment`. AV-119: it also doubles as
+        // the settling reveal's settlement time. Capture the
+        // pre-settlement remainder so the `PanelResolved` event records
+        // the principal legs (the AV-107 convention — see `resolve`).
+        let now = Clock::get()?.unix_timestamp as u64;
+        let remaining = escrow.remaining_amount();
+        let settled = escrow
+            .reveal_judgment(
+                ctx.accounts.member.key().to_bytes(),
+                taker_amount,
+                rationale_hash,
+                salt,
+                now,
+                now,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+                ctx.accounts.payout_to.key().to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::JudgmentRevealed,
             from,
             escrow.state() as u8,
             taker_amount,
@@ -7957,6 +8097,19 @@ pub struct InitializeArbiterPanel<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-137: opt in to blind (commit-reveal) panel voting at initialize
+/// time (mirrors `Escrow::with_blind_panel`).
+#[derive(Accounts)]
+pub struct InitializeBlindPanel<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer opts into blind panel arbitration; the
+    /// state machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`. Mutually exclusive with the single arbiter —
+    /// last-wins in both directions.
+    pub initializer: Signer<'info>,
+}
+
 /// AV-82: opt in to the default-penalty (slash) clause at initialize
 /// time.
 #[derive(Accounts)]
@@ -9327,6 +9480,34 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidArbiterFee => {
             error!(ErrorCode::InvalidArbiterFee)
         }
+        // AV-137: appended, never renumbered.
+        escrow_state::EscrowError::BlindInvalidCommitment => {
+            error!(ErrorCode::BlindInvalidCommitment)
+        }
+        // AV-137: appended, never renumbered.
+        escrow_state::EscrowError::BlindCommitMismatch => {
+            error!(ErrorCode::BlindCommitMismatch)
+        }
+        // AV-137: appended, never renumbered.
+        escrow_state::EscrowError::BlindDuplicateReveal => {
+            error!(ErrorCode::BlindDuplicateReveal)
+        }
+        // AV-137: appended, never renumbered.
+        escrow_state::EscrowError::BlindRevealWindowClosed => {
+            error!(ErrorCode::BlindRevealWindowClosed)
+        }
+        // AV-137: appended, never renumbered.
+        escrow_state::EscrowError::BlindCommitStale => {
+            error!(ErrorCode::BlindCommitStale)
+        }
+        // AV-137: appended, never renumbered.
+        escrow_state::EscrowError::BlindNoCommit => {
+            error!(ErrorCode::BlindNoCommit)
+        }
+        // AV-137: appended, never renumbered.
+        escrow_state::EscrowError::BlindVoteMustReveal => {
+            error!(ErrorCode::BlindVoteMustReveal)
+        }
     }
 }
 
@@ -9555,4 +9736,18 @@ pub enum ErrorCode {
     AmountOutOfBounds,
     #[msg("Invalid arbiter fee (AV-135): initialize_arbiter_fee with fee_bps > 10_000 — a basis-point rate above 100%")]
     InvalidArbiterFee,
+    #[msg("Blind invalid commitment (AV-137): submit_judgment_commit with a zero commitment — no preimage can ever reveal against it")]
+    BlindInvalidCommitment,
+    #[msg("Blind commitment mismatch (AV-137): reveal_judgment whose recomputed SHA-256(taker_amount || rationale_hash || salt) does not match the stored commitment")]
+    BlindCommitMismatch,
+    #[msg("Blind duplicate reveal (AV-137): reveal_judgment for a commit that was already revealed — each commit reveals exactly once")]
+    BlindDuplicateReveal,
+    #[msg("Blind reveal window closed (AV-137): reveal_judgment after committed_at + reveal_window_secs lapsed")]
+    BlindRevealWindowClosed,
+    #[msg("Blind commit stale (AV-137): reveal_judgment whose commit no longer matches the escrow's dispute snapshot — auto-invalidated")]
+    BlindCommitStale,
+    #[msg("Blind no commit (AV-137): reveal_judgment with no active commitment from this member")]
+    BlindNoCommit,
+    #[msg("Blind vote must reveal (AV-137): submit_panel_judgment on a blind-mode panel — direct votes are disabled, vote via commit + reveal")]
+    BlindVoteMustReveal,
 }

@@ -527,13 +527,22 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
             ),
         ],
         // ArbiterPanel { n: u8, threshold: u8, members: [[u8; 32]; 8],
-        // votes: [PanelVote; 8], voted: u64 } (AV-65: 594 bytes).
+        // votes: [PanelVote; 8], voted: u64, blind: bool,
+        // reveal_window_secs: u64, commitments: [[u8; 32]; 8],
+        // committed_at: [u64; 8], commit_disputed_at: [u64; 8],
+        // revealed: u64 } (AV-65: 594 bytes; AV-137: +401 = 995 bytes).
         "ArbiterPanel" => vec![
             ("n", IdlType::U8),
             ("threshold", IdlType::U8),
             ("members", IdlType::Array(ArrayElem::PublicKey, 8)),
             ("votes", IdlType::Array(ArrayElem::Defined("PanelVote"), 8)),
             ("voted", IdlType::U64),
+            ("blind", IdlType::Bool),
+            ("reveal_window_secs", IdlType::U64),
+            ("commitments", IdlType::Array(ArrayElem::PublicKey, 8)),
+            ("committed_at", IdlType::Array(ArrayElem::U64, 8)),
+            ("commit_disputed_at", IdlType::Array(ArrayElem::U64, 8)),
+            ("revealed", IdlType::U64),
         ],
         // FeeTier { min_amount: u64, bps: u16 } (AV-66: 10 bytes).
         "FeeTier" => vec![("min_amount", IdlType::U64), ("bps", IdlType::U16)],
@@ -1009,7 +1018,7 @@ fn named_type_sizes_pin_constants() {
     // AV-65: member count + threshold + 8 member keys + 8 vote slots
     // + voted bitmask.
     assert_eq!(size("ArbiterPanel"), ARBITER_PANEL_LEN);
-    assert_eq!(size("ArbiterPanel"), 594);
+    assert_eq!(size("ArbiterPanel"), 995);
     // AV-66: min_amount u64 + bps u16.
     assert_eq!(size("FeeTier"), FEE_TIER_LEN);
     assert_eq!(size("FeeTier"), 10);
@@ -1120,12 +1129,12 @@ fn idl_errors_pin_enum() {
         let name = format!("{e:?}");
         assert!(seen.insert(name.clone()), "duplicate error variant {name}");
         assert!(
-            (100..200).contains(&e.code()),
+            (100..206).contains(&e.code()),
             "error code out of pinned range: {name} = {}",
             e.code()
         );
     }
-    assert_eq!(errors.len(), 99, "error variant count drift");
+    assert_eq!(errors.len(), 106, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);

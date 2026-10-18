@@ -644,9 +644,29 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
             };
         }
         let voted = c.u64_le()?;
+        // AV-137: the blind-vote region, appended after the voted
+        // bitmask so every earlier panel offset stays stable.
+        let blind = c.u8()? != 0;
+        let reveal_window_secs = c.u64_le()?;
+        let mut commitments = [[0u8; 32]; MAX_PANEL_MEMBERS];
+        for cm in commitments.iter_mut() {
+            *cm = c.pubkey()?;
+        }
+        let mut committed_at = [0u64; MAX_PANEL_MEMBERS];
+        for t in committed_at.iter_mut() {
+            *t = c.u64_le()?;
+        }
+        let mut commit_disputed_at = [0u64; MAX_PANEL_MEMBERS];
+        for t in commit_disputed_at.iter_mut() {
+            *t = c.u64_le()?;
+        }
+        let revealed = c.u64_le()?;
         debug_assert_eq!(
             ARBITER_PANEL_LEN,
-            1 + 1 + MAX_PANEL_MEMBERS * 32 + MAX_PANEL_MEMBERS * PANEL_VOTE_LEN + 8,
+            1 + 1 + MAX_PANEL_MEMBERS * 32 + MAX_PANEL_MEMBERS * PANEL_VOTE_LEN + 8
+                + 1 + 8 + MAX_PANEL_MEMBERS * 32 + MAX_PANEL_MEMBERS * 8
+                + MAX_PANEL_MEMBERS * 8
+                + 8,
             "panel region drift vs ARBITER_PANEL_LEN"
         );
         Some(ArbiterPanel {
@@ -655,6 +675,12 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
             members,
             votes,
             voted,
+            blind,
+            reveal_window_secs,
+            commitments,
+            committed_at,
+            commit_disputed_at,
+            revealed,
         })
     } else {
         c.skip(ARBITER_PANEL_LEN)?;

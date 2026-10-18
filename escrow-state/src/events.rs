@@ -890,6 +890,22 @@ pub enum EscrowEventKind {
     /// [`EventAmounts::none`] (the abort moves no funds — like AV-112's
     /// `ReleaseIntentVetoed`). The actor is the cancelling party.
     DualControlCancelled,
+    /// AV-137: a panel member committed their blind judgment
+    /// ([`Escrow::submit_judgment_commit`]) — the commitment hash is
+    /// recorded, the judgment itself stays hidden until the reveal.
+    /// `from == to == Disputed`; amounts carry [`EventAmounts::none`]
+    /// (the commit moves no funds). The actor is the committing
+    /// member.
+    JudgmentCommitted,
+    /// AV-137: a panel member revealed their blind judgment
+    /// ([`Escrow::reveal_judgment`]) — the revealed
+    /// `(taker_amount, rationale_hash)` enters the panel tally like a
+    /// plain vote. `from == to == Disputed` per reveal,
+    /// `Disputed -> Settled` on the M-th matching reveal (then
+    /// `PanelResolved` follows, like the plain path). Amounts follow
+    /// the `PanelJudgment` shape (`payout` = the revealed taker
+    /// share). The actor is the revealing member.
+    JudgmentRevealed,
 }
 
 impl EscrowEventKind {
@@ -1062,6 +1078,14 @@ impl EscrowEventKind {
             69 => Self::DualControlInitiated,
             70 => Self::DualControlConfirmed,
             71 => Self::DualControlCancelled,
+            // AV-137: appended after DualControlCancelled so
+            // discriminants 0–71 stay stable for already-serialized
+            // histories.
+            72 => Self::JudgmentCommitted,
+            // AV-137: appended after JudgmentCommitted so
+            // discriminants 0–72 stay stable for already-serialized
+            // histories.
+            73 => Self::JudgmentRevealed,
             _ => return None,
         })
     }
@@ -1150,6 +1174,11 @@ impl EscrowEventKind {
             Self::DualControlInitiated => "dual_control_initiated",
             Self::DualControlConfirmed => "dual_control_confirmed",
             Self::DualControlCancelled => "dual_control_cancelled",
+            // AV-137: appended after dual_control_cancelled so the
+            // name table stays stable for already-serialized
+            // histories.
+            Self::JudgmentCommitted => "judgment_committed",
+            Self::JudgmentRevealed => "judgment_revealed",
         }
     }
 
@@ -1242,6 +1271,11 @@ impl EscrowEventKind {
             "dual_control_initiated" => Self::DualControlInitiated,
             "dual_control_confirmed" => Self::DualControlConfirmed,
             "dual_control_cancelled" => Self::DualControlCancelled,
+            // AV-137: appended after dual_control_cancelled so the
+            // name table stays stable for already-serialized
+            // histories.
+            "judgment_committed" => Self::JudgmentCommitted,
+            "judgment_revealed" => Self::JudgmentRevealed,
             _ => return None,
         })
     }
@@ -4811,6 +4845,148 @@ impl IndexedEscrow {
         Ok(settled)
     }
 
+    /// Opt in to blind (commit-reveal) panel voting (mirrors
+    /// [`Escrow::with_blind_panel`], AV-137): the panel tallies
+    /// judgments exactly like [`Escrow::with_arbiter_panel`], except
+    /// members vote via commit + reveal. Configuration: emits no
+    /// event (pre-fund configuration).
+    pub fn with_blind_panel(
+        mut self,
+        members: &[[u8; 32]],
+        threshold: u8,
+        reveal_window_secs: u64,
+    ) -> Result<Self, EscrowError> {
+        self.inner = self
+            .inner
+            .with_blind_panel(members, threshold, reveal_window_secs)?;
+        Ok(self)
+    }
+
+    /// Commit one panel member's blind judgment (mirrors
+    /// [`Escrow::submit_judgment_commit`], AV-137): records the
+    /// `SHA-256(taker_amount || rationale_hash || salt)` commitment
+    /// without revealing the judgment. Emits `JudgmentCommitted`
+    /// (`from == to == Disputed`); `at` is the caller-supplied event
+    /// timestamp (and the commitment's `committed_at`).
+    pub fn submit_judgment_commit(
+        &mut self,
+        member: [u8; 32],
+        commitment: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`. (Commit is not fund-moving, but the
+        // wrapper keeps the uniform reentrancy mapping.)
+        let result = self.inner.submit_judgment_commit(member, commitment, at);
+        self.map_reentrant(result, at)?;
+        // Every commitment is recorded: the commit is the audit
+        // trail of the blind round.
+        self.push_event(
+            EscrowEventKind::JudgmentCommitted,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(member),
+        );
+        Ok(())
+    }
+
+    /// Reveal one panel member's blind judgment (mirrors
+    /// [`Escrow::reveal_judgment`], AV-137): the revealed
+    /// `(taker_amount, rationale_hash)` enters the panel tally exactly
+    /// like a plain vote. Emits `JudgmentRevealed` per reveal (the
+    /// revealed taker share rides `amounts.payout`, like
+    /// `PanelJudgment`), and `PanelResolved` on the M-th matching
+    /// reveal (the reveal event first, then the settlement —
+    /// mirroring `submit_panel_judgment`). `at` doubles as the
+    /// reveal's `now` and as the settling reveal's settlement time
+    /// (the AV-119 convention).
+    pub fn reveal_judgment(
+        &mut self,
+        member: [u8; 32],
+        taker_amount: u64,
+        rationale_hash: Option<[u8; 32]>,
+        salt: [u8; 32],
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+        at: u64,
+    ) -> Result<Option<(u64, u64, u64)>, EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`. AV-119: the reveal's `at` doubles as the
+        // settling reveal's settlement time. Capture the
+        // pre-settlement remainder so the `PanelResolved` event
+        // records the principal legs (the AV-107 convention — see
+        // `resolve` above).
+        let remaining = self.inner.remaining_amount();
+        let result = self.inner.reveal_judgment(
+            member,
+            taker_amount,
+            rationale_hash,
+            salt,
+            at,
+            at,
+            mint,
+            payout_to,
+        );
+        let settled = self.map_reentrant(result, at)?;
+        // Every reveal is recorded, settled or not: the revealed
+        // vote is the audit trail.
+        self.push_event(
+            EscrowEventKind::JudgmentRevealed,
+            from,
+            self.inner.state(),
+            EventAmounts {
+                payout: taker_amount,
+                fee: 0,
+                refund: 0,
+                penalty: 0,
+                rent_reclaimed: 0,
+                arbiter_fee: 0,
+            },
+            at,
+            None,
+            rationale_hash,
+            None,
+            None,
+            Some(member),
+        );
+        if let Some((_payout, fee, _refund)) = settled {
+            // The M-th matching reveal settled the escrow: emit the
+            // settlement after the reveal event (the same shape as
+            // the plain panel path's `PanelResolved`).
+            let amounts = EventAmounts {
+                payout: taker_amount,
+                fee,
+                refund: remaining.saturating_sub(taker_amount),
+                penalty: 0,
+                rent_reclaimed: 0,
+                arbiter_fee: self.inner.arbiter_fee_for(taker_amount - fee),
+            };
+            let evidence_hash = self.inner.evidence_hash();
+            let rationale_hash = self.inner.rationale_hash();
+            self.push_event(
+                EscrowEventKind::PanelResolved,
+                from,
+                self.inner.state(),
+                amounts,
+                at,
+                evidence_hash,
+                rationale_hash,
+                None,
+                None,
+                Some(member),
+            );
+        }
+        Ok(settled)
+    }
+
     /// Retune the arbiter panel's judgment threshold by dual-signed
     /// governance (mirrors [`Escrow::update_panel_threshold`], AV-69).
     /// Emits `PanelThresholdChanged` (`from == to == Uninitialized`)
@@ -7818,7 +7994,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(59), Some(EscrowEventKind::ReleaseIntentAnnounced));
         assert_eq!(EscrowEventKind::from_discriminant(60), Some(EscrowEventKind::ReleaseIntentVetoed));
         assert_eq!(EscrowEventKind::from_discriminant(61), Some(EscrowEventKind::EscrowsMerged));
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -7921,7 +8097,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -8458,7 +8634,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -8473,7 +8649,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -8485,7 +8661,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -8497,7 +8673,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -8509,7 +8685,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -8524,7 +8700,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -8539,7 +8715,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -8551,7 +8727,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -8563,7 +8739,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -8575,7 +8751,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -8587,7 +8763,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -8599,7 +8775,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
     }
 
     #[test]
@@ -8611,7 +8787,80 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(72), None);
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+    }
+
+    #[test]
+    fn judgment_committed_kind_round_trips() {
+        // AV-137: discriminant 72, appended after
+        // DualControlCancelled — 0–71 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::JudgmentCommitted;
+        assert_eq!(kind.discriminant(), 72);
+        assert_eq!(EscrowEventKind::from_discriminant(72), Some(kind));
+        assert_eq!(kind.name(), "judgment_committed");
+        assert_eq!(
+            EscrowEventKind::from_name("judgment_committed"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+    }
+
+    #[test]
+    fn judgment_revealed_kind_round_trips() {
+        // AV-137: discriminant 73, appended after JudgmentCommitted —
+        // 0–72 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::JudgmentRevealed;
+        assert_eq!(kind.discriminant(), 73);
+        assert_eq!(EscrowEventKind::from_discriminant(73), Some(kind));
+        assert_eq!(kind.name(), "judgment_revealed");
+        assert_eq!(
+            EscrowEventKind::from_name("judgment_revealed"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+    }
+
+    #[test]
+    fn blind_wrappers_emit_commit_reveal_and_settlement_events() {
+        // AV-137: the IndexedEscrow wrappers emit JudgmentCommitted
+        // per commit, JudgmentRevealed per reveal, and PanelResolved
+        // on the M-th matching reveal.
+        const M1: [u8; 32] = [0xC1; 32];
+        const M2: [u8; 32] = [0xC2; 32];
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_blind_panel(&[M1, M2], 2, 86_400)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.escalate(ALICE, T0 + 2, 1_000_000, None, None, 0).unwrap();
+        let kinds_before = e.event_count();
+        let salt1 = [0x11; 32];
+        let salt2 = [0x22; 32];
+        let c1 = crate::blind_commitment(600_000, None, salt1);
+        e.submit_judgment_commit(M1, c1, T0 + 3).unwrap();
+        assert_eq!(
+            e.events()[kinds_before].kind,
+            EscrowEventKind::JudgmentCommitted
+        );
+        e.reveal_judgment(M1, 600_000, None, salt1, None, BOB, T0 + 4)
+            .unwrap();
+        assert_eq!(
+            e.events()[kinds_before + 1].kind,
+            EscrowEventKind::JudgmentRevealed
+        );
+        // M2's matching reveal settles: JudgmentRevealed then
+        // PanelResolved.
+        let c2 = crate::blind_commitment(600_000, None, salt2);
+        e.submit_judgment_commit(M2, c2, T0 + 5).unwrap();
+        let settled = e
+            .reveal_judgment(M2, 600_000, None, salt2, None, BOB, T0 + 6)
+            .unwrap();
+        assert!(settled.is_some());
+        let n = e.event_count();
+        assert_eq!(e.events()[n - 2].kind, EscrowEventKind::JudgmentRevealed);
+        assert_eq!(e.events()[n - 1].kind, EscrowEventKind::PanelResolved);
+        assert_eq!(e.inner().state(), EscrowState::Settled);
     }
 
     #[test]

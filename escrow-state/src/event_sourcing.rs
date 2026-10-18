@@ -176,6 +176,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // would invent a payout; only the settling `PanelResolved`
         // moves funds.
         | EscrowEventKind::PanelJudgment
+        // AV-137: a blind commit moves no funds; a reveal's `payout`
+        // is the *revealed* split, not an executed one (the
+        // PanelJudgment rule) — only the settling `PanelResolved`
+        // moves funds.
+        | EscrowEventKind::JudgmentCommitted
+        | EscrowEventKind::JudgmentRevealed
         // A keeper bundle summary: the per-tranche `MilestoneReleased`
         // events already booked the gross — booking the Σ again would
         // double-count.
@@ -632,7 +638,7 @@ mod event_sourcing_tests {
         const FEE: u64 = 100;
         const REFUND: u64 = 700;
         const PENALTY: u64 = 50;
-        for d in 0..=71u8 {
+        for d in 0..=73u8 {
             let kind = EscrowEventKind::from_discriminant(d)
                 .unwrap_or_else(|| panic!("missing discriminant {d}"));
             let event = synth(kind, 0, PAYOUT, FEE, REFUND, PENALTY);
@@ -696,6 +702,10 @@ mod event_sourcing_tests {
                 | EscrowEventKind::ExpiryExtended
                 | EscrowEventKind::ArbiterRotated
                 | EscrowEventKind::PanelJudgment
+                // AV-137: a blind commit moves no funds; a reveal's
+                // payout is the revealed (not executed) split.
+                | EscrowEventKind::JudgmentCommitted
+                | EscrowEventKind::JudgmentRevealed
                 | EscrowEventKind::FeeRecipientRotated
                 | EscrowEventKind::EvidenceSubmitted
                 | EscrowEventKind::PanelThresholdChanged
