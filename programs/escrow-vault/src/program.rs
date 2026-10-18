@@ -226,12 +226,35 @@ pub mod escrow_vault {
         if !escrow.is_slot_unlock_eligible(slot) {
             return Err(escrow_error(escrow_state::EscrowError::TimelockNotReached));
         }
-        // AV-113: when a price gate is configured, the release routes
-        // through the gated entry point and the oracle account (first
-        // remaining account) feeds the quote — the program passes it
-        // through to the state machine. Ungated escrows take the plain
-        // path exactly as before.
-        let (payout, fee) = if escrow.price_gate().is_some() {
+        // AV-128: when a TWAP gate is configured, the release routes
+        // through the twap-gated entry point and the oracle account
+        // (first remaining account) feeds the quote history — the
+        // program passes it through to the state machine. The
+        // twap-gated entry point also enforces the AV-113 single-point
+        // gate when both are configured, so the TWAP gate takes
+        // precedence in routing.
+        // AV-113: when only a price gate is configured, the release
+        // routes through the price-gated entry point and the oracle
+        // account (first remaining account) feeds the quote — the
+        // program passes it through to the state machine. Ungated
+        // escrows take the plain path exactly as before.
+        let (payout, fee) = if escrow.twap_gate().is_some() {
+            let quote = read_oracle_quote(ctx.remaining_accounts)?;
+            let history = read_oracle_history(ctx.remaining_accounts)?;
+            let feed = TwapFeed { quote, history };
+            let slot = Clock::get()?.slot;
+            escrow
+                .release_twap_gated(
+                    ctx.accounts.initializer.key().to_bytes(),
+                    now,
+                    slot,
+                    amount,
+                    vault_token_mint(&ctx.accounts.vault_token_account),
+                    ctx.accounts.payout_to.key().to_bytes(),
+                    &feed,
+                )
+                .map_err(|e| escrow_error(e))?
+        } else if escrow.price_gate().is_some() {
             let quote = read_oracle_quote(ctx.remaining_accounts)?;
             let feed = QuoteFeed(quote);
             escrow
@@ -1310,10 +1333,29 @@ pub mod escrow_vault {
         if !escrow.is_claim_cooldown_eligible(slot) {
             return Err(escrow_error(escrow_state::EscrowError::InvalidClaimCooldown));
         }
+        // AV-128: like `release` — a configured TWAP gate routes the
+        // taker's pull through the twap-gated entry point, fed by the
+        // oracle account's quote history (see `read_oracle_history`).
+        // The TWAP gate takes precedence over the AV-113 price gate.
         // AV-113: like `release` — a configured price gate routes the
         // taker's pull through the gated entry point, fed by the
         // oracle account's quote (see `read_oracle_quote`).
-        let (payout, fee) = if escrow.price_gate().is_some() {
+        let (payout, fee) = if escrow.twap_gate().is_some() {
+            let quote = read_oracle_quote(ctx.remaining_accounts)?;
+            let history = read_oracle_history(ctx.remaining_accounts)?;
+            let feed = TwapFeed { quote, history };
+            let slot = Clock::get()?.slot;
+            escrow
+                .claim_twap_gated(
+                    ctx.accounts.taker.key().to_bytes(),
+                    now,
+                    slot,
+                    vault_token_mint(&ctx.accounts.vault_token_account),
+                    ctx.accounts.payout_to.key().to_bytes(),
+                    &feed,
+                )
+                .map_err(|e| escrow_error(e))?
+        } else if escrow.price_gate().is_some() {
             let quote = read_oracle_quote(ctx.remaining_accounts)?;
             let feed = QuoteFeed(quote);
             escrow
@@ -1917,7 +1959,45 @@ pub mod escrow_vault {
         Ok(())
     }
 
-    /// Merge the source vault into the target vault (AV-114; mirrors
+    /// Attach a TWAP price gate (AV-128; mirrors
+    /// `Escrow::with_twap_gate`). `Uninitialized` only — the window,
+    /// target and direction are fixed before any funds move, like the
+    /// other `initialize_*` opt-ins. `window_slots == 0` or `target ==
+    /// 0` is `InvalidTwapGate` (code 187): a zero window is a
+    /// single-point gate in disguise, and a zero threshold is never a
+    /// deliberate policy. Once configured, `release` / `claim` route
+    /// to the twap-gated entry points and require the oracle account's
+    /// quote history (see `read_oracle_history`).
+    pub fn initialize_twap_gate(
+        ctx: Context<InitializeTwapGate>,
+        window_slots: u64,
+        target: u64,
+        direction: u8,
+        max_staleness_secs: u64,
+    ) -> Result<()> {
+        let direction = match direction {
+            0 => escrow_state::PriceDirection::AtOrAbove,
+            1 => escrow_state::PriceDirection::AtOrBelow,
+            _ => {
+                return Err(escrow_error(
+                    escrow_state::EscrowError::InvalidTwapGate,
+                ))
+            }
+        };
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .with_twap_gate_and_staleness(
+                window_slots,
+                target,
+                direction,
+                max_staleness_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // No indexer event: pre-fund configuration, like the other
+        // `initialize_*` opt-ins.
+        Ok(())
+    }
     /// `Escrow::merge_escrows`). Both vaults must be `Funded` with the
     /// same parties and identical settlement terms
     /// (`MergeIncompatible`, code 177, otherwise); only the
@@ -7306,6 +7386,17 @@ pub struct InitializePriceGate<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-128: accounts for `initialize_twap_gate` — the initializer
+/// fixes the TWAP price-gate terms before funding.
+#[derive(Accounts)]
+pub struct InitializeTwapGate<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer may fix the release governance; the state
+    /// machine runs the `Uninitialized`-only builder check.
+    pub initializer: Signer<'info>,
+}
+
 /// AV-114: accounts for `merge_escrows` — the surviving target vault
 /// and the absorbed source vault, plus the initializer signer (the
 /// only authority that may merge) and the clock sysvar for the event
@@ -8329,6 +8420,57 @@ struct QuoteFeed(escrow_state::PriceQuote);
 impl escrow_state::PriceFeed for QuoteFeed {
     fn quote(&self) -> Option<escrow_state::PriceQuote> {
         Some(self.0)
+    }
+}
+
+/// AV-128: read the oracle price history for a TWAP-gated `release` /
+/// `claim`. The oracle account travels as the first remaining account;
+/// after the 16-byte quote (`price` u64 LE ++ `observed_at` u64 LE —
+/// see `read_oracle_quote`), each 16-byte chunk is one [`PriceSample`]
+/// (`slot` u64 LE ++ `price` u64 LE, any order). A missing account or
+/// short quote is `TwapGateNotSatisfied` — a dark oracle fails the
+/// gate, never passes silently. A trailing partial chunk is ignored
+/// (the keeper pads the account; the state machine clamps samples to
+/// the window anyway).
+fn read_oracle_history(
+    remaining: &[AccountInfo],
+) -> Result<Vec<escrow_state::PriceSample>> {
+    let account = remaining.first().ok_or_else(|| {
+        escrow_error(escrow_state::EscrowError::TwapGateNotSatisfied)
+    })?;
+    let data = account.try_borrow_data()?;
+    if data.len() < 16 {
+        return Err(escrow_error(
+            escrow_state::EscrowError::TwapGateNotSatisfied,
+        ));
+    }
+    let mut history = Vec::new();
+    let mut offset = 16;
+    while offset + 16 <= data.len() {
+        let slot = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        let price = u64::from_le_bytes(data[offset + 8..offset + 16].try_into().unwrap());
+        history.push(escrow_state::PriceSample { slot, price });
+        offset += 16;
+    }
+    Ok(history)
+}
+
+/// AV-128: the [`escrow_state::PriceFeed`] adapter for a TWAP gate —
+/// the program reads the oracle account once (`read_oracle_quote` +
+/// `read_oracle_history`) and feeds the fixed quote and history to
+/// the state machine's twap-gated entry points.
+struct TwapFeed {
+    quote: escrow_state::PriceQuote,
+    history: Vec<escrow_state::PriceSample>,
+}
+
+impl escrow_state::PriceFeed for TwapFeed {
+    fn quote(&self) -> Option<escrow_state::PriceQuote> {
+        Some(self.quote)
+    }
+
+    fn price_history(&self) -> Vec<escrow_state::PriceSample> {
+        self.history.clone()
     }
 }
 

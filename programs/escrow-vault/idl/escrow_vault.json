@@ -956,6 +956,17 @@
       ]
     },
     {
+      "name": "initialize_twap_gate",
+      "discriminator": [52, 134, 25, 173, 33, 217, 15, 110],
+      "accounts": [],
+      "args": [
+        {"name": "window_slots", "type": "u64"},
+        {"name": "target", "type": "u64"},
+        {"name": "direction", "type": "u8"},
+        {"name": "max_staleness_secs", "type": "u64"}
+      ]
+    },
+    {
       "name": "merge_escrows",
       "discriminator": [107, 14, 126, 41, 132, 158, 212, 191],
       "accounts": [],
@@ -1075,7 +1086,8 @@
           {"name": "keeper_bounty_per_crank", "type": "u64", "offset": 5226},
           {"name": "slash_ladder", "type": {"option": {"defined": "SlashLadder"}}, "offset": 5234},
           {"name": "slash_ladder_index", "type": "u8", "offset": 5348},
-          {"name": "refunded", "type": "u64", "offset": 5349}
+          {"name": "refunded", "type": "u64", "offset": 5349},
+          {"name": "twap_gate", "type": {"option": {"defined": "TwapGate"}}, "offset": 5357}
         ]
       }
     }
@@ -1337,6 +1349,18 @@
       }
     },
     {
+      "name": "TwapGate",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "direction", "type": "u8", "offset": 0},
+          {"name": "target", "type": "u64", "offset": 1},
+          {"name": "window_slots", "type": "u64", "offset": 9},
+          {"name": "max_staleness_secs", "type": "u64", "offset": 17}
+        ]
+      }
+    },
+    {
       "name": "CounterOffer",
       "type": {
         "kind": "struct",
@@ -1433,7 +1457,9 @@
     {"code": 182, "name": "IntentNonceReused"},
     {"code": 183, "name": "IntentExpired"},
     {"code": 184, "name": "InvalidSlashLadder"},
-    {"code": 185, "name": "PartialRefundExceedsLocked"}
+    {"code": 185, "name": "PartialRefundExceedsLocked"},
+    {"code": 186, "name": "TwapGateNotSatisfied"},
+    {"code": 187, "name": "InvalidTwapGate"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

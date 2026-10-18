@@ -67,6 +67,19 @@
 //!   permissionless sweep (`caller_role: "anyone"`) that closes the
 //!   appeal and forfeits the locked bond to the initializer.
 //!
+//! AV-128: TWAP-gated escrows (`twap_gate` configured) are *not*
+//! listed for `claim` / `release` by this scan — the gate's
+//! time-weighted average depends on the oracle account's price
+//! history, which the off-chain scan cannot evaluate without the
+//! keeper-supplied feed. A keeper bot servicing TWAP-gated escrows
+//! must fetch the oracle account's quote history itself (see
+//! [`Escrow::require_twap_gate`]) and only submit the instruction
+//! when the TWAP satisfies the gate; listing such an escrow here
+//! would promise executability the scan cannot verify. The
+//! `twap_gate` terms are visible on the snapshot (see
+//! [`crate::snapshot::EscrowSnapshot`]) so the keeper can decide
+//! whether to service the escrow.
+//!
 //! Every listed action carries the exact arguments the keeper needs to
 //! build the instruction: `caller` (the signing key), `mint` (the bound
 //! SPL mint, or `null` on the native-SOL path), `refund_to` (the refund

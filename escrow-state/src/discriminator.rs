@@ -178,6 +178,11 @@ pub enum AccountDecodeError {
     /// The mapping is pinned to declaration order (AV-113; AV-32
     /// panic-free guarantee).
     InvalidPriceGateDiscriminant(u8),
+    /// A present TWAP gate's direction byte is not a known
+    /// [`PriceDirection`](crate::PriceDirection) discriminant (0–1).
+    /// The mapping is pinned to declaration order (AV-128; AV-32
+    /// panic-free guarantee).
+    InvalidTwapGateDiscriminant(u8),
     /// A present slash ladder's live-rung count is outside `1..=8`
     /// ([`MAX_SLASH_LADDER_RUNGS`](crate::MAX_SLASH_LADDER_RUNGS)).
     /// The count byte is part of the field's layout — an out-of-range
@@ -1278,6 +1283,39 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // AV-127: the cumulative partial-refund counter — 8 bytes,
     // appended last so every earlier offset above is unchanged.
     let refunded = c.u64_le()?;
+    // AV-128: the TWAP price-gate tail, always reserved: the
+    // `Option<TwapGate>` region (1-byte discriminant + 1-byte
+    // direction + 8-byte target + 8-byte window + 8-byte staleness
+    // bound). Structural decode only — the window/target invariants
+    // are enforced by `Escrow::with_twap_gate`, not re-litigated
+    // here. An out-of-range direction byte is a corrupt account
+    // (InvalidTwapGateDiscriminant), never silently normalized.
+    let twap_gate = if c.option_present("twap_gate")? {
+        let direction_byte = c.u8()?;
+        let direction = match direction_byte {
+            0 => crate::PriceDirection::AtOrAbove,
+            1 => crate::PriceDirection::AtOrBelow,
+            _ => {
+                return Err(crate::AccountDecodeError::InvalidTwapGateDiscriminant(
+                    direction_byte,
+                ));
+            }
+        };
+        let target = c.u64_le()?;
+        let window_slots = c.u64_le()?;
+        let max_staleness_secs = c.u64_le()?;
+        Some(crate::TwapGate {
+            direction,
+            target,
+            window_slots,
+            max_staleness_secs,
+        })
+    } else {
+        // Absent: skip the reserved 25-byte payload (the encoder
+        // zero-pads it, matching the other `Option` regions).
+        c.skip(crate::TWAP_GATE_LEN - 1)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1536,6 +1574,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-127: the partial-refund tail decodes like any other
         // persisted tail field.
         refunded,
+        // AV-128: the TWAP-gate tail decodes like any other persisted
+        // tail field.
+        twap_gate,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

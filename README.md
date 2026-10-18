@@ -143,6 +143,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); AV-104: a live CANCEL-scoped operator may also call (either party's grant — the refund routing is unchanged); the refund still goes to the whitelisted address even when the taker calls; returns `(refund, penalty)` — a taker-initiated cancel with `penalty_bps > 0` slices an anti-griefing penalty for the initializer (see below) |
 | `cancel_partial(authority, amount, refund_to)` (AV-60) | `Funded` | `Funded` (no state change) | initializer; Funded-only; the initializer's counterpart to AV-11's partial release — reclaims a tranche of the lockup instead of streaming it to the taker; `amount == 0` is `AmountMismatch`, `amount` above the still-locked remainder is `ReleaseExceedsLocked`; the `released` counter is untouched and the locked total shrinks; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise; quorum / timelock / vesting do **not** gate it (same as `cancel`); emits `PartiallyCancelled`; returns the refunded amount |
 | `partial_refund(authority, amount, refund_to)` (AV-127) | `Funded` | `Funded` (no state change) | initializer-only (no delegation scope); Funded-only; the audited counterpart to AV-60's `cancel_partial` — reclaims a tranche of the lockup and accumulates it in the persisted `refunded` counter (`refunded_amount()`), so the refund audit trail survives serialization; `amount == 0` is `AmountMismatch`, `amount` above the still-locked remainder is the dedicated `PartialRefundExceedsLocked` (code 185); the `released` counter is untouched and the locked total shrinks; `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise; quorum / timelock / vesting do **not** gate it (same as `cancel`); emits `PartialRefunded`; returns the refunded amount |
+| `initialize_twap_gate(window_slots, target, direction, max_staleness_secs)` (AV-128) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the TWAP window, target, direction and staleness bound — `window_slots == 0` or `target == 0` is `InvalidTwapGate` code 187; the 26-byte tail region is always reserved so the gate writes in place; once configured `release` / `claim` route to the twap-gated entry points, which also enforce the AV-113 single-point gate when both are configured) |
 | `crank_expired(caller, now)` (AV-48) | `Funded` | `Cancelled` | **anyone** — permissionless crank (Solana crank pattern), only when `now >= expires_at + grace_period`; no counterparty signature needed, so a keeper bot that is party to nothing can sweep timed-out vaults; the refund follows the same pinned refund policy (whitelisted address, or the initializer) — anti-MEV; AV-124: when the initializer opted into the keeper bounty, the crank additionally pays `min(keeper_bounty_per_crank, keeper_bounty_pool)` (saturating) to the caller — without the bounty the cranker receives nothing; returns `(refund, penalty, bounty)`; a taker cranker still pays the anti-griefing penalty; rejected with `Paused` while the escrow is paused |
 | `initialize_payout_allowlist(allowlist)` (AV-49) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; 1–4 live payout-destination addresses; empty / over-long / zero-address input is `InvalidPayoutAllowlist`); the payout policy gates every fund-moving transition's `payout_to` |
 | `update_payout_allowlist(initializer, taker, allowlist)` (AV-49) | `Uninitialized` / `Funded` | same (no state change) | dual-signature governance — both initializer and taker on a dual-sig escrow, initializer alone on a plain escrow (`Unauthorized` otherwise); empty clears the allowlist (back to taker-only payouts); emits `PayoutAllowlistUpdated` only on an actual change |
@@ -1391,6 +1392,8 @@ program error per variant):
 | `IntentExpired` | 183 | `release_via_intent` (AV-123) with `now_slot >= expiry_slot` |
 | `InvalidSlashLadder` | 184 | `with_slash_ladder` (AV-126) with an empty or over-8 rung table, a zero-bps rung, a bps above 10_000, non-ascending deadlines or bps, the zero penalty account, or when the AV-82 `with_slash_terms` are already configured (and configuring the slash terms when a ladder is already set is the same error) |
 | `PartialRefundExceedsLocked` | 185 | `partial_refund` (AV-127) with `amount` above the still-locked remainder |
+| `TwapGateNotSatisfied` | 186 | `release_twap_gated` / `claim_twap_gated` (AV-128) with a configured gate when the oracle is dark, the latest quote is stale, the history does not cover the full TWAP window, or the time-weighted average misses the gate's direction condition |
+| `InvalidTwapGate` | 187 | `with_twap_gate` / `initialize_twap_gate` (AV-128) with `window_slots == 0` or `target == 0`, or a vault-account decode hitting an out-of-range direction byte |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2556,7 +2559,9 @@ two-way consistency check against the IDL parameter table:
 | keeper_bounty_per_crank | u64 | 8 |
 | slash_ladder | Option<SlashLadder> (1-byte discriminant + 113-byte region: 32-byte penalty account + 8 fixed 10-byte (deadline u64, bps u16) rung slots + 1 rung-count byte) | 114 |
 | slash_ladder_index | u8 | 1 |
-| **total**     |                   | **5341** |
+| refunded | u64 | 8 |
+| twap_gate | Option<TwapGate> (1-byte discriminant + 1-byte direction + 8-byte target + 8-byte window_slots + 8-byte max_staleness_secs) | 26 |
+| **total**     |                   | **5375** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -4027,6 +4032,101 @@ initializer              taker                    oracle
    |                     |   Released                 |
    |                     |<---------------------------|
 ```
+
+## TWAP price-gated release (AV-128)
+
+The problem: AV-113's single-point gate asks "is the price *now*
+above the target" — answerable by one flash-manipulated observation.
+A taker (or an attacker who compromised the oracle for a single
+block) can spike the price for one slot, release, and leave. AV-128
+adds the manipulation-resistant complement: release (and claim)
+proceeds only when the *time-weighted average price* over a
+configured slot window satisfies a directional condition. A single
+manipulated block moves the average by at most `price_delta * 1 /
+window_slots` — briefly spiking the oracle cannot unlock the payout.
+
+`with_twap_gate(window_slots, target, direction)` is a builder on an
+`Uninitialized` escrow (like the other `with_*` opt-ins);
+`with_twap_gate_and_staleness(...)` sets an explicit staleness bound
+(default 300s). `window_slots == 0` or `target == 0` is rejected with
+`InvalidTwapGate` (code 187) — a zero window is a single-point gate
+in disguise (use AV-113's `PriceGate`), and a zero threshold is never
+a deliberate policy. The gate is a `TwapGate` — `AtOrAbove` /
+`AtOrBelow` plus the target, the window in slots, and the maximum
+quote age — and lives in a 26-byte tail region of the vault account
+(1-byte `Option` discriminant + 25 bytes: direction, target, window,
+staleness bound), appended last so every earlier field offset stays
+stable.
+
+`release_twap_gated(authority, now, now_slot, amount, payout_to,
+feed)` and `claim_twap_gated(...)` are the gated entries. The TWAP
+gate is evaluated *first*, before the release/claim guard chains
+(pause → authority → state → mint → payout destination →
+milestone/subscription/payout-split ownership → quorum → timelock →
+vesting → amount math): the oracle history is the most
+failure-prone external input, and the gate's existence is public in
+the vault bytes anyway, so no information leaks by checking it up
+front. The evaluation:
+
+1. the feed must yield a latest quote (dark oracle →
+   `TwapGateNotSatisfied`, code 186);
+2. the latest quote must be fresh (`now - observed_at <=
+   max_staleness_secs`, the AV-113 staleness rule reused unchanged);
+3. the feed's history must cover the full `[now_slot -
+   window_slots, now_slot]` window — the price at the window's left
+   edge must be known, otherwise the average cannot be trusted — and
+   the time-weighted average over it must sit on the gate's side of
+   the target.
+
+One code (186) for all four failure modes, mirroring AV-113: the
+caller learns the gate blocked, never which sub-condition tripped.
+The TWAP itself is computed in `u128` (`price * slots`, durations
+summing to exactly `window_slots` under full coverage) and floored
+to `u64` — no overflow, no precision loss that matters for a
+threshold comparison.
+
+The `PriceFeed` trait gains `price_history()` (AV-128): historical
+`(slot, price)` samples, any order (the state machine sorts). The
+default impl degrades gracefully — a single-point feed reports its
+latest quote as one sample at slot 0 ("this price has held since
+genesis"), so existing implementors (`StaticPriceFeed`, the Anchor
+`QuoteFeed`) keep working unchanged, and a single-point feed behaves
+as a constant-price history. Deterministic tests use the new
+`ScriptedPriceFeed` with a scripted history.
+
+Check-order composition: when an AV-113 single-point `PriceGate` is
+*also* configured, the twap-gated entry points enforce both (TWAP
+first, then the single-point gate) — the two gates are
+complementary, and a payout must satisfy each configured condition.
+The Anchor `release` / `claim` handlers route to the twap-gated
+entry points when `twap_gate` is `Some` (taking precedence over the
+price gate), reading the slot from the clock sysvar and the history
+from the oracle account (16-byte quote ++ 16-byte `(slot, price)`
+samples; missing/short account → code 186). No new event kind — the
+standard `Released` / `Claimed` fire, the gate is a check like the
+timelock, not a new transition. The keeper scan does *not* list
+TWAP-gated escrows for claim/release (the off-chain scan cannot
+evaluate the oracle history); the gate terms ride the snapshot so
+keepers can decide whether to service the escrow.
+
+Account layout grows by the 26-byte tail: body 5349 → **5375**,
+`VAULT_SPACE` 5357 → **5383**, `VAULT_SPACE_NO_QUORUM` 4867 →
+**4893**, rent-exempt 38,175,600 → **38,356,560** lamports
+(no-quorum: 34,765,200 → **34,946,160**).
+
+**Walkthrough — the spike that couldn't unlock.** The initializer
+sets `with_twap_gate(100, 100_000, AtOrAbove)`. For 99 slots SOL
+trades at 90,000; at slot 100 an attacker spikes the oracle to
+1,000,000 and the taker tries to release:
+
+```
+TWAP = (90,000 × 99 + 1,000,000 × 1) / 100 = 99,100 < 100,000
+→ TwapGateNotSatisfied. The spike moved the average by only 910.
+```
+
+A sustained move — 50 slots at 90,000 then 50 slots at 120,000 —
+gives TWAP = 105,000 ≥ 100,000, and the release proceeds. The gate
+rewards genuine price moves and ignores flash spikes.
 
 ## Escrow merge (AV-114)
 

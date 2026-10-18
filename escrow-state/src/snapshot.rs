@@ -628,6 +628,12 @@ pub struct EscrowSnapshot {
     /// the single truth source the state machine itself uses, so the
     /// snapshot can never disagree with the chain.
     pub release_cooling_eligible: bool,
+    /// AV-128: the TWAP price-gate terms — `None` when no gate is
+    /// configured, else the `(direction, target, window_slots,
+    /// max_staleness_secs)` tuple, so keepers and indexers see the
+    /// gate without replaying the setup. `direction`: 0 = AtOrAbove,
+    /// 1 = AtOrBelow.
+    pub twap_gate: Option<(u8, u64, u64, u64)>,
 }
 
 /// AV-82: point-in-time, read-only view of the opt-in slash terms —
@@ -1000,6 +1006,16 @@ impl Escrow {
             release_cooling_secs: self.release_cooling_secs(),
             release_intent_at: self.release_intent_at(),
             release_cooling_eligible: self.is_release_cooling_eligible(now),
+            // AV-128: the TWAP-gate terms ride the export — `None` when
+            // unconfigured, so a plain escrow's JSON is unchanged.
+            twap_gate: self.twap_gate().map(|g| {
+                (
+                    g.direction as u8,
+                    g.target,
+                    g.window_slots,
+                    g.max_staleness_secs,
+                )
+            }),
         }
     }
 }
@@ -1662,6 +1678,15 @@ impl EscrowSnapshot {
         write_opt_u64(&mut s, self.release_intent_at);
         s.push_str(",\"release_cooling_eligible\":");
         s.push_str(&self.release_cooling_eligible.to_string());
+        s.push_str(",\"twap_gate\":");
+        match self.twap_gate {
+            Some((direction, target, window_slots, max_staleness_secs)) => {
+                s.push_str(&format!(
+                    "{{\"direction\":{direction},\"target\":{target},\"window_slots\":{window_slots},\"max_staleness_secs\":{max_staleness_secs}}}"
+                ));
+            }
+            None => s.push_str("null"),
+        }
         s.push('}');
         s
     }
@@ -1783,7 +1808,8 @@ mod snapshot_tests {
              \"interest_rate_bps\":0,\"interest_accrued\":0,\"interest_paid\":0,\"compound_interest\":false,\"interest_compounded\":0,\"dispute_interest\":0,\"payout_split\":null,\
              \"deadman_inactivity_secs\":0,\"deadman_heir\":null,\"deadman_last_activity\":1700000000,\
              \"deadman_eligible\":false,\"rent_topped_up_total\":0,\"funded_total\":1000000,\"funding_total_amount\":0,\"funding_max_tranches\":0,\"funding_tranches_used\":0,\"funding_complete\":true,\
-             \"release_cooling_secs\":0,\"release_intent_at\":null,\"release_cooling_eligible\":true\
+             \"release_cooling_secs\":0,\"release_intent_at\":null,\"release_cooling_eligible\":true,\
+             \"twap_gate\":null\
              }}",
             init = hex_of(0xAA),
             taker = hex_of(0xBB),
