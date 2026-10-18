@@ -171,6 +171,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_funding_plan(total_amount, max_tranches)` (AV-111) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the cumulative funding target — must equal the escrow's declared `amount` (`AmountMismatch` otherwise) — and the tranche budget, at least 1 (`InvalidFundingPlan`, code 173, on zero); attaching the plan moves the deposit path from `fund` to `fund_tranche`) |
 | `fund_tranche(authority, tranche_amount, now)` (AV-111) | `Uninitialized` (non-dual-sig) / `Activated` / `Funded` | `Funded` (first tranche; later tranches re-enter `Funded`) | initializer or their FUND-scoped operator (AV-104); `now` <- clock sysvar (never a param); full check sequence — pause → reentrancy → FUND-scoped authority → plan presence (`InvalidFundingPlan`, code 173, when no plan is attached) → state → positive amount (`AmountMismatch` on zero) → AV-134 funding window (`AmountOutOfBounds`, code 197, when the tranche sits outside the configured bounds) → tranche budget (`FundingTranchesExhausted`, code 172, when spent) → overfund cap (`AmountMismatch`); each call accumulates `funded_total` and consumes one tranche slot; the first call anchors `fund_at` / the interest clock / the deadman clock exactly like `fund`; emits `TrancheFunded` (`from == to ==` the state after the call; no amount — the fold seeds the lockup with the deal size at `Funded`) |
 | `initialize_amount_bounds(min_amount, max_amount)` (AV-134) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; opt-in deposit guardrails — `min_amount > max_amount` is `InvalidAmountBounds`, code 196); once attached, `fund` and each `fund_tranche` deposit must sit inside the window (`AmountOutOfBounds`, code 197, otherwise); with no bounds configured both deposit paths keep their existing semantics |
+| `initialize_arbiter_fee(flat_lamports, fee_bps)` (AV-135) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; opt-in arbiter compensation — `fee_bps > 10_000` is `InvalidArbiterFee`, code 198); once attached, every dispute settlement (`resolve`, the panel settling vote, the AV-55 default judgment) deducts the fee from the taker's adjudicated share and routes it to the arbiter (deduction order: AV-17 protocol fee, AV-100 streaming fee, then the arbiter fee); with no fee configured the settlement paths keep their existing semantics |
 | `with_release_cooling(cooling_secs)` (AV-112) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; builder-style like the other `with_*` opt-ins); `cooling_secs = 0` means unconfigured — `release` is ungated, exactly like AV-21's grace-period convention |
 | `announce_release(authority, now)` (AV-112) | `Funded` | `Funded` | initializer or taker (either party, no delegation); full check sequence — pause → authority → state; stamps `release_intent_at = now` (re-announce overwrites — idempotent); touches the AV-109 deadman clock (party liveness); emits `ReleaseIntentAnnounced` |
 | `veto_release(caller, now)` (AV-112) | any non-`Closed` | unchanged | initializer or taker (either party); full check sequence — pause → authority → state; clears `release_intent_at`; no intent is a no-op success; touches the deadman clock; emits `ReleaseIntentVetoed` |
@@ -1421,6 +1422,7 @@ program error per variant):
 | `SlippageExceeded` | 195 | `release_via_cpi` (AV-132) whose executor-reported post-execution taker-leg amount came back below the `min_payout` floor — the whole release rolled back (same atomicity as `CpiExecutionFailed`) |
 | `InvalidAmountBounds` | 196 | `with_amount_bounds` / `initialize_amount_bounds` (AV-134) with `min_amount > max_amount` — an inverted funding window |
 | `AmountOutOfBounds` | 197 | `fund` / `fund_tranche` (AV-134) with a deposit below `min_funding_amount` or above `max_funding_amount` — the deposit is rejected before any state moves |
+| `InvalidArbiterFee` | 198 | `with_arbiter_fee` / `initialize_arbiter_fee` (AV-135) with `fee_bps > 10_000` — an invalid arbiter fee schedule |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2594,7 +2596,9 @@ two-way consistency check against the IDL parameter table:
 | auto_unpause_at | Option<u64> (1-byte discriminant + 8-byte timestamp) | 9 |
 | min_funding_amount | Option<u64> (1-byte discriminant + 8-byte bound) | 9 |
 | max_funding_amount | Option<u64> (1-byte discriminant + 8-byte bound) | 9 |
-| **total**     |                   | **5533** |
+| arbiter_fee_flat | Option<u64> (1-byte discriminant + 8-byte flat lamport slice) | 9 |
+| arbiter_fee_bps | Option<u16> (1-byte discriminant + 2-byte bps rate) | 3 |
+| **total**     |                   | **5545** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2725,10 +2729,10 @@ discriminant + 113-byte region — 32-byte penalty account + 8 fixed
 zeroed when no ladder is configured) + the 1-byte
 `slash_ladder_index` rung cursor, zeroed when no ladder is
 configured).
-`escrow-state` exposes `VAULT_SPACE` (5541) and
-`VAULT_SPACE_NO_QUORUM` (5051) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (5553) and
+`VAULT_SPACE_NO_QUORUM` (5063) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **39,456,240 lamports** to be
+mainnet rent parameters the full vault needs **39,539,760 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -4556,6 +4560,44 @@ Layout growth: the vault body grows from 5515 to 5533 bytes (+18: two
 `VAULT_SPACE_NO_QUORUM` from 5033 to 5051, `VAULT_SPACE` from 5523 to
 5541, and the close-time rent reclamation from 39_330_960 to 39_456_240
 lamports (`(128 + VAULT_SPACE) * 3480 * 2`).
+
+## Arbiter adjudication fee (AV-135)
+
+The problem: arbitration is skilled labor, but nothing in the vault paid
+for it — the arbiter settled disputes for free, which invites free-riding
+(arbiters decline hard cases) or off-protocol side payments (opaque and
+unenforceable). AV-135 makes the fee a first-class, opt-in term:
+`with_arbiter_fee(flat_lamports, fee_bps)` (or the
+`initialize_arbiter_fee` instruction) attaches a two-leg fee schedule
+before funding — a fixed lamport slice, a basis-point rate on the
+adjudicated share, or both (`fee_bps > 10_000` is `InvalidArbiterFee`,
+code 198; `(0, 0)` disables the fee). Like the arbiter binding itself,
+the terms are `Uninitialized`-only — reconfiguring a live escrow is
+`InvalidStateTransition`.
+
+At settlement, the fee is deducted from the taker's adjudicated share
+and routed to the arbiter on all three dispute paths: `resolve`, the
+panel settling vote, and the AV-55 default judgment. The charge is
+`flat_lamports + floor(net_taker_share * fee_bps / 10_000)`, computed in
+`u128` (no overflow: `u64::MAX * 10_000 < u128::MAX`) and capped at the
+share, so the payout can never go negative. Deduction order is fixed and
+documented: **AV-17 protocol fee first, AV-100 streaming fee second, the
+arbiter fee last** — each fee slices the remainder of the previous one,
+and the initializer's refund is never fee'd. With no fee configured the
+three paths settle exactly as before (zero behavior change, backward
+compatible).
+
+The fee rides the settlement events (`Resolved`, `DefaultJudgment`,
+`PanelResolved`) in `EventAmounts.arbiter_fee`, the keeper report
+(`arbiter_fee` on the `Resolve` / `PanelJudgment` actions), and the
+state snapshot — so indexers and arbiter bots see the arbitration
+economics before and after the ruling.
+
+Layout growth: the vault body grows from 5533 to 5545 bytes (+12: the
+9-byte flat slice + the 3-byte bps rate), `VAULT_SPACE_NO_QUORUM` from
+5051 to 5063, `VAULT_SPACE` from 5541 to 5553, and the close-time rent
+reclamation from 39_456_240 to 39_539_760 lamports
+(`(128 + VAULT_SPACE) * 3480 * 2`).
 
 ### Local-validator integration stubs
 

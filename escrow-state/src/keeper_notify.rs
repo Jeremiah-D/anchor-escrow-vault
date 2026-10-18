@@ -747,6 +747,8 @@ mod keeper_notify_tests {
             slot_unlock_at: None,
             bounty_lamports: 0,
             bounty_unprofitable: false,
+            // AV-135: no arbiter fee on synthetic/test actions.
+            arbiter_fee: None,
         }
     }
 

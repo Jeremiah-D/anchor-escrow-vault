@@ -570,6 +570,7 @@ mod event_sourcing_tests {
                 refund,
                 penalty,
                 rent_reclaimed: 0,
+                arbiter_fee: 0,
             },
             at: NOW,
             evidence_hash: None,

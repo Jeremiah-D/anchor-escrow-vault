@@ -9,14 +9,16 @@
 //! # Columns
 //!
 //! ```text
-//! kind,seq,at,actor,payout,fee,refund,penalty,rent_reclaimed
+//! kind,seq,at,actor,payout,fee,refund,penalty,rent_reclaimed,arbiter_fee
 //! ```
 //!
 //! - `kind` — the canonical snake_case [`EscrowEventKind::name`].
 //! - `seq`, `at` — decimal `u64`.
 //! - `actor` — see "Actor provenance" below.
-//! - `payout`, `fee`, `refund`, `penalty`, `rent_reclaimed` —
-//!   [`EventAmounts`] expanded, decimal `u64`.
+//! - `payout`, `fee`, `refund`, `penalty`, `rent_reclaimed`,
+//!   `arbiter_fee` — [`EventAmounts`] expanded, decimal `u64`
+//!   (AV-135: the arbiter adjudication fee column; 0 on every kind
+//!   but the dispute settlements).
 //!
 //! # Actor provenance
 //!
@@ -59,10 +61,12 @@ use crate::{EscrowEvent, EscrowEventKind, EscrowState, EventAmounts};
 
 /// The exact header row [`events_to_csv`] writes and
 /// [`csv_to_events`] requires.
-const HEADER: &str = "kind,seq,at,actor,payout,fee,refund,penalty,rent_reclaimed";
+const HEADER: &str =
+    "kind,seq,at,actor,payout,fee,refund,penalty,rent_reclaimed,arbiter_fee";
 
 /// Expected column count per record row.
-const COLUMN_COUNT: usize = 9;
+// AV-135: the arbiter_fee column joined the export.
+const COLUMN_COUNT: usize = 10;
 
 /// Errors [`csv_to_events`] can return. Line numbers are 1-based; the
 /// header is line 1, the first record line 2. The parser never panics —
@@ -125,6 +129,10 @@ pub fn events_to_csv(events: &[EscrowEvent]) -> String {
         push_u64(&mut out, a.penalty);
         out.push(',');
         push_u64(&mut out, a.rent_reclaimed);
+        out.push(',');
+        // AV-135: the arbiter adjudication fee leg of the settlement
+        // (0 on every other kind).
+        push_u64(&mut out, a.arbiter_fee);
         out.push('\n');
     }
     out
@@ -180,7 +188,10 @@ pub fn csv_to_events(csv: &str) -> Result<Vec<EscrowEvent>, CsvError> {
         let refund = parse_u64(&fields[6], line_no, "refund")?;
         let penalty = parse_u64(&fields[7], line_no, "penalty")?;
         let rent_reclaimed = parse_u64(&fields[8], line_no, "rent_reclaimed")?;
-        // The CSV is a projection: only the nine columns round-trip.
+        // AV-135: the arbiter-fee column — appended, so older readers
+        // stop at rent_reclaimed.
+        let arbiter_fee = parse_u64(&fields[9], line_no, "arbiter_fee")?;
+        // The CSV is a projection: only the ten columns round-trip.
         // Non-carried fields take documented zero-values — `from`/`to`
         // are the explicit "not carried" marker, never inferred.
         events.push(EscrowEvent {
@@ -195,6 +206,7 @@ pub fn csv_to_events(csv: &str) -> Result<Vec<EscrowEvent>, CsvError> {
                 refund,
                 penalty,
                 rent_reclaimed,
+                arbiter_fee,
             },
             at,
             evidence_hash: None,
@@ -424,8 +436,8 @@ mod event_csv_tests {
     fn header_and_single_event_are_byte_pinned() {
         let csv = events_to_csv(&initialized_events());
         let expected = format!(
-            "kind,seq,at,actor,payout,fee,refund,penalty,rent_reclaimed\n\
-             initialized,0,{T0},{ACTOR_HEX},0,0,0,0,0\n"
+            "kind,seq,at,actor,payout,fee,refund,penalty,rent_reclaimed,arbiter_fee\n\
+             initialized,0,{T0},{ACTOR_HEX},0,0,0,0,0,0\n"
         );
         assert_eq!(csv, expected);
     }
@@ -434,9 +446,9 @@ mod event_csv_tests {
     fn empty_slice_exports_header_only() {
         assert_eq!(
             events_to_csv(&[]),
-            "kind,seq,at,actor,payout,fee,refund,penalty,rent_reclaimed\n"
+            "kind,seq,at,actor,payout,fee,refund,penalty,rent_reclaimed,arbiter_fee\n"
         );
-        assert_eq!(csv_to_events("kind,seq,at,actor,payout,fee,refund,penalty,rent_reclaimed\n").unwrap(), vec![]);
+        assert_eq!(csv_to_events("kind,seq,at,actor,payout,fee,refund,penalty,rent_reclaimed,arbiter_fee\n").unwrap(), vec![]);
     }
 
     #[test]
@@ -518,6 +530,7 @@ mod event_csv_tests {
                 refund: 0,
                 penalty: 0,
                 rent_reclaimed: 0,
+                arbiter_fee: 0,
             }
         );
         // The projection does not carry states: the documented
@@ -540,8 +553,8 @@ mod event_csv_tests {
     #[test]
     fn actor_hex_accepts_uppercase_on_import() {
         let csv = format!(
-            "kind,seq,at,actor,payout,fee,refund,penalty,rent_reclaimed\n\
-             initialized,0,{T0},{},0,0,0,0,0\n",
+            "kind,seq,at,actor,payout,fee,refund,penalty,rent_reclaimed,arbiter_fee\n\
+             initialized,0,{T0},{},0,0,0,0,0,0\n",
             ACTOR_HEX.to_uppercase()
         );
         let parsed = csv_to_events(&csv).unwrap();
@@ -581,7 +594,7 @@ mod event_csv_tests {
             csv_to_events(&csv).unwrap_err(),
             CsvError::BadFieldCount {
                 line: 2,
-                expected: 9,
+                expected: 10,
                 got: 3
             }
         );
@@ -591,7 +604,7 @@ mod event_csv_tests {
             csv_to_events(&csv).unwrap_err(),
             CsvError::BadFieldCount {
                 line: 2,
-                expected: 9,
+                expected: 10,
                 got: 1
             }
         );
@@ -599,7 +612,7 @@ mod event_csv_tests {
 
     #[test]
     fn unknown_kind_is_an_error() {
-        let csv = format!("{HEADER}\nlaunched,0,{T0},{ACTOR_HEX},0,0,0,0,0\n");
+        let csv = format!("{HEADER}\nlaunched,0,{T0},{ACTOR_HEX},0,0,0,0,0,0\n");
         assert_eq!(
             csv_to_events(&csv).unwrap_err(),
             CsvError::UnknownKind {
@@ -611,7 +624,7 @@ mod event_csv_tests {
 
     #[test]
     fn invalid_integers_are_errors() {
-        let bad_seq = format!("{HEADER}\nreleased,x,{T0},{ACTOR_HEX},1,2,3,4,5\n");
+        let bad_seq = format!("{HEADER}\nreleased,x,{T0},{ACTOR_HEX},1,2,3,4,5,0\n");
         assert_eq!(
             csv_to_events(&bad_seq).unwrap_err(),
             CsvError::InvalidInt {
@@ -620,7 +633,7 @@ mod event_csv_tests {
                 value: "x".to_string()
             }
         );
-        let negative = format!("{HEADER}\nreleased,0,{T0},{ACTOR_HEX},-1,0,0,0,0\n");
+        let negative = format!("{HEADER}\nreleased,0,{T0},{ACTOR_HEX},-1,0,0,0,0,0\n");
         assert_eq!(
             csv_to_events(&negative).unwrap_err(),
             CsvError::InvalidInt {
@@ -629,7 +642,7 @@ mod event_csv_tests {
                 value: "-1".to_string()
             }
         );
-        let overflow = format!("{HEADER}\nreleased,0,{T0},{ACTOR_HEX},18446744073709551616,0,0,0,0\n");
+        let overflow = format!("{HEADER}\nreleased,0,{T0},{ACTOR_HEX},18446744073709551616,0,0,0,0,0\n");
         assert_eq!(
             csv_to_events(&overflow).unwrap_err(),
             CsvError::InvalidInt {
@@ -643,7 +656,7 @@ mod event_csv_tests {
     #[test]
     fn invalid_actor_hex_is_an_error() {
         // Too short.
-        let short = format!("{HEADER}\nreleased,0,{T0},1d1d,1,2,3,4,5\n");
+        let short = format!("{HEADER}\nreleased,0,{T0},1d1d,1,2,3,4,5,0\n");
         assert_eq!(
             csv_to_events(&short).unwrap_err(),
             CsvError::InvalidActorHex {
@@ -653,7 +666,7 @@ mod event_csv_tests {
         );
         // Right length, non-hex character.
         let actor = "zz".to_string() + &"1d".repeat(31);
-        let bad_char = format!("{HEADER}\nreleased,0,{T0},{actor},1,2,3,4,5\n");
+        let bad_char = format!("{HEADER}\nreleased,0,{T0},{actor},1,2,3,4,5,0\n");
         assert_eq!(
             csv_to_events(&bad_char).unwrap_err(),
             CsvError::InvalidActorHex {

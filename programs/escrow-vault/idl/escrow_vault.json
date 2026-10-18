@@ -1015,6 +1015,15 @@
         {"name": "min_amount", "type": "u64"},
         {"name": "max_amount", "type": "u64"}
       ]
+    },
+    {
+      "name": "initialize_arbiter_fee",
+      "discriminator": [7, 78, 191, 38, 252, 92, 232, 217],
+      "accounts": [],
+      "args": [
+        {"name": "flat_lamports", "type": "u64"},
+        {"name": "fee_bps", "type": "u16"}
+      ]
     }
   ],
   "accounts": [
@@ -1137,7 +1146,9 @@
           {"name": "disputed_amount", "type": "u64", "offset": 5506},
           {"name": "auto_unpause_at", "type": {"option": "u64"}, "offset": 5514},
           {"name": "min_funding_amount", "type": {"option": "u64"}, "offset": 5523},
-          {"name": "max_funding_amount", "type": {"option": "u64"}, "offset": 5532}
+          {"name": "max_funding_amount", "type": {"option": "u64"}, "offset": 5532},
+          {"name": "arbiter_fee_flat", "type": {"option": "u64"}, "offset": 5541},
+          {"name": "arbiter_fee_bps", "type": {"option": "u16"}, "offset": 5550}
         ]
       }
     }
@@ -1532,7 +1543,8 @@
     {"code": 194, "name": "DisputedAmountLocked"},
     {"code": 195, "name": "SlippageExceeded"},
     {"code": 196, "name": "InvalidAmountBounds"},
-    {"code": 197, "name": "AmountOutOfBounds"}
+    {"code": 197, "name": "AmountOutOfBounds"},
+    {"code": 198, "name": "InvalidArbiterFee"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

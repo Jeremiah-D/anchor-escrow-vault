@@ -393,6 +393,14 @@ pub struct EscrowSnapshot {
     /// AV-134: the funding amount window's ceiling; see
     /// `min_funding_amount`.
     pub max_funding_amount: Option<u64>,
+    /// AV-135: the arbiter adjudication fee's fixed lamport slice
+    /// (`Escrow::arbiter_fee_flat`); `None` when the flat leg is not
+    /// configured.
+    pub arbiter_fee_flat: Option<u64>,
+    /// AV-135: the arbiter adjudication fee's basis-point rate
+    /// (`Escrow::arbiter_fee_bps`); `None` when the bps leg is not
+    /// configured.
+    pub arbiter_fee_bps: Option<u16>,
     /// The arbiter's rationale-document commitment attached at
     /// `resolve`, or `None` when the arbiter supplied no rationale
     /// (AV-38). Only `Some` on a `Settled` escrow — never cleared, so
@@ -844,6 +852,11 @@ impl Escrow {
             // path.
             min_funding_amount: self.min_funding_amount(),
             max_funding_amount: self.max_funding_amount(),
+            // AV-135: the arbiter adjudication fee terms ride the
+            // export so indexers price the settlement's fee leg
+            // without replaying the setup.
+            arbiter_fee_flat: self.arbiter_fee_flat(),
+            arbiter_fee_bps: self.arbiter_fee_bps(),
             rationale_hash: self.rationale_hash(),
             refund_to: self.refund_to(),
             refund_recipient: self.refund_recipient(),
@@ -1375,6 +1388,18 @@ impl EscrowSnapshot {
             Some(m) => s.push_str(&m.to_string()),
             None => s.push_str("null"),
         }
+        // AV-135: the arbiter adjudication fee terms — `null` when a
+        // leg is not configured (no fee charged).
+        s.push_str(",\"arbiter_fee_flat\":");
+        match self.arbiter_fee_flat {
+            Some(f) => s.push_str(&f.to_string()),
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"arbiter_fee_bps\":");
+        match self.arbiter_fee_bps {
+            Some(b) => s.push_str(&b.to_string()),
+            None => s.push_str("null"),
+        }
         // AV-38: the arbiter's rationale-document commitment — `null`
         // until the arbiter attaches one at `resolve`.
         s.push_str(",\"rationale_hash\":");
@@ -1843,7 +1868,7 @@ mod snapshot_tests {
              \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
-             \"evidence_hash\":null,\"evidence_root\":null,\"evidence_disclosure\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"disputed_amount\":0,\"auto_unpause_at\":null,\"min_funding_amount\":null,\"max_funding_amount\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
+             \"evidence_hash\":null,\"evidence_root\":null,\"evidence_disclosure\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"disputed_amount\":0,\"auto_unpause_at\":null,\"min_funding_amount\":null,\"max_funding_amount\":null,\"arbiter_fee_flat\":null,\"arbiter_fee_bps\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
              \"penalty_bps\":0,\"penalty_escalation_rate_bps\":0,\"penalty_escalation_cap_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"slot_timelock_slots\":0,\"fund_slot\":0,\"claim_cooldown_slots\":0,\"last_claim_slot\":null,\"counter_offer\":null,\"payout_allowlist\":null,\"payout_denylist\":null,\"cpi_allowlist\":null,\"multisig_authority\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
@@ -1880,14 +1905,37 @@ mod snapshot_tests {
         assert_eq!(snap.max_funding_amount, Some(900_000));
         assert!(snap
             .to_json()
-            .contains("\"min_funding_amount\":100000,\"max_funding_amount\":900000"));
+            .contains("\"min_funding_amount\":100000,\"max_funding_amount\":900000,\"arbiter_fee_flat\":null,\"arbiter_fee_bps\":null"));
         let plain = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER).unwrap();
         let snap = plain.snapshot(MID);
         assert_eq!(snap.min_funding_amount, None);
         assert_eq!(snap.max_funding_amount, None);
         assert!(snap
             .to_json()
-            .contains("\"min_funding_amount\":null,\"max_funding_amount\":null"));
+            .contains("\"min_funding_amount\":null,\"max_funding_amount\":null,\"arbiter_fee_flat\":null,\"arbiter_fee_bps\":null"));
+    }
+
+    #[test]
+    fn snapshot_carries_arbiter_fee_terms() {
+        // AV-135: the configured fee rides the snapshot export;
+        // unconfigured vaults export nulls.
+        let e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_arbiter_fee(50_000, 1_000)
+            .unwrap();
+        let snap = e.snapshot(MID);
+        assert_eq!(snap.arbiter_fee_flat, Some(50_000));
+        assert_eq!(snap.arbiter_fee_bps, Some(1_000));
+        assert!(snap
+            .to_json()
+            .contains("\"arbiter_fee_flat\":50000,\"arbiter_fee_bps\":1000"));
+        let plain = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER).unwrap();
+        let snap = plain.snapshot(MID);
+        assert_eq!(snap.arbiter_fee_flat, None);
+        assert_eq!(snap.arbiter_fee_bps, None);
+        assert!(snap
+            .to_json()
+            .contains("\"arbiter_fee_flat\":null,\"arbiter_fee_bps\":null"));
     }
 
     #[test]

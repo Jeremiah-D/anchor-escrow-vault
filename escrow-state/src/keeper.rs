@@ -446,6 +446,17 @@ impl KeeperActionKind {
     }
 }
 
+/// AV-135: the escrow's configured arbiter adjudication fee, passed
+/// through on `Resolve` / `PanelJudgment` keeper actions. `Copy` like
+/// the other small report structs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArbiterFeeTerms {
+    /// The fixed lamport slice of the fee.
+    pub flat_lamports: u64,
+    /// The basis-point rate of the variable leg (`<= 10_000`).
+    pub bps: u16,
+}
+
 /// One executable keeper call: everything needed to build the
 /// instruction, nothing more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -595,6 +606,17 @@ pub struct KeeperAction {
     /// alone does not pay for the transaction. Informational, like
     /// `bounty_lamports`.
     pub bounty_unprofitable: bool,
+    /// AV-135: the escrow's configured arbiter adjudication fee
+    /// ([`Escrow::with_arbiter_fee`]) — the flat lamport slice and
+    /// the bps rate the settlement would deduct from the taker's
+    /// adjudicated share and route to the arbiter. Set on
+    /// [`KeeperActionKind::Resolve`] /
+    /// [`KeeperActionKind::PanelJudgment`] actions; `None` on every
+    /// other kind and when no fee is configured. Informational: it is
+    /// never an instruction input and never affects which actions are
+    /// listed — an arbiter-operated keeper bot reads the
+    /// compensation before deciding to rule.
+    pub arbiter_fee: Option<ArbiterFeeTerms>,
 }
 
 /// AV-111: the live tranched-funding counters passed through on a
@@ -855,6 +877,7 @@ impl KeeperReport {
     ///    "funding_progress":null,"merge_source":null,
     ///    "penalty_estimate":0,"slot_unlock_at":null,
     ///    "bounty_lamports":0,"bounty_unprofitable":false,
+    ///    "arbiter_fee":null,
     ///    "estimated_cu":13814}
     ///  ],
     ///  "report_seq":null,"pending_auto_unpause":[],"funding_bounds":[]}
@@ -1082,6 +1105,20 @@ impl KeeperReport {
             // pay for the transaction under the assumed fee regime.
             s.push_str(",\"bounty_unprofitable\":");
             s.push_str(if a.bounty_unprofitable { "true" } else { "false" });
+            // AV-135: the escrow's configured arbiter adjudication fee
+            // — `null` on every action but Resolve / PanelJudgment
+            // (and on dispute actions when no fee is configured).
+            s.push_str(",\"arbiter_fee\":");
+            match a.arbiter_fee {
+                Some(t) => {
+                    s.push_str("{\"flat_lamports\":");
+                    s.push_str(&t.flat_lamports.to_string());
+                    s.push_str(",\"bps\":");
+                    s.push_str(&t.bps.to_string());
+                    s.push('}');
+                }
+                None => s.push_str("null"),
+            }
             // AV-88: the per-action CU passthrough — the heuristic
             // estimate for this keeper call, same cost model as the
             // execution plan.
@@ -1148,6 +1185,20 @@ fn slot_unlock_opt(e: &Escrow) -> Option<u64> {
         None
     } else {
         Some(e.slot_unlock_slot())
+    }
+}
+
+/// AV-135: read the escrow's configured arbiter adjudication fee
+/// ([`Escrow::with_arbiter_fee`]) for the keeper report — the flat
+/// slice and the bps rate a dispute settlement would charge. `None`
+/// when the escrow never opted in.
+fn arbiter_fee_terms(e: &Escrow) -> Option<ArbiterFeeTerms> {
+    match (e.arbiter_fee_flat(), e.arbiter_fee_bps()) {
+        (None, None) => None,
+        (flat, bps) => Some(ArbiterFeeTerms {
+            flat_lamports: flat.unwrap_or(0),
+            bps: bps.unwrap_or(0),
+        }),
     }
 }
 
@@ -1265,6 +1316,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                             slot_unlock_at: slot_unlock_opt(e),
                             bounty_lamports: 0,
                             bounty_unprofitable: false,
+                            // AV-135: the arbiter adjudication fee rides the dispute actions.
+                            arbiter_fee: arbiter_fee_terms(e),
                         });
                     }
                 }
@@ -1300,6 +1353,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         slot_unlock_at: slot_unlock_opt(e),
                         bounty_lamports: 0,
                         bounty_unprofitable: false,
+                        // AV-135: the arbiter adjudication fee rides the dispute actions.
+                        arbiter_fee: arbiter_fee_terms(e),
                     });
                 }
             }
@@ -1354,6 +1409,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         slot_unlock_at: slot_unlock_opt(e),
                         bounty_lamports: 0,
                         bounty_unprofitable: false,
+                        arbiter_fee: None,
                     });
                 }
             }
@@ -1404,6 +1460,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 slot_unlock_at: slot_unlock_opt(e),
                 bounty_lamports: 0,
                 bounty_unprofitable: false,
+                arbiter_fee: None,
             });
             // AV-48: the permissionless crank — the same expiry exit,
             // callable by anyone. A keeper bot that is party to nothing
@@ -1460,6 +1517,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     slot_unlock_at: slot_unlock_opt(e),
                     bounty_lamports: 0,
                     bounty_unprofitable: false,
+                    arbiter_fee: None,
                 };
                 let bounty = e.keeper_bounty_payable();
                 crank.bounty_lamports = bounty;
@@ -1507,6 +1565,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 slot_unlock_at: slot_unlock_opt(e),
                 bounty_lamports: 0,
                 bounty_unprofitable: false,
+                arbiter_fee: None,
             });
         }
         // The taker's pull path: vesting attached (or an AV-97 Dutch
@@ -1557,6 +1616,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 slot_unlock_at: slot_unlock_opt(e),
                 bounty_lamports: 0,
                 bounty_unprofitable: false,
+                arbiter_fee: None,
             });
         }
         // AV-56: the initializer's push path for the next due
@@ -1611,6 +1671,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     slot_unlock_at: slot_unlock_opt(e),
                     bounty_lamports: 0,
                     bounty_unprofitable: false,
+                    arbiter_fee: None,
                 });
             }
         }
@@ -1649,6 +1710,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 slot_unlock_at: slot_unlock_opt(e),
                 bounty_lamports: 0,
                 bounty_unprofitable: false,
+                arbiter_fee: None,
             });
             if let Some(arbiter) = e.arbiter() {
                 actions.push(KeeperAction {
@@ -1673,6 +1735,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     slot_unlock_at: slot_unlock_opt(e),
                     bounty_lamports: 0,
                     bounty_unprofitable: false,
+                    arbiter_fee: None,
                 });
             }
         }
@@ -1710,6 +1773,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 slot_unlock_at: slot_unlock_opt(e),
                 bounty_lamports: 0,
                 bounty_unprofitable: false,
+                arbiter_fee: None,
             });
         }
         if e.is_appeal_under_review() {
@@ -1749,6 +1813,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                         slot_unlock_at: slot_unlock_opt(e),
                         bounty_lamports: 0,
                         bounty_unprofitable: false,
+                        arbiter_fee: None,
                     });
                 }
             }
@@ -1788,6 +1853,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 slot_unlock_at: slot_unlock_opt(e),
                 bounty_lamports: 0,
                 bounty_unprofitable: false,
+                arbiter_fee: None,
             });
         }
         // AV-106: the insurance-pool payout. Listed when
@@ -1833,6 +1899,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     slot_unlock_at: slot_unlock_opt(e),
                     bounty_lamports: 0,
                     bounty_unprofitable: false,
+                    arbiter_fee: None,
                 });
             }
         }
@@ -1908,6 +1975,7 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     slot_unlock_at: slot_unlock_opt(&target.escrow),
                     bounty_lamports: 0,
                     bounty_unprofitable: false,
+                    arbiter_fee: None,
                 });
                 break;
             }
@@ -3110,6 +3178,49 @@ mod keeper_tests {
     }
 
     #[test]
+    fn resolve_action_carries_the_arbiter_fee_terms() {
+        // AV-135: the keeper's resolve action tells the arbiter bot
+        // the fee terms the settlement will charge — the anti-free-riding
+        // economics are visible before the ruling is submitted.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbiter_fee(50_000, 1_000)
+            .unwrap();
+        e.fund(ALICE, MID).unwrap();
+        e.escalate(ALICE, MID, e.remaining_amount(), None, None, 0).unwrap();
+        let watched = [watch(ID1, e)];
+        let report = scan_keeper_actions(&watched, MID);
+        assert_eq!(report.actions.len(), 1);
+        let a = report.actions[0];
+        assert_eq!(a.kind, KeeperActionKind::Resolve);
+        let terms = a.arbiter_fee.expect("fee terms ride the resolve action");
+        assert_eq!(terms.flat_lamports, 50_000);
+        assert_eq!(terms.bps, 1_000);
+        let json = report.to_json();
+        assert!(json.contains("\"arbiter_fee\":{\"flat_lamports\":50000,\"bps\":1000}"));
+    }
+
+    #[test]
+    fn resolve_action_arbiter_fee_null_without_opt_in() {
+        // No opt-in: the field stays null, the legacy shape untouched.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE, MID).unwrap();
+        e.escalate(ALICE, MID, e.remaining_amount(), None, None, 0).unwrap();
+        let watched = [watch(ID1, e)];
+        let report = scan_keeper_actions(&watched, MID);
+        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions[0].arbiter_fee, None);
+        assert!(report.to_json().contains("\"arbiter_fee\":null"));
+    }
+
+    #[test]
     fn disputed_evidence_hash_survives_keeper_scan() {
         // AV-22 passthrough: the keeper lists only the arbiter's
         // `resolve` for a disputed escrow (AV-38), but the scan pipeline
@@ -3256,6 +3367,7 @@ mod keeper_tests {
                 slot_unlock_at: slot_unlock_opt(&e1),
                 bounty_lamports: 0,
                 bounty_unprofitable: false,
+                arbiter_fee: None,
             }
         );
         assert_eq!(
@@ -3286,6 +3398,8 @@ mod keeper_tests {
                 // unprofitable (the classic unpaid AV-48 crank).
                 bounty_lamports: 0,
                 bounty_unprofitable: true,
+                // AV-135: no arbiter fee on the crank action.
+                arbiter_fee: None,
             }
         );
         assert_eq!(report.actions[2].escrow_id, ID2);
@@ -3390,7 +3504,7 @@ mod keeper_tests {
         // 3 accounts, 8 data bytes, 1 signer →
         // 10_000 + 3_000 + 3×250 + 8×8 = 13_814 each; total 27_628.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":false,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":true,\"estimated_cu\":13814}}],\"report_seq\":null,\"pending_auto_unpause\":[],\"funding_bounds\":[]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":false,\"arbiter_fee\":null,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":true,\"arbiter_fee\":null,\"estimated_cu\":13814}}],\"report_seq\":null,\"pending_auto_unpause\":[],\"funding_bounds\":[]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -3415,7 +3529,7 @@ mod keeper_tests {
         // AV-88: claim with mint, no refund_to: 3 accounts, 8 data
         // bytes, 1 signer → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":false,\"estimated_cu\":17814}}],\"report_seq\":null,\"pending_auto_unpause\":[],\"funding_bounds\":[]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":false,\"arbiter_fee\":null,\"estimated_cu\":17814}}],\"report_seq\":null,\"pending_auto_unpause\":[],\"funding_bounds\":[]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),
@@ -3693,6 +3807,7 @@ mod keeper_tests {
             slot_unlock_at: None,
             bounty_lamports: 0,
             bounty_unprofitable: false,
+            arbiter_fee: None,
         };
         assert_eq!(a.estimated_compute_units(), 13_814);
         // Without refund_to the account drops out of the estimate.
@@ -3721,6 +3836,7 @@ mod keeper_tests {
             slot_unlock_at: None,
             bounty_lamports: 0,
             bounty_unprofitable: false,
+            arbiter_fee: None,
             refund_to: None,
             ..a
         };

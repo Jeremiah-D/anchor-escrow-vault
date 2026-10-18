@@ -235,9 +235,9 @@
 //! | ReleaseIntentVetoed (AV-112) | 0 | 0 | 0 | 0 — a live release intent was vetoed (governance signal; the announced release is cancelled) |
 //! | EscrowsMerged (AV-114) | the source's locked amount folded into the survivor | 0 | 0 | 0 |
 //! | ExpiredCranked (AV-48) | 0 | 0 | remainder minus penalty, to the whitelisted destination (the cranker receives nothing — unless the vault opted into the AV-124 keeper bounty, paid via `KeeperBountyPaid`) | anti-griefing penalty to the initializer (AV-24; 0 unless the cranker is the taker; AV-115 escalation grows the rate with days past the expiry gate) |
-//! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's principal share of the split (AV-119: the initializer's dispute-interest share rides the refund transfer — tracked in `dispute_interest`, the event keeps the principal leg) | 0 |
-//! | DefaultJudgment (AV-55) | gross taker share (`default_taker_amount`) | protocol fee on the taker's share | initializer's principal share of the split (AV-119: same dispute-interest rule as `Resolved`) | 0 |
-//! | PanelResolved (AV-65) | gross taker share (the winning vote's `taker_amount`) | protocol fee on the taker's share | initializer's principal share of the split (AV-119: same dispute-interest rule as `Resolved`) | 0 |
+//! | Resolved | gross taker share (`taker_amount`) | protocol fee on the taker's share | initializer's principal share of the split (AV-119: the initializer's dispute-interest share rides the refund transfer — tracked in `dispute_interest`, the event keeps the principal leg) | 0 — the AV-135 arbiter adjudication fee rides `arbiter_fee` (0 when the escrow never opted in) |
+//! | DefaultJudgment (AV-55) | gross taker share (`default_taker_amount`) | protocol fee on the taker's share | initializer's principal share of the split (AV-119: same dispute-interest rule as `Resolved`) | 0 — the AV-135 arbiter adjudication fee rides `arbiter_fee` |
+//! | PanelResolved (AV-65) | gross taker share (the winning vote's `taker_amount`) | protocol fee on the taker's share | initializer's principal share of the split (AV-119: same dispute-interest rule as `Resolved`) | 0 — the AV-135 arbiter adjudication fee rides `arbiter_fee` |
 //! | PanelJudgment (AV-65) | the voted split (`taker_amount`) | 0 | 0 | 0 |
 //! | MilestoneSkipped | 0 | 0 | skipped tranche (the initializer's refund) | 0 |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
@@ -1256,10 +1256,13 @@ impl EscrowEventKind {
 /// returned to the initializer, `penalty` is the AV-24 anti-griefing
 /// penalty sliced from the remainder on a taker-initiated
 /// `cancel_expired` (routed to the initializer as griefing
-/// compensation), and `rent_reclaimed` is the AV-34 rent-exempt deposit
+/// compensation), `rent_reclaimed` is the AV-34 rent-exempt deposit
 /// returned to the initializer when the vault account is closed
-/// (non-zero only on `VaultClosed`). All fields are zero when the kind
-/// moves no such value.
+/// (non-zero only on `VaultClosed`), and `arbiter_fee` is the AV-135
+/// arbiter adjudication fee sliced from the taker's share on a dispute
+/// settlement (non-zero only on `Resolved`, `DefaultJudgment` and
+/// `PanelResolved` when the escrow opted into the fee). All fields are
+/// zero when the kind moves no such value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventAmounts {
     pub payout: u64,
@@ -1267,6 +1270,7 @@ pub struct EventAmounts {
     pub refund: u64,
     pub penalty: u64,
     pub rent_reclaimed: u64,
+    pub arbiter_fee: u64,
 }
 
 impl EventAmounts {
@@ -1278,6 +1282,7 @@ impl EventAmounts {
             refund: 0,
             penalty: 0,
             rent_reclaimed: 0,
+            arbiter_fee: 0,
         }
     }
 
@@ -1289,6 +1294,7 @@ impl EventAmounts {
             refund: 0,
             penalty: 0,
             rent_reclaimed: 0,
+            arbiter_fee: 0,
         }
     }
 
@@ -1300,6 +1306,7 @@ impl EventAmounts {
             refund,
             penalty: 0,
             rent_reclaimed: 0,
+            arbiter_fee: 0,
         }
     }
 
@@ -1313,6 +1320,7 @@ impl EventAmounts {
             refund,
             penalty,
             rent_reclaimed: 0,
+            arbiter_fee: 0,
         }
     }
 
@@ -1326,6 +1334,7 @@ impl EventAmounts {
             refund: 0,
             penalty: 0,
             rent_reclaimed: rent,
+            arbiter_fee: 0,
         }
     }
 
@@ -1349,6 +1358,7 @@ impl EventAmounts {
             refund: 0,
             penalty: 0,
             rent_reclaimed: lamports,
+            arbiter_fee: 0,
         }
     }
 
@@ -1366,6 +1376,7 @@ impl EventAmounts {
             refund: 0,
             penalty: 0,
             rent_reclaimed: 0,
+            arbiter_fee: 0,
         }
     }
 
@@ -1379,6 +1390,7 @@ impl EventAmounts {
             refund: 0,
             penalty,
             rent_reclaimed: 0,
+            arbiter_fee: 0,
         }
     }
 
@@ -1396,6 +1408,7 @@ impl EventAmounts {
             refund: 0,
             penalty: 0,
             rent_reclaimed: 0,
+            arbiter_fee: 0,
         }
     }
 
@@ -1412,6 +1425,7 @@ impl EventAmounts {
             refund: 0,
             penalty: 0,
             rent_reclaimed: 0,
+            arbiter_fee: 0,
         }
     }
 
@@ -1428,6 +1442,7 @@ impl EventAmounts {
             refund: 0,
             penalty: forfeited,
             rent_reclaimed: 0,
+            arbiter_fee: 0,
         }
     }
 }
@@ -2170,6 +2185,17 @@ impl IndexedEscrow {
     /// Configuration: emits no event.
     pub fn with_arbiter(mut self, arbiter: [u8; 32]) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_arbiter(arbiter)?;
+        Ok(self)
+    }
+
+    /// Opt in to the AV-135 arbiter adjudication fee (mirrors
+    /// [`Escrow::with_arbiter_fee`]). Configuration: emits no event.
+    pub fn with_arbiter_fee(
+        mut self,
+        flat_lamports: u64,
+        fee_bps: u16,
+    ) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_arbiter_fee(flat_lamports, fee_bps)?;
         Ok(self)
     }
 
@@ -4529,8 +4555,10 @@ impl IndexedEscrow {
 
     /// Settle a disputed escrow (mirrors [`Escrow::resolve`]). Emits
     /// `Resolved` (`Disputed -> Settled`) with the gross taker share in
-    /// `amounts.payout`, the protocol fee in `amounts.fee`, and the
-    /// initializer's share in `amounts.refund` — and the dispute
+    /// `amounts.payout`, the protocol fee in `amounts.fee`, the
+    /// initializer's share in `amounts.refund`, and the AV-135 arbiter
+    /// adjudication fee in `amounts.arbiter_fee` (zero when the escrow
+    /// never opted in) — and the dispute
     /// evidence hash the escrow still holds, so the settlement
     /// references the evidence the arbiter reviewed — and the arbiter's
     /// rationale-document commitment (AV-38), so the settlement
@@ -4564,13 +4592,17 @@ impl IndexedEscrow {
         // (`payout + fee == taker_amount`); the refund leg is the
         // principal refund — the initializer's dispute-interest share
         // rides the transfer (see the returned `refund`) but the event
-        // keeps the principal leg, like the taker side.
+        // keeps the principal leg, like the taker side. AV-135: the
+        // arbiter adjudication fee sliced from the post-fee taker
+        // share rides `amounts.arbiter_fee` (zero when the escrow never
+        // opted in — the legacy event shape is untouched).
         let amounts = EventAmounts {
             payout: taker_amount,
             fee,
             refund: remaining.saturating_sub(taker_amount),
             penalty: 0,
             rent_reclaimed: 0,
+            arbiter_fee: self.inner.arbiter_fee_for(taker_amount - fee),
         };
         // AV-22: the evidence hash survives `resolve` on the escrow, so
         // the settlement event carries the same commitment the
@@ -4598,8 +4630,9 @@ impl IndexedEscrow {
     /// Trigger the pre-agreed arbitration default judgment (mirrors
     /// [`Escrow::trigger_default_judgment`]). Emits `DefaultJudgment`
     /// (`Disputed -> Settled`) with the gross taker share in
-    /// `amounts.payout`, the protocol fee in `amounts.fee`, and the
-    /// initializer's share in `amounts.refund` — the same amounts shape
+    /// `amounts.payout`, the protocol fee in `amounts.fee`, the
+    /// initializer's share in `amounts.refund`, and the AV-135 arbiter
+    /// adjudication fee in `amounts.arbiter_fee` — the same amounts shape
     /// as `Resolved` — and the dispute evidence hash the escrow still
     /// holds, so the fallback settlement references the evidence the
     /// (absent) arbiter never reviewed. The rationale-document
@@ -4643,7 +4676,9 @@ impl IndexedEscrow {
         // leg is the principal refund — read the pre-agreed taker
         // amount off the judgment (the returned `payout` already
         // carries the taker's dispute-interest share, which stays on
-        // the transfer, not the event).
+        // the transfer, not the event). AV-135: the arbiter
+        // adjudication fee rides `amounts.arbiter_fee` (zero when the
+        // escrow never opted in).
         let taker_amount = self
             .inner
             .default_judgment()
@@ -4655,6 +4690,7 @@ impl IndexedEscrow {
             refund: remaining.saturating_sub(taker_amount),
             penalty: 0,
             rent_reclaimed: 0,
+            arbiter_fee: self.inner.arbiter_fee_for(taker_amount - fee),
         };
         // AV-22: the evidence hash survives on the escrow, so the
         // fallback settlement event carries the same commitment the
@@ -4683,7 +4719,8 @@ impl IndexedEscrow {
     /// rides the rationale slot — re-votes included, so an overwritten
     /// vote stays in the log as the audit trail. When the submission is
     /// the M-th matching vote, a `PanelResolved` event follows
-    /// (`Disputed -> Settled`) with the `Resolved` amounts shape and
+    /// (`Disputed -> Settled`) with the `Resolved` amounts shape
+    /// (including the AV-135 arbiter fee in `amounts.arbiter_fee`) and
     /// the winning vote's rationale — the vote event first, then the
     /// settlement, in `seq` order. Returns what the inner method
     /// returns: `None` when the vote did not settle, `Some((payout,
@@ -4727,6 +4764,7 @@ impl IndexedEscrow {
                 refund: 0,
                 penalty: 0,
                 rent_reclaimed: 0,
+                arbiter_fee: 0,
             },
             at,
             None,
@@ -4740,13 +4778,16 @@ impl IndexedEscrow {
             // settlement after the vote event. `taker_amount` is the
             // gross taker share by construction
             // (`payout + fee == taker_amount`); the refund leg is the
-            // principal refund (see `resolve` above).
+            // principal refund (see `resolve` above). AV-135: the
+            // arbiter adjudication fee rides `amounts.arbiter_fee`
+            // (zero when the escrow never opted in).
             let amounts = EventAmounts {
                 payout: taker_amount,
                 fee,
                 refund: remaining.saturating_sub(taker_amount),
                 penalty: 0,
                 rent_reclaimed: 0,
+                arbiter_fee: self.inner.arbiter_fee_for(taker_amount - fee),
             };
             // AV-22: the evidence hash survives on the escrow, so the
             // panel settlement references the evidence the panel
@@ -6092,6 +6133,7 @@ mod event_tests {
                 refund,
                 penalty: 0,
                 rent_reclaimed: 0,
+                arbiter_fee: 0,
             },
             "amounts"
         );
@@ -6523,6 +6565,39 @@ mod event_tests {
         e2.fund(ALICE, T0 + 1).unwrap();
         e2.escalate(ALICE, EXPIRES_AT - 1, e2.inner().remaining_amount(), None, None, 0).unwrap();
         assert_eq!(last(&e2).evidence_hash, None);
+    }
+
+    #[test]
+    fn resolved_event_carries_the_arbiter_fee() {
+        // AV-135: the arbiter adjudication fee sliced from the taker's
+        // share rides `amounts.arbiter_fee` on the Resolved event — the
+        // anti-free-riding trail for arbitration economics.
+        let mut e = indexed(1_000_000)
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbiter_fee(50_000, 1_000) // flat + 10%
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, e.inner().remaining_amount(), None, None, 0).unwrap();
+        e.resolve(ARBITER, 600_000, None, None, BOB, T0 + 3).unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::Resolved);
+        // 50_000 + floor(600_000 * 1_000 / 10_000) = 110_000.
+        assert_eq!(event.amounts.arbiter_fee, 110_000);
+        assert_eq!(event.amounts.payout, 600_000);
+        assert_eq!(event.amounts.fee, 0);
+    }
+
+    #[test]
+    fn resolved_event_arbiter_fee_zero_without_opt_in() {
+        // No opt-in: the legacy event shape is untouched.
+        let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, e.inner().remaining_amount(), None, None, 0).unwrap();
+        e.resolve(ARBITER, 600_000, None, None, BOB, T0 + 3).unwrap();
+        let event = last(&e);
+        assert_eq!(event.kind, EscrowEventKind::Resolved);
+        assert_eq!(event.amounts.arbiter_fee, 0);
     }
 
     #[test]
@@ -7230,6 +7305,7 @@ mod event_tests {
                     refund: 0,
                     penalty: 0,
                     rent_reclaimed: crate::vault_close_rent_reclaimed(),
+                    arbiter_fee: 0,
                 },
                 "from {state:?}: only rent_reclaimed carries value"
             );
@@ -7502,6 +7578,7 @@ mod event_tests {
                 refund: 0,
                 penalty: 0,
                 rent_reclaimed: 0,
+                arbiter_fee: 0,
             }
         );
         assert_eq!(rejected.seq + 1, last(&e).seq);

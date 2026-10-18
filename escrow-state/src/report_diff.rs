@@ -487,6 +487,16 @@ fn fingerprint_actions(actions: &[KeeperAction]) -> u64 {
         h.u64_field(a.decimals as u64);
         h.u64_field(a.extension_count);
         h.u64_field(a.penalty_estimate);
+        // AV-135: the arbiter adjudication fee terms ride the
+        // fingerprint — a fee change is a report change.
+        match a.arbiter_fee {
+            Some(t) => {
+                h.u64_field(1);
+                h.u64_field(t.flat_lamports);
+                h.u64_field(t.bps as u64);
+            }
+            None => h.u64_field(0),
+        }
         h.opt32(&a.vault_address);
         h.opt32(&a.mint);
         h.opt32(&a.refund_to);
@@ -905,6 +915,8 @@ pub fn csv_to_report_diff(csv: &str) -> Result<ReportDiff, DiffCsvError> {
                     slot_unlock_at: None,
                     bounty_lamports: 0,
                     bounty_unprofitable: false,
+                    // AV-135: no arbiter fee on synthetic/test actions.
+                    arbiter_fee: None,
                 });
             }
         }
@@ -1177,6 +1189,8 @@ mod report_diff_tests {
             slot_unlock_at: None,
             bounty_lamports: 0,
             bounty_unprofitable: false,
+            // AV-135: no arbiter fee on synthetic/test actions.
+            arbiter_fee: None,
         }
     }
 

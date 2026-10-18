@@ -1388,6 +1388,23 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         None
     };
 
+    // AV-135: the arbiter adjudication fee terms — 1-byte `Option`
+    // discriminant + 8-byte flat lamport slice, then 1-byte `Option`
+    // discriminant + 2-byte bps rate, decoded like any other
+    // persisted tail field.
+    let arbiter_fee_flat = if c.option_present("arbiter_fee_flat")? {
+        Some(c.u64_le()?)
+    } else {
+        c.skip(8)?;
+        None
+    };
+    let arbiter_fee_bps = if c.option_present("arbiter_fee_bps")? {
+        Some(c.u16_le()?)
+    } else {
+        c.skip(2)?;
+        None
+    };
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1663,6 +1680,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // carries the same window `with_amount_bounds` recorded.
         min_funding_amount,
         max_funding_amount,
+        // AV-135: the arbiter adjudication fee terms — a decoded
+        // escrow carries the same fee `with_arbiter_fee` recorded.
+        arbiter_fee_flat,
+        arbiter_fee_bps,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

@@ -2063,6 +2063,34 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Fix the arbiter adjudication fee (AV-135; mirrors
+    /// `Escrow::with_arbiter_fee`). The initializer prices the
+    /// arbitration up front: every dispute settlement (`resolve`,
+    /// the panel's settling vote, `trigger_default_judgment`)
+    /// deducts `flat_lamports` plus `floor(net_share * fee_bps /
+    /// 10_000)` from the taker's adjudicated share (deduction order:
+    /// AV-17 protocol fee, AV-100 streaming fee, AV-135 arbiter fee)
+    /// and routes the fee to the arbiter; the initializer's refund is
+    /// never fee'd. `fee_bps > 10_000` is `InvalidArbiterFee` (code
+    /// 198); `(0, 0)` disables the fee (backward compatible).
+    pub fn initialize_arbiter_fee(
+        ctx: Context<InitializeArbiterFee>,
+        flat_lamports: u64,
+        fee_bps: u16,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_arbiter_fee(flat_lamports, fee_bps)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the full arbiter-fee
+        // region (`escrow_state::ARBITER_FEE_TAIL_LEN`), so the fee
+        // terms are written in place — no realloc needed in the real
+        // build. No indexer event: pre-fund configuration, like the
+        // other `initialize_*` opt-ins.
+        Ok(())
+    }
+
     /// Declare a release for checker approval (AV-130; mirrors
     /// `Escrow::initiate_release` — the *maker* half of the
     /// maker-checker protocol). The initializer (or their
@@ -7376,6 +7404,18 @@ pub struct InitializeAmountBounds<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-135: accounts for `initialize_arbiter_fee` — the initializer
+/// fixes the arbiter adjudication fee while the escrow is
+/// `Uninitialized`.
+#[derive(Accounts)]
+pub struct InitializeArbiterFee<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer opts into the arbiter fee; the state
+    /// machine rejects re-configuration once the escrow is funded.
+    pub initializer: Signer<'info>,
+}
+
 /// AV-130: accounts for `initiate_release` — the maker freezes the
 /// release declaration into the vault.
 #[derive(Accounts)]
@@ -9283,6 +9323,10 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::AmountOutOfBounds => {
             error!(ErrorCode::AmountOutOfBounds)
         }
+        // AV-135: appended, never renumbered.
+        escrow_state::EscrowError::InvalidArbiterFee => {
+            error!(ErrorCode::InvalidArbiterFee)
+        }
     }
 }
 
@@ -9509,4 +9553,6 @@ pub enum ErrorCode {
     InvalidAmountBounds,
     #[msg("Amount out of bounds (AV-134): fund / fund_tranche deposit below min_funding_amount or above max_funding_amount")]
     AmountOutOfBounds,
+    #[msg("Invalid arbiter fee (AV-135): initialize_arbiter_fee with fee_bps > 10_000 — a basis-point rate above 100%")]
+    InvalidArbiterFee,
 }
