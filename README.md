@@ -2130,6 +2130,44 @@ entry's recorded seeds (`WatchedEscrow::with_vault_seeds`) — hex when
 seeds are known, `null` otherwise; informational, never an instruction
 input.
 
+## Expiry-warning scan (AV-136)
+
+The keeper report (AV-20) lists *already-expired* escrows. Its
+complement, `escrow-state/src/expiry_watch.rs`, fires *before* the
+deadline — while the operator can still act. `scan_expiry_warnings`
+takes the same `WatchedEscrow` watch list plus a `warn_window_secs`
+and returns an `ExpiryWarningReport`: one warning per `Funded` /
+`Activated` escrow with `now < expires_at <= now + warn_window_secs`
+(`Disputed` escrows belong to the arbitration path, terminal states
+need no warning, and expired escrows stay with AV-20's
+`cancel_expired` scan — never double-listed).
+
+Each warning carries an executable checklist trimmed by state and
+configuration, reusing the AV-59 `extend_expiry` semantics:
+
+| checklist action | listed when | `executable_now` |
+|------------------|-------------|------------------|
+| `extend_expiry` | `Funded` (on `Activated` it is listed as not-executable: AV-59's state gate accepts only `Uninitialized` / `Funded`) | true iff extension was enabled (`with_max_extension_secs`) and the escrow is not yet expiry-eligible; the detail names the per-call increment bound |
+| `cancel_expired` | always (either party) | false inside the window by construction — the detail names the exact eligibility instant `expires_at + grace_period` and the refundable remainder |
+| `claim` | vesting schedule attached | false — the schedule unlock is evaluated at call time |
+
+The scan is pure (dry-run: no mutation, no events, no clock) and
+deterministic (warnings sorted by `(expires_at, escrow_id)`,
+hand-serialized JSON). Edge-triggering lives in the caller-held
+`ExpiryWarningLedger::filter_new`: the same escrow warns exactly once
+per deadline, and a renewed deadline (via `extend_expiry`) produces a
+new `warning_key` (`hex(escrow_id):expires_at`) so the warning re-arms
+automatically.
+
+```json
+{"at":999000,"warn_window_secs":86400,"scanned":1,"warnings":[
+ {"escrow_id":"...","state":"Funded","expires_at":1000000,"expires_in_secs":1000,
+  "remaining_amount":1000000,"extension_count":0,"max_extension_secs":86400,
+  "warning_key":"...:1000000",
+  "checklist":[{"action":"extend_expiry","caller":"initializer","executable_now":true,"detail":"..."},
+               {"action":"cancel_expired","caller":"initializer_or_taker","executable_now":false,"detail":"..."}]}]}
+```
+
 ## Keeper report signing (AV-101)
 
 Keeper reports are consumed by offline signers (multisig CLIs, keeper
