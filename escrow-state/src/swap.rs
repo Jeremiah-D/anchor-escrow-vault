@@ -655,7 +655,7 @@ mod swap_tests {
         link_swap(&mut a, &mut b, ALICE, ID_A, ID_B, 1_000, 500).unwrap();
         a.fund(ALICE, T0).unwrap();
         b.fund(BOB, T0).unwrap();
-        a.escalate(ALICE, T0 + 1, None, None, 0).unwrap();
+        a.escalate(ALICE, T0 + 1, a.remaining_amount(), None, None, 0).unwrap();
         assert_eq!(
             a.resolve(MALLORY, 600, T0 + 1, None, None, BOB),
             Err(EscrowError::SwapLinkActive)

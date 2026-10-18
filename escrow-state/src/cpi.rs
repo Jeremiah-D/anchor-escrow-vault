@@ -1080,7 +1080,7 @@ mod cpi_tests {
             .with_arbiter(arbiter)
             .unwrap();
         e.fund(init, FUND_AT).unwrap();
-        e.escalate(taker, 0, None, None, 0).unwrap();
+        e.escalate(taker, 0, e.remaining_amount(), None, None, 0).unwrap();
         let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, 0, None, None, key(2)).unwrap();
         assert_eq!(fee, 0);
         assert_eq!(taker_payout + refund, 1_000_000);
@@ -1125,7 +1125,7 @@ mod cpi_tests {
         // 36.5 days to the dispute: 5_000 of yield; one full dispute year
         // adds 50_000 more — total claim 55_000.
         let disputed_at = FUND_AT + 3_153_600;
-        e.escalate(taker, disputed_at, None, None, 0).unwrap();
+        e.escalate(taker, disputed_at, e.remaining_amount(), None, None, 0).unwrap();
         // Partial ruling: 600k to the taker, 400k refunded.
         let (taker_payout, fee, refund) = e
             .resolve(arbiter, 600_000, disputed_at + 31_536_000, None, None, key(2))
@@ -1176,7 +1176,7 @@ mod cpi_tests {
             .with_protocol_fee(100)
             .unwrap();
         e.fund(init, FUND_AT).unwrap();
-        e.escalate(taker, 0, None, None, 0).unwrap();
+        e.escalate(taker, 0, e.remaining_amount(), None, None, 0).unwrap();
         let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, 0, None, None, key(2)).unwrap();
         assert!(fee > 0);
         let addrs = ResolveAddrs {
@@ -1241,7 +1241,7 @@ mod cpi_tests {
             .with_fee_recipient(recipient)
             .unwrap();
         e.fund(init, FUND_AT).unwrap();
-        e.escalate(taker, 0, None, None, 0).unwrap();
+        e.escalate(taker, 0, e.remaining_amount(), None, None, 0).unwrap();
         let (taker_payout, fee, refund) = e.resolve(arbiter, 600_000, 0, None, None, key(2)).unwrap();
         // 2% of 600_000 = 12_000 fee; the initializer is refunded the rest.
         assert_eq!((taker_payout, fee, refund), (588_000, 12_000, 400_000));
@@ -1463,7 +1463,7 @@ mod cpi_tests {
         let bytes = crate::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), crate::ESCROW_BODY_LEN);
         let hook_at =
-            crate::ESCROW_BODY_LEN - crate::DUAL_CONTROL_TAIL_LEN - crate::TWAP_GATE_LEN - crate::REFUNDED_TAIL_LEN - crate::SLASH_LADDER_TAIL_LEN - crate::CLAIM_COOLDOWN_TAIL_LEN - crate::COUNTER_OFFER_TAIL_LEN - crate::RELEASE_INTENT_TAIL_LEN - crate::KEEPER_BOUNTY_TAIL_LEN - crate::DISPUTE_INTEREST_LEN - crate::PRICE_GATE_LEN - crate::PENALTY_ESCALATION_TAIL_LEN - crate::COMPOUND_INTEREST_TAIL_LEN - crate::SLOT_TIMELOCK_TAIL_LEN - crate::RELEASE_COOLING_TAIL_LEN - crate::FUNDING_TAIL_LEN - crate::RENT_TOP_UP_LEN - crate::DEADMAN_REGION_LEN - crate::PAYOUT_SPLIT_LEN - crate::INTEREST_REGION_LEN - crate::POOL_REGION_LEN - crate::SWAP_LINK_REGION_LEN - crate::APPEAL_BOND_REGION_LEN - crate::DELEGATION_REGION_LEN - crate::STREAMING_FEE_REGION_LEN - 33;
+            crate::ESCROW_BODY_LEN - crate::DISPUTED_AMOUNT_TAIL_LEN - crate::DUAL_CONTROL_TAIL_LEN - crate::TWAP_GATE_LEN - crate::REFUNDED_TAIL_LEN - crate::SLASH_LADDER_TAIL_LEN - crate::CLAIM_COOLDOWN_TAIL_LEN - crate::COUNTER_OFFER_TAIL_LEN - crate::RELEASE_INTENT_TAIL_LEN - crate::KEEPER_BOUNTY_TAIL_LEN - crate::DISPUTE_INTEREST_LEN - crate::PRICE_GATE_LEN - crate::PENALTY_ESCALATION_TAIL_LEN - crate::COMPOUND_INTEREST_TAIL_LEN - crate::SLOT_TIMELOCK_TAIL_LEN - crate::RELEASE_COOLING_TAIL_LEN - crate::FUNDING_TAIL_LEN - crate::RENT_TOP_UP_LEN - crate::DEADMAN_REGION_LEN - crate::PAYOUT_SPLIT_LEN - crate::INTEREST_REGION_LEN - crate::POOL_REGION_LEN - crate::SWAP_LINK_REGION_LEN - crate::APPEAL_BOND_REGION_LEN - crate::DELEGATION_REGION_LEN - crate::STREAMING_FEE_REGION_LEN - 33;
         assert_eq!(bytes[hook_at], 1, "Some discriminant");
         assert_eq!(&bytes[hook_at + 1..hook_at + 33], &hook);
         // A hook-less escrow zero-fills the region.

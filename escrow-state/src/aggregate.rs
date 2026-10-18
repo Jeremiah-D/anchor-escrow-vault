@@ -426,7 +426,7 @@ mod aggregate_tests {
                 .with_arbiter(key(3))
                 .expect("with_arbiter");
         d.fund(key(1), 600).expect("fund");
-        d.escalate(key(1), 700, None, None, 0).expect("escalate");
+        d.escalate(key(1), 700, d.inner().remaining_amount(), None, None, 0).expect("escalate");
 
         let view = EscrowAggregateView::from_indexed(&[ix, d], 2_000);
         assert_eq!(view.escrow_count, 2);

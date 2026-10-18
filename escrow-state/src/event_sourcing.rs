@@ -980,7 +980,7 @@ mod event_sourcing_tests {
 
         // dispute + resolve: taker 100_000 gross into released,
         // initializer 70_000 into refunded.
-        ie.escalate(ALICE, NOW, None, None, 0).unwrap();
+        ie.escalate(ALICE, NOW, ie.inner().remaining_amount(), None, None, 0).unwrap();
         assert_consistent(&ie, 1_000_000, 50_000, 0, "escalate");
         ie.resolve(ARB, 100_000, None, None, BOB, NOW).unwrap();
         assert_consistent(&ie, 1_000_000, 120_000, 0, "resolve");
@@ -1178,7 +1178,7 @@ mod event_sourcing_tests {
                     }
                     7 => {
                         // Dispute terminal path.
-                        if ie.escalate(ALICE, NOW, None, None, 0).is_ok() {
+                        if ie.escalate(ALICE, NOW, ie.inner().remaining_amount(), None, None, 0).is_ok() {
                             let rem = ie.inner().remaining_amount();
                             let taker_amt = rng.below(rem + 1);
                             match ie.resolve(ARB, taker_amt, None, None, BOB, NOW) {

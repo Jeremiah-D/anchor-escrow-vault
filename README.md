@@ -552,27 +552,46 @@ instruction (`start`, `end`, `cliff`, `tiers: Vec<VestingTier>`) and the
 **Dispute arbitration (escrowed payments with a judge).** An escrow can
 name an arbiter (`with_arbiter`, opt-in on `Uninitialized`, like the
 quorum builder; the zero key is rejected since `resolve` authenticates
-against it). While `Funded`, *either* party may `escalate(authority, now)`
-into `Disputed` — the dispute window is the escrow's live window
-(`now < expires_at`; at/after expiry the unilateral `cancel_expired` path
-is the way out, so `escalate` reports `DisputeWindowClosed`). While
-`Disputed`, every unilateral exit is locked: `release`, `cancel`,
-`cancel_expired`, and `claim` all return `InvalidStateTransition`, so
-neither party can move funds mid-deliberation. The arbiter then
-`resolve`s with a single atomic split of the *remaining* locked funds —
-`taker_amount` to the taker, the rest refunded to the initializer —
-moving the escrow to the terminal `Settled` state and returning
-`(taker_payout, initializer_refund)` so the program can size both
-transfers. Partial releases made before the dispute are honored (the
-split applies to the remainder); the taker's share accumulates in the
-shared `released` counter while `remaining_amount()` preserves the
-initializer's refund for audit, exactly like `cancel`'s refund
-accounting. Deliberately, a configured quorum does *not* gate `resolve`
-(the arbiter is the resolution mechanism — attestors must not veto the
-settlement), and vesting does not gate it either (the dispute exists
-precisely because the schedule is contested; `claim` stays locked while
-`Disputed`). The escalating party may attach a 32-byte **dispute evidence
-hash** (`escalate(authority, now, evidence_hash)`) — a commitment to the
+against it). While `Funded`, *either* party may `escalate(authority, now,
+dispute_amount, …)` into `Disputed` — the dispute window is the escrow's
+live window (`now < expires_at`; at/after expiry the unilateral
+`cancel_expired` path is the way out, so `escalate` reports
+`DisputeWindowClosed`). The dispute is a **partial-amount** dispute:
+`dispute_amount` names the contested slice of the lockup and must lie in
+`[1, remaining_amount()]`, otherwise `escalate` fails with
+`InvalidDisputeAmount` (code 193); it is persisted as `disputed_amount`
+and never cleared (the audit trail of what was under arbitration, in the
+`evidence_hash`/`rationale_hash` tradition). While `Disputed`, only the
+contested pool is locked — the **undisputed remainder stays movable**:
+`release` and `claim` still work from `Disputed`, capped at
+`remaining - disputed_amount`. A `release` that names into the locked
+pool fails with `DisputedAmountLocked` (code 194); a `release` past the
+whole lockup keeps the old `ReleaseExceedsLocked`; a `claim` is silently
+capped (its "take what's available" pull semantics — it errors only when
+the whole pull would come from the locked pool). `cancel`,
+`cancel_expired` and `attest` stay locked with `InvalidStateTransition`
+while the arbitration is live. The arbiter then `resolve`s with a single
+atomic split of the *disputed* pool — `taker_amount` to the taker (it must
+be `<= disputed_amount`, else `ReleaseExceedsLocked`), the rest of the
+disputed pool refunded to the initializer — moving the escrow to the
+terminal `Settled` state and returning `(taker_payout,
+initializer_refund)` so the program can size both transfers. The refund
+formula is unchanged — `(remaining - taker_amount)` — because the
+undisputed remainder naturally rides the refund back to the initializer,
+so nothing strands; partial releases or capped claims made while
+`Disputed` are honored (the split applies to the adjudicated pool only,
+and dispute interest accrues on `disputed_amount`, not the whole
+`remaining`). The taker's share accumulates in the shared `released`
+counter while `remaining_amount()` preserves the initializer's refund for
+audit, exactly like `cancel`'s refund accounting. The panel settling vote
+and the AV-55 default judgment adjudicate the same disputed pool, so all
+three settlement paths agree. Deliberately, a configured quorum does *not*
+gate `resolve` (the arbiter is the resolution mechanism — attestors must
+not veto the settlement), and vesting does not gate it either (the
+dispute exists precisely because the schedule is contested; a `claim`
+while `Disputed` is capped at the undisputed remainder rather than
+locked). The escalating party may attach a 32-byte **dispute evidence
+hash** (`escalate(authority, now, dispute_amount, evidence_hash)`) — a commitment to the
 off-chain evidence (e.g. the SHA-256 of an IPFS CID holding chat logs,
 delivery photos, or an oracle report) — persisted on the escrow so the
 arbiter and indexers can read it without trusting the escalator to
@@ -4221,6 +4240,34 @@ to 5506, and the close-time rent reclamation from 38_356_560 to
 39_212_640 lamports (`(128 + VAULT_SPACE) * 3480 * 2`). The state
 machine's `EscrowState` enum gains no new variant — the two-step
 protocol reuses `Funded`, so discriminants stay stable.
+
+## Partial-amount dispute arbitration (AV-131)
+
+The problem: every dispute so far locked the *entire* lockup — a
+1-lamport grievance could freeze a million-lamport escrow for the whole
+deliberation, and neither party could touch the uncontested funds.
+AV-131 makes the dispute a **partial-amount** dispute: `escalate` takes a
+`dispute_amount` naming the contested slice of the lockup (`1..=
+remaining_amount()`, else `InvalidDisputeAmount`, code 193), persisted as
+`disputed_amount` and never cleared. While `Disputed`, only the
+contested pool is locked — `release` and `claim` still move the
+undisputed remainder (`remaining - disputed_amount`); a `release` that
+names into the locked pool fails with `DisputedAmountLocked` (code 194),
+and a `claim` is silently capped at the remainder (its take-what's-there
+pull semantics). `resolve`, the panel settling vote, and the AV-55
+default judgment all adjudicate the same disputed pool (`taker_amount <=
+disputed_amount`, else `ReleaseExceedsLocked`); dispute interest accrues
+on the disputed pool, and the refund formula is unchanged —
+`(remaining - taker_amount)` — because the undisputed remainder
+naturally rides the refund back to the initializer, so no lamport
+strands.
+
+Layout growth: the vault body grows from 5498 to 5506 bytes (+8),
+`VAULT_SPACE_NO_QUORUM` from 5016 to 5024, `VAULT_SPACE` from 5506 to
+5514, and the close-time rent reclamation from 39_212_640 to 39_268_320
+lamports (`(128 + VAULT_SPACE) * 3480 * 2`). The state machine's
+`EscrowState` enum gains no new variant — partial disputes reuse
+`Disputed`, so discriminants stay stable.
 
 ## Escrow merge (AV-114)
 

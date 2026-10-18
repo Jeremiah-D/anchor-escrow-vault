@@ -378,6 +378,10 @@ pub struct EscrowSnapshot {
     /// deadline binds — or `None` when the escrow was never disputed
     /// (AV-68).
     pub escalated_by: Option<[u8; 32]>,
+    /// AV-131: the contested lamport amount (`Escrow::disputed_amount`);
+    /// `0` when never disputed, never cleared afterwards — the snapshot
+    /// keeps the audit trail of the arbitration.
+    pub disputed_amount: u64,
     /// The arbiter's rationale-document commitment attached at
     /// `resolve`, or `None` when the arbiter supplied no rationale
     /// (AV-38). Only `Some` on a `Settled` escrow — never cleared, so
@@ -818,6 +822,9 @@ impl Escrow {
             // snapshot.
             evidence_deadline_secs: self.evidence_deadline_secs(),
             escalated_by: self.escalated_by(),
+            // AV-131: the contested amount rides the export for the
+            // same audit-trail reason — never cleared after `escalate`.
+            disputed_amount: self.disputed_amount(),
             rationale_hash: self.rationale_hash(),
             refund_to: self.refund_to(),
             refund_recipient: self.refund_recipient(),
@@ -1325,6 +1332,11 @@ impl EscrowSnapshot {
         s.push_str(&self.evidence_deadline_secs.to_string());
         s.push_str(",\"escalated_by\":");
         write_opt_hex(&mut s, self.escalated_by);
+        // AV-131: the contested amount (0 when never disputed) — an
+        // off-chain indexer derives the locked/unlocked split from
+        // this and `remaining`.
+        s.push_str(",\"disputed_amount\":");
+        s.push_str(&self.disputed_amount.to_string());
         // AV-38: the arbiter's rationale-document commitment — `null`
         // until the arbiter attaches one at `resolve`.
         s.push_str(",\"rationale_hash\":");
@@ -1793,7 +1805,7 @@ mod snapshot_tests {
              \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
-             \"evidence_hash\":null,\"evidence_root\":null,\"evidence_disclosure\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
+             \"evidence_hash\":null,\"evidence_root\":null,\"evidence_disclosure\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"disputed_amount\":0,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
              \"penalty_bps\":0,\"penalty_escalation_rate_bps\":0,\"penalty_escalation_cap_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"slot_timelock_slots\":0,\"fund_slot\":0,\"claim_cooldown_slots\":0,\"last_claim_slot\":null,\"counter_offer\":null,\"payout_allowlist\":null,\"payout_denylist\":null,\"cpi_allowlist\":null,\"multisig_authority\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
@@ -1992,7 +2004,7 @@ mod snapshot_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, VEST_START).unwrap();
-        e.escalate(BOB, MID, Some(EVIDENCE), None, 0).unwrap();
+        e.escalate(BOB, MID, e.remaining_amount(), Some(EVIDENCE), None, 0).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.state, "disputed");
         assert_eq!(snap.arbiter, Some(ARBITER));
@@ -2014,7 +2026,7 @@ mod snapshot_tests {
             .with_evidence_deadline(3_600)
             .unwrap();
         e.fund(ALICE, VEST_START).unwrap();
-        e.escalate(BOB, MID, None, None, 0).unwrap();
+        e.escalate(BOB, MID, e.remaining_amount(), None, None, 0).unwrap();
         let snap = e.snapshot(MID);
         assert_eq!(snap.evidence_deadline_secs, 3_600);
         assert_eq!(snap.escalated_by, Some(BOB));
@@ -2027,7 +2039,7 @@ mod snapshot_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         plain.fund(ALICE, VEST_START).unwrap();
-        plain.escalate(ALICE, MID, None, None, 0).unwrap();
+        plain.escalate(ALICE, MID, plain.remaining_amount(), None, None, 0).unwrap();
         let plain_snap = plain.snapshot(MID);
         assert_eq!(plain_snap.evidence_deadline_secs, 0);
         assert_eq!(plain_snap.escalated_by, Some(ALICE));
@@ -2048,7 +2060,7 @@ mod snapshot_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, VEST_START).unwrap();
-        e.escalate(BOB, MID, None, None, 0).unwrap();
+        e.escalate(BOB, MID, e.remaining_amount(), None, None, 0).unwrap();
         assert_eq!(e.snapshot(MID).rationale_hash, None);
         e.resolve(ARBITER, 400_000, MID, None, Some(RATIONALE), BOB).unwrap();
         let snap = e.snapshot(MID);

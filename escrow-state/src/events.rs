@@ -4111,18 +4111,21 @@ impl IndexedEscrow {
     /// Escalate the escrow into arbitration (mirrors [`Escrow::escalate`]).
     /// Emits `Escalated` (`Funded -> Disputed`) carrying the evidence
     /// hash and the AV-91 evidence Merkle root attached at escalation;
-    /// `now` doubles as the event's `at`.
+    /// `now` doubles as the event's `at`. AV-131: `dispute_amount` is
+    /// the lockup slice the arbiter adjudicates (passed straight
+    /// through to `Escrow::escalate`).
     pub fn escalate(
         &mut self,
         authority: [u8; 32],
         now: u64,
+        dispute_amount: u64,
         evidence_hash: Option<[u8; 32]>,
         evidence_root: Option<[u8; 32]>,
         evidence_leaves: u8,
     ) -> Result<(), EscrowError> {
         let from = self.inner.state();
         self.inner
-            .escalate(authority, now, evidence_hash, evidence_root, evidence_leaves)?;
+            .escalate(authority, now, dispute_amount, evidence_hash, evidence_root, evidence_leaves)?;
         self.push_event(
             EscrowEventKind::Escalated,
             from,
@@ -6062,7 +6065,7 @@ mod event_tests {
     fn escalate_and_resolve_emit_with_split_amounts() {
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(BOB, EXPIRES_AT - 1, None, None, 0).unwrap();
+        e.escalate(BOB, EXPIRES_AT - 1, e.inner().remaining_amount(), None, None, 0).unwrap();
         assert_event(
             &last(&e),
             EscrowEventKind::Escalated,
@@ -6097,7 +6100,7 @@ mod event_tests {
         const EVIDENCE: [u8; 32] = [0xE1; 32];
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(BOB, EXPIRES_AT - 1, Some(EVIDENCE), None, 0).unwrap();
+        e.escalate(BOB, EXPIRES_AT - 1, e.inner().remaining_amount(), Some(EVIDENCE), None, 0).unwrap();
         let event = last(&e);
         assert_eq!(event.kind, EscrowEventKind::Escalated);
         assert_eq!(event.evidence_hash, Some(EVIDENCE));
@@ -6105,7 +6108,7 @@ mod event_tests {
         // invents evidence.
         let mut e2 = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e2.fund(ALICE, T0 + 1).unwrap();
-        e2.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
+        e2.escalate(ALICE, EXPIRES_AT - 1, e2.inner().remaining_amount(), None, None, 0).unwrap();
         assert_eq!(last(&e2).evidence_hash, None);
     }
 
@@ -6118,7 +6121,7 @@ mod event_tests {
         const EVIDENCE: [u8; 32] = [0xE1; 32];
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE), None, 0).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, e.inner().remaining_amount(), Some(EVIDENCE), None, 0).unwrap();
         e.resolve(ARBITER, 600_000, None, None, BOB, T0 + 3).unwrap();
         let event = last(&e);
         assert_eq!(event.kind, EscrowEventKind::Resolved);
@@ -6147,7 +6150,7 @@ mod event_tests {
             .with_evidence_deadline(EVIDENCE_DEADLINE)
             .unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(escalator, at, None, None, 0).unwrap();
+        e.escalate(escalator, at, e.inner().remaining_amount(), None, None, 0).unwrap();
         e
     }
 
@@ -6209,7 +6212,7 @@ mod event_tests {
         // signal — even settling "late".
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(BOB, T0 + 10, None, None, 0).unwrap();
+        e.escalate(BOB, T0 + 10, e.inner().remaining_amount(), None, None, 0).unwrap();
         e.resolve(ARBITER, 600_000, None, None, BOB, u64::MAX - 1)
             .unwrap();
         assert!(!last(&e).evidence_defaulted);
@@ -6231,7 +6234,7 @@ mod event_tests {
         let proof1 = [crate::merkle_leaf_hash(&d0)];
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(BOB, T0 + 10, None, Some(root), 2).unwrap();
+        e.escalate(BOB, T0 + 10, e.inner().remaining_amount(), None, Some(root), 2).unwrap();
         let event = last(&e);
         assert_eq!(event.kind, EscrowEventKind::Escalated);
         assert_eq!(event.evidence_root, Some(root));
@@ -6267,7 +6270,7 @@ mod event_tests {
         let proof0 = [crate::merkle_leaf_hash(&d1)];
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(BOB, T0 + 10, None, Some(root), 2).unwrap();
+        e.escalate(BOB, T0 + 10, e.inner().remaining_amount(), None, Some(root), 2).unwrap();
         e.file_evidence(BOB, d0, 0, &proof0, T0 + 11).unwrap();
         e.resolve(ARBITER, 600_000, None, None, BOB, T0 + 12).unwrap();
         let event = last(&e);
@@ -6289,7 +6292,7 @@ mod event_tests {
             .confirm_default_judgment(BOB)
             .unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(ALICE, T0 + 10, None, None, 0).unwrap();
+        e.escalate(ALICE, T0 + 10, e.inner().remaining_amount(), None, None, 0).unwrap();
         let trigger_at = T0 + 10 + 7_200;
         e.trigger_default_judgment(BOB, trigger_at, None, BOB, trigger_at)
             .unwrap();
@@ -6309,7 +6312,7 @@ mod event_tests {
             .with_evidence_deadline(EVIDENCE_DEADLINE)
             .unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(BOB, T0 + 10, None, None, 0).unwrap();
+        e.escalate(BOB, T0 + 10, e.inner().remaining_amount(), None, None, 0).unwrap();
         let settled_at = T0 + 10 + EVIDENCE_DEADLINE + 1;
         e.submit_panel_judgment(M1, 600_000, None, None, BOB, settled_at)
             .unwrap();
@@ -6354,7 +6357,7 @@ mod event_tests {
         const EVIDENCE: [u8; 32] = [0xE1; 32];
         let mut e = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, Some(EVIDENCE), None, 0).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, e.inner().remaining_amount(), Some(EVIDENCE), None, 0).unwrap();
         e.resolve(ARBITER, 600_000, None, Some(RATIONALE), BOB, T0 + 3)
             .unwrap();
         let event = last(&e);
@@ -6368,7 +6371,7 @@ mod event_tests {
 
         let mut e2 = indexed(1_000_000).with_arbiter(ARBITER).unwrap();
         e2.fund(ALICE, T0 + 1).unwrap();
-        e2.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
+        e2.escalate(ALICE, EXPIRES_AT - 1, e2.inner().remaining_amount(), None, None, 0).unwrap();
         e2.resolve(ARBITER, 600_000, None, None, BOB, T0 + 3).unwrap();
         assert_eq!(last(&e2).rationale_hash, None);
         // Non-resolve events never carry a rationale hash.
@@ -6490,7 +6493,7 @@ mod event_tests {
         // Attest with no quorum configured.
         assert!(e.attest(ATTESTOR_1, T0 + 9).is_err());
         // Escalate with no arbiter configured.
-        assert!(e.escalate(ALICE, T0 + 9, None, None, 0).is_err());
+        assert!(e.escalate(ALICE, T0 + 9, e.inner().remaining_amount(), None, None, 0).is_err());
         // Resolve outside a dispute.
         assert!(e.resolve(ARBITER, 1, None, None, BOB, T0 + 9).is_err());
         // Milestone ops with no plan attached.
@@ -6680,7 +6683,7 @@ mod event_tests {
             .with_protocol_fee(1_000)
             .unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        e.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, e.inner().remaining_amount(), None, None, 0).unwrap();
         let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, BOB, T0 + 3).unwrap();
         // 1000 bps of 600_000 = 60_000; the refund is never fee'd.
         assert_eq!((payout, fee, refund), (540_000, 60_000, 400_000));
@@ -6772,7 +6775,7 @@ mod event_tests {
                     .with_arbiter(ARBITER)
                     .unwrap();
                 d.fund(ALICE, T0 + 1).unwrap();
-                d.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
+                d.escalate(ALICE, EXPIRES_AT - 1, d.inner().remaining_amount(), None, None, 0).unwrap();
                 d.resolve(ARBITER, 0, None, None, BOB, T0 + 3).unwrap();
                 return d;
             }
@@ -6842,7 +6845,7 @@ mod event_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         d.fund(ALICE, T0 + 1).unwrap();
-        d.escalate(ALICE, EXPIRES_AT - 1, None, None, 0).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.inner().remaining_amount(), None, None, 0).unwrap();
         let events_before = d.event_count();
         assert_eq!(
             d.close_vault(ALICE, T0 + 10),

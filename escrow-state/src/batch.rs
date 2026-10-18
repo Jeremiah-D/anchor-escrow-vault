@@ -902,7 +902,7 @@ mod batch_tests {
             .with_arbiter([0xA8; 32])
             .unwrap();
         e.fund(ALICE, NOW).unwrap();
-        e.escalate(ALICE, NOW, None, None, 0).unwrap();
+        e.escalate(ALICE, NOW, e.remaining_amount(), None, None, 0).unwrap();
         let mut e2 = funded(AMOUNT);
         e2.release(ALICE, NOW, AMOUNT, None, BOB).unwrap();
         assert_eq!(e2.state(), EscrowState::Released);

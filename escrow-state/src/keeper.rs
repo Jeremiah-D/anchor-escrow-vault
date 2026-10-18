@@ -94,8 +94,10 @@
 //!
 //! `Disputed` escrows list exactly the `resolve` action above in
 //! single-arbiter mode — or one `submit_panel_judgment` action per
-//! panel member in panel mode (AV-65) — their unilateral exits stay
-//! locked — and the scan never drops their state:
+//! panel member in panel mode (AV-65) — the keeper has no standing to
+//! move the undisputed remainder itself (AV-131: `release`/`claim`
+//! stay initializer/taker-signed, so the keeper never lists them) —
+//! and the scan never drops their state:
 //! the dispute evidence hash attached at `escalate` (AV-22) stays
 //! readable on the watched snapshot ([`Escrow::evidence_hash`]) so
 //! operator tooling can fetch the off-chain evidence for the arbiter.
@@ -2865,7 +2867,7 @@ mod keeper_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, MID).unwrap();
-        e.escalate(ALICE, MID, None, None, 0).unwrap();
+        e.escalate(ALICE, MID, e.remaining_amount(), None, None, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
@@ -2899,7 +2901,7 @@ mod keeper_tests {
             .with_arbiter([0xA8; 32])
             .unwrap();
         e.fund(ALICE, MID).unwrap();
-        e.escalate(BOB, MID, Some(EVIDENCE), None, 0).unwrap();
+        e.escalate(BOB, MID, e.remaining_amount(), Some(EVIDENCE), None, 0).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
         assert_eq!(report.actions.len(), 1);
@@ -2929,7 +2931,7 @@ mod keeper_tests {
             .with_arbiter([0xA8; 32])
             .unwrap();
         e.fund(ALICE, MID).unwrap();
-        e.escalate(BOB, MID, None, Some(root), 2).unwrap();
+        e.escalate(BOB, MID, e.remaining_amount(), None, Some(root), 2).unwrap();
         e.file_evidence(BOB, d0, 0, &proof0, MID).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
@@ -2949,7 +2951,7 @@ mod keeper_tests {
             .with_arbiter([0xA8; 32])
             .unwrap();
         e2.fund(ALICE, MID).unwrap();
-        e2.escalate(BOB, MID, None, None, 0).unwrap();
+        e2.escalate(BOB, MID, e2.remaining_amount(), None, None, 0).unwrap();
         let watched = [watch(ID1, e2)];
         let report = scan_keeper_actions(&watched, MID);
         assert_eq!(report.actions[0].evidence_disclosure, None);
@@ -2972,7 +2974,7 @@ mod keeper_tests {
             .with_evidence_deadline(3_600)
             .unwrap();
         e.fund(ALICE, MID).unwrap();
-        e.escalate(BOB, MID, None, None, 0).unwrap();
+        e.escalate(BOB, MID, e.remaining_amount(), None, None, 0).unwrap();
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
         assert_eq!(report.actions.len(), 1);
@@ -3821,7 +3823,7 @@ mod close_keeper_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, MID).unwrap();
-        e.escalate(ALICE, MID, None, None, 0).unwrap();
+        e.escalate(ALICE, MID, e.remaining_amount(), None, None, 0).unwrap();
         e.resolve(ARBITER, 400_000, MID, None, None, BOB).unwrap();
         assert_eq!(e.state(), EscrowState::Settled);
         e
@@ -3840,7 +3842,7 @@ mod close_keeper_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, MID).unwrap();
-        e.escalate(ALICE, MID, None, None, 0).unwrap();
+        e.escalate(ALICE, MID, e.remaining_amount(), None, None, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Disputed);
         e
     }
@@ -6058,7 +6060,7 @@ mod stale_sweep_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(initializer, NOW).unwrap();
-        e.escalate(initializer, NOW, None, None, 0).unwrap();
+        e.escalate(initializer, NOW, e.remaining_amount(), None, None, 0).unwrap();
         e.resolve(ARBITER, 400_000, NOW, None, None, BOB).unwrap();
         assert_eq!(e.state(), EscrowState::Settled);
         e
@@ -6150,7 +6152,7 @@ mod stale_sweep_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         d.fund(ALICE, NOW).unwrap();
-        d.escalate(ALICE, NOW, None, None, 0).unwrap();
+        d.escalate(ALICE, NOW, d.remaining_amount(), None, None, 0).unwrap();
         assert_eq!(d.state(), EscrowState::Disputed);
         // Closed: the rent is already reclaimed.
         let mut c = cancelled(ALICE, EXPIRED);

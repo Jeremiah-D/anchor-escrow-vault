@@ -204,6 +204,7 @@
       "discriminator": [123, 99, 100, 10, 66, 238, 154, 23],
       "accounts": [],
       "args": [
+        {"name": "dispute_amount", "type": "u64"},
         {"name": "evidence_hash", "type": {"option": {"array": ["u8", 32]}}},
         {"name": "evidence_root", "type": {"option": {"array": ["u8", 32]}}},
         {"name": "evidence_leaves", "type": "u8"}
@@ -1120,7 +1121,8 @@
           {"name": "refunded", "type": "u64", "offset": 5349},
           {"name": "twap_gate", "type": {"option": {"defined": "TwapGate"}}, "offset": 5357},
           {"name": "dual_control_checker", "type": {"option": "publicKey"}, "offset": 5383},
-          {"name": "dual_control_intent", "type": {"option": {"defined": "DualControlIntent"}}, "offset": 5416}
+          {"name": "dual_control_intent", "type": {"option": {"defined": "DualControlIntent"}}, "offset": 5416},
+          {"name": "disputed_amount", "type": "u64", "offset": 5506}
         ]
       }
     }
@@ -1510,7 +1512,9 @@
     {"code": 189, "name": "DualControlIntentExists"},
     {"code": 190, "name": "DualControlNotInitiated"},
     {"code": 191, "name": "DualControlExpired"},
-    {"code": 192, "name": "DualControlRequired"}
+    {"code": 192, "name": "DualControlRequired"},
+    {"code": 193, "name": "InvalidDisputeAmount"},
+    {"code": 194, "name": "DisputedAmountLocked"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

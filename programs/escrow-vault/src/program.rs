@@ -2287,8 +2287,14 @@ pub mod escrow_vault {
     /// root is `None`, `1..=64` otherwise — `InvalidEvidenceProof` on
     /// a count that does not describe the root). Both are persisted
     /// and never cleared; the disclosure bitmap starts zeroed.
+    /// AV-131: `dispute_amount` is the contested lamport amount —
+    /// `1..=remaining_amount` (`InvalidDisputeAmount` otherwise). While
+    /// the vault is `Disputed`, the undisputed remainder stays
+    /// releasable/claimable; only the disputed pool is locked, and
+    /// `resolve` adjudicates that pool alone.
     pub fn escalate(
         ctx: Context<Escalate>,
+        dispute_amount: u64,
         evidence_hash: Option<[u8; 32]>,
         evidence_root: Option<[u8; 32]>,
         evidence_leaves: u8,
@@ -2300,6 +2306,7 @@ pub mod escrow_vault {
             .escalate(
                 ctx.accounts.authority.key().to_bytes(),
                 now,
+                dispute_amount,
                 evidence_hash,
                 evidence_root,
                 evidence_leaves,
@@ -5977,6 +5984,13 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `dual_control_checker`).
     pub dual_control_intent: Option<DualControlIntentMirror>,
+    /// AV-131: the contested lamport amount, persisted by `escalate`
+    /// (mirrors `escrow_state`'s `disputed_amount`); `0` when the vault
+    /// was never disputed, and never cleared afterwards — the audit
+    /// trail of how much was under arbitration. Layout position
+    /// matches `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `dual_control_intent`).
+    pub disputed_amount: u64,
 }
 
 /// Skeleton mirror of `escrow_state::DualControlIntent` (AV-130): the
@@ -9201,6 +9215,13 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::DualControlRequired => {
             error!(ErrorCode::DualControlRequired)
         }
+        // AV-131: appended, never renumbered.
+        escrow_state::EscrowError::InvalidDisputeAmount => {
+            error!(ErrorCode::InvalidDisputeAmount)
+        }
+        escrow_state::EscrowError::DisputedAmountLocked => {
+            error!(ErrorCode::DisputedAmountLocked)
+        }
     }
 }
 
@@ -9417,4 +9438,8 @@ pub enum ErrorCode {
     DualControlExpired,
     #[msg("Dual-control release required (AV-130): direct release (or a path routed through it) on a dual-control escrow — payouts leave only via the two-step initiate_release + confirm_release protocol")]
     DualControlRequired,
+    #[msg("Invalid dispute amount (AV-131): escalate with dispute_amount = 0 or above remaining_amount")]
+    InvalidDisputeAmount,
+    #[msg("Disputed amount locked (AV-131): release names an amount that reaches into the contested pool — release only the undisputed remainder or wait for resolve")]
+    DisputedAmountLocked,
 }
