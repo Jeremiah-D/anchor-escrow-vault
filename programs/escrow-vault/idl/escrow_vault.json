@@ -387,7 +387,9 @@
       "name": "pause",
       "discriminator": [211, 22, 221, 251, 74, 121, 193, 47],
       "accounts": [],
-      "args": []
+      "args": [
+        {"name": "auto_unpause_at", "type": {"option": "u64"}}
+      ]
     },
     {
       "name": "unpause",
@@ -1123,7 +1125,8 @@
           {"name": "twap_gate", "type": {"option": {"defined": "TwapGate"}}, "offset": 5357},
           {"name": "dual_control_checker", "type": {"option": "publicKey"}, "offset": 5383},
           {"name": "dual_control_intent", "type": {"option": {"defined": "DualControlIntent"}}, "offset": 5416},
-          {"name": "disputed_amount", "type": "u64", "offset": 5506}
+          {"name": "disputed_amount", "type": "u64", "offset": 5506},
+          {"name": "auto_unpause_at", "type": {"option": "u64"}, "offset": 5514}
         ]
       }
     }

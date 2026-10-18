@@ -466,7 +466,7 @@ mod swap_tests {
     fn link_swap_rejects_when_paused() {
         let (mut a, mut b) = pair();
         a = a.with_pause_authority(ALICE).unwrap();
-        a.pause(ALICE).unwrap();
+        a.pause(ALICE, None).unwrap();
         assert_eq!(
             link_swap(&mut a, &mut b, ALICE, ID_A, ID_B, 1_000, 500),
             Err(EscrowError::Paused)

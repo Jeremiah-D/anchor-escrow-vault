@@ -95,7 +95,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_fee_schedule(tiers)` (AV-66)     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opt-in volume-priced fee tiers as `(min_amount, bps)` pairs — the fee for a gross payout uses the rate of the highest tier with `min_amount <= amount`, still floored by the AV-63 cap; 1–8 tiers, each `bps` 0–10000, floors strictly ascending; mutually exclusive with the flat rate — fail-fast `InvalidProtocolFee`, code 114, in either direction) |
 | `initialize_fee_recipient(fee_recipient)`    | `Uninitialized`| `Uninitialized` | initializer (once, before funding; pins the destination of every fee leg — the settlement builders reject a `fee_leg` that does not equal it; zero address is `InvalidFeeRecipient`; with no pin the fee goes to the program-level fee account) |
 | `initialize_pause_authority(pause_authority)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding; binds the key allowed to engage/release the emergency pause; zero address is `InvalidPauseAuthority`) |
-| `pause()`                                     | any            | — (no state change; sets the pause flag) | the bound pause authority only (`Unauthorized` otherwise; `InvalidStateTransition` with no authority bound or when already paused); emits `Paused` |
+| `pause(authority, auto_unpause_at)` (AV-133)   | any            | — (no state change; sets the pause flag) | the bound pause authority only (`Unauthorized` otherwise; `InvalidStateTransition` with no authority bound or when already paused); `auto_unpause_at: Option<u64>` — `Some(t)` arms a scheduled auto-recovery at Unix time `t`, `None` = manual `unpause` only (old semantics); while paused, every clock-bearing state-changing path runs `try_auto_unpause(now)` before the `Paused` gate — at `now >= t` the vault auto-recovers (no authority signature, emits `Unpaused{auto:true}`); emits `Paused` |
 | `unpause()`                                   | any            | — (no state change; clears the pause flag) | the bound pause authority only (same rules as `pause`; `InvalidStateTransition` when not paused); emits `Unpaused` |
 | `rotate_pause_authority(new_authority)`       | any (post-`Uninitialized`) | — (no state change; rewrites the bound pause authority) | the escrow authority (initializer) only — a stranger/taker is `Unauthorized`; `InvalidStateTransition` on `Uninitialized` or with no authority bound; zero address is `InvalidPauseAuthority`; works while paused (key-loss escape hatch); emits `PauseAuthorityRotated` only on an actual change |
 | `rotate_taker(new_taker)`                   | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the taker) | **both** the initializer and the *current* taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition` (no live counterparty left; arbitration in flight adjudicates the taker's identity); zero address is `InvalidTaker`; amount / released / attest records / milestone state all preserved; emits `TakerRotated` only on an actual change |
@@ -4503,6 +4503,24 @@ enumeration hits every pairwise and triplewise value assignment, and
 focused probes on the maximal configuration verify the documented check
 orders, builder immutability after funding, and builder-order
 irrelevance.
+
+## Scheduled pause auto-recovery (AV-133)
+
+`pause(authority, auto_unpause_at: Option<u64>)` — `Some(t)` arms a
+scheduled auto-recovery at Unix timestamp `t`; `None` keeps the manual
+`unpause` semantics. While paused, every clock-bearing state-changing
+path runs `try_auto_unpause(now)` before the AV-46 `Paused` gate: at
+`now >= t` the vault auto-recovers internally (no authority signature
+consumed) and emits `Unpaused{auto:true}` (the `auto_unpause` flag on
+the event). The schedule is consumed on fire; a manual `unpause`
+clears it. Keeper reports list armed vaults with their exact recovery
+timestamps (`pending_auto_unpause`).
+
+Layout growth: the vault body grows from 5506 to 5515 bytes (+9:
+1-byte discriminant + 8-byte timestamp), `VAULT_SPACE_NO_QUORUM` from
+5024 to 5033, `VAULT_SPACE` from 5514 to 5523, and the close-time rent
+reclamation from 39_268_320 to 39_330_960 lamports
+(`(128 + VAULT_SPACE) * 3480 * 2`).
 
 ### Local-validator integration stubs
 

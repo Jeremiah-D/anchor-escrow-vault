@@ -382,6 +382,10 @@ pub struct EscrowSnapshot {
     /// `0` when never disputed, never cleared afterwards — the snapshot
     /// keeps the audit trail of the arbitration.
     pub disputed_amount: u64,
+    /// AV-133: the armed scheduled auto-recovery timestamp
+    /// (`Escrow::auto_unpause_at`); `None` when no schedule is armed
+    /// (manual unpause only).
+    pub auto_unpause_at: Option<u64>,
     /// The arbiter's rationale-document commitment attached at
     /// `resolve`, or `None` when the arbiter supplied no rationale
     /// (AV-38). Only `Some` on a `Settled` escrow — never cleared, so
@@ -825,6 +829,9 @@ impl Escrow {
             // AV-131: the contested amount rides the export for the
             // same audit-trail reason — never cleared after `escalate`.
             disputed_amount: self.disputed_amount(),
+            // AV-133: the armed auto-recovery schedule rides the export
+            // so indexers see the exact recovery timestamp.
+            auto_unpause_at: self.auto_unpause_at(),
             rationale_hash: self.rationale_hash(),
             refund_to: self.refund_to(),
             refund_recipient: self.refund_recipient(),
@@ -1337,6 +1344,13 @@ impl EscrowSnapshot {
         // this and `remaining`.
         s.push_str(",\"disputed_amount\":");
         s.push_str(&self.disputed_amount.to_string());
+        // AV-133: the armed auto-recovery timestamp — `null` when no
+        // schedule is armed (manual unpause only).
+        s.push_str(",\"auto_unpause_at\":");
+        match self.auto_unpause_at {
+            Some(t) => s.push_str(&t.to_string()),
+            None => s.push_str("null"),
+        }
         // AV-38: the arbiter's rationale-document commitment — `null`
         // until the arbiter attaches one at `resolve`.
         s.push_str(",\"rationale_hash\":");
@@ -1805,7 +1819,7 @@ mod snapshot_tests {
              \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
-             \"evidence_hash\":null,\"evidence_root\":null,\"evidence_disclosure\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"disputed_amount\":0,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
+             \"evidence_hash\":null,\"evidence_root\":null,\"evidence_disclosure\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"disputed_amount\":0,\"auto_unpause_at\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
              \"penalty_bps\":0,\"penalty_escalation_rate_bps\":0,\"penalty_escalation_cap_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"slot_timelock_slots\":0,\"fund_slot\":0,\"claim_cooldown_slots\":0,\"last_claim_slot\":null,\"counter_offer\":null,\"payout_allowlist\":null,\"payout_denylist\":null,\"cpi_allowlist\":null,\"multisig_authority\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\

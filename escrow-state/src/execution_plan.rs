@@ -451,6 +451,7 @@ mod execution_plan_tests {
             pool_outflow: 0,
             // AV-120: execution-plan tests never stamp a sequence.
             report_seq: None,
+            pending_auto_unpause: Vec::new(),
         }
     }
 

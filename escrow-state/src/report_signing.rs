@@ -282,7 +282,9 @@ mod report_signing_tests {
         // bytes (`null` when the operator stamped nothing).
         // AV-123: the gasless-intent annotations ride the canonical
         // bytes (`[]` when no watched escrow carries an intent).
-        assert_eq!(canonical, "{\"at\":1000,\"scanned\":0,\"total_estimated_cu\":0,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[],\"report_seq\":null}");
+        // AV-133: the pending auto-unpause vaults ride the canonical
+        // bytes (`[]` when none are armed).
+        assert_eq!(canonical, "{\"at\":1000,\"scanned\":0,\"total_estimated_cu\":0,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[],\"report_seq\":null,\"pending_auto_unpause\":[]}");
     }
 
     #[test]

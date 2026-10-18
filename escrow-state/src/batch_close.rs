@@ -633,7 +633,7 @@ mod batch_close_tests {
             .unwrap();
         paused.fund(ALICE, NOW).unwrap();
         paused.cancel(ALICE, None, ALICE).unwrap();
-        paused.pause(ALICE).unwrap();
+        paused.pause(ALICE, None).unwrap();
         let mut vaults = vec![CloseWatchItem::new(paused), CloseWatchItem::new(cancelled(1_000_000, FUTURE))];
         let report = close_vaults(&mut vaults, ALICE, BOB, &CloseVaultsFilter::any());
         assert_eq!(report.failed_count(), 1);

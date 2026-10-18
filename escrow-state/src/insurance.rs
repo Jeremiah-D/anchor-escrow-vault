@@ -269,7 +269,7 @@ mod insurance_tests {
             .with_pause_authority(ALICE)
             .unwrap();
         e.fund(ALICE, T0).unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         // The pause guard fires before the state gate.
         assert_eq!(
             e.with_insurance_pool().unwrap_err(),
@@ -559,7 +559,7 @@ mod insurance_tests {
             .unwrap();
         e.fund(ALICE, T0).unwrap();
         e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         // The pause guard fires before the authorization check.
         assert_eq!(
             e.pool_payout([0x99; 32], BOB, 1, None, DEADLINE + WINDOW)

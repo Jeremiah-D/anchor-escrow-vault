@@ -763,6 +763,7 @@ mod keeper_notify_tests {
             pool_outflow: 0,
             // AV-120: keeper-notify tests never stamp a sequence.
             report_seq: None,
+            pending_auto_unpause: Vec::new(),
         }
     }
 

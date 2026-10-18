@@ -1726,6 +1726,16 @@ pub struct Escrow {
     /// u64 in the vault account. Appended last so every earlier field
     /// offset stays stable.
     disputed_amount: u64,
+    /// AV-133: the scheduled auto-recovery timestamp for the emergency
+    /// pause (see [`Escrow::pause`] / [`Escrow::try_auto_unpause`]):
+    /// `Some(t)` means a paused escrow automatically resumes when a
+    /// clock-bearing transition observes `now >= t` — no authority
+    /// signature needed. `None` is the manual-pause semantic (only
+    /// [`Escrow::unpause`] resumes). Written by `pause`, consumed
+    /// (cleared) by the auto-recovery and by manual `unpause`. Persisted
+    /// as 1-byte discriminant + 8-byte timestamp (9 bytes) in the vault
+    /// account. Appended last so every earlier field offset stays stable.
+    auto_unpause_at: Option<u64>,
     /// AV-36: in-process reentrancy lock. Runtime-only — it is
     /// deliberately *not* serialized: excluded from `VAULT_FIELDS`,
     /// [`Escrow::claim`], [`Escrow::cancel`],
@@ -5657,6 +5667,12 @@ pub const DUAL_CONTROL_TAIL_LEN: usize = 33 + (1 + DUAL_CONTROL_INTENT_LEN);
 /// stable.
 pub const DISPUTED_AMOUNT_TAIL_LEN: usize = 8;
 
+/// AV-133: scheduled pause auto-recovery timestamp. `Option<u64>` —
+/// 1-byte discriminant + 8-byte LE timestamp (`None` = manual unpause
+/// only). Appended after `disputed_amount` so every earlier field
+/// offset stays stable.
+pub const AUTO_UNPAUSE_TAIL_LEN: usize = 9;
+
 /// AV-116: pluggable Solana slot source for the slot-based relative
 /// timelock. The state machine takes `&dyn SlotClock` so callers
 /// inject whatever source they trust — the clock sysvar's `slot`
@@ -6033,6 +6049,10 @@ impl Escrow {
             // compatible) — `escalate` records the locked dispute pool
             // once arbitration starts; zero until then.
             disputed_amount: 0,
+            // AV-133: no scheduled auto-recovery by default (backward
+            // compatible) — `pause` with `auto_unpause_at: None` keeps
+            // the manual-pause semantic.
+            auto_unpause_at: None,
             // AV-36: the reentrancy lock starts clear — it is runtime
             // state, armed only around the injected executor window of
             // `release_via_cpi`, never persisted.
@@ -6160,6 +6180,9 @@ impl Escrow {
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
         // AV-46: pause guard first — a paused escrow fails fast,
         // before the reentrancy guard and the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         // AV-104: the initializer funds, or their FUND-scoped operator.
@@ -6266,6 +6289,9 @@ impl Escrow {
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
         // AV-46: pause guard first — a paused escrow fails fast,
         // before the reentrancy guard and the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         // AV-104: the initializer funds, or their FUND-scoped operator.
@@ -7046,6 +7072,9 @@ impl Escrow {
     pub fn announce_release(&mut self, authority: [u8; 32], now: u64) -> Result<(), EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast, before
         // the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         if authority != self.initializer && authority != self.taker {
             return Err(EscrowError::Unauthorized);
@@ -7088,6 +7117,9 @@ impl Escrow {
     pub fn veto_release(&mut self, caller: [u8; 32], now: u64) -> Result<(), EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast, before
         // the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         if caller != self.initializer && caller != self.taker {
             return Err(EscrowError::Unauthorized);
@@ -7305,6 +7337,9 @@ impl Escrow {
     ) -> Result<u64, EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast,
         // before the reentrancy guard and the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         // AV-36: reentrancy guard — the payout moves funds.
         self.require_not_reentrant()?;
@@ -7581,6 +7616,9 @@ impl Escrow {
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
         // AV-46: pause guard first — a paused escrow fails fast,
         // before the reentrancy guard and the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         // AV-104: the initializer releases, or their RELEASE-scoped
@@ -7825,6 +7863,9 @@ let fee = self.charge_protocol_fee(amount)?;
     ) -> Result<(u64, u64), EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast, the
         // crate convention.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         // AV-123: the authority gate — the intent must verify against
         // the initializer's key. Checked before the nonce/expiry
@@ -7966,6 +8007,9 @@ let fee = self.charge_protocol_fee(amount)?;
         intent_ttl_secs: u64,
     ) -> Result<(), EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         // AV-36: reentrancy guard before the authority check, like
         // every fund-moving transition.
@@ -8041,6 +8085,9 @@ let fee = self.charge_protocol_fee(amount)?;
         now: u64,
     ) -> Result<(u64, u64), EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         // AV-36: reentrancy guard before the identity check.
         self.require_not_reentrant()?;
@@ -8103,6 +8150,9 @@ let fee = self.charge_protocol_fee(amount)?;
     /// stays `Funded`.
     pub fn cancel_release(&mut self, caller: [u8; 32], now: u64) -> Result<(), EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         // AV-36: reentrancy guard before the identity check.
         self.require_not_reentrant()?;
@@ -8275,6 +8325,9 @@ let fee = self.charge_protocol_fee(amount)?;
         // runs mid-transition.
         // AV-46: pause guard first — a paused escrow fails fast,
         // before the reentrancy guard and the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         // Snapshot the three fields `release` mutates, so a failure
@@ -8417,6 +8470,9 @@ let fee = self.charge_protocol_fee(amount)?;
     ) -> Result<(Vec<([u8; 32], u64)>, u64), EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         self.require_initializer(authority)?;
@@ -8596,6 +8652,9 @@ let fee = self.charge_protocol_fee(amount)?;
     ) -> Result<Vec<([u8; 32], u64)>, EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         // AV-104: the initializer releases, or their RELEASE-scoped
@@ -9011,6 +9070,9 @@ let fee = self.charge_protocol_fee(amount)?;
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
         // AV-46: pause guard first — a paused escrow fails fast,
         // before the reentrancy guard and the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         // AV-104: either party cancels expiry, or their CANCEL-scoped
@@ -9066,6 +9128,9 @@ let fee = self.charge_protocol_fee(amount)?;
         // AV-46: pause guard first — a paused escrow fails fast, before
         // the reentrancy guard. There is deliberately no authority
         // check: the crank is permissionless.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         let refund_to = self.refund_recipient();
@@ -9453,6 +9518,9 @@ let fee = self.charge_protocol_fee(amount)?;
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
         // AV-46: pause guard first — a paused escrow fails fast,
         // before the reentrancy guard and the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         if authority != self.taker {
@@ -9888,6 +9956,9 @@ let fee = self.charge_protocol_fee(claimable)?;
     ) -> Result<u64, EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast,
         // before the reentrancy guard and the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         // AV-36: reentrancy guard — slash moves funds.
         self.require_not_reentrant()?;
@@ -10296,6 +10367,9 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// Anchor layer), paralleling `slash`'s `Slashed` event.
     pub fn file_appeal(&mut self, taker: [u8; 32], now: u64) -> Result<u64, EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         // AV-36: reentrancy guard — with an opt-in bond, filing locks
         // funds (the taker's bond transfer), so the guard applies
@@ -10521,6 +10595,9 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// the Anchor layer).
     pub fn expire_appeal(&mut self, caller: [u8; 32], now: u64) -> Result<u64, EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         // AV-36: reentrancy guard — the sweep moves the forfeited bond.
         self.require_not_reentrant()?;
@@ -11204,6 +11281,9 @@ let fee = self.charge_protocol_fee(claimable)?;
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
         // AV-46: pause guard first — a paused escrow fails fast,
         // before the reentrancy guard and the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         if authority != self.taker {
@@ -11468,6 +11548,9 @@ let fee = self.charge_protocol_fee(claimable)?;
     pub fn claim_deadman(&mut self, heir: [u8; 32], now: u64) -> Result<u64, EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast,
         // before the reentrancy guard and the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         // AV-36: reentrancy guard — the claim moves funds.
         self.require_not_reentrant()?;
@@ -11953,7 +12036,20 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// so every successful call flips the bit and the
     /// [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits exactly one
     /// `Paused` event per engagement.
-    pub fn pause(&mut self, authority: [u8; 32]) -> Result<(), EscrowError> {
+    ///
+    /// AV-133: `auto_unpause_at` opts into scheduled auto-recovery —
+    /// `Some(t)` records the timestamp at which a clock-bearing
+    /// transition automatically resumes the escrow (see
+    /// [`Escrow::try_auto_unpause`]), with no authority signature
+    /// needed. `None` keeps the manual-pause semantic: only
+    /// [`Escrow::unpause`] resumes. The schedule is stored on the vault
+    /// (9 bytes, appended to the layout tail) so keepers and indexers
+    /// can read the exact recovery moment.
+    pub fn pause(
+        &mut self,
+        authority: [u8; 32],
+        auto_unpause_at: Option<u64>,
+    ) -> Result<(), EscrowError> {
         let bound = match self.pause_authority {
             Some(a) => a,
             None => return Err(EscrowError::InvalidStateTransition),
@@ -11965,7 +12061,53 @@ let fee = self.charge_protocol_fee(claimable)?;
             return Err(EscrowError::InvalidStateTransition);
         }
         self.paused = true;
+        self.auto_unpause_at = auto_unpause_at;
         Ok(())
+    }
+
+    /// The scheduled auto-recovery timestamp (AV-133): `Some(t)` when
+    /// [`Escrow::pause`] was called with a recovery schedule, `None`
+    /// for a manual pause (or after any unpause consumed the schedule).
+    pub fn auto_unpause_at(&self) -> Option<u64> {
+        self.auto_unpause_at
+    }
+
+    /// AV-133: attempt scheduled auto-recovery of the emergency pause.
+    /// When the escrow is paused with an `auto_unpause_at` schedule and
+    /// `now >= auto_unpause_at`, the pause lifts without an authority
+    /// signature: `paused` clears and the schedule is consumed (set to
+    /// `None`, so the recovery fires exactly once). Returns `true`
+    /// when the auto-recovery fired.
+    ///
+    /// Called first by every clock-bearing state-changing transition,
+    /// before [`Escrow::require_not_paused`] — the AV-46 gate itself is
+    /// unchanged: a paused escrow with no schedule, or a schedule not
+    /// yet due, still fails fast with [`EscrowError::Paused`].
+    /// Idempotent: a second call after the recovery (or on a
+    /// non-paused escrow) returns `false` and changes nothing.
+    pub fn try_auto_unpause(&mut self, now: u64) -> bool {
+        if !self.paused {
+            return false;
+        }
+        match self.auto_unpause_at {
+            Some(t) if now >= t => {
+                self.paused = false;
+                self.auto_unpause_at = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// AV-133: restore a fired auto-recovery (crate-internal). The
+    /// [`IndexedEscrow`](crate::IndexedEscrow) wrapper snapshots the
+    /// pause state before calling [`Escrow::try_auto_unpause`] and
+    /// restores it when the enclosing transition fails — a failed call
+    /// changes nothing observable and (the `ReentryRejected` security
+    /// signal aside) emits no events.
+    pub(crate) fn restore_auto_unpause(&mut self, paused: bool, auto_unpause_at: Option<u64>) {
+        self.paused = paused;
+        self.auto_unpause_at = auto_unpause_at;
     }
 
     /// Release the emergency pause (AV-46): state-changing transitions
@@ -11973,6 +12115,10 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// a non-paused escrow is `InvalidStateTransition`. Emits one
     /// `Unpaused` event via the [`IndexedEscrow`](crate::IndexedEscrow)
     /// wrapper.
+    ///
+    /// AV-133: the manual semantic is unchanged — but a manual unpause
+    /// also consumes any scheduled auto-recovery (the pause is over,
+    /// the schedule is moot).
     pub fn unpause(&mut self, authority: [u8; 32]) -> Result<(), EscrowError> {
         let bound = match self.pause_authority {
             Some(a) => a,
@@ -11985,6 +12131,7 @@ let fee = self.charge_protocol_fee(claimable)?;
             return Err(EscrowError::InvalidStateTransition);
         }
         self.paused = false;
+        self.auto_unpause_at = None;
         Ok(())
     }
 
@@ -12559,6 +12706,9 @@ let fee = self.charge_protocol_fee(claimable)?;
         now: u64,
     ) -> Result<(), EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         if initializer != self.initializer {
             return Err(EscrowError::Unauthorized);
@@ -12936,6 +13086,9 @@ let fee = self.charge_protocol_fee(claimable)?;
         evidence_leaves: u8,
     ) -> Result<(), EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         if authority != self.initializer && authority != self.taker {
             return Err(EscrowError::Unauthorized);
@@ -13191,6 +13344,9 @@ let fee = self.charge_protocol_fee(claimable)?;
         now: u64,
     ) -> Result<(), EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         // Disclosure is the escalating party's duty: only the recorded
         // escalator may submit. On a never-disputed escrow
@@ -13259,6 +13415,9 @@ let fee = self.charge_protocol_fee(claimable)?;
         now: u64,
     ) -> Result<(), EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         // Disclosure is the escalating party's duty: only the recorded
         // escalator may file. Mirrors `submit_evidence`.
@@ -14381,6 +14540,9 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// The [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits
     /// [`EscrowEventKind::Declined`](crate::EscrowEventKind::Declined).
     pub fn decline_escrow(&mut self, authority: [u8; 32], now: u64) -> Result<(), EscrowError> {
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         if authority != self.taker {
@@ -14430,6 +14592,9 @@ let fee = self.charge_protocol_fee(claimable)?;
         expiry: u64,
         now: u64,
     ) -> Result<(), EscrowError> {
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         if authority != self.taker {
@@ -14470,6 +14635,9 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// The [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits
     /// [`EscrowEventKind::CounterOfferAccepted`](crate::EscrowEventKind::CounterOfferAccepted).
     pub fn accept_counter_offer(&mut self, authority: [u8; 32], now: u64) -> Result<(), EscrowError> {
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         self.require_initializer(authority)?;
@@ -14495,6 +14663,9 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// The [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits
     /// [`EscrowEventKind::CounterOfferRejected`](crate::EscrowEventKind::CounterOfferRejected).
     pub fn reject_counter_offer(&mut self, authority: [u8; 32], now: u64) -> Result<(), EscrowError> {
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         self.require_initializer(authority)?;
@@ -15210,6 +15381,9 @@ let fee = self.charge_protocol_fee(taker_amount)?;
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
         // AV-46: pause guard first — a paused escrow fails fast,
         // before the reentrancy guard and the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         if caller != self.initializer && caller != self.taker {
@@ -15402,6 +15576,9 @@ let fee = self.charge_protocol_fee(taker_amount)?;
         // first — the inner legs re-check them anyway, but failing
         // fast here makes the combined call's own check order (pause,
         // reentrancy, authority, state) explicit.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         // Snapshot the three fields the legs mutate, so a failed close
@@ -15525,6 +15702,9 @@ let fee = self.charge_protocol_fee(taker_amount)?;
         now: u64,
     ) -> Result<Vec<Escrow>, EscrowError> {
         // AV-46: pause guard first — a paused escrow fails fast.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         // AV-36: the split re-homes locked funds — a fund-moving
         // transition, so the reentrancy guard applies.
@@ -15751,6 +15931,9 @@ let fee = self.charge_protocol_fee(taker_amount)?;
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
         // AV-46: pause guard first — a paused escrow fails fast,
         // before the reentrancy guard and the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         self.require_initializer(authority)?;
@@ -16402,6 +16585,9 @@ let fee = self.charge_protocol_fee(tranche)?;
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
         // AV-46: pause guard first — a paused escrow fails fast,
         // before the reentrancy guard and the authority check.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
         self.require_initializer(authority)?;
@@ -17360,6 +17546,12 @@ pub const VAULT_FIELDS: &[(&str, &str, usize)] = &[
     // present (zeroed when the escrow was never disputed). Appended
     // last so every earlier field offset stays stable.
     ("disputed_amount", "u64", 8),
+    // AV-133: the scheduled pause auto-recovery timestamp (see
+    // `Escrow::pause` / `Escrow::try_auto_unpause`): 1-byte `Option`
+    // discriminant + 8-byte timestamp (9 bytes), zeroed when no
+    // schedule is armed. Appended last so every earlier field offset
+    // stays stable.
+    ("auto_unpause_at", "Option<u64>", 9),
 ];
 
 /// Sums the serialized lengths of a field table at compile time.
@@ -17526,7 +17718,11 @@ pub const VAULT_SPACE_NO_QUORUM: usize =
     + 33 + (1 + DUAL_CONTROL_INTENT_LEN)
     // AV-131: the disputed-amount tail — the 8-byte `disputed_amount`
     // counter (zeroed when the escrow was never disputed).
-    + 8;
+    + 8
+    // AV-133: the scheduled pause auto-recovery tail — the 1-byte
+    // `Option` discriminant + 8-byte `auto_unpause_at` timestamp
+    // (zeroed when no schedule is armed).
+    + 9;
 
 /// Account storage overhead in bytes added by the Solana runtime when
 /// computing rent (mirrors `solana_rent::ACCOUNT_STORAGE_OVERHEAD`).
@@ -17821,7 +18017,7 @@ mod tests {
             .with_pause_authority(PAUSE_AUTH)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause(PAUSE_AUTH).unwrap();
+        e.pause(PAUSE_AUTH, None).unwrap();
         assert_eq!(
             e.crank_expired(MALLORY, EXPIRES_AT + 1, None),
             Err(EscrowError::Paused)
@@ -17937,7 +18133,7 @@ mod tests {
         assert_eq!(e.state(), EscrowState::Funded, "failed crank moves nothing");
         assert_eq!(e.keeper_bounty_pool(), 50_000, "pool untouched by failed crank");
         // A paused escrow rejects before the pool is even read.
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         assert_eq!(
             e.crank_expired(MALLORY, EXPIRES_AT + 1, None),
             Err(EscrowError::Paused)
@@ -17952,7 +18148,7 @@ mod tests {
         let mut e = bounty_escrow(50_000, 10_000);
         e.crank_expired(MALLORY, EXPIRES_AT + 1, None).unwrap();
         let body = super::account_space_tests::encode_escrow(&e);
-        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN;
+        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN;
         assert_eq!(
             u64::from_le_bytes(body[tail..tail + 8].try_into().unwrap()),
             40_000,
@@ -18209,7 +18405,7 @@ mod tests {
             // The reclaimed rent is the mainnet rent-exempt minimum for
             // VAULT_SPACE — hand-computed in
             // rent_formula_matches_hand_computed_mainnet_numbers.
-            assert_eq!(rent, 39_268_320, "from {state:?}");
+            assert_eq!(rent, 39_330_960, "from {state:?}");
             assert_eq!(rent, vault_close_rent_reclaimed(), "from {state:?}");
             assert_eq!(e.state(), EscrowState::Closed, "from {state:?}");
         }
@@ -18307,9 +18503,9 @@ mod tests {
         // No fee configured: the taker takes the whole lockup.
         assert_eq!((payout, fee), (1_000_000, 0));
         // The rent reclaimed is the mainnet rent-exempt minimum for
-        // VAULT_SPACE — pinned at 39_268_320 by
+        // VAULT_SPACE — pinned at 39_330_960 by
         // rent_formula_matches_hand_computed_mainnet_numbers.
-        assert_eq!(rent, 39_268_320);
+        assert_eq!(rent, 39_330_960);
         assert_eq!(rent, vault_close_rent_reclaimed());
         // Funded -> Released -> Closed in one call.
         assert_eq!(e.state(), EscrowState::Closed);
@@ -18477,11 +18673,11 @@ mod tests {
     fn release_and_close_adds_no_fields_and_keeps_space() {
         // AV-50 touches no persisted field: the release leg moves the
         // `released` / `fees_paid` counters and the state byte, and
-        // then the account is closed. VAULT_SPACE stays 5514 — re-asserted
+        // then the account is closed. VAULT_SPACE stays 5523 — re-asserted
         // here so the combined instruction cannot silently grow the
         // account (every byte is rent the initializer paid for).
-        assert_eq!(VAULT_SPACE, 5514, "full Vault account space");
-        assert_eq!(vault_close_rent_reclaimed(), 39_268_320);
+        assert_eq!(VAULT_SPACE, 5523, "full Vault account space");
+        assert_eq!(vault_close_rent_reclaimed(), 39_330_960);
     }
 
     #[test]
@@ -18500,7 +18696,7 @@ mod tests {
         // 595 (arbiter panel), and AV-68 by 41 (evidence-disclosure
         // deadline + escalating party), so the pin tracks the new total
         // deliberately.
-        assert_eq!(VAULT_SPACE, 5514, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 5523, "full Vault account space");
         assert_eq!(
             EscrowState::Closed as u8, 7,
             "Closed appended last, discriminants 0-6 stable"
@@ -20690,9 +20886,9 @@ pub(crate) mod anchor_idl_tests {
         InstructionSpec {
             // AV-46: engage the emergency pause.
             name: "pause",
-            params: &[],
+            params: &[("auto_unpause_at", "Option<u64>", "scheduled auto-recovery timestamp (None = manual unpause only)")],
             method: "Escrow::pause",
-            input_mapping: "no params; authority <- accounts.pause_authority \\
+            input_mapping: "auto_unpause_at <- param (Option<u64>); authority <- accounts.pause_authority \\
                             (signer); the pause authority must be opted in \\
                             (InvalidStateTransition otherwise); a stranger \\
                             is Unauthorized; pausing an already-paused \\
@@ -22709,6 +22905,9 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_decimals",
                 &"initialize_fee_recipient",
                 &"initialize_pause_authority",
+                // AV-133: the scheduled auto-recovery timestamp
+                // (Option<u64>, None = manual unpause only).
+                &"pause",
                 &"rotate_pause_authority",
                 &"rotate_taker",
                 &"rotate_initializer",
@@ -24818,6 +25017,10 @@ pub(crate) mod anchor_idl_tests {
         // `initiate_release` as a transition side effect (see
         // FIELD_SOURCES), never as an instruction param.
         ("initialize_dual_control", "checker", "dual_control_checker"),
+        // AV-133: the scheduled auto-recovery timestamp — the `pause`
+        // instruction's `auto_unpause_at` param populates the vault
+        // field in place (`None` = manual unpause only).
+        ("pause", "auto_unpause_at", "auto_unpause_at"),
     ];
 
     /// Vault field paths not populated by instruction params, with their
@@ -26533,7 +26736,7 @@ mod error_code_tests {
     #[test]
     fn paused_triggered_by_fund_while_pause_engaged() {
         let mut e = escrow().with_pause_authority(MALLORY).unwrap();
-        e.pause(MALLORY).unwrap();
+        e.pause(MALLORY, None).unwrap();
         // Authorized caller, legal state — the pause alone rejects it.
         let err = e.fund(ALICE, EXPIRES_AT - 3_600).unwrap_err();
         assert_eq!(err, EscrowError::Paused);
@@ -28089,6 +28292,20 @@ mod account_space_tests {
         // AV-131: the disputed amount locked for arbitration, always
         // present (zeroed when the escrow was never disputed).
         out.extend_from_slice(&e.disputed_amount.to_le_bytes());
+        // AV-133: the scheduled pause auto-recovery timestamp —
+        // 1-byte `Option` discriminant + 8-byte timestamp (zeroed when
+        // no schedule is armed). Appended last so every earlier offset
+        // above is unchanged.
+        match e.auto_unpause_at {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; 8]);
+            }
+            Some(t) => {
+                out.push(1);
+                out.extend_from_slice(&t.to_le_bytes());
+            }
+        }
         out
     }
 
@@ -28188,6 +28405,8 @@ mod account_space_tests {
         // 1-byte `Option` discriminant + 89-byte intent region).
         // + 8 (AV-131 disputed-amount tail: the u64 counter of the
         // amount locked for arbitration).
+        // + 9 (AV-133 scheduled pause auto-recovery tail: 1-byte
+        // `Option` discriminant + 8-byte `auto_unpause_at` timestamp).
         assert_eq!(PAYOUT_SPLIT_LEN, 1 + 8 * 32 + 8 * 8, "payout split bytes");
         assert_eq!(PAYOUT_SPLIT_LEN, 321);
         assert_eq!(DEADMAN_REGION_LEN, 8 + 1 + 32 + 8, "deadman tail bytes");
@@ -28205,9 +28424,11 @@ mod account_space_tests {
         assert_eq!(SLASH_LADDER_LEN, 113);
         assert_eq!(SLASH_LADDER_TAIL_LEN, 1 + 113 + 1, "ladder tail bytes");
         assert_eq!(SLASH_LADDER_TAIL_LEN, 115);
-        assert_eq!(ESCROW_BODY_LEN, 5506, "escrow payload bytes");
+        // + 9 (AV-133 scheduled pause auto-recovery: 1-byte `Option`
+        // discriminant + 8-byte `auto_unpause_at` timestamp).
+        assert_eq!(ESCROW_BODY_LEN, 5515, "escrow payload bytes");
         // 8-byte Anchor discriminator + payload.
-        assert_eq!(VAULT_SPACE, 5514, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 5523, "full Vault account space");
         // Discriminator + payload with `quorum: None` (1-byte
         // discriminant) + 1-byte activation bitmask (AV-12) + 1-byte
         // vesting discriminant (AV-13, zeroed when no schedule) + 1-byte
@@ -28347,10 +28568,10 @@ mod account_space_tests {
         // disputed).
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + 321 + 49 + 8 + 8 + 11 + 8 + 9 + 18 + 2 + 2 + 8 + 8 + 1 + 8 + 8 + 8 + 9 + 17 + 8 + 8 + 8 + 114 + 1 + 8 + 26 + 123 + 8,
+            8 + 32 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 1 + 2 + 8 + 8 + 1 + 32 + 1 + 32 + 2 + 8 + 1 + 1 + 32 + 1 + 1 + 32 + 1 + 32 + 1 + 1 + 129 + 1 + 32 + 8 + 1 + 16 + 1 + 18 + 1 + 8 + 1 + 8 + 1 + 1 + 1152 + 8 + 8 + 8 + 8 + 8 + 595 + 81 + 8 + 33 + 512 + 1 + 41 + 8 + 258 + 67 + 8 + 8 + 1 + 9 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + 321 + 49 + 8 + 8 + 11 + 8 + 9 + 18 + 2 + 2 + 8 + 8 + 1 + 8 + 8 + 8 + 9 + 17 + 8 + 8 + 8 + 114 + 1 + 8 + 26 + 123 + 8 + 9,
             "no-quorum Vault account space"
         );
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5024);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5033);
     }
 
     #[test]
@@ -28760,16 +28981,16 @@ mod account_space_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5514) * 3480 * 2 = 5642 * 6960 = 39_268_320 lamports.
-        assert_eq!(full, 39_268_320);
+        // (128 + 5523) * 3480 * 2 = 5651 * 6960 = 39_330_960 lamports.
+        assert_eq!(full, 39_330_960);
 
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5024) * 3480 * 2 = 5152 * 6960 = 35_857_920 lamports.
-        assert_eq!(no_quorum, 35_857_920);
+        // (128 + 5033) * 3480 * 2 = 5161 * 6960 = 35_920_560 lamports.
+        assert_eq!(no_quorum, 35_920_560);
         assert!(no_quorum < full, "smaller account needs less rent");
 
         // Zero-byte account: pure storage overhead.
@@ -28813,13 +29034,13 @@ mod account_space_tests {
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
         // Exactly the minimum: exempt.
-        assert_eq!(check_vault_rent_exempt(39_268_320, params.0, params.1), Ok(()));
+        assert_eq!(check_vault_rent_exempt(39_330_960, params.0, params.1), Ok(()));
         // One lamport short: exact shortfall reported.
         assert_eq!(
-            check_vault_rent_exempt(37_263_839, params.0, params.1),
+            check_vault_rent_exempt(37_326_479, params.0, params.1),
             Err(RentShortfall {
-                required: 39_268_320,
-                provided: 37_263_839,
+                required: 39_330_960,
+                provided: 37_326_479,
             })
         );
         // Generous funding: exempt.
@@ -28831,7 +29052,7 @@ mod account_space_tests {
         assert_eq!(
             check_vault_rent_exempt(0, params.0, params.1),
             Err(RentShortfall {
-                required: 39_268_320,
+                required: 39_330_960,
                 provided: 0,
             })
         );
@@ -28888,7 +29109,7 @@ mod basket_tests {
         let body = encode_escrow(&e);
         assert_eq!(body.len(), ESCROW_BODY_LEN);
         let basket_at =
-            ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN;
+            ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN;
         assert_eq!(body[basket_at], 1, "Some discriminant");
         assert_eq!(body[basket_at + 1], 2, "leg count");
         assert_eq!(&body[basket_at + 2..basket_at + 34], &MINT_A);
@@ -29815,7 +30036,7 @@ mod basket_settlement_tests {
             .with_pause_authority(ALICE)
             .unwrap();
         paused.fund(ALICE, NOW).unwrap();
-        paused.pause(ALICE).unwrap();
+        paused.pause(ALICE, None).unwrap();
         assert_eq!(
             paused.release_basket(ALICE, NOW, Some(MINT_A)),
             Err(EscrowError::Paused)
@@ -30136,7 +30357,7 @@ mod basket_atomic_tests {
             .with_pause_authority(PAUSE_AUTH)
             .unwrap();
         e.fund(ALICE, NOW).unwrap();
-        e.pause(PAUSE_AUTH).unwrap();
+        e.pause(PAUSE_AUTH, None).unwrap();
         assert_eq!(
             e.release_basket_all(ALICE, NOW, BOB),
             Err(EscrowError::Paused)
@@ -30426,7 +30647,7 @@ mod denylist_tests {
             .unwrap()
             .with_pause_authority(PAUSE_AUTH)
             .unwrap();
-        paused.pause(PAUSE_AUTH).unwrap();
+        paused.pause(PAUSE_AUTH, None).unwrap();
         paused.fund(ALICE, NOW).unwrap_err(); // funding while paused fails
         assert_eq!(
             paused.update_payout_denylist(ALICE, &[DEST]),
@@ -30547,7 +30768,7 @@ mod denylist_tests {
         let e = funded_denied();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN);
+        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN);
         assert_eq!(bytes[tail], 1, "Some discriminant");
         assert_eq!(&bytes[tail + 1..tail + 1 + 32], &MALLORY);
         assert_eq!(&bytes[tail + 33..tail + 129], &[0u8; 96]);
@@ -30878,8 +31099,8 @@ mod dutch_auction_tests {
         plain.fund(ALICE, START - 3_600).unwrap();
         let bytes = encode_escrow(&plain);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506);
-        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
+        assert_eq!(bytes.len(), 5515);
+        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
         assert_eq!(bytes[tail], 0, "auction: None discriminant");
         assert_eq!(
             &bytes[tail + 1..tail + 1 + DUTCH_AUCTION_LEN],
@@ -30946,65 +31167,65 @@ mod dutch_auction_tests {
         // appeal-bond region trails the delegation region, the
         // AV-100 streaming-fee region trails the bond region, the
         // AV-99 hook region trails the auction region.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].0, "insurance_pool");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].2, 1);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].0, "pool_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 40].0, "insurance_pool");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 40].2, 1);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].0, "pool_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].0, "pool_slashed");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 37].0, "pool_slashed");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 37].0, "pool_inflow");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 37].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 36].0, "pool_inflow");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 36].0, "pool_payout_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 36].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 35].0, "pool_payout_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 35].2, 8);
         // AV-107: the interest-bearing tail — 2-byte
         // annual rate in basis points, then the accrual-clock base,
         // the outstanding yield claim, and the cumulative paid
         // counter (26 bytes: INTEREST_REGION_LEN).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 34].0, "interest_rate_bps");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 34].2, 2);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 35].0, "interest_rate_bps");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 35].2, 2);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 33].0,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 34].0,
             "interest_accrual_base"
         );
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 34].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 33].0, "interest_accrued");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 33].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].0, "interest_accrued");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].0, "interest_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 31].0, "interest_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 31].2, 8);
         // AV-108: the payout-split tail (1-byte live split count +
         // eight 32-byte recipient slots + eight 8-byte share slots).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 30].0, "payout_split");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 30].2, PAYOUT_SPLIT_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 31].0, "payout_split");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 31].2, PAYOUT_SPLIT_LEN);
         // AV-109: the dead-man's switch tail (8-byte inactivity
         // threshold + 33-byte Option<Pubkey> heir + 8-byte activity
         // clock) sits just before the AV-110 tail.
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 29].0,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 30].0,
             "deadman_inactivity_secs"
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 29].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 28].0, "deadman_heir");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 28].2, 1 + PUBKEY_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 30].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 29].0, "deadman_heir");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 29].2, 1 + PUBKEY_LEN);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 27].0,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 28].0,
             "deadman_last_activity"
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 27].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 28].2, 8);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 29].2
-                + VAULT_FIELDS[VAULT_FIELDS.len() - 28].2
-                + VAULT_FIELDS[VAULT_FIELDS.len() - 27].2,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 30].2
+                + VAULT_FIELDS[VAULT_FIELDS.len() - 29].2
+                + VAULT_FIELDS[VAULT_FIELDS.len() - 28].2,
             DEADMAN_REGION_LEN
         );
         // AV-110: the rent top-up counter trails the AV-111 tail —
         // one u64, zeroed when no top-up was ever made.
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 26].0,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 27].0,
             "rent_topped_up_total"
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 26].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 27].2, 8);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 26].2,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 27].2,
             RENT_TOP_UP_LEN
         );
         // AV-111: the tranched-funding tail — the 8-byte cumulative
@@ -31013,46 +31234,46 @@ mod dutch_auction_tests {
         // total_amount u64 + max_tranches u8 + tranches_used u8).
         // The AV-112 release-cooling tail is the new absolute tail
         // after it.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].0, "funded_total");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 24].0, "funding_plan");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 26].0, "funded_total");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 26].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].0, "funding_plan");
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 24].1,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 25].1,
             "Option<FundingPlan>"
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 24].2, FUNDING_PLAN_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 25].2, FUNDING_PLAN_LEN);
         // AV-112: the release-cooling tail is the absolute tail — the
         // 8-byte cooling window (0 = unconfigured), then the
         // `Option<u64>` intent timestamp (1-byte discriminant +
         // 8-byte stamp, `None` when no intent is live).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].0, "release_cooling_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].0, "release_intent_at");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].1, "Option<u64>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].2, 9);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 24].0, "release_cooling_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 24].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].0, "release_intent_at");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].1, "Option<u64>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 23].2, 9);
         // AV-113: the oracle price-gate tail is the absolute tail —
         // the `Option<PriceGate>` region (1-byte discriminant +
         // 1-byte direction + 8-byte target + 8-byte staleness bound).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].0, "price_gate");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].1, "Option<PriceGate>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].2, PRICE_GATE_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].2, 18);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].0, "price_gate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].1, "Option<PriceGate>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].2, PRICE_GATE_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].2, 18);
         // AV-115: the penalty-escalation tail sits just before the
         // AV-116 tail — the 2-byte daily rate plus the 2-byte cap.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].0, "penalty_escalation_rate_bps");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].0, "penalty_escalation_rate_bps");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].2, 2);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].0, "penalty_escalation_cap_bps");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].2, 2);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "penalty_escalation_cap_bps");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].2, 2);
         // AV-116: the slot-based relative timelock tail — the 8-byte
         // opt-in slot duration plus the 8-byte funding slot anchor
         // (no longer the absolute tail since AV-117/AV-119/AV-121/AV-122).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "slot_timelock_slots");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "slot_timelock_slots");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "fund_slot");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "fund_slot");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].2, 8);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 18].2
-                + VAULT_FIELDS[VAULT_FIELDS.len() - 17].2,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 19].2
+                + VAULT_FIELDS[VAULT_FIELDS.len() - 18].2,
             SLOT_TIMELOCK_TAIL_LEN
         );
         // AV-122: the counter-offer tail is the absolute tail — the
@@ -31061,37 +31282,37 @@ mod dutch_auction_tests {
         // trailing the AV-121 claim-cooldown tail (8-byte opt-in
         // per-taker cooldown duration plus the 9-byte last-claim slot
         // anchor: 1-byte discriminant + 8-byte slot).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "claim_cooldown_slots");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "last_claim_slot");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].2, 9);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "claim_cooldown_slots");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "last_claim_slot");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].2, 9);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 13].2
-                + VAULT_FIELDS[VAULT_FIELDS.len() - 12].2,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 14].2
+                + VAULT_FIELDS[VAULT_FIELDS.len() - 13].2,
             CLAIM_COOLDOWN_TAIL_LEN
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "counter_offer");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].1, "Option<CounterOffer>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].2, COUNTER_OFFER_TAIL_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].0, "counter_offer");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].1, "Option<CounterOffer>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 12].2, COUNTER_OFFER_TAIL_LEN);
         // AV-123: the gasless-release intent nonce tail — the 8-byte
         // highest consumed intent nonce — trails the AV-122
         // counter-offer tail (no longer the absolute tail since
         // AV-124).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "last_intent_nonce");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, RELEASE_INTENT_TAIL_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].0, "last_intent_nonce");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 11].2, RELEASE_INTENT_TAIL_LEN);
         // AV-124: the keeper-bounty tail — the 8-byte remaining bounty
         // pool plus the 8-byte fixed per-crank bounty (no longer the
         // absolute tail since AV-126).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "keeper_bounty_pool");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].0, "keeper_bounty_pool");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 10].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].0, "keeper_bounty_per_crank");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 9].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "keeper_bounty_per_crank");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].2, 8);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 9].2
-                + VAULT_FIELDS[VAULT_FIELDS.len() - 8].2,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 10].2
+                + VAULT_FIELDS[VAULT_FIELDS.len() - 9].2,
             KEEPER_BOUNTY_TAIL_LEN
         );
         // AV-126: the slash-ladder tail — the 114-byte opt-in ladder
@@ -31100,43 +31321,43 @@ mod dutch_auction_tests {
         // counter trails it; AV-128: the TWAP-gate region trails that;
         // AV-130: the dual-control tail trails that; AV-131: the
         // disputed-amount counter is the new absolute tail.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "slash_ladder");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].1, "Option<SlashLadder>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 1 + SLASH_LADDER_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "slash_ladder_index");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].1, "u8");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 1);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "refunded");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].0, "slash_ladder");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].1, "Option<SlashLadder>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 8].2, 1 + SLASH_LADDER_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].0, "slash_ladder_index");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].1, "u8");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 7].2, 1);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].0, "refunded");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 6].2, 8);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 7].2
-                + VAULT_FIELDS[VAULT_FIELDS.len() - 6].2,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 8].2
+                + VAULT_FIELDS[VAULT_FIELDS.len() - 7].2,
             SLASH_LADDER_TAIL_LEN
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 40].0, "swap_link");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 41].0, "swap_link");
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 40].2,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 41].2,
             SWAP_LINK_REGION_LEN
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 41].0, "delegation");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 41].2, DELEGATION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 42].0, "appeal_bond_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 42].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 43].0, "appeal_bond");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 42].0, "delegation");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 42].2, DELEGATION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 43].0, "appeal_bond_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 43].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 44].0, "streaming_fees_accrued");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 44].0, "appeal_bond");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 44].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 45].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 45].0, "streaming_fees_accrued");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 45].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 46].0, "transfer_hook");
-        assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 46].2,
-            TRANSFER_HOOK_REGION_LEN
-        );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 47].0, "auction");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 46].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 46].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 47].0, "transfer_hook");
         assert_eq!(
             VAULT_FIELDS[VAULT_FIELDS.len() - 47].2,
+            TRANSFER_HOOK_REGION_LEN
+        );
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 48].0, "auction");
+        assert_eq!(
+            VAULT_FIELDS[VAULT_FIELDS.len() - 48].2,
             1 + DUTCH_AUCTION_LEN
         );
     }
@@ -31147,7 +31368,7 @@ mod dutch_auction_tests {
         let mut account = vec![0u8; 8 + ESCROW_BODY_LEN];
         account[..8].copy_from_slice(&vault_account_discriminator());
         account[8..].copy_from_slice(&encode_escrow(&e));
-        let tail = 8 + ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
+        let tail = 8 + ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN);
         // Zero-length window: start_at == end_at would divide by zero
         // in `payout_cap`.
         account[tail + 1..tail + 9].copy_from_slice(&END.to_le_bytes());
@@ -31433,7 +31654,7 @@ mod payout_split_tests {
             .with_payout_split(&[(R1, AMOUNT)])
             .unwrap();
         e.fund(ALICE, NOW).unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         assert_eq!(
             e.release_payout_split(ALICE, NOW, None),
             Err(EscrowError::Paused)
@@ -31647,7 +31868,7 @@ mod payout_split_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         // The split region now sits just before the AV-109 deadman
         // tail: count, 8 recipients, 8 amounts.
-        let split_start = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN;
+        let split_start = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN;
         let tail = &bytes[split_start..split_start + PAYOUT_SPLIT_LEN];
         assert_eq!(tail[0], 2, "split_count");
         assert_eq!(&tail[1..33], &R1, "recipient slot 0");
@@ -31667,7 +31888,7 @@ mod payout_split_tests {
         // but `fund` anchored the activity clock (the clock resets on
         // every now-transition whether or not the switch is
         // configured).
-        let ptail = &plain[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
+        let ptail = &plain[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
         assert_eq!(&ptail[..8], &[0u8; 8], "threshold zeroed");
         assert_eq!(ptail[8], 0, "heir discriminant");
         assert_eq!(&ptail[9..41], &[0u8; 32], "heir zeroed");
@@ -31998,7 +32219,7 @@ mod deadman_tests {
         // The deadman tail is the 49 bytes before the AV-110 rent
         // top-up tail: threshold, heir discriminant + key, activity
         // clock.
-        let tail = &bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
+        let tail = &bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
         assert_eq!(&tail[..8], &INACTIVITY.to_le_bytes(), "threshold");
         assert_eq!(tail[8], 1, "heir discriminant");
         assert_eq!(&tail[9..41], &HEIR_KEY, "heir");
@@ -32028,7 +32249,7 @@ mod deadman_tests {
         // clock (the clock resets on every now-transition whether or
         // not the switch is configured).
         let plain = encode_escrow(&funded_plain());
-        let ptail = &plain[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
+        let ptail = &plain[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
         assert_eq!(&ptail[..8], &[0u8; 8], "threshold zeroed");
         assert_eq!(ptail[8], 0, "heir discriminant");
         assert_eq!(&ptail[9..41], &[0u8; 32], "heir zeroed");
@@ -32066,9 +32287,11 @@ mod deadman_tests {
                 + TWAP_GATE_LEN
                 // AV-130: the dual-control (maker-checker) tail was the
                 // absolute tail; AV-131: the disputed-amount tail is
-                // the new absolute tail.
+                // the new absolute tail; AV-133: the auto-unpause tail
+                // is the new absolute tail.
                 + DUAL_CONTROL_TAIL_LEN
                 + DISPUTED_AMOUNT_TAIL_LEN
+                + AUTO_UNPAUSE_TAIL_LEN
         );
     }
 
@@ -32194,7 +32417,7 @@ mod topup_rent_tests {
             .with_pause_authority(ALICE)
             .unwrap();
         e.fund(ALICE, T0).unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         e.top_up_rent(MALLORY, 10_000).unwrap();
         assert_eq!(e.rent_topped_up_total(), 10_000);
         assert_eq!(e.state(), EscrowState::Funded);
@@ -32208,7 +32431,7 @@ mod topup_rent_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         // The counter rides 8 bytes before the AV-111 funding tail at
         // the end of the body.
-        let tail = &bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN..];
+        let tail = &bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN..];
         assert_eq!(&tail[..8], &123_456u64.to_le_bytes());
         let mut account = vec![0u8; 8 + ESCROW_BODY_LEN];
         account[..8].copy_from_slice(&crate::discriminator::vault_account_discriminator());
@@ -32468,7 +32691,7 @@ mod funding_tranche_tests {
             EscrowError::Unauthorized
         );
         e = e.with_pause_authority(ALICE).unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         assert_eq!(
             e.fund_tranche(ALICE, 100_000, T0).unwrap_err(),
             EscrowError::Paused
@@ -32547,7 +32770,7 @@ mod funding_tranche_tests {
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         // funded_total at 57..65, plan discriminant at 65, payload at 66..76.
-        let tail = &bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
+        let tail = &bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN..];
         assert_eq!(&tail[57..65], &400_000u64.to_le_bytes());
         assert_eq!(tail[65], 1, "funding plan Some discriminant");
         assert_eq!(&tail[66..74], &AMOUNT.to_le_bytes(), "total_amount");
@@ -32657,7 +32880,7 @@ mod funding_tranche_tests {
         let mut e = plan_escrow(2);
         e = e.with_pause_authority(ALICE).unwrap();
         e.fund_tranche(ALICE, 400_000, T0).unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         let w = crate::keeper::WatchedEscrow { escrow_id: [0xE5; 32], escrow: e, reference: None, vault_derivation: None, pending_intent: None };
         let report = scan_keeper_actions(&[w], T0 + 1);
         assert!(
@@ -32810,7 +33033,7 @@ mod release_cooling_tests {
             .with_pause_authority(ALICE)
             .unwrap();
         e.fund(ALICE, T0).unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         assert_eq!(
             e.announce_release(ALICE, T0),
             Err(EscrowError::Paused)
@@ -33023,8 +33246,8 @@ mod release_cooling_tests {
         e.announce_release(ALICE, T0).unwrap();
         let bytes = encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506);
-        let tail_at = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN;
+        assert_eq!(bytes.len(), 5515);
+        let tail_at = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN;
         assert_eq!(RELEASE_COOLING_TAIL_LEN, 17);
         assert_eq!(
             &bytes[tail_at..tail_at + 8],
@@ -33051,9 +33274,9 @@ mod release_cooling_tests {
         let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
         e.fund(ALICE, T0).unwrap();
         let bytes = encode_escrow(&e);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         // The cooling tail now sits before the AV-113 price-gate tail.
-        let cooling_at = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN;
+        let cooling_at = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN;
         assert_eq!(
             &bytes[cooling_at..cooling_at + RELEASE_COOLING_TAIL_LEN],
             &[0u8; 17],
@@ -33391,7 +33614,7 @@ mod price_gate_tests {
         // The tail region carries the gate: discriminant 1, direction
         // 0 (AtOrAbove), target, staleness bound. AV-115 appended the
         // escalation tail after it.
-        let gate_at = bytes.len() - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN;
+        let gate_at = bytes.len() - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN;
         let tail = &bytes[gate_at..gate_at + PRICE_GATE_LEN];
         assert_eq!(tail[0], 1);
         assert_eq!(tail[1], 0);
@@ -33410,7 +33633,7 @@ mod price_gate_tests {
         e.fund(ALICE, T0).unwrap();
         let bytes = encode_escrow(&e);
         // AV-115 appended the escalation tail after the gate region.
-        let gate_at = bytes.len() - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN;
+        let gate_at = bytes.len() - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN;
         assert_eq!(&bytes[gate_at..gate_at + PRICE_GATE_LEN], &[0u8; PRICE_GATE_LEN]);
         let d = decode_vault_account(&with_discriminator(&bytes)).expect("decodes");
         assert_eq!(d.price_gate(), None);
@@ -33428,7 +33651,7 @@ mod price_gate_tests {
         // compound-interest tail, AV-119 the dispute-interest tail,
         // AV-121 the claim-cooldown tail, and AV-122 the counter-offer
         // tail).
-        let dir_at = 8 + bytes.len() - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN + 1;
+        let dir_at = 8 + bytes.len() - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN + 1;
         account[dir_at] = 0xFF;
         assert_eq!(
             decode_vault_account(&account),
@@ -33889,7 +34112,7 @@ mod twap_gate_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         // The TWAP gate is the absolute tail: discriminant 1, direction
         // 0 (AtOrAbove), target, window, staleness bound.
-        let gate_at = bytes.len() - DISPUTED_AMOUNT_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN;
+        let gate_at = bytes.len() - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN;
         let tail = &bytes[gate_at..gate_at + TWAP_GATE_LEN];
         assert_eq!(tail[0], 1);
         assert_eq!(tail[1], 0);
@@ -33908,7 +34131,7 @@ mod twap_gate_tests {
         let e = gated_escrow(floor_gate());
         let mut account = with_discriminator(&encode_escrow(&e));
         // Corrupt the direction byte (second byte of the tail region).
-        let dir_at = account.len() - DISPUTED_AMOUNT_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN + 1;
+        let dir_at = account.len() - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN + 1;
         account[dir_at] = 0xFF;
         assert_eq!(
             decode_vault_account(&account),
@@ -34161,7 +34384,7 @@ mod merge_escrows_tests {
             .unwrap();
         let mut target = target;
         target.fund(ALICE, T0).unwrap();
-        target.pause(ALICE).unwrap();
+        target.pause(ALICE, None).unwrap();
         assert_eq!(
             target.merge_escrows(&mut source, ALICE),
             Err(EscrowError::Paused)
@@ -34172,7 +34395,7 @@ mod merge_escrows_tests {
             .with_pause_authority(ALICE)
             .unwrap();
         source2p.fund(ALICE, T0).unwrap();
-        source2p.pause(ALICE).unwrap();
+        source2p.pause(ALICE, None).unwrap();
         assert_eq!(
             target2.merge_escrows(&mut source2p, ALICE),
             Err(EscrowError::Paused)
@@ -35215,7 +35438,7 @@ mod vesting_curve_tests {
         // the AV-96 denylist (130 bytes) plus the AV-97 auction
         // region (19 bytes) trail everything: discriminant 1,
         // tier-count 2, then the two live tiers.
-        let base = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42 - (1 + VESTING_CURVE_LEN);
+        let base = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42 - (1 + VESTING_CURVE_LEN);
         assert_eq!(bytes[base], 1, "curve: Some discriminant");
         assert_eq!(bytes[base + 1], 2, "curve: tier count");
         assert_eq!(
@@ -36915,7 +37138,7 @@ mod adjust_milestone_amounts_tests {
             .with_milestones(plan_3())
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         assert_eq!(
             e.adjust_milestone_amounts(ALICE, BOB, &[500_000, 250_000, 250_000]),
             Err(EscrowError::Paused)
@@ -37196,7 +37419,7 @@ mod adjust_period_amounts_tests {
             .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         assert_eq!(
             e.adjust_period_amounts(ALICE, BOB, &[400_000, 300_000, 200_000, 100_000]),
             Err(EscrowError::Paused)
@@ -37506,7 +37729,7 @@ mod migrate_schema_tests {
             .with_pause_authority(PAUSE_AUTH)
             .unwrap();
         e.schema_version = 0;
-        e.pause(PAUSE_AUTH).unwrap();
+        e.pause(PAUSE_AUTH, None).unwrap();
         // The pause guard fires before the authority check: even the
         // initializer cannot migrate a paused escrow.
         assert_eq!(e.migrate_schema(ALICE), Err(EscrowError::Paused));
@@ -37521,7 +37744,7 @@ mod migrate_schema_tests {
         // region, the slash region and the CPI allowlist trail it);
         // every earlier offset stays stable, and the carry-over is
         // still a byte-prefix copy.
-        let version_at = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        let version_at = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         let e = v0_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
@@ -37840,7 +38063,7 @@ mod migrate_schema_tests {
             .with_pause_authority(PAUSE_AUTH)
             .unwrap();
         e.schema_version = 0;
-        e.pause(PAUSE_AUTH).unwrap();
+        e.pause(PAUSE_AUTH, None).unwrap();
         // The pause guard fires before the authority check, like the
         // real migration.
         assert_eq!(e.migrate_dry_run(ALICE), Err(EscrowError::Paused));
@@ -38402,7 +38625,7 @@ mod evidence_merkle_tests {
         e3.fund(ALICE, T0).unwrap();
         let (root3, proofs3) = build_tree(&docs);
         e3.escalate(ALICE, T0 + 1, e3.remaining_amount(), None, Some(root3), 2).unwrap();
-        e3.pause(ALICE).unwrap();
+        e3.pause(ALICE, None).unwrap();
         assert_eq!(
             e3.file_evidence(ALICE, docs[0], 0, &proofs3[0], T0 + 3),
             Err(EscrowError::Paused)
@@ -38487,7 +38710,7 @@ mod evidence_merkle_tests {
         // AV-97 auction region (19 bytes) are appended after it now:
         // 1-byte discriminant + 32-byte root, then the leaf-count
         // byte, then the u64-LE disclosure bitmap with bit 0 set.
-        let base = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42;
+        let base = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - 42;
         assert_eq!(bytes[base], 1, "evidence_root: Some discriminant");
         assert_eq!(&bytes[base + 1..base + 33], &root, "evidence_root bytes");
         assert_eq!(bytes[base + 33], 2, "evidence_leaves");
@@ -38986,11 +39209,11 @@ mod dispute_amount_tests {
     #[test]
     fn disputed_amount_layout_is_pinned() {
         assert_eq!(DISPUTED_AMOUNT_TAIL_LEN, 8);
-        assert_eq!(ESCROW_BODY_LEN, 5506, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 5514, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5024, "no-quorum Vault account space");
-        // (128 + 5514) * 3480 * 2 = 5642 * 6960 = 39_268_320 lamports.
-        assert_eq!(vault_close_rent_reclaimed(), 39_268_320);
+        assert_eq!(ESCROW_BODY_LEN, 5515, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 5523, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5033, "no-quorum Vault account space");
+        // (128 + 5523) * 3480 * 2 = 5651 * 6960 = 39_330_960 lamports.
+        assert_eq!(vault_close_rent_reclaimed(), 39_330_960);
     }
 }
 
@@ -39183,7 +39406,7 @@ mod panel_threshold_tests {
             .unwrap()
             .with_pause_authority(ALICE)
             .unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         assert_eq!(
             e.update_panel_threshold(ALICE, BOB, 1),
             Err(EscrowError::Paused)
@@ -39314,7 +39537,7 @@ mod rationale_tests {
         e.resolve(ARBITER, 600_000, 0, None, Some(RATIONALE_HASH), BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) + 37 (AV-104 authority delegation) + 33 (AV-105 atomic swap link) + 33 (AV-106 penalty insurance pool) + 26 (AV-107 interest-bearing tail) + 321 (AV-108 payout split) + 49 (AV-109 dead-man's switch) + 8 (AV-110 rent top-up counter) + 19 (AV-111 tranched-funding tail) + 17 (AV-112 release-cooling tail) + 18 (AV-113 oracle price-gate tail) + 4 (AV-115 penalty escalation tail) + 16 (AV-116 slot timelock tail) + 8 (AV-119 dispute-interest tail) + 17 (AV-121 claim-cooldown tail) + 17 (AV-122 counter-offer tail) + 8 (AV-123 gasless intent nonce) + 16 (AV-124 keeper-bounty tail) + 115 (AV-126 slash-ladder tail) + 8 (AV-127 refunded counter) + 26 (AV-128 TWAP-gate tail) + 123 (AV-130 dual-control tail) + 8 (AV-131 disputed-amount tail) bytes");
+        assert_eq!(bytes.len(), 5515, "body grew by 33 (AV-38) + 1 (AV-41) + 33 (AV-44) + 71 (AV-45) + 34 (AV-46) + 130 (AV-49) + 8 (AV-51) + 33 (AV-53) + 26 (AV-55) + 27 (AV-56) + 1163 (AV-57) + 16 (AV-59) + 8 (AV-63) + 16 (AV-64) + 595 (AV-65) + 81 (AV-66) + 41 (AV-68) + 512 (AV-73) + 1 (AV-75) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 258 (AV-83 CPI allowlist) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) + 37 (AV-104 authority delegation) + 33 (AV-105 atomic swap link) + 33 (AV-106 penalty insurance pool) + 26 (AV-107 interest-bearing tail) + 321 (AV-108 payout split) + 49 (AV-109 dead-man's switch) + 8 (AV-110 rent top-up counter) + 19 (AV-111 tranched-funding tail) + 17 (AV-112 release-cooling tail) + 18 (AV-113 oracle price-gate tail) + 4 (AV-115 penalty escalation tail) + 16 (AV-116 slot timelock tail) + 8 (AV-119 dispute-interest tail) + 17 (AV-121 claim-cooldown tail) + 17 (AV-122 counter-offer tail) + 8 (AV-123 gasless intent nonce) + 16 (AV-124 keeper-bounty tail) + 115 (AV-126 slash-ladder tail) + 8 (AV-127 refunded counter) + 26 (AV-128 TWAP-gate tail) + 123 (AV-130 dual-control tail) + 8 (AV-131 disputed-amount tail) bytes");
         // All offsets from decimals on sit 8 bytes past the pre-AV-51
         // layout: the vesting schedule grew by the cliff_at u64.
         assert_eq!(bytes[695], 0, "decimals offset");
@@ -39339,7 +39562,7 @@ mod rationale_tests {
         let mut e = disputed_escrow();
         e.resolve(ARBITER, 600_000, 0, None, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         assert_eq!(bytes[696], 0, "rationale_hash: None discriminant");
         assert_eq!(&bytes[697..729], &[0u8; 32], "rationale_hash: zeroed");
         assert_eq!(bytes[730], 0, "fee_recipient: None discriminant");
@@ -39361,18 +39584,18 @@ mod rationale_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5514) * 3480 * 2 = 5642 * 6960 = 39_268_320 lamports.
-        assert_eq!(VAULT_SPACE, 5514);
-        assert_eq!(full, 39_268_320);
+        // (128 + 5523) * 3480 * 2 = 5651 * 6960 = 39_330_960 lamports.
+        assert_eq!(VAULT_SPACE, 5523);
+        assert_eq!(full, 39_330_960);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5024) * 3480 * 2 = 5152 * 6960 = 35_857_920 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5024);
-        assert_eq!(no_quorum, 35_857_920);
+        // (128 + 5033) * 3480 * 2 = 5161 * 6960 = 35_920_560 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5033);
+        assert_eq!(no_quorum, 35_920_560);
     }
 
     /// Prepend the 8-byte Anchor discriminator: the exact input
@@ -39516,7 +39739,7 @@ mod reference_tests {
         let e = referenced();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         assert_eq!(bytes[927], 1, "reference: Some discriminant");
         assert_eq!(&bytes[928..960], &ORDER_REF, "reference bytes");
         // Earlier tail offsets are untouched by the append.
@@ -39531,7 +39754,7 @@ mod reference_tests {
         // other `None` tail field.
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         assert_eq!(bytes[927], 0, "reference: None discriminant");
         assert_eq!(&bytes[928..960], &[0u8; 32], "reference: zeroed");
     }
@@ -39562,18 +39785,18 @@ mod reference_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5514) * 3480 * 2 = 5642 * 6960 = 39_268_320 lamports.
-        assert_eq!(VAULT_SPACE, 5514);
-        assert_eq!(full, 39_268_320);
+        // (128 + 5523) * 3480 * 2 = 5651 * 6960 = 39_330_960 lamports.
+        assert_eq!(VAULT_SPACE, 5523);
+        assert_eq!(full, 39_330_960);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5024) * 3480 * 2 = 5152 * 6960 = 35_857_920 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5024);
-        assert_eq!(no_quorum, 35_857_920);
+        // (128 + 5033) * 3480 * 2 = 5161 * 6960 = 35_920_560 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5033);
+        assert_eq!(no_quorum, 35_920_560);
     }
 
     #[test]
@@ -40211,7 +40434,7 @@ mod escalation_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         // The tail grew by exactly 4 bytes: rate at [5131..5133], cap
         // at [5133..5135].
         assert_eq!(
@@ -40667,7 +40890,7 @@ mod emergency_unlock_tests {
             .with_emergency_unlock()
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&opted);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         assert_eq!(bytes[729], 1, "emergency_unlock: opt-in byte set");
         assert_eq!(
             u64::from_le_bytes(bytes[687..695].try_into().unwrap()),
@@ -40842,7 +41065,7 @@ mod decimals_tests {
         let e = initialized().with_decimals(9).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(ESCROW_BODY_LEN, 5506, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region, 82 by AV-90 vesting curve, 42 by AV-91 evidence commitment region, 386 by AV-95 basket, 19 by AV-97 auction, 33 by AV-99 transfer hook, 16 by AV-100 streaming fee, 16 by AV-103 appeal bond + 37 by AV-104 authority delegation + 33 by AV-105 atomic swap link + 33 by AV-106 penalty insurance pool + 26 by AV-107 interest-bearing tail + 321 by AV-108 payout split + 49 by AV-109 deadman tail + 8 by AV-110 rent top-up counter + 19 by AV-111 tranched-funding tail + 17 by AV-112 release-cooling tail + 18 by AV-113 oracle price-gate tail + 4 by AV-115 penalty escalation tail + 16 by AV-116 slot-timelock tail + 9 by AV-117 compound-interest tail + 8 by AV-119 dispute-interest tail + 17 by AV-121 claim-cooldown tail + 17 by AV-122 counter-offer tail + 8 by AV-123 gasless intent nonce + 16 by AV-124 keeper-bounty tail + 115 by AV-126 slash-ladder tail + 8 by AV-127 refunded counter");
+        assert_eq!(ESCROW_BODY_LEN, 5515, "33 bytes appended by AV-38, 1 by AV-41, 33 by AV-44, 71 by AV-45, 34 by AV-46, 130 by AV-49, 8 by AV-51, 33 by AV-53, 26 by AV-55, 1163 by AV-57, 16 by AV-59, 8 by AV-63, 16 by AV-64, 595 by AV-65, 81 by AV-66, 41 by AV-68, 512 by AV-73, 1 by AV-75, 41 by AV-82 slash terms, 8 by AV-82 penalty counter, 258 by AV-83 CPI allowlist, 67 by AV-84 multisig authority, 26 by AV-86 appeal window region, 82 by AV-90 vesting curve, 42 by AV-91 evidence commitment region, 386 by AV-95 basket, 19 by AV-97 auction, 33 by AV-99 transfer hook, 16 by AV-100 streaming fee, 16 by AV-103 appeal bond + 37 by AV-104 authority delegation + 33 by AV-105 atomic swap link + 33 by AV-106 penalty insurance pool + 26 by AV-107 interest-bearing tail + 321 by AV-108 payout split + 49 by AV-109 deadman tail + 8 by AV-110 rent top-up counter + 19 by AV-111 tranched-funding tail + 17 by AV-112 release-cooling tail + 18 by AV-113 oracle price-gate tail + 4 by AV-115 penalty escalation tail + 16 by AV-116 slot-timelock tail + 9 by AV-117 compound-interest tail + 8 by AV-119 dispute-interest tail + 17 by AV-121 claim-cooldown tail + 17 by AV-122 counter-offer tail + 8 by AV-123 gasless intent nonce + 16 by AV-124 keeper-bounty tail + 115 by AV-126 slash-ladder tail + 8 by AV-127 refunded counter");
         assert_eq!(bytes[695], 9, "decimals tail offset");
         // The timelock offset shifts +8 with the AV-51 vesting cliff.
         assert_eq!(
@@ -40860,34 +41083,34 @@ mod decimals_tests {
 
     #[test]
     fn rent_accounts_for_the_extra_byte() {
-        // (128 + 5514) * 3480 * 2 = 5642 * 6960 = 39_268_320 lamports.
+        // (128 + 5523) * 3480 * 2 = 5651 * 6960 = 39_330_960 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            39_268_320
+            39_330_960
         );
-        // (128 + 5024) * 3480 * 2 = 5152 * 6960 = 35_857_920 lamports.
+        // (128 + 5033) * 3480 * 2 = 5161 * 6960 = 35_920_560 lamports.
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE_NO_QUORUM,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            35_857_920
+            35_920_560
         );
-        // 1974 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
+        // 1983 bytes' rent above the AV-28 numbers (AV-38 rationale hash +
         // AV-41 emergency-unlock opt-in byte + AV-44 fee-recipient pin +
         // AV-45 quorum weights + AV-46 pause switch + AV-51 vesting cliff
         // + AV-53 off-chain reference memo + AV-55 default judgment +
         // AV-56 subscription schedule + AV-57 event-history ring +
         // AV-104 authority delegation + AV-105 atomic swap link +
         // AV-124 keeper-bounty tail).
-        assert_eq!(VAULT_SPACE, 5514);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5024);
-        assert!(check_vault_rent_exempt(39_268_320, 3_480, 2.0).is_ok());
+        assert_eq!(VAULT_SPACE, 5523);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5033);
+        assert!(check_vault_rent_exempt(39_330_960, 3_480, 2.0).is_ok());
         assert!(check_vault_rent_exempt(6_437_999, 3_480, 2.0).is_err());
     }
 
@@ -41644,7 +41867,7 @@ mod pause_tests {
     fn paused_funded() -> Escrow {
         let mut e = pausable();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert!(e.is_paused());
         e
     }
@@ -41669,7 +41892,7 @@ mod pause_tests {
         assert!(!e.is_paused());
         // No switch: pause / unpause fail as an illegal transition,
         // not as an authorization error.
-        assert_eq!(e.pause(PAUSER), Err(EscrowError::InvalidStateTransition));
+        assert_eq!(e.pause(PAUSER, None), Err(EscrowError::InvalidStateTransition));
         assert_eq!(e.unpause(PAUSER), Err(EscrowError::InvalidStateTransition));
     }
 
@@ -41709,16 +41932,16 @@ mod pause_tests {
     #[test]
     fn pause_rejects_stranger_with_unauthorized() {
         let mut e = pausable();
-        assert_eq!(e.pause(MALLORY), Err(EscrowError::Unauthorized));
+        assert_eq!(e.pause(MALLORY, None), Err(EscrowError::Unauthorized));
         assert!(!e.is_paused());
     }
 
     #[test]
     fn pause_is_a_strict_toggle() {
         let mut e = pausable();
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert_eq!(
-            e.pause(PAUSER),
+            e.pause(PAUSER, None),
             Err(EscrowError::InvalidStateTransition),
             "pausing a paused escrow is not a no-op"
         );
@@ -41734,7 +41957,7 @@ mod pause_tests {
     #[test]
     fn unpause_rejects_stranger_with_unauthorized() {
         let mut e = pausable();
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert_eq!(e.unpause(MALLORY), Err(EscrowError::Unauthorized));
         assert!(e.is_paused(), "a stranger cannot lift the pause");
     }
@@ -41744,7 +41967,7 @@ mod pause_tests {
         // The switch works even Uninitialized, so an operator can freeze
         // an escrow before it is funded.
         let mut e = pausable();
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert_eq!(e.state(), EscrowState::Uninitialized);
         assert!(e.is_paused());
     }
@@ -41754,7 +41977,7 @@ mod pause_tests {
     #[test]
     fn paused_blocks_fund_and_release() {
         let mut e = pausable();
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert_paused(e.fund(ALICE, EXPIRES_AT - 3_600));
         assert_eq!(e.state(), EscrowState::Uninitialized);
 
@@ -41793,7 +42016,7 @@ mod pause_tests {
             .with_quorum(QuorumPolicy::new(&[ATTESTOR], &[1], 1).unwrap())
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert_paused(e.attest(ATTESTOR));
     }
 
@@ -41805,7 +42028,7 @@ mod pause_tests {
             .with_vesting(VestingSchedule::new(NOW - 100, NOW + 100).unwrap())
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert_paused(e.claim(BOB, NOW, None, BOB));
     }
 
@@ -41827,7 +42050,7 @@ mod pause_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert_paused(e.escalate(ALICE, NOW, e.remaining_amount(), None, None, 0));
         // And resolve on an already-disputed escrow.
         let mut e2 = base()
@@ -41837,7 +42060,7 @@ mod pause_tests {
             .unwrap();
         e2.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         e2.escalate(ALICE, NOW, e2.remaining_amount(), None, None, 0).unwrap();
-        e2.pause(PAUSER).unwrap();
+        e2.pause(PAUSER, None).unwrap();
         assert_paused(e2.resolve(ARBITER, 600_000, NOW, None, None, BOB));
         assert_eq!(e2.state(), EscrowState::Disputed);
     }
@@ -41851,7 +42074,7 @@ mod pause_tests {
             .with_milestones(plan)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert_paused(e.confirm_milestone(ALICE, 0));
         assert_paused(e.skip_milestone(ALICE, 0));
         assert_paused(e.release_milestone(ALICE, NOW, 0, None, BOB));
@@ -41865,7 +42088,7 @@ mod pause_tests {
             .with_quorum(QuorumPolicy::new(&[ATTESTOR], &[1], 1).unwrap())
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert_paused(e.update_quorum(ALICE, BOB, 1));
         assert_paused(e.update_attestors(ALICE, BOB, &[ATTESTOR_2], &[7]));
     }
@@ -41880,7 +42103,7 @@ mod pause_tests {
             .with_emergency_unlock()
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert_paused(e.emergency_unlock(ALICE, BOB));
         assert_ne!(e.unlock_at(), 0, "the timelock survives the rejected call");
     }
@@ -41892,7 +42115,7 @@ mod pause_tests {
             .unwrap()
             .with_dual_sig()
             .unwrap();
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert_paused(e.activate(ALICE));
     }
 
@@ -41902,7 +42125,7 @@ mod pause_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         e.release(ALICE, NOW, 1_000_000, None, BOB).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert_paused(e.close_vault(ALICE));
         assert_eq!(e.state(), EscrowState::Released);
     }
@@ -41915,7 +42138,7 @@ mod pause_tests {
         e.release(ALICE, NOW, 1_000_000, None, BOB).unwrap();
         assert_eq!(e.state(), EscrowState::Released);
         // The switch survives the lifecycle: it can be re-engaged later.
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert!(e.is_paused());
     }
 
@@ -41942,7 +42165,7 @@ mod pause_tests {
             .with_pause_authority(PAUSER)
             .unwrap();
         let base_events = e.events().len();
-        e.pause(PAUSER, T0 + 1).unwrap();
+        e.pause(PAUSER, None, T0 + 1).unwrap();
         let ev = *e.events().last().unwrap();
         assert_eq!(ev.kind, EscrowEventKind::Paused);
         assert_eq!(
@@ -41968,10 +42191,10 @@ mod pause_tests {
             .with_pause_authority(PAUSER)
             .unwrap();
         let base_events = e.events().len();
-        assert_eq!(e.pause(MALLORY, T0 + 1), Err(EscrowError::Unauthorized));
+        assert_eq!(e.pause(MALLORY, None, T0 + 1), Err(EscrowError::Unauthorized));
         assert_eq!(e.events().len(), base_events, "a rejected pause is silent");
         // A blocked transition is silent too — only the switch flips emit.
-        e.pause(PAUSER, T0 + 1).unwrap();
+        e.pause(PAUSER, None, T0 + 1).unwrap();
         let after_pause = e.events().len();
         assert_eq!(e.fund(ALICE, T0 + 2), Err(EscrowError::Paused));
         assert_eq!(e.events().len(), after_pause);
@@ -42025,6 +42248,84 @@ mod pause_tests {
         assert_eq!(decoded.pause_authority(), Some(PAUSER));
         assert!(!decoded.is_paused());
     }
+
+    // ----- AV-133: scheduled auto-recovery -----
+
+    #[test]
+    fn auto_unpause_fires_when_clock_reaches_schedule() {
+        let mut e = pausable();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.pause(PAUSER, Some(T0 + 100)).unwrap();
+        assert!(e.is_paused());
+        assert_eq!(e.auto_unpause_at(), Some(T0 + 100));
+        // Before the schedule: no fire, still paused.
+        assert!(!e.try_auto_unpause(T0 + 99), "no fire before schedule");
+        assert!(e.is_paused());
+        assert_eq!(e.auto_unpause_at(), Some(T0 + 100), "schedule intact");
+        // At the schedule: fires.
+        assert!(e.try_auto_unpause(T0 + 100), "fires at now == t");
+        assert!(!e.is_paused());
+        assert_eq!(e.auto_unpause_at(), None, "schedule consumed");
+    }
+
+    #[test]
+    fn auto_unpause_does_not_fire_twice() {
+        let mut e = pausable();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.pause(PAUSER, Some(T0 + 100)).unwrap();
+        assert!(e.try_auto_unpause(T0 + 200));
+        assert!(!e.try_auto_unpause(T0 + 300), "schedule consumed, no second fire");
+    }
+
+    #[test]
+    fn none_schedule_means_manual_unpause_only() {
+        let mut e = pausable();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.pause(PAUSER, None).unwrap();
+        assert!(!e.try_auto_unpause(u64::MAX), "None schedule never fires");
+        assert!(e.is_paused());
+        e.unpause(PAUSER).unwrap();
+        assert!(!e.is_paused());
+    }
+
+    #[test]
+    fn manual_unpause_clears_armed_schedule() {
+        let mut e = pausable();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.pause(PAUSER, Some(T0 + 100)).unwrap();
+        e.unpause(PAUSER).unwrap();
+        assert_eq!(e.auto_unpause_at(), None, "manual unpause clears schedule");
+        assert!(!e.is_paused());
+    }
+
+    #[test]
+    fn state_changing_path_auto_recovers_before_paused_gate() {
+        let mut e = pausable();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.pause(PAUSER, Some(T0 + 100)).unwrap();
+        // A state-changing path at now >= t auto-recovers instead of
+        // failing with Paused. Use release (valid on funded escrow).
+        e.release(ALICE, T0 + 100, 100_000, None, BOB).unwrap();
+        assert!(!e.is_paused(), "auto-recovered");
+        assert_eq!(e.auto_unpause_at(), None);
+    }
+
+    #[test]
+    fn indexed_escrow_emits_unpaused_auto_true_on_recovery() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0).unwrap();
+        e = e.with_pause_authority(PAUSER).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.pause(PAUSER, Some(T0 + 100), T0 + 10).unwrap();
+        let base = e.events().len();
+        // Trigger a state-changing path at now >= t: release works on a
+        // funded escrow and would fail with Paused if not recovered.
+        e.release(ALICE, 100_000, None, BOB, T0 + 100).unwrap();
+        let events = e.events();
+        assert_eq!(events.len(), base + 2, "Unpaused{{auto:true}} + Released");
+        let unpaused = &events[base];
+        assert_eq!(unpaused.kind, EscrowEventKind::Unpaused);
+        assert!(unpaused.auto_unpause, "auto flag set");
+    }
 }
 
 // ----- AV-47: pause-authority rotation matrix (Solana governance) -----
@@ -42063,10 +42364,10 @@ mod pause_rotation_tests {
         assert_eq!(e.pause_authority(), Some(PAUSER2));
         // The old key is dead immediately: it can neither pause nor
         // unpause anymore.
-        assert_eq!(e.pause(MALLORY), Err(EscrowError::Unauthorized));
-        assert_eq!(e.pause(PAUSER), Err(EscrowError::Unauthorized));
+        assert_eq!(e.pause(MALLORY, None), Err(EscrowError::Unauthorized));
+        assert_eq!(e.pause(PAUSER, None), Err(EscrowError::Unauthorized));
         // The new key owns the switch.
-        e.pause(PAUSER2).unwrap();
+        e.pause(PAUSER2, None).unwrap();
         assert!(e.is_paused());
         assert_eq!(e.unpause(PAUSER), Err(EscrowError::Unauthorized));
         e.unpause(PAUSER2).unwrap();
@@ -42146,7 +42447,7 @@ mod pause_rotation_tests {
         e.rotate_pause_authority(ALICE, PAUSER).unwrap();
         assert_eq!(e.pause_authority(), Some(PAUSER));
         // The old (same) key still owns the switch.
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         e.unpause(PAUSER).unwrap();
     }
 
@@ -42157,7 +42458,7 @@ mod pause_rotation_tests {
         // paused* — the one governance call the pause gate does not
         // block — then unpauses with the fresh key.
         let mut e = funded_pausable();
-        e.pause(PAUSER).unwrap();
+        e.pause(PAUSER, None).unwrap();
         assert!(e.is_paused());
         // While paused, ordinary transitions fail fast...
         assert_eq!(
@@ -42241,7 +42542,7 @@ mod pause_rotation_tests {
         let mut e = pausable();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         e.rotate_pause_authority(ALICE, PAUSER2).unwrap();
-        e.pause(PAUSER2).unwrap();
+        e.pause(PAUSER2, None).unwrap();
         assert_eq!(
             e.release(ALICE, NOW, 500_000, None, BOB).map(|_| ()),
             Err(EscrowError::Paused)
@@ -42467,7 +42768,7 @@ mod taker_rotation_tests {
             .with_pause_authority([0xDD; 32])
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause([0xDD; 32]).unwrap();
+        e.pause([0xDD; 32], None).unwrap();
         assert_eq!(
             e.rotate_taker(ALICE, BOB, CAROL),
             Err(EscrowError::Paused)
@@ -42767,7 +43068,7 @@ mod initializer_rotation_tests {
             .with_pause_authority([0xDD; 32])
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause([0xDD; 32]).unwrap();
+        e.pause([0xDD; 32], None).unwrap();
         assert_eq!(
             e.rotate_initializer(ALICE, BOB, CAROL),
             Err(EscrowError::Paused)
@@ -43105,7 +43406,7 @@ mod arbiter_rotation_tests {
             .with_arbiter(ARBITER)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause([0xDD; 32]).unwrap();
+        e.pause([0xDD; 32], None).unwrap();
         assert_eq!(
             e.rotate_arbiter(ALICE, BOB, NEW_ARBITER),
             Err(EscrowError::Paused)
@@ -43493,7 +43794,7 @@ mod fee_recipient_rotation_tests {
             .unwrap()
             .with_pause_authority(DAVE)
             .unwrap();
-        e.pause(DAVE).unwrap();
+        e.pause(DAVE, None).unwrap();
         assert_eq!(
             e.rotate_fee_recipient(ALICE, BOB, NEW_RECIPIENT),
             Err(EscrowError::Paused)
@@ -43795,7 +44096,7 @@ mod extension_tests {
             .with_pause_authority([0xDD; 32])
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause([0xDD; 32]).unwrap();
+        e.pause([0xDD; 32], None).unwrap();
         assert_eq!(
             e.extend_expiry(ALICE, EXPIRES_AT + 1, T0),
             Err(EscrowError::Paused)
@@ -43862,9 +44163,9 @@ mod extension_tests {
         e.extend_expiry(ALICE, EXPIRES_AT + 7_200, T0).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) + 37 (AV-104 authority delegation) + 33 (AV-105 atomic swap link) + 33 (AV-106 penalty insurance pool) + 321 (AV-108 payout split) + 49 (AV-109 dead-man's switch) + 8 (AV-110 rent top-up counter) + 19 (AV-111 tranched-funding tail) + 17 (AV-112 release-cooling tail) + 18 (AV-113 oracle price-gate tail) + 4 (AV-115 penalty escalation tail) + 16 (AV-116 slot timelock tail) + 9 (AV-117 compound-interest tail) + 8 (AV-119 dispute-interest tail) + 17 (AV-121 claim-cooldown tail) + 17 (AV-122 counter-offer tail) + 8 (AV-123 gasless intent nonce) + 16 (AV-124 keeper-bounty tail) + 115 (AV-126 slash-ladder tail) + 8 (AV-127 refunded counter) + 26 (AV-128 TWAP-gate tail) + 123 (AV-130 dual-control tail) + 8 (AV-131 disputed-amount tail)");
-        assert_eq!(VAULT_SPACE, 5514);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5024);
+        assert_eq!(bytes.len(), 5515, "body 2216 + 595 (AV-65 arbiter panel) + 81 (AV-66 fee schedule) + 41 (AV-68 evidence deadline) + 512 (AV-73 per-period table) + 1 (AV-75 schema version) + 41 (AV-82 slash terms) + 8 (AV-82 penalty counter) + 67 (AV-84 multisig authority) + 26 (AV-86 appeal window region) + 82 (AV-90 vesting curve) + 42 (AV-91 evidence Merkle commitment) + 386 (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction) + 33 (AV-99 transfer hook) + 16 (AV-100 streaming fee) + 16 (AV-103 appeal bond) + 37 (AV-104 authority delegation) + 33 (AV-105 atomic swap link) + 33 (AV-106 penalty insurance pool) + 321 (AV-108 payout split) + 49 (AV-109 dead-man's switch) + 8 (AV-110 rent top-up counter) + 19 (AV-111 tranched-funding tail) + 17 (AV-112 release-cooling tail) + 18 (AV-113 oracle price-gate tail) + 4 (AV-115 penalty escalation tail) + 16 (AV-116 slot timelock tail) + 9 (AV-117 compound-interest tail) + 8 (AV-119 dispute-interest tail) + 17 (AV-121 claim-cooldown tail) + 17 (AV-122 counter-offer tail) + 8 (AV-123 gasless intent nonce) + 16 (AV-124 keeper-bounty tail) + 115 (AV-126 slash-ladder tail) + 8 (AV-127 refunded counter) + 26 (AV-128 TWAP-gate tail) + 123 (AV-130 dual-control tail) + 8 (AV-131 disputed-amount tail)");
+        assert_eq!(VAULT_SPACE, 5523);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5033);
         let body_tail = &bytes[2176..];
         assert_eq!(
             u64::from_le_bytes(body_tail[0..8].try_into().unwrap()),
@@ -44109,7 +44410,7 @@ mod default_judgment_tests {
             .unwrap()
             .with_pause_authority([0xDD; 32])
             .unwrap();
-        e.pause([0xDD; 32]).unwrap();
+        e.pause([0xDD; 32], None).unwrap();
         assert_eq!(
             e.confirm_default_judgment(BOB),
             Err(EscrowError::Paused)
@@ -44363,7 +44664,7 @@ mod default_judgment_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let disputed_at = EXPIRES_AT - 10_000;
         e.escalate(ALICE, disputed_at, e.remaining_amount(), None, None, 0).unwrap();
-        e.pause([0xDD; 32]).unwrap();
+        e.pause([0xDD; 32], None).unwrap();
         assert_eq!(
             e.trigger_default_judgment(ALICE, disputed_at + DEADLINE, None, BOB),
             Err(EscrowError::Paused)
@@ -44417,7 +44718,7 @@ mod default_judgment_tests {
         e.confirm_default_judgment(BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         // Not yet disputed: zeroed timestamp.
         assert_eq!(
             u64::from_le_bytes(bytes[960..968].try_into().unwrap()),
@@ -44986,7 +45287,7 @@ mod subscription_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         // Configured schedule: Some discriminant + the 17-byte terms.
         assert_eq!(bytes[986], 1, "subscription: Some discriminant");
         assert_eq!(
@@ -45491,11 +45792,11 @@ mod event_history_tests {
         assert_eq!(MAX_EVENT_HISTORY, 64);
         assert_eq!(EVENT_HISTORY_LEN, 1 + 8 + 1 + 1 + 64 * 18);
         assert_eq!(EVENT_HISTORY_LEN, 1163);
-        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN + PENALTY_ESCALATION_TAIL_LEN + SLOT_TIMELOCK_TAIL_LEN + COMPOUND_INTEREST_TAIL_LEN + DISPUTE_INTEREST_LEN + CLAIM_COOLDOWN_TAIL_LEN + COUNTER_OFFER_TAIL_LEN + RELEASE_INTENT_TAIL_LEN + KEEPER_BOUNTY_TAIL_LEN + SLASH_LADDER_TAIL_LEN + REFUNDED_TAIL_LEN + TWAP_GATE_LEN + DUAL_CONTROL_TAIL_LEN + DISPUTED_AMOUNT_TAIL_LEN);
+        assert_eq!(ESCROW_BODY_LEN, 1013 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN + PENALTY_ESCALATION_TAIL_LEN + SLOT_TIMELOCK_TAIL_LEN + COMPOUND_INTEREST_TAIL_LEN + DISPUTE_INTEREST_LEN + CLAIM_COOLDOWN_TAIL_LEN + COUNTER_OFFER_TAIL_LEN + RELEASE_INTENT_TAIL_LEN + KEEPER_BOUNTY_TAIL_LEN + SLASH_LADDER_TAIL_LEN + REFUNDED_TAIL_LEN + TWAP_GATE_LEN + DUAL_CONTROL_TAIL_LEN + DISPUTED_AMOUNT_TAIL_LEN + AUTO_UNPAUSE_TAIL_LEN);
         assert_eq!(VAULT_SPACE, 8 + ESCROW_BODY_LEN);
         assert_eq!(
             VAULT_SPACE_NO_QUORUM,
-            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN + PENALTY_ESCALATION_TAIL_LEN + SLOT_TIMELOCK_TAIL_LEN + COMPOUND_INTEREST_TAIL_LEN + DISPUTE_INTEREST_LEN + CLAIM_COOLDOWN_TAIL_LEN + COUNTER_OFFER_TAIL_LEN + RELEASE_INTENT_TAIL_LEN + KEEPER_BOUNTY_TAIL_LEN + SLASH_LADDER_TAIL_LEN + REFUNDED_TAIL_LEN + TWAP_GATE_LEN + DUAL_CONTROL_TAIL_LEN + DISPUTED_AMOUNT_TAIL_LEN
+            531 + EVENT_HISTORY_LEN + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN + PENALTY_ESCALATION_TAIL_LEN + SLOT_TIMELOCK_TAIL_LEN + COMPOUND_INTEREST_TAIL_LEN + DISPUTE_INTEREST_LEN + CLAIM_COOLDOWN_TAIL_LEN + COUNTER_OFFER_TAIL_LEN + RELEASE_INTENT_TAIL_LEN + KEEPER_BOUNTY_TAIL_LEN + SLASH_LADDER_TAIL_LEN + REFUNDED_TAIL_LEN + TWAP_GATE_LEN + DUAL_CONTROL_TAIL_LEN + DISPUTED_AMOUNT_TAIL_LEN + AUTO_UNPAUSE_TAIL_LEN
         );
     }
 
@@ -45512,7 +45813,7 @@ mod event_history_tests {
         e.record_history(EscrowEventKind::Released, T0 + 9, None);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         assert_eq!(bytes[1013], 0, "event_head: still filling");
         assert_eq!(
             u64::from_le_bytes(bytes[1014..1022].try_into().unwrap()),
@@ -45540,7 +45841,7 @@ mod event_history_tests {
         // Slots past the valid window stay zeroed; the tail byte is the
         // last slot's last byte.
         assert_eq!(&bytes[1060..1078], &[0u8; 18], "unused slot zeroed");
-        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN + PENALTY_ESCALATION_TAIL_LEN + SLOT_TIMELOCK_TAIL_LEN + COMPOUND_INTEREST_TAIL_LEN + DISPUTE_INTEREST_LEN + CLAIM_COOLDOWN_TAIL_LEN + COUNTER_OFFER_TAIL_LEN + RELEASE_INTENT_TAIL_LEN + KEEPER_BOUNTY_TAIL_LEN + SLASH_LADDER_TAIL_LEN + REFUNDED_TAIL_LEN + TWAP_GATE_LEN + DUAL_CONTROL_TAIL_LEN + DISPUTED_AMOUNT_TAIL_LEN, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103/AV-104/AV-105/AV-106/AV-107/AV-108/AV-109/AV-110/AV-111/AV-112/AV-113/AV-115/AV-116/AV-117/AV-119/AV-121/AV-122/AV-124/AV-126/AV-127/AV-128/AV-130/AV-131 tail");
+        assert_eq!(bytes.len(), 1024 + 64 * 18 + 16 + 8 + 16 + 595 + 81 + 41 + 512 + 1 + 41 + 8 + 258 + 67 + 26 + 82 + 42 + 386 + 130 + 19 + 33 + 16 + 16 + 37 + 33 + 1 + 8 + 8 + 8 + 8 + 2 + 8 + 8 + 8 + PAYOUT_SPLIT_LEN + DEADMAN_REGION_LEN + RENT_TOP_UP_LEN + FUNDING_TAIL_LEN + RELEASE_COOLING_TAIL_LEN + PRICE_GATE_LEN + PENALTY_ESCALATION_TAIL_LEN + SLOT_TIMELOCK_TAIL_LEN + COMPOUND_INTEREST_TAIL_LEN + DISPUTE_INTEREST_LEN + CLAIM_COOLDOWN_TAIL_LEN + COUNTER_OFFER_TAIL_LEN + RELEASE_INTENT_TAIL_LEN + KEEPER_BOUNTY_TAIL_LEN + SLASH_LADDER_TAIL_LEN + REFUNDED_TAIL_LEN + TWAP_GATE_LEN + DUAL_CONTROL_TAIL_LEN + DISPUTED_AMOUNT_TAIL_LEN + AUTO_UNPAUSE_TAIL_LEN, "AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103/AV-104/AV-105/AV-106/AV-107/AV-108/AV-109/AV-110/AV-111/AV-112/AV-113/AV-115/AV-116/AV-117/AV-119/AV-121/AV-122/AV-124/AV-126/AV-127/AV-128/AV-130/AV-131/AV-133 tail");
     }
 
     #[test]
@@ -45555,18 +45856,18 @@ mod event_history_tests {
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5514) * 3480 * 2 = 5642 * 6960 = 39_268_320 lamports.
-        assert_eq!(VAULT_SPACE, 5514);
-        assert_eq!(full, 39_268_320);
+        // (128 + 5523) * 3480 * 2 = 5651 * 6960 = 39_330_960 lamports.
+        assert_eq!(VAULT_SPACE, 5523);
+        assert_eq!(full, 39_330_960);
         assert_eq!(full, vault_close_rent_reclaimed());
         let no_quorum = rent_exempt_minimum_lamports(
             VAULT_SPACE_NO_QUORUM,
             MAINNET_LAMPORTS_PER_BYTE_YEAR,
             MAINNET_EXEMPTION_THRESHOLD_YEARS,
         );
-        // (128 + 5024) * 3480 * 2 = 5152 * 6960 = 35_857_920 lamports.
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5024);
-        assert_eq!(no_quorum, 35_857_920);
+        // (128 + 5033) * 3480 * 2 = 5161 * 6960 = 35_920_560 lamports.
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5033);
+        assert_eq!(no_quorum, 35_920_560);
     }
 
     // ----- decode -----
@@ -46037,7 +46338,7 @@ mod partial_refund_tests {
             .with_pause_authority(ALICE)
             .expect("pause authority setup");
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         // A paused escrow fails fast — before the authority check.
         assert_eq!(
             e.partial_refund(MALLORY, 100_000, None, ALICE),
@@ -46135,8 +46436,8 @@ mod partial_refund_tests {
         assert_eq!(bytes.len(), super::ESCROW_BODY_LEN);
         // The counter sits just before the AV-128 TWAP-gate tail (the
         // AV-131 disputed-amount tail is the new absolute tail).
-        let tail = &bytes[super::ESCROW_BODY_LEN - super::DISPUTED_AMOUNT_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN
-            ..super::ESCROW_BODY_LEN - super::DISPUTED_AMOUNT_TAIL_LEN - super::DUAL_CONTROL_TAIL_LEN - super::TWAP_GATE_LEN];
+        let tail = &bytes[super::ESCROW_BODY_LEN - super::DISPUTED_AMOUNT_TAIL_LEN - super::AUTO_UNPAUSE_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN
+            ..super::ESCROW_BODY_LEN - super::DISPUTED_AMOUNT_TAIL_LEN - super::AUTO_UNPAUSE_TAIL_LEN - super::DUAL_CONTROL_TAIL_LEN - super::TWAP_GATE_LEN];
         assert_eq!(u64::from_le_bytes(tail.try_into().unwrap()), 250_000);
         // Full-state decode round-trips it.
         let mut full = crate::discriminator::vault_account_discriminator().to_vec();
@@ -46566,17 +46867,17 @@ mod fee_cap_tests {
         // authority) + 26 (AV-86 appeal window region) + 82 (AV-90
         // vesting curve) + 42 (AV-91 evidence commitment) + 386
         // (AV-95 basket) + 130 (AV-96 denylist) + 19 (AV-97 auction).
-        assert_eq!(ESCROW_BODY_LEN, 5506, "escrow payload bytes");
-        assert_eq!(VAULT_SPACE, 5514, "full Vault account space");
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5024, "no-quorum Vault account space");
+        assert_eq!(ESCROW_BODY_LEN, 5515, "escrow payload bytes");
+        assert_eq!(VAULT_SPACE, 5523, "full Vault account space");
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5033, "no-quorum Vault account space");
         assert_eq!(
             rent_exempt_minimum_lamports(
                 VAULT_SPACE,
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            39_268_320,
-            "(128 + 5514) * 3480 * 2 = 5642 * 6960"
+            39_330_960,
+            "(128 + 5523) * 3480 * 2 = 5651 * 6960"
         );
         assert_eq!(
             rent_exempt_minimum_lamports(
@@ -46584,8 +46885,8 @@ mod fee_cap_tests {
                 MAINNET_LAMPORTS_PER_BYTE_YEAR,
                 MAINNET_EXEMPTION_THRESHOLD_YEARS
             ),
-            35_857_920,
-            "(128 + 5024) * 3480 * 2 = 5152 * 6960"
+            35_920_560,
+            "(128 + 5033) * 3480 * 2 = 5161 * 6960"
         );
     }
 
@@ -46597,7 +46898,7 @@ mod fee_cap_tests {
         let e = capped_escrow(7_500);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         assert_eq!(
             u64::from_le_bytes(bytes[2192..2200].try_into().unwrap()),
             7_500,
@@ -47099,8 +47400,8 @@ mod fee_schedule_tests {
         let e = scheduled_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506);
-        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        assert_eq!(bytes.len(), 5515);
+        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(bytes[tail], 3, "tier_count at the tail");
         assert_eq!(
             u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
@@ -47140,7 +47441,7 @@ mod fee_schedule_tests {
         // denylist region (130 bytes) and AV-97 the auction region
         // (19 bytes) after the fee schedule, so the schedule no
         // longer sits at the body tail.
-        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         assert_eq!(
             &bytes[tail..tail + FEE_SCHEDULE_LEN],
             &[0u8; FEE_SCHEDULE_LEN],
@@ -47164,7 +47465,7 @@ mod fee_schedule_tests {
         // denylist region (130 bytes) and AV-97 the auction region
         // (19 bytes) after the fee schedule, so the schedule no
         // longer sits at the body tail.
-        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
+        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - FEE_SCHEDULE_LEN - 8 - (1 + 32);
         bytes[tail] = 9;
         let mut full = vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
@@ -47497,7 +47798,7 @@ mod relative_timelock_tests {
         let e = funded_with_relative_lock();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         assert_eq!(
             u64::from_le_bytes(bytes[2200..2208].try_into().unwrap()),
             LOCK_SECS,
@@ -47794,8 +48095,8 @@ mod relative_timelock_tests {
         // The 16-byte slot tail sits just before the AV-117
         // compound-interest tail (ahead of the AV-119 dispute-interest
         // absolute tail).
-        let tail = &bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN
-            ..ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN];
+        let tail = &bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN
+            ..ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN];
         assert_eq!(
             u64::from_le_bytes(tail[..8].try_into().unwrap()),
             SLOT_LOCK,
@@ -48011,7 +48312,7 @@ mod claim_cooldown_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         // Tail layout: 8-byte duration then 1-byte discriminant +
         // 8-byte slot.
-        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN;
+        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN;
         assert_eq!(
             u64::from_le_bytes(bytes[tail..tail + 8].try_into().unwrap()),
             COOLDOWN,
@@ -48360,7 +48661,7 @@ mod counter_offer_tests {
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
         // Tail layout: 1-byte `Option` discriminant + 8-byte amount +
         // 8-byte expiry.
-        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN;
+        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN;
         assert_eq!(bytes[tail], 1, "counter_offer Some discriminant");
         assert_eq!(
             u64::from_le_bytes(bytes[tail + 1..tail + 9].try_into().unwrap()),
@@ -48386,7 +48687,7 @@ mod counter_offer_tests {
     fn empty_counter_offer_decodes_to_none() {
         let e = funded();
         let bytes = encode_escrow(&e);
-        assert_eq!(bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN], 0, "None discriminant");
+        assert_eq!(bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN], 0, "None discriminant");
         let mut full = crate::discriminator::vault_account_discriminator().to_vec();
         full.extend_from_slice(&bytes);
         let decoded = decode_vault_account(&full).unwrap();
@@ -48587,7 +48888,7 @@ mod release_via_intent_tests {
             .with_pause_authority(init)
             .unwrap();
         e.fund(init, T0).unwrap();
-        e.pause(init).unwrap();
+        e.pause(init, None).unwrap();
         let i = intent(1, 400_000);
         // Pause fails fast — before the signature is even checked.
         assert_eq!(
@@ -48716,7 +49017,7 @@ mod release_via_intent_tests {
         // The 8-byte nonce tail is the new absolute tail.
         let body = encode_escrow(&e);
         assert_eq!(body.len(), ESCROW_BODY_LEN);
-        let nonce_at = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN;
+        let nonce_at = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN;
         assert_eq!(
             u64::from_le_bytes(body[nonce_at..nonce_at + 8].try_into().unwrap()),
             1
@@ -49278,7 +49579,7 @@ mod arbiter_panel_tests {
             .unwrap()
             .with_pause_authority(ARBITER)
             .unwrap();
-        e.pause(ARBITER).unwrap();
+        e.pause(ARBITER, None).unwrap();
         assert_eq!(
             e.with_arbiter_panel(&[M1, M2], 1),
             Err(EscrowError::Paused)
@@ -49288,7 +49589,7 @@ mod arbiter_panel_tests {
         e.with_arbiter_panel(&[M1, M2], 1).unwrap();
 
         let mut d = disputed_panel();
-        d.pause(ARBITER).unwrap_err(); // no pause authority on this one
+        d.pause(ARBITER, None).unwrap_err(); // no pause authority on this one
         let mut p = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_arbiter_panel(&[M1, M2], 2)
@@ -49297,7 +49598,7 @@ mod arbiter_panel_tests {
             .unwrap();
         p.fund(ALICE, T0).unwrap();
         p.escalate(ALICE, T0 + 10, p.remaining_amount(), None, None, 0).unwrap();
-        p.pause(ARBITER).unwrap();
+        p.pause(ARBITER, None).unwrap();
         assert_eq!(
             p.submit_panel_judgment(M1, 600_000, T0 + 10, None, None, BOB),
             Err(EscrowError::Paused)
@@ -49311,7 +49612,7 @@ mod arbiter_panel_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         // AV-91: the evidence-commitment region (33-byte root + 1-byte
         // leaf count + 8-byte disclosure bitmap = 42 bytes) now trails
         // the AV-90 vesting-curve region (82 bytes), which trails the
@@ -49324,7 +49625,7 @@ mod arbiter_panel_tests {
         // trail everything, so the panel region ends 33 + 19 + 130 +
         // 386 + 42 + 82 + 26 + 68 + 258 + 49 + 1 bytes before the end
         // of the buffer.
-        let version_end = bytes.len() - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
+        let version_end = bytes.len() - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1;
         // The panel region trails the AV-73 per-period amount table
         // (512 bytes), the AV-68 evidence-deadline region (41 bytes) and
         // the AV-66 fee-schedule region (81 bytes):
@@ -49361,7 +49662,7 @@ mod arbiter_panel_tests {
         // A panel-less escrow decodes with `None` and a zeroed region.
         let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let plain_bytes = encode_escrow(&plain);
-        assert_eq!(plain_bytes[plain_bytes.len() - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - DELEGATION_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - 41 - FEE_SCHEDULE_LEN - 595], 0);
+        assert_eq!(plain_bytes[plain_bytes.len() - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - DELEGATION_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - (1 + SLASH_TERMS_LEN) - 1 - SUBSCRIPTION_AMOUNTS_LEN - 41 - FEE_SCHEDULE_LEN - 595], 0);
         assert!(decode_vault_account(&account_bytes(&plain))
             .unwrap()
             .arbiter_panel()
@@ -49379,7 +49680,7 @@ mod arbiter_panel_tests {
         assert_eq!(panel.2, 595);
         // Appended last before AV-68/AV-73/AV-75/AV-82/AV-83/AV-84/AV-86/AV-90/AV-91/AV-95/AV-96/AV-97/AV-99/AV-100/AV-103/AV-104/AV-105/AV-106/AV-107/AV-108/AV-109/AV-110/AV-111/AV-112/AV-113/AV-115/AV-116/AV-117/AV-119/AV-121/AV-122/AV-123/AV-124/AV-126/AV-127/AV-128/AV-130/AV-131:
         // every earlier field offset stays stable.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 66].0, "fee_schedule");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 67].0, "fee_schedule");
     }
 
     #[test]
@@ -49409,108 +49710,108 @@ mod arbiter_panel_tests {
         // AV-119 the dispute-interest tail, AV-121 the claim-cooldown
         // tail, AV-122 the counter-offer tail, AV-123 the intent
         // nonce tail (auction moved to len() - 39).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 65].0, "evidence_deadline_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 64].0, "escalated_by");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 63].0, "subscription_amounts");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 62].0, "schema_version");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 61].0, "slash_terms");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 60].0, "penalty_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 59].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 59].2, 1 + CPI_ALLOWLIST_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 58].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 58].2, 1 + MULTISIG_AUTHORITY_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 57].0, "appeal_window_secs");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 56].0, "appeal_deadline");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 55].0, "appeal_state");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 54].0, "appeal_ballot");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 54].2, APPEAL_BALLOT_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 53].0, "vesting_curve");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 53].1, "Option<VestingCurve>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 53].2, 1 + VESTING_CURVE_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 53].2, 82);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 52].0, "evidence_root");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 52].1, "Option<[u8; 32]>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 52].2, 33);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 51].0, "evidence_leaves");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 51].2, 1);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 50].0, "evidence_disclosed");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 50].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 50].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 49].0, "basket");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 49].1, "Option<BasketLegs>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 49].2, BASKET_REGION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 49].2, 386);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 48].0, "payout_denylist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 48].1, "Option<PayoutDenylist>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 48].2, 1 + PAYOUT_DENYLIST_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 47].0, "auction");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 47].1, "Option<DutchAuction>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 47].2, 1 + DUTCH_AUCTION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 47].2, 19);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 46].0, "transfer_hook");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 46].1, "Option<[u8; 32]>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 46].2, 33);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 66].0, "evidence_deadline_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 65].0, "escalated_by");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 64].0, "subscription_amounts");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 63].0, "schema_version");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 62].0, "slash_terms");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 61].0, "penalty_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 60].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 60].2, 1 + CPI_ALLOWLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 59].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 59].2, 1 + MULTISIG_AUTHORITY_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 58].0, "appeal_window_secs");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 57].0, "appeal_deadline");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 56].0, "appeal_state");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 55].0, "appeal_ballot");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 55].2, APPEAL_BALLOT_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 54].0, "vesting_curve");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 54].1, "Option<VestingCurve>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 54].2, 1 + VESTING_CURVE_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 54].2, 82);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 53].0, "evidence_root");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 53].1, "Option<[u8; 32]>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 53].2, 33);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 52].0, "evidence_leaves");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 52].2, 1);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 51].0, "evidence_disclosed");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 51].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 51].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 50].0, "basket");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 50].1, "Option<BasketLegs>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 50].2, BASKET_REGION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 50].2, 386);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 49].0, "payout_denylist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 49].1, "Option<PayoutDenylist>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 49].2, 1 + PAYOUT_DENYLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 48].0, "auction");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 48].1, "Option<DutchAuction>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 48].2, 1 + DUTCH_AUCTION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 48].2, 19);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 47].0, "transfer_hook");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 47].1, "Option<[u8; 32]>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 47].2, 33);
         // AV-103: the appeal bond and the locked-bond counter —
         // two plain u64s — and AV-104: the delegation region (37 bytes:
         // 1-byte discriminant + 32-byte operator key + 4-byte scope
         // bitmap) — and AV-105: the swap-link region is the new tail
         // (33 bytes: 1-byte discriminant + 32-byte counterparty
         // escrow id).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 45].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 46].0, "streaming_fee_rate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 46].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 46].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 45].0, "streaming_fees_accrued");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 45].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 45].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 44].0, "streaming_fees_accrued");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 44].0, "appeal_bond");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 44].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 44].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 43].0, "appeal_bond");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 43].0, "appeal_bond_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 43].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 43].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 42].0, "appeal_bond_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 42].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 42].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 41].0, "delegation");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 41].1, "Option<Delegation>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 41].2, DELEGATION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 40].0, "swap_link");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 40].1, "Option<[u8; 32]>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 40].2, SWAP_LINK_REGION_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 40].2, 33);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 42].0, "delegation");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 42].1, "Option<Delegation>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 42].2, DELEGATION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 41].0, "swap_link");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 41].1, "Option<[u8; 32]>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 41].2, SWAP_LINK_REGION_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 41].2, 33);
         // AV-106: the penalty insurance pool is the new tail — 1-byte
         // opt-in flag plus four u64 counters.
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].0, "insurance_pool");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].1, "bool");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].2, 1);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].0, "pool_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 40].0, "insurance_pool");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 40].1, "bool");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 40].2, 1);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].0, "pool_paid");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 39].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].0, "pool_slashed");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 38].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 37].0, "pool_slashed");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 37].0, "pool_inflow");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 37].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 37].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 36].0, "pool_inflow");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 36].0, "pool_payout_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 36].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 36].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 35].0, "pool_payout_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 35].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 35].2, 8);
         // AV-107: the interest-bearing tail is the new tail — 2-byte
         // annual rate in basis points, then the accrual-clock base,
         // the outstanding yield claim, and the cumulative paid
         // counter (26 bytes: INTEREST_REGION_LEN).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 34].0, "interest_rate_bps");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 34].1, "u16");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 34].2, 2);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 35].0, "interest_rate_bps");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 35].1, "u16");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 35].2, 2);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 33].0,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 34].0,
             "interest_accrual_base"
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 33].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 34].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 33].0, "interest_accrued");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 33].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 33].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].0, "interest_accrued");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].0, "interest_paid");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 32].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 31].0, "interest_paid");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 31].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 31].2, 8);
         // AV-111: the tranched-funding tail — the 8-byte cumulative
         // `funded_total` counter, then the `Option<FundingPlan>`
         // region; the AV-110 rent top-up counter trails it, then the
@@ -49525,71 +49826,72 @@ mod arbiter_panel_tests {
         // (114-byte ladder region + 1-byte consumed-rung cursor), then
         // the AV-127 refunded counter (8 bytes), then the AV-128 TWAP
         // price-gate region (26 bytes), then the AV-130 dual-control
-        // tail (33-byte checker + 90-byte intent), and the AV-131
-        // disputed-amount counter (8 bytes) is the new absolute tail.
-        assert_eq!(VAULT_FIELDS.last().unwrap().0, "disputed_amount");
-        assert_eq!(VAULT_FIELDS.last().unwrap().1, "u64");
-        assert_eq!(VAULT_FIELDS.last().unwrap().2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].0, "dual_control_intent");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].1, "Option<DualControlIntent>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 1 + DUAL_CONTROL_INTENT_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 2].2, 90);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "dual_control_checker");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].1, "Option<Pubkey>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, 33);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "twap_gate");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].1, "Option<TwapGate>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, TWAP_GATE_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 26);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].0, "claim_cooldown_slots");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 13].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "dispute_interest");
+        // tail (33-byte checker + 90-byte intent), the AV-131
+        // disputed-amount counter (8 bytes), and the AV-133
+        // auto-unpause timestamp (9 bytes) is the new absolute tail.
+        assert_eq!(VAULT_FIELDS.last().unwrap().0, "auto_unpause_at");
+        assert_eq!(VAULT_FIELDS.last().unwrap().1, "Option<u64>");
+        assert_eq!(VAULT_FIELDS.last().unwrap().2, 9);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].0, "dual_control_intent");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].1, "Option<DualControlIntent>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, 1 + DUAL_CONTROL_INTENT_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 3].2, 90);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].0, "dual_control_checker");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].1, "Option<Pubkey>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 4].2, 33);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].0, "twap_gate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].1, "Option<TwapGate>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, TWAP_GATE_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 5].2, 26);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].0, "claim_cooldown_slots");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 14].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "interest_compounded");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].0, "dispute_interest");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 15].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "compound_interest");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].1, "bool");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].2, 1);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "fund_slot");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].1, "u64");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].2, 8);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "slot_timelock_slots");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].0, "interest_compounded");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 16].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].0, "compound_interest");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].1, "bool");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 17].2, 1);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].0, "fund_slot");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].1, "u64");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 18].2, 8);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "slot_timelock_slots");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].1, "u64");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].2, 8);
         assert_eq!(
-            VAULT_FIELDS[VAULT_FIELDS.len() - 18].2
-                + VAULT_FIELDS[VAULT_FIELDS.len() - 17].2,
+            VAULT_FIELDS[VAULT_FIELDS.len() - 19].2
+                + VAULT_FIELDS[VAULT_FIELDS.len() - 18].2,
             SLOT_TIMELOCK_TAIL_LEN
         );
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].0, "penalty_escalation_rate_bps");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].0, "penalty_escalation_rate_bps");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].1, "u16");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].2, 2);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].0, "penalty_escalation_cap_bps");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].1, "u16");
         assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 20].2, 2);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].0, "penalty_escalation_cap_bps");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].1, "u16");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 19].2, 2);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].0, "price_gate");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].1, "Option<PriceGate>");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].2, PRICE_GATE_LEN);
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 21].2, 18);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].0, "price_gate");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].1, "Option<PriceGate>");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].2, PRICE_GATE_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 22].2, 18);
         let n = VAULT_FIELDS.len();
-        assert_eq!(VAULT_FIELDS[n - 22].0, "release_intent_at");
-        assert_eq!(VAULT_FIELDS[n - 22].1, "Option<u64>");
-        assert_eq!(VAULT_FIELDS[n - 22].2, 9);
-        assert_eq!(VAULT_FIELDS[n - 23].0, "release_cooling_secs");
-        assert_eq!(VAULT_FIELDS[n - 23].1, "u64");
-        assert_eq!(VAULT_FIELDS[n - 23].2, 8);
-        assert_eq!(VAULT_FIELDS[n - 24].0, "funding_plan");
-        assert_eq!(VAULT_FIELDS[n - 24].1, "Option<FundingPlan>");
-        assert_eq!(VAULT_FIELDS[n - 24].2, FUNDING_PLAN_LEN);
-        assert_eq!(VAULT_FIELDS[n - 25].0, "funded_total");
-        assert_eq!(VAULT_FIELDS[n - 25].1, "u64");
-        assert_eq!(VAULT_FIELDS[n - 25].2, 8);
-        assert_eq!(VAULT_FIELDS[n - 26].0, "rent_topped_up_total"); // AV-110 trails the funding tail
+        assert_eq!(VAULT_FIELDS[n - 23].0, "release_intent_at");
+        assert_eq!(VAULT_FIELDS[n - 23].1, "Option<u64>");
+        assert_eq!(VAULT_FIELDS[n - 23].2, 9);
+        assert_eq!(VAULT_FIELDS[n - 24].0, "release_cooling_secs");
+        assert_eq!(VAULT_FIELDS[n - 24].1, "u64");
+        assert_eq!(VAULT_FIELDS[n - 24].2, 8);
+        assert_eq!(VAULT_FIELDS[n - 25].0, "funding_plan");
+        assert_eq!(VAULT_FIELDS[n - 25].1, "Option<FundingPlan>");
+        assert_eq!(VAULT_FIELDS[n - 25].2, FUNDING_PLAN_LEN);
+        assert_eq!(VAULT_FIELDS[n - 26].0, "funded_total");
+        assert_eq!(VAULT_FIELDS[n - 26].1, "u64");
         assert_eq!(VAULT_FIELDS[n - 26].2, 8);
-        assert_eq!(VAULT_FIELDS[n - 26].2, RENT_TOP_UP_LEN);
+        assert_eq!(VAULT_FIELDS[n - 27].0, "rent_topped_up_total"); // AV-110 trails the funding tail
+        assert_eq!(VAULT_FIELDS[n - 27].2, 8);
+        assert_eq!(VAULT_FIELDS[n - 27].2, RENT_TOP_UP_LEN);
     }
 
     #[test]
@@ -50210,7 +50512,7 @@ mod split_tests {
             .with_pause_authority(ALICE)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         assert_eq!(
             e.split_escrow(ALICE, BOB, &[1_000_000], SplitConfig::default(), EXPIRES_AT),
             Err(EscrowError::Paused)
@@ -50229,7 +50531,7 @@ mod split_tests {
             .unwrap();
         assert_eq!(e.state(), EscrowState::Split);
         assert_eq!(EscrowState::Split as u8, 8, "Split appended last");
-        assert_eq!(VAULT_SPACE, 5514, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 5523, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -50499,7 +50801,7 @@ mod release_split_tests {
         e.release_split(ALICE, NOW, 1_000_000, None, &[(BOB, 10_000)])
             .unwrap();
         assert_eq!(e.state(), EscrowState::Released);
-        assert_eq!(VAULT_SPACE, 5514, "full Vault account space");
+        assert_eq!(VAULT_SPACE, 5523, "full Vault account space");
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN, "no layout change");
     }
@@ -50816,7 +51118,7 @@ mod slash_tests {
         let e = slashable(1_000_000);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let base = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
+        let base = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8 - 41 - 1;
         assert_eq!(bytes[base], 3, "schema_version");
         assert_eq!(bytes[base + 1], 1, "slash_terms: Some");
         assert_eq!(&bytes[base + 2..base + 34], &PENALTY, "penalty account");
@@ -50827,8 +51129,8 @@ mod slash_tests {
         );
         assert_eq!(
             u64::from_le_bytes(
-                bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
-                    ..ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
+                bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN) - 8
+                    ..ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN - TRANSFER_HOOK_REGION_LEN - (1 + DUTCH_AUCTION_LEN) - (1 + PAYOUT_DENYLIST_LEN) - BASKET_REGION_LEN - (1 + 32) - 1 - 8 - (1 + VESTING_CURVE_LEN) - APPEAL_REGION_LEN - (1 + MULTISIG_AUTHORITY_LEN) - (1 + CPI_ALLOWLIST_LEN)]
                     .try_into()
                     .unwrap()
             ),
@@ -51141,7 +51443,7 @@ mod slash_ladder_tests {
         let e = ladder_escrow();
         let body = super::account_space_tests::encode_escrow(&e);
         assert_eq!(body.len(), ESCROW_BODY_LEN);
-        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN;
+        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN;
         // The ladder region: 1-byte discriminant + 113-byte ladder.
         assert_eq!(body[tail], 1, "ladder discriminant");
         assert_eq!(&body[tail + 1..tail + 33], &PENALTY, "penalty account");
@@ -51179,7 +51481,7 @@ mod slash_ladder_tests {
         e.slash(ALICE, 10_000, None, T0).unwrap();
         assert_eq!(e.slash_ladder_index(), 1);
         let body = super::account_space_tests::encode_escrow(&e);
-        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN;
+        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN;
         assert_eq!(body[tail + 114], 1, "cursor byte persists the advance");
         // The structural decoder round-trips the ladder and the
         // cursor.
@@ -51205,7 +51507,7 @@ mod slash_ladder_tests {
     fn ladder_without_config_decodes_to_none() {
         let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         let body = super::account_space_tests::encode_escrow(&e);
-        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN;
+        let tail = ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN;
         assert_eq!(body[tail], 0, "None discriminant");
         assert!(body[tail + 1..tail + SLASH_LADDER_TAIL_LEN]
             .iter()
@@ -51296,7 +51598,7 @@ mod appeal_tests {
             .with_pause_authority(ALICE)
             .unwrap();
         e.fund(ALICE, T0).unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         // The pause guard fires before the Uninitialized-state gate.
         let err = e.with_appeal_window(WINDOW).unwrap_err();
         assert_eq!(err, EscrowError::Paused);
@@ -51597,7 +51899,7 @@ mod appeal_tests {
         e.review_appeal(M1, true).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         // Appeal region: [3820..3846] — window (8), deadline (8), state
         // (1), ballot (9).
         assert_eq!(
@@ -51732,7 +52034,7 @@ mod appeal_bond_tests {
             .with_pause_authority(ALICE)
             .unwrap();
         e.fund(ALICE, T0).unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         // The pause guard fires before the Uninitialized-state gate.
         let err = e.with_appeal_bond(BOND).unwrap_err();
         assert_eq!(err, EscrowError::Paused);
@@ -51984,7 +52286,7 @@ mod appeal_bond_tests {
         // The two u64s before the delegation region are the bond region
         // (encode order: appeal_bond, then appeal_bond_paid) — the
         // AV-104 delegation region (37 bytes) trails them.
-        let tail = &full[8 + super::ESCROW_BODY_LEN - super::DISPUTED_AMOUNT_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN - super::CLAIM_COOLDOWN_TAIL_LEN - super::COUNTER_OFFER_TAIL_LEN - super::RELEASE_INTENT_TAIL_LEN - super::KEEPER_BOUNTY_TAIL_LEN - super::DISPUTE_INTEREST_LEN - super::PRICE_GATE_LEN - super::PENALTY_ESCALATION_TAIL_LEN - super::COMPOUND_INTEREST_TAIL_LEN - super::SLOT_TIMELOCK_TAIL_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - 37 - 16..8 + super::ESCROW_BODY_LEN - super::DISPUTED_AMOUNT_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN - super::CLAIM_COOLDOWN_TAIL_LEN - super::COUNTER_OFFER_TAIL_LEN - super::RELEASE_INTENT_TAIL_LEN - super::KEEPER_BOUNTY_TAIL_LEN - super::DISPUTE_INTEREST_LEN - super::PRICE_GATE_LEN - super::PENALTY_ESCALATION_TAIL_LEN - super::COMPOUND_INTEREST_TAIL_LEN - super::SLOT_TIMELOCK_TAIL_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - 37];
+        let tail = &full[8 + super::ESCROW_BODY_LEN - super::DISPUTED_AMOUNT_TAIL_LEN - super::AUTO_UNPAUSE_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN - super::CLAIM_COOLDOWN_TAIL_LEN - super::COUNTER_OFFER_TAIL_LEN - super::RELEASE_INTENT_TAIL_LEN - super::KEEPER_BOUNTY_TAIL_LEN - super::DISPUTE_INTEREST_LEN - super::PRICE_GATE_LEN - super::PENALTY_ESCALATION_TAIL_LEN - super::COMPOUND_INTEREST_TAIL_LEN - super::SLOT_TIMELOCK_TAIL_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - 37 - 16..8 + super::ESCROW_BODY_LEN - super::DISPUTED_AMOUNT_TAIL_LEN - super::AUTO_UNPAUSE_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN - super::CLAIM_COOLDOWN_TAIL_LEN - super::COUNTER_OFFER_TAIL_LEN - super::RELEASE_INTENT_TAIL_LEN - super::KEEPER_BOUNTY_TAIL_LEN - super::DISPUTE_INTEREST_LEN - super::PRICE_GATE_LEN - super::PENALTY_ESCALATION_TAIL_LEN - super::COMPOUND_INTEREST_TAIL_LEN - super::SLOT_TIMELOCK_TAIL_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - 37];
         assert_eq!(&tail[..8], &BOND.to_le_bytes());
         assert_eq!(&tail[8..], &[0u8; 8], "forfeited bond zeroes the counter");
         let decoded = crate::discriminator::decode_vault_account(&full).unwrap();
@@ -52281,7 +52583,7 @@ mod cpi_allowlist_tests {
             .with_pause_authority(ALICE)
             .unwrap();
         e.fund(ALICE, NOW).unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         assert_eq!(
             e.update_cpi_allowlist(ALICE, BOB, &[DEX]),
             Err(EscrowError::Paused)
@@ -52367,7 +52669,7 @@ mod cpi_allowlist_tests {
             .unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         assert_eq!(bytes[3495], 1, "Some discriminant");
         assert_eq!(&bytes[3496..3496 + 32], &DEX);
         assert_eq!(&bytes[3496 + 32..3496 + 64], &LENDING);
@@ -52399,8 +52701,8 @@ mod cpi_allowlist_tests {
         // that, AV-121 the claim-cooldown tail after that, AV-122
         // the counter-offer tail after that, AV-123 the intent nonce
         // tail after that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 59].0, "cpi_allowlist");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 59].2, 1 + CPI_ALLOWLIST_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 60].0, "cpi_allowlist");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 60].2, 1 + CPI_ALLOWLIST_LEN);
     }
 }
 
@@ -52593,7 +52895,7 @@ mod multisig_tests {
         let e = bound_escrow();
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        assert_eq!(bytes.len(), 5506);
+        assert_eq!(bytes.len(), 5515);
         assert_eq!(bytes[3753], 1, "Some discriminant");
         assert_eq!(&bytes[3754..3754 + 32], &SQUADS_V4_PROGRAM_ID);
         assert_eq!(&bytes[3754 + 32..3754 + 64], &VAULT_PDA);
@@ -52618,8 +52920,8 @@ mod multisig_tests {
         // that, AV-104 the delegation region after that, AV-105 the
         // swap-link region after that, AV-106 the insurance-pool
         // region after that).
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 58].0, "multisig_authority");
-        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 58].2, 1 + MULTISIG_AUTHORITY_LEN);
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 59].0, "multisig_authority");
+        assert_eq!(VAULT_FIELDS[VAULT_FIELDS.len() - 59].2, 1 + MULTISIG_AUTHORITY_LEN);
         assert_eq!(MULTISIG_AUTHORITY_LEN, 66);
     }
 
@@ -52833,7 +53135,7 @@ mod streaming_fee_tests {
         let mut e = streaming_escrow(10);
         e.release(ALICE, FUND_AT + 100, 600_000, None, BOB).unwrap();
         let bytes = super::account_space_tests::encode_escrow(&e);
-        let tail = &bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN..];
+        let tail = &bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN - POOL_REGION_LEN - SWAP_LINK_REGION_LEN - APPEAL_BOND_REGION_LEN - DELEGATION_REGION_LEN - STREAMING_FEE_REGION_LEN..];
         assert_eq!(u64::from_le_bytes(tail[..8].try_into().unwrap()), 10);
         assert_eq!(u64::from_le_bytes(tail[8..16].try_into().unwrap()), 1_000);
         let mut account = vec![0u8; 8 + ESCROW_BODY_LEN];
@@ -53304,8 +53606,8 @@ mod interest_tests {
         // The dispute-interest tail sits just before the AV-121
         // claim-cooldown tail (the AV-124 keeper-bounty tail is the
         // absolute tail).
-        let tail = &bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN
-            ..ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN];
+        let tail = &bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN
+            ..ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN];
         assert_eq!(
             u64::from_le_bytes(tail.try_into().unwrap()),
             5_000,
@@ -53364,7 +53666,7 @@ mod interest_tests {
         assert_eq!(e.claim_interest(BOB, FUND_AT + 3_153_600).unwrap(), 5_000);
         let bytes = super::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), ESCROW_BODY_LEN);
-        let tail = &bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN..];
+        let tail = &bytes[ESCROW_BODY_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - TWAP_GATE_LEN - DUAL_CONTROL_TAIL_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - PENALTY_ESCALATION_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - RELEASE_COOLING_TAIL_LEN - FUNDING_TAIL_LEN - RENT_TOP_UP_LEN - DEADMAN_REGION_LEN - PAYOUT_SPLIT_LEN - INTEREST_REGION_LEN..];
         assert_eq!(u16::from_le_bytes(tail[..2].try_into().unwrap()), 500);
         assert_eq!(
             u64::from_le_bytes(tail[2..10].try_into().unwrap()),
@@ -53625,7 +53927,7 @@ mod delegation_tests {
             .unwrap()
             .with_pause_authority(ALICE)
             .unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         // The pause gate runs before the authority check (AV-46).
         assert_eq!(
             e.delegate_authority(ALICE, OPERATOR, full_scopes()),
@@ -53638,7 +53940,7 @@ mod delegation_tests {
         e.unpause(ALICE).unwrap();
         e.delegate_authority(ALICE, OPERATOR, DELEGATION_SCOPE_FUND)
             .unwrap();
-        e.pause(ALICE).unwrap();
+        e.pause(ALICE, None).unwrap();
         assert_eq!(e.fund(OPERATOR, NOW), Err(EscrowError::Paused));
     }
 
@@ -53689,7 +53991,7 @@ mod delegation_tests {
         // The grant sits in the 37 bytes before the trailing 33-byte
         // AV-105 swap-link region: 1-byte Some discriminant, the
         // 32-byte operator key, the u32 bitmap.
-        let tail = &bytes[super::ESCROW_BODY_LEN - super::DISPUTED_AMOUNT_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN - super::CLAIM_COOLDOWN_TAIL_LEN - super::COUNTER_OFFER_TAIL_LEN - super::RELEASE_INTENT_TAIL_LEN - super::KEEPER_BOUNTY_TAIL_LEN - super::DISPUTE_INTEREST_LEN - super::PRICE_GATE_LEN - super::PENALTY_ESCALATION_TAIL_LEN - super::COMPOUND_INTEREST_TAIL_LEN - super::SLOT_TIMELOCK_TAIL_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - DELEGATION_LEN..];
+        let tail = &bytes[super::ESCROW_BODY_LEN - super::DISPUTED_AMOUNT_TAIL_LEN - super::AUTO_UNPAUSE_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN - super::CLAIM_COOLDOWN_TAIL_LEN - super::COUNTER_OFFER_TAIL_LEN - super::RELEASE_INTENT_TAIL_LEN - super::KEEPER_BOUNTY_TAIL_LEN - super::DISPUTE_INTEREST_LEN - super::PRICE_GATE_LEN - super::PENALTY_ESCALATION_TAIL_LEN - super::COMPOUND_INTEREST_TAIL_LEN - super::SLOT_TIMELOCK_TAIL_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - DELEGATION_LEN..];
         assert_eq!(tail[0], 1, "Some discriminant");
         assert_eq!(&tail[1..33], &OPERATOR);
         assert_eq!(
@@ -53705,7 +54007,7 @@ mod delegation_tests {
         let plain = funded();
         let plain_bytes = super::account_space_tests::encode_escrow(&plain);
         assert_eq!(
-            &plain_bytes[super::ESCROW_BODY_LEN - super::DISPUTED_AMOUNT_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN - super::CLAIM_COOLDOWN_TAIL_LEN - super::COUNTER_OFFER_TAIL_LEN - super::RELEASE_INTENT_TAIL_LEN - super::KEEPER_BOUNTY_TAIL_LEN - super::DISPUTE_INTEREST_LEN - super::PRICE_GATE_LEN - super::PENALTY_ESCALATION_TAIL_LEN - super::COMPOUND_INTEREST_TAIL_LEN - super::SLOT_TIMELOCK_TAIL_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - DELEGATION_LEN..super::ESCROW_BODY_LEN - super::DISPUTED_AMOUNT_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN - super::CLAIM_COOLDOWN_TAIL_LEN - super::COUNTER_OFFER_TAIL_LEN - super::RELEASE_INTENT_TAIL_LEN - super::KEEPER_BOUNTY_TAIL_LEN - super::DISPUTE_INTEREST_LEN - super::PRICE_GATE_LEN - super::PENALTY_ESCALATION_TAIL_LEN - super::COMPOUND_INTEREST_TAIL_LEN - super::SLOT_TIMELOCK_TAIL_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN],
+            &plain_bytes[super::ESCROW_BODY_LEN - super::DISPUTED_AMOUNT_TAIL_LEN - super::AUTO_UNPAUSE_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN - super::CLAIM_COOLDOWN_TAIL_LEN - super::COUNTER_OFFER_TAIL_LEN - super::RELEASE_INTENT_TAIL_LEN - super::KEEPER_BOUNTY_TAIL_LEN - super::DISPUTE_INTEREST_LEN - super::PRICE_GATE_LEN - super::PENALTY_ESCALATION_TAIL_LEN - super::COMPOUND_INTEREST_TAIL_LEN - super::SLOT_TIMELOCK_TAIL_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN - DELEGATION_LEN..super::ESCROW_BODY_LEN - super::DISPUTED_AMOUNT_TAIL_LEN - super::AUTO_UNPAUSE_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN - super::CLAIM_COOLDOWN_TAIL_LEN - super::COUNTER_OFFER_TAIL_LEN - super::RELEASE_INTENT_TAIL_LEN - super::KEEPER_BOUNTY_TAIL_LEN - super::DISPUTE_INTEREST_LEN - super::PRICE_GATE_LEN - super::PENALTY_ESCALATION_TAIL_LEN - super::COMPOUND_INTEREST_TAIL_LEN - super::SLOT_TIMELOCK_TAIL_LEN - super::RELEASE_COOLING_TAIL_LEN - super::FUNDING_TAIL_LEN - super::RENT_TOP_UP_LEN - super::DEADMAN_REGION_LEN - super::PAYOUT_SPLIT_LEN - super::INTEREST_REGION_LEN - POOL_REGION_LEN - super::SWAP_LINK_REGION_LEN],
             &[0u8; DELEGATION_LEN]
         );
         let mut account = vec![0u8; 8 + super::ESCROW_BODY_LEN];
@@ -53869,13 +54171,13 @@ mod compound_interest_tests {
         // the AV-123 intent nonce tail, the AV-124 keeper-bounty tail
         // and the AV-126 slash-ladder tail).
         let tail = &bytes[super::ESCROW_BODY_LEN
-            - super::DISPUTED_AMOUNT_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN
+            - super::DISPUTED_AMOUNT_TAIL_LEN - super::AUTO_UNPAUSE_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN
             - super::CLAIM_COOLDOWN_TAIL_LEN - super::COUNTER_OFFER_TAIL_LEN
             - super::RELEASE_INTENT_TAIL_LEN - super::KEEPER_BOUNTY_TAIL_LEN
             - super::DISPUTE_INTEREST_LEN
             - super::COMPOUND_INTEREST_TAIL_LEN
             ..super::ESCROW_BODY_LEN
-                - super::DISPUTED_AMOUNT_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN
+                - super::DISPUTED_AMOUNT_TAIL_LEN - super::AUTO_UNPAUSE_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN
                 - super::CLAIM_COOLDOWN_TAIL_LEN - super::COUNTER_OFFER_TAIL_LEN
                 - super::RELEASE_INTENT_TAIL_LEN - super::KEEPER_BOUNTY_TAIL_LEN
                 - super::DISPUTE_INTEREST_LEN];
@@ -53891,14 +54193,14 @@ mod compound_interest_tests {
         // slash-ladder tails — zeroed here (no dispute ever ran on
         // this escrow).
         let dtail = &bytes[super::ESCROW_BODY_LEN
-            - super::DISPUTED_AMOUNT_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN
+            - super::DISPUTED_AMOUNT_TAIL_LEN - super::AUTO_UNPAUSE_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN
             - super::KEEPER_BOUNTY_TAIL_LEN
             - super::RELEASE_INTENT_TAIL_LEN
             - super::COUNTER_OFFER_TAIL_LEN
             - super::CLAIM_COOLDOWN_TAIL_LEN
             - super::DISPUTE_INTEREST_LEN
             ..super::ESCROW_BODY_LEN
-                - super::DISPUTED_AMOUNT_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN
+                - super::DISPUTED_AMOUNT_TAIL_LEN - super::AUTO_UNPAUSE_TAIL_LEN - super::TWAP_GATE_LEN - super::DUAL_CONTROL_TAIL_LEN - super::REFUNDED_TAIL_LEN - super::SLASH_LADDER_TAIL_LEN
                 - super::KEEPER_BOUNTY_TAIL_LEN
                 - super::RELEASE_INTENT_TAIL_LEN
                 - super::COUNTER_OFFER_TAIL_LEN
@@ -54028,7 +54330,7 @@ mod dual_control_tests {
             .unwrap()
             .with_pause_authority(PAUSE_AUTH)
             .unwrap();
-        e.pause(PAUSE_AUTH).unwrap();
+        e.pause(PAUSE_AUTH, None).unwrap();
         assert_eq!(
             e.with_dual_control(CHECKER).unwrap_err(),
             EscrowError::Paused
@@ -54125,7 +54427,7 @@ mod dual_control_tests {
             .with_dual_control(CHECKER)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
-        e.pause(PAUSE_AUTH).unwrap();
+        e.pause(PAUSE_AUTH, None).unwrap();
         assert_eq!(
             e.initiate_release(ALICE, NOW, 400_000, None, BOB, TTL),
             Err(EscrowError::Paused)
@@ -54383,21 +54685,25 @@ mod dual_control_tests {
         assert_eq!(DUAL_CONTROL_INTENT_LEN, 89);
         assert_eq!(DUAL_CONTROL_TAIL_LEN, 33 + (1 + 89));
         assert_eq!(DUAL_CONTROL_TAIL_LEN, 123);
-        assert_eq!(VAULT_SPACE_NO_QUORUM, 5024);
-        assert_eq!(VAULT_SPACE, 5514);
-        assert_eq!(ESCROW_BODY_LEN, 5506);
-        assert_eq!(vault_close_rent_reclaimed(), 39_268_320);
+        assert_eq!(VAULT_SPACE_NO_QUORUM, 5033);
+        assert_eq!(VAULT_SPACE, 5523);
+        assert_eq!(ESCROW_BODY_LEN, 5515);
+        assert_eq!(vault_close_rent_reclaimed(), 39_330_960);
         let n = VAULT_FIELDS.len();
-        assert_eq!(VAULT_FIELDS[n - 3].0, "dual_control_checker");
-        assert_eq!(VAULT_FIELDS[n - 3].1, "Option<Pubkey>");
-        assert_eq!(VAULT_FIELDS[n - 3].2, 33);
-        assert_eq!(VAULT_FIELDS[n - 2].0, "dual_control_intent");
-        assert_eq!(VAULT_FIELDS[n - 2].1, "Option<DualControlIntent>");
-        assert_eq!(VAULT_FIELDS[n - 2].2, 90);
-        // AV-131: the disputed-amount counter is the new absolute tail.
-        assert_eq!(VAULT_FIELDS[n - 1].0, "disputed_amount");
-        assert_eq!(VAULT_FIELDS[n - 1].1, "u64");
-        assert_eq!(VAULT_FIELDS[n - 1].2, 8);
+        assert_eq!(VAULT_FIELDS[n - 4].0, "dual_control_checker");
+        assert_eq!(VAULT_FIELDS[n - 4].1, "Option<Pubkey>");
+        assert_eq!(VAULT_FIELDS[n - 4].2, 33);
+        assert_eq!(VAULT_FIELDS[n - 3].0, "dual_control_intent");
+        assert_eq!(VAULT_FIELDS[n - 3].1, "Option<DualControlIntent>");
+        assert_eq!(VAULT_FIELDS[n - 3].2, 90);
+        // AV-131: the disputed-amount counter was the absolute tail.
+        assert_eq!(VAULT_FIELDS[n - 2].0, "disputed_amount");
+        assert_eq!(VAULT_FIELDS[n - 2].1, "u64");
+        assert_eq!(VAULT_FIELDS[n - 2].2, 8);
+        // AV-133: the auto-unpause timestamp is the new absolute tail.
+        assert_eq!(VAULT_FIELDS[n - 1].0, "auto_unpause_at");
+        assert_eq!(VAULT_FIELDS[n - 1].1, "Option<u64>");
+        assert_eq!(VAULT_FIELDS[n - 1].2, 9);
     }
 
     #[test]

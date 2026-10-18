@@ -1645,6 +1645,16 @@ pub struct EscrowEvent {
     /// `split_children` precedent — never a `push_event` parameter —
     /// so the log records exactly the tier that priced the penalty.
     pub slash_ladder_index: Option<u8>,
+    /// AV-133: whether this `Unpaused` event was emitted by the
+    /// scheduled auto-recovery ([`Escrow::try_auto_unpause`]) rather
+    /// than a manual [`IndexedEscrow::unpause`] call. `true` only on
+    /// the auto-recovered `Unpaused` event — `false` on every other
+    /// kind and on manual unpauses (like `evidence_defaulted`, the
+    /// event log never invents an auto-recovery). Stamped by the
+    /// transition emitter after the push — never a `push_event`
+    /// parameter — because the schedule is consumed by the recovery
+    /// before the event is pushed.
+    pub auto_unpause: bool,
 }
 
 /// One split child on an [`EscrowEventKind::EscrowSplit`] event's
@@ -1942,6 +1952,12 @@ impl IndexedEscrow {
             // during the slash), so `push_event` leaves it `None`
             // here — never a push_event parameter (see above).
             slash_ladder_index: None,
+            // AV-133: the auto-recovery flag rides the auto-recovered
+            // Unpaused event — stamped by the transition emitter after
+            // the push (the schedule is consumed by the recovery), so
+            // `push_event` leaves it `false` here — never a push_event
+            // parameter (see above).
+            auto_unpause: false,
         };
         self.next_seq += 1;
         self.events.push(event);
@@ -1985,6 +2001,69 @@ impl IndexedEscrow {
                 Err(EscrowError::ReentrantCall)
             }
             other => other,
+        }
+    }
+
+    /// AV-133: stamp the scheduled-auto-recovery flag on the most
+    /// recently pushed event. Called by transition emitters right after
+    /// pushing the auto-recovered `Unpaused` event — the schedule is
+    /// consumed by the recovery, so the flag cannot be derived at emit
+    /// time and is never a `push_event` parameter (mirrors the
+    /// `slash_ladder_index` / `appeal_outcome` stamping precedent).
+    fn mark_last_event_auto_unpause(&mut self) {
+        if let Some(last) = self.events.last_mut() {
+            last.auto_unpause = true;
+        }
+    }
+
+    /// AV-133: run the scheduled auto-recovery check before a
+    /// clock-bearing transition. Returns `(was_paused, schedule,
+    /// auto_unpaused)`: the pre-call pause snapshot for restore, and
+    /// whether the recovery fired. The inner state machine repeats the
+    /// check idempotently at its own gate — this call exists so the
+    /// wrapper can emit the `Unpaused` event and restore on failure.
+    fn begin_auto_unpause(&mut self, at: u64) -> (bool, Option<u64>, bool) {
+        let was_paused = self.inner.is_paused();
+        let schedule = self.inner.auto_unpause_at();
+        let auto_unpaused = self.inner.try_auto_unpause(at);
+        (was_paused, schedule, auto_unpaused)
+    }
+
+    /// AV-133: restore the pre-call pause state when a transition that
+    /// fired the auto-recovery goes on to fail — a failed call changes
+    /// nothing observable and (the `ReentryRejected` security signal
+    /// aside) emits no events.
+    fn restore_auto_unpause_on_failure(
+        &mut self,
+        was_paused: bool,
+        schedule: Option<u64>,
+        auto_unpaused: bool,
+    ) {
+        if auto_unpaused {
+            self.inner.restore_auto_unpause(was_paused, schedule);
+        }
+    }
+
+    /// AV-133: emit the `Unpaused` event for a fired scheduled
+    /// auto-recovery, before the transition's own event. `from` is the
+    /// pre-call state (the pause flip is a config change, not a
+    /// lifecycle move — `from == to`). No event when the recovery did
+    /// not fire.
+    fn emit_auto_unpause(&mut self, from: EscrowState, at: u64, auto_unpaused: bool) {
+        if auto_unpaused {
+            self.push_event(
+                EscrowEventKind::Unpaused,
+                from,
+                from,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            self.mark_last_event_auto_unpause();
         }
     }
 
@@ -2335,8 +2414,19 @@ impl IndexedEscrow {
         // (the deliberate exception to the no-events-on-failure rule).
         // (The inner result is bound first so its `&mut` borrow ends
         // before `map_reentrant` reborrows `self`.)
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self.inner.fund(authority, at);
-        self.map_reentrant(result, at)?;
+        match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         self.push_event(
             EscrowEventKind::Funded,
             from,
@@ -2371,8 +2461,19 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self.inner.release(authority, at, amount, mint, payout_to);
-        let (payout, fee) = self.map_reentrant(result, at)?;
+        let (payout, fee) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         // `amount` is the gross *principal* payout by construction
         // (`payout + fee == amount`); it cannot overflow u64 addition.
         // AV-107: when interest is configured the taker's `payout`
@@ -2422,10 +2523,21 @@ impl IndexedEscrow {
         // `ReentryRejected`. A failed intent check (bad signature,
         // replayed nonce, expired intent) is not a reentrant entry
         // and emits nothing.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self
             .inner
             .release_via_intent(intent, signature, at, slot, mint);
-        let (payout, fee) = self.map_reentrant(result, at)?;
+        let (payout, fee) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         let initializer = self.inner.initializer();
         self.push_event(
             EscrowEventKind::ReleaseViaIntent,
@@ -2474,10 +2586,21 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`; a failed declaration gate emits nothing.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result =
             self.inner
                 .initiate_release(authority, at, amount, mint, payout_to, intent_ttl_secs);
-        self.map_reentrant(result, at)?;
+        match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         self.push_event(
             EscrowEventKind::DualControlInitiated,
             from,
@@ -2520,8 +2643,19 @@ impl IndexedEscrow {
             .inner
             .dual_control_intent()
             .map(|intent| intent.amount);
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self.inner.confirm_release(checker, at);
-        let (payout, fee) = self.map_reentrant(result, at)?;
+        let (payout, fee) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         self.push_event(
             EscrowEventKind::DualControlConfirmed,
             from,
@@ -2551,8 +2685,19 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`; a failed cancel gate emits nothing.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self.inner.cancel_release(caller, at);
-        self.map_reentrant(result, at)?;
+        match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         self.push_event(
             EscrowEventKind::DualControlCancelled,
             from,
@@ -2658,8 +2803,19 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self.inner.decline_escrow(authority, at);
-        self.map_reentrant(result, at)?;
+        match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         self.push_event(
             EscrowEventKind::Declined,
             from,
@@ -2693,8 +2849,19 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self.inner.propose_counter_offer(authority, amount, expiry, at);
-        self.map_reentrant(result, at)?;
+        match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         self.push_event(
             EscrowEventKind::CounterOfferProposed,
             from,
@@ -2720,8 +2887,19 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self.inner.accept_counter_offer(authority, at);
-        self.map_reentrant(result, at)?;
+        match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         self.push_event(
             EscrowEventKind::CounterOfferAccepted,
             from,
@@ -2746,8 +2924,19 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self.inner.reject_counter_offer(authority, at);
-        self.map_reentrant(result, at)?;
+        match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         self.push_event(
             EscrowEventKind::CounterOfferRejected,
             from,
@@ -2853,10 +3042,21 @@ impl IndexedEscrow {
         // taker-leg amount and an actual below the floor rolls back
         // with `SlippageExceeded` (no event, like every other failed
         // transition).
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self
             .inner
             .release_via_cpi(authority, at, amount, mint, payout_to, min_payout, cpi, execute_cpi);
-        let (payout, fee, receipt) = self.map_reentrant(result, at)?;
+        let (payout, fee, receipt) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         // `amount` is the gross payout by construction
         // (`payout + fee == amount`); it cannot overflow u64 addition.
         self.push_event(
@@ -2906,10 +3106,21 @@ impl IndexedEscrow {
         // `ReentryRejected`.
         // (The inner result is bound first so its `&mut` borrow ends
         // before `map_reentrant` reborrows `self`.)
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self
             .inner
             .release_split(authority, at, amount, mint, shares);
-        let (legs, fee) = self.map_reentrant(result, at)?;
+        let (legs, fee) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         // `amount` is the gross payout by construction
         // (Σ legs + fee == amount); it cannot overflow u64 addition.
         self.push_event(
@@ -2971,8 +3182,19 @@ impl IndexedEscrow {
         // `ReentryRejected`.
         // (The inner result is bound first so its `&mut` borrow ends
         // before `map_reentrant` reborrows `self`.)
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self.inner.release_payout_split(authority, at, mint);
-        let legs = self.map_reentrant(result, at)?;
+        let legs = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         // The gross amount is the escrow's locked amount by
         // construction (the split table's Σ == amount); the fee is
         // re-derived from the same `charge_protocol_fee` point the
@@ -3134,10 +3356,21 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected` (`now` doubles as the event's `at`).
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(now);
         let result = self
             .inner
             .cancel_expired(authority, now, mint, refund_to);
-        let (refund, penalty) = self.map_reentrant(result, now)?;
+        let (refund, penalty) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), now);
+            }
+        };
+        self.emit_auto_unpause(pause_state, now, auto_unpaused);
         let to = self.inner.state();
         self.push_event(
             EscrowEventKind::ExpiredCancelled,
@@ -3175,8 +3408,19 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected` (`now` doubles as the event's `at`).
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(now);
         let result = self.inner.crank_expired(caller, now, mint);
-        let (refund, penalty, bounty) = self.map_reentrant(result, now)?;
+        let (refund, penalty, bounty) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), now);
+            }
+        };
+        self.emit_auto_unpause(pause_state, now, auto_unpaused);
         let to = self.inner.state();
         self.push_event(
             EscrowEventKind::ExpiredCranked,
@@ -3570,9 +3814,17 @@ impl IndexedEscrow {
     /// Engage the emergency pause (mirrors [`Escrow::pause`]).
     /// Emits `Paused`; `from == to ==` the current state (a config
     /// flip, not a lifecycle move — like `EmergencyUnlock`). `at` is
-    /// the caller-supplied event timestamp.
-    pub fn pause(&mut self, authority: [u8; 32], at: u64) -> Result<(), EscrowError> {
-        self.inner.pause(authority)?;
+    /// the caller-supplied event timestamp. AV-133: `auto_unpause_at`
+    /// opts into scheduled auto-recovery (`Some(t)` — the escrow
+    /// resumes automatically when a clock-bearing transition observes
+    /// `now >= t`); `None` keeps the manual-pause semantic.
+    pub fn pause(
+        &mut self,
+        authority: [u8; 32],
+        auto_unpause_at: Option<u64>,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        self.inner.pause(authority, auto_unpause_at)?;
         let state = self.inner.state();
         self.push_event(
             EscrowEventKind::Paused,
@@ -3660,7 +3912,15 @@ impl IndexedEscrow {
         now: u64,
         at: u64,
     ) -> Result<(), EscrowError> {
-        self.inner.fund_tranche(authority, tranche_amount, now)?;
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(now);
+        if let Err(e) = self.inner.fund_tranche(authority, tranche_amount, now) {
+            self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+            return Err(e);
+        }
+        self.emit_auto_unpause(pause_state, now, auto_unpaused);
         let state = self.inner.state();
         self.push_event(
             EscrowEventKind::TrancheFunded,
@@ -3695,7 +3955,15 @@ impl IndexedEscrow {
         at: u64,
     ) -> Result<(), EscrowError> {
         let before = self.inner.release_intent_at();
-        self.inner.announce_release(authority, now)?;
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(now);
+        if let Err(e) = self.inner.announce_release(authority, now) {
+            self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+            return Err(e);
+        }
+        self.emit_auto_unpause(pause_state, now, auto_unpaused);
         let after = self.inner.release_intent_at();
         // The inner call rejects strangers, wrong states, and paused
         // escrows, so a changed intent here always means real
@@ -3734,7 +4002,15 @@ impl IndexedEscrow {
         at: u64,
     ) -> Result<(), EscrowError> {
         let had_intent = self.inner.release_intent_at().is_some();
-        self.inner.veto_release(caller, now)?;
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(now);
+        if let Err(e) = self.inner.veto_release(caller, now) {
+            self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+            return Err(e);
+        }
+        self.emit_auto_unpause(pause_state, now, auto_unpaused);
         // The inner call is a no-op success with no live intent, so a
         // cleared intent here always means a real veto — and the
         // no-intent no-op stays silent.
@@ -4065,7 +4341,15 @@ impl IndexedEscrow {
         now: u64,
     ) -> Result<(), EscrowError> {
         let from = self.inner.state();
-        self.inner.extend_expiry(initializer, new_expires_at, now)?;
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(now);
+        if let Err(e) = self.inner.extend_expiry(initializer, new_expires_at, now) {
+            self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+            return Err(e);
+        }
+        self.emit_auto_unpause(pause_state, now, auto_unpaused);
         self.push_event(
             EscrowEventKind::ExpiryExtended,
             from,
@@ -4095,8 +4379,19 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected` (`now` doubles as the event's `at`).
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(now);
         let result = self.inner.claim(authority, now, mint, payout_to);
-        let (payout, fee) = self.map_reentrant(result, now)?;
+        let (payout, fee) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), now);
+            }
+        };
+        self.emit_auto_unpause(pause_state, now, auto_unpaused);
         // `payout + fee` is the gross claimable (`<= amount`); no
         // overflow possible.
         self.push_event(
@@ -4130,8 +4425,16 @@ impl IndexedEscrow {
         evidence_leaves: u8,
     ) -> Result<(), EscrowError> {
         let from = self.inner.state();
-        self.inner
-            .escalate(authority, now, dispute_amount, evidence_hash, evidence_root, evidence_leaves)?;
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(now);
+        if let Err(e) = self.inner
+            .escalate(authority, now, dispute_amount, evidence_hash, evidence_root, evidence_leaves) {
+            self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+            return Err(e);
+        }
+        self.emit_auto_unpause(pause_state, now, auto_unpaused);
         self.push_event(
             EscrowEventKind::Escalated,
             from,
@@ -4161,8 +4464,16 @@ impl IndexedEscrow {
         now: u64,
     ) -> Result<(), EscrowError> {
         let from = self.inner.state();
-        self.inner
-            .file_evidence(authority, doc_hash, leaf_index, proof, now)?;
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(now);
+        if let Err(e) = self.inner
+            .file_evidence(authority, doc_hash, leaf_index, proof, now) {
+            self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+            return Err(e);
+        }
+        self.emit_auto_unpause(pause_state, now, auto_unpaused);
         self.push_event(
             EscrowEventKind::EvidenceFiled,
             from,
@@ -4192,7 +4503,15 @@ impl IndexedEscrow {
         now: u64,
     ) -> Result<(), EscrowError> {
         let from = self.inner.state();
-        self.inner.submit_evidence(authority, evidence_hash, now)?;
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(now);
+        if let Err(e) = self.inner.submit_evidence(authority, evidence_hash, now) {
+            self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+            return Err(e);
+        }
+        self.emit_auto_unpause(pause_state, now, auto_unpaused);
         self.push_event(
             EscrowEventKind::EvidenceSubmitted,
             from,
@@ -4304,10 +4623,21 @@ impl IndexedEscrow {
         // the principal refund leg (the AV-107 convention — see
         // `resolve` above).
         let remaining = self.inner.remaining_amount();
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(now);
         let result = self
             .inner
             .trigger_default_judgment(caller, now, mint, payout_to);
-        let (payout, fee, refund) = self.map_reentrant(result, at)?;
+        let (payout, fee, refund) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), now);
+            }
+        };
+        self.emit_auto_unpause(pause_state, now, auto_unpaused);
         // `default_taker_amount` is the gross taker share by construction
         // (`payout + fee == default_taker_amount`); the event's refund
         // leg is the principal refund — read the pre-agreed taker
@@ -4665,10 +4995,21 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self
             .inner
             .release_milestone(authority, at, index, mint, payout_to);
-        let (payout, fee) = self.map_reentrant(result, at)?;
+        let (payout, fee) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         // `payout + fee` is the gross tranche (`<= amount`); no overflow
         // possible.
         self.push_event(
@@ -4769,10 +5110,21 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self
             .inner
             .release_period(authority, at, index, mint, payout_to);
-        let (payout, fee) = self.map_reentrant(result, at)?;
+        let (payout, fee) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         // `payout + fee` is the gross per-period amount
         // (`== per_period` by construction); no overflow possible.
         self.push_event(
@@ -4910,10 +5262,21 @@ impl IndexedEscrow {
         // before `map_reentrant` reborrows `self`.) `at` doubles as the
         // inner `now`: each child's fund_at sees the same clock the
         // event log records.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self
             .inner
             .split_escrow(initializer, taker, amounts, config, at);
-        let children = self.map_reentrant(result, at)?;
+        let children = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         // The inner call validated the table and built every child, so
         // the roster below cannot overflow: `amounts.len() <=
         // MAX_SPLIT_CHILDREN` was checked before any child existed, and
@@ -4985,8 +5348,19 @@ impl IndexedEscrow {
         let consumed_rung = self.inner.slash_ladder_index();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self.inner.slash(authority, amount, mint, at);
-        let slashed = self.map_reentrant(result, at)?;
+        let slashed = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         self.push_event(
             EscrowEventKind::Slashed,
             from,
@@ -5043,7 +5417,18 @@ impl IndexedEscrow {
     /// [`Escrow::file_appeal`]: super::Escrow::file_appeal
     pub fn file_appeal(&mut self, taker: [u8; 32], at: u64) -> Result<u64, EscrowError> {
         let from = self.inner.state();
-        let locked = self.inner.file_appeal(taker, at)?;
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
+        let locked = match self.inner.file_appeal(taker, at) {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return Err(e);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         self.push_event(
             EscrowEventKind::AppealFiled,
             from,
@@ -5139,7 +5524,18 @@ impl IndexedEscrow {
     /// [`Escrow::expire_appeal`]: super::Escrow::expire_appeal
     pub fn expire_appeal(&mut self, caller: [u8; 32], at: u64) -> Result<u64, EscrowError> {
         let from = self.inner.state();
-        let forfeited = self.inner.expire_appeal(caller, at)?;
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
+        let forfeited = match self.inner.expire_appeal(caller, at) {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return Err(e);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         self.push_event(
             EscrowEventKind::AppealExpired,
             from,
@@ -5570,8 +5966,19 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
         let result = self.inner.release_and_close(authority, at, mint, payout_to);
-        let (payout, fee, rent) = self.map_reentrant(result, at)?;
+        let (payout, fee, rent) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
         // `payout + fee` is the gross payout by construction (== the
         // released remainder); it cannot overflow u64 addition.
         self.push_event(

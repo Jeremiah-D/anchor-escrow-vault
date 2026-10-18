@@ -590,6 +590,7 @@ mod event_sourcing_tests {
             // extra, not part of the synth projection — `None` here,
             // like the other kind-specific extras.
             slash_ladder_index: None,
+            auto_unpause: false,
         }
     }
 

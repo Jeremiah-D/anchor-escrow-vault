@@ -1362,6 +1362,16 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // persisted tail field.
     let disputed_amount = c.u64_le()?;
 
+    // AV-133: the scheduled pause auto-recovery timestamp — 1-byte
+    // `Option` discriminant + 8-byte timestamp, decoded like any
+    // other persisted tail field.
+    let auto_unpause_at = if c.option_present("auto_unpause_at")? {
+        Some(c.u64_le()?)
+    } else {
+        c.skip(8)?;
+        None
+    };
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1630,6 +1640,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // decoded escrow carries the same locked pool `escalate`
         // recorded.
         disputed_amount,
+        // AV-133: the scheduled pause auto-recovery timestamp — a
+        // decoded escrow carries the same schedule `pause` recorded.
+        auto_unpause_at,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

@@ -1512,6 +1512,7 @@ mod report_diff_tests {
             pool_inflow: 0,
             pool_outflow: 0,
             report_seq: Some(7),
+            pending_auto_unpause: Vec::new(),
         };
         let (diff, next) = diff_report(&ReportWatermark::initial(), &base);
         assert_eq!(diff.report_seq, 7);

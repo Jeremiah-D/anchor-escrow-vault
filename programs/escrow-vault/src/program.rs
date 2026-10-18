@@ -3373,15 +3373,17 @@ pub mod escrow_vault {
     /// may call this (`Unauthorized` otherwise); without an opted-in
     /// authority the switch does not exist (`InvalidStateTransition`).
     /// Emits `Paused` (from == to == the current state).
-    pub fn pause(ctx: Context<Pause>) -> Result<()> {
+    pub fn pause(ctx: Context<Pause>, auto_unpause_at: Option<u64>) -> Result<()> {
         let mut escrow = read_escrow(&ctx.accounts.vault);
         let state = escrow.state() as u8;
         escrow
-            .pause(ctx.accounts.pause_authority.key().to_bytes())
+            .pause(ctx.accounts.pause_authority.key().to_bytes(), auto_unpause_at)
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         // Flips `vault.paused` in place in the real build (1 byte,
-        // always present, zeroed by default).
+        // always present, zeroed by default). AV-133: the
+        // `auto_unpause_at` schedule is persisted in the vault tail
+        // (9 bytes: 1-byte discriminant + 8-byte timestamp).
         emit_transition(
             &ctx.accounts.vault,
             escrow_state::EscrowEventKind::Paused,

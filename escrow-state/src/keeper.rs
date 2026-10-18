@@ -710,6 +710,16 @@ pub struct IntentReleaseAnnotation {
     pub expiry_slot: u64,
 }
 
+/// AV-133: a vault with an armed scheduled auto-recovery — the exact
+/// Unix timestamp when `try_auto_unpause` will fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingAutoUnpause {
+    /// The escrow id.
+    pub escrow_id: [u8; 32],
+    /// The exact `auto_unpause_at` timestamp.
+    pub auto_unpause_at: u64,
+}
+
 /// The scan result: every executable keeper call at [`KeeperReport::at`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeeperReport {
@@ -755,6 +765,11 @@ pub struct KeeperReport {
     /// [`with_report_seq`](KeeperReport::with_report_seq); the scan
     /// itself leaves it `None`.
     pub report_seq: Option<u64>,
+    /// AV-133: vaults with an armed scheduled auto-recovery
+    /// (`pause(authority, Some(t))`) — the exact recovery timestamp
+    /// per vault. Informational: the recovery fires inside the state
+    /// machine's `try_auto_unpause`, not via a keeper action.
+    pub pending_auto_unpause: Vec<PendingAutoUnpause>,
 }
 
 impl KeeperReport {
@@ -824,7 +839,7 @@ impl KeeperReport {
     ///    "bounty_lamports":0,"bounty_unprofitable":false,
     ///    "estimated_cu":13814}
     ///  ],
-    ///  "report_seq":null}
+    ///  "report_seq":null,"pending_auto_unpause":[]}
     /// ```
     ///
     /// AV-120: `report_seq` rides last — the operator-stamped sequence
@@ -1064,6 +1079,20 @@ impl KeeperReport {
             Some(seq) => s.push_str(&seq.to_string()),
             None => s.push_str("null"),
         }
+        // AV-133: vaults with an armed scheduled auto-recovery — the
+        // exact recovery timestamp per vault.
+        s.push_str(",\"pending_auto_unpause\":[");
+        for (i, p) in self.pending_auto_unpause.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"escrow_id\":\"");
+            s.push_str(&hex32(&p.escrow_id));
+            s.push_str("\",\"auto_unpause_at\":");
+            s.push_str(&p.auto_unpause_at.to_string());
+            s.push('}');
+        }
+        s.push(']');
         s.push('}');
         s
     }
@@ -1099,6 +1128,10 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
     // AV-123: escrows carrying a signed, unsubmitted gasless-release
     // intent — annotation only (see `IntentReleaseAnnotation`).
     let mut intent_releases = Vec::new();
+    // AV-133: vaults with an armed scheduled auto-recovery — the exact
+    // recovery timestamp per vault (informational; the recovery fires
+    // inside the state machine, not via a keeper action).
+    let mut pending_auto_unpause = Vec::new();
     // AV-106: fleet-wide insurance-pool lines — saturating sums over
     // the scanned escrows.
     let mut pool_balance = 0u64;
@@ -1107,6 +1140,15 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         let e = &w.escrow;
         pool_balance = pool_balance.saturating_add(e.pool_paid());
         pool_inflow = pool_inflow.saturating_add(e.pool_inflow());
+        // AV-133: record vaults with an armed auto-recovery schedule.
+        if e.is_paused() {
+            if let Some(t) = e.auto_unpause_at() {
+                pending_auto_unpause.push(PendingAutoUnpause {
+                    escrow_id: w.escrow_id,
+                    auto_unpause_at: t,
+                });
+            }
+        }
         // AV-123: annotate escrows carrying a signed, unsubmitted
         // gasless-release intent. The intent verifies against the
         // escrow's initializer key and must carry a fresh nonce
@@ -1840,6 +1882,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         // AV-120: the operator stamps the report sequence number via
         // `with_report_seq` — the scan itself stays sequence-free.
         report_seq: None,
+        // AV-133: the armed auto-recovery schedules collected above.
+        pending_auto_unpause,
     }
 }
 
@@ -2582,7 +2626,7 @@ mod keeper_tests {
         let report = scan_keeper_actions(&[], MID);
         assert!(report.is_empty());
         assert_eq!(report.scanned, 0);
-        assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"total_estimated_cu":0,"jito_tip":null,"intent_releases":[],"pool_balance":0,"pool_inflow":0,"pool_outflow":0,"actions":[],"report_seq":null}"#);
+        assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"total_estimated_cu":0,"jito_tip":null,"intent_releases":[],"pool_balance":0,"pool_inflow":0,"pool_outflow":0,"actions":[],"report_seq":null,"pending_auto_unpause":[]}"#);
     }
 
     #[test]
@@ -2591,14 +2635,14 @@ mod keeper_tests {
         // stamps the next sequence before diffing.
         let legacy = scan_keeper_actions(&[], MID);
         assert_eq!(legacy.report_seq, None);
-        assert!(legacy.to_json().ends_with(",\"report_seq\":null}"));
+        assert!(legacy.to_json().ends_with(",\"report_seq\":null,\"pending_auto_unpause\":[]}"));
         let stamped = scan_keeper_actions(&[], MID).with_report_seq(9);
         assert_eq!(stamped.report_seq, Some(9));
-        assert!(stamped.to_json().ends_with(",\"report_seq\":9}"));
+        assert!(stamped.to_json().ends_with(",\"report_seq\":9,\"pending_auto_unpause\":[]}"));
         // The stamp is last and fixed-order: pin the tail bytes.
         assert!(stamped
             .to_json()
-            .ends_with("\"actions\":[],\"report_seq\":9}"));
+            .ends_with("\"actions\":[],\"report_seq\":9,\"pending_auto_unpause\":[]}"));
     }
 
     #[test]
@@ -2718,7 +2762,7 @@ mod keeper_tests {
             .with_pause_authority(PAUSE_AUTH)
             .unwrap();
         e.fund(ALICE, MID).unwrap();
-        e.pause(PAUSE_AUTH).unwrap();
+        e.pause(PAUSE_AUTH, None).unwrap();
         assert!(e.is_paused());
         let watched = [watch(ID1, e)];
         let report = scan_keeper_actions(&watched, MID);
@@ -3276,7 +3320,7 @@ mod keeper_tests {
         // 3 accounts, 8 data bytes, 1 signer →
         // 10_000 + 3_000 + 3×250 + 8×8 = 13_814 each; total 27_628.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":false,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":true,\"estimated_cu\":13814}}],\"report_seq\":null}}",
+            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":false,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":true,\"estimated_cu\":13814}}],\"report_seq\":null,\"pending_auto_unpause\":[]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -3301,7 +3345,7 @@ mod keeper_tests {
         // AV-88: claim with mint, no refund_to: 3 accounts, 8 data
         // bytes, 1 signer → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":false,\"estimated_cu\":17814}}],\"report_seq\":null}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":false,\"estimated_cu\":17814}}],\"report_seq\":null,\"pending_auto_unpause\":[]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),
@@ -5753,7 +5797,7 @@ mod schema_migration_tests {
             .with_pause_authority(PAUSE_AUTH)
             .unwrap();
         paused.schema_version = 0;
-        paused.pause(PAUSE_AUTH).unwrap();
+        paused.pause(PAUSE_AUTH, None).unwrap();
         // Corrupt: a carried-over field violates the conservation
         // invariants — repair, never migrate.
         let mut corrupt = v0_escrow();
@@ -6272,7 +6316,7 @@ mod stale_sweep_tests {
             .unwrap();
         p.fund(ALICE, NOW).unwrap();
         p.cancel(ALICE, None, ALICE).unwrap();
-        p.pause(ALICE).unwrap();
+        p.pause(ALICE, None).unwrap();
         assert!(p.is_paused());
         let watched = [
             watch(ID1, d, r),
