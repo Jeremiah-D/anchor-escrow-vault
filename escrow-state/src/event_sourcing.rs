@@ -226,6 +226,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // accounting; the event kind distinguishes the authorization
         // path, the fund triple does not.
         | EscrowEventKind::ReleaseViaIntent
+        // AV-130: a checker-approved release is a release — same
+        // lifecycle move, same gross accounting; the kind
+        // distinguishes the two-step authorization path, the fund
+        // triple does not.
+        | EscrowEventKind::DualControlConfirmed
         | EscrowEventKind::Claimed
         | EscrowEventKind::MilestoneReleased
         | EscrowEventKind::SubscriptionPeriodReleased
@@ -268,7 +273,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // funds — pure bookkeeping for the indexer, like the AV-104
         // delegation config changes — so the fold books nothing.
         | EscrowEventKind::ReleaseIntentAnnounced
-        | EscrowEventKind::ReleaseIntentVetoed => (0, 0, 0),
+        | EscrowEventKind::ReleaseIntentVetoed
+        // AV-130: the maker-checker declaration and its abort are the
+        // same class of governance signal — no fund movement, the fold
+        // books nothing.
+        | EscrowEventKind::DualControlInitiated
+        | EscrowEventKind::DualControlCancelled => (0, 0, 0),
         // AV-114: the survivor's lockup grew by the merged-in amount
         // (the event's `payout` leg). The triple's legs only express
         // outflows, so `fund_delta` books nothing here — the locked
@@ -620,7 +630,7 @@ mod event_sourcing_tests {
         const FEE: u64 = 100;
         const REFUND: u64 = 700;
         const PENALTY: u64 = 50;
-        for d in 0..=67u8 {
+        for d in 0..=71u8 {
             let kind = EscrowEventKind::from_discriminant(d)
                 .unwrap_or_else(|| panic!("missing discriminant {d}"));
             let event = synth(kind, 0, PAYOUT, FEE, REFUND, PENALTY);
@@ -632,6 +642,8 @@ mod event_sourcing_tests {
                 | EscrowEventKind::ReleasedSplit
                 // AV-123: an intent-driven release books like Released.
                 | EscrowEventKind::ReleaseViaIntent
+                // AV-130: a checker-approved release books like Released.
+                | EscrowEventKind::DualControlConfirmed
                 | EscrowEventKind::Claimed
                 | EscrowEventKind::MilestoneReleased
                 | EscrowEventKind::SubscriptionPeriodReleased
@@ -717,6 +729,10 @@ mod event_sourcing_tests {
                 // escrow funds.
                 | EscrowEventKind::ReleaseIntentAnnounced
                 | EscrowEventKind::ReleaseIntentVetoed
+                // AV-130: the maker-checker declaration and its abort
+                // move no escrow funds either.
+                | EscrowEventKind::DualControlInitiated
+                | EscrowEventKind::DualControlCancelled
                 // AV-114: the survivor's locked increment rides the
                 // event's payout leg, applied directly in `apply` —
                 // `fund_delta` books nothing.

@@ -37,11 +37,11 @@
 
 use super::{
     sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, CounterOffer, CpiAllowlist,
-    DefaultJudgment, DutchAuction, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
+    DefaultJudgment, DualControlIntent, DutchAuction, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
     Delegation, FundingPlan, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, PayoutSplit, QuorumPolicy,
     SlashTerms, SlashLadder, SlashRung, SubscriptionSchedule, VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
     APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, COUNTER_OFFER_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
-    DELEGATION_LEN, DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
+    DELEGATION_LEN, DUAL_CONTROL_INTENT_LEN, DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
     MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS,
     MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_RELEASE_SPLIT_RECIPIENTS, MAX_SLASH_LADDER_RUNGS, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
     MILESTONE_PLAN_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN,
@@ -1317,6 +1317,47 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         None
     };
 
+    // AV-130: the maker-checker release tail decodes like any other
+    // persisted tail field.
+    let dual_control_checker = if c.option_present("dual_control_checker")? {
+        Some(c.pubkey()?)
+    } else {
+        // Absent: skip the reserved 32-byte payload (the encoder
+        // zero-pads it, matching the other `Option` regions).
+        c.skip(PUBKEY_LEN)?;
+        None
+    };
+    let dual_control_intent = if c.option_present("dual_control_intent")? {
+        let amount = c.u64_le()?;
+        let mint = if c.option_present("dual_control_intent.mint")? {
+            Some(c.pubkey()?)
+        } else {
+            // Absent: skip the reserved 32-byte mint payload.
+            c.skip(PUBKEY_LEN)?;
+            None
+        };
+        let payout_to = c.pubkey()?;
+        let initiated_at = c.u64_le()?;
+        let intent_expires_at = c.u64_le()?;
+        Some(DualControlIntent {
+            amount,
+            mint,
+            payout_to,
+            initiated_at,
+            intent_expires_at,
+        })
+    } else {
+        // Absent: skip the reserved 89-byte payload (the encoder
+        // zero-pads it, matching the other `Option` regions).
+        c.skip(DUAL_CONTROL_INTENT_LEN)?;
+        None
+    };
+    debug_assert_eq!(
+        DUAL_CONTROL_INTENT_LEN,
+        89,
+        "dual-control intent region drift vs DUAL_CONTROL_INTENT_LEN"
+    );
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1577,6 +1618,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-128: the TWAP-gate tail decodes like any other persisted
         // tail field.
         twap_gate,
+        // AV-130: the maker-checker release tail decodes like any
+        // other persisted tail field.
+        dual_control_checker,
+        dual_control_intent,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

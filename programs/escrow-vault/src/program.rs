@@ -1998,6 +1998,177 @@ pub mod escrow_vault {
         // `initialize_*` opt-ins.
         Ok(())
     }
+
+    /// Opt into dual-control (maker-checker) release governance
+    /// (AV-130; mirrors `Escrow::with_dual_control`). The initializer
+    /// binds the checker's key while the escrow is `Uninitialized` —
+    /// the checker's identity is fixed before any funds move, like
+    /// the other `initialize_*` opt-ins. A zero `checker` key is
+    /// `InvalidDualControl` (code 188); re-configuring a live escrow
+    /// is `InvalidStateTransition`; a paused escrow fails fast
+    /// (`Paused`). Once set, direct `release` (and every path routed
+    /// through it) becomes `DualControlRequired` (code 192) — payouts
+    /// leave only via the two-step `initiate_release` +
+    /// `confirm_release` protocol.
+    pub fn initialize_dual_control(
+        ctx: Context<InitializeDualControl>,
+        checker: Pubkey,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_dual_control(checker.to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the full dual-control
+        // region (`escrow_state::DUAL_CONTROL_TAIL_LEN`), so the
+        // checker key is written in place — no realloc needed in the
+        // real build. No indexer event: pre-fund configuration, like
+        // the other `initialize_*` opt-ins.
+        Ok(())
+    }
+
+    /// Declare a release for checker approval (AV-130; mirrors
+    /// `Escrow::initiate_release` — the *maker* half of the
+    /// maker-checker protocol). The initializer (or their
+    /// `RELEASE`-scoped operator) freezes the exact payout
+    /// `{amount, mint, payout_to}` plus the declaration clock into the
+    /// vault; the escrow state stays `Funded`. Check order is pause →
+    /// reentrancy → dual-control configured (`InvalidDualControl`,
+    /// code 188) → authority (`Unauthorized`) → state (`Funded` only)
+    /// → no live intent (`DualControlIntentExists`, code 189) →
+    /// declaration shape (`amount == 0`, `intent_ttl_secs == 0`, or an
+    /// overflowing `intent_expires_at` is `InvalidDualControl`, code
+    /// 188). The checker settles the declaration with
+    /// `confirm_release`; either party aborts it with
+    /// `cancel_release`.
+    pub fn initiate_release(
+        ctx: Context<InitiateRelease>,
+        amount: u64,
+        mint: Option<Pubkey>,
+        payout_to: Pubkey,
+        intent_ttl_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        // AV-27: the declaration clock reads the Solana clock sysvar —
+        // never an instruction param, so the maker cannot fast-forward
+        // the declaration's life.
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        escrow
+            .initiate_release(
+                ctx.accounts.authority.key().to_bytes(),
+                now,
+                amount,
+                mint.map(|m| m.to_bytes()),
+                payout_to.to_bytes(),
+                intent_ttl_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `from == to ==` the current state — the declaration
+        // is a pending intent, not a lifecycle move; the event carries
+        // no amounts (the declaration moves no funds).
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::DualControlInitiated,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
+    /// Approve the live dual-control declaration and settle it
+    /// (AV-130; mirrors `Escrow::confirm_release` — the *checker* half
+    /// of the maker-checker protocol). `ctx.accounts.checker` must
+    /// equal the bound checker key (`Unauthorized` otherwise — the
+    /// maker cannot self-approve, and neither can a stranger); a stale
+    /// declaration (`now >= intent_expires_at`) is cleared and the
+    /// call fails with `DualControlExpired` (code 191). The frozen
+    /// `{amount, mint, payout_to}` then settles through the exact
+    /// `release` settlement engine with the authority pinned to the
+    /// initializer (the AV-123 `release_via_intent` precedent) — a
+    /// checker-approved release moves funds bit-identically to a
+    /// direct one. Returns `(taker_payout, fee)` so the real build can
+    /// size both transfers.
+    pub fn confirm_release(ctx: Context<ConfirmRelease>) -> Result<(u64, u64)> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        // AV-27: the freshness clock reads the Solana clock sysvar —
+        // never an instruction param, so the checker cannot
+        // fast-forward the declaration's life.
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let (payout, fee) = escrow
+            .confirm_release(ctx.accounts.checker.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-31: settle via `cpi_settle_payout` (`PayoutKind::Release`) —
+        // the transfer instruction bytes are built and validated by
+        // `escrow_state::cpi::payout_plan`; the real build executes the
+        // validated plan once the token accounts are wired up. AV-18:
+        // `payout + fee` is the gross declared amount; a partial
+        // declaration carries from == to == Funded, the closing one to
+        // == Released.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::DualControlConfirmed,
+            from,
+            escrow.state() as u8,
+            payout + fee,
+            fee,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok((payout, fee))
+    }
+
+    /// Abort the live dual-control declaration (AV-130; mirrors
+    /// `Escrow::cancel_release`). Either the initializer (the maker —
+    /// retracting their own declaration) or the bound checker
+    /// (refusing to approve it) may cancel; a stranger is
+    /// `Unauthorized`. `DualControlNotInitiated` (code 190) when no
+    /// declaration is live. Cancelling clears the intent and moves no
+    /// funds; the escrow stays `Funded`.
+    pub fn cancel_release(ctx: Context<CancelRelease>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        escrow
+            .cancel_release(ctx.accounts.caller.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `from == to ==` the current state; the abort moves no
+        // funds — the AV-112 `ReleaseIntentVetoed` shape.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::DualControlCancelled,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
     /// `Escrow::merge_escrows`). Both vaults must be `Funded` with the
     /// same parties and identical settlement terms
     /// (`MergeIncompatible`, code 177, otherwise); only the
@@ -5794,6 +5965,44 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `slash_ladder_index`).
     pub refunded: u64,
+    /// AV-130: the opt-in dual-control (maker-checker) release checker
+    /// (mirrors `escrow_state`'s `dual_control_checker`); `None` for
+    /// escrows that never opted in via `initialize_dual_control`.
+    /// Layout position matches `escrow_state::VAULT_FIELDS`
+    /// (appended last, after `refunded`).
+    pub dual_control_checker: Option<Pubkey>,
+    /// AV-130: the live maker-checker release declaration (mirrors
+    /// `escrow_state`'s `dual_control_intent`); `None` when no release
+    /// is awaiting checker approval. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `dual_control_checker`).
+    pub dual_control_intent: Option<DualControlIntentMirror>,
+}
+
+/// Skeleton mirror of `escrow_state::DualControlIntent` (AV-130): the
+/// frozen maker-checker release declaration — the exact payout the
+/// initializer (the *maker*) declared for the checker to review. The
+/// checker settles it with `confirm_release`, or either party aborts
+/// it with `cancel_release`. Serialized size is pinned by
+/// `escrow_state::DUAL_CONTROL_INTENT_LEN` (89 bytes: 8-byte amount +
+/// 1-byte mint `Option` discriminant + 32-byte mint + 32-byte payout
+/// destination + 8-byte initiated clock + 8-byte expiry clock); on the
+/// vault it rides a 1-byte `Option` discriminant.
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, Debug, PartialEq, Eq,
+)]
+pub struct DualControlIntentMirror {
+    /// The gross release amount the checker is asked to approve.
+    pub amount: u64,
+    /// The token-mint binding of the intended payout (`None` =
+    /// native SOL), pinned exactly like `release`'s mint.
+    pub mint: Option<Pubkey>,
+    /// The taker payout destination the checker is asked to approve.
+    pub payout_to: Pubkey,
+    /// `initiate_release`'s `now` — the declaration clock.
+    pub initiated_at: u64,
+    /// `initiated_at + intent_ttl_secs` — the declaration's expiry.
+    pub intent_expires_at: u64,
 }
 
 /// Skeleton mirror of `escrow_state::PayoutSplit`: the opt-in
@@ -6399,6 +6608,21 @@ pub enum EscrowVaultEventKind {
     /// emitted only when an intent was actually cleared. Mirrors
     /// `escrow_state::EscrowEventKind::ReleaseIntentVetoed`.
     ReleaseIntentVetoed,
+    /// AV-130: a dual-control (maker-checker) release declaration was
+    /// frozen (`Escrow::initiate_release`). `from == to ==` the
+    /// current state; the declaration is a pending intent, not a
+    /// lifecycle move. Mirrors
+    /// `escrow_state::EscrowEventKind::DualControlInitiated`.
+    DualControlInitiated,
+    /// AV-130: the checker approved the live dual-control declaration
+    /// and it settled (`Escrow::confirm_release`). Mirrors
+    /// `escrow_state::EscrowEventKind::DualControlConfirmed`.
+    DualControlConfirmed,
+    /// AV-130: the live dual-control declaration was aborted
+    /// (`Escrow::cancel_release`). `from == to ==` the current state.
+    /// Mirrors
+    /// `escrow_state::EscrowEventKind::DualControlCancelled`.
+    DualControlCancelled,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -6488,6 +6712,16 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::ReleaseIntentVetoed => {
             EscrowVaultEventKind::ReleaseIntentVetoed
+        }
+        // AV-130: the maker-checker declaration lifecycle.
+        escrow_state::EscrowEventKind::DualControlInitiated => {
+            EscrowVaultEventKind::DualControlInitiated
+        }
+        escrow_state::EscrowEventKind::DualControlConfirmed => {
+            EscrowVaultEventKind::DualControlConfirmed
+        }
+        escrow_state::EscrowEventKind::DualControlCancelled => {
+            EscrowVaultEventKind::DualControlCancelled
         }
     }
 }
@@ -7065,6 +7299,59 @@ pub struct InitializeQuorum<'info> {
     /// Only the initializer configures the quorum; the state machine
     /// rejects re-configuration once the escrow is funded.
     pub initializer: Signer<'info>,
+}
+
+/// AV-130: accounts for `initialize_dual_control` — the initializer
+/// binds the maker's checker key while the escrow is `Uninitialized`.
+#[derive(Accounts)]
+pub struct InitializeDualControl<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer opts into dual control; the state machine
+    /// rejects re-configuration once the escrow is funded.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-130: accounts for `initiate_release` — the maker freezes the
+/// release declaration into the vault.
+#[derive(Accounts)]
+pub struct InitiateRelease<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The declaration authority: the initializer, or their
+    /// `RELEASE`-scoped operator. The payout destination is pinned by
+    /// the state machine, so an operator cannot redirect funds.
+    pub authority: Signer<'info>,
+    /// The declaration clock (the AV-27 rule: the state machine reads
+    /// the clock, never an instruction param).
+    pub clock: Sysvar<'info, Clock>,
+}
+
+/// AV-130: accounts for `confirm_release` — the checker approves the
+/// live declaration and it settles.
+#[derive(Accounts)]
+pub struct ConfirmRelease<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Must equal the bound checker key — the state machine rejects
+    /// anyone else with `Unauthorized`.
+    pub checker: Signer<'info>,
+    /// The freshness clock (the AV-27 rule).
+    pub clock: Sysvar<'info, Clock>,
+}
+
+/// AV-130: accounts for `cancel_release` — either party aborts the
+/// live declaration.
+#[derive(Accounts)]
+pub struct CancelRelease<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The initializer (the maker, retracting) or the bound checker
+    /// (refusing); the state machine rejects a stranger with
+    /// `Unauthorized`.
+    pub caller: Signer<'info>,
+    /// The abort clock (the AV-27 rule).
+    pub clock: Sysvar<'info, Clock>,
 }
 
 #[derive(Accounts)]
@@ -8898,6 +9185,22 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidSlashLadder => {
             error!(ErrorCode::InvalidSlashLadder)
         }
+        // AV-130: appended, never renumbered.
+        escrow_state::EscrowError::InvalidDualControl => {
+            error!(ErrorCode::InvalidDualControl)
+        }
+        escrow_state::EscrowError::DualControlIntentExists => {
+            error!(ErrorCode::DualControlIntentExists)
+        }
+        escrow_state::EscrowError::DualControlNotInitiated => {
+            error!(ErrorCode::DualControlNotInitiated)
+        }
+        escrow_state::EscrowError::DualControlExpired => {
+            error!(ErrorCode::DualControlExpired)
+        }
+        escrow_state::EscrowError::DualControlRequired => {
+            error!(ErrorCode::DualControlRequired)
+        }
     }
 }
 
@@ -9104,4 +9407,14 @@ pub enum ErrorCode {
     Ed25519ProgramInstructionMissing,
     #[msg("Invalid slash ladder (AV-126): with_slash_ladder with an empty or over-long rung table, a zero bps rung, bps above 10_000, non-strictly-ascending deadlines or bps, a zero penalty account, or on an escrow that already carries single-level slash terms (mutually exclusive)")]
     InvalidSlashLadder,
+    #[msg("Invalid dual-control configuration or operation (AV-130): with_dual_control with the zero checker key; initiate_release with amount == 0, intent_ttl_secs == 0 or an overflowing intent expiry; or any dual-control transition on an escrow that never opted in via with_dual_control")]
+    InvalidDualControl,
+    #[msg("Dual-control intent already live (AV-130): initiate_release while a dual-control declaration is already pending — confirm or cancel it first")]
+    DualControlIntentExists,
+    #[msg("No dual-control intent live (AV-130): confirm_release / cancel_release with nothing to confirm or cancel")]
+    DualControlNotInitiated,
+    #[msg("Dual-control intent expired (AV-130): confirm_release with now >= the live declaration's intent_expires_at — the stale declaration is cleared and the release is refused")]
+    DualControlExpired,
+    #[msg("Dual-control release required (AV-130): direct release (or a path routed through it) on a dual-control escrow — payouts leave only via the two-step initiate_release + confirm_release protocol")]
+    DualControlRequired,
 }

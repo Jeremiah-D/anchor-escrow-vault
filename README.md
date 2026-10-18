@@ -124,7 +124,11 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `reject_counter_offer(authority, now)` (AV-122) | `CounterOffered` | `Funded` | initializer only; drops the offer, terms unchanged; resets the deadman clock; emits `CounterOfferRejected` |
 | `initialize_dutch_auction(start_at, end_at, reserve_bps)` (AV-97) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the descending-price settlement window: `start_at < end_at`, `reserve_bps` in 0–10000 — `InvalidAuctionParams`, code 155, otherwise); the taker's pull path becomes the auction cap `max(amount * (end_at - now) / (end_at - start_at), amount * reserve_bps / 10000)` inside the window — early claimers keep more, the `reserve_bps` floor is the initializer's guaranteed keep; mutually exclusive with the AV-13/AV-90 unlock paths (last-wins) and with dispute arbitration while the window is live (`escalate` is refused with `AuctionNotActive`, code 156) |
 | `fund(authority, now)`                      | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer (`now` <- clock sysvar, recorded as `fund_at` — the origin the AV-64 relative timelock measures from); AV-104: a live FUND-scoped operator may call for the initializer instead (same checks, operator pays nothing — delegation covers transition rights only) |
-| `release(authority, now, amount, payout_to)` (AV-49)                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); AV-104: a live RELEASE-scoped operator may call for the initializer instead (all other gates identical; delegation covers transition rights only); cumulative releases ≤ locked amount; `payout_to` must satisfy the payout policy — the taker, or a member of the payout allowlist when one is configured (`PayoutNotAllowlisted` otherwise) |
+| `with_dual_control(checker)` (AV-130)               | `Uninitialized`| `Uninitialized` | initializer (once, before funding; binds the checker key for the maker-checker release protocol — a zero `checker` key is `InvalidDualControl`, code 188) |
+| `initiate_release(authority, now, amount, mint, payout_to, intent_ttl_secs)` (AV-130) | `Funded` | `Funded` (no state change; freezes the declaration) | initializer or their RELEASE-scoped operator (`Unauthorized` otherwise); pause → reentrancy → dual-control configured (`InvalidDualControl`, code 188, when never opted in) → authority → state → no live intent (`DualControlIntentExists`, code 189) → declaration shape (`amount == 0`, `intent_ttl_secs == 0`, or an overflowing expiry is `InvalidDualControl`, code 188); emits `DualControlInitiated` |
+| `confirm_release(checker, now)` (AV-130)        | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | the bound checker only — the maker cannot self-approve (`Unauthorized` otherwise); the declaration must be live (`DualControlNotInitiated`, code 190, when none) and fresh (`now < intent_expires_at` — a stale declaration is cleared and fails with `DualControlExpired`, code 191); settles through the exact `release` engine with the authority pinned to the initializer (fee, released-accounting, terminal-state logic identical to `release`); the declaration is consumed on success; emits `DualControlConfirmed` |
+| `cancel_release(caller, now)` (AV-130)          | `Funded`       | `Funded` (no state change; clears the declaration) | initializer **or** the bound checker (either party — a stranger is `Unauthorized`); no live declaration is `DualControlNotInitiated`, code 190; moves no funds; emits `DualControlCancelled` |
+| `release(authority, now, amount, payout_to)` (AV-49)                 | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | initializer (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); AV-104: a live RELEASE-scoped operator may call for the initializer instead (all other gates identical; delegation covers transition rights only); cumulative releases ≤ locked amount; `payout_to` must satisfy the payout policy — the taker, or a member of the payout allowlist when one is configured (`PayoutNotAllowlisted` otherwise); AV-130: on a dual-control escrow direct `release` is `DualControlRequired` (code 192) — payouts leave only via `initiate_release` + `confirm_release` |
 | `release_via_intent(intent, signature, now, now_slot, mint)` (AV-123) | `Funded` | `Funded` (partial) / `Released` (cumulative full) | **gasless / meta-transaction release** — any relayer (permissionless) may submit; the initializer's Ed25519 signature over the canonical `ReleaseIntent{escrow, amount, payout_to, nonce, expiry_slot}` bytes (prefixed with the `b"ESCROW-RELEASE-v1"` domain separator, verified with the hand-rolled RFC 8032 verifier from AV-101) is the authority; check order — pause → signature (`InvalidReleaseIntent`, code 181 — deliberately not `Unauthorized`: the submitter is permissionless, the signature is the authorization) → nonce strictly increasing against the persisted `last_intent_nonce` watermark (`IntentNonceReused`, code 182 — replays are dead) → expiry (`now_slot >= expiry_slot` is `IntentExpired`, code 183) → the full `release` guard chain (reentrancy / state / mint / payout-policy / funding-complete / quorum / timelock) with the initializer as authority; `payout_to` is pinned against the AV-49 payout policy like `release`; `released` accumulates the gross; the intent's `escrow` field binds the signature to the vault (the Anchor handler reconstructs the intent with the vault account's own key, so a signed intent cannot be retargeted at another vault); emits `ReleaseViaIntent` |
 | `release_split(authority, now, amount, recipients, bps)` (AV-93) | `Funded` | `Funded` (partial) / `Released` (cumulative full) | initializer; the check order mirrors `release` — authority → state → mint → the share-table shape (non-empty, ≤ 8 recipients, no zero address, no zero weight, weights summing to exactly 10_000 bps — `InvalidReleaseSplit`, code 150, otherwise) → every recipient pinned against the AV-49 payout policy (`PayoutNotAllowlisted` otherwise; with no allowlist only the taker passes, so a multi-recipient split is the allowlist's declared distribution set) → milestones / subscription / quorum / timelock gates → amount math (`AmountMismatch` on 0, `ReleaseExceedsLocked` past the remainder); the AV-17 protocol fee is charged on the gross amount first, then the net splits — each leg `floor(net * bps / 10_000)`, the dust landing on the first recipient, so the legs sum to the net exactly; `released` accumulates the gross, so the conservation invariant is untouched; returns the `(recipient, net_share)` legs (sizing the program's transfers) plus the fee; emits `ReleasedSplit` with the legs stamped on the event |
 | `slash(authority, amount)` (AV-82) | `Funded` | `Funded` (no state change — the escrow stays live, the taker can still earn the remainder) | initializer **or** the configured arbiter (the neutral enforcer — one party's griefing cannot burn the other's stake); `now` <- clock sysvar; requires the AV-82 slash terms (`Uninitialized`-time opt-in), `now >= slash_deadline`, and the amount ≤ the slashable remainder (`amount - released - penalty_paid`); single-level slashes are **one-shot** (a second slash is `SlashNotEligible`); `Disputed` is locked (`SlashNotEligible` — arbitration owns the funds) and milestone/subscription-scheduled escrows reject slash (the schedule owns the release path); on a dual-sig escrow both activation bits must be set; the slashed amount moves to the fixed penalty account and accumulates in `penalty_paid` (never in `released` — the audit trail distinguishes a default penalty from a taker payout); emits `Slashed` (`amounts.penalty` = the slashed amount); AV-126: on a ladder escrow (`Uninitialized`-time `with_slash_ladder` opt-in) the one-shot gate is bypassed — the ladder IS the repeated-slash path: each slash consumes the current rung, capped per slash at `floor(slashable_remainder * rung_bps / 10_000)` computed in u128 (`SlashNotEligible` above the cap); the `slash_ladder_index` cursor advances by one after each successful slash and stays pinned at the top rung once the last rung is consumed (further slashes are still allowed at the top rung's bps, never escalating further); every other guard (authority, `Funded`, the `Disputed` lock, no swap link, no milestone/subscription schedule, dual-sig bits, pause, mint match, amount > 0) still applies; the AV-107 interest settle and the AV-86 appeal-window stamping run per slash (each slash is a separate enforcement) and the AV-106 insurance-pool routing applies per slash; the `Slashed` event carries `slash_ladder_index` = the actually-consumed rung |
@@ -4127,6 +4131,96 @@ TWAP = (90,000 × 99 + 1,000,000 × 1) / 100 = 99,100 < 100,000
 A sustained move — 50 slots at 90,000 then 50 slots at 120,000 —
 gives TWAP = 105,000 ≥ 100,000, and the release proceeds. The gate
 rewards genuine price moves and ignores flash spikes.
+
+## Dual control (maker-checker) release (AV-130)
+
+The problem: every release path so far is a one-signature action —
+whoever holds the initializer key (or a `RELEASE`-scoped delegation)
+can drain the vault alone. A stolen initializer key is a stolen
+vault. AV-130 adds the classic treasury control: **maker-checker** —
+the initializer (the *maker*) declares each payout, and a second,
+distinct key (the *checker*) must approve it before anything settles.
+One key compromised is never enough; two must conspire (or the honest
+holder of the other key must fail to act).
+
+`with_dual_control(checker)` is an opt-in builder on an
+`Uninitialized` escrow (like the other `with_*` opt-ins). The
+checker's identity is fixed before any funds move; a zero `checker`
+key is `InvalidDualControl` (code 188), re-configuring a live escrow
+is `InvalidStateTransition`, and a paused escrow fails fast
+(`Paused`). The binding lives in two tail regions appended last to
+the vault account (123 bytes total, every earlier field offset
+stable): `dual_control_checker` (1-byte `Option` discriminant +
+32-byte key) and `dual_control_intent` (1-byte discriminant +
+89-byte frozen declaration — 8-byte amount, 1-byte mint-`Option`
+discriminant + 32-byte mint, 32-byte payout destination, 8-byte
+declaration clock, 8-byte expiry clock).
+
+The protocol is two steps:
+
+1. **`initiate_release(authority, now, amount, mint, payout_to,
+   intent_ttl_secs)`** — the maker freezes the *exact* payout into
+   the vault: `{amount, mint, payout_to, initiated_at: now,
+   intent_expires_at: now + intent_ttl_secs}`. The authority is the
+   initializer or their `RELEASE`-scoped operator (the payout
+   destination is pinned by the declaration, so an operator cannot
+   redirect funds). Check order is pause → reentrancy → dual-control
+   configured → authority → `Funded` state → no live intent →
+   declaration shape (`amount == 0`, `intent_ttl_secs == 0`, or an
+   overflowing expiry is `InvalidDualControl`, code 188; redeclaring
+   over a live intent is `DualControlIntentExists`, code 189). The
+   escrow state stays `Funded` — the declaration is a pending intent,
+   not a lifecycle move — and no funds move. Emits
+   `DualControlInitiated`.
+2. **`confirm_release(checker, now)`** — the checker approves the
+   live declaration and it settles. `checker` must equal the bound
+   key (`Unauthorized` otherwise — the maker cannot self-approve,
+   and neither can a stranger); a stale declaration (`now >=
+   intent_expires_at`) is cleared and the call fails with
+   `DualControlExpired` (code 191). The frozen
+   `{amount, mint, payout_to}` then settles through the *exact*
+   `release` settlement engine — fee, released-accounting, and
+   terminal-state logic are reused verbatim, not reimplemented
+   (code 192 never reaches the engine on the unapproved path). On
+   success the declaration is consumed (cleared); a failed settlement
+   leaves it live for a retry. Emits `DualControlConfirmed` with the
+   release amounts shape.
+3. **`cancel_release(caller, now)`** — either party aborts a live
+   declaration: the initializer retracting their own, or the checker
+   refusing to approve it. A stranger is `Unauthorized`; no live
+   declaration is `DualControlNotInitiated` (code 190). Cancelling
+   clears the intent and moves no funds. Emits `DualControlCancelled`.
+
+The core semantic change: on a dual-control escrow, **direct
+`release` is refused with `DualControlRequired` (code 192)** — and
+every path routed through it (`release_via_cpi`, the gasless
+`release_via_intent`) inherits the gate, so there is no one-signature
+bypass. The check sits in the shared internal `release_impl`, which
+`confirm_release` enters with `via_dual_control = true` and the
+authority pinned to the initializer (the AV-123 `release_via_intent`
+precedent: the authority semantics is "in whose name the release
+settles"). The payout-split-owned path `release_payout_split` is
+deliberately separate and ungated — a split table owns the release
+destination by construction, so dual-control and payout-split are
+not combined.
+
+Single-key-compromise properties (pinned by tests): a stolen
+initializer key can only *declare* intents — `confirm_release` with
+the maker's key is `Unauthorized`, and direct `release` is
+`DualControlRequired`, so the attacker can never settle. A stolen
+checker key cannot *declare* (`initiate_release` is `Unauthorized`
+for non-initializers), so there is nothing hostile to approve —
+though a checker-side compromise can refuse to approve, which is why
+the maker can always `cancel_release` and re-declare. An honest
+checker who spots a hostile declaration from a compromised maker key
+aborts it with `cancel_release`.
+
+Layout growth: the vault body grows from 5375 to 5498 bytes (+123),
+`VAULT_SPACE_NO_QUORUM` from 4893 to 5016, `VAULT_SPACE` from 5383
+to 5506, and the close-time rent reclamation from 38_356_560 to
+39_212_640 lamports (`(128 + VAULT_SPACE) * 3480 * 2`). The state
+machine's `EscrowState` enum gains no new variant — the two-step
+protocol reuses `Funded`, so discriminants stay stable.
 
 ## Escrow merge (AV-114)
 

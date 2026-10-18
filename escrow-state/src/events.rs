@@ -868,6 +868,28 @@ pub enum EscrowEventKind {
     /// also accumulates in the vault's persisted `refunded` counter
     /// (see `Escrow::refunded_amount`).
     PartialRefunded,
+    /// AV-130: a dual-control (maker-checker) release declaration was
+    /// frozen ([`Escrow::initiate_release`]) — the initializer (the
+    /// *maker*) declared the exact payout for the checker to review.
+    /// `from == to == Funded`; the intent is a pending declaration,
+    /// not a lifecycle move, so amounts carry [`EventAmounts::none`]
+    /// (the declaration moves no funds — like AV-112's
+    /// `ReleaseIntentAnnounced`). The actor is the maker.
+    DualControlInitiated,
+    /// AV-130: the checker approved the live dual-control declaration
+    /// and it settled ([`Escrow::confirm_release`]) — the two-step
+    /// release's terminal event. Amounts follow the `Released` shape
+    /// (`payout` = the gross declared amount, `fee` = the protocol
+    /// fee); the event-sourced fold books it like `Released`. The
+    /// actor is the checker — their approval authorized the payout;
+    /// the maker who declared it is visible in the vault state.
+    DualControlConfirmed,
+    /// AV-130: the live dual-control declaration was aborted
+    /// ([`Escrow::cancel_release`]) — either the maker retracted it or
+    /// the checker refused it. `from == to == Funded`; amounts carry
+    /// [`EventAmounts::none`] (the abort moves no funds — like AV-112's
+    /// `ReleaseIntentVetoed`). The actor is the cancelling party.
+    DualControlCancelled,
 }
 
 impl EscrowEventKind {
@@ -1035,6 +1057,11 @@ impl EscrowEventKind {
             // AV-127: appended after KeeperBountyPaid so discriminants
             // 0-67 stay stable for already-serialized histories.
             68 => Self::PartialRefunded,
+            // AV-130: appended after PartialRefunded so discriminants
+            // 0-68 stay stable for already-serialized histories.
+            69 => Self::DualControlInitiated,
+            70 => Self::DualControlConfirmed,
+            71 => Self::DualControlCancelled,
             _ => return None,
         })
     }
@@ -1118,6 +1145,11 @@ impl EscrowEventKind {
             // AV-127: appended after keeper_bounty_paid so the name
             // table stays stable for already-serialized histories.
             Self::PartialRefunded => "partial_refunded",
+            // AV-130: appended after partial_refunded so the name
+            // table stays stable for already-serialized histories.
+            Self::DualControlInitiated => "dual_control_initiated",
+            Self::DualControlConfirmed => "dual_control_confirmed",
+            Self::DualControlCancelled => "dual_control_cancelled",
         }
     }
 
@@ -1205,6 +1237,11 @@ impl EscrowEventKind {
             // AV-127: appended after keeper_bounty_paid so the name
             // table stays stable for already-serialized histories.
             "partial_refunded" => Self::PartialRefunded,
+            // AV-130: appended after partial_refunded so the name
+            // table stays stable for already-serialized histories.
+            "dual_control_initiated" => Self::DualControlInitiated,
+            "dual_control_confirmed" => Self::DualControlConfirmed,
+            "dual_control_cancelled" => Self::DualControlCancelled,
             _ => return None,
         })
     }
@@ -2405,7 +2442,131 @@ impl IndexedEscrow {
         Ok((payout, fee))
     }
 
-    /// Release `amount` through the AV-113 oracle price gate (mirrors
+    /// Opt into dual-control (maker-checker) release governance
+    /// (mirrors [`Escrow::with_dual_control`], AV-130). Configuration:
+    /// emits no event.
+    pub fn with_dual_control(mut self, checker: [u8; 32]) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_dual_control(checker)?;
+        Ok(self)
+    }
+
+    /// Declare a release for checker approval (mirrors
+    /// [`Escrow::initiate_release`], AV-130 — the *maker* half of the
+    /// maker-checker protocol). Emits
+    /// [`EscrowEventKind::DualControlInitiated`] (`from == to ==` the
+    /// current state — the declaration is a pending intent, not a
+    /// lifecycle move; amounts are [`EventAmounts::none`], the
+    /// declaration moves no funds). The actor is the maker (the
+    /// initializer or their RELEASE-scoped operator). `at` doubles as
+    /// the state machine's `now` and the event timestamp. Failed
+    /// declarations emit nothing.
+    ///
+    /// [`Escrow::initiate_release`]: crate::Escrow::initiate_release
+    pub fn initiate_release(
+        &mut self,
+        authority: [u8; 32],
+        amount: u64,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+        intent_ttl_secs: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`; a failed declaration gate emits nothing.
+        let result =
+            self.inner
+                .initiate_release(authority, at, amount, mint, payout_to, intent_ttl_secs);
+        self.map_reentrant(result, at)?;
+        self.push_event(
+            EscrowEventKind::DualControlInitiated,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(())
+    }
+
+    /// Approve the live dual-control declaration and settle it
+    /// (mirrors [`Escrow::confirm_release`], AV-130 — the *checker*
+    /// half of the maker-checker protocol). Emits
+    /// [`EscrowEventKind::DualControlConfirmed`] (not `Released`) so
+    /// indexers can distinguish a two-step settlement from a direct
+    /// one — amounts follow the `Released` shape (`payout` = the gross
+    /// declared amount, `fee` = the protocol fee; the event-sourced
+    /// fold books it like `Released`). The actor is the checker —
+    /// their approval authorized the payout. `at` doubles as the state
+    /// machine's `now` and the event timestamp. Failed confirmations
+    /// emit nothing.
+    ///
+    /// [`Escrow::confirm_release`]: crate::Escrow::confirm_release
+    pub fn confirm_release(
+        &mut self,
+        checker: [u8; 32],
+        at: u64,
+    ) -> Result<(u64, u64), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`. A failed confirmation gate (wrong
+        // checker, expired intent, a release guard that would stop the
+        // settlement) is not a reentrant entry and emits nothing.
+        let intent_amount = self
+            .inner
+            .dual_control_intent()
+            .map(|intent| intent.amount);
+        let result = self.inner.confirm_release(checker, at);
+        let (payout, fee) = self.map_reentrant(result, at)?;
+        self.push_event(
+            EscrowEventKind::DualControlConfirmed,
+            from,
+            self.inner.state(),
+            EventAmounts::payout(intent_amount.unwrap_or(0), fee),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(checker),
+        );
+        Ok((payout, fee))
+    }
+
+    /// Abort the live dual-control declaration (mirrors
+    /// [`Escrow::cancel_release`], AV-130). Emits
+    /// [`EscrowEventKind::DualControlCancelled`] (`from == to ==` the
+    /// current state; amounts are [`EventAmounts::none`], the abort
+    /// moves no funds — the AV-112 `ReleaseIntentVetoed` shape). The
+    /// actor is the cancelling party (the maker or the checker). `at`
+    /// doubles as the state machine's `now` and the event timestamp.
+    /// Failed cancels emit nothing.
+    ///
+    /// [`Escrow::cancel_release`]: crate::Escrow::cancel_release
+    pub fn cancel_release(&mut self, caller: [u8; 32], at: u64) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`; a failed cancel gate emits nothing.
+        let result = self.inner.cancel_release(caller, at);
+        self.map_reentrant(result, at)?;
+        self.push_event(
+            EscrowEventKind::DualControlCancelled,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(caller),
+        );
+        Ok(())
+    }
     /// [`Escrow::release_price_gated`]). Emits `Released` exactly like
     /// [`IndexedEscrow::release`] — the gate is a check, not a
     /// lifecycle move (mirroring the AV-27 timelock, which likewise
@@ -7140,7 +7301,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(59), Some(EscrowEventKind::ReleaseIntentAnnounced));
         assert_eq!(EscrowEventKind::from_discriminant(60), Some(EscrowEventKind::ReleaseIntentVetoed));
         assert_eq!(EscrowEventKind::from_discriminant(61), Some(EscrowEventKind::EscrowsMerged));
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
@@ -7243,7 +7404,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
@@ -7780,7 +7941,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
@@ -7795,7 +7956,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
@@ -7807,7 +7968,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
@@ -7819,7 +7980,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
@@ -7831,7 +7992,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
@@ -7846,7 +8007,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
@@ -7861,7 +8022,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
@@ -7873,7 +8034,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
@@ -7885,7 +8046,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
@@ -7897,7 +8058,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
@@ -7909,7 +8070,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
@@ -7921,7 +8082,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
@@ -7933,7 +8094,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(69), None);
+        assert_eq!(EscrowEventKind::from_discriminant(72), None);
     }
 
     #[test]
