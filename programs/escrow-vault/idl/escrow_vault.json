@@ -1006,6 +1006,15 @@
       "discriminator": [109, 170, 172, 190, 125, 251, 1, 66],
       "accounts": [],
       "args": []
+    },
+    {
+      "name": "initialize_amount_bounds",
+      "discriminator": [79, 16, 125, 146, 48, 120, 89, 84],
+      "accounts": [],
+      "args": [
+        {"name": "min_amount", "type": "u64"},
+        {"name": "max_amount", "type": "u64"}
+      ]
     }
   ],
   "accounts": [
@@ -1126,7 +1135,9 @@
           {"name": "dual_control_checker", "type": {"option": "publicKey"}, "offset": 5383},
           {"name": "dual_control_intent", "type": {"option": {"defined": "DualControlIntent"}}, "offset": 5416},
           {"name": "disputed_amount", "type": "u64", "offset": 5506},
-          {"name": "auto_unpause_at", "type": {"option": "u64"}, "offset": 5514}
+          {"name": "auto_unpause_at", "type": {"option": "u64"}, "offset": 5514},
+          {"name": "min_funding_amount", "type": {"option": "u64"}, "offset": 5523},
+          {"name": "max_funding_amount", "type": {"option": "u64"}, "offset": 5532}
         ]
       }
     }
@@ -1519,7 +1530,9 @@
     {"code": 192, "name": "DualControlRequired"},
     {"code": 193, "name": "InvalidDisputeAmount"},
     {"code": 194, "name": "DisputedAmountLocked"},
-    {"code": 195, "name": "SlippageExceeded"}
+    {"code": 195, "name": "SlippageExceeded"},
+    {"code": 196, "name": "InvalidAmountBounds"},
+    {"code": 197, "name": "AmountOutOfBounds"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

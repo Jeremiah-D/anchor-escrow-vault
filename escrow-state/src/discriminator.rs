@@ -1372,6 +1372,22 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         None
     };
 
+    // AV-134: the funding amount bounds — 1-byte `Option`
+    // discriminant + 8-byte bound each, decoded like any other
+    // persisted tail field.
+    let min_funding_amount = if c.option_present("min_funding_amount")? {
+        Some(c.u64_le()?)
+    } else {
+        c.skip(8)?;
+        None
+    };
+    let max_funding_amount = if c.option_present("max_funding_amount")? {
+        Some(c.u64_le()?)
+    } else {
+        c.skip(8)?;
+        None
+    };
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1643,6 +1659,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-133: the scheduled pause auto-recovery timestamp — a
         // decoded escrow carries the same schedule `pause` recorded.
         auto_unpause_at,
+        // AV-134: the funding amount bounds — a decoded escrow
+        // carries the same window `with_amount_bounds` recorded.
+        min_funding_amount,
+        max_funding_amount,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

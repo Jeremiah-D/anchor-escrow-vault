@@ -720,6 +720,19 @@ pub struct PendingAutoUnpause {
     pub auto_unpause_at: u64,
 }
 
+/// AV-134: a vault with a configured funding amount window (see
+/// [`Escrow::with_amount_bounds`](super::Escrow::with_amount_bounds))
+/// — the floor and ceiling every deposit must sit inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FundingBounds {
+    /// The escrow id.
+    pub escrow_id: [u8; 32],
+    /// The configured `min_funding_amount` floor.
+    pub min_amount: u64,
+    /// The configured `max_funding_amount` ceiling.
+    pub max_amount: u64,
+}
+
 /// The scan result: every executable keeper call at [`KeeperReport::at`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeeperReport {
@@ -770,6 +783,11 @@ pub struct KeeperReport {
     /// per vault. Informational: the recovery fires inside the state
     /// machine's `try_auto_unpause`, not via a keeper action.
     pub pending_auto_unpause: Vec<PendingAutoUnpause>,
+    /// AV-134: vaults with a configured funding amount window
+    /// (`with_amount_bounds`) — the floor and ceiling per vault.
+    /// Informational: the window gates the deposit path inside the
+    /// state machine, not via a keeper action.
+    pub funding_bounds: Vec<FundingBounds>,
 }
 
 impl KeeperReport {
@@ -839,7 +857,7 @@ impl KeeperReport {
     ///    "bounty_lamports":0,"bounty_unprofitable":false,
     ///    "estimated_cu":13814}
     ///  ],
-    ///  "report_seq":null,"pending_auto_unpause":[]}
+    ///  "report_seq":null,"pending_auto_unpause":[],"funding_bounds":[]}
     /// ```
     ///
     /// AV-120: `report_seq` rides last — the operator-stamped sequence
@@ -1093,6 +1111,22 @@ impl KeeperReport {
             s.push('}');
         }
         s.push(']');
+        // AV-134: vaults with a configured funding amount window —
+        // the floor and ceiling per vault.
+        s.push_str(",\"funding_bounds\":[");
+        for (i, b) in self.funding_bounds.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"escrow_id\":\"");
+            s.push_str(&hex32(&b.escrow_id));
+            s.push_str("\",\"min_amount\":");
+            s.push_str(&b.min_amount.to_string());
+            s.push_str(",\"max_amount\":");
+            s.push_str(&b.max_amount.to_string());
+            s.push('}');
+        }
+        s.push(']');
         s.push('}');
         s
     }
@@ -1132,6 +1166,11 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
     // recovery timestamp per vault (informational; the recovery fires
     // inside the state machine, not via a keeper action).
     let mut pending_auto_unpause = Vec::new();
+    // AV-134: vaults with a configured funding amount window — the
+    // floor and ceiling per vault (informational; the window gates
+    // the deposit path inside the state machine, not via a keeper
+    // action).
+    let mut funding_bounds = Vec::new();
     // AV-106: fleet-wide insurance-pool lines — saturating sums over
     // the scanned escrows.
     let mut pool_balance = 0u64;
@@ -1148,6 +1187,15 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     auto_unpause_at: t,
                 });
             }
+        }
+        // AV-134: record vaults with a configured funding amount
+        // window.
+        if let Some((min, max)) = e.amount_bounds() {
+            funding_bounds.push(FundingBounds {
+                escrow_id: w.escrow_id,
+                min_amount: min,
+                max_amount: max,
+            });
         }
         // AV-123: annotate escrows carrying a signed, unsubmitted
         // gasless-release intent. The intent verifies against the
@@ -1884,6 +1932,8 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         report_seq: None,
         // AV-133: the armed auto-recovery schedules collected above.
         pending_auto_unpause,
+        // AV-134: the funding amount windows collected above.
+        funding_bounds,
     }
 }
 
@@ -2626,7 +2676,7 @@ mod keeper_tests {
         let report = scan_keeper_actions(&[], MID);
         assert!(report.is_empty());
         assert_eq!(report.scanned, 0);
-        assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"total_estimated_cu":0,"jito_tip":null,"intent_releases":[],"pool_balance":0,"pool_inflow":0,"pool_outflow":0,"actions":[],"report_seq":null,"pending_auto_unpause":[]}"#);
+        assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"total_estimated_cu":0,"jito_tip":null,"intent_releases":[],"pool_balance":0,"pool_inflow":0,"pool_outflow":0,"actions":[],"report_seq":null,"pending_auto_unpause":[],"funding_bounds":[]}"#);
     }
 
     #[test]
@@ -2635,14 +2685,34 @@ mod keeper_tests {
         // stamps the next sequence before diffing.
         let legacy = scan_keeper_actions(&[], MID);
         assert_eq!(legacy.report_seq, None);
-        assert!(legacy.to_json().ends_with(",\"report_seq\":null,\"pending_auto_unpause\":[]}"));
+        assert!(legacy.to_json().ends_with(",\"report_seq\":null,\"pending_auto_unpause\":[],\"funding_bounds\":[]}"));
         let stamped = scan_keeper_actions(&[], MID).with_report_seq(9);
         assert_eq!(stamped.report_seq, Some(9));
-        assert!(stamped.to_json().ends_with(",\"report_seq\":9,\"pending_auto_unpause\":[]}"));
+        assert!(stamped.to_json().ends_with(",\"report_seq\":9,\"pending_auto_unpause\":[],\"funding_bounds\":[]}"));
         // The stamp is last and fixed-order: pin the tail bytes.
         assert!(stamped
             .to_json()
-            .ends_with("\"actions\":[],\"report_seq\":9,\"pending_auto_unpause\":[]}"));
+            .ends_with("\"actions\":[],\"report_seq\":9,\"pending_auto_unpause\":[],\"funding_bounds\":[]}"));
+    }
+
+    #[test]
+    fn funding_bounds_are_listed_in_the_report() {
+        // AV-134: vaults with a configured funding window are listed
+        // with their floor and ceiling; vaults without bounds are not.
+        let bounded = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_amount_bounds(100_000, 900_000)
+            .unwrap();
+        let plain = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER).unwrap();
+        let watched = [watch(ID1, bounded), watch(ID2, plain)];
+        let report = scan_keeper_actions(&watched, MID);
+        assert_eq!(report.funding_bounds.len(), 1);
+        let b = &report.funding_bounds[0];
+        assert_eq!(b.escrow_id, ID1);
+        assert_eq!((b.min_amount, b.max_amount), (100_000, 900_000));
+        let json = report.to_json();
+        assert!(json.contains("\"funding_bounds\":[{\"escrow_id\":\""));
+        assert!(json.contains("\"min_amount\":100000,\"max_amount\":900000"));
     }
 
     #[test]
@@ -3320,7 +3390,7 @@ mod keeper_tests {
         // 3 accounts, 8 data bytes, 1 signer →
         // 10_000 + 3_000 + 3×250 + 8×8 = 13_814 each; total 27_628.
         let expected = format!(
-            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":false,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":true,\"estimated_cu\":13814}}],\"report_seq\":null,\"pending_auto_unpause\":[]}}",
+            "{{\"at\":1000000,\"scanned\":1,\"total_estimated_cu\":27628,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"cancel_expired\",\"caller\":\"{}\",\"caller_role\":\"initializer\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":false,\"estimated_cu\":13814}},{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"crank_expired\",\"caller\":\"{}\",\"caller_role\":\"anyone\",\"mint\":null,\"refund_to\":\"{}\",\"amount\":1000000,\"decimals\":0,\"display_amount\":\"1000000\",\"reason\":\"expired\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":true,\"estimated_cu\":13814}}],\"report_seq\":null,\"pending_auto_unpause\":[],\"funding_bounds\":[]}}",
             hex_of(0x01),
             hex_of(0xAA),
             hex_of(0xAA),
@@ -3345,7 +3415,7 @@ mod keeper_tests {
         // AV-88: claim with mint, no refund_to: 3 accounts, 8 data
         // bytes, 1 signer → 14_000 + 3_000 + 3×250 + 8×8 = 17_814.
         let expected = format!(
-            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":false,\"estimated_cu\":17814}}],\"report_seq\":null,\"pending_auto_unpause\":[]}}",
+            "{{\"at\":1750000000,\"scanned\":1,\"total_estimated_cu\":17814,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[{{\"escrow_id\":\"{}\",\"vault_address\":null,\"action\":\"claim\",\"caller\":\"{}\",\"caller_role\":\"taker\",\"mint\":\"{}\",\"refund_to\":null,\"amount\":500000,\"decimals\":0,\"display_amount\":\"500000\",\"reason\":\"vesting_unlocked\",\"reference\":null,\"extension_count\":0,\"multisig_authority\":null,\"evidence_disclosure\":null,\"funding_progress\":null,\"merge_source\":null,\"penalty_estimate\":0,\"slot_unlock_at\":null,\"bounty_lamports\":0,\"bounty_unprofitable\":false,\"estimated_cu\":17814}}],\"report_seq\":null,\"pending_auto_unpause\":[],\"funding_bounds\":[]}}",
             hex_of(0x02),
             hex_of(0xBB),
             hex_of(0xD0),

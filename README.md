@@ -123,7 +123,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `accept_counter_offer(authority, now)` (AV-122) | `CounterOffered` | `Funded` | initializer only; atomically re-sets `amount`/`expires_at` to the offered terms (terms-only — no funds move); resets the deadman clock; emits `CounterOfferAccepted` |
 | `reject_counter_offer(authority, now)` (AV-122) | `CounterOffered` | `Funded` | initializer only; drops the offer, terms unchanged; resets the deadman clock; emits `CounterOfferRejected` |
 | `initialize_dutch_auction(start_at, end_at, reserve_bps)` (AV-97) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the descending-price settlement window: `start_at < end_at`, `reserve_bps` in 0–10000 — `InvalidAuctionParams`, code 155, otherwise); the taker's pull path becomes the auction cap `max(amount * (end_at - now) / (end_at - start_at), amount * reserve_bps / 10000)` inside the window — early claimers keep more, the `reserve_bps` floor is the initializer's guaranteed keep; mutually exclusive with the AV-13/AV-90 unlock paths (last-wins) and with dispute arbitration while the window is live (`escalate` is refused with `AuctionNotActive`, code 156) |
-| `fund(authority, now)`                      | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer (`now` <- clock sysvar, recorded as `fund_at` — the origin the AV-64 relative timelock measures from); AV-104: a live FUND-scoped operator may call for the initializer instead (same checks, operator pays nothing — delegation covers transition rights only) |
+| `fund(authority, now)`                      | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer (`now` <- clock sysvar, recorded as `fund_at` — the origin the AV-64 relative timelock measures from); AV-104: a live FUND-scoped operator may call for the initializer instead (same checks, operator pays nothing — delegation covers transition rights only); AV-134: with a funding window configured, the deposit must sit inside `[min_funding_amount, max_funding_amount]` (`AmountOutOfBounds`, code 197, otherwise) |
 | `with_dual_control(checker)` (AV-130)               | `Uninitialized`| `Uninitialized` | initializer (once, before funding; binds the checker key for the maker-checker release protocol — a zero `checker` key is `InvalidDualControl`, code 188) |
 | `initiate_release(authority, now, amount, mint, payout_to, intent_ttl_secs)` (AV-130) | `Funded` | `Funded` (no state change; freezes the declaration) | initializer or their RELEASE-scoped operator (`Unauthorized` otherwise); pause → reentrancy → dual-control configured (`InvalidDualControl`, code 188, when never opted in) → authority → state → no live intent (`DualControlIntentExists`, code 189) → declaration shape (`amount == 0`, `intent_ttl_secs == 0`, or an overflowing expiry is `InvalidDualControl`, code 188); emits `DualControlInitiated` |
 | `confirm_release(checker, now)` (AV-130)        | `Funded`       | `Funded` (partial) / `Released` (cumulative full) | the bound checker only — the maker cannot self-approve (`Unauthorized` otherwise); the declaration must be live (`DualControlNotInitiated`, code 190, when none) and fresh (`now < intent_expires_at` — a stale declaration is cleared and fails with `DualControlExpired`, code 191); settles through the exact `release` engine with the authority pinned to the initializer (fee, released-accounting, terminal-state logic identical to `release`); the declaration is consumed on success; emits `DualControlConfirmed` |
@@ -169,7 +169,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `claim_deadman(heir, now)` (AV-109) | `Funded` | `Cancelled` | **the configured heir only** (`Unauthorized` otherwise — the heir is deliberately *not* required to be either party, the orthogonality point with `cancel_expired`); only once `now - deadman_last_activity >= inactivity_secs` (saturating; exactly-equal counts as elapsed — `DeadmanNotElapsed`, code 169, before the window lapses); unconfigured switch is `InvalidDeadmanConfig` (code 168); the pause gate and the AV-105 swap-link refusal apply; `now` <- clock sysvar (never an instruction param); the unsettled AV-107 interest claim is voided like `cancel`; returns the remaining locked amount (refund-family unwind — `released` untouched, the remainder preserved for audit like `cancel`'s); emits `DeadmanClaimed` |
 | `top_up_rent(caller, lamports)` (AV-110) | any except `Closed` | unchanged (no state change) | **permissionless** — anyone may top up (the initializer, the taker, the keeper bot, or a stranger; no authority check, the caller only acts as the event actor); `Closed` is `InvalidStateTransition` (no account left to keep rent-exempt); `lamports == 0` is `InvalidRentTopUp` (code 170); deliberately *not* pause-gated (pausing freezes fund movement, not operational hygiene) and no reentrancy guard (no escrow funds move); accumulates `rent_topped_up_total` only — the state byte and the amount conservation identity are untouched (a top-up is pure lamport bookkeeping on the vault account); emits `RentToppedUp` (`from == to ==` the current state; the topped-up lamports ride the event's `rent_reclaimed` amount field) |
 | `initialize_funding_plan(total_amount, max_tranches)` (AV-111) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the cumulative funding target — must equal the escrow's declared `amount` (`AmountMismatch` otherwise) — and the tranche budget, at least 1 (`InvalidFundingPlan`, code 173, on zero); attaching the plan moves the deposit path from `fund` to `fund_tranche`) |
-| `fund_tranche(authority, tranche_amount, now)` (AV-111) | `Uninitialized` (non-dual-sig) / `Activated` / `Funded` | `Funded` (first tranche; later tranches re-enter `Funded`) | initializer or their FUND-scoped operator (AV-104); `now` <- clock sysvar (never a param); full check sequence — pause → reentrancy → FUND-scoped authority → plan presence (`InvalidFundingPlan`, code 173, when no plan is attached) → state → positive amount (`AmountMismatch` on zero) → tranche budget (`FundingTranchesExhausted`, code 172, when spent) → overfund cap (`AmountMismatch`); each call accumulates `funded_total` and consumes one tranche slot; the first call anchors `fund_at` / the interest clock / the deadman clock exactly like `fund`; emits `TrancheFunded` (`from == to ==` the state after the call; no amount — the fold seeds the lockup with the deal size at `Funded`) |
+| `fund_tranche(authority, tranche_amount, now)` (AV-111) | `Uninitialized` (non-dual-sig) / `Activated` / `Funded` | `Funded` (first tranche; later tranches re-enter `Funded`) | initializer or their FUND-scoped operator (AV-104); `now` <- clock sysvar (never a param); full check sequence — pause → reentrancy → FUND-scoped authority → plan presence (`InvalidFundingPlan`, code 173, when no plan is attached) → state → positive amount (`AmountMismatch` on zero) → AV-134 funding window (`AmountOutOfBounds`, code 197, when the tranche sits outside the configured bounds) → tranche budget (`FundingTranchesExhausted`, code 172, when spent) → overfund cap (`AmountMismatch`); each call accumulates `funded_total` and consumes one tranche slot; the first call anchors `fund_at` / the interest clock / the deadman clock exactly like `fund`; emits `TrancheFunded` (`from == to ==` the state after the call; no amount — the fold seeds the lockup with the deal size at `Funded`) |
+| `initialize_amount_bounds(min_amount, max_amount)` (AV-134) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; opt-in deposit guardrails — `min_amount > max_amount` is `InvalidAmountBounds`, code 196); once attached, `fund` and each `fund_tranche` deposit must sit inside the window (`AmountOutOfBounds`, code 197, otherwise); with no bounds configured both deposit paths keep their existing semantics |
 | `with_release_cooling(cooling_secs)` (AV-112) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; builder-style like the other `with_*` opt-ins); `cooling_secs = 0` means unconfigured — `release` is ungated, exactly like AV-21's grace-period convention |
 | `announce_release(authority, now)` (AV-112) | `Funded` | `Funded` | initializer or taker (either party, no delegation); full check sequence — pause → authority → state; stamps `release_intent_at = now` (re-announce overwrites — idempotent); touches the AV-109 deadman clock (party liveness); emits `ReleaseIntentAnnounced` |
 | `veto_release(caller, now)` (AV-112) | any non-`Closed` | unchanged | initializer or taker (either party); full check sequence — pause → authority → state; clears `release_intent_at`; no intent is a no-op success; touches the deadman clock; emits `ReleaseIntentVetoed` |
@@ -1418,6 +1419,8 @@ program error per variant):
 | `TwapGateNotSatisfied` | 186 | `release_twap_gated` / `claim_twap_gated` (AV-128) with a configured gate when the oracle is dark, the latest quote is stale, the history does not cover the full TWAP window, or the time-weighted average misses the gate's direction condition |
 | `InvalidTwapGate` | 187 | `with_twap_gate` / `initialize_twap_gate` (AV-128) with `window_slots == 0` or `target == 0`, or a vault-account decode hitting an out-of-range direction byte |
 | `SlippageExceeded` | 195 | `release_via_cpi` (AV-132) whose executor-reported post-execution taker-leg amount came back below the `min_payout` floor — the whole release rolled back (same atomicity as `CpiExecutionFailed`) |
+| `InvalidAmountBounds` | 196 | `with_amount_bounds` / `initialize_amount_bounds` (AV-134) with `min_amount > max_amount` — an inverted funding window |
+| `AmountOutOfBounds` | 197 | `fund` / `fund_tranche` (AV-134) with a deposit below `min_funding_amount` or above `max_funding_amount` — the deposit is rejected before any state moves |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2585,7 +2588,13 @@ two-way consistency check against the IDL parameter table:
 | slash_ladder_index | u8 | 1 |
 | refunded | u64 | 8 |
 | twap_gate | Option<TwapGate> (1-byte discriminant + 1-byte direction + 8-byte target + 8-byte window_slots + 8-byte max_staleness_secs) | 26 |
-| **total**     |                   | **5375** |
+| dual_control_checker | Option<Pubkey> (1-byte discriminant + 32-byte checker key) | 33 |
+| dual_control_intent | Option<DualControlIntent> (1-byte discriminant + 89-byte intent region) | 90 |
+| disputed_amount | u64 | 8 |
+| auto_unpause_at | Option<u64> (1-byte discriminant + 8-byte timestamp) | 9 |
+| min_funding_amount | Option<u64> (1-byte discriminant + 8-byte bound) | 9 |
+| max_funding_amount | Option<u64> (1-byte discriminant + 8-byte bound) | 9 |
+| **total**     |                   | **5533** |
 
 The quorum region is always reserved (zeroed when `None`), so
 `initialize_quorum` writes the policy in place — the account never needs a
@@ -2716,10 +2725,10 @@ discriminant + 113-byte region — 32-byte penalty account + 8 fixed
 zeroed when no ladder is configured) + the 1-byte
 `slash_ladder_index` rung cursor, zeroed when no ladder is
 configured).
-`escrow-state` exposes `VAULT_SPACE` (5349) and
-`VAULT_SPACE_NO_QUORUM` (4859) for the Anchor `space =` constraint, plus a
+`escrow-state` exposes `VAULT_SPACE` (5541) and
+`VAULT_SPACE_NO_QUORUM` (5051) for the Anchor `space =` constraint, plus a
 pure-logic rent-exemption check mirroring `Rent::minimum_balance`. With
-mainnet rent parameters the full vault needs **38,119,920 lamports** to be
+mainnet rent parameters the full vault needs **39,456,240 lamports** to be
 rent-exempt (`check_vault_rent_exempt` asserts the exact boundary).
 
 ### Terminal-state rent reclamation (AV-34)
@@ -4521,6 +4530,32 @@ Layout growth: the vault body grows from 5506 to 5515 bytes (+9:
 5024 to 5033, `VAULT_SPACE` from 5514 to 5523, and the close-time rent
 reclamation from 39_268_320 to 39_330_960 lamports
 (`(128 + VAULT_SPACE) * 3480 * 2`).
+
+## Funding amount bounds (AV-134)
+
+`with_amount_bounds(min_amount, max_amount)` (`initialize_amount_bounds`
+on the Anchor layer) is an `Uninitialized`-only opt-in builder for
+deposit guardrails — the payment-fintech answer to fat-fingered or
+mispriced transfers. `min_amount > max_amount` is `InvalidAmountBounds`
+(code 196): an inverted window can never be a deliberate policy.
+
+Once attached, `fund` rejects a deposit outside the window with
+`AmountOutOfBounds` (code 197), checked after authority / plan / state
+on the deposit itself; each `fund_tranche` call is gated on the tranche
+amount the same way (the AV-111 plan still owns the tranche schedule —
+the bounds cap each tranche, and the plan's overfund cap still applies).
+A rejected deposit moves nothing: state, `funded_total` and the clocks
+are untouched. With no bounds configured both deposit paths keep their
+existing semantics (backward compatible). The bounds persist in the
+vault tail (`min_funding_amount` / `max_funding_amount`, 9 bytes each),
+ride the snapshot export, and are listed per vault in keeper reports
+(`funding_bounds`).
+
+Layout growth: the vault body grows from 5515 to 5533 bytes (+18: two
+1-byte `Option` discriminants + two 8-byte bounds),
+`VAULT_SPACE_NO_QUORUM` from 5033 to 5051, `VAULT_SPACE` from 5523 to
+5541, and the close-time rent reclamation from 39_330_960 to 39_456_240
+lamports (`(128 + VAULT_SPACE) * 3480 * 2`).
 
 ### Local-validator integration stubs
 

@@ -2039,6 +2039,30 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Fix the funding amount window (AV-134; mirrors
+    /// `Escrow::with_amount_bounds`). The initializer bounds every
+    /// deposit: `fund` and each `fund_tranche` call reject amounts
+    /// outside `[min_amount, max_amount]` with `AmountOutOfBounds`
+    /// (code 197); `min_amount > max_amount` is `InvalidAmountBounds`
+    /// (code 196).
+    pub fn initialize_amount_bounds(
+        ctx: Context<InitializeAmountBounds>,
+        min_amount: u64,
+        max_amount: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_amount_bounds(min_amount, max_amount)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the full amount-bounds
+        // region (`escrow_state::AMOUNT_BOUNDS_TAIL_LEN`), so the
+        // bounds are written in place — no realloc needed in the real
+        // build. No indexer event: pre-fund configuration, like the
+        // other `initialize_*` opt-ins.
+        Ok(())
+    }
+
     /// Declare a release for checker approval (AV-130; mirrors
     /// `Escrow::initiate_release` — the *maker* half of the
     /// maker-checker protocol). The initializer (or their
@@ -7340,6 +7364,18 @@ pub struct InitializeDualControl<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-134: accounts for `initialize_amount_bounds` — the initializer
+/// fixes the funding amount window while the escrow is
+/// `Uninitialized`.
+#[derive(Accounts)]
+pub struct InitializeAmountBounds<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer opts into funding bounds; the state
+    /// machine rejects re-configuration once the escrow is funded.
+    pub initializer: Signer<'info>,
+}
+
 /// AV-130: accounts for `initiate_release` — the maker freezes the
 /// release declaration into the vault.
 #[derive(Accounts)]
@@ -9240,6 +9276,13 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::SlippageExceeded => {
             error!(ErrorCode::SlippageExceeded)
         }
+        // AV-134: appended, never renumbered.
+        escrow_state::EscrowError::InvalidAmountBounds => {
+            error!(ErrorCode::InvalidAmountBounds)
+        }
+        escrow_state::EscrowError::AmountOutOfBounds => {
+            error!(ErrorCode::AmountOutOfBounds)
+        }
     }
 }
 
@@ -9462,4 +9505,8 @@ pub enum ErrorCode {
     DisputedAmountLocked,
     #[msg("Slippage exceeded (AV-132): release_via_cpi post-execution taker-leg amount below the min_payout floor — the whole release rolled back")]
     SlippageExceeded,
+    #[msg("Invalid amount bounds (AV-134): initialize_amount_bounds with min_amount > max_amount — an inverted funding window")]
+    InvalidAmountBounds,
+    #[msg("Amount out of bounds (AV-134): fund / fund_tranche deposit below min_funding_amount or above max_funding_amount")]
+    AmountOutOfBounds,
 }

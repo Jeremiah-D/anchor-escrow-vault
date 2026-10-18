@@ -386,6 +386,13 @@ pub struct EscrowSnapshot {
     /// (`Escrow::auto_unpause_at`); `None` when no schedule is armed
     /// (manual unpause only).
     pub auto_unpause_at: Option<u64>,
+    /// AV-134: the funding amount window
+    /// (`Escrow::amount_bounds`); `None` when no bounds are
+    /// configured (both deposit paths ungated).
+    pub min_funding_amount: Option<u64>,
+    /// AV-134: the funding amount window's ceiling; see
+    /// `min_funding_amount`.
+    pub max_funding_amount: Option<u64>,
     /// The arbiter's rationale-document commitment attached at
     /// `resolve`, or `None` when the arbiter supplied no rationale
     /// (AV-38). Only `Some` on a `Settled` escrow — never cleared, so
@@ -832,6 +839,11 @@ impl Escrow {
             // AV-133: the armed auto-recovery schedule rides the export
             // so indexers see the exact recovery timestamp.
             auto_unpause_at: self.auto_unpause_at(),
+            // AV-134: the funding amount window rides the export so
+            // indexers see the floor and ceiling gating the deposit
+            // path.
+            min_funding_amount: self.min_funding_amount(),
+            max_funding_amount: self.max_funding_amount(),
             rationale_hash: self.rationale_hash(),
             refund_to: self.refund_to(),
             refund_recipient: self.refund_recipient(),
@@ -1351,6 +1363,18 @@ impl EscrowSnapshot {
             Some(t) => s.push_str(&t.to_string()),
             None => s.push_str("null"),
         }
+        // AV-134: the funding amount window — `null` when no bounds
+        // are configured (both deposit paths ungated).
+        s.push_str(",\"min_funding_amount\":");
+        match self.min_funding_amount {
+            Some(m) => s.push_str(&m.to_string()),
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"max_funding_amount\":");
+        match self.max_funding_amount {
+            Some(m) => s.push_str(&m.to_string()),
+            None => s.push_str("null"),
+        }
         // AV-38: the arbiter's rationale-document commitment — `null`
         // until the arbiter attaches one at `resolve`.
         s.push_str(",\"rationale_hash\":");
@@ -1819,7 +1843,7 @@ mod snapshot_tests {
              \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
-             \"evidence_hash\":null,\"evidence_root\":null,\"evidence_disclosure\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"disputed_amount\":0,\"auto_unpause_at\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
+             \"evidence_hash\":null,\"evidence_root\":null,\"evidence_disclosure\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"disputed_amount\":0,\"auto_unpause_at\":null,\"min_funding_amount\":null,\"max_funding_amount\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\
              \"penalty_bps\":0,\"penalty_escalation_rate_bps\":0,\"penalty_escalation_cap_bps\":0,\"unlock_at\":0,\"unlock_eligible\":true,\"relative_timelock_secs\":0,\"fund_at\":1700000000,\"slot_timelock_slots\":0,\"fund_slot\":0,\"claim_cooldown_slots\":0,\"last_claim_slot\":null,\"counter_offer\":null,\"payout_allowlist\":null,\"payout_denylist\":null,\"cpi_allowlist\":null,\"multisig_authority\":null,\
              \"reference\":null,\
              \"event_history\":{{\"capacity\":64,\"total\":0,\"count\":0,\"entries\":[]}},\
@@ -1841,6 +1865,29 @@ mod snapshot_tests {
             taker = hex_of(0xBB),
         );
         assert_eq!(snap.to_json(), expected);
+    }
+
+    #[test]
+    fn snapshot_carries_funding_amount_bounds() {
+        // AV-134: the configured window rides the snapshot export;
+        // unconfigured vaults export nulls.
+        let e = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER)
+            .unwrap()
+            .with_amount_bounds(100_000, 900_000)
+            .unwrap();
+        let snap = e.snapshot(MID);
+        assert_eq!(snap.min_funding_amount, Some(100_000));
+        assert_eq!(snap.max_funding_amount, Some(900_000));
+        assert!(snap
+            .to_json()
+            .contains("\"min_funding_amount\":100000,\"max_funding_amount\":900000"));
+        let plain = Escrow::initialize(ALICE, BOB, AMOUNT, NEVER).unwrap();
+        let snap = plain.snapshot(MID);
+        assert_eq!(snap.min_funding_amount, None);
+        assert_eq!(snap.max_funding_amount, None);
+        assert!(snap
+            .to_json()
+            .contains("\"min_funding_amount\":null,\"max_funding_amount\":null"));
     }
 
     #[test]

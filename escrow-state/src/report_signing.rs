@@ -284,7 +284,7 @@ mod report_signing_tests {
         // bytes (`[]` when no watched escrow carries an intent).
         // AV-133: the pending auto-unpause vaults ride the canonical
         // bytes (`[]` when none are armed).
-        assert_eq!(canonical, "{\"at\":1000,\"scanned\":0,\"total_estimated_cu\":0,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[],\"report_seq\":null,\"pending_auto_unpause\":[]}");
+        assert_eq!(canonical, "{\"at\":1000,\"scanned\":0,\"total_estimated_cu\":0,\"jito_tip\":null,\"intent_releases\":[],\"pool_balance\":0,\"pool_inflow\":0,\"pool_outflow\":0,\"actions\":[],\"report_seq\":null,\"pending_auto_unpause\":[],\"funding_bounds\":[]}");
     }
 
     #[test]
