@@ -176,6 +176,8 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `fund_taker(taker, amount, now)` (AV-148) | `Funded` (or `Activated` on a dual-sig escrow) | `Funded` (unchanged — additive funding on a live escrow) | taker only (a stranger or the initializer is `Unauthorized`; AV-104 delegation does not extend to the taker's leg); `now` <- clock sysvar (never a param); full check sequence — pause (`Paused`) → reentrancy (`ReentrantCall`) → taker authority → state (`InvalidStateTransition` unless `Funded`/`Activated`) → config (a milestone plan or subscription schedule refuses the counter-fund — `InvalidMilestones` / `InvalidSubscription`) → positive amount (`AmountMismatch` on zero or wrapping accumulate); each call accumulates `taker_locked` and touches the deadman clock; emits `TakerFunded` (discriminant 76; `from == to ==` the state after the call; no amount — the fold seeds the lockup with the bilateral total at `Funded`) |
 | `initialize_claimants(shares)` (AV-149) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; opt-in multi-taker pull roster — 1–8 `(claimant, share_bps)` legs; empty / over-8 / zero-address / zero-share / duplicate-claimant / Σ != 10_000 bps is `InvalidClaimantShares`, code 211); once attached, each claimant pulls their own share via `claim_share` (the roster does not gate the bilateral release/claim paths — it is a pull roster, not a release lock) |
 | `claim_share(claimant)` (AV-149) | `Funded` | `Funded` (or `Released` once the last leg is pulled) | the claiming claimant only — `authority` must equal `claimant` (`Unauthorized` otherwise; one claimant cannot pull another's share); `now` <- clock sysvar (never a param); full check sequence — pause (`Paused`) → reentrancy (`ReentrantCall`) → authority → state (`InvalidStateTransition` unless `Funded`) → roster (not a roster leg is `ClaimantNotInRoster`, code 209) → bitmask (already-pulled leg is `ClaimantAlreadyClaimed`, code 210); the leg's gross is its bps share of the current locked remainder (`released` accumulates the gross, AV-17 fee deducted on top); the last unclaimed leg takes the whole remainder (dust-absorbing), so the final pull moves `Funded` -> `Released`; emits `ShareClaimed` (discriminant 77) |
+| `pause_vesting()` (AV-150) | `Funded` | `Funded` (unchanged — a schedule-config flip, not a lifecycle move) | initializer only (`Unauthorized` for the taker or a stranger; AV-46 global pause is checked first); `now` <- clock sysvar (never a param); full check sequence — auto-unpause (AV-133) → pause (`Paused`) → authority → state (`InvalidStateTransition` unless `Funded`) → vesting attached (schedule-less is `InvalidVesting`) → not already paused (re-pause is `VestingAlreadyPaused`, code 213); stamps `paused_at` = now; while paused, the taker's schedule-priced `claim` is refused (`VestingPaused`, code 212) but the initializer's `release` push path and the roster 's `claim_share` stay open; emits `VestingPaused` (discriminant 78) |
+| `resume_vesting()` (AV-150) | `Funded` | `Funded` (unchanged — a schedule-config flip, not a lifecycle move) | initializer only (`Unauthorized` otherwise); `now` <- clock sysvar (never a param); full check sequence — auto-unpause (AV-133) → pause (`Paused`) → authority → state (`InvalidStateTransition` unless `Funded`) → paused (live schedule is `VestingNotPaused`, code 214) → clock sane (`now < paused_at` is `InvalidVesting`); shifts the schedule's start/end/cliff_at forward by `now - paused_at` so the taker loses no unlock time (unlock duration unchanged), then clears the marker; emits `VestingResumed` (discriminant 79) |
 | `initialize_amount_bounds(min_amount, max_amount)` (AV-134) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; opt-in deposit guardrails — `min_amount > max_amount` is `InvalidAmountBounds`, code 196); once attached, `fund` and each `fund_tranche` deposit must sit inside the window (`AmountOutOfBounds`, code 197, otherwise); with no bounds configured both deposit paths keep their existing semantics |
 | `initialize_arbiter_fee(flat_lamports, fee_bps)` (AV-135) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; opt-in arbiter compensation — `fee_bps > 10_000` is `InvalidArbiterFee`, code 198); once attached, every dispute settlement (`resolve`, the panel settling vote, the AV-55 default judgment) deducts the fee from the taker's adjudicated share and routes it to the arbiter (deduction order: AV-17 protocol fee, AV-100 streaming fee, then the arbiter fee); with no fee configured the settlement paths keep their existing semantics |
 | `with_release_cooling(cooling_secs)` (AV-112) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; builder-style like the other `with_*` opt-ins); `cooling_secs = 0` means unconfigured — `release` is ungated, exactly like AV-21's grace-period convention |
@@ -1476,6 +1478,9 @@ program error per variant):
 | `ClaimantNotInRoster` | 209 | `claim_share` (AV-149) by a caller who is not a roster leg |
 | `ClaimantAlreadyClaimed` | 210 | `claim_share` (AV-149) on an already-pulled leg (claimed bitmask bit set) |
 | `InvalidClaimantShares` | 211 | `initialize_claimants` (AV-149) with a malformed share table (empty, over-8, zero-address, zero-share, duplicate, or Σ != 10_000 bps) |
+| `VestingPaused` | 212 | `claim` (AV-150) while the vesting unlock clock is paused — the taker's schedule-priced pull is frozen until `resume_vesting` |
+| `VestingAlreadyPaused` | 213 | `pause_vesting` (AV-150) on an already-paused schedule — the pause is a strict toggle, so a second stamp is refused rather than silently re-stamping `paused_at` |
+| `VestingNotPaused` | 214 | `resume_vesting` (AV-150) on a live (unpaused) schedule |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1889,6 +1894,34 @@ initializer      claimant1      claimant2        escrow
    |                                            |  Released    |
 ```
 
+### Vesting pause / resume (AV-150)
+
+The initializer freezes a streaming-payments schedule mid-flight and
+restarts it later; the pause never moves the state byte.
+
+```
+initializer      taker          escrow
+   |  pause_vesting()  |            |
+   |------------------->| (paused_at = now; |
+   |                    |  still Funded)    |
+   |               claim()  |               |
+   |               -------->| Err(VestingPaused) |
+   |  resume_vesting()  |            |
+   |------------------->| (start/end/cliff_at += |
+   |                    |  now - paused_at;      |
+   |                    |  still Funded)         |
+   |               claim()  |               |
+   |               -------->| vested amount for |
+   |                         | the shifted window |
+```
+
+The schedule's start, end and cliff shift forward by the paused
+duration, so the unlock duration — and the taker's eventual payout —
+is unchanged. The freeze is scoped to the taker's schedule-priced
+`claim`: the initializer's `release` push path, the roster's
+`claim_share`, and `cancel`/`cancel_expired` refunds are unaffected
+(by design — a pause halts the unlock clock, not the escrow).
+
 ## Indexer events (AV-18)
 
 Every state transition of the escrow state machine emits one typed
@@ -1901,7 +1934,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `KeeperBountyPaid` (AV-124), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `ShareClaimed` (AV-149), `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82), `CpiAllowlistUpdated` (AV-83), `AppealFiled` (AV-86), `AppealResolved` (AV-86), `EvidenceFiled` (AV-91), `ReleasedSplit` (AV-93), `Declined` (AV-122), `CounterOfferProposed` (AV-122), `CounterOfferAccepted` (AV-122), `CounterOfferRejected` (AV-122) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `KeeperBountyPaid` (AV-124), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `ShareClaimed` (AV-149), `VestingPaused` (AV-150), `VestingResumed` (AV-150), `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82), `CpiAllowlistUpdated` (AV-83), `AppealFiled` (AV-86), `AppealResolved` (AV-86), `EvidenceFiled` (AV-91), `ReleasedSplit` (AV-93), `Declined` (AV-122), `CounterOfferProposed` (AV-122), `CounterOfferAccepted` (AV-122), `CounterOfferRejected` (AV-122) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |
@@ -5171,6 +5204,12 @@ maps the fee to `FeeType::Claim`.
 1-byte `Option` discriminant + 274-byte roster region);
 `VAULT_SPACE_NO_QUORUM` 5488 → **5763**; mainnet rent-exempt minimum
 42,497,760 → **44,411,760** lamports ((128 + 6253) × 3480 × 2).
+
+**Layout growth (AV-150).** `VAULT_SPACE` 6253 → **6262** (+9 bytes:
+1-byte `Option` discriminant + 8-byte `paused_at` timestamp, the
+vesting-pause tail appended last after `claimants`);
+`VAULT_SPACE_NO_QUORUM` 5763 → **5772**; mainnet rent-exempt minimum
+44,411,760 → **44,474,400** lamports ((128 + 6262) × 3480 × 2).
 
 Eligibility is `is_rent_sweep_eligible(now)`: terminal state, grace
 elapsed since `terminal_at`, not paused, no reentrancy lock, empty

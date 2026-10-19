@@ -44,6 +44,18 @@
       ]
     },
     {
+      "name": "pause_vesting",
+      "discriminator": [236, 70, 50, 112, 203, 144, 171, 1],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "resume_vesting",
+      "discriminator": [220, 59, 250, 22, 78, 191, 12, 174],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "release",
       "discriminator": [253, 249, 15, 206, 28, 127, 193, 241],
       "accounts": [],
@@ -1233,7 +1245,8 @@
           {"name": "terminal_at", "type": "u64", "offset": 5954},
           {"name": "rent_sweep_grace_secs", "type": "u64", "offset": 5962},
           {"name": "taker_locked", "type": "u64", "offset": 5970},
-          {"name": "claimants", "type": {"option": {"defined": "ClaimantRoster"}}, "offset": 5978}
+          {"name": "claimants", "type": {"option": {"defined": "ClaimantRoster"}}, "offset": 5978},
+          {"name": "vesting_pause", "type": {"option": {"defined": "VestingPause"}}, "offset": 6253}
         ]
       }
     }
@@ -1489,6 +1502,15 @@
       }
     },
     {
+      "name": "VestingPause",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "paused_at", "type": "u64", "offset": 0}
+        ]
+      }
+    },
+    {
       "name": "FundingPlan",
       "type": {
         "kind": "struct",
@@ -1668,7 +1690,10 @@
     {"code": 208, "name": "LegsCountMismatch"},
     {"code": 209, "name": "ClaimantNotInRoster"},
     {"code": 210, "name": "ClaimantAlreadyClaimed"},
-    {"code": 211, "name": "InvalidClaimantShares"}
+    {"code": 211, "name": "InvalidClaimantShares"},
+    {"code": 212, "name": "VestingPaused"},
+    {"code": 213, "name": "VestingAlreadyPaused"},
+    {"code": 214, "name": "VestingNotPaused"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

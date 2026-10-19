@@ -218,6 +218,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // AV-103: an expired appeal forfeits the bond — taker-supplied
         // funds the fold never booked (the bond is additional inflow
         // outside the principal) — so it is the symmetric no-op too.
+        // AV-150: freezing / restarting the vesting unlock clock is a
+        // Funded → Funded schedule-config flip — no funds move; the
+        // schedule's window shift on resume is time math, not a
+        // transfer.
+        | EscrowEventKind::VestingPaused
+        | EscrowEventKind::VestingResumed
         | EscrowEventKind::AppealResolved
         | EscrowEventKind::AppealExpired => (0, 0, 0),
         // AV-124: a keeper-bounty payout — the bounty pool is
@@ -775,6 +781,10 @@ mod event_sourcing_tests {
                 | EscrowEventKind::AppealResolved
                 | EscrowEventKind::AppealExpired
                 | EscrowEventKind::EvidenceFiled
+                // AV-150: the vesting unlock clock freezes / restarts —
+                // a Funded → Funded schedule-config flip, no funds move.
+                | EscrowEventKind::VestingPaused
+                | EscrowEventKind::VestingResumed
                 // AV-104: config changes — no fund movement.
                 | EscrowEventKind::DelegationGranted
                 | EscrowEventKind::DelegationRevoked

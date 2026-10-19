@@ -39,7 +39,7 @@ use super::{
     sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, ClaimantRoster, CounterOffer, CpiAllowlist,
     DefaultJudgment, DualControlIntent, DutchAuction, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
     Delegation, FundingPlan, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, PayoutSplit, QuorumPolicy,
-    SlashTerms, SlashLadder, SlashRung, SubscriptionSchedule, VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
+    SlashTerms, SlashLadder, SlashRung, SubscriptionSchedule, VestingCurve, VestingPause, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
     APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, CLAIMANT_ROSTER_LEN, COUNTER_OFFER_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
     DELEGATION_LEN, DUAL_CONTROL_INTENT_LEN, DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
     MAX_CLAIMANTS, MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS,
@@ -1463,6 +1463,17 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(CLAIMANT_ROSTER_LEN)?;
         None
     };
+    // AV-150: the vesting pause marker — 1-byte `Option`
+    // discriminant + 8-byte `paused_at` timestamp. Structural
+    // decode only — the pause invariants are enforced by
+    // `pause_vesting` / `resume_vesting`, not re-litigated here.
+    let vesting_pause = if c.option_present("vesting_pause")? {
+        let paused_at = c.u64_le()?;
+        Some(VestingPause { paused_at })
+    } else {
+        c.skip(8)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1755,6 +1766,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // carries the same roster and claimed bitmask the live one
         // recorded.
         claimants,
+        // AV-150: the vesting pause marker — a decoded escrow carries
+        // the same `paused_at` the live one recorded.
+        vesting_pause,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

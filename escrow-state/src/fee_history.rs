@@ -262,6 +262,10 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         | EscrowEventKind::RentSwept
         // AV-148: the taker's counter-fund is pure deposit
         // bookkeeping — no fee leg.
+        // AV-150: freezing / restarting the vesting unlock clock
+        // moves no funds — no fee leg.
+        | EscrowEventKind::VestingPaused
+        | EscrowEventKind::VestingResumed
         | EscrowEventKind::TakerFunded => None,
     }
 }
@@ -874,6 +878,10 @@ mod fee_history_tests {
                 | EscrowEventKind::TrancheFunded
                 // AV-148: the taker's counter-fund carries no fee leg.
                 | EscrowEventKind::TakerFunded
+                // AV-150: freezing / restarting the vesting unlock
+                // clock moves no funds — no fee leg.
+                | EscrowEventKind::VestingPaused
+                | EscrowEventKind::VestingResumed
                 | EscrowEventKind::ReleaseIntentAnnounced
                 | EscrowEventKind::ReleaseIntentVetoed
                 | EscrowEventKind::EscrowsMerged

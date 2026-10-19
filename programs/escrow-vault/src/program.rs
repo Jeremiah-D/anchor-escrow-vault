@@ -1465,6 +1465,83 @@ pub mod escrow_vault {
         Ok((payout, fee))
     }
 
+    /// Freeze the vesting unlock clock (AV-150; mirrors
+    /// `Escrow::pause_vesting`). The initializer (signer) halts a
+    /// streaming-payments schedule mid-flight; `now` comes from the
+    /// Solana clock sysvar (never an instruction param). Funded
+    /// only, with a vesting schedule attached — pausing an
+    /// already-paused schedule is `VestingAlreadyPaused` (code 213),
+    /// a schedule-less escrow is `InvalidVesting`. The vault account
+    /// already reserves the 9-byte vesting-pause tail (1-byte
+    /// `Option` discriminant + 8-byte `paused_at`, zeroed when
+    /// unpaused), so the marker is written in place — no realloc
+    /// needed in the real build. The state byte does not move.
+    /// Emits the `VestingPaused` indexer event (discriminant 78;
+    /// the fold books nothing — a Funded -> Funded schedule-config
+    /// flip).
+    pub fn pause_vesting(ctx: Context<PauseVesting>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        escrow
+            .pause_vesting(ctx.accounts.initializer.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::VestingPaused,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
+    /// Restart a paused vesting schedule (AV-150; mirrors
+    /// `Escrow::resume_vesting`). The initializer (signer) resumes
+    /// the unlock clock; `now` comes from the Solana clock sysvar
+    /// (never an instruction param). The schedule's start/end/cliff
+    /// shift forward by `now - paused_at` so the taker loses no
+    /// unlock time — the unlock duration is unchanged. Resuming a
+    /// live schedule is `VestingNotPaused` (code 214); a backwards
+    /// clock is `InvalidVesting`. The state byte does not move.
+    /// Emits the `VestingResumed` indexer event (discriminant 79;
+    /// the fold books nothing — a Funded -> Funded schedule-config
+    /// flip).
+    pub fn resume_vesting(ctx: Context<ResumeVesting>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        escrow
+            .resume_vesting(ctx.accounts.initializer.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::VestingResumed,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// The taker declines the escrow before any claim (AV-122;
     /// mirrors `Escrow::decline_escrow`). Taker-only; `now` comes
     /// from the Solana clock sysvar (never an instruction param).
@@ -6528,6 +6605,27 @@ pub struct Vault {
     /// Layout position matches `escrow_state::VAULT_FIELDS`
     /// (appended last, after `taker_locked`).
     pub claimants: Option<Claimants>,
+    /// AV-150: the vesting-pause marker, written by `pause_vesting`
+    /// and cleared by `resume_vesting` (mirrors `escrow_state`'s
+    /// `vesting_pause`); `None` on a schedule-less or live escrow.
+    /// Layout position matches `escrow_state::VAULT_FIELDS`
+    /// (appended last, after `claimants`).
+    pub vesting_pause: Option<VestingPause>,
+}
+
+/// Skeleton mirror of `escrow_state::VestingPause` (AV-150): the
+/// persisted pause marker — `Some` while the vesting unlock clock is
+/// frozen, holding the Unix timestamp the pause was stamped at.
+/// Serialized size is pinned by
+/// `escrow_state::VESTING_PAUSE_TAIL_LEN` (9 bytes: 1-byte `Option`
+/// discriminant + 8-byte `paused_at`).
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, Debug, PartialEq, Eq,
+)]
+pub struct VestingPause {
+    /// Unix timestamp the pause was stamped at; `resume_vesting`
+    /// shifts the schedule by `now - paused_at`.
+    pub paused_at: u64,
 }
 
 /// Skeleton mirror of `escrow_state::ClaimantRoster` (AV-149): the
@@ -8221,6 +8319,41 @@ pub struct ClaimShare<'info> {
     /// build funds the claimant's transfer from the vault's holdings;
     /// unused on the native-SOL path.
     pub vault_token_account: AccountInfo<'info>,
+}
+
+/// AV-150: accounts for `pause_vesting` — the initializer freezes
+/// the vesting unlock clock mid-flight. The signer must be the
+/// initializer (enforced by `Escrow::pause_vesting`, not by an
+/// Anchor constraint — the skeleton mirrors the state machine's
+/// authority check, like `FundTaker`). The vault account already
+/// reserves the 9-byte vesting-pause tail, so no realloc is needed.
+#[derive(Accounts)]
+pub struct PauseVesting<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer can freeze the unlock clock; a paused
+    /// schedule re-paused is `VestingAlreadyPaused` (code 213).
+    pub initializer: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for `paused_at` (never an
+    /// instruction param).
+    pub clock: AccountInfo<'info>,
+}
+
+/// AV-150: accounts for `resume_vesting` — the initializer restarts
+/// a paused vesting schedule. Same shape as `PauseVesting`: the
+/// signer must be the initializer (enforced by
+/// `Escrow::resume_vesting`), `now` comes from the clock sysvar.
+/// Resuming a live schedule is `VestingNotPaused` (code 214); a
+/// backwards clock is `InvalidVesting`.
+#[derive(Accounts)]
+pub struct ResumeVesting<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer can restart the unlock clock.
+    pub initializer: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the resume timestamp
+    /// (never an instruction param).
+    pub clock: AccountInfo<'info>,
 }
 
 /// AV-109: accounts for `initialize_deadman_switch` — same shape as
@@ -10285,4 +10418,8 @@ pub enum ErrorCode {
     BlindVoteMustReveal,
     #[msg("Batch leg-count mismatch (AV-141): release_many with legs.len() != vault count — the batch is all-or-nothing, so a short or long leg table is refused before any vault is touched")]
     LegsCountMismatch,
+    #[msg("Vesting paused (AV-150): pause_vesting froze the taker's unlock clock mid-flight — claim is refused (VestingPaused, code 212) until the initializer resumes")]
+    VestingPaused,
+    #[msg("Vesting resumed (AV-150): resume_vesting restarted the unlock clock — the schedule's start/end/cliff shifted forward by the paused duration, so the taker loses no unlock time")]
+    VestingResumed,
 }
