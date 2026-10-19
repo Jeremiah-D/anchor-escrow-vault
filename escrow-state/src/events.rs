@@ -179,6 +179,15 @@
 //!   event-sourced fold (AV-94) books it bit-identically to the
 //!   per-leg event sequence it replaces. The actor is the
 //!   initializer. A failed call emits nothing.
+//! - `release_many` (AV-141) emits one [`EscrowEventKind::Released`]
+//!   per successfully settled leg, in leg order — `from == Funded`,
+//!   `to == Funded` on a partial leg, `to == Released` on the closing
+//!   one, amounts following the `Released` shape (`payout` = the
+//!   leg's gross amount, `fee` = the leg's AV-17 protocol fee); the
+//!   actor is the initializer. Exactly the per-leg event sequence a
+//!   series of standalone `release` calls would have produced, so the
+//!   event-sourced fold needs no new logic. A failed batch emits
+//!   nothing on any leg.
 //! - `cancel_basket_all` (AV-95c) emits a single
 //!   [`EscrowEventKind::BasketCancelled`] for the atomic all-legs
 //!   cancel. `from == Funded`, `to == Cancelled`;
@@ -262,7 +271,7 @@
 //! `with_appeal_bond` builder, and `expire_appeal`; every earlier
 //! field offset stays stable. The crate stays dependency-free.
 
-use crate::{Escrow, EscrowError, EscrowState, MilestonePlan, PriceFeed, QuorumPolicy, SplitConfig, VestingSchedule};
+use crate::{Escrow, EscrowError, EscrowState, MilestonePlan, PriceFeed, QuorumPolicy, ReleaseLeg, SplitConfig, VestingSchedule};
 use crate::{AppealOutcome, BasketSettlement, OverrideValue, TemplatePreset};
 use crate::cpi::CpiError;
 use crate::cpi_call::{CpiInvocation, CpiReceipt};
@@ -3175,6 +3184,71 @@ impl IndexedEscrow {
             Some(authority),
         );
         Ok(settlement)
+    }
+
+    /// Atomically release N escrows in one batch (mirrors
+    /// [`Escrow::release_many`], AV-141): the initializer's fleet
+    /// settlement — N vaults release in one instruction instead of N
+    /// transactions. Emits exactly one
+    /// [`EscrowEventKind::Released`] per successful leg, in leg order —
+    /// partial legs carry `from == to == Funded`, the closing one
+    /// `to == Released` — so the payout stream stays complete in
+    /// per-escrow `seq` order, exactly as if each leg had gone through
+    /// [`IndexedEscrow::release`] alone. `at` doubles as the state
+    /// machine's `now` and the event timestamp (the AV-27 timelock gate
+    /// sees the same clock the event log records). Returns the
+    /// per-leg `(taker_payout, fee)` detail in leg order, like the
+    /// inner call.
+    ///
+    /// Two-phase like the inner call: phase 1 dry-runs every leg's
+    /// full `release` guard chain on a shadow copy of the inner state
+    /// machine; phase 2 settles the real wrappers leg by leg through
+    /// the per-leg `release` wrapper (the auto-unpause handling and
+    /// the `Released` emission, identical to a standalone release). A
+    /// phase-2 failure restores every wrapper — inner state, the
+    /// event stream, and the seq counters — from the pre-call
+    /// snapshot, so a failed batch emits nothing and leaves every
+    /// escrow bit-identical: the emission rule's "failed calls record
+    /// nothing" holds for the batch too. `legs.len() !=
+    /// escrows.len()` is [`EscrowError::LegsCountMismatch`] (code
+    /// 208), checked before any leg is touched.
+    ///
+    /// [`Escrow::release_many`]: crate::Escrow::release_many
+    pub fn release_many(
+        escrows: &mut [IndexedEscrow],
+        authority: [u8; 32],
+        legs: &[ReleaseLeg],
+        mint: Option<[u8; 32]>,
+        at: u64,
+    ) -> Result<Vec<(u64, u64)>, EscrowError> {
+        // Caller-shape bug — fail closed before any leg is touched.
+        if legs.len() != escrows.len() {
+            return Err(EscrowError::LegsCountMismatch);
+        }
+        // Phase 1: dry-run shadow validation on the inner state
+        // machines — no wrapper (and no event stream) is touched
+        // until every leg's guard chain passes.
+        for (w, leg) in escrows.iter().zip(legs.iter()) {
+            let mut shadow = w.inner;
+            shadow.release(authority, at, leg.amount, mint, leg.payout_to)?;
+        }
+        // Phase 2: real execution through the per-leg `release`
+        // wrapper. `IndexedEscrow` is `Clone`, so the defensive
+        // snapshot covers inner state, the event stream and the seq
+        // counters — a phase-2 failure restores every wrapper
+        // bit-identically and emits nothing.
+        let snapshot: Vec<IndexedEscrow> = escrows.to_vec();
+        let mut out = Vec::with_capacity(legs.len());
+        for i in 0..escrows.len() {
+            match escrows[i].release(authority, legs[i].amount, mint, legs[i].payout_to, at) {
+                Ok(detail) => out.push(detail),
+                Err(e) => {
+                    escrows.clone_from_slice(&snapshot);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Release `amount` routed through a third-party program via CPI

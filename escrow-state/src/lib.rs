@@ -437,9 +437,10 @@ pub use tx_message::{
 // report's CU passthrough. Heuristic planning numbers, not measured
 // on-chain costs; see the module docs.
 pub use cu_estimate::{
-    check_compute_budget, estimate_instruction_cu, instruction_cu_base, instruction_data_bytes,
-    ComputeBudgetWarning, CU_MAX_PER_TRANSACTION, CU_PER_ACCOUNT, CU_PER_DATA_BYTE,
-    CU_PER_SIGNATURE, INSTRUCTION_CU_TABLE,
+    check_compute_budget, estimate_instruction_cu, estimate_release_many_cu, instruction_cu_base,
+    instruction_data_bytes, release_many_data_bytes, ComputeBudgetWarning, CU_MAX_PER_TRANSACTION,
+    CU_PER_ACCOUNT, CU_PER_DATA_BYTE, CU_PER_SIGNATURE, INSTRUCTION_CU_TABLE,
+    RELEASE_MANY_DISPATCH_CU, RELEASE_MANY_LEG_DATA_BYTES, RELEASE_MANY_PER_LEG_CU,
 };
 
 // AV-89: priority-fee oracle — keeper-side recent-prioritization-fees
@@ -2709,6 +2710,13 @@ pub enum EscrowError {
     /// tripped. Both escrows are untouched. Never renumbered (see
     /// [`EscrowError::code`]).
     NettingIncompatible,
+    /// AV-141: [`Escrow::release_many`] refused — `legs.len()` does
+    /// not equal the escrow count. A short leg table would silently
+    /// drop settlements; a long one would invent them — both are the
+    /// caller's shape bug, refused before any escrow is touched. All
+    /// escrows are untouched. Never renumbered (see
+    /// [`EscrowError::code`]).
+    LegsCountMismatch,
 }
 
 impl EscrowError {
@@ -2862,6 +2870,8 @@ impl EscrowError {
             EscrowError::SweepGraceNotElapsed => 206,
             // AV-140: appended, never renumbered.
             EscrowError::NettingIncompatible => 207,
+            // AV-141: appended, never renumbered.
+            EscrowError::LegsCountMismatch => 208,
         }
     }
 
@@ -2997,6 +3007,8 @@ impl EscrowError {
             EscrowError::SweepGraceNotElapsed,
             // AV-140: appended, never renumbered.
             EscrowError::NettingIncompatible,
+            // AV-141: appended, never renumbered.
+            EscrowError::LegsCountMismatch,
         ]
     }
 }
@@ -6017,6 +6029,20 @@ pub struct NettingSettlement {
     pub smaller_released: u64,
 }
 
+/// One leg of an AV-141 atomic batch release ([`Escrow::release_many`]):
+/// the gross release amount for one escrow plus its explicit payout
+/// destination. The destination is per-leg (a fleet's vaults may pay
+/// different takers); the AV-49 payout-policy pin applies to each leg
+/// exactly like [`Escrow::release`]'s `payout_to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseLeg {
+    /// The gross amount to release from this leg's escrow — the fee
+    /// slices off it, exactly like [`Escrow::release`]'s `amount`.
+    pub amount: u64,
+    /// The explicit payout destination for this leg's taker payout.
+    pub payout_to: [u8; 32],
+}
+
 impl Escrow {
     /// AV-75: the current schema version of the persisted vault layout
     /// (see `VAULT_FIELDS`). New vaults are born at this version;
@@ -8450,6 +8476,90 @@ let fee = self.charge_protocol_fee(amount)?;
             .ok_or(EscrowError::ReleaseExceedsLocked)?;
         self.touch_deadman_clock(now);
         Ok((taker_payout, fee))
+    }
+
+    /// Atomically release N escrows in one batch (AV-141): the
+    /// initializer's fleet settlement. N escrows of one initializer
+    /// release in a single instruction instead of N transactions —
+    /// one signature and one transaction fee instead of N.
+    ///
+    /// Every leg reuses the exact [`Escrow::release`] check order
+    /// (authority, then the dual-control routing gate, state, the
+    /// swap-link guard, funding completeness, the mint binding, the
+    /// payout destination, the milestone plan, the subscription
+    /// schedule, the payout-split table, quorum, the timelock, then
+    /// the amount checks) — no reimplementation, no gate drift. A leg
+    /// that would fail a standalone `release` fails the batch with
+    /// the identical [`EscrowError`]. `legs.len()` must equal
+    /// `escrows.len()`: a shape mismatch is the caller's bug, refused
+    /// with [`EscrowError::LegsCountMismatch`] (code 208) before any
+    /// leg is touched. One instruction-level `mint` binds every leg
+    /// (the fleet shares a mint — Solana/backend-engineering
+    /// reality: a payroll or market-maker fleet settles one token);
+    /// a leg bound to a different mint fails that leg's
+    /// `MintMismatch` and the batch rolls back. The authority is one
+    /// key for the whole batch: a leg owned by another initializer
+    /// fails `Unauthorized` (a stranger cannot force-settle anyone's
+    /// vaults, one leg at a time or N).
+    ///
+    /// Two-phase atomicity:
+    /// - Phase 1 (dry-run shadow validation): every leg runs
+    ///   `release` on a `Clone` of its escrow. The first failure
+    ///   returns that leg's error with the real escrows untouched —
+    ///   zero side effects, by construction.
+    /// - Phase 2 (real execution): every leg runs `release` on the
+    ///   real escrows, with a full `Vec<Escrow>` snapshot taken
+    ///   first. Phase 1 ran the identical transitions on
+    ///   bit-identical state with identical inputs, so a phase-2
+    ///   failure is unreachable in the pure model; the snapshot and
+    ///   restore is defense-in-depth against future refactors that
+    ///   introduce non-determinism (a slot or randomness source, a
+    ///   new stateful guard).
+    ///
+    /// Returns the per-leg `(taker_payout, fee)` detail in leg order —
+    /// the same shape as `release`, so the caller (the Anchor
+    /// handler, the indexer) can size each leg's transfer.
+    ///
+    /// An empty batch (both slices empty) is a vacuous no-op
+    /// returning `Ok(vec![])`: there is nothing to settle and nothing
+    /// to roll back.
+    pub fn release_many(
+        escrows: &mut [Escrow],
+        authority: [u8; 32],
+        now: u64,
+        legs: &[ReleaseLeg],
+        mint: Option<[u8; 32]>,
+    ) -> Result<Vec<(u64, u64)>, EscrowError> {
+        // Caller-shape bug — fail closed before touching any escrow:
+        // a short leg table must never silently drop a settlement, a
+        // long one must never invent one.
+        if legs.len() != escrows.len() {
+            return Err(EscrowError::LegsCountMismatch);
+        }
+        // Phase 1: dry-run shadow validation — every leg's full
+        // `release` guard chain runs on a clone. The first failure
+        // aborts with the real escrows bit-identical to the caller's
+        // input. `Escrow` is `Copy`, so the shadow is a plain copy.
+        for (escrow, leg) in escrows.iter().zip(legs.iter()) {
+            let mut shadow = *escrow;
+            shadow.release(authority, now, leg.amount, mint, leg.payout_to)?;
+        }
+        // Phase 2: real execution with a defensive whole-batch
+        // snapshot. On the (pure-model-unreachable) failure path
+        // every escrow is restored bit-identically before the error
+        // propagates — the batch is all-or-nothing, never partial.
+        let snapshot: Vec<Escrow> = escrows.to_vec();
+        let mut out = Vec::with_capacity(legs.len());
+        for i in 0..escrows.len() {
+            match escrows[i].release(authority, now, legs[i].amount, mint, legs[i].payout_to) {
+                Ok(detail) => out.push(detail),
+                Err(e) => {
+                    escrows.clone_from_slice(&snapshot);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Release `intent.amount` authorized by the initializer's
@@ -23921,6 +24031,31 @@ pub(crate) mod anchor_idl_tests {
             method: "Escrow::sweep_unclaimed_rent",
             input_mapping: "caller <- accounts.caller (signer, permissionless — \\\\\n                            anyone may sweep; no authority check by \\\\\n                            design); treasury <- accounts.treasury \\\\\n                            (the rent destination); now <- clock sysvar \\\\\n                            (NOT an instruction param); Cancelled | \\\\\n                            Released | Settled | Split | Declined -> \\\\\n                            Closed — the state machine checks pause, then \\\\\n                            reentrancy, then the terminal-state gate \\\\\n                            (InvalidStateTransition otherwise), then the \\\\\n                            sweep-eligibility gate (SweepGraceNotElapsed, \\\\\n                            code 206, when now < terminal_at + \\\\\n                            rent_sweep_grace_secs); the AV-106 pool guard \\\\\n                            applies (InvalidPoolPayout on a non-empty \\\\\n                            pool); returns the swept rent-exempt lamports \\\\\n                            (escrow_state::vault_close_rent_reclaimed), \\\\\n                            which the real build's account-close \\\\\n                            transfers to the treasury — only the rent \\\\\n                            moves, never escrowed funds; emits the \\\\\n                            RentSwept indexer event (from == the terminal \\\\\n                            state, to == Closed; amounts.rent_reclaimed = \\\\\n                            the swept lamports)",
         },
+        InstructionSpec {
+            // AV-141: atomic batch release — one instruction settles N
+            // escrows of the same initializer (the fleet scenario:
+            // payroll / market-maker vaults settling one token in one
+            // transaction instead of N). IDL:
+            // discriminator = sha256("global:release_many")[..8] =
+            // [0xd9, 0xb6, 0x39, 0x63, 0x9f, 0xa0, 0x1a, 0xa8] — the
+            // Anchor instruction discriminator for the release_many
+            // handler (pinned by the discriminator test below).
+            name: "release_many",
+            params: &[
+                (
+                    "legs",
+                    "Vec<ReleaseLeg>",
+                    "instruction param; one (amount, payout_to) leg per vault, in vault order — legs.len() must equal the vault count (LegsCountMismatch, code 208, otherwise); each leg's gross amount settles through the exact `release` guard chain, and each leg's payout destination is pinned against that leg's AV-49 payout policy",
+                ),
+                (
+                    "mint",
+                    "Option<Pubkey>",
+                    "instruction param; the fleet-wide SPL mint binding, checked against every leg's bound mint (a leg bound to a different mint fails MintMismatch and rolls the whole batch back); None on the native-SOL path",
+                ),
+            ],
+            method: "Escrow::release_many",
+            input_mapping: "authority <- accounts.initializer (signer); legs <- params (ReleaseLeg -> (amount, payout_to) per vault, in vault order); mint <- param (Pubkey -> [u8; 32] conversion); now <- clock sysvar (NOT an instruction param — see module docs); accounts.remaining_accounts are the N vaults in leg order (all mut — N is caller-chosen, so the vaults ride remaining accounts, not the static account struct); two-phase atomicity — phase 1 dry-runs every leg's full `release` guard chain on a shadow copy (the first failing leg returns its error with all vaults untouched), phase 2 executes on the real vaults with a defensive whole-batch snapshot (a phase-2 failure restores every vault before the error propagates; unreachable in the pure model); any leg failing aborts the whole instruction (no partial release — on-chain the failed instruction rolls every vault write back); returns the per-leg (taker_payout, fee) detail in leg order; emits one `Released` indexer event per leg (from == Funded, to == Funded/Released; amounts follow the Released shape: payout = the leg's gross amount, fee = the leg's protocol fee)",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -24184,6 +24319,9 @@ pub(crate) mod anchor_idl_tests {
             "Escrow::sweep_unclaimed_rent",
             // AV-140: bilateral netting of opposite-direction legs.
             "Escrow::net_escrows",
+            // AV-141: atomic batch release of N escrows in one
+            // instruction (the initializer's fleet settlement).
+            "Escrow::release_many",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -24375,6 +24513,9 @@ pub(crate) mod anchor_idl_tests {
                 // (u64), fee_bps (u16).
                 &"initialize_arbiter_fee",
                 &"initialize_rent_sweep_grace",
+                // AV-141: the batch legs (Vec<ReleaseLeg>) + the
+                // fleet-wide mint (Option<Pubkey>).
+                &"release_many",
             ]
         );
     }
@@ -25951,6 +26092,11 @@ pub(crate) mod anchor_idl_tests {
         // commitment hash itself persists, in the panel's commitments
         // array (see PARAM_FIELD_MAP).
         ("reveal_judgment", "salt"),
+        // AV-141: the fleet-wide mint binding is consumed at call time
+        // by each leg's `require_mint_match` and never persisted — the
+        // bound mint lives on the vault (see `initialize_mint`); the
+        // param only names the token account's mint for the check.
+        ("release_many", "mint"),
     ];
     const PARAM_FIELD_MAP: &[(&str, &str, &str)] = &[
         ("initialize", "amount", "amount"),
@@ -25992,6 +26138,12 @@ pub(crate) mod anchor_idl_tests {
         // the same `released` counter — the intent-driven release
         // delegates to `release`, so the accounting is identical.
         ("release_via_intent", "amount", "released"),
+        // AV-141: each batch leg's gross amount accumulates into its
+        // own vault's `released` counter — one instruction, N vaults,
+        // each leg's counter moving independently (the same
+        // dual-writing the direction-2 note allows for `release`'s
+        // amount param).
+        ("release_many", "legs", "released"),
         ("initialize_quorum", "attestors", "quorum.attestors"),
         ("initialize_quorum", "weights", "quorum.weights"),
         ("initialize_quorum", "threshold", "quorum.threshold"),
@@ -27564,6 +27716,12 @@ mod error_code_tests {
             EscrowError::NettingIncompatible,
             207,
             "net_escrows on two escrows whose (initializer, taker) pairs are not swapped mirrors, whose SPL mints differ, or whose larger side's released + netted would overflow u64 (AV-140)",
+        ),
+        // AV-141: appended, never renumbered.
+        (
+            EscrowError::LegsCountMismatch,
+            208,
+            "release_many with legs.len() != the escrow count — a short leg table would silently drop settlements, a long one would invent them (AV-141)",
         ),
     ];
 
@@ -36372,6 +36530,291 @@ mod netting_tests {
             .unwrap();
         assert_eq!(released.to, EscrowState::Released);
         assert_eq!(released.amounts.payout, 0);
+    }
+}
+
+// ---------- AV-141: atomic batch release (release_many) ----------
+//
+// One instruction settles N escrows of the same initializer — the
+// fleet scenario. Every leg reuses `Escrow::release` (no gate
+// drift); two-phase atomicity (dry-run shadow validation, then real
+// execution with a defensive snapshot) makes the batch
+// all-or-nothing. The tests below nail the atomicity: a poisoned leg
+// anywhere in the batch leaves every escrow — and every event stream
+// — bit-identical to the pre-call state.
+#[cfg(test)]
+mod release_many_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer (the fleet owner)
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const CAROL: [u8; 32] = [0xCC; 32]; // second taker / stranger
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+
+    fn funded_escrow(taker: [u8; 32], amount: u64) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, taker, amount, EXPIRES_AT).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    fn funded_indexed(taker: [u8; 32], amount: u64, escrow_id: [u8; 32]) -> IndexedEscrow {
+        let mut e = IndexedEscrow::initialize(ALICE, taker, amount, EXPIRES_AT, escrow_id, T0)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    fn funded_escrow_with_mint(taker: [u8; 32], amount: u64, mint: [u8; 32]) -> Escrow {
+        // The mint binds pre-fund (Uninitialized only, like
+        // `initialize_mint`).
+        let mut e = Escrow::initialize(ALICE, taker, amount, EXPIRES_AT)
+            .unwrap()
+            .with_mint(mint)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    fn leg(amount: u64, payout_to: [u8; 32]) -> ReleaseLeg {
+        ReleaseLeg { amount, payout_to }
+    }
+
+    #[test]
+    fn release_many_discriminator_is_pinned() {
+        // IDL: sha256("global:release_many")[..8] — the Anchor
+        // instruction discriminator, pinned here and in the generated
+        // escrow_vault.json.
+        assert_eq!(
+            crate::discriminator::instruction_discriminator("release_many"),
+            [0xd9, 0xb6, 0x39, 0x63, 0x9f, 0xa0, 0x1a, 0xa8]
+        );
+        // And the INSTRUCTIONS table carries the spec.
+        let names: Vec<&&str> = crate::anchor_idl_tests::INSTRUCTIONS
+            .iter()
+            .map(|s| &s.name)
+            .collect();
+        assert!(names.contains(&&"release_many"));
+    }
+
+    #[test]
+    fn legs_count_mismatch_error_code_is_pinned() {
+        // AV-141: appended after NettingIncompatible — never renumbered.
+        assert_eq!(EscrowError::LegsCountMismatch.code(), 208);
+        assert!(EscrowError::all().contains(&EscrowError::LegsCountMismatch));
+    }
+
+    #[test]
+    fn release_many_settles_each_leg_exactly_like_release() {
+        // Three vaults of the fleet: a full release, a partial, and a
+        // second taker's vault.
+        let mut escrows = vec![
+            funded_escrow(BOB, 1_000_000),
+            funded_escrow(BOB, 600_000),
+            funded_escrow(CAROL, 300_000),
+        ];
+        let legs = vec![
+            leg(1_000_000, BOB),
+            leg(250_000, BOB),
+            leg(300_000, CAROL),
+        ];
+        // The expected per-leg detail: what a standalone `release`
+        // returns on bit-identical escrows.
+        let mut expected = Vec::new();
+        for (e, l) in escrows.iter().zip(legs.iter()) {
+            let mut shadow = *e;
+            expected.push(shadow.release(ALICE, T0 + 10, l.amount, None, l.payout_to).unwrap());
+        }
+        let detail =
+            Escrow::release_many(&mut escrows, ALICE, T0 + 10, &legs, None).unwrap();
+        assert_eq!(detail, expected);
+        // No protocol fee configured: payout == gross amount.
+        assert_eq!(detail, vec![(1_000_000, 0), (250_000, 0), (300_000, 0)]);
+        // Settlement effects land per leg.
+        assert_eq!(escrows[0].state(), EscrowState::Released);
+        assert_eq!(escrows[0].released_amount(), 1_000_000);
+        assert_eq!(escrows[1].state(), EscrowState::Funded);
+        assert_eq!(escrows[1].released_amount(), 250_000);
+        assert_eq!(escrows[1].remaining_amount(), 350_000);
+        assert_eq!(escrows[2].state(), EscrowState::Released);
+        assert_eq!(escrows[2].released_amount(), 300_000);
+    }
+
+    #[test]
+    fn release_many_rejects_leg_count_mismatch_untouched() {
+        let mut escrows = vec![funded_escrow(BOB, 1_000_000), funded_escrow(BOB, 600_000)];
+        let before = escrows.clone();
+        // Too few legs.
+        let legs = vec![leg(1_000_000, BOB)];
+        assert_eq!(
+            Escrow::release_many(&mut escrows, ALICE, T0 + 10, &legs, None),
+            Err(EscrowError::LegsCountMismatch)
+        );
+        // Too many legs.
+        let legs = vec![leg(1_000_000, BOB), leg(600_000, BOB), leg(1, BOB)];
+        assert_eq!(
+            Escrow::release_many(&mut escrows, ALICE, T0 + 10, &legs, None),
+            Err(EscrowError::LegsCountMismatch)
+        );
+        // The shape check runs before any leg is touched.
+        assert_eq!(escrows, before);
+    }
+
+    #[test]
+    fn release_many_empty_batch_is_vacuous() {
+        let mut escrows: Vec<Escrow> = vec![];
+        let detail = Escrow::release_many(&mut escrows, ALICE, T0 + 10, &[], None).unwrap();
+        assert!(detail.is_empty());
+        assert!(escrows.is_empty());
+    }
+
+    #[test]
+    fn release_many_rolls_back_when_a_middle_leg_over_releases() {
+        // Five legs; leg 2 (index 2) names more than its vault locks.
+        // Phase 1 must catch it before leg 0 or 1 settles.
+        let mut escrows = vec![
+            funded_escrow(BOB, 1_000_000),
+            funded_escrow(BOB, 1_000_000),
+            funded_escrow(BOB, 1_000_000),
+            funded_escrow(BOB, 1_000_000),
+            funded_escrow(BOB, 1_000_000),
+        ];
+        let before = escrows.clone();
+        let legs = vec![
+            leg(400_000, BOB),
+            leg(400_000, BOB),
+            leg(1_000_001, BOB), // over the locked amount
+            leg(400_000, BOB),
+            leg(400_000, BOB),
+        ];
+        assert_eq!(
+            Escrow::release_many(&mut escrows, ALICE, T0 + 10, &legs, None),
+            Err(EscrowError::ReleaseExceedsLocked)
+        );
+        // All-or-nothing: every escrow is bit-identical to the
+        // pre-call state — legs 0 and 1 did not settle.
+        assert_eq!(escrows, before);
+        for e in &escrows {
+            assert_eq!(e.released_amount(), 0);
+            assert_eq!(e.state(), EscrowState::Funded);
+        }
+    }
+
+    #[test]
+    fn release_many_rolls_back_when_a_leg_is_not_funded() {
+        // The poisoned leg never left Uninitialized (never funded).
+        let mut escrows = vec![
+            funded_escrow(BOB, 1_000_000),
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap(),
+            funded_escrow(BOB, 1_000_000),
+        ];
+        let before = escrows.clone();
+        let legs = vec![leg(500_000, BOB), leg(500_000, BOB), leg(500_000, BOB)];
+        assert_eq!(
+            Escrow::release_many(&mut escrows, ALICE, T0 + 10, &legs, None),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(escrows, before);
+    }
+
+    #[test]
+    fn release_many_rolls_back_on_stranger_authority() {
+        // CAROL is a stranger to the fleet — the authority gate trips
+        // on leg 0 and nothing settles.
+        let mut escrows = vec![funded_escrow(BOB, 1_000_000), funded_escrow(BOB, 600_000)];
+        let before = escrows.clone();
+        let legs = vec![leg(1_000_000, BOB), leg(600_000, BOB)];
+        assert_eq!(
+            Escrow::release_many(&mut escrows, CAROL, T0 + 10, &legs, None),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(escrows, before);
+    }
+
+    #[test]
+    fn release_many_rolls_back_on_mint_mismatch() {
+        // The fleet settles one token: leg 1 is bound to a different
+        // mint, so the instruction-level mint trips its MintMismatch.
+        const MINT_A: [u8; 32] = [0xA0; 32];
+        const MINT_B: [u8; 32] = [0xB0; 32];
+        let mut escrows = vec![
+            funded_escrow_with_mint(BOB, 1_000_000, MINT_A),
+            funded_escrow_with_mint(BOB, 1_000_000, MINT_B),
+        ];
+        let before = escrows.clone();
+        let legs = vec![leg(1_000_000, BOB), leg(1_000_000, BOB)];
+        assert_eq!(
+            Escrow::release_many(&mut escrows, ALICE, T0 + 10, &legs, Some(MINT_A)),
+            Err(EscrowError::MintMismatch)
+        );
+        assert_eq!(escrows, before);
+    }
+
+    #[test]
+    fn indexed_release_many_emits_one_released_per_leg() {
+        let mut escrows = vec![
+            funded_indexed(BOB, 1_000_000, [0x01; 32]),
+            funded_indexed(BOB, 600_000, [0x02; 32]),
+        ];
+        let legs = vec![leg(1_000_000, BOB), leg(250_000, BOB)];
+        let detail =
+            IndexedEscrow::release_many(&mut escrows, ALICE, &legs, None, T0 + 10).unwrap();
+        assert_eq!(detail, vec![(1_000_000, 0), (250_000, 0)]);
+        // One Released event per leg, in leg order — the payout stream
+        // stays complete, exactly as if each leg had gone through
+        // `IndexedEscrow::release` alone.
+        for (i, e) in escrows.iter().enumerate() {
+            let events = e.events();
+            // Initialized (seq 0), Funded (seq 1), then the batch's
+            // Released (seq 2).
+            assert_eq!(events.len(), 3);
+            let released = &events[2];
+            assert_eq!(released.kind, crate::EscrowEventKind::Released);
+            assert_eq!(released.seq, 2);
+            assert_eq!(released.from, EscrowState::Funded);
+            let expect_to = if i == 0 { EscrowState::Released } else { EscrowState::Funded };
+            assert_eq!(released.to, expect_to);
+            assert_eq!(released.amounts.payout, legs[i].amount);
+            assert_eq!(released.amounts.fee, 0);
+            assert_eq!(released.at, T0 + 10);
+        }
+    }
+
+    #[test]
+    fn indexed_release_many_failure_emits_nothing_and_restores() {
+        // Leg 1 (the middle) over-releases; legs 0 and 2 must not
+        // settle and no event may be recorded anywhere.
+        let mut escrows = vec![
+            funded_indexed(BOB, 1_000_000, [0x01; 32]),
+            funded_indexed(BOB, 1_000_000, [0x02; 32]),
+            funded_indexed(BOB, 1_000_000, [0x03; 32]),
+        ];
+        let event_counts: Vec<usize> = escrows.iter().map(|e| e.events().len()).collect();
+        let inners_before: Vec<Escrow> = escrows.iter().map(|e| *e.inner()).collect();
+        let legs = vec![leg(400_000, BOB), leg(1_000_001, BOB), leg(400_000, BOB)];
+        assert_eq!(
+            IndexedEscrow::release_many(&mut escrows, ALICE, &legs, None, T0 + 10),
+            Err(EscrowError::ReleaseExceedsLocked)
+        );
+        // Failed calls record nothing — the emission rule holds for
+        // the batch too — and every wrapper is bit-identical.
+        for (i, e) in escrows.iter().enumerate() {
+            assert_eq!(e.events().len(), event_counts[i]);
+            assert_eq!(*e.inner(), inners_before[i]);
+            assert_eq!(e.next_seq(), event_counts[i] as u64);
+        }
+    }
+
+    #[test]
+    fn indexed_release_many_rejects_leg_count_mismatch() {
+        let mut escrows = vec![funded_indexed(BOB, 1_000_000, [0x01; 32])];
+        let event_count = escrows[0].events().len();
+        let legs = vec![leg(1_000_000, BOB), leg(1, BOB)];
+        assert_eq!(
+            IndexedEscrow::release_many(&mut escrows, ALICE, &legs, None, T0 + 10),
+            Err(EscrowError::LegsCountMismatch)
+        );
+        assert_eq!(escrows[0].events().len(), event_count);
     }
 }
 
@@ -51558,7 +52001,10 @@ mod arbiter_panel_tests {
         // AV-140: the bilateral-netting compatibility error.
         assert_eq!(EscrowError::NettingIncompatible.code(), 207);
         assert!(EscrowError::all().contains(&EscrowError::NettingIncompatible));
-        assert_eq!(EscrowError::all().len(), 108);
+        // AV-141: the batch leg-count shape error.
+        assert_eq!(EscrowError::LegsCountMismatch.code(), 208);
+        assert!(EscrowError::all().contains(&EscrowError::LegsCountMismatch));
+        assert_eq!(EscrowError::all().len(), 109);
     }
 
     #[test]

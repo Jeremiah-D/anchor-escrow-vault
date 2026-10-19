@@ -4533,6 +4533,85 @@ alice                  vault A (1M)          vault B (700k)
    |                       |                       |  zero payout)
 ```
 
+## Atomic batch release (AV-141)
+
+The problem: one initializer's fleet — payroll vaults, market-maker
+legs, a distributor's outstanding payouts — settles one token across
+many escrows. Releasing them one transaction at a time costs N
+signatures and N transaction fees and leaves N chances for a partial
+settlement to strand the fleet half-paid. AV-141 adds
+`Escrow::release_many`: one instruction atomically releases N escrows.
+
+`release_many(escrows, authority, now, legs, mint)` takes one
+`ReleaseLeg { amount, payout_to }` per escrow, in escrow order, plus a
+single instruction-level `mint` (the fleet shares a token — the
+backend-engineering reality of a payroll or market-maker run; `None`
+on the native-SOL path). Every leg reuses the exact `release` check
+order — authority, the dual-control routing gate, state, the
+swap-link guard, funding completeness, the mint binding, the payout
+destination, the milestone plan, the subscription schedule, the
+payout-split table, quorum, the timelock, then the amount checks — so
+there is no gate drift: a leg that would fail a standalone `release`
+fails the batch with the identical error. `legs.len()` must equal the
+escrow count; a shape mismatch is the caller's bug, refused with
+`LegsCountMismatch` (code 208) before any leg is touched. One
+authority key drives the whole batch: a leg owned by another
+initializer fails `Unauthorized`, and a leg bound to a different mint
+fails `MintMismatch` — strangers cannot force-settle anyone's vaults,
+one leg at a time or N.
+
+Two-phase atomicity makes the batch all-or-nothing. Phase 1 is a
+dry-run shadow validation: every leg runs `release` on a `Clone` of
+its escrow, and the first failure returns that leg's error with the
+real escrows untouched — zero side effects, by construction. Phase 2
+executes on the real escrows with a defensive whole-batch snapshot
+taken first: phase 1 ran the identical transitions on bit-identical
+state with identical inputs, so a phase-2 failure is unreachable in
+the pure model, and the snapshot/restore is defense-in-depth against
+future refactors that introduce non-determinism. The call returns the
+per-leg `(taker_payout, fee)` detail in leg order — the same shape as
+`release` — so the caller can size each leg's transfer.
+
+The `IndexedEscrow` wrapper mirrors it with one `Released` indexer
+event per successful leg, in leg order (`from == Funded`, `to ==
+Funded` on a partial leg, `to == Released` on the closing one;
+amounts follow the `Released` shape) — exactly the per-leg event
+sequence a series of standalone `release` calls would have produced,
+so the event-sourced fold needs no new logic. A failed batch emits
+nothing on any leg: inner state, the event stream, and the seq
+counters all restore bit-identically.
+
+Compute units grow linearly with the leg count — each leg runs one
+full `release` guard chain plus settlement writes — so the CU table
+is honest about it instead of pretending one row fits all N: the
+`INSTRUCTION_CU_TABLE` row pins the N=1 case (85 data bytes: 8-byte
+discriminator + 4-byte vec length + one 40-byte leg + 33-byte mint
+option; 16_000 base = 4_000 dispatch overhead + 12_000 per-leg
+marginal, heuristic planning numbers, not measurements), and
+`estimate_release_many_cu` takes the leg count for the real estimate
+(each extra leg: +12_000 CU + 40 data bytes). Size production batches
+against `simulateTransaction`, not the heuristic.
+
+No new persisted fields — the account layout is untouched.
+
+**Walkthrough — settling a three-vault payroll fleet.** The
+initializer's three vaults lock 1,000,000 / 600,000 / 300,000 for two
+takers; one instruction releases all three:
+
+```
+initializer        vault 1 (1M)    vault 2 (600k)    vault 3 (300k)
+   | release_many      |                 |                 |
+   | legs=[1M,250k,300k], mint=None      |                 |
+   |------------------>|---------------->|---------------->|
+   |                   | Released (1M)   | Released (250k) | Released (300k)
+   |                   | to == Released  | to == Funded    | to == Released
+```
+
+If vault 2's leg named 600,001 (over the locked amount), phase 1
+returns `ReleaseExceedsLocked` and all three vaults — states,
+counters, event streams — stay exactly as they were: no partial
+payroll.
+
 ## Basket escrow (AV-95)
 
 One escrow, up to 8 SPL mints: a basket escrow locks a per-mint leg

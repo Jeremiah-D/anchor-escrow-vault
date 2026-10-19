@@ -2375,6 +2375,82 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Atomically release N escrows in one instruction (AV-141;
+    /// mirrors `escrow_state::Escrow::release_many`). The
+    /// initializer's fleet settlement: N vaults release in one
+    /// transaction instead of N — one signature and one transaction
+    /// fee instead of N (Solana / backend-engineering / payment
+    /// fintech: a payroll or market-maker fleet settling one token).
+    ///
+    /// Every leg runs the exact `release` gates (authority, the
+    /// dual-control routing gate, state, the swap-link guard, funding
+    /// completeness, the mint binding AV-16, the payout policy AV-49,
+    /// the milestone plan, the subscription schedule, the payout-split
+    /// table, quorum, the timelock AV-27, the amount math) — a leg that
+    /// would fail a standalone `release` fails the batch with the
+    /// identical error. Two-phase atomicity: phase 1 dry-runs every
+    /// leg on a shadow copy (the first failing leg returns its error
+    /// with all vaults untouched), phase 2 executes on the real vaults
+    /// with a defensive whole-batch snapshot — on-chain the failed
+    /// instruction rolls every vault write back, so no partial release
+    /// ever persists.
+    ///
+    /// `legs.len()` must equal the vault count (`LegsCountMismatch`,
+    /// code 208 — the caller's shape bug, refused before any vault is
+    /// read). The vaults ride `ctx.remaining_accounts` in leg order
+    /// (all `mut` — N is caller-chosen, so the static account struct
+    /// cannot name them). One instruction-level `mint` binds every leg
+    /// (the fleet shares a token; `None` on the native-SOL path).
+    /// AV-27: the timelock gate reads the Solana clock sysvar — never
+    /// an instruction param.
+    pub fn release_many(
+        ctx: Context<ReleaseMany>,
+        legs: Vec<ReleaseLegArg>,
+        mint: Option<Pubkey>,
+    ) -> Result<()> {
+        // One leg per vault, in vault order — a shape mismatch is the
+        // caller's bug; fail closed before reading any vault.
+        require!(
+            ctx.remaining_accounts.len() == legs.len(),
+            ErrorCode::LegsCountMismatch
+        );
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let authority = ctx.accounts.initializer.key().to_bytes();
+        let mint_bytes = mint.map(|m| m.to_bytes());
+        // The real build decodes each remaining account as a Vault
+        // (Anchor `Account<Vault>` per index, all `mut`); the skeleton
+        // reads them through the same helper shape as `read_escrow`.
+        let mut escrows: Vec<escrow_state::Escrow> =
+            Vec::with_capacity(ctx.remaining_accounts.len());
+        for vault_info in ctx.remaining_accounts.iter() {
+            escrows.push(read_escrow_info(vault_info));
+        }
+        let state_legs: Vec<escrow_state::ReleaseLeg> = legs
+            .iter()
+            .map(|l| escrow_state::ReleaseLeg {
+                amount: l.amount,
+                payout_to: l.payout_to.to_bytes(),
+            })
+            .collect();
+        let _detail = escrow_state::Escrow::release_many(
+            &mut escrows,
+            authority,
+            now,
+            &state_legs,
+            mint_bytes,
+        )
+        .map_err(|e| escrow_error(e))?;
+        // The real build writes each settled escrow back into its vault
+        // account, emits one `Released` event per leg in leg order
+        // (`from == Funded`, `to == Funded`/`Released`; amounts follow
+        // the `Released` shape — the leg's gross amount and fee —
+        // mirroring `escrow_state::IndexedEscrow::release_many`), then
+        // settles via `cpi_settle_payout` (`PayoutKind::Release`) per
+        // leg: leg i's net payout to `legs[i].payout_to`, sized from
+        // the per-leg (taker_payout, fee) detail, plus the fee leg.
+        Ok(())
+    }
+
     /// Opt in to dispute arbitration (AV-14; mirrors
     /// `Escrow::with_arbiter`). `Uninitialized` only, like
     /// `initialize_quorum`: the arbiter's identity is fixed before funds
@@ -6446,6 +6522,22 @@ pub struct BasketLegArg {
     pub amount: u64,
 }
 
+/// Skeleton mirror of `escrow_state::ReleaseLeg` as an instruction
+/// argument (AV-141): one batch leg — the gross release amount for
+/// one vault plus its explicit payout destination. The
+/// `release_many` handler converts `Vec<ReleaseLegArg>` to the
+/// `Vec<escrow_state::ReleaseLeg>` the state machine's
+/// [`escrow_state::Escrow::release_many`] validates; `legs.len()`
+/// must equal the vault count (`LegsCountMismatch`, code 208,
+/// otherwise). Serialized size is pinned by
+/// `escrow_state::RELEASE_MANY_LEG_DATA_BYTES` (40 bytes: amount u64
+/// + payout_to Pubkey).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct ReleaseLegArg {
+    pub amount: u64,
+    pub payout_to: Pubkey,
+}
+
 /// Skeleton mirror of `escrow_state::VestingSchedule`: the linear unlock
 /// window `[start, end)` in Unix seconds, with an optional cliff
 /// (AV-51): before `cliff_at` nothing unlocks, at/after it the linear
@@ -8104,6 +8196,33 @@ pub struct NetEscrows<'info> {
     pub clock: AccountInfo<'info>,
 }
 
+/// AV-141: accounts for `release_many` — the initializer signer, the
+/// clock sysvar, and the fleet's SPL token account. The N vaults ride
+/// `ctx.remaining_accounts` in leg order (all `mut`): N is
+/// caller-chosen, so Anchor's static account struct cannot name them.
+/// The handler cross-checks `remaining_accounts.len() == legs.len()`
+/// (`LegsCountMismatch`, code 208) before reading any vault.
+#[derive(Accounts)]
+pub struct ReleaseMany<'info> {
+    /// Only the initializer releases the fleet; every leg's state
+    /// machine checks authority before state validity (`Unauthorized`
+    /// otherwise, so strangers learn nothing about any leg's state).
+    /// A constraint in the real build asserts `initializer.key() ==
+    /// vault.initializer` on every vault.
+    pub initializer: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the AV-27 timelock gate
+    /// and the event `at` timestamps (never an instruction param — a
+    /// caller-supplied timestamp would let the initializer
+    /// fast-forward the lock).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the fleet's SPL token account. The real build reads this
+    /// account's `mint` and the state machine requires it to equal
+    /// every leg's bound mint (`MintMismatch` on a leg rolls the whole
+    /// batch back). Unused on the native-SOL path — the state machine
+    /// then requires `None`.
+    pub vault_token_account: AccountInfo<'info>,
+}
+
 #[derive(Accounts)]
 pub struct Claim<'info> {
     #[account(mut)]
@@ -9109,6 +9228,15 @@ fn read_escrow(_vault: &Account<Vault>) -> escrow_state::Escrow {
     unimplemented!("deserialize Vault account into escrow_state::Escrow")
 }
 
+/// Skeleton helper for AV-141 `release_many`: read one of the N vaults
+/// riding `ctx.remaining_accounts` (an `AccountInfo`, not a statically
+/// typed `Account<Vault>` — N is caller-chosen). The real build wraps
+/// each remaining account in Anchor `Account<Vault>` and deserializes
+/// it exactly like `read_escrow`.
+fn read_escrow_info(_info: &AccountInfo) -> escrow_state::Escrow {
+    unimplemented!("deserialize a remaining-accounts Vault into escrow_state::Escrow")
+}
+
 fn read_clock_unix_timestamp(_clock: &AccountInfo) -> u64 {
     unimplemented!("read Clock::get()?.unix_timestamp as u64 in the real build")
 }
@@ -9695,9 +9823,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::BlindNoCommit => {
             error!(ErrorCode::BlindNoCommit)
         }
-        // AV-137: appended, never renumbered.
-        escrow_state::EscrowError::BlindVoteMustReveal => {
-            error!(ErrorCode::BlindVoteMustReveal)
+        // AV-141: appended, never renumbered.
+        escrow_state::EscrowError::LegsCountMismatch => {
+            error!(ErrorCode::LegsCountMismatch)
         }
     }
 }
@@ -9943,4 +10071,6 @@ pub enum ErrorCode {
     BlindNoCommit,
     #[msg("Blind vote must reveal (AV-137): submit_panel_judgment on a blind-mode panel — direct votes are disabled, vote via commit + reveal")]
     BlindVoteMustReveal,
+    #[msg("Batch leg-count mismatch (AV-141): release_many with legs.len() != vault count — the batch is all-or-nothing, so a short or long leg table is refused before any vault is touched")]
+    LegsCountMismatch,
 }

@@ -286,6 +286,9 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         // AV-126: the initialize_slash_ladder instruction's
         // (deadline, bps) rung table.
         "Vec<SlashRung>" => IdlType::Vec(Box::new(IdlType::Named("SlashRung"))),
+        // AV-141: the release_many instruction's (amount, payout_to)
+        // batch leg table.
+        "Vec<ReleaseLeg>" => IdlType::Vec(Box::new(IdlType::Named("ReleaseLeg"))),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         // AV-130: the initiate_release instruction's optional SPL mint
         // binding (a real pubkey, not raw bytes).
@@ -570,6 +573,14 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
             ("deadline", IdlType::U64),
             ("bps", IdlType::U16),
         ],
+        // ReleaseLeg { amount: u64, payout_to: Pubkey } (AV-141:
+        // 40 bytes — one entry of the release_many instruction's
+        // batch leg table; the IDL has no tuple type, so the leg is
+        // a named struct).
+        "ReleaseLeg" => vec![
+            ("amount", IdlType::U64),
+            ("payout_to", IdlType::PublicKey),
+        ],
         // SlashLadder { penalty_account: Pubkey, rungs: [SlashRung;
         // 8], rung_count: u8 } (AV-126: 113 bytes — the penalty sink
         // plus the 8 fixed rung slots and the live rung-count byte;
@@ -833,6 +844,8 @@ fn render_idl_json() -> String {
         "CounterOffer",
         // AV-130: the frozen maker-checker release declaration type.
         "DualControlIntent",
+        // AV-141: the release_many instruction's batch leg type.
+        "ReleaseLeg",
     ];
     for (ti, type_name) in type_names.iter().enumerate() {
         w.line("{");
@@ -1067,6 +1080,9 @@ fn named_type_sizes_pin_constants() {
     // named type).
     assert_eq!(size("DualControlIntent"), DUAL_CONTROL_INTENT_LEN);
     assert_eq!(size("DualControlIntent"), 89);
+    // AV-141: amount u64 + payout_to pubkey — one entry of the
+    // release_many instruction's batch leg table.
+    assert_eq!(size("ReleaseLeg"), 40);
 }
 
 #[test]
@@ -1129,12 +1145,12 @@ fn idl_errors_pin_enum() {
         let name = format!("{e:?}");
         assert!(seen.insert(name.clone()), "duplicate error variant {name}");
         assert!(
-            (100..208).contains(&e.code()),
+            (100..209).contains(&e.code()),
             "error code out of pinned range: {name} = {}",
             e.code()
         );
     }
-    assert_eq!(errors.len(), 108, "error variant count drift");
+    assert_eq!(errors.len(), 109, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -1256,6 +1272,10 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::InvalidArbiterFee.code(), 198);
     // AV-139: appended, never renumbered.
     assert_eq!(EscrowError::SweepGraceNotElapsed.code(), 206);
+    // AV-140: appended, never renumbered.
+    assert_eq!(EscrowError::NettingIncompatible.code(), 207);
+    // AV-141: appended, never renumbered.
+    assert_eq!(EscrowError::LegsCountMismatch.code(), 208);
 }
 
 #[test]

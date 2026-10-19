@@ -34,12 +34,21 @@
 //! # Single source of truth
 //!
 //! [`INSTRUCTION_CU_TABLE`] is the only place per-instruction costs
-//! live. [`estimate_instruction_cu`] is the only arithmetic. The tests
-//! pin every row: the data-byte column against the `INSTRUCTIONS` IDL
-//! spec table, the base column against hardcoded values, and the table
-//! against full coverage of every keeper instruction kind — a new
-//! instruction without a cost row fails the build instead of silently
-//! estimating zero.
+//! live. [`estimate_instruction_cu`] is the arithmetic for fixed-size
+//! instructions. The tests pin every row: the data-byte column against
+//! the `INSTRUCTIONS` IDL spec table, the base column against hardcoded
+//! values, and the table against full coverage of every keeper
+//! instruction kind — a new instruction without a cost row fails the
+//! build instead of silently estimating zero.
+//!
+//! Variable-N instructions are the documented exception: `release_many`
+//! (AV-141) settles a caller-chosen number of legs, so a fixed row
+//! cannot honestly express its cost. The table row pins the N=1 case
+//! (the smallest valid batch — 85 data bytes, the 16_000 base as the
+//! dispatch overhead plus one per-leg marginal), and
+//! [`estimate_release_many_cu`] takes the leg count for the honest
+//! linear model; the tests pin both the N=1 row and the per-leg growth
+//! formula.
 
 /// Hard compute-budget ceiling per Solana transaction. A batch whose
 /// estimate exceeds this cannot fit one transaction — the operator must
@@ -120,6 +129,21 @@ pub const INSTRUCTION_CU_TABLE: &[(&str, u64, usize)] = &[
     // term compatibility, u128-checked accumulation) — ranked with
     // claim, the other initializer/taker fund-moving call.
     ("merge_escrows", 14_000, 8),
+    // AV-141: legs: Vec<ReleaseLeg> + mint: Option<Pubkey> → 8 + 4 +
+    // 40×N + 33. The row pins the N=1 case (8 + 4 + 40 + 33 = 85) —
+    // the smallest valid batch. Compute units grow linearly with the
+    // leg count (each leg runs one full `release` guard chain plus
+    // settlement writes, across the two phases' shadow + real passes),
+    // so the base is the N=1 total: the fixed dispatch overhead
+    // (RELEASE_MANY_DISPATCH_CU — Anchor dispatch, account decoding,
+    // the leg/vault count cross-check, the two-phase snapshot
+    // allocation) plus one per-leg marginal (RELEASE_MANY_PER_LEG_CU —
+    // one full release guard chain + settlement writes, ranked with
+    // the fund-moving claim/merge_escrows band). A fixed row cannot
+    // honestly express linear growth: use `estimate_release_many_cu`
+    // for the leg-count-parameterized estimate. Heuristic planning
+    // numbers, not measurements — see the module honesty notes.
+    ("release_many", 16_000, 85),
 ];
 
 /// Base cost for `instruction`, or `None` when the table has no row —
@@ -157,6 +181,64 @@ pub fn estimate_instruction_cu(
         base.saturating_add(CU_PER_SIGNATURE.saturating_mul(signer_count as u64))
             .saturating_add(CU_PER_ACCOUNT.saturating_mul(account_count as u64))
             .saturating_add(CU_PER_DATA_BYTE.saturating_mul(data_bytes as u64)),
+    )
+}
+
+/// AV-141: fixed dispatch overhead of `release_many`: Anchor dispatch,
+/// account decoding, the leg/vault count cross-check and the two-phase
+/// snapshot allocation. Heuristic planning number, not a measurement —
+/// see the module honesty notes.
+pub const RELEASE_MANY_DISPATCH_CU: u64 = 4_000;
+
+/// AV-141: marginal compute per `release_many` leg: one full `release`
+/// guard chain plus settlement writes, ranked with the fund-moving
+/// claim/merge_escrows band. Heuristic planning number, not a
+/// measurement.
+pub const RELEASE_MANY_PER_LEG_CU: u64 = 12_000;
+
+/// AV-141: Borsh data bytes of one `release_many` leg — amount:u64 (8)
+/// + payout_to:Pubkey (32).
+pub const RELEASE_MANY_LEG_DATA_BYTES: usize = 40;
+
+/// AV-141: instruction-data bytes of `release_many` for `n_legs` legs:
+/// the 8-byte discriminator, the 4-byte vec length prefix, N×40 for
+/// the legs, and 33 for mint: Option<Pubkey> (1-byte tag + 32 bytes).
+pub fn release_many_data_bytes(n_legs: usize) -> usize {
+    8 + 4
+        + RELEASE_MANY_LEG_DATA_BYTES.saturating_mul(n_legs)
+        + 33
+}
+
+/// AV-141: heuristic compute-unit estimate for `release_many` with
+/// `n_legs` legs.
+///
+/// A fixed table row cannot honestly express linear growth, so the
+/// `INSTRUCTION_CU_TABLE` row pins the N=1 case (the smallest valid
+/// batch) and this dedicated estimator takes the leg count: the
+/// dispatch overhead plus one per-leg marginal per leg, plus the usual
+/// per-signature / per-account / per-data-byte charges (the data bytes
+/// themselves grow with N — see [`release_many_data_bytes`]). `None`
+/// for a zero-leg batch, which names no vaults and cannot execute.
+///
+/// Like [`estimate_instruction_cu`], a heuristic planning number, not
+/// a measurement — calibrate against `simulateTransaction` before
+/// sizing production batches.
+pub fn estimate_release_many_cu(
+    n_legs: usize,
+    account_count: usize,
+    signer_count: usize,
+) -> Option<u64> {
+    if n_legs == 0 {
+        return None;
+    }
+    Some(
+        RELEASE_MANY_DISPATCH_CU
+            .saturating_add(RELEASE_MANY_PER_LEG_CU.saturating_mul(n_legs as u64))
+            .saturating_add(CU_PER_SIGNATURE.saturating_mul(signer_count as u64))
+            .saturating_add(CU_PER_ACCOUNT.saturating_mul(account_count as u64))
+            .saturating_add(
+                CU_PER_DATA_BYTE.saturating_mul(release_many_data_bytes(n_legs) as u64),
+            ),
     )
 }
 
@@ -249,6 +331,13 @@ mod cu_estimate_tests {
             "u8" | "bool" => 1,
             "Pubkey" | "[u8; 32]" => 32,
             "Option<[u8; 32]>" => 33, // 1-byte tag + 32 bytes
+            // AV-141: 1-byte tag + 32 bytes, like Option<[u8; 32]> —
+            // the fleet-wide mint binding rides as a real pubkey.
+            "Option<Pubkey>" => 33,
+            // AV-141: the N=1 minimum-case pin — 4-byte vec length
+            // prefix + one leg (amount u64 + payout_to Pubkey); the
+            // variable-N formula lives in `release_many_data_bytes`.
+            "Vec<ReleaseLeg>" => 4 + 40,
             other => panic!("AV-88: add Borsh size for new keeper param type {other}"),
         }
     }
@@ -296,6 +385,10 @@ mod cu_estimate_tests {
             ("initialize_release_cooling", 8_000),
             ("announce_release", 8_000),
             ("veto_release", 8_000),
+            // AV-141: the N=1 total — dispatch overhead plus one
+            // per-leg marginal (RELEASE_MANY_DISPATCH_CU +
+            // RELEASE_MANY_PER_LEG_CU).
+            ("release_many", 16_000),
         ];
         for (name, base) in expected {
             assert_eq!(instruction_cu_base(name), Some(*base), "base drift for {name}");
@@ -320,6 +413,50 @@ mod cu_estimate_tests {
         );
         // Unknown instruction: no silent zero.
         assert_eq!(estimate_instruction_cu("nope", 3, 1), None);
+    }
+
+    /// AV-141: the `release_many` cost model is honestly linear in the
+    /// leg count — a fixed table row pins the N=1 case and the
+    /// dedicated estimator carries the leg count.
+    #[test]
+    fn release_many_cu_model_is_linear_in_leg_count() {
+        // The data-byte formula: 8 (discriminator) + 4 (vec length
+        // prefix) + N×40 (legs) + 33 (mint: Option<Pubkey>).
+        assert_eq!(release_many_data_bytes(0), 8 + 4 + 33);
+        assert_eq!(release_many_data_bytes(1), 85);
+        assert_eq!(release_many_data_bytes(5), 8 + 4 + 5 * 40 + 33);
+        assert_eq!(RELEASE_MANY_LEG_DATA_BYTES, 40);
+        // The table row pins the N=1 case — data bytes and the base as
+        // dispatch overhead plus one per-leg marginal.
+        assert_eq!(
+            instruction_data_bytes("release_many"),
+            Some(release_many_data_bytes(1))
+        );
+        assert_eq!(
+            instruction_cu_base("release_many"),
+            Some(RELEASE_MANY_DISPATCH_CU + RELEASE_MANY_PER_LEG_CU)
+        );
+        assert_eq!(RELEASE_MANY_DISPATCH_CU + RELEASE_MANY_PER_LEG_CU, 16_000);
+        // The dedicated estimator agrees with the table row on the N=1
+        // case — the two cost sources cannot drift apart. Pinned
+        // explicitly: 4_000 + 12_000 + 1×3_000 + 3×250 + 85×8 = 20_430.
+        assert_eq!(estimate_release_many_cu(1, 3, 1), Some(20_430));
+        assert_eq!(
+            estimate_release_many_cu(1, 3, 1),
+            estimate_instruction_cu("release_many", 3, 1)
+        );
+        // Linear growth: each extra leg adds one per-leg marginal plus
+        // its 40 data bytes — the honest scaling law, pinned.
+        let per_leg_step = RELEASE_MANY_PER_LEG_CU + CU_PER_DATA_BYTE * 40;
+        assert_eq!(per_leg_step, 12_320);
+        for n in 1..8usize {
+            let a = estimate_release_many_cu(n, 3, 1).unwrap();
+            let b = estimate_release_many_cu(n + 1, 3, 1).unwrap();
+            assert_eq!(b - a, per_leg_step, "non-linear step at N={n}");
+        }
+        // A zero-leg batch names no vaults and cannot execute — no
+        // silent zero estimate.
+        assert_eq!(estimate_release_many_cu(0, 3, 1), None);
     }
 
     #[test]
