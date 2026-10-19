@@ -5,7 +5,10 @@
 //! either a state-valid operation or a deliberately-invalid probe. After
 //! every step the runner asserts, for every escrow:
 //!
-//! - amount conservation: `deposited == paid_out + refunded + locked`;
+//! - amount conservation: `deposited == paid_out + refunded + locked`
+//!   (AV-148: the taker's counter-fund joins both sides — `deposited`
+//!   counts the taker's deposits, `locked` is the bilateral
+//!   `remaining_amount`);
 //! - the protocol-fee bound: `fees_paid <= released`;
 //! - probe operations fail with exactly the documented error, verifying
 //!   the check order (authority -> state -> config -> amount) under
@@ -240,9 +243,12 @@ impl SimEscrow {
             self.escrow.fees_paid() as u128 <= self.escrow.released_amount() as u128,
             "fee bound broken [{ctx}]"
         );
+        // AV-148: the release cap is the bilateral lockup —
+        // `released` may exceed the initializer's `amount` up to the
+        // taker's counter-fund.
         assert!(
-            self.escrow.released_amount() <= self.escrow.amount(),
-            "released exceeds locked [{ctx}]"
+            self.escrow.released_amount() <= self.escrow.amount() + self.escrow.taker_locked(),
+            "released exceeds bilateral locked [{ctx}]"
         );
     }
 
@@ -280,6 +286,8 @@ fn split_amount(rng: &mut SimRng, amount: u64, k: u64) -> Vec<u64> {
 enum ValidOp {
     Activate([u8; 32]),
     Fund,
+    // AV-148: the taker's counter-fund (bilateral collateral).
+    FundTaker(u64),
     Attest(usize),
     Release(u64),
     Claim,
@@ -395,6 +403,16 @@ impl Runner {
                     // skipped — only exits remain valid).
                     let mut cands: Vec<ValidOp> = Vec::new();
                     let remaining = s.escrow.remaining_amount();
+                    // AV-148: the taker counter-funds (bilateral
+                    // collateral) — only without a milestone plan (the
+                    // plan owns the release path and refuses the
+                    // counter-fund). The vesting claim path is
+                    // unaffected: `claim` prices against `amount` with
+                    // saturating math, so a counter-fund never breaks
+                    // the sim's Claim expectation.
+                    if s.ms_amounts.is_empty() {
+                        cands.push(ValidOp::FundTaker(1 + rng.below(1 + s.escrow.amount())));
+                    }
                     if s.ms_amounts.is_empty() && remaining > 0 {
                         if s.has_vesting {
                             let claimable =
@@ -504,6 +522,13 @@ impl Runner {
                 Self::expect_ok(s.escrow.fund(ALICE, NOW0), "fund", ctx, idx);
                 s.deposited += s.escrow.amount() as u128;
             }
+            ValidOp::FundTaker(amount) => {
+                Self::expect_ok(s.escrow.fund_taker(BOB, amount, now), "fund_taker", ctx, idx);
+                // AV-148: the counter-fund is inflow on the taker's leg —
+                // the conservation identity balances it against the
+                // bilateral locked remainder.
+                s.deposited += amount as u128;
+            }
             ValidOp::Attest(i) => {
                 let key = s.attestors[i];
                 Self::expect_ok(s.escrow.attest(key), "attest", ctx, idx);
@@ -538,20 +563,25 @@ impl Runner {
                 Self::expect_ok(s.escrow.update_quorum(ALICE, BOB, t), "update_quorum", ctx, idx);
             }
             ValidOp::Cancel => {
-                let refund = s.escrow.remaining_amount();
                 let to = s.escrow.refund_recipient();
-                Self::expect_ok(s.escrow.cancel(ALICE, s.mint, to, 0), "cancel", ctx, idx);
-                s.refunded += refund as u128;
+                // AV-148: the bilateral unwind — both legs are refund
+                // sinks in the conservation identity.
+                let (init_refund, taker_refund) =
+                    Self::expect_ok(s.escrow.cancel(ALICE, s.mint, to, 0), "cancel", ctx, idx);
+                s.refunded += (init_refund + taker_refund) as u128;
             }
             ValidOp::CancelExpired(who) => {
                 let to = s.escrow.refund_recipient();
-                let (refund, penalty) = Self::expect_ok(
+                // AV-148: the bilateral unwind — both legs plus the
+                // penalty are refund sinks in the conservation
+                // identity.
+                let (init_refund, taker_refund, penalty) = Self::expect_ok(
                     s.escrow.cancel_expired(who, now, s.mint, to),
                     "cancel_expired",
                     ctx,
                     idx,
                 );
-                s.refunded += (refund + penalty) as u128;
+                s.refunded += (init_refund + taker_refund + penalty) as u128;
             }
             ValidOp::Escalate(who, evidence) => {
                 Self::expect_ok(s.escrow.escalate(who, now, s.escrow.remaining_amount(), evidence, None, 0), "escalate", ctx, idx);
@@ -636,7 +666,11 @@ impl Runner {
             if state == EscrowState::Funded {
                 cands.push(Probe {
                     name: "taker cancel",
-                    run: |s, _| s.escrow.cancel(BOB, s.mint, s.escrow.refund_recipient(), 0),
+                    run: |s, _| {
+                        s.escrow
+                            .cancel(BOB, s.mint, s.escrow.refund_recipient(), 0)
+                            .map(|_| ())
+                    },
                     expected: EscrowError::Unauthorized,
                 });
                 if !eligible {

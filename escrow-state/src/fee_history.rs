@@ -256,7 +256,10 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // fees.
         | EscrowEventKind::JudgmentCommitted
         | EscrowEventKind::JudgmentRevealed
-        | EscrowEventKind::RentSwept => None,
+        | EscrowEventKind::RentSwept
+        // AV-148: the taker's counter-fund is pure deposit
+        // bookkeeping — no fee leg.
+        | EscrowEventKind::TakerFunded => None,
     }
 }
 
@@ -864,6 +867,8 @@ mod fee_history_tests {
                 | EscrowEventKind::DeadmanClaimed
                 | EscrowEventKind::RentToppedUp
                 | EscrowEventKind::TrancheFunded
+                // AV-148: the taker's counter-fund carries no fee leg.
+                | EscrowEventKind::TakerFunded
                 | EscrowEventKind::ReleaseIntentAnnounced
                 | EscrowEventKind::ReleaseIntentVetoed
                 | EscrowEventKind::EscrowsMerged

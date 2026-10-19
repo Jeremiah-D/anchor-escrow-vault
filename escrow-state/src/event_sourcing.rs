@@ -293,6 +293,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // (exactly like `Funded` itself), so the tranche carries no
         // amount and the fold books nothing.
         | EscrowEventKind::TrancheFunded => (0, 0, 0),
+        // AV-148: the taker's counter-fund is the fold seed's inflow
+        // leg — the fold seeds the lockup with the bilateral total at
+        // `Funded` (exactly like `Funded` itself), so the counter-fund
+        // carries no amount and the fold books nothing.
+        | EscrowEventKind::TakerFunded => (0, 0, 0),
         // AV-112: release-intent governance signals move no escrow
         // funds — pure bookkeeping for the indexer, like the AV-104
         // delegation config changes — so the fold books nothing.
@@ -777,6 +782,11 @@ mod event_sourcing_tests {
                 // leg — the fold seeds the lockup with the deal size
                 // at `Funded`, so the tranche books nothing.
                 | EscrowEventKind::TrancheFunded
+                // AV-148: the taker's counter-fund is the fold seed's
+                // inflow leg — the fold seeds the lockup with the
+                // bilateral total at `Funded`, so the counter-fund
+                // books nothing.
+                | EscrowEventKind::TakerFunded
                 // AV-112: release-intent governance signals move no
                 // escrow funds.
                 | EscrowEventKind::ReleaseIntentAnnounced
@@ -1282,14 +1292,14 @@ mod event_sourcing_tests {
                         }
                     }
                     8 => match ie.cancel(ALICE, None, ALICE, NOW) {
-                        Ok(()) => {
+                        Ok((_init_refund, _taker_refund)) => {
                             refunded += ie.inner().remaining_amount();
                             true
                         }
                         Err(_) => false,
                     },
                     _ => match ie.cancel_expired(BOB, expires_at + 1, None, ALICE) {
-                        Ok((r, p)) => {
+                        Ok((r, _, p)) => {
                             // The AV-24 penalty routes to the
                             // initializer as compensation: an
                             // initializer receipt, like the refund.

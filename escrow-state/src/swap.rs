@@ -265,8 +265,9 @@ pub fn cancel_swap(
 
 /// Cancel both sides of a linked pair on expiry (AV-105).
 ///
-/// Returns `(refund_a, penalty_a, refund_b, penalty_b)` — the
-/// per-side [`Escrow::cancel_expired`] splits. The caller must be one
+/// Returns `(init_a, taker_a, penalty_a, init_b, taker_b, penalty_b)`
+/// — the per-side [`Escrow::cancel_expired`] bilateral splits
+/// (AV-148). The caller must be one
 /// of the two parties (the single-side path allows either party, so
 /// the pair path does too); per-side authority is the caller, so the
 /// AV-24 anti-griefing penalty keys per side exactly as the
@@ -290,7 +291,7 @@ pub fn cancel_swap_expired(
     refund_to_a: [u8; 32],
     mint_b: Option<[u8; 32]>,
     refund_to_b: [u8; 32],
-) -> Result<(u64, u64, u64, u64), EscrowError> {
+) -> Result<(u64, u64, u64, u64, u64, u64), EscrowError> {
     a.require_not_paused()?;
     b.require_not_paused()?;
     // Party-only: an AV-104 operator is Unauthorized.
@@ -315,12 +316,12 @@ pub fn cancel_swap_expired(
     let link_a = a.swap_link.take();
     let real_a = a.cancel_expired(caller, now, mint_a, refund_to_a);
     a.swap_link = link_a;
-    let (refund_a, penalty_a) = real_a?;
+    let (init_a, taker_a, penalty_a) = real_a?;
     let link_b = b.swap_link.take();
     let real_b = b.cancel_expired(caller, now, mint_b, refund_to_b);
     b.swap_link = link_b;
-    let (refund_b, penalty_b) = real_b?;
-    Ok((refund_a, penalty_a, refund_b, penalty_b))
+    let (init_b, taker_b, penalty_b) = real_b?;
+    Ok((init_a, taker_a, penalty_a, init_b, taker_b, penalty_b))
 }
 
 #[cfg(test)]
@@ -708,7 +709,7 @@ mod swap_tests {
         link_swap(&mut a, &mut b, ALICE, ID_A, ID_B, 1_000, 500).unwrap();
         a.fund(ALICE, T0).unwrap();
         b.fund(BOB, T0).unwrap();
-        let (refund_a, penalty_a, refund_b, penalty_b) = cancel_swap_expired(
+        let (init_a, taker_a, penalty_a, init_b, taker_b, penalty_b) = cancel_swap_expired(
             &mut a,
             &mut b,
             ALICE,
@@ -721,8 +722,8 @@ mod swap_tests {
             BOB,
         )
         .unwrap();
-        assert_eq!((refund_a, penalty_a), (1_000, 0));
-        assert_eq!((refund_b, penalty_b), (500, 0));
+        assert_eq!((init_a, taker_a, penalty_a), (1_000, 0, 0));
+        assert_eq!((init_b, taker_b, penalty_b), (500, 0, 0));
         assert_eq!(a.state(), EscrowState::Cancelled);
         assert_eq!(b.state(), EscrowState::Cancelled);
         // One side ineligible: atomic refusal, both unchanged.
@@ -906,7 +907,7 @@ mod swap_tests {
         b.fund(BOB, T0 + 2).unwrap();
         a.drain_events();
         b.drain_events();
-        let (refund_a, penalty_a, refund_b, penalty_b) =
+        let (init_a, taker_a, penalty_a, init_b, taker_b, penalty_b) =
             IndexedEscrow::cancel_swap_expired_pair(
                 &mut a,
                 &mut b,
@@ -920,7 +921,10 @@ mod swap_tests {
                 BOB,
             )
             .unwrap();
-        assert_eq!((refund_a, penalty_a, refund_b, penalty_b), (1_000, 0, 500, 0));
+        assert_eq!(
+            (init_a, taker_a, penalty_a, init_b, taker_b, penalty_b),
+            (1_000, 0, 0, 500, 0, 0)
+        );
         let ev_a = a.drain_events();
         let ev_b = b.drain_events();
         assert_eq!(ev_a.len(), 1);

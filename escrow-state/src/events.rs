@@ -240,6 +240,7 @@
 //! | DeadmanClaimed (AV-109) | 0 | 0 | remaining locked amount, to the configured heir (the heir is not required to be either party) | 0 |
 //! | RentToppedUp (AV-110) | 0 | 0 | 0 | 0 — the topped-up lamports ride `rent_reclaimed` (the rent-balance leg: added here, reclaimed on `VaultClosed`; direction is read from the kind) |
 //! | TrancheFunded (AV-111) | 0 | 0 | 0 | 0 — a funding tranche landed; the fold seeds the lockup with the deal size at `Funded`, so the tranche carries no amount (exactly like `Funded` itself) |
+//! | TakerFunded (AV-148) | 0 | 0 | 0 | 0 — the taker posted counter-fund; the fold seeds the lockup with the bilateral total at `Funded`, so the counter-fund carries no amount (exactly like `Funded` itself) |
 //! | ReleaseIntentAnnounced (AV-112) | 0 | 0 | 0 | 0 — a release intent was announced (governance signal; the cooling window starts) |
 //! | ReleaseIntentVetoed (AV-112) | 0 | 0 | 0 | 0 — a live release intent was vetoed (governance signal; the announced release is cancelled) |
 //! | EscrowsMerged (AV-114) | the source's locked amount folded into the survivor | 0 | 0 | 0 |
@@ -939,6 +940,18 @@ pub enum EscrowEventKind {
     /// separately — with a zero payout, the honest record that no
     /// transfer occurred. The actor is the netting party.
     EscrowsNetted,
+    /// AV-148: the taker posted counter-fund via
+    /// [`Escrow::fund_taker`](crate::Escrow::fund_taker). `from == to
+    /// ==` the state after the call (a `Funded` re-entry — pure
+    /// deposit bookkeeping, not a lifecycle move — like
+    /// [`EscrowEventKind::TrancheFunded`]). The event carries
+    /// [`EventAmounts::none`]: the counter-fund is the fold seed's
+    /// inflow leg (the taker's locked leg), so the fold seeds the
+    /// lockup with the bilateral total at `Funded`, exactly like
+    /// `Funded` itself. The actor is the funding taker. Always emitted
+    /// on success — a rejected call changes nothing, so a failed call
+    /// emits nothing.
+    TakerFunded,
 }
 
 impl EscrowEventKind {
@@ -1126,6 +1139,9 @@ impl EscrowEventKind {
             // AV-140: appended after RentSwept so discriminants 0–74
             // stay stable for already-serialized histories.
             75 => Self::EscrowsNetted,
+            // AV-148: appended after EscrowsNetted so discriminants
+            // 0–75 stay stable for already-serialized histories.
+            76 => Self::TakerFunded,
             _ => return None,
         })
     }
@@ -1225,6 +1241,9 @@ impl EscrowEventKind {
             // AV-140: appended after rent_swept so the name table
             // stays stable for already-serialized histories.
             Self::EscrowsNetted => "escrows_netted",
+            // AV-148: appended after escrows_netted so the name table
+            // stays stable for already-serialized histories.
+            Self::TakerFunded => "taker_funded",
         }
     }
 
@@ -1328,6 +1347,9 @@ impl EscrowEventKind {
             // AV-140: appended after rent_swept so the name table
             // stays stable for already-serialized histories.
             "escrows_netted" => Self::EscrowsNetted,
+            // AV-148: appended after escrows_netted so the name table
+            // stays stable for already-serialized histories.
+            "taker_funded" => Self::TakerFunded,
             _ => return None,
         })
     }
@@ -3489,28 +3511,30 @@ impl IndexedEscrow {
     }
 
     /// Cancel the escrow and return funds (mirrors [`Escrow::cancel`]).
-    /// Emits `Cancelled` with the refunded remainder in
+    /// Emits `Cancelled` with the combined unwound remainder in
     /// `amounts.refund`. `refund_to` is the refund destination, pinned
-    /// against the escrow's refund policy (AV-23).
+    /// against the escrow's refund policy (AV-23). Returns the
+    /// `(initializer_refund, taker_refund)` split (AV-148 bilateral
+    /// unwind — the initializer's leg to `refund_to`, the taker's leg
+    /// back to the taker).
     pub fn cancel(
         &mut self,
         authority: [u8; 32],
         mint: Option<[u8; 32]>,
         refund_to: [u8; 32],
         at: u64,
-    ) -> Result<(), EscrowError> {
+    ) -> Result<(u64, u64), EscrowError> {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
         let result = self.inner.cancel(authority, mint, refund_to, at);
-        self.map_reentrant(result, at)?;
+        let (initializer_refund, taker_refund) = self.map_reentrant(result, at)?;
         let to = self.inner.state();
-        let refund = self.inner.remaining_amount();
         self.push_event(
             EscrowEventKind::Cancelled,
             from,
             to,
-            EventAmounts::refund(refund),
+            EventAmounts::refund(initializer_refund + taker_refund),
             at,
             None,
             None,
@@ -3518,7 +3542,7 @@ impl IndexedEscrow {
             None,
             Some(authority),
         );
-        Ok(())
+        Ok((initializer_refund, taker_refund))
     }
 
     /// Partially cancel the escrow and refund a tranche to the
@@ -3597,15 +3621,19 @@ impl IndexedEscrow {
     /// Cancel an expired escrow (mirrors [`Escrow::cancel_expired`]).
     /// Emits `ExpiredCancelled`; `now` doubles as the event's `at`.
     /// `refund_to` is the refund destination, pinned against the
-    /// escrow's refund policy (AV-23). Returns the `(refund, penalty)`
-    /// split (AV-24): only a taker-initiated cancel charges the penalty.
+    /// escrow's refund policy (AV-23). Returns the
+    /// `(initializer_refund, taker_refund, penalty)` split (AV-148
+    /// bilateral unwind; AV-24: only a taker-initiated cancel charges
+    /// the penalty). The event's `refund` leg carries the combined
+    /// unwind (`initializer_refund + taker_refund`) — the total funds
+    /// the cancel returned to the parties.
     pub fn cancel_expired(
         &mut self,
         authority: [u8; 32],
         now: u64,
         mint: Option<[u8; 32]>,
         refund_to: [u8; 32],
-    ) -> Result<(u64, u64), EscrowError> {
+    ) -> Result<(u64, u64, u64), EscrowError> {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected` (`now` doubles as the event's `at`).
@@ -3616,7 +3644,7 @@ impl IndexedEscrow {
         let result = self
             .inner
             .cancel_expired(authority, now, mint, refund_to);
-        let (refund, penalty) = match result {
+        let (initializer_refund, taker_refund, penalty) = match result {
             Ok(v) => v,
             Err(e) => {
                 self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
@@ -3629,7 +3657,7 @@ impl IndexedEscrow {
             EscrowEventKind::ExpiredCancelled,
             from,
             to,
-            EventAmounts::expired_cancel(refund, penalty),
+            EventAmounts::expired_cancel(initializer_refund + taker_refund, penalty),
             now,
             None,
             None,
@@ -3637,7 +3665,7 @@ impl IndexedEscrow {
             None,
             Some(authority),
         );
-        Ok((refund, penalty))
+        Ok((initializer_refund, taker_refund, penalty))
     }
 
     /// Permissionless expiry crank (mirrors [`Escrow::crank_expired`],
@@ -3648,16 +3676,17 @@ impl IndexedEscrow {
     /// paid a keeper bounty, a second `KeeperBountyPaid` event follows
     /// (`from == to == Cancelled` — the unwind is already final; the
     /// event carries the bounty in `payout`, the caller, and the
-    /// post-debit pool balance). Returns the `(refund, penalty,
-    /// bounty)` triple: only a taker cranker pays the AV-24 penalty,
-    /// and the bounty is `0` when no bounty is configured or the pool
-    /// is exhausted.
+    /// post-debit pool balance). Returns the
+    /// `(initializer_refund, taker_refund, penalty, bounty)` tuple:
+    /// the AV-148 bilateral unwind, only a taker cranker pays the
+    /// AV-24 penalty, and the bounty is `0` when no bounty is
+    /// configured or the pool is exhausted.
     pub fn crank_expired(
         &mut self,
         caller: [u8; 32],
         now: u64,
         mint: Option<[u8; 32]>,
-    ) -> Result<(u64, u64, u64), EscrowError> {
+    ) -> Result<(u64, u64, u64, u64), EscrowError> {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected` (`now` doubles as the event's `at`).
@@ -3666,7 +3695,7 @@ impl IndexedEscrow {
         let pause_state = self.inner.state();
         let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(now);
         let result = self.inner.crank_expired(caller, now, mint);
-        let (refund, penalty, bounty) = match result {
+        let (initializer_refund, taker_refund, penalty, bounty) = match result {
             Ok(v) => v,
             Err(e) => {
                 self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
@@ -3679,7 +3708,7 @@ impl IndexedEscrow {
             EscrowEventKind::ExpiredCranked,
             from,
             to,
-            EventAmounts::expired_cancel(refund, penalty),
+            EventAmounts::expired_cancel(initializer_refund + taker_refund, penalty),
             now,
             None,
             None,
@@ -3706,7 +3735,7 @@ impl IndexedEscrow {
                 Some(caller),
             );
         }
-        Ok((refund, penalty, bounty))
+        Ok((initializer_refund, taker_refund, penalty, bounty))
     }
 
     /// Settle one basket leg to the taker (mirrors
@@ -4177,6 +4206,50 @@ impl IndexedEscrow {
         let state = self.inner.state();
         self.push_event(
             EscrowEventKind::TrancheFunded,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(())
+    }
+
+    /// Post the taker's counter-fund (mirrors
+    /// [`Escrow::fund_taker`](crate::Escrow::fund_taker), AV-148).
+    /// Emits `TakerFunded` with `from == to ==` the state after the
+    /// call (a `Funded` re-entry — pure deposit bookkeeping, not a
+    /// lifecycle move, like [`EscrowEventKind::TrancheFunded`]). The
+    /// event carries [`EventAmounts::none`]: the counter-fund is the
+    /// fold seed's inflow leg (the taker's locked leg), so the fold
+    /// seeds the lockup with the bilateral total at `Funded`, exactly
+    /// like `Funded` itself. `at` is the caller-supplied event
+    /// timestamp (on-chain: the clock sysvar). The actor is the funding
+    /// taker. A rejected call changes nothing, so a failed call emits
+    /// nothing.
+    pub fn fund_taker(
+        &mut self,
+        authority: [u8; 32],
+        amount: u64,
+        now: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(now);
+        if let Err(e) = self.inner.fund_taker(authority, amount, now) {
+            self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+            return Err(e);
+        }
+        self.emit_auto_unpause(pause_state, now, auto_unpaused);
+        let state = self.inner.state();
+        self.push_event(
+            EscrowEventKind::TakerFunded,
             state,
             state,
             EventAmounts::none(),
@@ -6256,8 +6329,8 @@ impl IndexedEscrow {
         refund_to_a: [u8; 32],
         mint_b: Option<[u8; 32]>,
         refund_to_b: [u8; 32],
-    ) -> Result<(u64, u64, u64, u64), EscrowError> {
-        let (refund_a, penalty_a, refund_b, penalty_b) = super::cancel_swap_expired(
+    ) -> Result<(u64, u64, u64, u64, u64, u64), EscrowError> {
+        let (init_a, taker_a, penalty_a, init_b, taker_b, penalty_b) = super::cancel_swap_expired(
             &mut a.inner,
             &mut b.inner,
             caller,
@@ -6269,13 +6342,13 @@ impl IndexedEscrow {
             mint_b,
             refund_to_b,
         )?;
-        let splits = [(refund_a, penalty_a), (refund_b, penalty_b)];
-        for (escrow, (refund, penalty)) in [a, b].into_iter().zip(splits) {
+        let splits = [(init_a, taker_a, penalty_a), (init_b, taker_b, penalty_b)];
+        for (escrow, (init_refund, taker_refund, penalty)) in [a, b].into_iter().zip(splits) {
             escrow.push_event(
                 EscrowEventKind::ExpiredCancelled,
                 EscrowState::Funded,
                 escrow.inner.state(),
-                EventAmounts::expired_cancel(refund, penalty),
+                EventAmounts::expired_cancel(init_refund + taker_refund, penalty),
                 now,
                 None,
                 None,
@@ -6284,7 +6357,7 @@ impl IndexedEscrow {
                 Some(caller),
             );
         }
-        Ok((refund_a, penalty_a, refund_b, penalty_b))
+        Ok((init_a, taker_a, penalty_a, init_b, taker_b, penalty_b))
     }
 
     /// AV-81: wrap a freshly-split child escrow in its own event log.
@@ -6707,7 +6780,7 @@ mod event_tests {
         // so indexers see the compensation routing.
         let mut e = indexed(1_000_000).with_penalty_bps(250).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        let (refund, penalty) = e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        let (refund, _, penalty) = e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
         assert_eq!((refund, penalty), (975_000, 25_000));
         let event = last(&e);
         assert_eq!(event.kind, EscrowEventKind::ExpiredCancelled);
@@ -6736,7 +6809,7 @@ mod event_tests {
         // (not `ExpiredCancelled`) carrying the crank caller's key —
         // the one event kind where the caller is neither party.
         let mut e = funded(1_000_000);
-        let (refund, penalty, _) = e.crank_expired(MALLORY, EXPIRES_AT, None).unwrap();
+        let (refund, _, penalty, _) = e.crank_expired(MALLORY, EXPIRES_AT, None).unwrap();
         assert_eq!((refund, penalty), (1_000_000, 0));
         let event = last(&e);
         assert_eq!(event.kind, EscrowEventKind::ExpiredCranked);
@@ -6761,7 +6834,7 @@ mod event_tests {
             .with_keeper_bounty(50_000, 10_000)
             .unwrap();
         e.fund(ALICE, T0).unwrap();
-        let (refund, penalty, bounty) = e.crank_expired(MALLORY, EXPIRES_AT, None).unwrap();
+        let (refund, _, penalty, bounty) = e.crank_expired(MALLORY, EXPIRES_AT, None).unwrap();
         assert_eq!((refund, penalty, bounty), (1_000_000, 0, 10_000));
         let events = e.events();
         assert_eq!(events.len(), 4, "Initialized + Funded + ExpiredCranked + KeeperBountyPaid");
@@ -6783,7 +6856,7 @@ mod event_tests {
         // AV-124: a zero-bounty crank emits `ExpiredCranked` alone —
         // the AV-48 event shape is unchanged for unbountied escrows.
         let mut e = funded(1_000_000);
-        let (_, _, bounty) = e.crank_expired(MALLORY, EXPIRES_AT, None).unwrap();
+        let (_, _, _, bounty) = e.crank_expired(MALLORY, EXPIRES_AT, None).unwrap();
         assert_eq!(bounty, 0);
         let events = e.events();
         assert_eq!(events.len(), 3, "Initialized + Funded + ExpiredCranked only");
@@ -6827,7 +6900,7 @@ mod event_tests {
         // carries the exact (refund, penalty) split.
         let mut e = indexed(1_000_000).with_penalty_bps(250).unwrap();
         e.fund(ALICE, T0 + 1).unwrap();
-        let (refund, penalty, _) = e.crank_expired(BOB, EXPIRES_AT, None).unwrap();
+        let (refund, _, penalty, _) = e.crank_expired(BOB, EXPIRES_AT, None).unwrap();
         assert_eq!((refund, penalty), (975_000, 25_000));
         let event = last(&e);
         assert_eq!(event.kind, EscrowEventKind::ExpiredCranked);
@@ -7649,7 +7722,9 @@ mod event_tests {
     fn terminal_indexed(state: EscrowState) -> IndexedEscrow {
         let mut e = funded(1_000_000);
         match state {
-            EscrowState::Cancelled => e.cancel(ALICE, None, ALICE, T0 + 2).unwrap(),
+            EscrowState::Cancelled => {
+                e.cancel(ALICE, None, ALICE, T0 + 2).unwrap();
+            }
             EscrowState::Released => {
                 e.release(ALICE, 1_000_000, None, BOB, T0 + 2).unwrap();
             }
@@ -8214,7 +8289,10 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(59), Some(EscrowEventKind::ReleaseIntentAnnounced));
         assert_eq!(EscrowEventKind::from_discriminant(60), Some(EscrowEventKind::ReleaseIntentVetoed));
         assert_eq!(EscrowEventKind::from_discriminant(61), Some(EscrowEventKind::EscrowsMerged));
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        // AV-148: discriminant 76, appended after EscrowsNetted —
+        // 0–75 stay stable for already-serialized histories.
+        assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -8317,7 +8395,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -8854,7 +8932,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -8869,7 +8947,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -8881,7 +8959,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -8893,7 +8971,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -8905,7 +8983,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -8920,7 +8998,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -8935,7 +9013,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -8947,7 +9025,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -8959,7 +9037,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -8971,7 +9049,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -8983,7 +9061,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -8995,7 +9073,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -9007,7 +9085,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -9023,7 +9101,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]
@@ -9038,7 +9116,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(76), None);
+        assert_eq!(EscrowEventKind::from_discriminant(77), None);
     }
 
     #[test]

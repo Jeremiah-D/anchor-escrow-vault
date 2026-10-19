@@ -20,6 +20,14 @@
       "args": []
     },
     {
+      "name": "fund_taker",
+      "discriminator": [207, 221, 78, 199, 178, 209, 54, 197],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"}
+      ]
+    },
+    {
       "name": "release",
       "discriminator": [253, 249, 15, 206, 28, 127, 193, 241],
       "accounts": [],
@@ -1207,7 +1215,8 @@
           {"name": "arbiter_fee_flat", "type": {"option": "u64"}, "offset": 5942},
           {"name": "arbiter_fee_bps", "type": {"option": "u16"}, "offset": 5951},
           {"name": "terminal_at", "type": "u64", "offset": 5954},
-          {"name": "rent_sweep_grace_secs", "type": "u64", "offset": 5962}
+          {"name": "rent_sweep_grace_secs", "type": "u64", "offset": 5962},
+          {"name": "taker_locked", "type": "u64", "offset": 5970}
         ]
       }
     }

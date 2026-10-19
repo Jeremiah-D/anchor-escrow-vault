@@ -173,6 +173,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `top_up_rent(caller, lamports)` (AV-110) | any except `Closed` | unchanged (no state change) | **permissionless** — anyone may top up (the initializer, the taker, the keeper bot, or a stranger; no authority check, the caller only acts as the event actor); `Closed` is `InvalidStateTransition` (no account left to keep rent-exempt); `lamports == 0` is `InvalidRentTopUp` (code 170); deliberately *not* pause-gated (pausing freezes fund movement, not operational hygiene) and no reentrancy guard (no escrow funds move); accumulates `rent_topped_up_total` only — the state byte and the amount conservation identity are untouched (a top-up is pure lamport bookkeeping on the vault account); emits `RentToppedUp` (`from == to ==` the current state; the topped-up lamports ride the event's `rent_reclaimed` amount field) |
 | `initialize_funding_plan(total_amount, max_tranches)` (AV-111) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the cumulative funding target — must equal the escrow's declared `amount` (`AmountMismatch` otherwise) — and the tranche budget, at least 1 (`InvalidFundingPlan`, code 173, on zero); attaching the plan moves the deposit path from `fund` to `fund_tranche`) |
 | `fund_tranche(authority, tranche_amount, now)` (AV-111) | `Uninitialized` (non-dual-sig) / `Activated` / `Funded` | `Funded` (first tranche; later tranches re-enter `Funded`) | initializer or their FUND-scoped operator (AV-104); `now` <- clock sysvar (never a param); full check sequence — pause → reentrancy → FUND-scoped authority → plan presence (`InvalidFundingPlan`, code 173, when no plan is attached) → state → positive amount (`AmountMismatch` on zero) → AV-134 funding window (`AmountOutOfBounds`, code 197, when the tranche sits outside the configured bounds) → tranche budget (`FundingTranchesExhausted`, code 172, when spent) → overfund cap (`AmountMismatch`); each call accumulates `funded_total` and consumes one tranche slot; the first call anchors `fund_at` / the interest clock / the deadman clock exactly like `fund`; emits `TrancheFunded` (`from == to ==` the state after the call; no amount — the fold seeds the lockup with the deal size at `Funded`) |
+| `fund_taker(taker, amount, now)` (AV-148) | `Funded` (or `Activated` on a dual-sig escrow) | `Funded` (unchanged — additive funding on a live escrow) | taker only (a stranger or the initializer is `Unauthorized`; AV-104 delegation does not extend to the taker's leg); `now` <- clock sysvar (never a param); full check sequence — pause (`Paused`) → reentrancy (`ReentrantCall`) → taker authority → state (`InvalidStateTransition` unless `Funded`/`Activated`) → config (a milestone plan or subscription schedule refuses the counter-fund — `InvalidMilestones` / `InvalidSubscription`) → positive amount (`AmountMismatch` on zero or wrapping accumulate); each call accumulates `taker_locked` and touches the deadman clock; emits `TakerFunded` (discriminant 76; `from == to ==` the state after the call; no amount — the fold seeds the lockup with the bilateral total at `Funded`) |
 | `initialize_amount_bounds(min_amount, max_amount)` (AV-134) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; opt-in deposit guardrails — `min_amount > max_amount` is `InvalidAmountBounds`, code 196); once attached, `fund` and each `fund_tranche` deposit must sit inside the window (`AmountOutOfBounds`, code 197, otherwise); with no bounds configured both deposit paths keep their existing semantics |
 | `initialize_arbiter_fee(flat_lamports, fee_bps)` (AV-135) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; opt-in arbiter compensation — `fee_bps > 10_000` is `InvalidArbiterFee`, code 198); once attached, every dispute settlement (`resolve`, the panel settling vote, the AV-55 default judgment) deducts the fee from the taker's adjudicated share and routes it to the arbiter (deduction order: AV-17 protocol fee, AV-100 streaming fee, then the arbiter fee); with no fee configured the settlement paths keep their existing semantics |
 | `with_release_cooling(cooling_secs)` (AV-112) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; builder-style like the other `with_*` opt-ins); `cooling_secs = 0` means unconfigured — `release` is ungated, exactly like AV-21's grace-period convention |
@@ -5078,6 +5079,28 @@ terminal state; 0 = never terminal) and `rent_sweep_grace_secs` (u64,
 `initialize_rent_sweep_grace` instruction), `Uninitialized`-only like
 every other opt-in — reconfiguring a live escrow is
 `InvalidStateTransition`.
+
+## AV-148: bilateral taker counter-fund
+
+A new vault field (appended last, borsh order): `taker_locked` (u64,
+the taker's bilateral counter-fund accumulator; 0 until the taker
+posts collateral). The taker posts via `fund_taker(taker, amount)`
+— taker-only, `Funded` (or `Activated` on a dual-sig escrow),
+positive amounts only. Each call accumulates into `taker_locked`;
+the state byte does not move.
+
+**Bilateral settlement.** Releases draw from the merged lockup
+(`amount + taker_locked`), spending the initializer's leg first;
+the `released` counter accumulates the gross payout (fees still ride
+the existing path). `cancel` / `cancel_expired` refund each party
+from their own leg — the initializer reclaims `amount`, the taker
+reclaims `taker_locked` ("dual original-route refund"). The
+conservation invariant is `inflow == released + refunded +
+remaining` on the bilateral totals, covered by the model fuzz.
+
+**Layout growth.** `VAULT_SPACE` 5970 → **5978** (+8 bytes);
+`VAULT_SPACE_NO_QUORUM` 5480 → **5488**; mainnet rent-exempt minimum
+42,442,080 → **42,497,760** lamports ((128 + 5978) × 3480 × 2).
 
 Eligibility is `is_rent_sweep_eligible(now)`: terminal state, grace
 elapsed since `terminal_at`, not paused, no reentrancy lock, empty

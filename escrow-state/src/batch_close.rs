@@ -528,7 +528,9 @@ mod batch_close_tests {
         let mut ix = IndexedEscrow::initialize(ALICE, BOB, escrow.amount(), escrow.expires_at(), id, NOW - 3).unwrap();
         ix.fund(ALICE, NOW - 2).unwrap();
         match escrow.state() {
-            EscrowState::Cancelled => ix.cancel(ALICE, None, ALICE, NOW - 1).unwrap(),
+            EscrowState::Cancelled => {
+                ix.cancel(ALICE, None, ALICE, NOW - 1).unwrap();
+            }
             EscrowState::Released => {
                 ix.release(ALICE, escrow.amount(), None, BOB, NOW - 1)
                     .unwrap();

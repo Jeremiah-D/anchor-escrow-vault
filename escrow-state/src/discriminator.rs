@@ -1434,6 +1434,8 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     let terminal_at = c.u64_le()?;
     // AV-139: opt-in unclaimed-rent sweep grace period (0 = default).
     let rent_sweep_grace_secs = c.u64_le()?;
+    // AV-148: the taker's counter-fund (0 = never counter-funded).
+    let taker_locked = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1719,6 +1721,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // recorded.
         terminal_at,
         rent_sweep_grace_secs,
+        // AV-148: the taker's counter-fund — a decoded escrow carries
+        // the same locked leg the live one recorded.
+        taker_locked,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

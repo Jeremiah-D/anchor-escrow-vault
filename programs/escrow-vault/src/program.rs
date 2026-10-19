@@ -1834,6 +1834,45 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// The taker's bilateral counter-fund (AV-148; mirrors
+    /// `Escrow::fund_taker`). `Funded` (or `Activated` on a dual-sig
+    /// escrow) only: the taker posts `amount` lamports of collateral
+    /// alongside the initializer's deal-size deposit. Taker-only —
+    /// the signer must be the escrow's taker (a stranger or the
+    /// initializer is `Unauthorized`). Zero amounts are rejected;
+    /// the call accumulates into `taker_locked` and touches the
+    /// deadman clock; the state byte does not move.
+    pub fn fund_taker(ctx: Context<FundTaker>, amount: u64) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        escrow
+            .fund_taker(ctx.accounts.taker.key().to_bytes(), amount, now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The on-chain event carries no amount leg — the counter-fund
+        // is the fold's inflow leg, so the fold seeds the lockup with
+        // the bilateral total at `Funded` (the off-chain
+        // `IndexedEscrow` event carries `EventAmounts::none`, exactly
+        // like `Funded` itself).
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::TakerFunded,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.taker.key()),
+        );
+        Ok(())
+    }
+
     /// Opt in to a release cooling period (AV-112; mirrors
     /// `Escrow::with_release_cooling`). `Uninitialized` only, like the
     /// other `initialize_*` opt-ins: the window is fixed before any
@@ -6400,10 +6439,14 @@ pub struct Vault {
     /// AV-131: the contested lamport amount, persisted by `escalate`
     /// (mirrors `escrow_state`'s `disputed_amount`); `0` when the vault
     /// was never disputed, and never cleared afterwards — the audit
-    /// trail of how much was under arbitration. Layout position
-    /// matches `escrow_state::VAULT_FIELDS` (appended last, after
-    /// `dual_control_intent`).
+    /// trail of how much was under arbitration.
     pub disputed_amount: u64,
+    /// AV-148: the taker's bilateral counter-fund accumulator,
+    /// persisted by `fund_taker` (mirrors `escrow_state`'s
+    /// `taker_locked`); `0` until the taker posts collateral.
+    /// Layout position matches `escrow_state::VAULT_FIELDS`
+    /// (appended last, after `rent_sweep_grace_secs`).
+    pub taker_locked: u64,
 }
 
 /// Skeleton mirror of `escrow_state::DualControlIntent` (AV-130): the
@@ -7255,6 +7298,20 @@ pub struct Fund<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     pub initializer: Signer<'info>,
+}
+
+/// AV-148: the taker's bilateral counter-fund. The signer must be the
+/// escrow's taker (enforced by `Escrow::fund_taker`, not by an Anchor
+/// constraint — the skeleton mirrors the state machine's authority
+/// check).
+#[derive(Accounts)]
+pub struct FundTaker<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    pub taker: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the deadman clock touch
+    /// (never an instruction param).
+    pub clock: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
