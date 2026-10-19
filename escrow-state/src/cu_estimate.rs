@@ -82,6 +82,22 @@ pub const INSTRUCTION_CU_TABLE: &[(&str, u64, usize)] = &[
     ("cancel_expired", 10_000, 8),
     ("crank_expired", 10_000, 8),
     ("claim", 14_000, 8),
+    // AV-145: the batch-lifecycle instructions (AV-61 bundles) — the
+    // keeper's multi-bundle merge needs CU estimates for them.
+    // `initialize`: vault PDA creation + full state write, ranked
+    // with `claim`/`merge_escrows` (14_000). Data: 8 + amount(8) +
+    // expires_at(8) + keeper_bounty_pool(8) + keeper_bounty_per_crank(8).
+    ("initialize", 14_000, 40),
+    // `fund`: lamport/token inflow + state transition, ranked with
+    // `fund_tranche` (12_000). Data: 8 (no params).
+    ("fund", 12_000, 8),
+    // `release`: payout + AV-17/AV-100 fee math + state transition,
+    // ranked with `release_period` (16_000). Data: 8 + amount(8).
+    ("release", 16_000, 16),
+    // `release_payout_split` (AV-108): multi-recipient payout across
+    // the split table, ranked with `slash`/`pool_payout` (18_000).
+    // Data: 8 (no params — recipients ride remaining_accounts).
+    ("release_payout_split", 18_000, 8),
     // taker_amount:u64 + rationale_hash:Option<[u8; 32]> → 8 + 8 + 33.
     ("resolve", 22_000, 49),
     // taker_amount:u64 + rationale_hash:Option<[u8; 32]> → 8 + 8 + 33.
@@ -371,6 +387,11 @@ mod cu_estimate_tests {
             ("cancel_expired", 10_000),
             ("crank_expired", 10_000),
             ("claim", 14_000),
+            // AV-145: the batch-lifecycle instructions.
+            ("initialize", 14_000),
+            ("fund", 12_000),
+            ("release", 16_000),
+            ("release_payout_split", 18_000),
             ("resolve", 22_000),
             ("submit_panel_judgment", 18_000),
             ("release_period", 16_000),

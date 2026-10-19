@@ -4804,6 +4804,32 @@ other types from the snapshot point on, the `MaterializedView`
 into a fleet `FeeHistoryReport` (gappy vaults are listed in
 `skipped`, never silently partial).
 
+## Multi-bundle merge submission (AV-145)
+
+AV-61 packs one batch report into per-`(mint, caller)` execution
+bundles, but a keeper submitting a whole fleet would sign each bundle
+separately. `escrow-state/src/bundle_merge.rs` merges several
+`ExecutionBundle`s into `MergeSession`s — one multisig proposal / CLI
+signing session each:
+
+- Bundles sort by `(mint, caller)` (native-SOL first); actions keep
+  bundle order.
+- Every action gets an AV-88 compute-unit estimate; actions
+  accumulate into a session until the next action would exceed the
+  1.4M `CU_MAX_PER_TRANSACTION`, at which point a new session starts
+  — the automatic split. (This needed CU rows for the lifecycle
+  instructions — `initialize`/`fund`/`release`/`release_payout_split`
+  — added to `INSTRUCTION_CU_TABLE` with the AV-88 heuristic ranking.)
+- Each session builds one cross-bundle deduped ALT table (the
+  batch.rs AV-37 convention: non-signers, first-seen order, cap 256)
+  and remaps every action's `alt_index` into it.
+- `MergeSession::signable_messages` compiles every action into a
+  signable v0 message (base64, AV-71) against the merged table;
+  `to_json` / `to_json_with_messages` render the deterministic
+  submission packet carrying the merged bundle references.
+
+Dry-run by construction: the merge only reads its input.
+
 ## Keeper bounty for permissionless crank (AV-124)
 
 The AV-48 permissionless crank ("the cranker receives nothing") made

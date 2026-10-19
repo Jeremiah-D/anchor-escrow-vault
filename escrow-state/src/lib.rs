@@ -43,6 +43,15 @@ mod batch_close;
 // ALT tables, as deterministic multisig/CLI-ready JSON. Purely
 // additive and read-only (dry-run by construction).
 mod execution_bundle;
+// AV-145: keeper multi-bundle merge submission — pack several AV-61
+// execution bundles into multisig/CLI submission sessions with
+// cross-bundle ALT dedup (batch.rs convention), CU budgeting across
+// bundles (AV-88, auto-split past 1.4M), and deterministic JSON with
+// AV-71 signable messages. Pure logic, zero dependencies, dry-run.
+mod bundle_merge;
+pub use bundle_merge::{
+    merge_bundles, BundleRef, MergeError, MergeSession, MergedAction, MessageParams, SessionMessage,
+};
 // AV-71: signable transaction-message serialization — turn an execution
 // bundle's actions into real Solana legacy transaction messages
 // (discriminator + Borsh params + logical account metas, base64) that a
