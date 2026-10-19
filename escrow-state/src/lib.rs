@@ -97,6 +97,13 @@ mod templates;
 // AV-78: escrow aggregate statistics view — read-only fleet rollup
 // (per-state counts, amount histogram, escrow durations, locked totals)
 // for keeper/operator dashboards, with deterministic JSON export.
+// AV-143: named, versioned escrow template library (publish /
+// from_template / usage audit) built on the AV-72 composition
+// templates. Purely additive.
+mod template_library;
+pub use template_library::{
+    BlueprintPlan, EscrowBlueprint, LibraryError, TemplateLibrary,
+};
 // AV-142: off-chain maker credit scoring (sliding-window reputation,
 // fee-tier discounts via the AV-66 schedule, dispute-loss cooldown),
 // fed from the AV-138 EscrowIndex. Purely additive.

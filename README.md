@@ -4750,6 +4750,29 @@ auditors can verify exactly which parameters took effect. Like the AV-72
 templates, presets are client-side composition: the vault layout and the
 Anchor program are untouched.
 
+## Escrow template library (AV-143)
+
+AV-72 templates are one-shot composition helpers — not named, not
+stored, not versioned. `escrow-state/src/template_library.rs` is the
+registry on top of them: a `TemplateLibrary` where an
+`EscrowBlueprint` packs amount, mint, release plan (milestone
+tranches / subscription cadence / arbitrated dispute), timelocks,
+quorum, the AV-66 fee tier ladder, and the AV-13/AV-90 vesting
+curve under a name.
+
+`publish` validates the blueprint by instantiating a probe escrow
+(dummy parties — the validation is shape-based) and then stores it
+as the next immutable version (`version = count + 1`): the library
+can never hold a template `from_template` would fail to build.
+`from_template(name, version, initializer, taker, now)` — `version ==
+None` takes the latest — builds the AV-72 composition, applies the
+fee ladder and vesting through the state machine's own builders, and
+bumps the version's `use_count` / `last_used_at`. Instantiated escrows
+lock the blueprint's version: publishing v2 does not change escrows
+already created from v1. Every blueprint audits its creator,
+creation time, version, and use count, so operators can see which
+template versions are actually originating escrows.
+
 ## Keeper bounty for permissionless crank (AV-124)
 
 The AV-48 permissionless crank ("the cranker receives nothing") made
