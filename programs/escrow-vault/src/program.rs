@@ -1418,6 +1418,53 @@ pub mod escrow_vault {
         Ok((payout, fee))
     }
 
+    /// Pull one claimant's share of the locked funds (AV-149;
+    /// mirrors `Escrow::claim_share`). Only the claimant may call
+    /// this, and only for their own leg — `authority` must equal
+    /// `claimant` (`Unauthorized` otherwise), so one claimant cannot
+    /// pull another's share. `Funded` only (`InvalidStateTransition`
+    /// otherwise); the claimant must be on the roster
+    /// (`ClaimantNotInRoster`, code 209) and the leg unpulled
+    /// (`ClaimantAlreadyClaimed`, code 210). `now` comes from the
+    /// Solana clock sysvar (never an instruction param). Returns
+    /// `(claimant_payout, fee)` so the real build can size the
+    /// claimant's transfer and the protocol fee (AV-17). The leg's
+    /// gross is its share of the current locked remainder; the last
+    /// unclaimed leg takes the whole remainder (dust-absorbing), so
+    /// the final pull moves the escrow `Funded` -> `Released`.
+    pub fn claim_share(ctx: Context<ClaimShare>, claimant: [u8; 32]) -> Result<(u64, u64)> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        let (payout, fee) = escrow
+            .claim_share(
+                ctx.accounts.claimant.key().to_bytes(),
+                claimant,
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-31: settle via `cpi_settle_payout` — see `claim`: the
+        // payout leg goes to the claimant, the fee leg to the
+        // protocol fee account. `payout + fee` is the leg's gross.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::ShareClaimed,
+            from,
+            escrow.state() as u8,
+            payout + fee,
+            fee,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok((payout, fee))
+    }
+
     /// The taker declines the escrow before any claim (AV-122;
     /// mirrors `Escrow::decline_escrow`). Taker-only; `now` comes
     /// from the Solana clock sysvar (never an instruction param).
@@ -1603,6 +1650,34 @@ pub mod escrow_vault {
             .collect();
         let escrow = escrow
             .with_payout_split(&table)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
+    /// Declare the multi-taker claimant roster (AV-149; mirrors
+    /// `Escrow::with_claimants`). `Uninitialized` only, like
+    /// `initialize_payout_split`: the claimant set and the shares are
+    /// fixed before funds move. Takes 1–8 `(claimant, share_bps)`
+    /// legs; empty / over-8 / zero-address / zero-share /
+    /// duplicate-claimant / Σ != 10_000 bps input is
+    /// `InvalidClaimantShares` (code 211). The vault account already
+    /// reserves the full 275-byte roster tail (1-byte `Option`
+    /// discriminant + 274-byte roster region, zeroed when
+    /// unconfigured), so the table is written in place — no realloc
+    /// needed in the real build. Emits no event (pre-fund
+    /// configuration).
+    pub fn initialize_claimants(
+        ctx: Context<InitializeClaimants>,
+        shares: Vec<ClaimantShare>,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let table: Vec<([u8; 32], u16)> = shares
+            .iter()
+            .map(|s| (s.claimant, s.share_bps))
+            .collect();
+        let escrow = escrow
+            .with_claimants(&table)
             .map_err(|e| escrow_error(e))?;
         write_escrow(&mut ctx.accounts.vault, &escrow);
         Ok(())
@@ -6447,6 +6522,47 @@ pub struct Vault {
     /// Layout position matches `escrow_state::VAULT_FIELDS`
     /// (appended last, after `rent_sweep_grace_secs`).
     pub taker_locked: u64,
+    /// AV-149: the multi-taker claimant roster, persisted by
+    /// `initialize_claimants` (mirrors `escrow_state`'s
+    /// `claimants`); `None` on a plain bilateral escrow.
+    /// Layout position matches `escrow_state::VAULT_FIELDS`
+    /// (appended last, after `taker_locked`).
+    pub claimants: Option<Claimants>,
+}
+
+/// Skeleton mirror of `escrow_state::ClaimantRoster` (AV-149): the
+/// opt-in multi-taker pull roster — up to 8 (claimant, share_bps)
+/// legs, one bit per leg in the claimed bitmask. Serialized size is
+/// pinned by `escrow_state::CLAIMANT_ROSTER_LEN` (274 bytes: 1-byte
+/// live count + eight 32-byte claimant slots + eight 2-byte share
+/// slots + 1-byte claimed bitmask); on the vault it rides a 1-byte
+/// `Option` discriminant.
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, Debug, PartialEq, Eq,
+)]
+pub struct Claimants {
+    /// Number of live legs (1–8); `0` means no roster configured.
+    pub claimant_count: u8,
+    /// Fixed claimant slots; unused slots are zero-filled.
+    pub claimants: [[u8; 32]; 8],
+    /// Fixed share slots (basis points, Σ == 10_000); unused slots
+    /// are zero.
+    pub share_bps: [u16; 8],
+    /// Bit `i` set once `claimants[i]` pulled their share — the
+    /// replay guard.
+    pub claimed: u8,
+}
+
+/// Skeleton mirror of `escrow_state::ClaimantShare`: one
+/// (claimant, share_bps) leg of the `initialize_claimants` table.
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, Debug, PartialEq, Eq,
+)]
+pub struct ClaimantShare {
+    /// The leg's claimant (never the zero address).
+    pub claimant: [u8; 32],
+    /// The leg's share in basis points (never zero; Σ == 10_000).
+    pub share_bps: u16,
 }
 
 /// Skeleton mirror of `escrow_state::DualControlIntent` (AV-130): the
@@ -6968,6 +7084,10 @@ pub enum EscrowVaultEventKind {
     ExpiredCranked,
     Attested,
     Claimed,
+    /// AV-149: one claimant pulled their share
+    /// (`Escrow::claim_share`). Mirrors
+    /// `escrow_state::EscrowEventKind::ShareClaimed`.
+    ShareClaimed,
     Escalated,
     Resolved,
     MilestoneConfirmed,
@@ -7126,6 +7246,7 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         escrow_state::EscrowEventKind::ExpiredCranked => EscrowVaultEventKind::ExpiredCranked,
         escrow_state::EscrowEventKind::Attested => EscrowVaultEventKind::Attested,
         escrow_state::EscrowEventKind::Claimed => EscrowVaultEventKind::Claimed,
+        escrow_state::EscrowEventKind::ShareClaimed => EscrowVaultEventKind::ShareClaimed,
         escrow_state::EscrowEventKind::Escalated => EscrowVaultEventKind::Escalated,
         escrow_state::EscrowEventKind::Resolved => EscrowVaultEventKind::Resolved,
         escrow_state::EscrowEventKind::MilestoneConfirmed => {
@@ -8064,6 +8185,40 @@ pub struct ReleasePayoutSplit<'info> {
     pub clock: AccountInfo<'info>,
     /// CHECK: the vault's SPL token account (see `Release`). The real
     /// build funds the per-leg transfers from the vault's holdings;
+    /// unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
+}
+
+/// AV-149: accounts for `initialize_claimants` — same shape as
+/// `InitializePayoutSplit`: only the initializer declares the
+/// roster.
+#[derive(Accounts)]
+pub struct InitializeClaimants<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer declares the claimant roster; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized` (`InvalidStateTransition`). A malformed table
+    /// is `InvalidClaimantShares` (code 211).
+    pub initializer: Signer<'info>,
+}
+
+/// AV-149: accounts for `claim_share` — the claimant pulls their own
+/// leg. The signer must be the claiming claimant (enforced by
+/// `Escrow::claim_share`, not by an Anchor constraint — the skeleton
+/// mirrors the state machine's authority check, like `FundTaker`).
+#[derive(Accounts)]
+pub struct ClaimShare<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The claiming claimant — must match the `claimant` instruction
+    /// param (the state machine's authority check).
+    pub claimant: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the deadman clock touch
+    /// (never an instruction param).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Claim`). The real
+    /// build funds the claimant's transfer from the vault's holdings;
     /// unused on the native-SOL path.
     pub vault_token_account: AccountInfo<'info>,
 }

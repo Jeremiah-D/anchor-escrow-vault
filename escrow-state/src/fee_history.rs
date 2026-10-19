@@ -176,6 +176,9 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         | EscrowEventKind::EscrowsNetted => Some(FeeType::Release),
         // Vesting claims.
         EscrowEventKind::Claimed => Some(FeeType::Claim),
+        // AV-149: one claimant's leg fees like a vesting claim — the
+        // AV-17 protocol fee slices the leg's gross.
+        EscrowEventKind::ShareClaimed => Some(FeeType::Claim),
         // Dispute settlements — the fee slices the taker's share.
         EscrowEventKind::Resolved
         | EscrowEventKind::DefaultJudgment
@@ -814,6 +817,8 @@ mod fee_history_tests {
                 | EscrowEventKind::BasketReleased
                 | EscrowEventKind::EscrowsNetted => Some(FeeType::Release),
                 EscrowEventKind::Claimed => Some(FeeType::Claim),
+                // AV-149: one claimant's leg fees like a vesting claim.
+                EscrowEventKind::ShareClaimed => Some(FeeType::Claim),
                 EscrowEventKind::Resolved
                 | EscrowEventKind::DefaultJudgment
                 | EscrowEventKind::PanelResolved => Some(FeeType::Resolve),

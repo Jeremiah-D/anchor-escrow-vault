@@ -36,13 +36,13 @@
 //! the result.
 
 use super::{
-    sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, CounterOffer, CpiAllowlist,
+    sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, ClaimantRoster, CounterOffer, CpiAllowlist,
     DefaultJudgment, DualControlIntent, DutchAuction, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
     Delegation, FundingPlan, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, PayoutSplit, QuorumPolicy,
     SlashTerms, SlashLadder, SlashRung, SubscriptionSchedule, VestingCurve, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
-    APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, COUNTER_OFFER_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
+    APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, CLAIMANT_ROSTER_LEN, COUNTER_OFFER_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
     DELEGATION_LEN, DUAL_CONTROL_INTENT_LEN, DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
-    MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS,
+    MAX_CLAIMANTS, MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS,
     MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_RELEASE_SPLIT_RECIPIENTS, MAX_SLASH_LADDER_RUNGS, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
     MILESTONE_PLAN_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN,
     PAYOUT_DENYLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_LADDER_LEN, SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN,
@@ -1436,6 +1436,33 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     let rent_sweep_grace_secs = c.u64_le()?;
     // AV-148: the taker's counter-fund (0 = never counter-funded).
     let taker_locked = c.u64_le()?;
+    // AV-149: the multi-taker claimant roster — 1-byte `Option`
+    // discriminant + 1-byte live count + eight 32-byte claimant
+    // slots + eight 2-byte share slots + 1-byte claimed bitmask
+    // (zeroed when no roster is configured). Structural decode
+    // only — the table invariants are enforced by
+    // `ClaimantRoster::new`, not re-litigated here.
+    let claimants = if c.option_present("claimants")? {
+        let claimant_count = c.u8()?;
+        let mut roster_claimants = [[0u8; 32]; MAX_CLAIMANTS];
+        for claimant in roster_claimants.iter_mut() {
+            *claimant = c.pubkey()?;
+        }
+        let mut share_bps = [0u16; MAX_CLAIMANTS];
+        for bps in share_bps.iter_mut() {
+            *bps = c.u16_le()?;
+        }
+        let claimed = c.u8()?;
+        Some(ClaimantRoster {
+            claimant_count,
+            claimants: roster_claimants,
+            share_bps,
+            claimed,
+        })
+    } else {
+        c.skip(CLAIMANT_ROSTER_LEN)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1724,6 +1751,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-148: the taker's counter-fund — a decoded escrow carries
         // the same locked leg the live one recorded.
         taker_locked,
+        // AV-149: the multi-taker claimant roster — a decoded escrow
+        // carries the same roster and claimed bitmask the live one
+        // recorded.
+        claimants,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

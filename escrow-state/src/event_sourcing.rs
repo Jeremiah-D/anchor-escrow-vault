@@ -15,7 +15,8 @@
 //! semantics are decided, never silently zero):
 //!
 //! * Taker payouts (`Released`, `ReleasedSplit`, `Claimed`,
-//!   `MilestoneReleased`, `SubscriptionPeriodReleased`) book the
+//!   `ShareClaimed` (AV-149), `MilestoneReleased`,
+//!   `SubscriptionPeriodReleased`) book the
 //!   **gross** amount: the AV-17 protocol fee is an internal routing
 //!   slice of the gross (`payout` already includes it), matching the
 //!   state machine's `released` counter bit-for-bit.
@@ -246,6 +247,10 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // triple does not.
         | EscrowEventKind::DualControlConfirmed
         | EscrowEventKind::Claimed
+        // AV-149: one claimant's leg paid out — the per-leg
+        // `Claimed`; the leg's gross books as `released`, like the
+        // plain kind.
+        | EscrowEventKind::ShareClaimed
         | EscrowEventKind::MilestoneReleased
         | EscrowEventKind::SubscriptionPeriodReleased
         // AV-95b: one basket leg paid out to the taker — the per-leg
@@ -692,6 +697,8 @@ mod event_sourcing_tests {
                 // AV-130: a checker-approved release books like Released.
                 | EscrowEventKind::DualControlConfirmed
                 | EscrowEventKind::Claimed
+                // AV-149: the per-leg taker payout books like Released.
+                | EscrowEventKind::ShareClaimed
                 | EscrowEventKind::MilestoneReleased
                 | EscrowEventKind::SubscriptionPeriodReleased
                 // AV-95b: the per-leg taker payout books like Released.

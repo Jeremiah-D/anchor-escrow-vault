@@ -28,6 +28,22 @@
       ]
     },
     {
+      "name": "initialize_claimants",
+      "discriminator": [110, 22, 93, 158, 22, 20, 188, 6],
+      "accounts": [],
+      "args": [
+        {"name": "shares", "type": {"vec": {"defined": "ClaimantShare"}}}
+      ]
+    },
+    {
+      "name": "claim_share",
+      "discriminator": [42, 18, 161, 15, 129, 155, 240, 52],
+      "accounts": [],
+      "args": [
+        {"name": "claimant", "type": {"array": ["u8", 32]}}
+      ]
+    },
+    {
       "name": "release",
       "discriminator": [253, 249, 15, 206, 28, 127, 193, 241],
       "accounts": [],
@@ -1216,7 +1232,8 @@
           {"name": "arbiter_fee_bps", "type": {"option": "u16"}, "offset": 5951},
           {"name": "terminal_at", "type": "u64", "offset": 5954},
           {"name": "rent_sweep_grace_secs", "type": "u64", "offset": 5962},
-          {"name": "taker_locked", "type": "u64", "offset": 5970}
+          {"name": "taker_locked", "type": "u64", "offset": 5970},
+          {"name": "claimants", "type": {"option": {"defined": "ClaimantRoster"}}, "offset": 5978}
         ]
       }
     }
@@ -1462,6 +1479,16 @@
       }
     },
     {
+      "name": "ClaimantShare",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "claimant", "type": "publicKey", "offset": 0},
+          {"name": "share_bps", "type": "u16", "offset": 32}
+        ]
+      }
+    },
+    {
       "name": "FundingPlan",
       "type": {
         "kind": "struct",
@@ -1638,7 +1665,10 @@
     {"code": 205, "name": "BlindVoteMustReveal"},
     {"code": 206, "name": "SweepGraceNotElapsed"},
     {"code": 207, "name": "NettingIncompatible"},
-    {"code": 208, "name": "LegsCountMismatch"}
+    {"code": 208, "name": "LegsCountMismatch"},
+    {"code": 209, "name": "ClaimantNotInRoster"},
+    {"code": 210, "name": "ClaimantAlreadyClaimed"},
+    {"code": 211, "name": "InvalidClaimantShares"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
