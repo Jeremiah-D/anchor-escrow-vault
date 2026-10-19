@@ -501,7 +501,7 @@ mod batch_close_tests {
     fn cancelled(amount: u64, expires_at: u64) -> Escrow {
         let mut e = Escrow::initialize(ALICE, BOB, amount, expires_at).unwrap();
         e.fund(ALICE, NOW).unwrap();
-        e.cancel(ALICE, None, ALICE).unwrap();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         e
     }
@@ -568,7 +568,7 @@ mod batch_close_tests {
         // Item 0 names MALLORY as taker instead of BOB.
         let mut stranger = Escrow::initialize(ALICE, MALLORY, 1_000_000, FUTURE).unwrap();
         stranger.fund(ALICE, NOW).unwrap();
-        stranger.cancel(ALICE, None, ALICE).unwrap();
+        stranger.cancel(ALICE, None, ALICE, 0).unwrap();
         let mut vaults = vec![CloseWatchItem::new(stranger), CloseWatchItem::new(cancelled(1_000_000, FUTURE))];
         let report = close_vaults(&mut vaults, ALICE, BOB, &CloseVaultsFilter::any());
         // Item 0: Unauthorized, vault untouched.
@@ -632,7 +632,7 @@ mod batch_close_tests {
             .with_pause_authority(ALICE)
             .unwrap();
         paused.fund(ALICE, NOW).unwrap();
-        paused.cancel(ALICE, None, ALICE).unwrap();
+        paused.cancel(ALICE, None, ALICE, 0).unwrap();
         paused.pause(ALICE, None).unwrap();
         let mut vaults = vec![CloseWatchItem::new(paused), CloseWatchItem::new(cancelled(1_000_000, FUTURE))];
         let report = close_vaults(&mut vaults, ALICE, BOB, &CloseVaultsFilter::any());
@@ -800,7 +800,7 @@ mod batch_close_tests {
         // item 2 closes.
         let mut stranger = Escrow::initialize(ALICE, MALLORY, 1_000_000, FUTURE).unwrap();
         stranger.fund(ALICE, NOW).unwrap();
-        stranger.cancel(ALICE, None, ALICE).unwrap();
+        stranger.cancel(ALICE, None, ALICE, 0).unwrap();
         let mut vaults = vec![
             CloseWatchItem::new(stranger),
             CloseWatchItem::new(funded(2_000_000, FUTURE)),

@@ -2461,7 +2461,7 @@ mod snapshot_tests {
         const SLOT: u64 = 312_456_789;
         let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, VEST_END).unwrap();
         e.fund(ALICE, VEST_END - 3_600).unwrap();
-        e.cancel(ALICE, None, ALICE).unwrap();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
         let snap = e.snapshot(MID);
         let from_snap = snap.attestation_summary(SLOT).expect("known state");
         assert_eq!(from_snap, e.state_summary(SLOT));

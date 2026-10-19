@@ -540,7 +540,7 @@ impl Runner {
             ValidOp::Cancel => {
                 let refund = s.escrow.remaining_amount();
                 let to = s.escrow.refund_recipient();
-                Self::expect_ok(s.escrow.cancel(ALICE, s.mint, to), "cancel", ctx, idx);
+                Self::expect_ok(s.escrow.cancel(ALICE, s.mint, to, 0), "cancel", ctx, idx);
                 s.refunded += refund as u128;
             }
             ValidOp::CancelExpired(who) => {
@@ -636,7 +636,7 @@ impl Runner {
             if state == EscrowState::Funded {
                 cands.push(Probe {
                     name: "taker cancel",
-                    run: |s, _| s.escrow.cancel(BOB, s.mint, s.escrow.refund_recipient()),
+                    run: |s, _| s.escrow.cancel(BOB, s.mint, s.escrow.refund_recipient(), 0),
                     expected: EscrowError::Unauthorized,
                 });
                 if !eligible {

@@ -1430,6 +1430,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(2)?;
         None
     };
+    // AV-139: terminal-entry timestamp for the unclaimed-rent sweep.
+    let terminal_at = c.u64_le()?;
+    // AV-139: opt-in unclaimed-rent sweep grace period (0 = default).
+    let rent_sweep_grace_secs = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1710,6 +1714,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // escrow carries the same fee `with_arbiter_fee` recorded.
         arbiter_fee_flat,
         arbiter_fee_bps,
+        // AV-139: the terminal-entry timestamp and sweep grace — a
+        // decoded escrow carries the same sweep schedule the live one
+        // recorded.
+        terminal_at,
+        rent_sweep_grace_secs,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
@@ -1894,7 +1903,7 @@ mod discriminator_tests {
         let mut released = funded(1_000_000, EXPIRES_AT);
         released.release(ALICE, EXPIRES_AT + 1, 1_000_000, None, BOB).unwrap();
         let mut cancelled = funded(2_000_000, EXPIRES_AT);
-        cancelled.cancel(ALICE, None, ALICE).unwrap();
+        cancelled.cancel(ALICE, None, ALICE, 0).unwrap();
         for e in [released, cancelled] {
             let decoded = decode_vault_account(&account_bytes(&e)).unwrap();
             assert_eq!(decoded, e);

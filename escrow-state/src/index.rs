@@ -420,13 +420,13 @@ mod index_tests {
 
     fn cancelled(id: u8, expires_at: u64) -> WatchedEscrow {
         let mut w = funded(id, expires_at);
-        w.escrow.cancel(ALICE, None, ALICE).unwrap();
+        w.escrow.cancel(ALICE, None, ALICE, 0).unwrap();
         w
     }
 
     fn cancelled_with_mint(id: u8, expires_at: u64, mint: [u8; 32]) -> WatchedEscrow {
         let mut w = funded_with_mint(id, expires_at, mint);
-        w.escrow.cancel(ALICE, Some(mint), ALICE).unwrap();
+        w.escrow.cancel(ALICE, Some(mint), ALICE, 0).unwrap();
         w
     }
 

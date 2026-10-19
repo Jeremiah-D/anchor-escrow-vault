@@ -1052,6 +1052,20 @@
         {"name": "flat_lamports", "type": "u64"},
         {"name": "fee_bps", "type": "u16"}
       ]
+    },
+    {
+      "name": "initialize_rent_sweep_grace",
+      "discriminator": [218, 5, 125, 150, 92, 219, 236, 86],
+      "accounts": [],
+      "args": [
+        {"name": "grace_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "sweep_unclaimed_rent",
+      "discriminator": [73, 149, 99, 99, 73, 30, 169, 98],
+      "accounts": [],
+      "args": []
     }
   ],
   "accounts": [
@@ -1176,7 +1190,9 @@
           {"name": "min_funding_amount", "type": {"option": "u64"}, "offset": 5924},
           {"name": "max_funding_amount", "type": {"option": "u64"}, "offset": 5933},
           {"name": "arbiter_fee_flat", "type": {"option": "u64"}, "offset": 5942},
-          {"name": "arbiter_fee_bps", "type": {"option": "u16"}, "offset": 5951}
+          {"name": "arbiter_fee_bps", "type": {"option": "u16"}, "offset": 5951},
+          {"name": "terminal_at", "type": "u64", "offset": 5954},
+          {"name": "rent_sweep_grace_secs", "type": "u64", "offset": 5962}
         ]
       }
     }
@@ -1585,7 +1601,8 @@
     {"code": 202, "name": "BlindRevealWindowClosed"},
     {"code": 203, "name": "BlindCommitStale"},
     {"code": 204, "name": "BlindNoCommit"},
-    {"code": 205, "name": "BlindVoteMustReveal"}
+    {"code": 205, "name": "BlindVoteMustReveal"},
+    {"code": 206, "name": "SweepGraceNotElapsed"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

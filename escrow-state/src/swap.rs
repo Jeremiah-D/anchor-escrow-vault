@@ -248,16 +248,16 @@ pub fn cancel_swap(
     let mut dry_b = *b;
     dry_a.swap_link = None;
     dry_b.swap_link = None;
-    dry_a.cancel(auth_a, mint_a, refund_to_a)?;
-    dry_b.cancel(auth_b, mint_b, refund_to_b)?;
+    dry_a.cancel(auth_a, mint_a, refund_to_a, 0)?;
+    dry_b.cancel(auth_b, mint_b, refund_to_b, 0)?;
     // Phase 2 — real run with link take/restore (the link persists as
     // the audit trail).
     let link_a = a.swap_link.take();
-    let real_a = a.cancel(auth_a, mint_a, refund_to_a);
+    let real_a = a.cancel(auth_a, mint_a, refund_to_a, 0);
     a.swap_link = link_a;
     real_a?;
     let link_b = b.swap_link.take();
-    let real_b = b.cancel(auth_b, mint_b, refund_to_b);
+    let real_b = b.cancel(auth_b, mint_b, refund_to_b, 0);
     b.swap_link = link_b;
     real_b?;
     Ok(())
@@ -621,7 +621,7 @@ mod swap_tests {
             a.release_via_cpi(ALICE, T0, 1_000, None, BOB, 0, &cpi_invocation(), |_| Ok(1_000)),
             Err(EscrowError::SwapLinkActive)
         );
-        assert_eq!(a.cancel(ALICE, None, ALICE), Err(EscrowError::SwapLinkActive));
+        assert_eq!(a.cancel(ALICE, None, ALICE, 0), Err(EscrowError::SwapLinkActive));
         assert_eq!(
             a.cancel_partial(ALICE, 100, None, ALICE),
             Err(EscrowError::SwapLinkActive)

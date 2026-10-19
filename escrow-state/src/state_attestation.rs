@@ -420,7 +420,7 @@ mod state_attestation_tests {
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         e.release(ALICE, EXPIRES_AT - 100, 250_000, None, BOB).unwrap();
-        e.cancel(ALICE, None, ALICE).unwrap();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
         let s = e.state_summary(SLOT);
         assert_eq!(s.state, EscrowState::Cancelled as u8);
         assert_eq!(s.released, 250_000);

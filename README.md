@@ -4714,6 +4714,47 @@ Layout growth: the vault body grows from 5533 to 5545 bytes (+12: the
 reclamation from 39_456_240 to 39_539_760 lamports
 (`(128 + VAULT_SPACE) * 3480 * 2`).
 
+## Unclaimed-rent sweep (AV-139)
+
+The problem: a vault that settles into a terminal state (`Cancelled`,
+`Released`, `Settled`, `Split`, `Declined`) keeps its rent-exempt
+balance locked forever if nobody calls `close_vault` — the initializer
+may have lost their keys, or the rent simply isn't worth their time.
+The lamports sit idle, unusable by anyone, while the protocol could
+have recycled them into its treasury.
+
+AV-139 adds a permissionless sweep: after a configurable grace period
+(default 30 days) following the terminal transition, **anyone** may call
+`sweep_unclaimed_rent(caller, now)` to close the vault and send the
+rent-exempt lamports to the treasury. Only the rent moves — escrowed
+funds were already paid out or refunded by the terminal transition, and
+the sweep never touches them. The vault moves to `Closed`, the deepest
+terminal state.
+
+Two new vault fields (appended last, borsh order): `terminal_at` (u64,
+stamped from the clock sysvar on every transition into a closeable
+terminal state; 0 = never terminal) and `rent_sweep_grace_secs` (u64,
+0 = the 30-day default). The grace is configured via
+`with_rent_sweep_grace_secs(secs)` (or the
+`initialize_rent_sweep_grace` instruction), `Uninitialized`-only like
+every other opt-in — reconfiguring a live escrow is
+`InvalidStateTransition`.
+
+Eligibility is `is_rent_sweep_eligible(now)`: terminal state, grace
+elapsed since `terminal_at`, not paused, no reentrancy lock, empty
+pool (the AV-106 guard). A premature sweep is `SweepGraceNotElapsed`
+(code 206). The keeper gets a dry-run `scan_unclaimed_rent(watched,
+now)` report listing sweepable vaults sorted by `terminal_at`
+(oldest first), and the sweep emits the `RentSwept` indexer event
+(from = the terminal state, to = `Closed`, the swept lamports in
+`rent_reclaimed`).
+
+Layout growth: the vault body grows from 5946 to 5962 bytes (+16: the
+two u64 fields), `VAULT_SPACE_NO_QUORUM` from 5464 to 5480,
+`VAULT_SPACE` from 5954 to 5970, and the close-time rent reclamation
+from 42_330_720 to 42_442_080 lamports
+(`(128 + VAULT_SPACE) * 3480 * 2`).
+
 ### Local-validator integration stubs
 
 `tests/local_validator.rs` under `programs/escrow-vault/` holds Anchor

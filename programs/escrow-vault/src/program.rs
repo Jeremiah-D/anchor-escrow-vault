@@ -5599,6 +5599,51 @@ pub mod escrow_vault {
         write_escrow(&mut ctx.accounts.vault, &escrow);
         Ok(paid)
     }
+
+    /// AV-139: configure the unclaimed-rent sweep grace period.
+    /// Uninitialized only — the sweep schedule is fixed before any
+    /// funds move. `grace_secs == 0` selects the 30-day default.
+    pub fn initialize_rent_sweep_grace(
+        ctx: Context<InitializeRentSweepGrace>,
+        grace_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .with_rent_sweep_grace_secs(
+                ctx.accounts.initializer.key().to_bytes(),
+                grace_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
+    /// AV-139: permissionless sweep of unclaimed rent from a terminal
+    /// vault. The vault must sit in a closeable terminal state with
+    /// the sweep grace elapsed since `terminal_at`. Only the
+    /// rent-exempt lamports move (to `treasury` via the `close`
+    /// constraint); escrowed funds never move. The vault closes.
+    pub fn sweep_unclaimed_rent(ctx: Context<SweepUnclaimedRent>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        let now = Clock::get()?.unix_timestamp as u64;
+        let _rent = escrow
+            .sweep_unclaimed_rent(ctx.accounts.caller.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::RentSwept,
+            from,
+            escrow.state() as u8,
+            0,
+            0,
+            _rent,
+            now,
+            None,
+        );
+        Ok(())
+    }
 }
 
 // --- Account structs (skeleton: field layout finalized during real build) ---
@@ -8876,6 +8921,38 @@ pub struct CloseVault<'info> {
     /// asserts `initializer.key() == vault.initializer`.
     #[account(mut)]
     pub initializer: Signer<'info>,
+}
+
+/// AV-139: accounts for `initialize_rent_sweep_grace`.
+#[derive(Accounts)]
+pub struct InitializeRentSweepGrace<'info> {
+    /// The vault being configured (Uninitialized only).
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer configures the sweep schedule; the state
+    /// machine additionally checks authority (`Unauthorized`
+    /// otherwise). A constraint in the real build asserts
+    /// `initializer.key() == vault.initializer`.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-139: accounts for `sweep_unclaimed_rent`.
+#[derive(Accounts)]
+pub struct SweepUnclaimedRent<'info> {
+    /// The terminal vault being swept. The `close` constraint transfers
+    /// the account's lamports — the unclaimed rent-exempt deposit
+    /// (`escrow_state::vault_close_rent_reclaimed`) — to `treasury`
+    /// and zeroes the account. `close` implies `mut`.
+    #[account(mut, close = treasury)]
+    pub vault: Account<'info, Vault>,
+    /// Permissionless caller — anyone may sweep; no authority check
+    /// by design (the state machine checks only the terminal-state
+    /// and grace gates).
+    pub caller: Signer<'info>,
+    /// The rent destination. In the real build this is a
+    /// protocol-treasury account.
+    #[account(mut)]
+    pub treasury: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]

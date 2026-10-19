@@ -270,6 +270,10 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // event's `rent_reclaimed` field for indexers, never the
         // fund triple).
         | EscrowEventKind::RentToppedUp => (0, 0, 0),
+        // AV-139: a rent sweep moves no escrow funds (rent sits
+        // outside the lockup; the swept lamports ride the event's
+        // `rent_reclaimed` field for indexers, never the fund triple).
+        | EscrowEventKind::RentSwept => (0, 0, 0),
         // AV-111: a funding tranche is the fold seed's inflow leg —
         // the fold seeds the lockup with the deal size at `Funded`
         // (exactly like `Funded` itself), so the tranche carries no
@@ -733,6 +737,8 @@ mod event_sourcing_tests {
                 // AV-110: a rent top-up moves no escrow funds (rent
                 // sits outside the lockup).
                 | EscrowEventKind::RentToppedUp
+                // AV-139: a rent sweep moves no escrow funds.
+                | EscrowEventKind::RentSwept
                 // AV-111: a funding tranche is the fold seed's inflow
                 // leg — the fold seeds the lockup with the deal size
                 // at `Funded`, so the tranche books nothing.

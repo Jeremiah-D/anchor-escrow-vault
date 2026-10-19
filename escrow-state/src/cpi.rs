@@ -880,7 +880,7 @@ mod cpi_tests {
         // A cancelled escrow never produces a payout plan, even if the
         // amounts would otherwise reconcile.
         let mut e = funded_escrow(1_000_000);
-        e.cancel(key(1), None, key(1)).unwrap();
+        e.cancel(key(1), None, key(1), 0).unwrap();
         assert_eq!(
             payout_plan(PayoutKind::Release, &e, &payout_addrs_native(), 1_000_000, 0, None),
             Err(CpiError::UnexpectedState)
@@ -941,7 +941,7 @@ mod cpi_tests {
     #[test]
     fn cancel_plan_refunds_to_initializer() {
         let mut e = funded_escrow(1_000_000);
-        e.cancel(key(1), None, key(1)).unwrap();
+        e.cancel(key(1), None, key(1), 0).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         let addrs = RefundAddrs {
             source: key(10),
@@ -989,7 +989,7 @@ mod cpi_tests {
     #[test]
     fn refund_plan_rejects_tampered_totals_and_recipients() {
         let mut e = funded_escrow(1_000_000);
-        e.cancel(key(1), None, key(1)).unwrap();
+        e.cancel(key(1), None, key(1), 0).unwrap();
         let addrs = RefundAddrs {
             source: key(10),
             vault_authority: key(10),
@@ -1084,7 +1084,7 @@ mod cpi_tests {
         );
         // No switch configured: no heir to pin.
         let mut plain = funded_escrow(1_000_000);
-        plain.cancel(key(1), None, key(1)).unwrap();
+        plain.cancel(key(1), None, key(1), 0).unwrap();
         assert_eq!(
             refund_plan(RefundKind::DeadmanClaim, &plain, &addrs, 1_000_000, 0),
             Err(CpiError::RecipientMismatch)
@@ -1532,7 +1532,7 @@ mod cpi_tests {
             .with_transfer_hook(hook)
             .unwrap();
         e.fund(key(1), FUND_AT).unwrap();
-        e.cancel(key(1), Some(mint), key(1)).unwrap();
+        e.cancel(key(1), Some(mint), key(1), 0).unwrap();
         let mut raddrs = RefundAddrs {
             source: key(11),
             vault_authority: key(10),
@@ -1567,7 +1567,7 @@ mod cpi_tests {
         let bytes = crate::account_space_tests::encode_escrow(&e);
         assert_eq!(bytes.len(), crate::ESCROW_BODY_LEN);
         let hook_at =
-            crate::ESCROW_BODY_LEN - crate::ARBITER_FEE_TAIL_LEN - crate::DISPUTED_AMOUNT_TAIL_LEN - crate::AUTO_UNPAUSE_TAIL_LEN - crate::AMOUNT_BOUNDS_TAIL_LEN - crate::DUAL_CONTROL_TAIL_LEN - crate::TWAP_GATE_LEN - crate::REFUNDED_TAIL_LEN - crate::SLASH_LADDER_TAIL_LEN - crate::CLAIM_COOLDOWN_TAIL_LEN - crate::COUNTER_OFFER_TAIL_LEN - crate::RELEASE_INTENT_TAIL_LEN - crate::KEEPER_BOUNTY_TAIL_LEN - crate::DISPUTE_INTEREST_LEN - crate::PRICE_GATE_LEN - crate::PENALTY_ESCALATION_TAIL_LEN - crate::COMPOUND_INTEREST_TAIL_LEN - crate::SLOT_TIMELOCK_TAIL_LEN - crate::RELEASE_COOLING_TAIL_LEN - crate::FUNDING_TAIL_LEN - crate::RENT_TOP_UP_LEN - crate::DEADMAN_REGION_LEN - crate::PAYOUT_SPLIT_LEN - crate::INTEREST_REGION_LEN - crate::POOL_REGION_LEN - crate::SWAP_LINK_REGION_LEN - crate::APPEAL_BOND_REGION_LEN - crate::DELEGATION_REGION_LEN - crate::STREAMING_FEE_REGION_LEN - 33;
+            crate::ESCROW_BODY_LEN - crate::RENT_SWEEP_TAIL_LEN - crate::ARBITER_FEE_TAIL_LEN - crate::DISPUTED_AMOUNT_TAIL_LEN - crate::AUTO_UNPAUSE_TAIL_LEN - crate::AMOUNT_BOUNDS_TAIL_LEN - crate::DUAL_CONTROL_TAIL_LEN - crate::TWAP_GATE_LEN - crate::REFUNDED_TAIL_LEN - crate::SLASH_LADDER_TAIL_LEN - crate::CLAIM_COOLDOWN_TAIL_LEN - crate::COUNTER_OFFER_TAIL_LEN - crate::RELEASE_INTENT_TAIL_LEN - crate::KEEPER_BOUNTY_TAIL_LEN - crate::DISPUTE_INTEREST_LEN - crate::PRICE_GATE_LEN - crate::PENALTY_ESCALATION_TAIL_LEN - crate::COMPOUND_INTEREST_TAIL_LEN - crate::SLOT_TIMELOCK_TAIL_LEN - crate::RELEASE_COOLING_TAIL_LEN - crate::FUNDING_TAIL_LEN - crate::RENT_TOP_UP_LEN - crate::DEADMAN_REGION_LEN - crate::PAYOUT_SPLIT_LEN - crate::INTEREST_REGION_LEN - crate::POOL_REGION_LEN - crate::SWAP_LINK_REGION_LEN - crate::APPEAL_BOND_REGION_LEN - crate::DELEGATION_REGION_LEN - crate::STREAMING_FEE_REGION_LEN - 33;
         assert_eq!(bytes[hook_at], 1, "Some discriminant");
         assert_eq!(&bytes[hook_at + 1..hook_at + 33], &hook);
         // A hook-less escrow zero-fills the region.

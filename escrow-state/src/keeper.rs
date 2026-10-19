@@ -2910,7 +2910,7 @@ mod keeper_tests {
         let mut released = funded(AMOUNT, NEVER);
         released.release(ALICE, 1_750_000_000, AMOUNT, None, BOB).unwrap();
         let mut cancelled = funded(AMOUNT, NEVER);
-        cancelled.cancel(ALICE, None, ALICE).unwrap();
+        cancelled.cancel(ALICE, None, ALICE, 0).unwrap();
         let watched = [watch(ID1, uninit), watch(ID2, released), watch(ID3, cancelled)];
         let report = scan_keeper_actions(&watched, MID);
         assert!(report.is_empty());
@@ -4203,7 +4203,7 @@ mod close_keeper_tests {
 
     fn cancelled() -> Escrow {
         let mut e = funded(ALICE);
-        e.cancel(ALICE, None, ALICE).unwrap();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         e
     }
@@ -4339,7 +4339,7 @@ mod close_keeper_tests {
         // chain will accept. Each escrow's own initializer signs for
         // its vault.
         let mut e = funded(CAROL);
-        e.cancel(CAROL, None, CAROL).unwrap();
+        e.cancel(CAROL, None, CAROL, 0).unwrap();
         let carol_escrow = e;
         let watched = [watch(ID1, cancelled()), watch(ID2, carol_escrow)];
         let report = scan_closeable(&watched);
@@ -4422,7 +4422,7 @@ mod close_keeper_tests {
         // caller with a per-batch reclaimed total.
         let rent = vault_close_rent_reclaimed();
         let mut carol_cancelled = funded(CAROL);
-        carol_cancelled.cancel(CAROL, None, CAROL).unwrap();
+        carol_cancelled.cancel(CAROL, None, CAROL, 0).unwrap();
         let watched = [
             watch(ID1, cancelled()),      // ALICE
             watch(ID2, carol_cancelled),  // CAROL
@@ -4458,7 +4458,7 @@ mod close_keeper_tests {
         // appearance in the input, so a stable watch list gives a
         // stable sweep list.
         let mut carol_cancelled = funded(CAROL);
-        carol_cancelled.cancel(CAROL, None, CAROL).unwrap();
+        carol_cancelled.cancel(CAROL, None, CAROL, 0).unwrap();
         let watched = [watch(ID1, carol_cancelled), watch(ID2, cancelled())];
         let report = scan_closeable(&watched);
         assert_eq!(report.batches.len(), 2);
@@ -6091,6 +6091,88 @@ mod schema_migration_tests {
     }
 }
 
+/// A vault whose unclaimed rent is sweepable — the dry-run entry
+/// of [`scan_unclaimed_rent`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepableVault {
+    /// Caller-supplied 32-byte escrow identity (see
+    /// [`WatchedEscrow::escrow_id`]).
+    pub escrow_id: [u8; 32],
+    /// The terminal state the vault sits in (e.g. `Cancelled`).
+    pub state: EscrowState,
+    /// When the vault entered the terminal state (see
+    /// [`Escrow::terminal_at`]).
+    pub terminal_at: u64,
+    /// Seconds of grace remaining before the sweep becomes callable
+    /// (0 when already eligible — included for completeness; the
+    /// scan only lists eligible vaults).
+    pub grace_remaining_secs: u64,
+    /// The rent-exempt lamports a sweep would reclaim (see
+    /// [`crate::vault_close_rent_reclaimed`]).
+    pub rent_lamports: u64,
+}
+
+/// The read-only result of [`scan_unclaimed_rent`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnclaimedRentReport {
+    /// Every watched vault whose rent is currently sweepable, sorted
+    /// by `terminal_at` ascending (oldest terminal entry first — the
+    /// keeper sweeps the stalest rent first).
+    pub sweepable: Vec<SweepableVault>,
+    /// Total rent-exempt lamports across all sweepable vaults.
+    pub total_rent_lamports: u64,
+}
+
+/// Dry-run scan listing the watched vaults whose unclaimed rent is
+/// currently sweepable via
+/// [`Escrow::sweep_unclaimed_rent`](crate::Escrow::sweep_unclaimed_rent)
+/// (AV-139).
+///
+/// A vault is listed when [`Escrow::is_rent_sweep_eligible`] holds at
+/// `now`: the state is a closeable terminal state, the sweep grace
+/// period has elapsed since `terminal_at`, and the vault is not
+/// paused or reentrancy-locked (the sweep would fail its guards, so
+/// listing it would be noise).
+///
+/// Pure: reads `&Escrow` snapshots only — no mutation, no events, no
+/// clock. The keeper calls `sweep_unclaimed_rent` for each listed
+/// vault; the scan itself never sweeps.
+pub fn scan_unclaimed_rent(watched: &[WatchedEscrow], now: u64) -> UnclaimedRentReport {
+    let mut sweepable = Vec::new();
+    let mut total_rent_lamports = 0u64;
+    for w in watched {
+        let e = &w.escrow;
+        if !e.is_rent_sweep_eligible(now) {
+            continue;
+        }
+        // The sweep's own guards would reject a paused or
+        // reentrancy-locked vault — skip it here so the report only
+        // lists vaults the keeper can actually sweep now.
+        if e.is_paused() || e.is_reentrancy_locked() {
+            continue;
+        }
+        let grace = e.effective_rent_sweep_grace_secs();
+        let eligible_at = e.terminal_at().saturating_add(grace);
+        sweepable.push(SweepableVault {
+            escrow_id: w.escrow_id,
+            state: e.state(),
+            terminal_at: e.terminal_at(),
+            grace_remaining_secs: eligible_at.saturating_sub(now),
+            rent_lamports: crate::vault_close_rent_reclaimed(),
+        });
+        total_rent_lamports = total_rent_lamports.saturating_add(crate::vault_close_rent_reclaimed());
+    }
+    sweepable.sort_by(|a, b| {
+        a.terminal_at
+            .cmp(&b.terminal_at)
+            .then_with(|| a.escrow_id.cmp(&b.escrow_id))
+    });
+    UnclaimedRentReport {
+        sweepable,
+        total_rent_lamports,
+    }
+}
+
 #[cfg(test)]
 mod rent_health_tests {
     use super::*;
@@ -6272,7 +6354,7 @@ mod rent_health_tests {
         // closed — rent erosion there matters just as much as on a live
         // vault.
         let mut cancelled = funded();
-        cancelled.cancel(ALICE, None, ALICE).unwrap();
+        cancelled.cancel(ALICE, None, ALICE, 0).unwrap();
         let watched = [
             watch(ID1, cancelled, 0),
             watch(ID2, released(), 0),
@@ -6439,7 +6521,7 @@ mod stale_sweep_tests {
     fn cancelled(initializer: [u8; 32], expires_at: u64) -> Escrow {
         let mut e = Escrow::initialize(initializer, BOB, 1_000_000, expires_at).unwrap();
         e.fund(initializer, NOW).unwrap();
-        e.cancel(initializer, None, initializer).unwrap();
+        e.cancel(initializer, None, initializer, 0).unwrap();
         assert_eq!(e.state(), EscrowState::Cancelled);
         e
     }
@@ -6562,7 +6644,7 @@ mod stale_sweep_tests {
             .with_pause_authority(ALICE)
             .unwrap();
         p.fund(ALICE, NOW).unwrap();
-        p.cancel(ALICE, None, ALICE).unwrap();
+        p.cancel(ALICE, None, ALICE, 0).unwrap();
         p.pause(ALICE, None).unwrap();
         assert!(p.is_paused());
         let watched = [

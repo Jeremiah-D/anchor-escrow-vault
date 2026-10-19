@@ -907,7 +907,7 @@ mod batch_tests {
         e2.release(ALICE, NOW, AMOUNT, None, BOB).unwrap();
         assert_eq!(e2.state(), EscrowState::Released);
         let mut e3 = funded(AMOUNT);
-        e3.cancel(ALICE, None, ALICE).unwrap();
+        e3.cancel(ALICE, None, ALICE, 0).unwrap();
         let report = scan_batch_lifecycle(
             &[watch(ID1, Some(e)), watch(ID2, Some(e2)), watch(ID3, Some(e3))],
             NOW,

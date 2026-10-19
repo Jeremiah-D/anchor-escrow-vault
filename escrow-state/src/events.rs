@@ -906,6 +906,14 @@ pub enum EscrowEventKind {
     /// the `PanelJudgment` shape (`payout` = the revealed taker
     /// share). The actor is the revealing member.
     JudgmentRevealed,
+    /// AV-139: unclaimed rent swept from a terminal vault via
+    /// [`Escrow::sweep_unclaimed_rent`](crate::Escrow::sweep_unclaimed_rent).
+    /// `from` is the terminal state, `to` is `Closed`; amounts carry
+    /// the swept rent-exempt lamports in `rent_reclaimed`. The actor
+    /// is the sweeping caller (permissionless). Always emitted on
+    /// success: an ineligible vault is rejected, so there is no
+    /// no-op case.
+    RentSwept,
 }
 
 impl EscrowEventKind {
@@ -1086,6 +1094,10 @@ impl EscrowEventKind {
             // discriminants 0–72 stay stable for already-serialized
             // histories.
             73 => Self::JudgmentRevealed,
+            // AV-139: appended after JudgmentRevealed so
+            // discriminants 0–73 stay stable for already-serialized
+            // histories.
+            74 => Self::RentSwept,
             _ => return None,
         })
     }
@@ -1179,6 +1191,9 @@ impl EscrowEventKind {
             // histories.
             Self::JudgmentCommitted => "judgment_committed",
             Self::JudgmentRevealed => "judgment_revealed",
+            // AV-139: appended after judgment_revealed so the name
+            // table stays stable.
+            Self::RentSwept => "rent_swept",
         }
     }
 
@@ -1276,6 +1291,9 @@ impl EscrowEventKind {
             // histories.
             "judgment_committed" => Self::JudgmentCommitted,
             "judgment_revealed" => Self::JudgmentRevealed,
+            // AV-139: appended after judgment_revealed so the name
+            // table stays stable.
+            "rent_swept" => Self::RentSwept,
             _ => return None,
         })
     }
@@ -3309,7 +3327,7 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
-        let result = self.inner.cancel(authority, mint, refund_to);
+        let result = self.inner.cancel(authority, mint, refund_to, at);
         self.map_reentrant(result, at)?;
         let to = self.inner.state();
         let refund = self.inner.remaining_amount();
@@ -3572,7 +3590,7 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
-        let result = self.inner.cancel_basket(authority, mint);
+        let result = self.inner.cancel_basket(authority, mint, at);
         let refund = self.map_reentrant(result, at)?;
         let to = self.inner.state();
         self.push_event(
@@ -3683,7 +3701,7 @@ impl IndexedEscrow {
         let from = self.inner.state();
         // AV-36: see `fund` — a rejected reentrant entry emits
         // `ReentryRejected`.
-        let result = self.inner.cancel_basket_all(authority);
+        let result = self.inner.cancel_basket_all(authority, at);
         let settlement = self.map_reentrant(result, at)?;
         let to = self.inner.state();
         self.push_event(
@@ -5430,6 +5448,33 @@ impl IndexedEscrow {
             None,
             None,
             Some(authority),
+        );
+        Ok(rent)
+    }
+
+    /// Sweep unclaimed rent from a terminal vault (mirrors
+    /// [`Escrow::sweep_unclaimed_rent`](crate::Escrow::sweep_unclaimed_rent),
+    /// AV-139). Permissionless — the caller is recorded as the event
+    /// actor. Returns the swept rent-exempt lamports.
+    pub fn sweep_unclaimed_rent(
+        &mut self,
+        caller: [u8; 32],
+        at: u64,
+    ) -> Result<u64, EscrowError> {
+        let from = self.inner.state();
+        let result = self.inner.sweep_unclaimed_rent(caller, at);
+        let rent = self.map_reentrant(result, at)?;
+        self.push_event(
+            EscrowEventKind::RentSwept,
+            from,
+            self.inner.state(),
+            EventAmounts::close(rent),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(caller),
         );
         Ok(rent)
     }
@@ -7994,7 +8039,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(59), Some(EscrowEventKind::ReleaseIntentAnnounced));
         assert_eq!(EscrowEventKind::from_discriminant(60), Some(EscrowEventKind::ReleaseIntentVetoed));
         assert_eq!(EscrowEventKind::from_discriminant(61), Some(EscrowEventKind::EscrowsMerged));
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8097,7 +8142,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8634,7 +8679,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8649,7 +8694,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8661,7 +8706,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8673,7 +8718,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8685,7 +8730,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8700,7 +8745,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8715,7 +8760,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8727,7 +8772,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8739,7 +8784,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8751,7 +8796,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8763,7 +8808,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8775,7 +8820,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8787,7 +8832,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8803,7 +8848,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
@@ -8818,7 +8863,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(74), None);
+        assert_eq!(EscrowEventKind::from_discriminant(75), None);
     }
 
     #[test]
