@@ -4773,6 +4773,37 @@ already created from v1. Every blueprint audits its creator,
 creation time, version, and use count, so operators can see which
 template versions are actually originating escrows.
 
+## Protocol-fee revenue history (AV-144)
+
+Which fee types earned, on which vaults, on which days — the
+keeper/indexer revenue view. `escrow-state/src/fee_history.rs`
+defines `FeeHistoryView`, a fold cursor over one escrow's
+`IndexedEscrow` event stream that books every fee leg into
+per-(vault, day) totals split by `FeeType`: `release` (AV-17 bps on
+taker releases), `claim` (AV-17 bps on vesting claims), `resolve`
+(AV-17 bps on dispute settlements), `streaming` (AV-100, folded into
+the payout's `fee` leg and recovered per event as
+`fee - protocol_fee_for(gross)`), and `arbiter` (AV-135, the separate
+`arbiter_fee` leg on resolve-family settlements — never part of
+`fees_paid`).
+
+The per-kind classification (`fee_kind`) is exhaustive over
+`EscrowEventKind` — a future variant fails to compile until its fee
+semantics are decided, the `fund_delta` convention from
+`event_sourcing.rs`. Days are Unix days (`at / 86_400`, UTC) in a
+`BTreeMap`, so the deterministic JSON export
+(`FeeHistoryView::to_json`, hand-written per the keeper.rs
+convention) lists days ascending. `reconcile` cross-checks the fold
+against the state machine's counters
+(`release+claim+resolve+streaming == fees_paid()`,
+`streaming == streaming_fees_accrued()`) — bit-identical on a
+genesis replay. `from_snapshot` seeds the `streaming` base from the
+snapshot's sub-counter (the snapshot.rs pass-through) and counts the
+other types from the snapshot point on, the `MaterializedView`
+`refunded = 0` precedent. `scan_fee_history` rolls per-vault views
+into a fleet `FeeHistoryReport` (gappy vaults are listed in
+`skipped`, never silently partial).
+
 ## Keeper bounty for permissionless crank (AV-124)
 
 The AV-48 permissionless crank ("the cranker receives nothing") made

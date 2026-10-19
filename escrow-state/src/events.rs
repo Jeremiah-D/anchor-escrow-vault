@@ -2368,6 +2368,14 @@ impl IndexedEscrow {
         Ok(self)
     }
 
+    /// Opt in to a streaming fee on funded time (mirrors
+    /// [`Escrow::with_streaming_fee`], AV-100). Configuration: emits
+    /// no event.
+    pub fn with_streaming_fee(mut self, rate: u64) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_streaming_fee(rate)?;
+        Ok(self)
+    }
+
     /// Pin the protocol-fee destination (mirrors
     /// [`Escrow::with_fee_recipient`]). Configuration: emits no event.
     pub fn with_fee_recipient(mut self, recipient: [u8; 32]) -> Result<Self, EscrowError> {

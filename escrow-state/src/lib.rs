@@ -119,6 +119,16 @@ mod aggregate;
 // continuity (`GapInEventStream`) and snapshot-base + incremental
 // apply. Pure logic, zero dependencies.
 mod event_sourcing;
+// AV-144: keeper-side protocol-fee revenue history — fold an
+// EscrowEvent stream into per-(vault, day) fee totals split by fee
+// type (release / claim / resolve / streaming / arbiter), with a
+// deterministic JSON daily rollup and reconciliation against the
+// state machine's `fees_paid` / `streaming_fees_accrued` counters.
+// Pure logic, zero dependencies.
+mod fee_history;
+pub use fee_history::{
+    scan_fee_history, FeeHistoryReport, FeeHistoryView, FeeReconciliation, FeeType, FeeTypeTotals,
+};
 #[cfg(test)]
 mod idl_json;
 #[cfg(test)]
