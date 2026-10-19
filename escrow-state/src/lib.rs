@@ -97,6 +97,14 @@ mod templates;
 // AV-78: escrow aggregate statistics view — read-only fleet rollup
 // (per-state counts, amount histogram, escrow durations, locked totals)
 // for keeper/operator dashboards, with deterministic JSON export.
+// AV-142: off-chain maker credit scoring (sliding-window reputation,
+// fee-tier discounts via the AV-66 schedule, dispute-loss cooldown),
+// fed from the AV-138 EscrowIndex. Purely additive.
+mod maker_score;
+pub use maker_score::{
+    MakerOutcome, MakerScore, MakerScoreSnapshot, MakerScorebook, ELITE_SCORE, MAKER_COOLDOWN_SECS,
+    SCORE_WINDOW, TRUSTED_SCORE,
+};
 mod aggregate;
 // AV-94: event-sourced materialized fund view — fold an EscrowEvent
 // stream into the per-escrow (locked, released, refunded) triple plus

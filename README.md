@@ -2246,6 +2246,44 @@ failure instead of a silently pruned scan.
 Purely off-chain: snapshots only, no mutation of chain state, no
 events, no clock. `std` only, no new dependencies.
 
+## Maker credit scoring (AV-142)
+
+`escrow-state/src/maker_score.rs` keeps an off-chain credit score per
+escrow initializer (maker), aggregated in the keeper layer — the vault
+account is fixed-layout and cannot cheaply maintain per-maker
+history, so the score lives next to the AV-138 index, not on-chain.
+
+`MakerScorebook::record(maker, escrow_id, outcome, at)` scores one
+terminal escrow per maker (idempotent per escrow id, so re-feeding a
+watch list is harmless); each maker keeps a sliding window of the
+last 32 scored escrows (`SCORE_WINDOW`). The score is integer math,
+0–1000:
+
+```text
+score = (600*completed + 300*(total - dispute_lost) + 100*(total - cancelled)) / total
+```
+
+Completion dominates (600‰), a clean dispute record is next (300‰ —
+losing a dispute as maker is the strongest negative signal), and a
+cancellation-free history is the tiebreak (100‰). A maker with no
+history scores a neutral 500 and earns nothing: trust is earned, not
+granted.
+
+The score feeds the AV-66 protocol-fee schedule: 900+ earns two tier
+steps, 750+ earns one — `MakerScorebook::fee_tier_bps` drops the
+payout's rate down the schedule's rate-ranked ladder (cheapest live
+rate first), so a 900+ maker on a 250/100/25 bps ladder pays the 25
+bps floor where a newcomer on the 100 bps tier pays 100. A recorded
+dispute loss starts a 7-day cooldown (`MAKER_COOLDOWN_SECS`) with no
+discount, on top of the score penalty.
+
+`EscrowIndex::record_terminal_outcomes` feeds terminal escrows from
+the index (`Released` → completed, `Cancelled`/`Declined` →
+cancelled). `Settled` is deliberately *not* fed — a state snapshot
+does not record which side the arbiter favored, so the honest call is
+an explicit `record` at resolve time. `MakerScorebook::snapshot`
+returns a score-sorted leaderboard for operator dashboards.
+
 ## Keeper report signing (AV-101)
 
 Keeper reports are consumed by offline signers (multisig CLIs, keeper
