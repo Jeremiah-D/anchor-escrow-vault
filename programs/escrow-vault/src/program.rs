@@ -2289,6 +2289,92 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Net two opposite-direction escrow legs bilaterally (AV-140;
+    /// mirrors `Escrow::net_escrows`). Both vaults must be `Funded`
+    /// opposite-direction mirrors of the same counterparty pair
+    /// (`vault_a.initializer == vault_b.taker` and `vault_a.taker ==
+    /// vault_b.initializer`) with the same SPL mint binding
+    /// (`NettingIncompatible`, code 207, otherwise); either party
+    /// may net (`Unauthorized` for a stranger). The smaller leg
+    /// settles to `Released` with `released := amount` (zero-payout
+    /// netting — no transfer moves); the larger leg's `released`
+    /// grows by the netted amount (u128-checked) and its lockup
+    /// shrinks by the same, settling to `Released` too on an exact
+    /// mutual offset. Emits `EscrowsNetted` on the larger vault and
+    /// `Released` (zero payout) on the smaller vault, mirroring the
+    /// off-chain `IndexedEscrow` wrapper.
+    pub fn net_escrows(ctx: Context<NetEscrows>) -> Result<()> {
+        let mut vault_a = read_escrow(&ctx.accounts.vault_a);
+        let mut vault_b = read_escrow(&ctx.accounts.vault_b);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let authority = ctx.accounts.authority.key().to_bytes();
+        // Pin the larger leg before settlement (see the off-chain
+        // `IndexedEscrow::net_escrows`): after the call the smaller
+        // leg is Released and both remainders have moved, so the
+        // roles are no longer recoverable from post-state.
+        let a_locked = vault_a.remaining_amount();
+        let b_locked = vault_b.remaining_amount();
+        let a_from = vault_a.state() as u8;
+        let b_from = vault_b.state() as u8;
+        let settlement = vault_a
+            .net_escrows(&mut vault_b, authority)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault_a, &vault_a);
+        write_escrow(&mut ctx.accounts.vault_b, &vault_b);
+        // Route the two events to the larger / smaller vaults —
+        // same >= rule as the state machine, so the program and the
+        // off-chain wrapper always agree on which leg is larger.
+        let (larger, smaller, larger_from, larger_to, smaller_from) =
+            if a_locked >= b_locked {
+                (
+                    &ctx.accounts.vault_a,
+                    &ctx.accounts.vault_b,
+                    a_from,
+                    vault_a.state() as u8,
+                    b_from,
+                )
+            } else {
+                (
+                    &ctx.accounts.vault_b,
+                    &ctx.accounts.vault_a,
+                    b_from,
+                    vault_b.state() as u8,
+                    a_from,
+                )
+            };
+        emit_transition(
+            larger,
+            escrow_state::EscrowEventKind::EscrowsNetted,
+            larger_from,
+            larger_to,
+            settlement.netted,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.authority.key()),
+        );
+        emit_transition(
+            smaller,
+            escrow_state::EscrowEventKind::Released,
+            smaller_from,
+            escrow_state::EscrowState::Released as u8,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.authority.key()),
+        );
+        Ok(())
+    }
+
     /// Opt in to dispute arbitration (AV-14; mirrors
     /// `Escrow::with_arbiter`). `Uninitialized` only, like
     /// `initialize_quorum`: the arbiter's identity is fixed before funds
@@ -7994,6 +8080,30 @@ pub struct MergeEscrows<'info> {
     pub clock: AccountInfo<'info>,
 }
 
+/// AV-140: accounts for `net_escrows` — the two opposite-direction
+/// escrow legs, plus a party signer (either party may net) and the
+/// clock sysvar for the event timestamps.
+#[derive(Accounts)]
+pub struct NetEscrows<'info> {
+    /// One netting leg: settles to `Released` when it is the smaller
+    /// side, keeps the residual lockup otherwise.
+    #[account(mut)]
+    pub vault_a: Account<'info, Vault>,
+    /// The opposite-direction leg: `vault_a.initializer ==
+    /// vault_b.taker` and `vault_a.taker == vault_b.initializer`
+    /// (the state machine refuses anything else with
+    /// `NettingIncompatible`).
+    #[account(mut)]
+    pub vault_b: Account<'info, Vault>,
+    /// Either party may net — the state machine requires the signer
+    /// to be the initializer or taker of either leg (`Unauthorized`
+    /// for a stranger).
+    pub authority: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the event `at` timestamps
+    /// (never an instruction param).
+    pub clock: AccountInfo<'info>,
+}
+
 #[derive(Accounts)]
 pub struct Claim<'info> {
     #[account(mut)]
@@ -9507,6 +9617,10 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::MergeIncompatible => {
             error!(ErrorCode::MergeIncompatible)
         }
+        // AV-140: appended, never renumbered.
+        escrow_state::EscrowError::NettingIncompatible => {
+            error!(ErrorCode::NettingIncompatible)
+        }
         escrow_state::EscrowError::InvalidReleaseIntent => {
             error!(ErrorCode::InvalidReleaseIntent)
         }
@@ -9781,6 +9895,8 @@ pub enum ErrorCode {
     InvalidPriceGate,
     #[msg("Escrows incompatible for merge (AV-114): different parties, mismatched settlement terms, or an amount counter that would overflow")]
     MergeIncompatible,
+    #[msg("Escrows incompatible for bilateral netting (AV-140): not opposite-direction mirrors of the same counterparty pair, different SPL mint bindings, or the larger leg's released + netted would overflow u64")]
+    NettingIncompatible,
     #[msg("Invalid gasless-release intent (AV-123): release_via_intent with a signature that does not verify against the initializer key over the intent's canonical bytes, or a malformed signature")]
     InvalidReleaseIntent,
     #[msg("Gasless-release intent nonce reused (AV-123): release_via_intent with intent.nonce <= last_intent_nonce — a replayed intent")]

@@ -2700,6 +2700,15 @@ pub enum EscrowError {
     /// rent_sweep_grace_secs`. Never renumbered (see
     /// [`EscrowError::code`]).
     SweepGraceNotElapsed,
+    /// AV-140: [`Escrow::net_escrows`] refused — the two escrows are
+    /// not opposite-direction mirrors (their `(initializer, taker)`
+    /// pairs are not swapped), they are bound to different SPL mints,
+    /// or the larger side's `released + netted` would overflow `u64`
+    /// on accumulation. One code for all incompatibility modes: the
+    /// caller learns the netting was refused, never which check
+    /// tripped. Both escrows are untouched. Never renumbered (see
+    /// [`EscrowError::code`]).
+    NettingIncompatible,
 }
 
 impl EscrowError {
@@ -2851,6 +2860,8 @@ impl EscrowError {
             EscrowError::BlindVoteMustReveal => 205,
             // AV-139: appended, never renumbered.
             EscrowError::SweepGraceNotElapsed => 206,
+            // AV-140: appended, never renumbered.
+            EscrowError::NettingIncompatible => 207,
         }
     }
 
@@ -2984,6 +2995,8 @@ impl EscrowError {
             EscrowError::BlindVoteMustReveal,
             // AV-139: appended, never renumbered.
             EscrowError::SweepGraceNotElapsed,
+            // AV-140: appended, never renumbered.
+            EscrowError::NettingIncompatible,
         ]
     }
 }
@@ -5979,6 +5992,31 @@ impl SlotClock for StaticSlotClock {
     }
 }
 
+/// Bilateral netting settlement receipt (AV-140): the caller
+/// already knows the two escrow identities (they are the two
+/// arguments of [`Escrow::net_escrows`]), so the receipt carries
+/// only the amounts — the netted (offset) amount and both sides'
+/// post-netting counters, enough for an indexer or the Anchor
+/// handler to emit the settlement events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NettingSettlement {
+    /// The bilateral offset: `min(self_locked, other_locked)` —
+    /// the smaller leg's locked amount, extinguished on both
+    /// sides without any transfer.
+    pub netted: u64,
+    /// The larger leg's locked amount after subtracting `netted`.
+    /// `0` on an exact mutual offset — in that case the larger
+    /// leg settles to `Released` too.
+    pub larger_new_locked: u64,
+    /// The larger leg's `released` counter after the netting
+    /// (`old_released + netted`).
+    pub larger_new_released: u64,
+    /// The smaller leg's `released` counter after the netting
+    /// (`released := amount` — the netted-away obligation is
+    /// booked as released at zero payout).
+    pub smaller_released: u64,
+}
+
 impl Escrow {
     /// AV-75: the current schema version of the persisted vault layout
     /// (see `VAULT_FIELDS`). New vaults are born at this version;
@@ -7505,6 +7543,155 @@ impl Escrow {
         source.released = source.amount;
         source.state = EscrowState::Cancelled;
         Ok(())
+    }
+
+    /// Net two opposite-direction escrows bilaterally (AV-140):
+    /// payment clearing's netting, on escrow vaults. When A locks 1M
+    /// for B and B locks 700K for A, the two obligations offset —
+    /// 700K is netted away and only 300K of residual obligation
+    /// remains, so the vaults settle without the gross 1.7M ever
+    /// needing to cross chains twice.
+    ///
+    /// `self` and `other` must be opposite-direction legs of the same
+    /// counterparty pair: `self.initializer == other.taker` and
+    /// `self.taker == other.initializer` (a same-direction pair has
+    /// no counter-obligation to offset, so it is
+    /// [`EscrowError::NettingIncompatible`]).
+    ///
+    /// Check order — pause → authority → state → direction → mint —
+    /// mirrors [`Escrow::merge_escrows`]: a paused escrow fails fast
+    /// (`Paused`, both sides checked); either party may net — the
+    /// authority must be the initializer or taker of one of the two
+    /// legs (`Unauthorized` for a stranger, who cannot force-settle
+    /// anyone's escrows); both legs must be `Funded`
+    /// (`InvalidStateTransition` otherwise — `Disputed` is refused
+    /// with no carve-out: the offset extinguishes the *whole* locked
+    /// position, which the arbiter may still be adjudicating); a
+    /// direction mismatch or a mint mismatch is
+    /// [`EscrowError::NettingIncompatible`] (code 207).
+    ///
+    /// Netting math (u128-checked): `netted = min(self_locked,
+    /// other_locked)`. The smaller leg settles to `Released` with
+    /// `released := amount` ("released-into-netting" accounting — the
+    /// mirror of `merge_escrows`' "released-into-merge": the
+    /// netted-away obligation is booked as released at zero payout, no
+    /// transfer ever moves, so the per-escrow conservation identity
+    /// still holds). The larger leg's `released` grows by `netted`
+    /// (u128-checked — on plain escrows `released + locked <= amount`
+    /// makes an overflow unreachable, so the check is
+    /// defense-in-depth against future accounting extensions, never
+    /// a reachable path) and its lockup shrinks by `netted`; on an
+    /// exact mutual offset the larger leg's lockup hits zero and it
+    /// settles to `Released` too — both obligations extinguish with
+    /// no transfer.
+    ///
+    /// Conservation: `netted + larger_new_locked == old_locked` on
+    /// the larger leg, pinned by a `debug_assert` (the subtraction
+    /// construction makes it hold by construction; the assert guards
+    /// future refactors of the settlement math).
+    ///
+    /// The [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits
+    /// [`EscrowEventKind::EscrowsNetted`](crate::EscrowEventKind::EscrowsNetted)
+    /// on the larger leg and `Released` (zero payout — the offset
+    /// moved no funds, and the event stream records that honestly) on
+    /// the smaller leg.
+    pub fn net_escrows(
+        &mut self,
+        other: &mut Escrow,
+        authority: [u8; 32],
+    ) -> Result<NettingSettlement, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast, on
+        // both sides (netting out of a paused vault would bypass the
+        // pause's fund-freeze). Takes no `now`, so there is no
+        // AV-133 scheduled auto-recovery — exactly like
+        // `merge_escrows`.
+        self.require_not_paused()?;
+        other.require_not_paused()?;
+        // Either party may net. The check runs before the
+        // direction-swap check below, so the (initializer, taker) sets
+        // of both legs are accepted defensively — after the swap check
+        // the two sets coincide, making the four-way check
+        // belt-and-braces fail-closed.
+        if authority != self.initializer
+            && authority != self.taker
+            && authority != other.initializer
+            && authority != other.taker
+        {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            // Deliberately no AV-131-style Disputed carve-out: `release`
+            // may move the *undisputed remainder* of a disputed escrow,
+            // but netting extinguishes the *whole* locked position —
+            // including the contested pool the arbiter owns — so a
+            // disputed leg refuses outright.
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        match other.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Opposite-direction mirrors only: my initializer is your
+        // taker and vice versa. A same-direction pair (or a pair
+        // sharing only one party) has no counter-obligation to
+        // offset — refusing is fail-closed, never a silent merge.
+        if self.initializer != other.taker || self.taker != other.initializer {
+            return Err(EscrowError::NettingIncompatible);
+        }
+        // AV-16 convention: both legs must bind the same mint (or
+        // both be native-SOL) — offsetting SOL against an SPL
+        // obligation would be a bookkeeping lie.
+        if self.mint != other.mint {
+            return Err(EscrowError::NettingIncompatible);
+        }
+        let self_locked = self.remaining_amount();
+        let other_locked = other.remaining_amount();
+        // The offset is the smaller leg's whole lockup: it is fully
+        // extinguished, the larger leg keeps the residual.
+        let netted = self_locked.min(other_locked);
+        let (larger, smaller): (&mut Escrow, &mut Escrow) = if self_locked >= other_locked {
+            (&mut *self, &mut *other)
+        } else {
+            (&mut *other, &mut *self)
+        };
+        let larger_old_locked = larger.remaining_amount();
+        let larger_new_released = (larger.released as u128)
+            .checked_add(netted as u128)
+            .filter(|&s| s <= u64::MAX as u128)
+            .ok_or(EscrowError::NettingIncompatible)? as u64;
+        let larger_new_locked = larger_old_locked - netted;
+        // Conservation: the offset amount plus the surviving lockup
+        // must equal the pre-netting lockup on the larger leg. The
+        // subtraction makes this hold by construction — the assert
+        // pins it against future refactors of the settlement math
+        // (fail-closed on an invariant the callers' accounting
+        // depends on).
+        debug_assert_eq!(
+            netted + larger_new_locked,
+            larger_old_locked,
+            "netting broke the larger leg's locked-amount conservation identity"
+        );
+        larger.released = larger_new_released;
+        // The smaller leg's obligation is fully offset — it settles at
+        // zero with no transfer ("released-into-netting"
+        // accounting, the mirror of merge_escrows'
+        // "released-into-merge": the netted-away position is booked
+        // as released so the per-escrow inflow == locked + released
+        // + ... identity still holds on both sides).
+        smaller.released = smaller.amount;
+        smaller.state = EscrowState::Released;
+        // An exact mutual offset extinguishes the larger leg too — no
+        // residual obligation, no transfer, both vaults Released.
+        if larger_new_locked == 0 {
+            larger.state = EscrowState::Released;
+        }
+        Ok(NettingSettlement {
+            netted,
+            larger_new_locked,
+            larger_new_released,
+            smaller_released: smaller.amount,
+        })
     }
 
     /// Announce a release intent (AV-112): either party records that a
@@ -23590,6 +23777,17 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "no params; authority <- accounts.initializer (signer) — initializer-only (Unauthorized otherwise); accounts.vault is the surviving target, accounts.source_vault the absorbed source; a paused escrow fails fast (Paused, both sides); both Funded (InvalidStateTransition otherwise); same (initializer, taker) and identical vesting/vesting-curve/milestones/fee_bps/quorum/dual-sig/mint/timelock terms (MergeIncompatible, code 177, otherwise); u128-checked accumulation of amount/released/skipped/fees_paid (overflow is MergeIncompatible); expires_at becomes the earlier deadline; the source moves to Cancelled with released := amount; emits the EscrowsMerged indexer event on the target (from == to == Funded) and Cancelled on the source",
         },
         InstructionSpec {
+            // AV-140: bilateral netting. IDL:
+            // discriminator = sha256("global:net_escrows")[..8] =
+            // [0xbb, 0x6c, 0x1c, 0x20, 0x9b, 0xbc, 0xb5, 0x51] — the
+            // Anchor instruction discriminator for the net_escrows
+            // handler (pinned by the discriminator test below).
+            name: "net_escrows",
+            params: &[],
+            method: "Escrow::net_escrows",
+            input_mapping: "no params; authority <- accounts.authority (signer) — either party may net (the initializer or taker of either leg; a stranger is Unauthorized); accounts.vault_a / accounts.vault_b are the two opposite-direction legs; a paused escrow fails fast (Paused, both sides); both Funded (InvalidStateTransition otherwise — Disputed is refused outright, the contested pool is under arbitration); opposite-direction mirrors only (self.initializer == other.taker && self.taker == other.initializer) with identical mint bindings (NettingIncompatible, code 207, otherwise); netted = min(locked_a, locked_b); the smaller leg settles to Released with released := amount (zero-payout netting — no transfer moves); the larger leg's released += netted (u128-checked, overflow is NettingIncompatible) and its lockup drops by netted (netted + new_locked == old_locked conservation); an exact mutual offset settles the larger leg to Released too; emits the EscrowsNetted indexer event on the larger leg (from == to == Funded, the netted amount in the payout leg) and Released with a zero payout on the smaller leg; returns the NettingSettlement receipt (netted, larger_new_locked, larger_new_released, smaller_released)",
+        },
+        InstructionSpec {
             // AV-130: the dual-control (maker-checker) release opt-in.
             // IDL: sha256("global:initialize_dual_control")[..8] — the
             // Anchor instruction discriminator for the
@@ -23984,6 +24182,8 @@ pub(crate) mod anchor_idl_tests {
             // permissionless unclaimed-rent sweep.
             "Escrow::with_rent_sweep_grace_secs",
             "Escrow::sweep_unclaimed_rent",
+            // AV-140: bilateral netting of opposite-direction legs.
+            "Escrow::net_escrows",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -27358,6 +27558,12 @@ mod error_code_tests {
             EscrowError::SweepGraceNotElapsed,
             206,
             "sweep_unclaimed_rent on a terminal vault still inside its unclaimed-rent grace period (AV-139)",
+        ),
+        // AV-140: appended, never renumbered.
+        (
+            EscrowError::NettingIncompatible,
+            207,
+            "net_escrows on two escrows whose (initializer, taker) pairs are not swapped mirrors, whose SPL mints differ, or whose larger side's released + netted would overflow u64 (AV-140)",
         ),
     ];
 
@@ -34174,9 +34380,9 @@ mod funding_tranche_tests {
         assert_eq!(kind.name(), "tranche_funded");
         assert_eq!(EscrowEventKind::from_name("tranche_funded"), Some(kind));
         // AV-112 claims 59/60 next, AV-114 claims 61, AV-124 claims 67,
-        // AV-127 claims 68, AV-139 claims 74 (append-only, never
-        // renumbered).
-        assert_eq!(EscrowEventKind::from_discriminant(75), None);
+        // AV-127 claims 68, AV-139 claims 74, AV-140 claims 75
+        // (append-only, never renumbered).
+        assert_eq!(EscrowEventKind::from_discriminant(76), None);
     }
 
     #[test]
@@ -35828,6 +36034,344 @@ mod merge_escrows_tests {
             crate::EscrowEventKind::from_name("escrows_merged"),
             Some(kind)
         );
+    }
+}
+
+// ---------- AV-140: bilateral netting (net_escrows) ----------
+//
+// `net_escrows` nets two opposite-direction legs of the same
+// counterparty pair: the smaller leg's lockup is fully offset
+// (netted away at zero payout, leg settles to `Released`) and the
+// larger leg keeps the residual. Either party may authorize; a
+// stranger, a paused leg, a non-Funded leg, a same-direction pair,
+// or a mint mismatch all refuse (fail-closed). On an exact mutual
+// offset both legs settle to `Released` — no transfer ever moves.
+#[cfg(test)]
+mod netting_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer of leg A / taker of leg B
+    const BOB: [u8; 32] = [0xBB; 32]; // taker of leg A / initializer of leg B
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const CAROL: [u8; 32] = [0xDD; 32]; // third party
+    const T0: u64 = 1_700_000_000;
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn funded_leg(initializer: [u8; 32], taker: [u8; 32], amount: u64) -> Escrow {
+        let mut e = Escrow::initialize(initializer, taker, amount, EXPIRES_AT).unwrap();
+        e.fund(initializer, T0).unwrap();
+        e
+    }
+
+    /// Leg A locks `a_amount` for B, leg B locks `b_amount` for A —
+    /// the opposite-direction mirror pair netting consumes.
+    fn mirror_pair(a_amount: u64, b_amount: u64) -> (Escrow, Escrow) {
+        (
+            funded_leg(ALICE, BOB, a_amount),
+            funded_leg(BOB, ALICE, b_amount),
+        )
+    }
+
+    /// A funded leg whose pause authority was bound pre-fund (the
+    /// builder is Uninitialized-only), then paused.
+    fn paused_leg(initializer: [u8; 32], taker: [u8; 32], amount: u64) -> Escrow {
+        let mut e = Escrow::initialize(initializer, taker, amount, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(MALLORY)
+            .unwrap();
+        e.fund(initializer, T0).unwrap();
+        e.pause(MALLORY, None).unwrap();
+        e
+    }
+
+    #[test]
+    fn net_escrows_settles_smaller_and_reduces_larger() {
+        let (mut a, mut b) = mirror_pair(1_000_000, 700_000);
+        let s = a.net_escrows(&mut b, ALICE).unwrap();
+        // The offset is the smaller leg's whole lockup.
+        assert_eq!(s.netted, 700_000);
+        assert_eq!(s.larger_new_locked, 300_000);
+        assert_eq!(s.larger_new_released, 700_000);
+        assert_eq!(s.smaller_released, 700_000);
+        // Conservation on the receipt: netted + new_locked == old_locked.
+        assert_eq!(s.netted + s.larger_new_locked, 1_000_000);
+        // The smaller leg (B) settles to Released at zero payout —
+        // released := amount, no transfer moved.
+        assert_eq!(b.state(), EscrowState::Released);
+        assert_eq!(b.released_amount(), 700_000);
+        assert_eq!(b.remaining_amount(), 0);
+        // The larger leg (A) stays Funded with the residual lockup.
+        assert_eq!(a.state(), EscrowState::Funded);
+        assert_eq!(a.released_amount(), 700_000);
+        assert_eq!(a.remaining_amount(), 300_000);
+        // Per-leg conservation: released + locked == amount on both.
+        assert_eq!(a.released_amount() + a.remaining_amount(), 1_000_000);
+        assert_eq!(b.released_amount() + b.remaining_amount(), 700_000);
+    }
+
+    #[test]
+    fn net_escrows_accepts_either_party() {
+        // BOB is leg A's taker and leg B's initializer — either party
+        // may net, not just the initializer of the calling leg.
+        let (mut a, mut b) = mirror_pair(1_000_000, 700_000);
+        let s = a.net_escrows(&mut b, BOB).unwrap();
+        assert_eq!(s.netted, 700_000);
+        assert_eq!(b.state(), EscrowState::Released);
+        assert_eq!(a.remaining_amount(), 300_000);
+    }
+
+    #[test]
+    fn net_escrows_works_when_self_is_the_smaller_leg() {
+        // Roles are assigned by locked amounts, not by argument
+        // position: calling on the smaller leg still settles it and
+        // reduces the other.
+        let (mut a, mut b) = mirror_pair(700_000, 1_000_000);
+        let s = a.net_escrows(&mut b, BOB).unwrap();
+        assert_eq!(s.netted, 700_000);
+        assert_eq!(a.state(), EscrowState::Released);
+        assert_eq!(a.released_amount(), 700_000);
+        assert_eq!(b.state(), EscrowState::Funded);
+        assert_eq!(b.released_amount(), 700_000);
+        assert_eq!(b.remaining_amount(), 300_000);
+        assert_eq!(s.larger_new_locked, 300_000);
+    }
+
+    #[test]
+    fn net_escrows_equal_legs_settle_both_released() {
+        // Exact mutual offset: both obligations extinguish, no
+        // residual, no transfer — both vaults Released.
+        let (mut a, mut b) = mirror_pair(500_000, 500_000);
+        let s = a.net_escrows(&mut b, ALICE).unwrap();
+        assert_eq!(s.netted, 500_000);
+        assert_eq!(s.larger_new_locked, 0);
+        assert_eq!(s.larger_new_released, 500_000);
+        assert_eq!(s.smaller_released, 500_000);
+        assert_eq!(a.state(), EscrowState::Released);
+        assert_eq!(b.state(), EscrowState::Released);
+        assert_eq!(a.released_amount(), 500_000);
+        assert_eq!(b.released_amount(), 500_000);
+    }
+
+    #[test]
+    fn net_escrows_rejects_stranger() {
+        let (mut a, mut b) = mirror_pair(1_000_000, 700_000);
+        assert_eq!(
+            a.net_escrows(&mut b, MALLORY),
+            Err(EscrowError::Unauthorized)
+        );
+        // Untouched: a stranger cannot force-settle anyone's legs.
+        assert_eq!(a.state(), EscrowState::Funded);
+        assert_eq!(b.state(), EscrowState::Funded);
+        assert_eq!(a.released_amount(), 0);
+        assert_eq!(b.released_amount(), 0);
+    }
+
+    #[test]
+    fn net_escrows_rejects_same_direction_pair() {
+        // Two legs in the same direction have no counter-obligation
+        // to offset — fail-closed, never a silent consolidation.
+        let mut a = funded_leg(ALICE, BOB, 1_000_000);
+        let mut b = funded_leg(ALICE, BOB, 700_000);
+        assert_eq!(
+            a.net_escrows(&mut b, ALICE),
+            Err(EscrowError::NettingIncompatible)
+        );
+        assert_eq!(a.state(), EscrowState::Funded);
+        assert_eq!(b.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn net_escrows_rejects_half_mirror() {
+        // Only one side of the mirror matches: (ALICE→BOB) against
+        // (BOB→CAROL) — not the same counterparty pair.
+        let mut a = funded_leg(ALICE, BOB, 1_000_000);
+        let mut b = funded_leg(BOB, CAROL, 700_000);
+        assert_eq!(
+            a.net_escrows(&mut b, BOB),
+            Err(EscrowError::NettingIncompatible)
+        );
+    }
+
+    #[test]
+    fn net_escrows_rejects_paused_either_side() {
+        // Paused on the calling leg.
+        let mut pa = paused_leg(ALICE, BOB, 1_000_000);
+        let mut b = funded_leg(BOB, ALICE, 700_000);
+        assert_eq!(
+            pa.net_escrows(&mut b, ALICE),
+            Err(EscrowError::Paused)
+        );
+        // Paused on the counter leg.
+        let mut a = funded_leg(ALICE, BOB, 1_000_000);
+        let mut pb = paused_leg(BOB, ALICE, 700_000);
+        assert_eq!(
+            a.net_escrows(&mut pb, ALICE),
+            Err(EscrowError::Paused)
+        );
+        // Both untouched.
+        assert_eq!(pa.released_amount(), 0);
+        assert_eq!(pb.released_amount(), 0);
+    }
+
+    #[test]
+    fn net_escrows_rejects_disputed_leg() {
+        // No AV-131-style carve-out: the offset would extinguish the
+        // *whole* locked position, including the contested pool the
+        // arbiter owns — a disputed leg refuses outright.
+        let mut a = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(MALLORY)
+            .unwrap();
+        a.fund(ALICE, T0).unwrap();
+        let mut b = funded_leg(BOB, ALICE, 700_000);
+        a.escalate(ALICE, EXPIRES_AT - 1, a.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(a.state(), EscrowState::Disputed);
+        assert_eq!(
+            a.net_escrows(&mut b, ALICE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // The healthy leg is untouched by the refused netting.
+        assert_eq!(b.state(), EscrowState::Funded);
+        assert_eq!(b.released_amount(), 0);
+    }
+
+    #[test]
+    fn net_escrows_rejects_mint_mismatch() {
+        // Offsetting native SOL against an SPL obligation is a
+        // bookkeeping lie — the mint bindings must match (AV-16).
+        let mut a = funded_leg(ALICE, BOB, 1_000_000);
+        let mut b = Escrow::initialize(BOB, ALICE, 700_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint([0xD0; 32])
+            .unwrap();
+        b.fund(BOB, T0).unwrap();
+        assert_eq!(
+            a.net_escrows(&mut b, ALICE),
+            Err(EscrowError::NettingIncompatible)
+        );
+    }
+
+    #[test]
+    fn net_escrows_rejects_unfunded_leg() {
+        let (mut a, _) = mirror_pair(1_000_000, 700_000);
+        let mut unfunded = Escrow::initialize(BOB, ALICE, 700_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            a.net_escrows(&mut unfunded, ALICE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            unfunded.net_escrows(&mut a, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn netting_error_code_is_pinned() {
+        // AV-140: appended after SweepGraceNotElapsed — never renumbered.
+        assert_eq!(EscrowError::NettingIncompatible.code(), 207);
+        assert!(EscrowError::all().contains(&EscrowError::NettingIncompatible));
+    }
+
+    #[test]
+    fn net_escrows_discriminator_is_pinned() {
+        // IDL: sha256("global:net_escrows")[..8] — the Anchor
+        // instruction discriminator, pinned here and in the generated
+        // escrow_vault.json.
+        assert_eq!(
+            crate::discriminator::instruction_discriminator("net_escrows"),
+            [0xbb, 0x6c, 0x1c, 0x20, 0x9b, 0xbc, 0xb5, 0x51]
+        );
+        // And the INSTRUCTIONS table carries the spec.
+        let names: Vec<&&str> = crate::anchor_idl_tests::INSTRUCTIONS
+            .iter()
+            .map(|s| &s.name)
+            .collect();
+        assert!(names.contains(&&"net_escrows"));
+    }
+
+    #[test]
+    fn netting_event_discriminant_and_name_are_pinned() {
+        // AV-140: appended after RentSwept — discriminants 0–74 stay
+        // stable for already-serialized histories.
+        let kind = crate::EscrowEventKind::EscrowsNetted;
+        assert_eq!(kind.discriminant(), 75);
+        assert_eq!(kind.name(), "escrows_netted");
+        assert_eq!(
+            crate::EscrowEventKind::from_name("escrows_netted"),
+            Some(kind)
+        );
+        assert_eq!(crate::EscrowEventKind::from_discriminant(75), Some(kind));
+    }
+
+    #[test]
+    fn indexed_wrapper_emits_netted_and_released() {
+        use crate::events::IndexedEscrow;
+        let id_a = [0x01; 32];
+        let id_b = [0x02; 32];
+        let mut leg_a =
+            IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, id_a, T0)
+                .unwrap();
+        let mut leg_b =
+            IndexedEscrow::initialize(BOB, ALICE, 700_000, EXPIRES_AT, id_b, T0)
+                .unwrap();
+        leg_a.fund(ALICE, T0).unwrap();
+        leg_b.fund(BOB, T0).unwrap();
+        let settlement = leg_a.net_escrows(&mut leg_b, ALICE, T0 + 10).unwrap();
+        assert_eq!(settlement.netted, 700_000);
+        // The larger leg emits EscrowsNetted: from == to == Funded,
+        // the netted amount payout-shaped.
+        let netted = leg_a
+            .events()
+            .iter()
+            .find(|e| e.kind == crate::EscrowEventKind::EscrowsNetted)
+            .unwrap();
+        assert_eq!(netted.from, EscrowState::Funded);
+        assert_eq!(netted.to, EscrowState::Funded);
+        assert_eq!(netted.amounts.payout, 700_000);
+        // The smaller leg emits Released with a zero payout — the
+        // honest record that the offset moved no funds.
+        let released = leg_b
+            .events()
+            .iter()
+            .find(|e| e.kind == crate::EscrowEventKind::Released)
+            .unwrap();
+        assert_eq!(released.from, EscrowState::Funded);
+        assert_eq!(released.to, EscrowState::Released);
+        assert_eq!(released.amounts.payout, 0);
+    }
+
+    #[test]
+    fn indexed_wrapper_emits_released_on_both_legs_for_exact_offset() {
+        use crate::events::IndexedEscrow;
+        let id_a = [0x01; 32];
+        let id_b = [0x02; 32];
+        let mut leg_a =
+            IndexedEscrow::initialize(ALICE, BOB, 500_000, EXPIRES_AT, id_a, T0)
+                .unwrap();
+        let mut leg_b =
+            IndexedEscrow::initialize(BOB, ALICE, 500_000, EXPIRES_AT, id_b, T0)
+                .unwrap();
+        leg_a.fund(ALICE, T0).unwrap();
+        leg_b.fund(BOB, T0).unwrap();
+        leg_a.net_escrows(&mut leg_b, BOB, T0 + 10).unwrap();
+        // Exact mutual offset: the larger leg's EscrowsNetted lands on
+        // Released too — its obligation is fully extinguished.
+        let netted = leg_a
+            .events()
+            .iter()
+            .find(|e| e.kind == crate::EscrowEventKind::EscrowsNetted)
+            .unwrap();
+        assert_eq!(netted.from, EscrowState::Funded);
+        assert_eq!(netted.to, EscrowState::Released);
+        assert_eq!(netted.amounts.payout, 500_000);
+        let released = leg_b
+            .events()
+            .iter()
+            .find(|e| e.kind == crate::EscrowEventKind::Released)
+            .unwrap();
+        assert_eq!(released.to, EscrowState::Released);
+        assert_eq!(released.amounts.payout, 0);
     }
 }
 
@@ -47488,7 +48032,12 @@ mod event_history_tests {
             EscrowEventKind::from_discriminant(74),
             Some(EscrowEventKind::RentSwept)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(75), None);
+        // AV-140: the bilateral-netting event.
+        assert_eq!(
+            EscrowEventKind::from_discriminant(75),
+            Some(EscrowEventKind::EscrowsNetted)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(76), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -47638,9 +48187,10 @@ mod event_history_tests {
         // `DualControlConfirmed` (AV-130), 71 is
         // `DualControlCancelled` (AV-130), 72 is
         // `JudgmentCommitted` (AV-137), 73 is `JudgmentRevealed`
-        // (AV-137), 74 is `RentSwept` (AV-139); 75 is the first
+        // (AV-137), 74 is `RentSwept` (AV-139), 75 is
+        // `EscrowsNetted` (AV-140); 76 is the first
         // still-unknown byte.
-        for bad in [75u8, 76, 255] {
+        for bad in [76u8, 77, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -51005,7 +51555,10 @@ mod arbiter_panel_tests {
         // AV-139: the rent-sweep grace error.
         assert_eq!(EscrowError::SweepGraceNotElapsed.code(), 206);
         assert!(EscrowError::all().contains(&EscrowError::SweepGraceNotElapsed));
-        assert_eq!(EscrowError::all().len(), 107);
+        // AV-140: the bilateral-netting compatibility error.
+        assert_eq!(EscrowError::NettingIncompatible.code(), 207);
+        assert!(EscrowError::all().contains(&EscrowError::NettingIncompatible));
+        assert_eq!(EscrowError::all().len(), 108);
     }
 
     #[test]

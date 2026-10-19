@@ -1005,6 +1005,12 @@
       "args": []
     },
     {
+      "name": "net_escrows",
+      "discriminator": [187, 108, 28, 32, 155, 188, 181, 81],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "initialize_dual_control",
       "discriminator": [136, 210, 181, 255, 218, 150, 179, 66],
       "accounts": [],
@@ -1602,7 +1608,8 @@
     {"code": 203, "name": "BlindCommitStale"},
     {"code": 204, "name": "BlindNoCommit"},
     {"code": 205, "name": "BlindVoteMustReveal"},
-    {"code": 206, "name": "SweepGraceNotElapsed"}
+    {"code": 206, "name": "SweepGraceNotElapsed"},
+    {"code": 207, "name": "NettingIncompatible"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

@@ -32,6 +32,14 @@
 //! * `EscrowSplit` moves the Σ child amounts sideways (re-locked into
 //!   the children, each folding its own log under its derived id):
 //!   out of this escrow's `locked`, but neither a payout nor a refund.
+//! * Bilateral netting (`EscrowsNetted`, AV-140): the larger leg's
+//!   lockup shrank by the netted amount and booked it as released (a
+//!   zero-payout settlement — no transfer) — books exactly like
+//!   `Released`. The smaller leg's `Released` carries a zero payout
+//!   (the netting signature — no other transition can emit one); the
+//!   fold moves its whole remaining lockup sideways into `released`,
+//!   mirroring the state machine's `released := amount` bookkeeping
+//!   bit-for-bit.
 //! * Everything else books `(0, 0, 0)` — votes, governance, pauses,
 //!   disclosures, and the two summary events (`BundlePartiallyExecuted`
 //!   re-states already-booked tranche payouts; `VaultsBatchClosed`
@@ -243,7 +251,13 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // AV-95b: one basket leg paid out to the taker — the per-leg
         // `Released`; the leg's gross books as `released`, like the
         // plain kind.
-        | EscrowEventKind::BasketReleased => {
+        // AV-140: bilateral netting shrank the larger leg's lockup by
+        // the netted amount and booked it as released (a zero-payout
+        // settlement, no transfer) — the fold books it exactly like a
+        // taker payout, matching the state machine's `released +=
+        // netted` bit-for-bit.
+        | EscrowEventKind::BasketReleased
+        | EscrowEventKind::EscrowsNetted => {
             (amounts.payout, amounts.payout, 0)
         }
         // Initializer refunds. `Cancelled` refunds the remainder;
@@ -503,6 +517,22 @@ impl MaterializedView {
                     .triple
                     .locked
                     .saturating_add(event.amounts.payout);
+            // AV-140: the smaller leg's netting settlement — a
+            // `Released` with a zero payout is the netting signature
+            // (no other transition can emit one: `release` refuses
+            // amount 0 with `AmountMismatch`). The offset extinguished
+            // the leg's whole remaining lockup at zero payout, so the
+            // remaining lockup moves sideways into `released` — the
+            // fold mirror of the state machine's `released := amount`
+            // ("released-into-netting") bookkeeping, keeping
+            // `triple.released == escrow.released_amount()`
+            // bit-identical.
+            } else if event.kind == EscrowEventKind::Released
+                && event.amounts.payout == 0
+            {
+                let rest = self.triple.locked;
+                self.triple.locked = 0;
+                self.triple.released = self.triple.released.saturating_add(rest);
             } else {
                 self.triple.locked = self.triple.locked.saturating_sub(locked_dec);
             }
@@ -642,7 +672,7 @@ mod event_sourcing_tests {
         const FEE: u64 = 100;
         const REFUND: u64 = 700;
         const PENALTY: u64 = 50;
-        for d in 0..=73u8 {
+        for d in 0..=74u8 {
             let kind = EscrowEventKind::from_discriminant(d)
                 .unwrap_or_else(|| panic!("missing discriminant {d}"));
             let event = synth(kind, 0, PAYOUT, FEE, REFUND, PENALTY);
@@ -660,7 +690,11 @@ mod event_sourcing_tests {
                 | EscrowEventKind::MilestoneReleased
                 | EscrowEventKind::SubscriptionPeriodReleased
                 // AV-95b: the per-leg taker payout books like Released.
-                | EscrowEventKind::BasketReleased => (PAYOUT, PAYOUT, 0),
+                // AV-140: the larger leg's netting offset books like
+                // Released (lockup shrank by the netted amount,
+                // released grew by it).
+                | EscrowEventKind::BasketReleased
+                | EscrowEventKind::EscrowsNetted => (PAYOUT, PAYOUT, 0),
                 EscrowEventKind::Cancelled
                 | EscrowEventKind::PartiallyCancelled
                 // AV-95b: the per-leg refund books like Cancelled.
@@ -794,6 +828,43 @@ mod event_sourcing_tests {
                 locked: 0,
                 released: 0,
                 refunded: 400_000,
+            }
+        );
+    }
+
+    #[test]
+    fn fold_tracks_netting_offset_on_both_legs() {
+        // AV-140: the larger leg's `EscrowsNetted` shrinks `locked` by
+        // the netted amount and grows `released` by it (zero-payout
+        // settlement — no transfer). The smaller leg's `Released`
+        // carries a zero payout (the netting signature); the fold
+        // moves its whole remaining lockup sideways into `released`,
+        // mirroring the state machine's `released := amount`
+        // bookkeeping bit-for-bit.
+        let netted = synth(EscrowEventKind::EscrowsNetted, 0, 700_000, 0, 0, 0);
+        let view =
+            MaterializedView::replay(ID, 1_000_000, &[netted]).unwrap();
+        assert_eq!(
+            view.triple(),
+            FundsTriple {
+                locked: 300_000,
+                released: 700_000,
+                refunded: 0,
+            }
+        );
+        let settled = EscrowEvent {
+            kind: EscrowEventKind::Released,
+            to: EscrowState::Released,
+            ..synth(EscrowEventKind::Released, 0, 0, 0, 0, 0)
+        };
+        let view =
+            MaterializedView::replay(ID, 700_000, &[settled]).unwrap();
+        assert_eq!(
+            view.triple(),
+            FundsTriple {
+                locked: 0,
+                released: 700_000,
+                refunded: 0,
             }
         );
     }

@@ -1467,6 +1467,8 @@ program error per variant):
 | `BlindCommitStale` | 203 | `reveal_judgment` (AV-137) whose commit no longer matches the escrow's dispute snapshot — auto-invalidated |
 | `BlindNoCommit` | 204 | `reveal_judgment` (AV-137) with no active commitment from this member |
 | `BlindVoteMustReveal` | 205 | `submit_panel_judgment` on a blind-mode panel (AV-137) — direct votes are disabled, vote via commit + reveal |
+| `SweepGraceNotElapsed` | 206 | `sweep_unclaimed_rent` (AV-139) on a terminal vault still inside its unclaimed-rent grace period |
+| `NettingIncompatible` | 207 | `net_escrows` (AV-140) on two legs that are not opposite-direction mirrors of the same counterparty pair, with different SPL mint bindings, or whose larger leg's `released + netted` would overflow `u64` |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -4463,6 +4465,72 @@ initializer              vault A (1M)          vault B (500k)
    |                         | EscrowsMerged         |
    |                         |                       | Cancelled
    |                         |                       | (released := 500k)
+```
+
+## Bilateral netting (AV-140)
+
+The problem: two parties who trade repeatedly end up with
+opposite-direction escrows — Alice locks 1M for Bob on one leg,
+Bob locks 700K for Alice on the other. Settling each leg gross
+moves 1.7M across chains; payment clearing instead *nets* the
+mutual obligations: 700K offsets bilaterally and only the 300K
+residual ever needs to move. AV-140 adds `net_escrows` for exactly
+that: two `Funded` opposite-direction legs of the same
+counterparty pair net without any transfer.
+
+`net_escrows(other, authority)` accepts *either* party as
+authority (`Unauthorized` for a stranger — nobody force-settles
+anyone else's legs). Both legs must be `Funded`
+(`InvalidStateTransition` otherwise — `Disputed` is refused
+outright, with no carve-out: the offset extinguishes the *whole*
+locked position, including the contested pool the arbiter owns).
+The legs must be opposite-direction mirrors
+(`self.initializer == other.taker` and `self.taker ==
+other.initializer`) with identical SPL mint bindings, else
+`NettingIncompatible` (code 207). A paused leg fails fast
+(`Paused`, both sides checked).
+
+The netting math: `netted = min(locked_a, locked_b)`. The smaller
+leg settles to `Released` with `released := amount`
+("released-into-netting" accounting — the mirror of
+`merge_escrows`' "released-into-merge": the netted-away obligation
+is booked as released at zero payout, so the per-leg conservation
+identity still holds). The larger leg's `released` grows by
+`netted` (u128-checked — on plain escrows `released + locked <=
+amount` makes an overflow unreachable, so the check is
+defense-in-depth) and its lockup shrinks by the same, with
+`netted + new_locked == old_locked` pinned by a conservation
+assert. On an exact mutual offset the larger leg's lockup hits
+zero and it settles to `Released` too — both obligations
+extinguish with no transfer. The call returns a
+`NettingSettlement` receipt (`netted`, `larger_new_locked`,
+`larger_new_released`, `smaller_released`).
+
+The `IndexedEscrow` wrapper emits `EscrowsNetted` (75) on the
+larger leg (`from == to == Funded`, the netted amount in the
+payout leg — payout-shaped like the merged-in leg of
+`EscrowsMerged`) and `Released` on the smaller leg with a zero
+payout — the honest record that the offset moved no funds. The
+event-sourced fold books the larger leg exactly like a release
+and moves the smaller leg's whole remaining lockup sideways into
+`released`, so the materialized view stays bit-identical with the
+state machine on both legs. The Anchor skeleton gains the
+`net_escrows` handler (two vault accounts) plus the error mapping
+(code 207). No new persisted fields — the account layout is
+untouched.
+
+**Walkthrough — netting two opposite legs.** Alice funded
+1,000,000 for Bob; Bob funded 700,000 for Alice, same mint:
+
+```
+alice                  vault A (1M)          vault B (700k)
+   | net_escrows(B)        |                       |
+   |---------------------->|---------------------->|
+   |                       | locked = 300,000      |
+   |                       | EscrowsNetted (700k)  |
+   |                       |                       | Released
+   |                       |                       | (released := 700k,
+   |                       |                       |  zero payout)
 ```
 
 ## Basket escrow (AV-95)
