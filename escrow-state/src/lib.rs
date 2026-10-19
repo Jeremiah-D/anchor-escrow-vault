@@ -52,6 +52,17 @@ mod bundle_merge;
 pub use bundle_merge::{
     merge_bundles, BundleRef, MergeError, MergeSession, MergedAction, MessageParams, SessionMessage,
 };
+// AV-146: batch claim sweep — one keeper pass sweeping the `claim`
+// calls for many ready vesting vaults (`claim_many` semantics):
+// deterministic vault order, AV-88 CU budgeting with the AV-145
+// 1.4M auto-split, cross-vault ALT dedup (batch.rs convention),
+// per-vault swept/skipped/failed outcomes, deterministic JSON.
+// Pure logic, zero dependencies, dry-run by construction.
+mod claim_sweep;
+pub use claim_sweep::{
+    plan_claim_sweep, ClaimSweep, ClaimSweepAccount, ClaimSweepItem, ClaimSweepReport, VaultClaimResult,
+    VaultClaimOutcome, fail_reason, skip_reason,
+};
 // AV-71: signable transaction-message serialization — turn an execution
 // bundle's actions into real Solana legacy transaction messages
 // (discriminator + Borsh params + logical account metas, base64) that a

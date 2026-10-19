@@ -4830,6 +4830,41 @@ signing session each:
 
 Dry-run by construction: the merge only reads its input.
 
+## Batch claim sweep (AV-146)
+
+A keeper servicing a large vesting fleet needs one pass that sweeps
+every ready `claim` — not one bundle per vault. `plan_claim_sweep`
+(`escrow-state/src/claim_sweep.rs`) walks the same watch list as the
+AV-20 keeper scan and packs exactly the vaults the scan would list
+for `claim` (the `claim_action_for` single truth source — the sweep
+never lists a claim the scan would not) into sweeps:
+
+- Vaults sort by `escrow_id` (deterministic); each vault's claim
+  carries its AV-88 compute-unit estimate, and vaults accumulate into
+  a sweep until the next claim would exceed the 1.4M
+  `CU_MAX_PER_TRANSACTION` — then a new sweep starts (the AV-145
+  automatic split; a vault alone over budget keeps its own sweep,
+  flagged `over_budget`, never dropped).
+- Each sweep builds one cross-vault deduped ALT table (the batch.rs
+  AV-37 convention: non-signers, first-seen order, cap 256) and
+  remaps every item's `alt_index` into it.
+- Every watched vault appears in the report's `results`: `swept`
+  (with the `sweep_id`), `skipped` (machine-readable reason —
+  `no_vesting_schedule` / `milestone_plan_attached` /
+  `nothing_claimable` / `quorum_not_satisfied` / `timelock_locked`,
+  the keeper predicate's conjuncts in check order), or `failed`
+  (`cu_estimate_unavailable` — defensive per-vault isolation, the
+  AV-88 table covers every keeper instruction kind).
+- `ClaimSweepReport::to_json()` renders hand-serialized deterministic
+  JSON: per-sweep items (action, `estimated_cu`, instruction
+  accounts with `alt_index`), the merged `alt_table`, and the
+  per-vault results list sorted by `escrow_id`.
+
+Dry-run by construction: the plan only reads `&Escrow` snapshots —
+no events, no clock access beyond the caller-supplied `now`, nothing
+mutates. Amounts are as of the scan; the operator submits the sweeps,
+then re-scans.
+
 ## Keeper bounty for permissionless crank (AV-124)
 
 The AV-48 permissionless crank ("the cranker receives nothing") made

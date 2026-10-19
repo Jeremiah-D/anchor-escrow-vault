@@ -635,15 +635,12 @@ pub struct FundingProgress {
 }
 
 impl KeeperAction {
-    /// AV-88: heuristic compute-unit estimate for this keeper call —
-    /// the dry-run report's CU passthrough. The account count is the
-    /// canonical planned shape (`vault` + `authority` + `refund_to`
-    /// when the kind carries one + `mint` when set) — the same accounts
-    /// [`plan_execution`](super::execution_plan::plan_execution) would
-    /// stamp — and one signature is charged for the caller key (the
-    /// permissionless crank's zero key is substituted by the keeper's
-    /// own key at build time). A planning number, not a measured cost.
-    pub fn estimated_compute_units(&self) -> u64 {
+    /// AV-146: the [`Option`]-returning twin of
+    /// [`estimated_compute_units`](Self::estimated_compute_units) —
+    /// the batch claim sweep needs per-vault failure isolation
+    /// (the batch.rs AV-37 precedent), so a missing CU-table row
+    /// becomes a per-vault `failed` outcome instead of a panic.
+    pub(crate) fn estimated_compute_units_opt(&self) -> Option<u64> {
         let mut accounts = 2; // vault + authority
         if matches!(
             self.kind,
@@ -656,6 +653,18 @@ impl KeeperAction {
             accounts += 1;
         }
         super::cu_estimate::estimate_instruction_cu(self.kind.as_str(), accounts, 1)
+    }
+
+    /// AV-88: heuristic compute-unit estimate for this keeper call —
+    /// the dry-run report's CU passthrough. The account count is the
+    /// canonical planned shape (`vault` + `authority` + `refund_to`
+    /// when the kind carries one + `mint` when set) — the same accounts
+    /// [`plan_execution`](super::execution_plan::plan_execution) would
+    /// stamp — and one signature is charged for the caller key (the
+    /// permissionless crank's zero key is substituted by the keeper's
+    /// own key at build time). A planning number, not a measured cost.
+    pub fn estimated_compute_units(&self) -> u64 {
+        self.estimated_compute_units_opt()
             // The cost table covers every keeper instruction kind — the
             // cu_estimate tests pin that — so this is unreachable on
             // real scans; the expect guards a hand-built kind.
@@ -1225,6 +1234,73 @@ struct KeeperScanAcc {
 /// (AV-138) so the indexed scan shares the exact logic. Reads one watched
 /// snapshot; never mutates it. The two `continue`s of the original loop
 /// became early `return`s — one escrow per call, so they are equivalent.
+/// AV-146: the keeper's `claim` eligibility predicate — the single
+/// truth source shared by the scan ([`scan_one_keeper_escrow`]) and
+/// the batch claim sweep
+/// ([`plan_claim_sweep`](crate::plan_claim_sweep)), so the sweep
+/// lists exactly the claims the scan would list. The taker's pull
+/// path: vesting attached (or an AV-97 Dutch auction — the auction
+/// prices `claim` on its own descending curve), no milestone plan
+/// (the plan owns the release schedule and disables `claim`),
+/// something priced-but-unreleased, any configured quorum satisfied,
+/// and the timelock (AV-27) already unlocked — otherwise the call
+/// would fail and is not executable.
+pub(crate) fn claim_eligible(e: &Escrow, now: u64) -> bool {
+    (e.vesting_schedule().is_some() || e.auction().is_some())
+        && e.milestone_plan().is_none()
+        && e.claimable_amount(now) > 0
+        && e.quorum().map(|q| q.is_satisfied()).unwrap_or(true)
+        && e.is_unlock_eligible(now)
+}
+
+/// AV-146: build the keeper `claim` action for one watch entry —
+/// `None` when [`claim_eligible`] fails. The scan and the batch
+/// claim sweep share this builder, so the sweep's per-vault action
+/// is exactly the action the scan lists.
+pub(crate) fn claim_action_for(w: &WatchedEscrow, now: u64) -> Option<KeeperAction> {
+    let e = &w.escrow;
+    if !claim_eligible(e, now) {
+        return None;
+    }
+    Some(KeeperAction {
+        escrow_id: w.escrow_id,
+        vault_address: w.vault_address(),
+        kind: KeeperActionKind::Claim,
+        caller: e.taker(),
+        caller_role: "taker",
+        mint: e.mint(),
+        // Claims pay the taker, not a refund: no refund
+        // destination applies.
+        refund_to: None,
+        amount: e.claimable_amount(now),
+        // AV-28: the report renders the amount in human units
+        // alongside the raw value.
+        decimals: e.decimals(),
+        // AV-53: the off-chain correlation id rides the action so
+        // the report JSON joins it to the operator's records.
+        reference: w.reference,
+        extension_count: e.extension_count(),
+        multisig_authority: e.multisig_authority,
+        evidence_disclosure: None,
+        funding_progress: None,
+        // AV-97: the auction window prices the claim, not a
+        // vesting curve — the reason tells the operator which
+        // pricing the amount came from.
+        reason: if e.auction().is_some() {
+            "auction_window_open"
+        } else {
+            "vesting_unlocked"
+        },
+        merge_source: None,
+        // AV-115: the penalty estimate is zero on non-cancel actions.
+        penalty_estimate: 0,
+        slot_unlock_at: slot_unlock_opt(e),
+        bounty_lamports: 0,
+        bounty_unprofitable: false,
+        arbiter_fee: None,
+    })
+}
+
 fn scan_one_keeper_escrow(w: &WatchedEscrow, now: u64, acc: &mut KeeperScanAcc) {
     let KeeperScanAcc {
         actions,
@@ -1575,56 +1651,11 @@ fn scan_one_keeper_escrow(w: &WatchedEscrow, now: u64, acc: &mut KeeperScanAcc) 
             arbiter_fee: None,
         });
     }
-    // The taker's pull path: vesting attached (or an AV-97 Dutch
-    // auction — the auction prices `claim` on its own descending
-    // curve), no milestone plan (the plan owns the release
-    // schedule and disables `claim`), something priced-but-unreleased,
-    // any configured quorum satisfied, and the timelock (AV-27)
-    // already unlocked — otherwise the call would fail and is not
-    // executable.
-    if (e.vesting_schedule().is_some() || e.auction().is_some())
-        && e.milestone_plan().is_none()
-        && e.claimable_amount(now) > 0
-        && e.quorum().map(|q| q.is_satisfied()).unwrap_or(true)
-        && e.is_unlock_eligible(now)
-    {
-        actions.push(KeeperAction {
-            escrow_id: w.escrow_id,
-            vault_address: w.vault_address(),
-            kind: KeeperActionKind::Claim,
-            caller: e.taker(),
-            caller_role: "taker",
-            mint: e.mint(),
-            // Claims pay the taker, not a refund: no refund
-            // destination applies.
-            refund_to: None,
-            amount: e.claimable_amount(now),
-            // AV-28: the report renders the amount in human units
-            // alongside the raw value.
-            decimals: e.decimals(),
-            // AV-53: the off-chain correlation id rides the action so
-            // the report JSON joins it to the operator's records.
-            reference: w.reference,
-            extension_count: e.extension_count(),
-            multisig_authority: e.multisig_authority,
-            evidence_disclosure: None,
-            funding_progress: None,
-            // AV-97: the auction window prices the claim, not a
-            // vesting curve — the reason tells the operator which
-            // pricing the amount came from.
-            reason: if e.auction().is_some() {
-                "auction_window_open"
-            } else {
-                "vesting_unlocked"
-            },
-            merge_source: None,
-            // AV-115: the penalty estimate is zero on non-cancel actions.
-            penalty_estimate: 0,
-            slot_unlock_at: slot_unlock_opt(e),
-            bounty_lamports: 0,
-            bounty_unprofitable: false,
-            arbiter_fee: None,
-        });
+    // AV-146: the taker's pull path now goes through
+    // `claim_action_for` — the batch claim sweep lists exactly
+    // these actions (single truth source).
+    if let Some(action) = claim_action_for(w, now) {
+        actions.push(action);
     }
     // AV-56: the initializer's push path for the next due
     // subscription period. An escrow may legitimately list both a
