@@ -4865,6 +4865,45 @@ no events, no clock access beyond the caller-supplied `now`, nothing
 mutates. Amounts are as of the scan; the operator submits the sweeps,
 then re-scans.
 
+## Keeper watchtower (AV-147)
+
+`scan_watchtower` (`escrow-state/src/watchtower.rs`) is the standing
+off-chain monitor over the fleet's `IndexedEscrow` vaults — one pass,
+three fleet-health alert classes for the conditions an operator pages
+on:
+
+- `expiry_soon`: a `Funded` vault whose deadline is inside the warning
+  window (`"warning"`; `"critical"` inside the tighter tier) — the
+  operator can still extend, release, or claim before the taker's
+  cancel window opens. No-timeout vaults (`expires_at == u64::MAX`)
+  and already-expired vaults never alert: the former have no
+  deadline, the latter are the AV-20 keeper scan's `cancel_expired`
+  territory.
+- `arbitration_pending`: a `Disputed` vault open longer than the
+  pending threshold — the arbiter or panel has not ruled.
+- `rent_unclaimed`: a terminal vault (the AV-34 `close_vault` gate:
+  `Cancelled` / `Released` / `Settled` / `Split` / `Declined`) whose
+  rent-exempt deposit has sat unclaimed longer than the threshold,
+  carrying the idle lamports (the same
+  `vault_close_rent_reclaimed()` figure the AV-40 close scan
+  reports). `Closed` vaults never alert (reclaimed); `Disputed`
+  vaults never alert (the arbitration is still live).
+
+This is the monitor, not the executor: the AV-136 expiry scan is the
+per-vault edge-triggered operator warning with its re-arm ledger and
+executable checklist; the AV-40/AV-139 scans plan the executable
+close/sweep calls. The watchtower only raises the alert and names the
+advisory remedy (`extend_expiry` / `resolve` / `close_vault`) — the
+operator picks the executable path. Thresholds are
+caller-configurable via `WatchtowerConfig` with conservative
+defaults (3-day expiry warning / 12-hour critical, 7-day
+arbitration-pending, 14-day rent-unclaimed); `validate()` fail-fasts
+on nonsense before any alert is evaluated. `WatchtowerReport::to_json()`
+renders hand-serialized deterministic JSON — alerts sorted by (kind,
+`escrow_id`) — so two scans of the same watch list at the same `now`
+are byte-identical. Dry-run by construction: pure reads, no events,
+no clock access beyond the caller-supplied `now`.
+
 ## Keeper bounty for permissionless crank (AV-124)
 
 The AV-48 permissionless crank ("the cranker receives nothing") made

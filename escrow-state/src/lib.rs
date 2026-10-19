@@ -321,6 +321,16 @@ pub use expiry_watch::{
     scan_expiry_warnings, scan_expiry_warnings_indexed, ExpiryWarning, ExpiryWarningLedger,
     ExpiryWarningReport, WatchAction,
 };
+// AV-147: keeper watchtower — the standing off-chain monitor scanning
+// IndexedEscrow vaults for expiry_soon / arbitration_pending /
+// rent_unclaimed fleet-health alerts (the monitor, not the executor:
+// the AV-136/AV-20/AV-40/AV-139 scans drive the per-vault response).
+// Purely additive and read-only (dry-run by construction).
+mod watchtower;
+pub use watchtower::{
+    scan_watchtower, WatchtowerAlert, WatchtowerAlertKind, WatchtowerConfig, WatchtowerConfigError,
+    WatchtowerReport,
+};
 // AV-138: off-chain multi-dimensional escrow index — a keeper's watch
 // list with incremental (state, mint, expires_at) inverted indexes, so
 // the keeper scans prune by dimension instead of walking the whole
