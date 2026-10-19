@@ -29,6 +29,7 @@
 //! order (the crate is dependency-free), so two scans of the same
 //! watch list at the same `now` produce byte-identical JSON.
 
+use crate::index::EscrowIndex;
 use crate::{Escrow, EscrowState, WatchedEscrow};
 use std::collections::HashSet;
 
@@ -223,6 +224,41 @@ pub fn scan_expiry_warnings(
         at: now,
         warn_window_secs,
         scanned: watched.len(),
+        warnings,
+    }
+}
+
+/// Indexed variant of [`scan_expiry_warnings`] (AV-138): reads only the
+/// `(now, now + warn_window_secs]` deadline range from a
+/// keeper-maintained [`EscrowIndex`] instead of testing every watched
+/// escrow's deadline, then trims to `Funded`/`Activated` exactly like the
+/// slice scan. Output is identical to [`scan_expiry_warnings`] for the
+/// same snapshots (see the `indexed_expiry_scan_matches_slice_scan`
+/// test); already-expired vaults stay the AV-20 `cancel_expired` scan's
+/// property and are never double-listed here either.
+pub fn scan_expiry_warnings_indexed(
+    index: &EscrowIndex,
+    now: u64,
+    warn_window_secs: u64,
+) -> ExpiryWarningReport {
+    debug_assert!(index.verify_consistency().is_ok());
+    let mut warnings = Vec::new();
+    for w in index.expiring_in(now, now.saturating_add(warn_window_secs)) {
+        let e = &w.escrow;
+        let state = match e.state() {
+            EscrowState::Funded => "Funded",
+            EscrowState::Activated => "Activated",
+            _ => continue,
+        };
+        warnings.push(build_warning(w.escrow_id, e, state, now));
+    }
+    warnings.sort_by(|a, b| {
+        (a.expires_at, a.escrow_id).cmp(&(b.expires_at, b.escrow_id))
+    });
+    ExpiryWarningReport {
+        at: now,
+        warn_window_secs,
+        scanned: index.len(),
         warnings,
     }
 }

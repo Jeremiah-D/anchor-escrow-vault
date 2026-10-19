@@ -189,9 +189,9 @@
 //! execution.
 
 use crate::{
-    aggregate::EscrowAggregateView, format_amount, vault_close_rent_reclaimed, Escrow, EscrowError,
-    EscrowState, IndexedEscrow, MultisigAuthority, SchemaFieldDelta, SignedReleaseIntent,
-    VaultDerivation,
+    aggregate::EscrowAggregateView, format_amount, index::EscrowIndex, vault_close_rent_reclaimed,
+    Escrow, EscrowError, EscrowState, IndexedEscrow, MultisigAuthority, SchemaFieldDelta,
+    SignedReleaseIntent, VaultDerivation,
 };
 use super::cpi::{AccountMeta, Pubkey};
 use super::discriminator::instruction_discriminator;
@@ -1208,139 +1208,109 @@ fn arbiter_fee_terms(e: &Escrow) -> Option<ArbiterFeeTerms> {
 /// caller `"anyone"`) alongside the party-signed `cancel_expired` — a
 /// third-party keeper sweeps with the crank, the initializer's own
 /// keeper with the party path.
-pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport {
-    let mut actions = Vec::new();
-    // AV-123: escrows carrying a signed, unsubmitted gasless-release
-    // intent — annotation only (see `IntentReleaseAnnotation`).
-    let mut intent_releases = Vec::new();
-    // AV-133: vaults with an armed scheduled auto-recovery — the exact
-    // recovery timestamp per vault (informational; the recovery fires
-    // inside the state machine, not via a keeper action).
-    let mut pending_auto_unpause = Vec::new();
-    // AV-134: vaults with a configured funding amount window — the
-    // floor and ceiling per vault (informational; the window gates
-    // the deposit path inside the state machine, not via a keeper
-    // action).
-    let mut funding_bounds = Vec::new();
-    // AV-106: fleet-wide insurance-pool lines — saturating sums over
-    // the scanned escrows.
-    let mut pool_balance = 0u64;
-    let mut pool_inflow = 0u64;
-    for w in watched {
-        let e = &w.escrow;
-        pool_balance = pool_balance.saturating_add(e.pool_paid());
-        pool_inflow = pool_inflow.saturating_add(e.pool_inflow());
-        // AV-133: record vaults with an armed auto-recovery schedule.
-        if e.is_paused() {
-            if let Some(t) = e.auto_unpause_at() {
-                pending_auto_unpause.push(PendingAutoUnpause {
-                    escrow_id: w.escrow_id,
-                    auto_unpause_at: t,
-                });
-            }
-        }
-        // AV-134: record vaults with a configured funding amount
-        // window.
-        if let Some((min, max)) = e.amount_bounds() {
-            funding_bounds.push(FundingBounds {
+/// Per-escrow accumulator for [`scan_keeper_actions`] (AV-138): the six
+/// collections the per-escrow pass builds. Extracted so the indexed scan
+/// ([`scan_keeper_actions_indexed`]) shares the exact per-escrow logic.
+#[derive(Default)]
+struct KeeperScanAcc {
+    actions: Vec<KeeperAction>,
+    intent_releases: Vec<IntentReleaseAnnotation>,
+    pending_auto_unpause: Vec<PendingAutoUnpause>,
+    funding_bounds: Vec<FundingBounds>,
+    pool_balance: u64,
+    pool_inflow: u64,
+}
+
+/// The per-escrow body of [`scan_keeper_actions`], extracted verbatim
+/// (AV-138) so the indexed scan shares the exact logic. Reads one watched
+/// snapshot; never mutates it. The two `continue`s of the original loop
+/// became early `return`s — one escrow per call, so they are equivalent.
+fn scan_one_keeper_escrow(w: &WatchedEscrow, now: u64, acc: &mut KeeperScanAcc) {
+    let KeeperScanAcc {
+        actions,
+        intent_releases,
+        pending_auto_unpause,
+        funding_bounds,
+        pool_balance,
+        pool_inflow,
+    } = acc;
+    let e = &w.escrow;
+    *pool_balance = pool_balance.saturating_add(e.pool_paid());
+    *pool_inflow = pool_inflow.saturating_add(e.pool_inflow());
+    // AV-133: record vaults with an armed auto-recovery schedule.
+    if e.is_paused() {
+        if let Some(t) = e.auto_unpause_at() {
+            pending_auto_unpause.push(PendingAutoUnpause {
                 escrow_id: w.escrow_id,
-                min_amount: min,
-                max_amount: max,
+                auto_unpause_at: t,
             });
         }
-        // AV-123: annotate escrows carrying a signed, unsubmitted
-        // gasless-release intent. The intent verifies against the
-        // escrow's initializer key and must carry a fresh nonce
-        // (`nonce > last_intent_nonce`) — an unverifiable or
-        // replayed intent is not annotated. The expiry slot is
-        // disclosed, not evaluated: the scan's clock is wall time,
-        // not slots (the `slot_unlock_opt` precedent), so the
-        // operator compares it against the chain tip before the
-        // relayer submits `release_via_intent`.
-        if let Some(signed) = w.pending_intent {
-            if signed.verify(&e.initializer())
-                && signed.intent.nonce > e.last_intent_nonce()
-            {
-                intent_releases.push(IntentReleaseAnnotation {
-                    escrow_id: w.escrow_id,
-                    nonce: signed.intent.nonce,
-                    expiry_slot: signed.intent.expiry_slot,
-                });
-            }
+    }
+    // AV-134: record vaults with a configured funding amount
+    // window.
+    if let Some((min, max)) = e.amount_bounds() {
+        funding_bounds.push(FundingBounds {
+            escrow_id: w.escrow_id,
+            min_amount: min,
+            max_amount: max,
+        });
+    }
+    // AV-123: annotate escrows carrying a signed, unsubmitted
+    // gasless-release intent. The intent verifies against the
+    // escrow's initializer key and must carry a fresh nonce
+    // (`nonce > last_intent_nonce`) — an unverifiable or
+    // replayed intent is not annotated. The expiry slot is
+    // disclosed, not evaluated: the scan's clock is wall time,
+    // not slots (the `slot_unlock_opt` precedent), so the
+    // operator compares it against the chain tip before the
+    // relayer submits `release_via_intent`.
+    if let Some(signed) = w.pending_intent {
+        if signed.verify(&e.initializer())
+            && signed.intent.nonce > e.last_intent_nonce()
+        {
+            intent_releases.push(IntentReleaseAnnotation {
+                escrow_id: w.escrow_id,
+                nonce: signed.intent.nonce,
+                expiry_slot: signed.intent.expiry_slot,
+            });
         }
-        // AV-38: a disputed escrow has exactly one keeper-executable
-        // call — the arbiter's `resolve`. The unilateral exits stay
-        // locked, so nothing else is listed; the taker/initializer split
-        // and the rationale-document commitment are the arbiter's
-        // judgment at call time, so the action carries the splittable
-        // pool rather than a decided split. An arbiter-less dispute
-        // (unreachable through the state machine, which requires an
-        // arbiter to escalate) lists nothing — no key could sign the
-        // call.
-        // AV-65: in panel mode the single-arbiter `resolve` is disabled
-        // (`PanelResolveDisabled`) — the panel's multisig judgment is
-        // the only settlement path. The scan lists one
-        // `submit_panel_judgment` action per panel member instead, so a
-        // member-operated keeper bot learns which disputes await its
-        // vote; the split and rationale are the member's call-time
-        // judgment, so the action carries the splittable pool rather
-        // than a decided split.
-        if e.state() == EscrowState::Disputed {
-            if let Some(panel) = e.arbiter_panel() {
-                let remaining = e.remaining_amount();
-                if remaining > 0 {
-                    for member in panel.members[..panel.n as usize].iter() {
-                        actions.push(KeeperAction {
-                            escrow_id: w.escrow_id,
-                            vault_address: w.vault_address(),
-                            kind: KeeperActionKind::PanelJudgment,
-                            caller: *member,
-                            caller_role: "panel_member",
-                            mint: e.mint(),
-                            // `submit_panel_judgment` splits the
-                            // remainder between the taker and the
-                            // initializer — no single refund
-                            // destination applies.
-                            refund_to: None,
-                            amount: remaining,
-                            decimals: e.decimals(),
-                            reference: w.reference,
-                            extension_count: e.extension_count(),
-                            multisig_authority: e.multisig_authority,
-                            evidence_disclosure: e.evidence_disclosure(),
-                            funding_progress: None,
-                            reason: "disputed",
-                            merge_source: None,
-                            // AV-115: the penalty estimate is zero on non-cancel actions.
-                            penalty_estimate: 0,
-                            slot_unlock_at: slot_unlock_opt(e),
-                            bounty_lamports: 0,
-                            bounty_unprofitable: false,
-                            // AV-135: the arbiter adjudication fee rides the dispute actions.
-                            arbiter_fee: arbiter_fee_terms(e),
-                        });
-                    }
-                }
-            } else if let Some(arbiter) = e.arbiter() {
-                let remaining = e.remaining_amount();
-                if remaining > 0 {
+    }
+    // AV-38: a disputed escrow has exactly one keeper-executable
+    // call — the arbiter's `resolve`. The unilateral exits stay
+    // locked, so nothing else is listed; the taker/initializer split
+    // and the rationale-document commitment are the arbiter's
+    // judgment at call time, so the action carries the splittable
+    // pool rather than a decided split. An arbiter-less dispute
+    // (unreachable through the state machine, which requires an
+    // arbiter to escalate) lists nothing — no key could sign the
+    // call.
+    // AV-65: in panel mode the single-arbiter `resolve` is disabled
+    // (`PanelResolveDisabled`) — the panel's multisig judgment is
+    // the only settlement path. The scan lists one
+    // `submit_panel_judgment` action per panel member instead, so a
+    // member-operated keeper bot learns which disputes await its
+    // vote; the split and rationale are the member's call-time
+    // judgment, so the action carries the splittable pool rather
+    // than a decided split.
+    if e.state() == EscrowState::Disputed {
+        if let Some(panel) = e.arbiter_panel() {
+            let remaining = e.remaining_amount();
+            if remaining > 0 {
+                for member in panel.members[..panel.n as usize].iter() {
                     actions.push(KeeperAction {
                         escrow_id: w.escrow_id,
                         vault_address: w.vault_address(),
-                        kind: KeeperActionKind::Resolve,
-                        caller: arbiter,
-                        caller_role: "arbiter",
+                        kind: KeeperActionKind::PanelJudgment,
+                        caller: *member,
+                        caller_role: "panel_member",
                         mint: e.mint(),
-                        // `resolve` splits the remainder between the
-                        // taker and the initializer — no single refund
+                        // `submit_panel_judgment` splits the
+                        // remainder between the taker and the
+                        // initializer — no single refund
                         // destination applies.
                         refund_to: None,
                         amount: remaining,
-                        // AV-28: the report renders the amount in human
-                        // units alongside the raw value.
                         decimals: e.decimals(),
-                        // AV-53: the off-chain correlation id rides the action so
-                        // the report JSON joins it to the operator's records.
                         reference: w.reference,
                         extension_count: e.extension_count(),
                         multisig_authority: e.multisig_authority,
@@ -1358,93 +1328,187 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                     });
                 }
             }
-            continue;
-        }
-        // AV-111: a tranched-funding escrow with an incomplete plan
-        // and a remaining tranche slot lists one `fund_tranche`
-        // action per scan — the initializer's keeper bot learns the
-        // next deposit is due, and `funding_progress` passes the live
-        // plan counters through to the operator's dashboard. The
-        // action is listed from `Uninitialized` (non-dual-sig),
-        // `Activated`, and `Funded` — exactly the states
-        // `fund_tranche` accepts — and withheld while paused, so a
-        // listed call is always executable.
-        if let Some(plan) = e.funding_plan() {
-            let tranche_open = e.state() == EscrowState::Funded
-                || e.state() == EscrowState::Activated
-                || (e.state() == EscrowState::Uninitialized && !e.dual_sig_required());
-            if tranche_open
-                && !e.is_paused()
-                && !e.is_funding_complete()
-                && plan.tranches_used() < plan.max_tranches()
-            {
-                let remaining = plan.total_amount().saturating_sub(e.funded_total());
-                if remaining > 0 {
-                    actions.push(KeeperAction {
-                        escrow_id: w.escrow_id,
-                        vault_address: w.vault_address(),
-                        kind: KeeperActionKind::FundTranche,
-                        caller: e.initializer(),
-                        caller_role: "initializer",
-                        mint: e.mint(),
-                        // A tranche is a deposit, not a refund — no
-                        // refund destination applies.
-                        refund_to: None,
-                        amount: remaining,
-                        decimals: e.decimals(),
-                        reference: w.reference,
-                        extension_count: e.extension_count(),
-                        multisig_authority: e.multisig_authority,
-                        evidence_disclosure: None,
-                        funding_progress: Some(FundingProgress {
-                            funded_total: e.funded_total(),
-                            total_amount: plan.total_amount(),
-                            tranches_used: plan.tranches_used(),
-                            max_tranches: plan.max_tranches(),
-                        }),
-                        reason: "funding_incomplete",
-                        merge_source: None,
-                        // AV-115: the penalty estimate is zero on non-cancel actions.
-                        penalty_estimate: 0,
-                        slot_unlock_at: slot_unlock_opt(e),
-                        bounty_lamports: 0,
-                        bounty_unprofitable: false,
-                        arbiter_fee: None,
-                    });
-                }
+        } else if let Some(arbiter) = e.arbiter() {
+            let remaining = e.remaining_amount();
+            if remaining > 0 {
+                actions.push(KeeperAction {
+                    escrow_id: w.escrow_id,
+                    vault_address: w.vault_address(),
+                    kind: KeeperActionKind::Resolve,
+                    caller: arbiter,
+                    caller_role: "arbiter",
+                    mint: e.mint(),
+                    // `resolve` splits the remainder between the
+                    // taker and the initializer — no single refund
+                    // destination applies.
+                    refund_to: None,
+                    amount: remaining,
+                    // AV-28: the report renders the amount in human
+                    // units alongside the raw value.
+                    decimals: e.decimals(),
+                    // AV-53: the off-chain correlation id rides the action so
+                    // the report JSON joins it to the operator's records.
+                    reference: w.reference,
+                    extension_count: e.extension_count(),
+                    multisig_authority: e.multisig_authority,
+                    evidence_disclosure: e.evidence_disclosure(),
+                    funding_progress: None,
+                    reason: "disputed",
+                    merge_source: None,
+                    // AV-115: the penalty estimate is zero on non-cancel actions.
+                    penalty_estimate: 0,
+                    slot_unlock_at: slot_unlock_opt(e),
+                    bounty_lamports: 0,
+                    bounty_unprofitable: false,
+                    // AV-135: the arbiter adjudication fee rides the dispute actions.
+                    arbiter_fee: arbiter_fee_terms(e),
+                });
             }
         }
-        // Only a live, funded escrow has keeper-executable exits:
-        // Uninitialized / Activated escrows are not funded yet, and the
-        // terminal states (Released, Cancelled, Settled, Closed) have
-        // none.
-        if e.state() != EscrowState::Funded {
-            continue;
+        return;
+    }
+    // AV-111: a tranched-funding escrow with an incomplete plan
+    // and a remaining tranche slot lists one `fund_tranche`
+    // action per scan — the initializer's keeper bot learns the
+    // next deposit is due, and `funding_progress` passes the live
+    // plan counters through to the operator's dashboard. The
+    // action is listed from `Uninitialized` (non-dual-sig),
+    // `Activated`, and `Funded` — exactly the states
+    // `fund_tranche` accepts — and withheld while paused, so a
+    // listed call is always executable.
+    if let Some(plan) = e.funding_plan() {
+        let tranche_open = e.state() == EscrowState::Funded
+            || e.state() == EscrowState::Activated
+            || (e.state() == EscrowState::Uninitialized && !e.dual_sig_required());
+        if tranche_open
+            && !e.is_paused()
+            && !e.is_funding_complete()
+            && plan.tranches_used() < plan.max_tranches()
+        {
+            let remaining = plan.total_amount().saturating_sub(e.funded_total());
+            if remaining > 0 {
+                actions.push(KeeperAction {
+                    escrow_id: w.escrow_id,
+                    vault_address: w.vault_address(),
+                    kind: KeeperActionKind::FundTranche,
+                    caller: e.initializer(),
+                    caller_role: "initializer",
+                    mint: e.mint(),
+                    // A tranche is a deposit, not a refund — no
+                    // refund destination applies.
+                    refund_to: None,
+                    amount: remaining,
+                    decimals: e.decimals(),
+                    reference: w.reference,
+                    extension_count: e.extension_count(),
+                    multisig_authority: e.multisig_authority,
+                    evidence_disclosure: None,
+                    funding_progress: Some(FundingProgress {
+                        funded_total: e.funded_total(),
+                        total_amount: plan.total_amount(),
+                        tranches_used: plan.tranches_used(),
+                        max_tranches: plan.max_tranches(),
+                    }),
+                    reason: "funding_incomplete",
+                    merge_source: None,
+                    // AV-115: the penalty estimate is zero on non-cancel actions.
+                    penalty_estimate: 0,
+                    slot_unlock_at: slot_unlock_opt(e),
+                    bounty_lamports: 0,
+                    bounty_unprofitable: false,
+                    arbiter_fee: None,
+                });
+            }
         }
-        // The expiry gate is the state machine's own predicate
-        // (`Escrow::is_expiry_eligible`): the keeper honors the grace
-        // period exactly as `cancel_expired` enforces it on-chain, so a
-        // listed call is always executable — never a `NotExpired`
-        // rejection caused by keeper/cluster clock drift.
-        if e.is_expiry_eligible(now) && e.remaining_amount() > 0 {
-            // Either party may cancel an expired escrow; the initializer
-            // is the canonical keeper caller. The refund is the remainder
-            // — never fee'd, so no fee accounting is needed here.
-            actions.push(KeeperAction {
+    }
+    // Only a live, funded escrow has keeper-executable exits:
+    // Uninitialized / Activated escrows are not funded yet, and the
+    // terminal states (Released, Cancelled, Settled, Closed) have
+    // none.
+    if e.state() != EscrowState::Funded {
+        return;
+    }
+    // The expiry gate is the state machine's own predicate
+    // (`Escrow::is_expiry_eligible`): the keeper honors the grace
+    // period exactly as `cancel_expired` enforces it on-chain, so a
+    // listed call is always executable — never a `NotExpired`
+    // rejection caused by keeper/cluster clock drift.
+    if e.is_expiry_eligible(now) && e.remaining_amount() > 0 {
+        // Either party may cancel an expired escrow; the initializer
+        // is the canonical keeper caller. The refund is the remainder
+        // — never fee'd, so no fee accounting is needed here.
+        actions.push(KeeperAction {
+            escrow_id: w.escrow_id,
+            vault_address: w.vault_address(),
+            kind: KeeperActionKind::CancelExpired,
+            caller: e.initializer(),
+            caller_role: "initializer",
+            mint: e.mint(),
+            // AV-23: the instruction must name the refund
+            // destination explicitly, and the state machine pins it
+            // to the escrow's refund policy — the report carries the
+            // effective recipient so the keeper builds a valid call.
+            refund_to: Some(e.refund_recipient()),
+            amount: e.remaining_amount(),
+            // AV-28: the report renders the amount in human units
+            // alongside the raw value.
+            decimals: e.decimals(),
+            // AV-53: the off-chain correlation id rides the action so
+            // the report JSON joins it to the operator's records.
+            reference: w.reference,
+            extension_count: e.extension_count(),
+            multisig_authority: e.multisig_authority,
+            evidence_disclosure: None,
+            funding_progress: None,
+            reason: "expired",
+            merge_source: None,
+            // AV-115: the taker-initiated penalty estimate at scan time.
+            penalty_estimate: e.expiry_cancel_penalty_at(e.remaining_amount(), now),
+            slot_unlock_at: slot_unlock_opt(e),
+            bounty_lamports: 0,
+            bounty_unprofitable: false,
+            arbiter_fee: None,
+        });
+        // AV-48: the permissionless crank — the same expiry exit,
+        // callable by anyone. A keeper bot that is party to nothing
+        // sweeps timed-out vaults with `crank_expired`; the party
+        // path above stays for the initializer's own keeper. The
+        // crank fails on a paused escrow (`require_not_paused`), so
+        // it is only listed when the escrow is not paused — a listed
+        // crank is always executable, never a `Paused` rejection.
+        // (The pre-existing `CancelExpired` listing above predates
+        // the pause feature and does not filter on it; left
+        // untouched.)
+        if !e.is_paused() {
+            // AV-124: the keeper-bounty annotation — the bounty a
+            // successful crank would pay right now
+            // (`Escrow::keeper_bounty_payable`: `min(per_crank,
+            // pool)`, `0` when the bounty is not configured or the
+            // pool is exhausted), and whether it covers the
+            // estimated execution cost. `bounty < cost` marks the
+            // crank `unprofitable`: the bounty alone does not pay
+            // for the transaction under the assumed fee regime —
+            // the crank is still listed (the scan lists every
+            // executable action; the keeper may crank at a loss),
+            // but the operator sees the economics before signing.
+            // The scan and the state machine read the same
+            // `keeper_bounty_payable`, so the preview and the
+            // payout can never disagree.
+            let mut crank = KeeperAction {
                 escrow_id: w.escrow_id,
                 vault_address: w.vault_address(),
-                kind: KeeperActionKind::CancelExpired,
-                caller: e.initializer(),
-                caller_role: "initializer",
+                kind: KeeperActionKind::CrankExpired,
+                // Permissionless: no specific key must sign — the
+                // keeper substitutes its own key; see `caller` docs.
+                caller: [0u8; 32],
+                caller_role: "anyone",
                 mint: e.mint(),
-                // AV-23: the instruction must name the refund
-                // destination explicitly, and the state machine pins it
-                // to the escrow's refund policy — the report carries the
-                // effective recipient so the keeper builds a valid call.
+                // The crank refunds to the same pinned destination
+                // as the party path; AV-124: without the bounty the
+                // cranker receives nothing (the AV-48 behavior) —
+                // with it, the bounty rides `bounty_lamports`.
                 refund_to: Some(e.refund_recipient()),
                 amount: e.remaining_amount(),
-                // AV-28: the report renders the amount in human units
-                // alongside the raw value.
                 decimals: e.decimals(),
                 // AV-53: the off-chain correlation id rides the action so
                 // the report JSON joins it to the operator's records.
@@ -1461,155 +1525,153 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 bounty_lamports: 0,
                 bounty_unprofitable: false,
                 arbiter_fee: None,
-            });
-            // AV-48: the permissionless crank — the same expiry exit,
-            // callable by anyone. A keeper bot that is party to nothing
-            // sweeps timed-out vaults with `crank_expired`; the party
-            // path above stays for the initializer's own keeper. The
-            // crank fails on a paused escrow (`require_not_paused`), so
-            // it is only listed when the escrow is not paused — a listed
-            // crank is always executable, never a `Paused` rejection.
-            // (The pre-existing `CancelExpired` listing above predates
-            // the pause feature and does not filter on it; left
-            // untouched.)
-            if !e.is_paused() {
-                // AV-124: the keeper-bounty annotation — the bounty a
-                // successful crank would pay right now
-                // (`Escrow::keeper_bounty_payable`: `min(per_crank,
-                // pool)`, `0` when the bounty is not configured or the
-                // pool is exhausted), and whether it covers the
-                // estimated execution cost. `bounty < cost` marks the
-                // crank `unprofitable`: the bounty alone does not pay
-                // for the transaction under the assumed fee regime —
-                // the crank is still listed (the scan lists every
-                // executable action; the keeper may crank at a loss),
-                // but the operator sees the economics before signing.
-                // The scan and the state machine read the same
-                // `keeper_bounty_payable`, so the preview and the
-                // payout can never disagree.
-                let mut crank = KeeperAction {
-                    escrow_id: w.escrow_id,
-                    vault_address: w.vault_address(),
-                    kind: KeeperActionKind::CrankExpired,
-                    // Permissionless: no specific key must sign — the
-                    // keeper substitutes its own key; see `caller` docs.
-                    caller: [0u8; 32],
-                    caller_role: "anyone",
-                    mint: e.mint(),
-                    // The crank refunds to the same pinned destination
-                    // as the party path; AV-124: without the bounty the
-                    // cranker receives nothing (the AV-48 behavior) —
-                    // with it, the bounty rides `bounty_lamports`.
-                    refund_to: Some(e.refund_recipient()),
-                    amount: e.remaining_amount(),
-                    decimals: e.decimals(),
-                    // AV-53: the off-chain correlation id rides the action so
-                    // the report JSON joins it to the operator's records.
-                    reference: w.reference,
-                    extension_count: e.extension_count(),
-                    multisig_authority: e.multisig_authority,
-                    evidence_disclosure: None,
-                    funding_progress: None,
-                    reason: "expired",
-                    merge_source: None,
-                    // AV-115: the taker-initiated penalty estimate at scan time.
-                    penalty_estimate: e.expiry_cancel_penalty_at(e.remaining_amount(), now),
-                    slot_unlock_at: slot_unlock_opt(e),
-                    bounty_lamports: 0,
-                    bounty_unprofitable: false,
-                    arbiter_fee: None,
-                };
-                let bounty = e.keeper_bounty_payable();
-                crank.bounty_lamports = bounty;
-                crank.bounty_unprofitable =
-                    bounty < crank.estimated_execution_cost_lamports();
-                actions.push(crank);
-            }
+            };
+            let bounty = e.keeper_bounty_payable();
+            crank.bounty_lamports = bounty;
+            crank.bounty_unprofitable =
+                bounty < crank.estimated_execution_cost_lamports();
+            actions.push(crank);
         }
-        // AV-109: the dead-man's switch — a configured, funded escrow
-        // whose inactivity threshold elapsed at scan time lists one
-        // `claim_deadman` action for the heir. The keeper mirrors the
-        // call's own guards so a listed claim is always executable:
-        // not paused (`require_not_paused`), no live swap link
-        // (`require_no_live_swap_link` — a linked escrow settles only
-        // through the pair path), and a non-zero remainder. The heir
-        // need not be either party — `caller_role` is `"heir"`.
-        if e.is_deadman_eligible(now) && e.remaining_amount() > 0 && !e.is_paused() && e.swap_link().is_none() {
-            // `is_deadman_eligible` implies configured, so the heir is
-            // `Some` — the expect documents the invariant.
-            let heir = e
-                .deadman_heir()
-                .expect("AV-109: eligible implies a configured heir");
-            actions.push(KeeperAction {
-                escrow_id: w.escrow_id,
-                vault_address: w.vault_address(),
-                kind: KeeperActionKind::ClaimDeadman,
-                caller: heir,
-                caller_role: "heir",
-                mint: e.mint(),
-                // The claim pays the heir directly — the destination
-                // is pinned to the configured heir, like
-                // `cancel_expired`'s pinned refund destination.
-                refund_to: Some(heir),
-                amount: e.remaining_amount(),
-                decimals: e.decimals(),
-                reference: w.reference,
-                extension_count: e.extension_count(),
-                multisig_authority: e.multisig_authority,
-                evidence_disclosure: None,
-                funding_progress: None,
-                reason: "deadman_inactivity_elapsed",
-                merge_source: None,
-                // AV-115: the penalty estimate is zero on non-cancel actions.
-                penalty_estimate: 0,
-                slot_unlock_at: slot_unlock_opt(e),
-                bounty_lamports: 0,
-                bounty_unprofitable: false,
-                arbiter_fee: None,
-            });
-        }
-        // The taker's pull path: vesting attached (or an AV-97 Dutch
-        // auction — the auction prices `claim` on its own descending
-        // curve), no milestone plan (the plan owns the release
-        // schedule and disables `claim`), something priced-but-unreleased,
-        // any configured quorum satisfied, and the timelock (AV-27)
-        // already unlocked — otherwise the call would fail and is not
-        // executable.
-        if (e.vesting_schedule().is_some() || e.auction().is_some())
-            && e.milestone_plan().is_none()
-            && e.claimable_amount(now) > 0
-            && e.quorum().map(|q| q.is_satisfied()).unwrap_or(true)
-            && e.is_unlock_eligible(now)
+    }
+    // AV-109: the dead-man's switch — a configured, funded escrow
+    // whose inactivity threshold elapsed at scan time lists one
+    // `claim_deadman` action for the heir. The keeper mirrors the
+    // call's own guards so a listed claim is always executable:
+    // not paused (`require_not_paused`), no live swap link
+    // (`require_no_live_swap_link` — a linked escrow settles only
+    // through the pair path), and a non-zero remainder. The heir
+    // need not be either party — `caller_role` is `"heir"`.
+    if e.is_deadman_eligible(now) && e.remaining_amount() > 0 && !e.is_paused() && e.swap_link().is_none() {
+        // `is_deadman_eligible` implies configured, so the heir is
+        // `Some` — the expect documents the invariant.
+        let heir = e
+            .deadman_heir()
+            .expect("AV-109: eligible implies a configured heir");
+        actions.push(KeeperAction {
+            escrow_id: w.escrow_id,
+            vault_address: w.vault_address(),
+            kind: KeeperActionKind::ClaimDeadman,
+            caller: heir,
+            caller_role: "heir",
+            mint: e.mint(),
+            // The claim pays the heir directly — the destination
+            // is pinned to the configured heir, like
+            // `cancel_expired`'s pinned refund destination.
+            refund_to: Some(heir),
+            amount: e.remaining_amount(),
+            decimals: e.decimals(),
+            reference: w.reference,
+            extension_count: e.extension_count(),
+            multisig_authority: e.multisig_authority,
+            evidence_disclosure: None,
+            funding_progress: None,
+            reason: "deadman_inactivity_elapsed",
+            merge_source: None,
+            // AV-115: the penalty estimate is zero on non-cancel actions.
+            penalty_estimate: 0,
+            slot_unlock_at: slot_unlock_opt(e),
+            bounty_lamports: 0,
+            bounty_unprofitable: false,
+            arbiter_fee: None,
+        });
+    }
+    // The taker's pull path: vesting attached (or an AV-97 Dutch
+    // auction — the auction prices `claim` on its own descending
+    // curve), no milestone plan (the plan owns the release
+    // schedule and disables `claim`), something priced-but-unreleased,
+    // any configured quorum satisfied, and the timelock (AV-27)
+    // already unlocked — otherwise the call would fail and is not
+    // executable.
+    if (e.vesting_schedule().is_some() || e.auction().is_some())
+        && e.milestone_plan().is_none()
+        && e.claimable_amount(now) > 0
+        && e.quorum().map(|q| q.is_satisfied()).unwrap_or(true)
+        && e.is_unlock_eligible(now)
+    {
+        actions.push(KeeperAction {
+            escrow_id: w.escrow_id,
+            vault_address: w.vault_address(),
+            kind: KeeperActionKind::Claim,
+            caller: e.taker(),
+            caller_role: "taker",
+            mint: e.mint(),
+            // Claims pay the taker, not a refund: no refund
+            // destination applies.
+            refund_to: None,
+            amount: e.claimable_amount(now),
+            // AV-28: the report renders the amount in human units
+            // alongside the raw value.
+            decimals: e.decimals(),
+            // AV-53: the off-chain correlation id rides the action so
+            // the report JSON joins it to the operator's records.
+            reference: w.reference,
+            extension_count: e.extension_count(),
+            multisig_authority: e.multisig_authority,
+            evidence_disclosure: None,
+            funding_progress: None,
+            // AV-97: the auction window prices the claim, not a
+            // vesting curve — the reason tells the operator which
+            // pricing the amount came from.
+            reason: if e.auction().is_some() {
+                "auction_window_open"
+            } else {
+                "vesting_unlocked"
+            },
+            merge_source: None,
+            // AV-115: the penalty estimate is zero on non-cancel actions.
+            penalty_estimate: 0,
+            slot_unlock_at: slot_unlock_opt(e),
+            bounty_lamports: 0,
+            bounty_unprofitable: false,
+            arbiter_fee: None,
+        });
+    }
+    // AV-56: the initializer's push path for the next due
+    // subscription period. An escrow may legitimately list both a
+    // `Claim` (the taker's pull on the vesting curve) and a
+    // `ReleasePeriod` (the initializer's push of the next due
+    // period) — at most one per kind.
+    if let Some(schedule) = e.subscription_schedule() {
+        let next = e.subscription_next_period();
+        // `subscription_next` only ever runs in order, so the scan
+        // names exactly the period `release_period` accepts. The
+        // amount is the period's *live* amount (AV-73): the uniform
+        // `per_period` at setup, or the dual-signed re-split — the
+        // keeper must list what `release_period` will actually pay,
+        // never the construction-time uniform.
+        let live_amount = e.subscription_period_amount(next).unwrap_or(0);
+        // The `live_amount > 0` guard mirrors the builder's
+        // invariant; the schedule gates keep zero-value actions
+        // off the list.
+        if next < schedule.periods
+            && live_amount > 0
+            && e.subscription_period_due_at(next)
+                .map(|due_at| now >= due_at)
+                .unwrap_or(false)
         {
             actions.push(KeeperAction {
                 escrow_id: w.escrow_id,
                 vault_address: w.vault_address(),
-                kind: KeeperActionKind::Claim,
-                caller: e.taker(),
-                caller_role: "taker",
+                kind: KeeperActionKind::ReleasePeriod,
+                caller: e.initializer(),
+                caller_role: "initializer",
                 mint: e.mint(),
-                // Claims pay the taker, not a refund: no refund
-                // destination applies.
+                // A period release pays the taker, not a refund: no
+                // refund destination applies.
                 refund_to: None,
-                amount: e.claimable_amount(now),
-                // AV-28: the report renders the amount in human units
-                // alongside the raw value.
+                amount: live_amount,
+                // AV-28: the report renders the amount in human
+                // units alongside the raw value.
                 decimals: e.decimals(),
-                // AV-53: the off-chain correlation id rides the action so
-                // the report JSON joins it to the operator's records.
+                // AV-53: the off-chain correlation id rides the
+                // action so the report JSON joins it to the
+                // operator's records.
                 reference: w.reference,
                 extension_count: e.extension_count(),
                 multisig_authority: e.multisig_authority,
                 evidence_disclosure: None,
                 funding_progress: None,
-                // AV-97: the auction window prices the claim, not a
-                // vesting curve — the reason tells the operator which
-                // pricing the amount came from.
-                reason: if e.auction().is_some() {
-                    "auction_window_open"
-                } else {
-                    "vesting_unlocked"
-                },
+                reason: "subscription_period_due",
                 merge_source: None,
                 // AV-115: the penalty estimate is zero on non-cancel actions.
                 penalty_estimate: 0,
@@ -1619,82 +1681,52 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 arbiter_fee: None,
             });
         }
-        // AV-56: the initializer's push path for the next due
-        // subscription period. An escrow may legitimately list both a
-        // `Claim` (the taker's pull on the vesting curve) and a
-        // `ReleasePeriod` (the initializer's push of the next due
-        // period) — at most one per kind.
-        if let Some(schedule) = e.subscription_schedule() {
-            let next = e.subscription_next_period();
-            // `subscription_next` only ever runs in order, so the scan
-            // names exactly the period `release_period` accepts. The
-            // amount is the period's *live* amount (AV-73): the uniform
-            // `per_period` at setup, or the dual-signed re-split — the
-            // keeper must list what `release_period` will actually pay,
-            // never the construction-time uniform.
-            let live_amount = e.subscription_period_amount(next).unwrap_or(0);
-            // The `live_amount > 0` guard mirrors the builder's
-            // invariant; the schedule gates keep zero-value actions
-            // off the list.
-            if next < schedule.periods
-                && live_amount > 0
-                && e.subscription_period_due_at(next)
-                    .map(|due_at| now >= due_at)
-                    .unwrap_or(false)
-            {
-                actions.push(KeeperAction {
-                    escrow_id: w.escrow_id,
-                    vault_address: w.vault_address(),
-                    kind: KeeperActionKind::ReleasePeriod,
-                    caller: e.initializer(),
-                    caller_role: "initializer",
-                    mint: e.mint(),
-                    // A period release pays the taker, not a refund: no
-                    // refund destination applies.
-                    refund_to: None,
-                    amount: live_amount,
-                    // AV-28: the report renders the amount in human
-                    // units alongside the raw value.
-                    decimals: e.decimals(),
-                    // AV-53: the off-chain correlation id rides the
-                    // action so the report JSON joins it to the
-                    // operator's records.
-                    reference: w.reference,
-                    extension_count: e.extension_count(),
-                    multisig_authority: e.multisig_authority,
-                    evidence_disclosure: None,
-                    funding_progress: None,
-                    reason: "subscription_period_due",
-                    merge_source: None,
-                    // AV-115: the penalty estimate is zero on non-cancel actions.
-                    penalty_estimate: 0,
-                    slot_unlock_at: slot_unlock_opt(e),
-                    bounty_lamports: 0,
-                    bounty_unprofitable: false,
-                    arbiter_fee: None,
-                });
-            }
-        }
-        // AV-82: the default-penalty enforcement path. Listed exactly
-        // when `is_slash_eligible` holds at scan time — the predicate
-        // mirrors every `slash` gate (Funded, terms configured,
-        // deadline passed, not yet slashed, not paused, no
-        // milestone/subscription schedule), so a listed slash is always
-        // executable, never a `Paused` or `SlashNotEligible` rejection.
-        // The initializer is the canonical keeper caller; when an
-        // arbiter is configured the neutral enforcer path is listed
-        // too. `amount` is the slashable remainder — the enforcement
-        // size is the caller's decision at call time.
-        if e.is_slash_eligible(now) && e.remaining_amount() > 0 {
+    }
+    // AV-82: the default-penalty enforcement path. Listed exactly
+    // when `is_slash_eligible` holds at scan time — the predicate
+    // mirrors every `slash` gate (Funded, terms configured,
+    // deadline passed, not yet slashed, not paused, no
+    // milestone/subscription schedule), so a listed slash is always
+    // executable, never a `Paused` or `SlashNotEligible` rejection.
+    // The initializer is the canonical keeper caller; when an
+    // arbiter is configured the neutral enforcer path is listed
+    // too. `amount` is the slashable remainder — the enforcement
+    // size is the caller's decision at call time.
+    if e.is_slash_eligible(now) && e.remaining_amount() > 0 {
+        actions.push(KeeperAction {
+            escrow_id: w.escrow_id,
+            vault_address: w.vault_address(),
+            kind: KeeperActionKind::Slash,
+            caller: e.initializer(),
+            caller_role: "initializer",
+            mint: e.mint(),
+            // Slash pays the escrow's configured penalty account,
+            // not a refund destination.
+            refund_to: None,
+            amount: e.remaining_amount(),
+            decimals: e.decimals(),
+            reference: w.reference,
+            extension_count: e.extension_count(),
+            multisig_authority: e.multisig_authority,
+            evidence_disclosure: None,
+            funding_progress: None,
+            reason: "slash_deadline_passed",
+            merge_source: None,
+            // AV-115: the penalty estimate is zero on non-cancel actions.
+            penalty_estimate: 0,
+            slot_unlock_at: slot_unlock_opt(e),
+            bounty_lamports: 0,
+            bounty_unprofitable: false,
+            arbiter_fee: None,
+        });
+        if let Some(arbiter) = e.arbiter() {
             actions.push(KeeperAction {
                 escrow_id: w.escrow_id,
                 vault_address: w.vault_address(),
                 kind: KeeperActionKind::Slash,
-                caller: e.initializer(),
-                caller_role: "initializer",
+                caller: arbiter,
+                caller_role: "arbiter",
                 mint: e.mint(),
-                // Slash pays the escrow's configured penalty account,
-                // not a refund destination.
                 refund_to: None,
                 amount: e.remaining_amount(),
                 decimals: e.decimals(),
@@ -1712,187 +1744,76 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
                 bounty_unprofitable: false,
                 arbiter_fee: None,
             });
-            if let Some(arbiter) = e.arbiter() {
-                actions.push(KeeperAction {
-                    escrow_id: w.escrow_id,
-                    vault_address: w.vault_address(),
-                    kind: KeeperActionKind::Slash,
-                    caller: arbiter,
-                    caller_role: "arbiter",
-                    mint: e.mint(),
-                    refund_to: None,
-                    amount: e.remaining_amount(),
-                    decimals: e.decimals(),
-                    reference: w.reference,
-                    extension_count: e.extension_count(),
-                    multisig_authority: e.multisig_authority,
-                    evidence_disclosure: None,
-                    funding_progress: None,
-                    reason: "slash_deadline_passed",
-                    merge_source: None,
-                    // AV-115: the penalty estimate is zero on non-cancel actions.
-                    penalty_estimate: 0,
-                    slot_unlock_at: slot_unlock_opt(e),
-                    bounty_lamports: 0,
-                    bounty_unprofitable: false,
-                    arbiter_fee: None,
-                });
-            }
         }
-        // AV-86: the slash-appeal paths. A taker whose slash is under a
-        // live appeal window is listed for `file_appeal` — the
-        // predicate mirrors every `file_appeal` gate (Funded, slashed,
-        // window configured and open, no appeal filed or resolved, not
-        // paused, panel configured), so a listed filing is always
-        // executable. A filed appeal lists one `review_appeal` per panel
-        // member who has not voted yet — members who already voted
-        // (their vote stands unless they re-vote) are not re-listed.
-        if e.is_appeal_eligible(now) {
-            actions.push(KeeperAction {
-                escrow_id: w.escrow_id,
-                vault_address: w.vault_address(),
-                kind: KeeperActionKind::FileAppeal,
-                caller: e.taker(),
-                caller_role: "taker",
-                mint: e.mint(),
-                // Filing moves no funds — there is no refund
-                // destination; `amount` is the slashed penalty under
-                // appeal, informational.
-                refund_to: None,
-                amount: e.penalty_paid(),
-                decimals: e.decimals(),
-                reference: w.reference,
-                extension_count: e.extension_count(),
-                multisig_authority: e.multisig_authority,
-                evidence_disclosure: None,
-                funding_progress: None,
-                reason: "appeal_window_open",
-                merge_source: None,
-                // AV-115: the penalty estimate is zero on non-cancel actions.
-                penalty_estimate: 0,
-                slot_unlock_at: slot_unlock_opt(e),
-                bounty_lamports: 0,
-                bounty_unprofitable: false,
-                arbiter_fee: None,
-            });
-        }
-        if e.is_appeal_under_review() {
-            if let Some(panel) = e.arbiter_panel() {
-                let ballot = e.appeal_ballot();
-                for (i, member) in panel.members[..panel.n as usize].iter().enumerate() {
-                    // Skip members whose effective vote is already on
-                    // record — the ballot is still open (a re-vote is
-                    // always allowed), but the keeper only nudges
-                    // members who have not voted yet.
-                    if ballot.voted & (1 << i) != 0 {
-                        continue;
-                    }
-                    actions.push(KeeperAction {
-                        escrow_id: w.escrow_id,
-                        vault_address: w.vault_address(),
-                        kind: KeeperActionKind::ReviewAppeal,
-                        caller: *member,
-                        caller_role: "panel_member",
-                        mint: e.mint(),
-                        // The review moves the penalty only on overturn
-                        // — the judgment is the member's call-time
-                        // decision; `amount` is the slashed penalty the
-                        // ballot decides over.
-                        refund_to: None,
-                        amount: e.penalty_paid(),
-                        decimals: e.decimals(),
-                        reference: w.reference,
-                        extension_count: e.extension_count(),
-                        multisig_authority: e.multisig_authority,
-                        evidence_disclosure: None,
-                        funding_progress: None,
-                        reason: "appeal_filed",
-                        merge_source: None,
-                        // AV-115: the penalty estimate is zero on non-cancel actions.
-                        penalty_estimate: 0,
-                        slot_unlock_at: slot_unlock_opt(e),
-                        bounty_lamports: 0,
-                        bounty_unprofitable: false,
-                        arbiter_fee: None,
-                    });
+    }
+    // AV-86: the slash-appeal paths. A taker whose slash is under a
+    // live appeal window is listed for `file_appeal` — the
+    // predicate mirrors every `file_appeal` gate (Funded, slashed,
+    // window configured and open, no appeal filed or resolved, not
+    // paused, panel configured), so a listed filing is always
+    // executable. A filed appeal lists one `review_appeal` per panel
+    // member who has not voted yet — members who already voted
+    // (their vote stands unless they re-vote) are not re-listed.
+    if e.is_appeal_eligible(now) {
+        actions.push(KeeperAction {
+            escrow_id: w.escrow_id,
+            vault_address: w.vault_address(),
+            kind: KeeperActionKind::FileAppeal,
+            caller: e.taker(),
+            caller_role: "taker",
+            mint: e.mint(),
+            // Filing moves no funds — there is no refund
+            // destination; `amount` is the slashed penalty under
+            // appeal, informational.
+            refund_to: None,
+            amount: e.penalty_paid(),
+            decimals: e.decimals(),
+            reference: w.reference,
+            extension_count: e.extension_count(),
+            multisig_authority: e.multisig_authority,
+            evidence_disclosure: None,
+            funding_progress: None,
+            reason: "appeal_window_open",
+            merge_source: None,
+            // AV-115: the penalty estimate is zero on non-cancel actions.
+            penalty_estimate: 0,
+            slot_unlock_at: slot_unlock_opt(e),
+            bounty_lamports: 0,
+            bounty_unprofitable: false,
+            arbiter_fee: None,
+        });
+    }
+    if e.is_appeal_under_review() {
+        if let Some(panel) = e.arbiter_panel() {
+            let ballot = e.appeal_ballot();
+            for (i, member) in panel.members[..panel.n as usize].iter().enumerate() {
+                // Skip members whose effective vote is already on
+                // record — the ballot is still open (a re-vote is
+                // always allowed), but the keeper only nudges
+                // members who have not voted yet.
+                if ballot.voted & (1 << i) != 0 {
+                    continue;
                 }
-            }
-        }
-        // AV-103: the appeal-expiry sweep. A filed appeal whose window
-        // lapsed unresolved is listed for `expire_appeal` — the
-        // predicate mirrors every `expire_appeal` gate (Funded, Filed,
-        // window lapsed, not paused), so a listed sweep is always
-        // executable. Permissionless: the keeper substitutes its own
-        // key (the zero key), like `crank_expired`; the forfeited bond
-        // routes to the initializer by rule, never the caller.
-        if e.is_appeal_expired(now) {
-            actions.push(KeeperAction {
-                escrow_id: w.escrow_id,
-                vault_address: w.vault_address(),
-                kind: KeeperActionKind::ExpireAppeal,
-                // Permissionless: no specific key must sign — the
-                // keeper substitutes its own key; see `caller` docs.
-                caller: [0u8; 32],
-                caller_role: "anyone",
-                mint: e.mint(),
-                // The forfeited bond routes to the initializer by rule
-                // (like `slash`'s penalty account) — no caller-chosen
-                // destination.
-                refund_to: None,
-                amount: e.appeal_bond_paid(),
-                decimals: e.decimals(),
-                reference: w.reference,
-                extension_count: e.extension_count(),
-                multisig_authority: e.multisig_authority,
-                evidence_disclosure: None,
-                funding_progress: None,
-                reason: "appeal_window_lapsed",
-                merge_source: None,
-                // AV-115: the penalty estimate is zero on non-cancel actions.
-                penalty_estimate: 0,
-                slot_unlock_at: slot_unlock_opt(e),
-                bounty_lamports: 0,
-                bounty_unprofitable: false,
-                arbiter_fee: None,
-            });
-        }
-        // AV-106: the insurance-pool payout. Listed when
-        // `is_pool_payout_eligible` holds at scan time — the predicate
-        // mirrors every `pool_payout` gate (pool opted in and funded,
-        // Funded, unencumbered, not paused, an authorized drainer
-        // exists), so a listed payout is always executable. One action
-        // per authorized drainer: the arbiter, and/or the bound
-        // multisig authority PDA (the keeper proposes the payout to
-        // the multisig — it does not sign as the PDA). `amount` is the
-        // pool balance — the ceiling; the beneficiary and the exact
-        // payout are the drainer's call-time judgment.
-        if e.is_pool_payout_eligible(now) {
-            let mut drainers: Vec<([u8; 32], &'static str)> = Vec::new();
-            if let Some(arbiter) = e.arbiter() {
-                drainers.push((arbiter, "arbiter"));
-            }
-            if let Some(bound) = e.multisig_authority() {
-                drainers.push((bound.authority, "multisig_authority"));
-            }
-            for (caller, caller_role) in drainers {
                 actions.push(KeeperAction {
                     escrow_id: w.escrow_id,
                     vault_address: w.vault_address(),
-                    kind: KeeperActionKind::PoolPayout,
-                    caller,
-                    caller_role,
+                    kind: KeeperActionKind::ReviewAppeal,
+                    caller: *member,
+                    caller_role: "panel_member",
                     mint: e.mint(),
-                    // The beneficiary is the drainer's call-time
-                    // judgment — no destination is pinned by rule.
+                    // The review moves the penalty only on overturn
+                    // — the judgment is the member's call-time
+                    // decision; `amount` is the slashed penalty the
+                    // ballot decides over.
                     refund_to: None,
-                    amount: e.pool_paid(),
+                    amount: e.penalty_paid(),
                     decimals: e.decimals(),
                     reference: w.reference,
                     extension_count: e.extension_count(),
                     multisig_authority: e.multisig_authority,
                     evidence_disclosure: None,
                     funding_progress: None,
-                    reason: "pool_payout_available",
+                    reason: "appeal_filed",
                     merge_source: None,
                     // AV-115: the penalty estimate is zero on non-cancel actions.
                     penalty_estimate: 0,
@@ -1904,86 +1825,192 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
             }
         }
     }
-    // AV-114: merge-pair scan — a second pass over the watched escrows
-    // finds pairs of `Funded` escrows the initializer can consolidate
-    // via `merge_escrows`. Greedy pairing in input order: the lower
-    // `escrow_id` survives as the merge target, the higher is the
-    // source. Each escrow joins at most one pair per scan, so a listed
-    // merge never double-spends a source. A listed merge is always
-    // executable — both sides unpaused, unexpired and `Funded`, same
-    // parties and term-identical via `is_merge_compatible_with` (so
-    // `merge_escrows` cannot refuse it with `MergeIncompatible`), and
-    // the u128-checked accumulation re-verified at call time.
-    {
-        let mut paired = vec![false; watched.len()];
-        for i in 0..watched.len() {
-            if paired[i] {
+    // AV-103: the appeal-expiry sweep. A filed appeal whose window
+    // lapsed unresolved is listed for `expire_appeal` — the
+    // predicate mirrors every `expire_appeal` gate (Funded, Filed,
+    // window lapsed, not paused), so a listed sweep is always
+    // executable. Permissionless: the keeper substitutes its own
+    // key (the zero key), like `crank_expired`; the forfeited bond
+    // routes to the initializer by rule, never the caller.
+    if e.is_appeal_expired(now) {
+        actions.push(KeeperAction {
+            escrow_id: w.escrow_id,
+            vault_address: w.vault_address(),
+            kind: KeeperActionKind::ExpireAppeal,
+            // Permissionless: no specific key must sign — the
+            // keeper substitutes its own key; see `caller` docs.
+            caller: [0u8; 32],
+            caller_role: "anyone",
+            mint: e.mint(),
+            // The forfeited bond routes to the initializer by rule
+            // (like `slash`'s penalty account) — no caller-chosen
+            // destination.
+            refund_to: None,
+            amount: e.appeal_bond_paid(),
+            decimals: e.decimals(),
+            reference: w.reference,
+            extension_count: e.extension_count(),
+            multisig_authority: e.multisig_authority,
+            evidence_disclosure: None,
+            funding_progress: None,
+            reason: "appeal_window_lapsed",
+            merge_source: None,
+            // AV-115: the penalty estimate is zero on non-cancel actions.
+            penalty_estimate: 0,
+            slot_unlock_at: slot_unlock_opt(e),
+            bounty_lamports: 0,
+            bounty_unprofitable: false,
+            arbiter_fee: None,
+        });
+    }
+    // AV-106: the insurance-pool payout. Listed when
+    // `is_pool_payout_eligible` holds at scan time — the predicate
+    // mirrors every `pool_payout` gate (pool opted in and funded,
+    // Funded, unencumbered, not paused, an authorized drainer
+    // exists), so a listed payout is always executable. One action
+    // per authorized drainer: the arbiter, and/or the bound
+    // multisig authority PDA (the keeper proposes the payout to
+    // the multisig — it does not sign as the PDA). `amount` is the
+    // pool balance — the ceiling; the beneficiary and the exact
+    // payout are the drainer's call-time judgment.
+    if e.is_pool_payout_eligible(now) {
+        let mut drainers: Vec<([u8; 32], &'static str)> = Vec::new();
+        if let Some(arbiter) = e.arbiter() {
+            drainers.push((arbiter, "arbiter"));
+        }
+        if let Some(bound) = e.multisig_authority() {
+            drainers.push((bound.authority, "multisig_authority"));
+        }
+        for (caller, caller_role) in drainers {
+            actions.push(KeeperAction {
+                escrow_id: w.escrow_id,
+                vault_address: w.vault_address(),
+                kind: KeeperActionKind::PoolPayout,
+                caller,
+                caller_role,
+                mint: e.mint(),
+                // The beneficiary is the drainer's call-time
+                // judgment — no destination is pinned by rule.
+                refund_to: None,
+                amount: e.pool_paid(),
+                decimals: e.decimals(),
+                reference: w.reference,
+                extension_count: e.extension_count(),
+                multisig_authority: e.multisig_authority,
+                evidence_disclosure: None,
+                funding_progress: None,
+                reason: "pool_payout_available",
+                merge_source: None,
+                // AV-115: the penalty estimate is zero on non-cancel actions.
+                penalty_estimate: 0,
+                slot_unlock_at: slot_unlock_opt(e),
+                bounty_lamports: 0,
+                bounty_unprofitable: false,
+                arbiter_fee: None,
+            });
+        }
+    }
+}
+
+/// AV-114 merge-pair pass, extracted (AV-138): greedy pairing of `Funded`
+/// escrows in candidate order. Each escrow joins at most one pair per
+/// scan; the lower `escrow_id` survives as the merge target, the higher
+/// is the source. A listed merge is always executable — both sides
+/// unpaused, unexpired and `Funded`, same parties and term-identical
+/// via `is_merge_compatible_with` (so `merge_escrows` cannot refuse it
+/// with `MergeIncompatible`), and the u128-checked accumulation
+/// re-verified at call time.
+///
+/// Restricting the pass to the `Funded` bucket is sound: the original
+/// loop skipped every non-`Funded` entry without marking it paired, so
+/// pairing over the bucket in watch order yields the identical pairs.
+fn scan_merge_pairs(
+    candidates: &[&WatchedEscrow],
+    now: u64,
+    actions: &mut Vec<KeeperAction>,
+) {
+    let mut paired = vec![false; candidates.len()];
+    for i in 0..candidates.len() {
+        if paired[i] {
+            continue;
+        }
+        let a = candidates[i];
+        // An expiry-eligible escrow already lists its cancel path —
+        // merging it would race the cancel, so the scan leaves it
+        // to the expiry exit.
+        if a.escrow.state() != EscrowState::Funded
+            || a.escrow.is_paused()
+            || a.escrow.is_expiry_eligible(now)
+        {
+            continue;
+        }
+        for j in (i + 1)..candidates.len() {
+            if paired[j] {
                 continue;
             }
-            let a = &watched[i];
-            // An expiry-eligible escrow already lists its cancel path —
-            // merging it would race the cancel, so the scan leaves it
-            // to the expiry exit.
-            if a.escrow.state() != EscrowState::Funded
-                || a.escrow.is_paused()
-                || a.escrow.is_expiry_eligible(now)
+            let b = candidates[j];
+            if b.escrow.state() != EscrowState::Funded
+                || b.escrow.is_paused()
+                || b.escrow.is_expiry_eligible(now)
             {
                 continue;
             }
-            for j in (i + 1)..watched.len() {
-                if paired[j] {
-                    continue;
-                }
-                let b = &watched[j];
-                if b.escrow.state() != EscrowState::Funded
-                    || b.escrow.is_paused()
-                    || b.escrow.is_expiry_eligible(now)
-                {
-                    continue;
-                }
-                if !a.escrow.is_merge_compatible_with(&b.escrow) {
-                    continue;
-                }
-                let (target, source) = if a.escrow_id <= b.escrow_id {
-                    (a, b)
-                } else {
-                    (b, a)
-                };
-                paired[i] = true;
-                paired[j] = true;
-                actions.push(KeeperAction {
-                    escrow_id: target.escrow_id,
-                    vault_address: target.vault_address(),
-                    kind: KeeperActionKind::MergeEscrows,
-                    caller: target.escrow.initializer(),
-                    caller_role: "initializer",
-                    mint: target.escrow.mint(),
-                    // `merge_escrows` consolidates the lockups — no
-                    // single refund destination applies.
-                    refund_to: None,
-                    amount: source.escrow.remaining_amount(),
-                    decimals: target.escrow.decimals(),
-                    reference: target.reference,
-                    extension_count: target.escrow.extension_count(),
-                    multisig_authority: target.escrow.multisig_authority,
-                    evidence_disclosure: None,
-                    funding_progress: None,
-                    reason: "mergeable_pair",
-                    merge_source: Some(source.escrow_id),
-                    // AV-115: the penalty estimate is zero on non-cancel actions.
-                    penalty_estimate: 0,
-                    slot_unlock_at: slot_unlock_opt(&target.escrow),
-                    bounty_lamports: 0,
-                    bounty_unprofitable: false,
-                    arbiter_fee: None,
-                });
-                break;
+            if !a.escrow.is_merge_compatible_with(&b.escrow) {
+                continue;
             }
+            let (target, source) = if a.escrow_id <= b.escrow_id {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            paired[i] = true;
+            paired[j] = true;
+            actions.push(KeeperAction {
+                escrow_id: target.escrow_id,
+                vault_address: target.vault_address(),
+                kind: KeeperActionKind::MergeEscrows,
+                caller: target.escrow.initializer(),
+                caller_role: "initializer",
+                mint: target.escrow.mint(),
+                // `merge_escrows` consolidates the lockups — no
+                // single refund destination applies.
+                refund_to: None,
+                amount: source.escrow.remaining_amount(),
+                decimals: target.escrow.decimals(),
+                reference: target.reference,
+                extension_count: target.escrow.extension_count(),
+                multisig_authority: target.escrow.multisig_authority,
+                evidence_disclosure: None,
+                funding_progress: None,
+                reason: "mergeable_pair",
+                merge_source: Some(source.escrow_id),
+                // AV-115: the penalty estimate is zero on non-cancel actions.
+                penalty_estimate: 0,
+                slot_unlock_at: slot_unlock_opt(&target.escrow),
+                bounty_lamports: 0,
+                bounty_unprofitable: false,
+                arbiter_fee: None,
+            });
+            break;
         }
     }
+}
+
+/// Shared report construction for [`scan_keeper_actions`] and
+/// [`scan_keeper_actions_indexed`] (AV-138): the scan-time fields are
+/// identical — only the candidate source differs.
+fn scan_keeper_actions_report(now: u64, scanned: usize, acc: KeeperScanAcc) -> KeeperReport {
+    let KeeperScanAcc {
+        actions,
+        intent_releases,
+        pending_auto_unpause,
+        funding_bounds,
+        pool_balance,
+        pool_inflow,
+    } = acc;
     KeeperReport {
         at: now,
-        scanned: watched.len(),
+        scanned,
         actions,
         // AV-98: the operator stamps the intended Jito tip via
         // `with_jito_tip` — the scan itself stays tip-free.
@@ -2003,6 +2030,40 @@ pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport 
         // AV-134: the funding amount windows collected above.
         funding_bounds,
     }
+}
+
+/// Indexed variant of [`scan_keeper_actions`] (AV-138): runs the identical
+/// per-escrow logic over a keeper-maintained [`EscrowIndex`], so a bot
+/// that re-scans the same watch list across slots pays the index build
+/// once and reuses it. The merge-pair pass reads only the `Funded`
+/// bucket instead of the whole list. Output is byte-identical to
+/// [`scan_keeper_actions`] for the same snapshots (see the
+/// `indexed_keeper_scan_matches_slice_scan` test); the indexed scans run
+/// `verify_consistency` under `debug_assertions`.
+pub fn scan_keeper_actions_indexed(index: &EscrowIndex, now: u64) -> KeeperReport {
+    debug_assert!(index.verify_consistency().is_ok());
+    let mut acc = KeeperScanAcc::default();
+    for w in index.iter() {
+        scan_one_keeper_escrow(w, now, &mut acc);
+    }
+    let funded = index.candidates_for_state(EscrowState::Funded);
+    scan_merge_pairs(&funded, now, &mut acc.actions);
+    scan_keeper_actions_report(now, index.len(), acc)
+}
+
+/// keeper with the party path.
+/// AV-138: [`scan_keeper_actions_indexed`] runs the identical logic over a
+/// keeper-maintained [`EscrowIndex`] — same output, pruned candidate reads.
+pub fn scan_keeper_actions(watched: &[WatchedEscrow], now: u64) -> KeeperReport {
+    let mut acc = KeeperScanAcc::default();
+    for w in watched {
+        scan_one_keeper_escrow(w, now, &mut acc);
+    }
+    // AV-114: merge-pair scan over the full watch list — see
+    // `scan_merge_pairs` for the pairing rules.
+    let all: Vec<&WatchedEscrow> = watched.iter().collect();
+    scan_merge_pairs(&all, now, &mut acc.actions);
+    scan_keeper_actions_report(now, watched.len(), acc)
 }
 
 /// One executable `close_vault` call: everything needed to build the

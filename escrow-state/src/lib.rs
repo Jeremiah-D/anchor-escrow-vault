@@ -264,7 +264,8 @@ pub use events::{
 // `cancel_expired` / `claim` calls and serialize the call list as JSON.
 // Purely additive and read-only (dry-run by construction).
 pub use keeper::{
-    scan_keeper_actions, KeeperAction, KeeperActionKind, KeeperReport, WatchedEscrow,
+    scan_keeper_actions, scan_keeper_actions_indexed, KeeperAction, KeeperActionKind, KeeperReport,
+    WatchedEscrow,
 };
 // AV-136: expiry-warning keeper scan — read-only, edge-triggered
 // warnings for escrows whose deadline falls inside a warning window
@@ -272,8 +273,15 @@ pub use keeper::{
 // deadline, while the operator can still act). Purely additive.
 mod expiry_watch;
 pub use expiry_watch::{
-    scan_expiry_warnings, ExpiryWarning, ExpiryWarningLedger, ExpiryWarningReport, WatchAction,
+    scan_expiry_warnings, scan_expiry_warnings_indexed, ExpiryWarning, ExpiryWarningLedger,
+    ExpiryWarningReport, WatchAction,
 };
+// AV-138: off-chain multi-dimensional escrow index — a keeper's watch
+// list with incremental (state, mint, expires_at) inverted indexes, so
+// the keeper scans prune by dimension instead of walking the whole
+// fleet. Purely additive and read-only.
+mod index;
+pub use index::EscrowIndex;
 // AV-78: escrow aggregate statistics view — read-only fleet rollup
 // (per-state counts, amount histogram, durations, locked totals) with
 // deterministic JSON export. Purely additive.

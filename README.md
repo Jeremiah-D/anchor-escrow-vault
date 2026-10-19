@@ -2212,6 +2212,38 @@ automatically.
                {"action":"cancel_expired","caller":"initializer_or_taker","executable_now":false,"detail":"..."}]}]}
 ```
 
+## Off-chain escrow index (AV-138)
+
+A keeper bot watches hundreds or thousands of vaults and re-scans the
+same watch list every few slots. `escrow-state/src/index.rs` keeps the
+`WatchedEscrow` snapshots in one `EscrowIndex` and maintains three
+inverted indexes over them, updated incrementally on `insert` /
+`update` / `remove`:
+
+| dimension | bucket | prunes |
+|-----------|--------|--------|
+| `state` | one bucket per `EscrowState` discriminant | close sweep reads only terminal buckets; merge-pair pass reads only `Funded` |
+| `mint` | one bucket per bound mint (`None` = native SOL) | a per-token operator scans only its own mint's vaults |
+| `expires_at` | `BTreeMap` deadline index | expiry scan reads only the `(now, now + window]` range |
+
+The indexed twins — `scan_keeper_actions_indexed` (AV-20's logic) and
+`scan_expiry_warnings_indexed` (AV-136's logic) — run the identical
+per-escrow code over the index's candidates, so their output is
+byte-identical to the slice scans for the same snapshots (pinned by
+equivalence tests). The slice-based entry points are unchanged, so
+existing callers keep working; a keeper that re-scans across slots
+builds the index once and reuses it.
+
+`EscrowIndex::verify_consistency` rebuilds every dimension from the
+backing store and reconciles it against the live index, naming the
+first divergence — the indexed scans run it under `debug_assertions`,
+and the test suite drives randomized insert/update/remove sequences
+through it. A keeper mutating the index across slots gets a loud
+failure instead of a silently pruned scan.
+
+Purely off-chain: snapshots only, no mutation of chain state, no
+events, no clock. `std` only, no new dependencies.
+
 ## Keeper report signing (AV-101)
 
 Keeper reports are consumed by offline signers (multisig CLIs, keeper
