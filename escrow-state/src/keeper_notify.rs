@@ -916,6 +916,9 @@ mod keeper_notify_tests {
             KeeperActionKind::Resolve,
             KeeperActionKind::PanelJudgment,
             KeeperActionKind::ReleasePeriod,
+            // AV-160: the permissionless subscription crank — a
+            // liveness suggestion, not a push-worthy event.
+            KeeperActionKind::CrankReleasePeriod,
             KeeperActionKind::Slash,
             KeeperActionKind::PoolPayout,
             KeeperActionKind::ClaimDeadman,

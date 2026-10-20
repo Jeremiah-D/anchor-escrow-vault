@@ -676,6 +676,12 @@
       ]
     },
     {
+      "name": "crank_release_period",
+      "discriminator": [14, 189, 219, 96, 0, 192, 234, 95],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "initialize_extension",
       "discriminator": [147, 62, 136, 75, 36, 117, 185, 148],
       "accounts": [],

@@ -19878,6 +19878,64 @@ let fee = self.charge_protocol_fee(tranche)?;
         mint: Option<[u8; 32]>,
         payout_to: [u8; 32],
     ) -> Result<(u64, u64), EscrowError> {
+        self.release_period_locked(Some(authority), now, period_index, mint, payout_to)
+    }
+
+    /// Permissionless subscription-period crank (AV-160; the
+    /// subscription analogue of the AV-48 `crank_expired` convention):
+    /// any key may release the next *due* subscription period when
+    /// the initializer's push path is idle — no counterparty
+    /// signature required, so a keeper bot that is party to nothing
+    /// keeps a subscription schedule liveness-safe.
+    ///
+    /// Anti-MEV by construction: the caller authorizes nothing about
+    /// the funds. The payout destination is pinned to the taker (the
+    /// AV-49 policy's always-allowed destination — the state machine
+    /// asserts the pin internally via `require_payout_recipient`, and
+    /// the Anchor layer asserts the transfer account matches), exactly
+    /// as `crank_expired` pins the refund. The caller receives zero —
+    /// there is deliberately no keeper bounty on this crank (unlike
+    /// AV-124): the period's funds are the taker's own, so paying the
+    /// cranker would be a pure extraction vector with no liveness
+    /// benefit.
+    ///
+    /// Gate order mirrors `release_period` minus the party-membership
+    /// check: pause (AV-46), reentrancy (AV-36), state, schedule
+    /// configuration, sequence, timing, mint, the pinned payout
+    /// destination, quorum, timelock — every other gate is identical,
+    /// so the crank can never succeed where the party path would fail
+    /// (modulo the authority check it deliberately drops). The fee
+    /// accounting (AV-17 protocol fee, AV-100 streaming fee, AV-107
+    /// interest) is identical too: `taker_payout + fee == per_period`
+    /// always.
+    ///
+    /// Returns `(taker_payout, fee)` like `release_period`.
+    pub fn crank_release_period(
+        &mut self,
+        _caller: [u8; 32],
+        now: u64,
+        mint: Option<[u8; 32]>,
+    ) -> Result<(u64, u64), EscrowError> {
+        // The payout destination is pinned to the taker — the caller
+        // names no destination, so there is nothing to redirect.
+        let payout_to = self.taker();
+        self.release_period_locked(None, now, self.subscription_next, mint, payout_to)
+    }
+
+    /// Shared period-release core for [`Escrow::release_period`] (the
+    /// initializer's push path) and [`Escrow::crank_release_period`]
+    /// (the permissionless crank, AV-160). `authority: Some` runs the
+    /// initializer-membership check; `None` skips it — the crank's
+    /// payout is pinned to the taker by the caller above, so the pin
+    /// holds by construction. Every other gate is identical.
+    fn release_period_locked(
+        &mut self,
+        authority: Option<[u8; 32]>,
+        now: u64,
+        period_index: u8,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+    ) -> Result<(u64, u64), EscrowError> {
         // AV-36: reentrancy guard first (see `require_not_reentrant`).
         // AV-46: pause guard first — a paused escrow fails fast,
         // before the reentrancy guard and the authority check.
@@ -19886,7 +19944,12 @@ let fee = self.charge_protocol_fee(tranche)?;
         self.try_auto_unpause(now);
         self.require_not_paused()?;
         self.require_not_reentrant()?;
-        self.require_initializer(authority)?;
+        // AV-160: the crank path (`None`) deliberately skips the
+        // party-membership check — permissionless, like
+        // `crank_expired`.
+        if let Some(auth) = authority {
+            self.require_initializer(auth)?;
+        }
         match self.state {
             EscrowState::Funded => {}
             _ => return Err(EscrowError::InvalidStateTransition),
@@ -25477,6 +25540,31 @@ pub(crate) mod anchor_idl_tests {
                             per-period amount, fee, refund = 0)",
         },
         InstructionSpec {
+            // AV-160: the permissionless subscription-period crank —
+            // the subscription analogue of `crank_expired` (AV-48).
+            name: "crank_release_period",
+            params: &[],
+            method: "Escrow::crank_release_period",
+            input_mapping: "caller <- accounts.cranker (signer: ANY key — \
+                            no party-membership check, the crank is \
+                            permissionless); now <- clock sysvar (NOT an \
+                            instruction param); mint <- vault token \
+                            account; payout destination <- \
+                            accounts.payout_to, asserted by the skeleton \
+                            against the vault's pinned taker (the state \
+                            machine pins it internally too, so a swapped \
+                            account fails closed); the crank releases \
+                            exactly the next due period (subscription_next \
+                            — PeriodNotDue when nothing is due); every \
+                            other gate mirrors release_period (Funded, \
+                            schedule required, due timing, mint, quorum, \
+                            timelock, fee slices the period); the caller \
+                            receives zero — no keeper bounty on this crank \
+                            (anti-MEV); returns (taker_payout, fee); emits \
+                            the SubscriptionPeriodReleased indexer event \
+                            with the cranker's key as caller",
+        },
+        InstructionSpec {
             // AV-59: opt in to bounded expiry extension at setup time.
             name: "initialize_extension",
             params: &[(
@@ -26782,6 +26870,10 @@ pub(crate) mod anchor_idl_tests {
             // AV-56: periodic (subscription-style) release schedule.
             "Escrow::with_subscription",
             "Escrow::release_period",
+            // AV-160: the permissionless subscription-period crank —
+            // anyone may release the next due period, payout pinned to
+            // the taker, caller receives zero (anti-MEV).
+            "Escrow::crank_release_period",
             "Escrow::with_max_extension_secs",
             "Escrow::extend_expiry",
             // AV-63: absolute protocol-fee ceiling.
@@ -43612,10 +43704,15 @@ mod adjust_period_amounts_tests {
             pending_intent: None,
         };
         let report = scan_keeper_actions(&[watched], due(0));
-        assert_eq!(report.actions.len(), 1);
+        // AV-160: the permissionless crank rides alongside the push
+        // path — both price from the live per-period table.
+        assert_eq!(report.actions.len(), 2);
         let a = report.actions[0];
         assert_eq!(a.kind, KeeperActionKind::ReleasePeriod);
         assert_eq!(a.amount, 400_000, "keeper prices the live table");
+        let crank = report.actions[1];
+        assert_eq!(crank.kind, KeeperActionKind::CrankReleasePeriod);
+        assert_eq!(crank.amount, 400_000, "the crank prices the live table too");
     }
 
     #[test]

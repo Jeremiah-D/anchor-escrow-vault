@@ -104,6 +104,10 @@ pub const INSTRUCTION_CU_TABLE: &[(&str, u64, usize)] = &[
     ("submit_panel_judgment", 18_000, 49),
     // period_index:u8 → 8 + 1.
     ("release_period", 16_000, 9),
+    // AV-160: no params → 8 + 0; the permissionless subscription
+    // crank runs the same fund-moving path as release_period (minus
+    // the authority check), ranked with it.
+    ("crank_release_period", 16_000, 8),
     // amount:u64 → 8 + 8.
     ("slash", 18_000, 16),
     ("file_appeal", 6_000, 8),
@@ -302,6 +306,8 @@ mod cu_estimate_tests {
             KeeperActionKind::Resolve,
             KeeperActionKind::PanelJudgment,
             KeeperActionKind::ReleasePeriod,
+            // AV-160: the permissionless subscription-period crank.
+            KeeperActionKind::CrankReleasePeriod,
             KeeperActionKind::Slash,
             KeeperActionKind::FileAppeal,
             KeeperActionKind::ReviewAppeal,
@@ -309,7 +315,7 @@ mod cu_estimate_tests {
             KeeperActionKind::PoolPayout,
             KeeperActionKind::ClaimDeadman,
         ];
-        assert_eq!(kinds.len(), 12, "keeper action kind count drift");
+        assert_eq!(kinds.len(), 13, "keeper action kind count drift");
         // The table may carry rows beyond the keeper kinds (AV-110:
         // `top_up_rent` is permissionless and keeper-executable but is
         // reported through `scan_rent_health`'s `TopUpAction`, not as a
@@ -395,6 +401,9 @@ mod cu_estimate_tests {
             ("resolve", 22_000),
             ("submit_panel_judgment", 18_000),
             ("release_period", 16_000),
+            // AV-160: the permissionless subscription crank — same
+            // fund-moving path as release_period, ranked with it.
+            ("crank_release_period", 16_000),
             ("slash", 18_000),
             ("file_appeal", 6_000),
             ("review_appeal", 14_000),

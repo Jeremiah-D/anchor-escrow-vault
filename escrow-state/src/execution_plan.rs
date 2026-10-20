@@ -197,13 +197,19 @@ fn plan_instruction(a: &KeeperAction) -> PlannedInstruction {
             writable: false,
         },
     ];
-    if a.kind == KeeperActionKind::CancelExpired || a.kind == KeeperActionKind::CrankExpired {
+    if a.kind == KeeperActionKind::CancelExpired
+        || a.kind == KeeperActionKind::CrankExpired
+        || a.kind == KeeperActionKind::CrankReleasePeriod
+    {
         // The scan always sets `refund_to` for `cancel_expired` /
         // `crank_expired` — the refund recipient the state machine pins
         // (AV-23 anti-phishing; the AV-48 crank refunds to the same
         // pinned destination, the cranker receives nothing — unless
         // the vault opted into the AV-124 keeper bounty, which the
-        // state machine pays as a separate bookkeeping transfer).
+        // state machine pays as a separate bookkeeping transfer). AV-160:
+        // the scan sets it for `crank_release_period` too — the pinned
+        // taker payout destination (the state machine asserts the pin,
+        // the cranker receives zero).
         // Guarded anyway: a plan must never name a wrong destination,
         // and must never panic on a hand-built report either.
         if let Some(r) = a.refund_to {

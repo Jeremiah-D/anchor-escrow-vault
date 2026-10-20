@@ -5959,6 +5959,56 @@ impl IndexedEscrow {
         Ok((payout, fee))
     }
 
+    /// Crank a due subscription period permissionlessly (mirrors
+    /// [`Escrow::crank_release_period`], AV-160; the subscription
+    /// analogue of `IndexedEscrow::crank_expired`). Emits
+    /// `SubscriptionPeriodReleased` with the gross per-period amount
+    /// in `amounts.payout` — `from == Funded`, `to == Funded` — or
+    /// `to == Released` on the last period. The event's `actor` is
+    /// the cranker's key (the caller is marked as the crank), so the
+    /// indexer distinguishes crank-driven period releases from the
+    /// initializer's push path. Returns `(taker_payout, fee)` like the
+    /// inner method. `at` is both the event timestamp and the state
+    /// machine's `now` (due-date + AV-27 timelock gates).
+    pub fn crank_release_period(
+        &mut self,
+        caller: [u8; 32],
+        at: u64,
+        mint: Option<[u8; 32]>,
+    ) -> Result<(u64, u64), EscrowError> {
+        let from = self.inner.state();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
+        let result = self.inner.crank_release_period(caller, at, mint);
+        let (payout, fee) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
+        // `payout + fee` is the gross per-period amount
+        // (`== per_period` by construction); no overflow possible.
+        self.push_event(
+            EscrowEventKind::SubscriptionPeriodReleased,
+            from,
+            self.inner.state(),
+            EventAmounts::payout(payout + fee, fee),
+            at,
+            None,
+            None,
+            None,
+            Some(caller),
+            Some(caller),
+        );
+        Ok((payout, fee))
+    }
+
     /// Skip a milestone by mutual agreement (mirrors
     /// [`Escrow::skip_milestone`]). Emits `MilestoneSkipped` only when
     /// the skip executes (both approvals present); a lone approval emits

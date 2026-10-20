@@ -3637,6 +3637,79 @@ pub mod escrow_vault {
         Ok((payout, fee))
     }
 
+    /// Permissionless subscription-period crank (AV-160; mirrors
+    /// `Escrow::crank_release_period` — the subscription analogue of
+    /// the AV-48 `crank_expired` convention). ANY signer may release
+    /// the next *due* subscription period when the initializer's push
+    /// path is idle — no counterparty signature required, so a keeper
+    /// bot that is party to nothing keeps the schedule liveness-safe.
+    ///
+    /// Anti-MEV by construction: the caller authorizes nothing about
+    /// the funds. `accounts.payout_to` is asserted here against the
+    /// vault's pinned taker (the AV-49 policy's always-allowed
+    /// destination — the state machine pins it internally too), so a
+    /// swapped account fails closed before any state changes. The
+    /// cranker receives zero: there is deliberately no keeper bounty
+    /// on this crank (unlike AV-124). The crank releases exactly the
+    /// next due period (`subscription_next` — `PeriodNotDue` when
+    /// nothing is due); every other gate mirrors `release_period`
+    /// (`Funded`, schedule required, due timing, `MintMismatch`,
+    /// quorum `QuorumNotReached`, timelock `TimelockNotReached`,
+    /// `PayoutNotAllowlisted` on the pinned taker as an invariant).
+    /// The fee slices the period (`payout + fee == per_period`); the
+    /// last period moves `Funded -> Released`. A paused escrow
+    /// rejects with `Paused` (AV-46). Emits
+    /// `SubscriptionPeriodReleased` (`from == Funded`, `to == Funded`
+    /// — or `Released` on the last period; payout = gross per-period
+    /// amount, fee, refund = 0) with the cranker's key as the caller,
+    /// so the indexer distinguishes crank-driven releases from the
+    /// initializer's push path. Returns `(taker_payout, fee)` so the
+    /// real build can size the taker's transfer and the protocol fee.
+    pub fn crank_release_period(ctx: Context<CrankReleasePeriod>) -> Result<(u64, u64)> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        // The state machine pins the payout destination to the taker
+        // (AV-160); the skeleton additionally asserts the transfer
+        // target account matches the pinned taker, so a swapped
+        // account fails closed before any state changes.
+        require!(
+            ctx.accounts.payout_to.key() == ctx.accounts.vault.taker,
+            ErrorCode::PayoutNotAllowlisted
+        );
+        let (payout, fee) = escrow
+            .crank_release_period(
+                ctx.accounts.cranker.key().to_bytes(),
+                now,
+                vault_token_mint(&ctx.accounts.vault_token_account),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-31: settle via `cpi_settle_payout` — see `release` (the
+        // period payout settles as one payout + one fee leg, to the
+        // pinned taker).
+        // AV-18: `payout + fee` is the gross period; the final period
+        // carries to == Released. The `caller` field carries the crank
+        // signer's key so the indexer sees who cranked without a
+        // second account read.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::SubscriptionPeriodReleased,
+            from,
+            escrow.state() as u8,
+            payout + fee,
+            fee,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.cranker.key()),
+        );
+        Ok((payout, fee))
+    }
+
     /// Bind one SPL token mint to the escrow (AV-16; mirrors
     /// `escrow_state::parse_mint_address` + `Escrow::with_mint`).
     /// `Uninitialized` only, like `initialize_quorum`: the token scope is
@@ -9376,6 +9449,34 @@ pub struct ReleasePeriod<'info> {
     /// build reads its `mint` for the state machine's `MintMismatch`
     /// check; unused on the native-SOL path.
     pub vault_token_account: AccountInfo<'info>,
+}
+
+/// AV-160: accounts for `crank_release_period` — the permissionless
+/// subscription-period crank. Mirrors `CrankExpired`'s shape: ANY key
+/// may sign, and the payout destination is a CHECK account the
+/// handler asserts against the vault's pinned taker.
+#[derive(Accounts)]
+pub struct CrankReleasePeriod<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// AV-160: ANY key may sign — no party-membership check. The state
+    /// machine enforces the permissionless crank; the cranker receives
+    /// nothing (anti-MEV).
+    pub cranker: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the period due-date check
+    /// (and the AV-27 timelock gate) — never an instruction param
+    /// (see `Release`).
+    pub clock: AccountInfo<'info>,
+    /// CHECK: the vault's SPL token account (see `Release`). The real
+    /// build reads its `mint` for the state machine's `MintMismatch`
+    /// check; unused on the native-SOL path.
+    pub vault_token_account: AccountInfo<'info>,
+    /// CHECK: the period payout destination account. AV-160: the
+    /// handler asserts this equals the vault's pinned taker (the
+    /// AV-49 policy's always-allowed destination) — the state machine
+    /// pins it internally too, so a swapped account fails closed. The
+    /// real build transfers the period payout to this account.
+    pub payout_to: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]

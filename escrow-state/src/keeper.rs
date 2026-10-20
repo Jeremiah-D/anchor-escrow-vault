@@ -326,6 +326,20 @@ pub enum KeeperActionKind {
     /// whose next period is due at the scan time — strictly in order,
     /// one per scan.
     ReleasePeriod,
+    /// `crank_release_period(caller, now, mint)` (AV-160): the
+    /// permissionless subscription-period crank — the subscription
+    /// analogue of the AV-48 `crank_expired` convention. Listed
+    /// alongside `ReleasePeriod` for `Funded` escrows with an attached
+    /// schedule whose next period is due at the scan time, so a keeper
+    /// bot that is party to nothing can keep the schedule
+    /// liveness-safe when the initializer's push path is idle. The
+    /// caller is `"anyone"` (see [`KeeperAction::caller`]), never the
+    /// escrow's parties; the payout destination is the pinned taker
+    /// and the cranker receives zero (anti-MEV — deliberately no
+    /// keeper bounty on this crank). Withheld while paused, so a
+    /// listed crank is always executable, never a `Paused`
+    /// rejection.
+    CrankReleasePeriod,
     /// `slash(authority, amount, mint, now)` (AV-82): the
     /// default-penalty enforcement on a `Funded` escrow whose taker
     /// missed the slash deadline. Listed when
@@ -434,6 +448,7 @@ impl KeeperActionKind {
             KeeperActionKind::Resolve => "resolve",
             KeeperActionKind::PanelJudgment => "submit_panel_judgment",
             KeeperActionKind::ReleasePeriod => "release_period",
+            KeeperActionKind::CrankReleasePeriod => "crank_release_period",
             KeeperActionKind::Slash => "slash",
             KeeperActionKind::FileAppeal => "file_appeal",
             KeeperActionKind::ReviewAppeal => "review_appeal",
@@ -1697,6 +1712,56 @@ fn scan_one_keeper_escrow(w: &WatchedEscrow, now: u64, acc: &mut KeeperScanAcc) 
                 // AV-53: the off-chain correlation id rides the
                 // action so the report JSON joins it to the
                 // operator's records.
+                reference: w.reference,
+                extension_count: e.extension_count(),
+                multisig_authority: e.multisig_authority,
+                evidence_disclosure: None,
+                funding_progress: None,
+                reason: "subscription_period_due",
+                merge_source: None,
+                // AV-115: the penalty estimate is zero on non-cancel actions.
+                penalty_estimate: 0,
+                slot_unlock_at: slot_unlock_opt(e),
+                bounty_lamports: 0,
+                bounty_unprofitable: false,
+                arbiter_fee: None,
+            });
+        }
+        // AV-160: the permissionless subscription-period crank — the
+        // subscription analogue of the AV-48 `crank_expired` listing
+        // above. A keeper bot that is party to nothing cranks the next
+        // due period when the initializer's push path is idle; the
+        // party path above stays for the initializer's own keeper. The
+        // crank fails on a paused escrow (`require_not_paused`), so it
+        // is only listed when the escrow is not paused — a listed
+        // crank is always executable, never a `Paused` rejection. The
+        // due-ness check is the same one the `ReleasePeriod` listing
+        // uses (the state machine enforces the remaining gates —
+        // quorum, timelock, mint — at call time, like the AV-48
+        // convention).
+        if !e.is_paused()
+            && next < schedule.periods
+            && live_amount > 0
+            && e.subscription_period_due_at(next)
+                .map(|due_at| now >= due_at)
+                .unwrap_or(false)
+        {
+            actions.push(KeeperAction {
+                escrow_id: w.escrow_id,
+                vault_address: w.vault_address(),
+                kind: KeeperActionKind::CrankReleasePeriod,
+                // Permissionless: no specific key must sign — the
+                // keeper substitutes its own key; see `caller` docs.
+                caller: [0u8; 32],
+                caller_role: "anyone",
+                mint: e.mint(),
+                // The crank pays the pinned taker — no caller-chosen
+                // destination; the state machine asserts the pin, so
+                // the keeper builds the instruction with exactly this
+                // address. Anti-MEV: the cranker receives zero.
+                refund_to: Some(e.taker()),
+                amount: live_amount,
+                decimals: e.decimals(),
                 reference: w.reference,
                 extension_count: e.extension_count(),
                 multisig_authority: e.multisig_authority,
@@ -4091,9 +4156,12 @@ mod keeper_tests {
         // AV-56: at a period's due date the keeper lists the
         // initializer's push path for exactly the next period — and
         // nothing else (the escrow is unexpired and has no vesting).
+        // AV-160: the permissionless crank rides alongside as the
+        // second action — the AV-48 convention (CancelExpired +
+        // CrankExpired) applied to subscription periods.
         let watched = [watch(ID1, funded_subscription())];
         let report = scan_keeper_actions(&watched, sub_due_at(0));
-        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions.len(), 2);
         let a = report.actions[0];
         assert_eq!(a.kind, KeeperActionKind::ReleasePeriod);
         assert_eq!(a.escrow_id, ID1);
@@ -4107,10 +4175,30 @@ mod keeper_tests {
         assert_eq!(a.amount, SUB_PER_PERIOD);
         assert_eq!(a.decimals, 0);
         assert_eq!(a.reason, "subscription_period_due");
+        // AV-160: the crank action — permissionless caller, pinned
+        // taker payout, zero caller reward.
+        let crank = report.actions[1];
+        assert_eq!(crank.kind, KeeperActionKind::CrankReleasePeriod);
+        assert_eq!(crank.escrow_id, ID1);
+        assert_eq!(crank.caller, [0u8; 32]);
+        assert_eq!(crank.caller_role, "anyone");
+        assert_eq!(crank.mint, None);
+        assert_eq!(
+            crank.refund_to,
+            Some(BOB),
+            "the crank pins the payout to the taker"
+        );
+        assert_eq!(crank.amount, SUB_PER_PERIOD);
+        assert_eq!(crank.reason, "subscription_period_due");
         // JSON shape: the new action name and reason serialize so
         // operator tooling can route the push call.
         let json = report.to_json();
         assert!(json.contains("\"action\":\"release_period\""), "got: {json}");
+        // AV-160: the crank action serializes under its own name.
+        assert!(
+            json.contains("\"action\":\"crank_release_period\""),
+            "got: {json}"
+        );
         assert!(
             json.contains("\"reason\":\"subscription_period_due\""),
             "got: {json}"
