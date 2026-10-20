@@ -280,7 +280,10 @@ impl<'a> Cursor<'a> {
 /// Map a `state` byte to [`EscrowState`]. Declaration order is the
 /// discriminant order (Borsh unit-enum); the test below pins every arm
 /// so a reordered enum fails loudly instead of silently mis-decoding.
-fn state_from_discriminant(d: u8) -> Result<EscrowState, AccountDecodeError> {
+// AV-151: `pub(crate)` so the zero-copy hot-field view
+// (`vault_view`) maps state discriminants through the same table as
+// the full structural decoder — one source of truth.
+pub(crate) fn state_from_discriminant(d: u8) -> Result<EscrowState, AccountDecodeError> {
     match d {
         0 => Ok(EscrowState::Uninitialized),
         1 => Ok(EscrowState::Funded),

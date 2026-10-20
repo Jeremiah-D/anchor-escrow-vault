@@ -3190,6 +3190,37 @@ vault accounts without trusting them:
   `pub(crate)` primitive so this module, the AV-33 planner, and the
   test-only IDL pipeline (AV-29) all use one implementation.
 
+## Zero-copy vault hot-field view (AV-151)
+
+`escrow-state/src/vault_view.rs` is the performance complement to the
+AV-32 decoder: for the keeper/indexer hot paths that only need a handful
+of fields, the full structural decode of a 6,262-byte `Vault` account is
+wasted work. `VaultView` borrows the raw account bytes and reads the hot
+fields — `initializer`, `taker`, `amount` (locked principal), `released`,
+`expires_at`, and the `state` discriminant — at fixed `VAULT_FIELDS`
+offsets (bytes 8/40/72/80/88/96) with zero allocation and no Borsh walk.
+
+- **Never panics**: short inputs return `VaultViewError::TooShort`,
+  out-of-range reads return `VaultViewError::Truncated`, and unknown
+  `state` discriminants return
+  `VaultViewError::InvalidStateDiscriminant` — values, not traps.
+- **Offset pinning**: the test suite derives every hot-field offset by
+  accumulating `VAULT_FIELDS` lens and asserts equality with the pinned
+  constants (plus absolute tripwire values), so any layout drift fails
+  the build.
+- **Equivalence fuzzing**: a deterministic xorshift64* fuzz (512 cases)
+  randomizes every hot field on real encoded account bytes and asserts
+  the view and the full `decode_vault_account` path agree on all six
+  fields; a separate sweep over the whole `u8` domain asserts the
+  view's `EscrowState` mapping matches the decoder's for valid (0–10)
+  and invalid (11–255) discriminants alike.
+- The view is intentionally discriminator-agnostic: it reads a
+  `VAULT_FIELDS` payload, not necessarily a `Vault` account — callers
+  that need the 8-byte account-type check keep using AV-32's decoder.
+  (No performance numbers are claimed here: the design goal is avoiding
+  the full decode on scan paths; the guarantee is byte-level
+  equivalence, verified by the fuzz above.)
+
 ## Batch settlement execution plan (AV-33)
 
 `escrow-state/src/execution_plan.rs` turns the keeper report (AV-20)

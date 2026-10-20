@@ -170,6 +170,15 @@ pub use delegation::{
 // the delegation region. Pure logic, zero dependencies.
 mod swap;
 pub use swap::{link_swap, cancel_swap, cancel_swap_expired, release_swap, SWAP_LINK_REGION_LEN};
+// AV-151: zero-copy hot-field view over raw vault account bytes — the
+// keeper/indexer hot paths read `initializer` / `taker` / `amount` /
+// `released` / `expires_at` / `state` at pinned VAULT_FIELDS offsets
+// with zero allocation instead of a full structural decode.
+mod vault_view;
+pub use vault_view::{
+    VaultView, VaultViewError, AMOUNT_OFFSET, EXPIRES_AT_OFFSET, HOT_FIELDS_END, INITIALIZER_OFFSET,
+    RELEASED_OFFSET, STATE_OFFSET, TAKER_OFFSET,
+};
 
 // ---------------------------------------------------------------------------
 // SHA-256 (hand-rolled, zero dependencies).
