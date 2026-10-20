@@ -3661,6 +3661,22 @@ base64 for a multisig or CLI to sign and submit.
   range, key mismatch) fails the build instead of signing against the
   wrong table, and decode rejects malformed lookup entries. The legacy
   path is byte-identical with or without the v0 code present.
+- **Packet-size pre-flight + keeper auto-route (AV-162)**:
+  `MAX_TRANSACTION_PACKET_BYTES` (1232 — a serialized Solana transaction
+  must fit one IPv6 MTU-sized UDP packet), `wire_size_legacy` /
+  `wire_size_v0`, and `ensure_fits_packet_limit` let the keeper check a
+  to-be-signed message *before* handing it to a signer — the cluster
+  rejects an oversized message only after signing, so an unchecked
+  multi-account CPI-path message burns a signature round-trip. The demo
+  case is pinned in the tests: a 60-account CPI-path message is 2094
+  bytes in legacy form (rejected) and 269 bytes in v0 (accepted).
+  `signable_bundle_action_message_base64` is the keeper one-call route:
+  it picks v0 automatically when the bundle stamps ALT-eligible
+  accounts and the caller supplies the on-chain table's key, falls back
+  to legacy when no account is ALT-eligible, and fails loud with
+  `AltTableNotFound` when the bundle promises a table the keeper did
+  not provide — instead of silently bloating past the limit on the
+  legacy path.
 - **Pinning**: the tests assert the data bytes against the
   `INSTRUCTIONS` spec table (param name/type/order per kind), the
   account metas 1:1 against the bundle's logical accounts, the wire

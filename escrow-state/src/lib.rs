@@ -501,9 +501,10 @@ pub use execution_bundle::{
 pub use tx_message::{
     bundle_action_message_v0_base64, compile_action_message_v0, compile_message, decode_base64,
     decode_message, decode_v0_message, encode_base64, encode_message, encode_v0_message,
-    instruction_for_action, signable_message_base64, signable_message_v0_base64,
-    AddressTableLookup, CompiledInstruction, MessageHeader, ProgramInstruction,
-    TransactionMessage, TxMessageError, V0TransactionMessage,
+    ensure_fits_packet_limit, instruction_for_action, signable_bundle_action_message_base64,
+    signable_message_base64, signable_message_v0_base64, wire_size_legacy, wire_size_v0,
+    AddressTableLookup, CompiledInstruction, MessageHeader, ProgramInstruction, TransactionMessage,
+    TxMessageError, V0TransactionMessage, MAX_TRANSACTION_PACKET_BYTES,
     // AV-89: compute-budget instruction data assembly — the passthrough
     // for the AV-88 CU estimate (limit) and the AV-89 oracle
     // recommendation (price) into a submittable transaction.

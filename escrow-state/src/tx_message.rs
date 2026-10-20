@@ -69,6 +69,21 @@
 //!   static key list. The legacy path is byte-identical with or without
 //!   the v0 code present.
 //!
+//! - **Packet-size pre-flight + keeper auto-route** (AV-162) — via
+//!   [`MAX_TRANSACTION_PACKET_BYTES`] (1232, the Solana transaction
+//!   packet limit), [`wire_size_legacy`] / [`wire_size_v0`],
+//!   [`ensure_fits_packet_limit`], and
+//!   [`signable_bundle_action_message_base64`]. A multi-account
+//!   CPI-path message that exceeds the limit is rejected by the
+//!   cluster *after* signing, so the keeper checks the wire size
+//!   before handing bytes to a signer. The auto-route picks v0 when
+//!   the bundle stamps ALT-eligible accounts and the caller supplies
+//!   the on-chain table's key, falls back to legacy when no account
+//!   is ALT-eligible, and fails loud with
+//!   [`TxMessageError::AltTableNotFound`] when the bundle promises a
+//!   table the keeper did not provide — instead of silently bloating
+//!   past the limit on the legacy path.
+//!
 //! # Anti-drift
 //!
 //! [`instruction_for_action`] recomputes the discriminator from the
@@ -121,6 +136,18 @@ pub enum TxMessageError {
     InvalidAddressTableLookup,
     /// v0 decode: the first byte is not the `0x80` v0 version prefix.
     NotV0Message,
+    /// Packet pre-flight (AV-162): the message's wire bytes exceed
+    /// [`MAX_TRANSACTION_PACKET_BYTES`] — the cluster would reject it
+    /// *after* signing. Shrink the message (v0 + address-table lookups,
+    /// fewer accounts) and re-check with
+    /// [`ensure_fits_packet_limit`].
+    PacketTooLarge,
+    /// Keeper auto-route (AV-162): the bundle stamps ALT-eligible
+    /// accounts but the caller supplied no on-chain table key — the
+    /// table the bundle promises cannot be resolved. Failing loud here
+    /// instead of silently falling back to a legacy message that bloats
+    /// past the packet limit.
+    AltTableNotFound,
 }
 
 /// One program instruction ready to compile into a message: the target
@@ -867,6 +894,85 @@ pub fn bundle_action_message_v0_base64(
         address_table_key,
         &bundle.alt_table,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Packet-size pre-flight and keeper auto-route (AV-162).
+// ---------------------------------------------------------------------------
+
+/// Solana transaction packet size limit: a serialized transaction must
+/// fit in one IPv6 MTU-sized UDP packet (1280 bytes minus the IPv6 +
+/// UDP headers). A multi-account CPI-path message that exceeds this is
+/// rejected by the cluster *after* signing — the keeper pre-flights
+/// with [`ensure_fits_packet_limit`] before handing bytes to a signer.
+pub const MAX_TRANSACTION_PACKET_BYTES: usize = 1232;
+
+/// Wire size of a legacy message in bytes: exactly what
+/// [`encode_message`] emits, without keeping the allocation.
+pub fn wire_size_legacy(msg: &TransactionMessage) -> usize {
+    encode_message(msg).len()
+}
+
+/// Wire size of a v0 message in bytes: exactly what
+/// [`encode_v0_message`] emits, without keeping the allocation.
+pub fn wire_size_v0(msg: &V0TransactionMessage) -> usize {
+    encode_v0_message(msg).len()
+}
+
+/// Pre-flight a to-be-signed message's wire size against the packet
+/// limit: [`TxMessageError::PacketTooLarge`] when the message would be
+/// rejected by the cluster. The keeper shrinks the message (v0 +
+/// address-table lookups, fewer accounts, or a smaller instruction
+/// batch) and re-checks before signing.
+pub fn ensure_fits_packet_limit(wire_size: usize) -> Result<(), TxMessageError> {
+    if wire_size > MAX_TRANSACTION_PACKET_BYTES {
+        return Err(TxMessageError::PacketTooLarge);
+    }
+    Ok(())
+}
+
+/// Whether a bundled action has any ALT-eligible account: a non-signer
+/// whose `alt_index` the scan stamped. Signers never resolve through a
+/// lookup table (the runtime forbids it), so a stamped signer does not
+/// count.
+fn action_has_alt_eligible(action: &BundledAction) -> bool {
+    action
+        .accounts
+        .iter()
+        .any(|a| !a.signer && a.alt_index.is_some())
+}
+
+/// Keeper one-call route: compile a bundle action into signable base64,
+/// choosing v0 automatically when the bundle stamps ALT-eligible
+/// accounts and the caller supplies the on-chain table's key.
+///
+/// Routing:
+/// - No ALT-eligible account → legacy message (the table is
+///   irrelevant); this is the "no table, legacy fallback" leg.
+/// - ALT-eligible accounts + table key → v0, resolving against the
+///   bundle's own `alt_table` snapshot (the self-contained bundle
+///   design, AV-61). Stale snapshots still fail loud
+///   (`AltIndexOutOfBounds` / `AltTableKeyMismatch`).
+/// - ALT-eligible accounts but no table key →
+///   [`TxMessageError::AltTableNotFound`]: the bundle promises a table
+///   the keeper did not provide. Falling back to legacy here would
+///   silently bloat past the packet limit, so the route fails instead.
+///
+/// The returned bytes are still the caller's to pre-flight with
+/// [`ensure_fits_packet_limit`]: v0 shrinks the static key list, but a
+/// pathological action can exceed the limit either way.
+pub fn signable_bundle_action_message_base64(
+    program_id: Pubkey,
+    bundle: &ExecutionBundle,
+    action: &BundledAction,
+    recent_blockhash: Pubkey,
+    address_table_key: Option<[u8; 32]>,
+) -> Result<String, TxMessageError> {
+    if !action_has_alt_eligible(action) {
+        return signable_message_base64(program_id, action, recent_blockhash);
+    }
+    let key = address_table_key.ok_or(TxMessageError::AltTableNotFound)?;
+    bundle_action_message_v0_base64(program_id, bundle, action, recent_blockhash, key)
 }
 
 // ---------------------------------------------------------------------------
@@ -1802,5 +1908,139 @@ mod tx_message_tests {
         // The full fee budget line the dry-run report would show:
         // 200_000 CU × 10_000 micro-lamports/CU = 2_000 lamports.
         assert_eq!(fee_budget_lamports(200_000, rec.recommended_micro_lamports_per_cu), 2_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // AV-162: packet-size pre-flight + keeper auto-route.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wire_size_helpers_agree_with_encoders() {
+        for a in three_actions() {
+            let ix = instruction_for_action(PROGRAM_ID, &a).unwrap();
+            let legacy = compile_message(&ix, BLOCKHASH);
+            assert_eq!(wire_size_legacy(&legacy), encode_message(&legacy).len());
+            let table = snapshot_for(&a);
+            let v0 =
+                compile_action_message_v0(PROGRAM_ID, &a, BLOCKHASH, TABLE_KEY, &table).unwrap();
+            assert_eq!(wire_size_v0(&v0), encode_v0_message(&v0).len());
+        }
+    }
+
+    #[test]
+    fn packet_limit_pre_flight() {
+        assert_eq!(MAX_TRANSACTION_PACKET_BYTES, 1232);
+        // The fund message is small.
+        let actions = three_actions();
+        let ix = instruction_for_action(PROGRAM_ID, &actions[1]).unwrap();
+        let size = wire_size_legacy(&compile_message(&ix, BLOCKHASH));
+        assert!(
+            size < MAX_TRANSACTION_PACKET_BYTES,
+            "fund message is {size} bytes"
+        );
+        assert!(ensure_fits_packet_limit(size).is_ok());
+        assert!(ensure_fits_packet_limit(MAX_TRANSACTION_PACKET_BYTES).is_ok());
+        assert_eq!(
+            ensure_fits_packet_limit(MAX_TRANSACTION_PACKET_BYTES + 1),
+            Err(TxMessageError::PacketTooLarge)
+        );
+    }
+
+    #[test]
+    fn v0_shrinks_a_packet_busting_legacy_message() {
+        // The spec's motivating case: a multi-account CPI-path message
+        // that does not fit the packet limit in legacy form fits in v0.
+        let (action, table) = wide_action(60);
+        let legacy_size = wire_size_legacy(&compile_message(
+            &instruction_for_action(PROGRAM_ID, &action).unwrap(),
+            BLOCKHASH,
+        ));
+        assert!(
+            legacy_size > MAX_TRANSACTION_PACKET_BYTES,
+            "legacy is {legacy_size} bytes, expected to bust the limit"
+        );
+        assert_eq!(
+            ensure_fits_packet_limit(legacy_size),
+            Err(TxMessageError::PacketTooLarge)
+        );
+        // Exact sizes, pinned: the README quotes these numbers.
+        assert_eq!(legacy_size, 2094);
+        let v0_size = wire_size_v0(
+            &compile_action_message_v0(PROGRAM_ID, &action, BLOCKHASH, TABLE_KEY, &table)
+                .unwrap(),
+        );
+        assert!(
+            v0_size < legacy_size,
+            "v0 ({v0_size}) must shrink legacy ({legacy_size})"
+        );
+        assert!(
+            v0_size <= MAX_TRANSACTION_PACKET_BYTES,
+            "v0 is {v0_size} bytes, expected to fit"
+        );
+        assert_eq!(v0_size, 269);
+        assert!(ensure_fits_packet_limit(v0_size).is_ok());
+    }
+
+    #[test]
+    fn keeper_auto_route_picks_v0_legacy_or_fails_loud() {
+        // Real pipeline bundle: two SPL releases sharing a mint — every
+        // action stamps ALT-eligible accounts against the bundle's
+        // alt_table.
+        let items = [
+            watch(ID1, Some(funded(ALICE, Some(MINT_A))), ALICE),
+            watch(ID2, Some(funded(ALICE, Some(MINT_A))), ALICE),
+        ];
+        let report = scan_batch_lifecycle(&items, NOW);
+        let bundles = bundle_execution(&report);
+        assert_eq!(bundles.len(), 1);
+        let bundle = &bundles[0];
+        let action = &bundle.actions[0];
+        assert!(action
+            .accounts
+            .iter()
+            .any(|a| !a.signer && a.alt_index.is_some()));
+
+        // With the table key: v0.
+        let b64 = signable_bundle_action_message_base64(
+            PROGRAM_ID,
+            bundle,
+            action,
+            BLOCKHASH,
+            Some(TABLE_KEY),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_base64(&b64).unwrap()[0],
+            0x80,
+            "auto-route picks v0 when the bundle stamps ALT accounts"
+        );
+
+        // ALT-eligible but no table key: loud failure, not a silent
+        // legacy fallback.
+        assert_eq!(
+            signable_bundle_action_message_base64(PROGRAM_ID, bundle, action, BLOCKHASH, None),
+            Err(TxMessageError::AltTableNotFound)
+        );
+
+        // No ALT-eligible account: legacy, even with a table key
+        // supplied.
+        let mut plain = action.clone();
+        for a in &mut plain.accounts {
+            a.alt_index = None;
+        }
+        let b64 = signable_bundle_action_message_base64(
+            PROGRAM_ID,
+            bundle,
+            &plain,
+            BLOCKHASH,
+            Some(TABLE_KEY),
+        )
+        .unwrap();
+        let bytes = decode_base64(&b64).unwrap();
+        assert_ne!(
+            bytes[0], 0x80,
+            "auto-route falls back to legacy without ALT accounts"
+        );
+        assert!(decode_message(&bytes).is_ok());
     }
 }
