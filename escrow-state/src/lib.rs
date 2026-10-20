@@ -184,6 +184,16 @@ pub use vault_view::{
     VaultView, VaultViewError, AMOUNT_OFFSET, EXPIRES_AT_OFFSET, HOT_FIELDS_END, INITIALIZER_OFFSET,
     RELEASED_OFFSET, STATE_OFFSET, TAKER_OFFSET,
 };
+// AV-161: chain-off-chain initialize-config assembly validator — the
+// keeper/UI fails fast on a misassembled config (plan conflicts,
+// amount coverage, quorum reachability, fee rate, time consistency,
+// allowlist shape) before burning a transaction. Pure function: no
+// state reads, no state writes, no events.
+mod init_config;
+pub use init_config::{
+    validate_initialize_config, InitConfig, InitMilestones, InitQuorum, InitSubscription,
+    InitVesting,
+};
 
 // ---------------------------------------------------------------------------
 // SHA-256 (hand-rolled, zero dependencies).

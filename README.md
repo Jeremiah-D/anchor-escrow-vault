@@ -2331,6 +2331,35 @@ entry's recorded seeds (`WatchedEscrow::with_vault_seeds`) — hex when
 seeds are known, `null` otherwise; informational, never an instruction
 input.
 
+## Initialize-config assembly validator (AV-161)
+
+A keeper or UI assembles the initialize config off-chain (typically
+from JSON) before driving the chain's `initialize` + builder sequence.
+`escrow_state::validate_initialize_config(&InitConfig)` checks every
+cross-field constraint the individual builders cannot see in one pure
+pass — no state reads, no state writes, no events — so a misassembled
+config fails fast off-chain instead of burning a transaction:
+
+- the three release plans (milestones / vesting / subscription) are
+  mutually exclusive at the config layer (one escrow, one release
+  story), and the set plan's amounts cover the locked amount exactly
+  (`periods * per_period == amount` for subscriptions);
+- the quorum threshold is reachable (`1 <= threshold <= total attestor
+  weight`, at most 8 attestors);
+- the protocol fee is a valid basis-point rate (`fee_bps <= 10_000`);
+- the time fields are mutually consistent (ordered vesting window with
+  the cliff inside it, vesting completing no later than expiry, the
+  timelock not outliving the escrow, the subscription schedule fitting
+  the lifetime);
+- configured allowlists are non-empty and well-formed (mint: 1–8
+  addresses, payout: 1–4, no zero addresses).
+
+Each check mirrors the corresponding chain-side builder's validation
+(error variant included), so a config that passes here assembles
+cleanly on-chain. Keeper usage: validate the assembled `InitConfig`
+right after JSON deserialization, before building the `initialize`
+transaction.
+
 ## Expiry-warning scan (AV-136)
 
 The keeper report (AV-20) lists *already-expired* escrows. Its
