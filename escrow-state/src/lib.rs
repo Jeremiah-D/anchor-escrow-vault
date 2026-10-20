@@ -2878,6 +2878,14 @@ pub enum EscrowError {
     /// the unlock window for no reason. Never renumbered (see
     /// [`EscrowError::code`]).
     VestingNotPaused,
+    /// AV-154: [`Escrow::replace_attestor`] refused — the attestor
+    /// slot is out of range (no registered attestor occupies it) or
+    /// the replacement key is the zero address (a rotation target
+    /// must be a real key). Parallels [`EscrowError::InvalidQuorum`]
+    /// (the quorum-shape errors stay there: no quorum configured, a
+    /// duplicate key, a key that already votes at another slot). Never
+    /// renumbered (see [`EscrowError::code`]).
+    AttestorSlotInvalid,
 }
 
 impl EscrowError {
@@ -3045,6 +3053,8 @@ impl EscrowError {
             EscrowError::VestingAlreadyPaused => 213,
             // AV-150: appended, never renumbered.
             EscrowError::VestingNotPaused => 214,
+            // AV-154: appended, never renumbered.
+            EscrowError::AttestorSlotInvalid => 215,
         }
     }
 
@@ -3194,6 +3204,8 @@ impl EscrowError {
             EscrowError::VestingAlreadyPaused,
             // AV-150: appended, never renumbered.
             EscrowError::VestingNotPaused,
+            // AV-154: appended, never renumbered.
+            EscrowError::AttestorSlotInvalid,
         ]
     }
 }
@@ -10698,6 +10710,87 @@ let fee = self.charge_protocol_fee(amount)?;
             }
         }
         self.quorum = Some(new_policy);
+        Ok(())
+    }
+
+    /// Rotate one attestor's key in place by dual-signed governance
+    /// (AV-154 — Solana quorum governance): the initializer and the
+    /// taker jointly replace the key registered at `slot` (0-based,
+    /// into the quorum's registered set) with `new_attestor`.
+    ///
+    /// Why a dedicated rotation, not [`Escrow::update_attestors`]:
+    /// a compromised or lost attestor key must be swapped *without*
+    /// carrying its approval over — a rogue key's recorded vote
+    /// cannot be inherited by the replacement. `update_attestors`
+    /// deliberately remaps votes by pubkey (retained attestors keep
+    /// theirs); rotation does the opposite: the rotated slot's
+    /// approval bit is cleared, so the new key starts counting from
+    /// zero. This is the key-compromise response (rotate the key,
+    /// don't lower the threshold): the electorate's voting power is
+    /// unchanged, but the compromised key loses its vote immediately.
+    ///
+    /// The slot keeps its vote *weight* (only the key changes — the
+    /// weight-sum threshold still fits, so no threshold move is
+    /// needed) and the fixed 8-slot reservation is untouched: no
+    /// layout change, no realloc, no rent change.
+    ///
+    /// Rotating to the key already registered at `slot` succeeds as a
+    /// no-op (the vote is preserved — nothing changed), paralleling
+    /// [`Escrow::update_quorum`]'s no-op rule.
+    ///
+    /// Check order is deliberate: authority (both parties) first, then
+    /// state, then quorum configuration, then the slot, then the new
+    /// key — mirroring [`Escrow::update_quorum`], so a stranger learns
+    /// nothing about the quorum from the error alone.
+    pub fn replace_attestor(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        slot: u8,
+        new_attestor: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Both parties must sign: either key alone (or a stranger) is
+        // Unauthorized. Independent `==` checks (not `||`): the
+        // degenerate initializer == taker self-escrow authorizes with
+        // one key passed twice, like AV-12's activation.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let policy = self.quorum.as_mut().ok_or(EscrowError::InvalidQuorum)?;
+        // The slot must be occupied: rotating an empty slot would
+        // silently mint a new attestor outside the electorate.
+        let i = slot as usize;
+        if i >= policy.registered_count() as usize {
+            return Err(EscrowError::AttestorSlotInvalid);
+        }
+        // A rotation target must be a real key.
+        if new_attestor == [0u8; 32] {
+            return Err(EscrowError::AttestorSlotInvalid);
+        }
+        // Same key: no-op success, the recorded vote is preserved.
+        if policy.attestors[i] == new_attestor {
+            return Ok(());
+        }
+        // The key must not already vote at another slot — one key, one
+        // vote; a duplicate would let a single key's approval count
+        // twice toward the weight-sum threshold.
+        if policy.attestors[..policy.registered_count() as usize]
+            .iter()
+            .any(|a| *a == new_attestor)
+        {
+            return Err(EscrowError::InvalidQuorum);
+        }
+        policy.attestors[i] = new_attestor;
+        // The rotated slot's approval is cleared: the old key may be
+        // compromised, so its recorded vote must not transfer to the
+        // new key. The replacement starts counting from zero.
+        policy.approvals &= !(1u64 << i);
         Ok(())
     }
 
@@ -21795,6 +21888,158 @@ mod quorum_tests {
         assert_eq!(q.total_weight(), 5 + 1);
     }
 
+    // ---------- attestor key rotation (AV-154) ----------
+
+    #[test]
+    fn replace_attestor_rotates_key_and_clears_vote() {
+        const NEW_KEY: [u8; 32] = [0xA4; 32];
+        // Weights [1, 1, 1], threshold 2. ATTESTOR_2 votes (weight 1).
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 2).unwrap())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.attest(ATTESTOR_2).unwrap();
+        assert_eq!(e.quorum().unwrap().approved_weight(), 1);
+        // Dual-signed rotation of slot 1 (ATTESTOR_2) to NEW_KEY.
+        e.replace_attestor(ALICE, BOB, 1, NEW_KEY).unwrap();
+        let q = e.quorum().unwrap();
+        // The key changed, the other slots are untouched.
+        assert_eq!(q.attestors(), &[ATTESTOR_1, NEW_KEY, ATTESTOR_3]);
+        // The rotated slot's vote is cleared — the new key starts from
+        // zero (the old key may be compromised; its approval must not
+        // transfer).
+        assert_eq!(q.approval_count(), 0);
+        assert_eq!(q.approved_weight(), 0);
+        assert!(!q.is_satisfied());
+        // The slot keeps its weight: the electorate's voting power is
+        // unchanged, so the threshold still fits.
+        assert_eq!(q.weights(), &[1, 1, 1]);
+        assert_eq!(q.total_weight(), 3);
+        assert_eq!(q.threshold(), 2);
+    }
+
+    #[test]
+    fn replace_attestor_requires_dual_sig() {
+        const NEW_KEY: [u8; 32] = [0xA4; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap())
+            .unwrap();
+        // One party alone (or a stranger pair) cannot rotate a key.
+        assert_eq!(
+            e.replace_attestor(ALICE, MALLORY, 0, NEW_KEY),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.replace_attestor(MALLORY, BOB, 0, NEW_KEY),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.replace_attestor(MALLORY, MALLORY, 0, NEW_KEY),
+            Err(EscrowError::Unauthorized)
+        );
+        // The failed calls changed nothing.
+        assert_eq!(e.quorum().unwrap().attestors(), &[ATTESTOR_1, ATTESTOR_2]);
+        // Both parties together succeed — also on Uninitialized.
+        e.replace_attestor(ALICE, BOB, 0, NEW_KEY).unwrap();
+        assert_eq!(e.quorum().unwrap().attestors()[0], NEW_KEY);
+    }
+
+    #[test]
+    fn replace_attestor_state_gating() {
+        const NEW_KEY: [u8; 32] = [0xA4; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        // Funded: rotation works.
+        e.replace_attestor(ALICE, BOB, 0, NEW_KEY).unwrap();
+        // A terminal state refuses the rotation.
+        e.cancel(ALICE, None, ALICE, EXPIRES_AT - 1).unwrap();
+        assert_eq!(
+            e.replace_attestor(ALICE, BOB, 1, ATTESTOR_1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn replace_attestor_rejects_bad_slot_and_key() {
+        const NEW_KEY: [u8; 32] = [0xA4; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap())
+            .unwrap();
+        // No quorum configured is InvalidQuorum, not a slot error.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            plain.replace_attestor(ALICE, BOB, 0, NEW_KEY),
+            Err(EscrowError::InvalidQuorum)
+        );
+        // Slots 0..2 are occupied; anything beyond is AttestorSlotInvalid.
+        assert_eq!(
+            e.replace_attestor(ALICE, BOB, 2, NEW_KEY),
+            Err(EscrowError::AttestorSlotInvalid)
+        );
+        assert_eq!(
+            e.replace_attestor(ALICE, BOB, 7, NEW_KEY),
+            Err(EscrowError::AttestorSlotInvalid)
+        );
+        assert_eq!(
+            e.replace_attestor(ALICE, BOB, 255, NEW_KEY),
+            Err(EscrowError::AttestorSlotInvalid)
+        );
+        // A rotation target must be a real key.
+        assert_eq!(
+            e.replace_attestor(ALICE, BOB, 0, [0u8; 32]),
+            Err(EscrowError::AttestorSlotInvalid)
+        );
+        // The key must not already vote at another slot — one key, one
+        // vote.
+        assert_eq!(
+            e.replace_attestor(ALICE, BOB, 0, ATTESTOR_2),
+            Err(EscrowError::InvalidQuorum)
+        );
+        // Failed calls changed nothing.
+        assert_eq!(e.quorum().unwrap().attestors(), &[ATTESTOR_1, ATTESTOR_2]);
+    }
+
+    #[test]
+    fn replace_attestor_same_key_is_noop_preserving_vote() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.attest(ATTESTOR_1).unwrap();
+        // Rotating to the already-registered key is a no-op success —
+        // the recorded vote survives.
+        e.replace_attestor(ALICE, BOB, 0, ATTESTOR_1).unwrap();
+        let q = e.quorum().unwrap();
+        assert_eq!(q.attestors(), &[ATTESTOR_1, ATTESTOR_2]);
+        assert_eq!(q.approved_weight(), 1);
+    }
+
+    #[test]
+    fn replace_attestor_compromised_key_loses_release_gate() {
+        const NEW_KEY: [u8; 32] = [0xA4; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 2).unwrap())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        // ATTESTOR_1 is suspected compromised: it had voted.
+        e.attest(ATTESTOR_1).unwrap();
+        e.replace_attestor(ALICE, BOB, 0, NEW_KEY).unwrap();
+        // The old key is out of the electorate entirely.
+        assert_eq!(e.attest(ATTESTOR_1), Err(EscrowError::Unauthorized));
+        // The gate is still reachable: the new key plus ATTESTOR_2.
+        e.attest(NEW_KEY).unwrap();
+        e.attest(ATTESTOR_2).unwrap();
+        assert!(e.quorum().unwrap().is_satisfied());
+    }
+
     // ---------- attestation recording ----------
 
     #[test]
@@ -22418,6 +22663,42 @@ pub(crate) mod anchor_idl_tests {
                             removed ones lose theirs; a no-op same-set \
                             update succeeds silently (AttestorsUpdated \
                             indexer event only fires on a real set change)",
+        },
+        InstructionSpec {
+            // AV-154: single-slot attestor key rotation by dual-signed
+            // governance (the key-compromise response — unlike
+            // update_attestors, the rotated slot's vote is cleared).
+            name: "replace_attestor",
+            params: &[
+                (
+                    "slot",
+                    "u8",
+                    "instruction param; 0-based slot into the quorum's registered set",
+                ),
+                (
+                    "new_attestor",
+                    "Pubkey",
+                    "instruction param; the replacement key (Pubkey -> [u8; 32] conversion)",
+                ),
+            ],
+            method: "Escrow::replace_attestor",
+            input_mapping: "authority <- accounts.initializer AND \
+                            accounts.taker (BOTH signers — dual-signature \
+                            governance; one party alone is Unauthorized, \
+                            so no party can rotate a key unilaterally); \
+                            slot/new_attestor <- params; Uninitialized \
+                            or Funded only; no quorum configured is \
+                            InvalidQuorum; an unoccupied slot or a zero \
+                            replacement key is AttestorSlotInvalid; a key \
+                            that already votes at another slot is \
+                            InvalidQuorum (one key, one vote); the slot \
+                            keeps its weight and the key is replaced in \
+                            place (no layout change, no realloc); the \
+                            rotated slot's approval bit is cleared — the \
+                            new key starts counting from zero; a no-op \
+                            same-key rotation succeeds silently \
+                            (AttestorReplaced indexer event only fires on \
+                            a real key change)",
         },
         InstructionSpec {
             // AV-12: dual-signature activation.
@@ -25143,6 +25424,9 @@ pub(crate) mod anchor_idl_tests {
             "QuorumPolicy::new + Escrow::with_quorum",
             "Escrow::update_quorum",
             "Escrow::update_attestors",
+            // AV-154: single-slot attestor key rotation by dual-signed
+            // governance (the rotated slot's vote is cleared).
+            "Escrow::replace_attestor",
             "Escrow::with_dual_sig",
             "Escrow::activate",
             "VestingSchedule::new/new_with_cliff + Escrow::with_vesting/with_vesting_cliff",
@@ -25423,6 +25707,8 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_quorum",
                 &"update_quorum",
                 &"update_attestors",
+                // AV-154: the rotation target slot (u8) + the new key.
+                &"replace_attestor",
                 &"initialize_vesting",
                 &"initialize_vesting_curve",
                 // AV-122: the counter-offer carries the proposed amount
@@ -27142,6 +27428,11 @@ pub(crate) mod anchor_idl_tests {
         // bound mint lives on the vault (see `initialize_mint`); the
         // param only names the token account's mint for the check.
         ("release_many", "mint"),
+        // AV-154: the rotation slot is consumed at call time (it
+        // selects which element of `quorum.attestors` the key lands
+        // in) and never persisted — only the replacement key itself
+        // persists, into `quorum.attestors` (see PARAM_FIELD_MAP).
+        ("replace_attestor", "slot"),
     ];
     const PARAM_FIELD_MAP: &[(&str, &str, &str)] = &[
         ("initialize", "amount", "amount"),
@@ -27212,6 +27503,10 @@ pub(crate) mod anchor_idl_tests {
         // param.
         ("update_attestors", "attestors", "quorum.attestors"),
         ("update_attestors", "weights", "quorum.weights"),
+        // AV-154: the single-slot key rotation writes the selected
+        // element of the quorum's attestor array; the slot index is
+        // transient (see TRANSIENT_PARAMS).
+        ("replace_attestor", "new_attestor", "quorum.attestors"),
         ("initialize_vesting", "start", "vesting.start"),
         ("initialize_vesting", "end", "vesting.end"),
         // AV-51: the cliff param populates `vesting.cliff_at`; the
@@ -28828,6 +29123,12 @@ mod error_code_tests {
             214,
             "resume_vesting on a vesting schedule that is not paused (AV-150)",
         ),
+        // AV-154: appended, never renumbered.
+        (
+            EscrowError::AttestorSlotInvalid,
+            215,
+            "replace_attestor with an out-of-range slot or a zero replacement key (AV-154)",
+        ),
     ];
 
     #[test]
@@ -29532,6 +29833,31 @@ mod error_code_tests {
         // Nothing moved: still Disputed, nothing released.
         assert_eq!(e.state(), EscrowState::Disputed);
         assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn attestor_slot_invalid_triggered_by_out_of_range_slot() {
+        // AV-154: two registered attestors — slot 2 is empty.
+        const NEW_KEY: [u8; 32] = [0xA4; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap())
+            .unwrap();
+        let err = e.replace_attestor(ALICE, BOB, 2, NEW_KEY).unwrap_err();
+        assert_eq!(err, EscrowError::AttestorSlotInvalid);
+        assert_eq!(err.code(), 215);
+    }
+
+    #[test]
+    fn attestor_slot_invalid_triggered_by_zero_key() {
+        // AV-154: a rotation target must be a real key.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap())
+            .unwrap();
+        let err = e.replace_attestor(ALICE, BOB, 0, [0u8; 32]).unwrap_err();
+        assert_eq!(err, EscrowError::AttestorSlotInvalid);
+        assert_eq!(err.code(), 215);
     }
 }
 
@@ -35707,9 +36033,9 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_name("tranche_funded"), Some(kind));
         // AV-112 claims 59/60 next, AV-114 claims 61, AV-124 claims 67,
         // AV-127 claims 68, AV-139 claims 74, AV-140 claims 75,
-        // AV-148 claims 76, AV-149 claims 77, AV-150 claims 78/79
-        // (append-only, never renumbered).
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        // AV-148 claims 76, AV-149 claims 77, AV-150 claims 78/79,
+        // AV-154 claims 80 (append-only, never renumbered).
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -49680,7 +50006,12 @@ mod event_history_tests {
             Some(EscrowEventKind::VestingResumed),
             "AV-150: appended after VestingPaused"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(80),
+            Some(EscrowEventKind::AttestorReplaced),
+            "AV-154: appended after VestingResumed"
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -49837,8 +50168,9 @@ mod event_history_tests {
         // `EscrowsNetted` (AV-140), 76 is `TakerFunded`
         // (AV-148), 77 is `ShareClaimed`
         // (AV-149), 78 is `VestingPaused` (AV-150), 79 is
-        // `VestingResumed` (AV-150); 80 is the first still-unknown byte.
-        for bad in [80u8, 81, 255] {
+        // `VestingResumed` (AV-150), 80 is `AttestorReplaced`
+        // (AV-154); 81 is the first still-unknown byte.
+        for bad in [81u8, 82, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -53223,7 +53555,10 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::VestingAlreadyPaused));
         assert_eq!(EscrowError::VestingNotPaused.code(), 214);
         assert!(EscrowError::all().contains(&EscrowError::VestingNotPaused));
-        assert_eq!(EscrowError::all().len(), 115);
+        // AV-154: the attestor key-rotation errors.
+        assert_eq!(EscrowError::AttestorSlotInvalid.code(), 215);
+        assert!(EscrowError::all().contains(&EscrowError::AttestorSlotInvalid));
+        assert_eq!(EscrowError::all().len(), 116);
     }
 
     #[test]

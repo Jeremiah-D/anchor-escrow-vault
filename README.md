@@ -118,6 +118,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `attest(attestor)`                          | `Uninitialized`/`Activated`/`Funded` | — (no state change) | registered attestor |
 | `update_quorum(initializer, taker, threshold)` | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance); `0` or `> total weight` is `InvalidQuorum` |
 | `update_attestors(initializer, taker, attestors)` | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance; no party can unilaterally reshape the electorate); empty set / `> 8` / duplicates / new set smaller than the unchanged threshold is `InvalidQuorum`; approval bits remap by pubkey (retained votes survive, removed voters' bits cleared); emits `AttestorsUpdated` on a real set change, nothing on a no-op |
+| `replace_attestor(initializer, taker, slot, new_attestor)` (AV-154) | `Uninitialized`/`Funded` | — (no state change) | **both** parties must sign (dual-signature governance); no quorum is `InvalidQuorum`; unoccupied slot or zero replacement key is `AttestorSlotInvalid`; a key already voting at another slot is `InvalidQuorum` (one key, one vote); the slot keeps its weight (key replaced in place, no realloc); the rotated slot's approval bit is **cleared** (unlike `update_attestors` — the old key may be compromised, so its vote must not transfer); same-key rotation is a no-op; emits `AttestorReplaced` on a real key change |
 | `activate(authority)`                       | `Uninitialized`| `Uninitialized` (one party) / `Activated` (both parties) | initializer **or** taker (dual-sig escrows only) |
 | `initialize_vesting(start, end, cliff)`     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `start < end`; `cliff` 0 = no cliff, else `cliff <= end`) |
 | `claim(authority, now)`                     | `Funded`       | `Funded` (partial) / `Released` (fully vested) | taker only, only when `now` has vested more than already released (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise); with an AV-97 Dutch auction attached, `claim` prices through the descending auction cap inside `[start_at, end_at]` instead of the vesting curve (`AuctionNotActive`, code 156, outside the window) — the gross lands in the same `released` counter and the initializer reclaims the remainder via `cancel` / `cancel_partial` |
@@ -485,6 +486,24 @@ duplicates, weight/length mismatches, and zero weights are `InvalidQuorum`
 too. Passing the identical set with identical weights succeeds as a no-op;
 a real set change emits an `AttestorsUpdated` indexer event (no-op updates
 emit nothing, mirroring `update_quorum`).
+
+**Attestor key rotation (AV-154).** When a registered attestor's key is
+compromised or lost, the two parties can rotate it in place with
+`replace_attestor(initializer, taker, slot, new_attestor)` — dual-signed
+governance on `Uninitialized`/`Funded`, the same check order as
+`update_quorum` (authority → state → slot → key). The slot keeps its vote
+weight (only the key changes, so the threshold still fits — no threshold
+move needed) and the 8-slot reservation is untouched (no realloc, no rent
+change). The critical difference from `update_attestors`: the rotated
+slot's recorded approval is **cleared** — a compromised key's vote must not
+transfer to its replacement, so the new key starts counting from zero.
+This is the key-compromise response (rotate the key, don't lower the
+threshold): the electorate's voting power is unchanged but the suspect key
+loses its vote immediately. An unoccupied slot or a zero replacement key is
+`AttestorSlotInvalid`; a key already voting at another slot is
+`InvalidQuorum` (one key, one vote). Rotating to the already-registered key
+is a no-op success (the vote is preserved); a real rotation emits an
+`AttestorReplaced` indexer event.
 
 **Dual-signature activation (multisig escrow).** An escrow can require
 *two* signatures to activate (`with_dual_sig`, opt-in on `Uninitialized`,
@@ -1481,6 +1500,7 @@ program error per variant):
 | `VestingPaused` | 212 | `claim` (AV-150) while the vesting unlock clock is paused — the taker's schedule-priced pull is frozen until `resume_vesting` |
 | `VestingAlreadyPaused` | 213 | `pause_vesting` (AV-150) on an already-paused schedule — the pause is a strict toggle, so a second stamp is refused rather than silently re-stamping `paused_at` |
 | `VestingNotPaused` | 214 | `resume_vesting` (AV-150) on a live (unpaused) schedule |
+| `AttestorSlotInvalid` | 215 | `replace_attestor` (AV-154) with an out-of-range slot (no registered attestor occupies it) or a zero replacement key |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1934,7 +1954,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `KeeperBountyPaid` (AV-124), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `ShareClaimed` (AV-149), `VestingPaused` (AV-150), `VestingResumed` (AV-150), `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82), `CpiAllowlistUpdated` (AV-83), `AppealFiled` (AV-86), `AppealResolved` (AV-86), `EvidenceFiled` (AV-91), `ReleasedSplit` (AV-93), `Declined` (AV-122), `CounterOfferProposed` (AV-122), `CounterOfferAccepted` (AV-122), `CounterOfferRejected` (AV-122) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `KeeperBountyPaid` (AV-124), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `ShareClaimed` (AV-149), `VestingPaused` (AV-150), `VestingResumed` (AV-150), `AttestorReplaced` (AV-154), `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82), `CpiAllowlistUpdated` (AV-83), `AppealFiled` (AV-86), `AppealResolved` (AV-86), `EvidenceFiled` (AV-91), `ReleasedSplit` (AV-93), `Declined` (AV-122), `CounterOfferProposed` (AV-122), `CounterOfferAccepted` (AV-122), `CounterOfferRejected` (AV-122) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |

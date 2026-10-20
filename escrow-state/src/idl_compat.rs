@@ -1424,14 +1424,14 @@ mod idl_compat_tests {
 
     #[test]
     fn full_idl_parses_and_self_diffs_clean() {
-        // The real 141-instruction IDL must parse; the checked-in file
+        // The real 142-instruction IDL must parse; the checked-in file
         // diffed against itself has no changes (exercises the parser
         // on the production artifact).
         let idl = std::fs::read_to_string("../programs/escrow-vault/idl/escrow_vault.json")
             .expect("read checked-in IDL");
         let spec = parse_idl(&idl).expect("parse checked-in IDL");
-        assert_eq!(spec.instructions.len(), 141);
-        assert_eq!(spec.errors.len(), 115);
+        assert_eq!(spec.instructions.len(), 142);
+        assert_eq!(spec.errors.len(), 116);
         assert_eq!(spec.types.len(), 30);
         let diff = diff_idl(&idl, &idl).unwrap();
         assert!(diff.changes.is_empty());

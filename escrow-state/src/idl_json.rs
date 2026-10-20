@@ -1195,12 +1195,12 @@ fn idl_errors_pin_enum() {
         let name = format!("{e:?}");
         assert!(seen.insert(name.clone()), "duplicate error variant {name}");
         assert!(
-            (100..215).contains(&e.code()),
+            (100..216).contains(&e.code()),
             "error code out of pinned range: {name} = {}",
             e.code()
         );
     }
-    assert_eq!(errors.len(), 115, "error variant count drift");
+    assert_eq!(errors.len(), 116, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -1334,6 +1334,8 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::VestingPaused.code(), 212);
     assert_eq!(EscrowError::VestingAlreadyPaused.code(), 213);
     assert_eq!(EscrowError::VestingNotPaused.code(), 214);
+    // AV-154: appended, never renumbered.
+    assert_eq!(EscrowError::AttestorSlotInvalid.code(), 215);
 }
 
 #[test]

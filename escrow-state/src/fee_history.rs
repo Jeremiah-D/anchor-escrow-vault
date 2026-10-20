@@ -199,6 +199,8 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         | EscrowEventKind::MilestoneSkipped
         | EscrowEventKind::QuorumUpdated
         | EscrowEventKind::AttestorsUpdated
+        // AV-154: a quorum key rotation moves no funds.
+        | EscrowEventKind::AttestorReplaced
         | EscrowEventKind::EmergencyUnlock
         | EscrowEventKind::VaultClosed
         | EscrowEventKind::ReentryRejected
@@ -837,6 +839,8 @@ mod fee_history_tests {
                 | EscrowEventKind::MilestoneSkipped
                 | EscrowEventKind::QuorumUpdated
                 | EscrowEventKind::AttestorsUpdated
+                // AV-154: a quorum key rotation moves no funds.
+                | EscrowEventKind::AttestorReplaced
                 | EscrowEventKind::EmergencyUnlock
                 | EscrowEventKind::VaultClosed
                 | EscrowEventKind::ReentryRejected

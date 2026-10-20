@@ -1071,6 +1071,68 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Rotate one quorum attestor's key by dual-signed governance
+    /// (AV-154; mirrors `Escrow::replace_attestor`). Both the
+    /// initializer and the taker must sign — one party alone cannot
+    /// rotate a key unilaterally (a single party rotating keys could
+    /// launder a compromised key's vote through a sockpuppet).
+    /// Allowed on `Uninitialized` or `Funded` escrows; no quorum
+    /// configured is `InvalidQuorum`; an unoccupied slot or a zero
+    /// replacement key is `AttestorSlotInvalid`; a key that already
+    /// votes at another slot is `InvalidQuorum` (one key, one vote).
+    /// The slot keeps its weight and the key is replaced in place (the
+    /// quorum region is always reserved — no realloc, no rent change).
+    /// Unlike `update_attestors`, the rotated slot's approval bit is
+    /// cleared: the old key may be compromised, so its recorded vote
+    /// must not transfer to the new key. Emits `AttestorReplaced`
+    /// when the key actually changes (a no-op same-key rotation emits
+    /// nothing), mirroring `IndexedEscrow::replace_attestor`.
+    pub fn replace_attestor(
+        ctx: Context<ReplaceAttestor>,
+        slot: u8,
+        new_attestor: Pubkey,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let key_before: Option<[u8; 32]> = escrow
+            .quorum()
+            .and_then(|q| q.attestors().get(slot as usize).copied());
+        escrow
+            .replace_attestor(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                slot,
+                new_attestor.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.quorum.attestors[slot]` in place and clears
+        // the slot's approval bit in the real build (in place — the
+        // quorum region is always reserved), exactly as the state
+        // machine does.
+        let key_after: Option<[u8; 32]> = escrow
+            .quorum()
+            .and_then(|q| q.attestors().get(slot as usize).copied());
+        if key_after != key_before {
+            let state = escrow.state() as u8;
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::AttestorReplaced,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Opt in to dual-signature activation (AV-12; mirrors
     /// `Escrow::with_dual_sig`). `Uninitialized` only, like
     /// `initialize_quorum`. After this, `fund` requires the escrow to be
@@ -7199,6 +7261,11 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::update_attestors`). Mirrors
     /// `escrow_state::EscrowEventKind::AttestorsUpdated`.
     AttestorsUpdated,
+    /// AV-154: one quorum attestor's key was rotated by dual-signed
+    /// governance (`Escrow::replace_attestor`) — the rotated slot's
+    /// vote was cleared. Mirrors
+    /// `escrow_state::EscrowEventKind::AttestorReplaced`.
+    AttestorReplaced,
     /// AV-36: a fund-moving transition was rejected as a reentrant call
     /// (`EscrowError::ReentrantCall`). Mirrors
     /// `escrow_state::EscrowEventKind::ReentryRejected`.
@@ -7359,6 +7426,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         escrow_state::EscrowEventKind::QuorumUpdated => EscrowVaultEventKind::QuorumUpdated,
         escrow_state::EscrowEventKind::AttestorsUpdated => {
             EscrowVaultEventKind::AttestorsUpdated
+        }
+        escrow_state::EscrowEventKind::AttestorReplaced => {
+            EscrowVaultEventKind::AttestorReplaced
         }
         escrow_state::EscrowEventKind::ReentryRejected => {
             EscrowVaultEventKind::ReentryRejected
@@ -8124,6 +8194,18 @@ pub struct UpdateAttestors<'info> {
     /// First governance signer: must equal the escrow's initializer.
     /// Both parties must sign — one alone is `Unauthorized`, so no
     /// party can unilaterally reshape the attestor electorate.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker.
+    pub taker: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ReplaceAttestor<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone is `Unauthorized`, so no
+    /// party can rotate a quorum key unilaterally.
     pub initializer: Signer<'info>,
     /// Second governance signer: must equal the escrow's taker.
     pub taker: Signer<'info>,
@@ -10172,6 +10254,10 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::LegsCountMismatch => {
             error!(ErrorCode::LegsCountMismatch)
         }
+        // AV-154: appended, never renumbered.
+        escrow_state::EscrowError::AttestorSlotInvalid => {
+            error!(ErrorCode::AttestorSlotInvalid)
+        }
     }
 }
 
@@ -10422,4 +10508,6 @@ pub enum ErrorCode {
     VestingPaused,
     #[msg("Vesting resumed (AV-150): resume_vesting restarted the unlock clock — the schedule's start/end/cliff shifted forward by the paused duration, so the taker loses no unlock time")]
     VestingResumed,
+    #[msg("Invalid attestor slot (AV-154): replace_attestor with an out-of-range slot (no registered attestor occupies it) or a zero replacement key — a rotation target must be a real key")]
+    AttestorSlotInvalid,
 }

@@ -62,6 +62,15 @@
 //!   so a retained attestor's vote survives; a removed attestor's bit
 //!   is cleared). A no-op update (the identical set, same order) emits
 //!   nothing, paralleling `update_quorum`'s no-op rule.
+//! - `replace_attestor` emits [`EscrowEventKind::AttestorReplaced`] when
+//!   the slot's key actually changes (AV-154) — `from == to ==` the
+//!   current state, all amounts zero: the event is the ordering signal
+//!   that a quorum key was rotated, and the indexer reads the new key
+//!   from the vault. Unlike `update_attestors`, the rotated slot's
+//!   recorded vote is cleared (the old key may be compromised — its
+//!   approval must not transfer to the new key). A no-op rotation
+//!   (the same key) emits nothing, paralleling
+//!   `update_quorum`'s no-op rule.
 //! - `rotate_taker` emits [`EscrowEventKind::TakerRotated`] when the
 //!   taker actually changes (AV-52) — `from == to ==` the current
 //!   state, all amounts zero: the event is the ordering signal that the
@@ -227,7 +236,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), PartiallyCancelled, ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-73), SchemaMigrated (AV-75), TemplateApplied (AV-77), VestingPaused (AV-150), VestingResumed (AV-150) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), PartiallyCancelled, ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-73), SchemaMigrated (AV-75), TemplateApplied (AV-77), VestingPaused (AV-150), VestingResumed (AV-150), AttestorReplaced (AV-154) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, ShareClaimed (AV-149), MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | ReleasedSplit (AV-93) | gross taker amount (Σ net legs + fee) | protocol fee (AV-17, charged on the gross before the split) | 0 | 0 — the per-recipient `(recipient, net_share)` legs ride the event's `release_split` field |
 //! | BasketReleased (AV-95b) | the leg's gross remainder (taker payout + fee) | protocol fee (AV-17, charged on the leg's remainder) | 0 | 0 |
@@ -979,6 +988,19 @@ pub enum EscrowEventKind {
     /// its length is unchanged), no funds move. The actor is the
     /// initializer.
     VestingResumed,
+    /// AV-154: one attestor's key was rotated in place by dual-signed
+    /// governance
+    /// ([`Escrow::replace_attestor`](crate::Escrow::replace_attestor)).
+    /// `from == to ==` the current state (a config change, not a
+    /// lifecycle move — like
+    /// [`EscrowEventKind::AttestorsUpdated`]); the new key is read
+    /// from the vault, the event is the ordering signal. Emitted only
+    /// on an actual change: rotating to the key already registered at
+    /// the slot is an idempotent no-op that emits nothing (paralleling
+    /// [`EscrowEventKind::AttestorsUpdated`]'s no-op rule). The
+    /// rotated slot's recorded vote was cleared — the event marks the
+    /// moment the old key lost its approval.
+    AttestorReplaced,
 }
 
 impl EscrowEventKind {
@@ -1178,6 +1200,9 @@ impl EscrowEventKind {
             // AV-150: appended after VestingPaused so discriminants
             // 0–78 stay stable for already-serialized histories.
             79 => Self::VestingResumed,
+            // AV-154: appended after VestingResumed so discriminants
+            // 0–79 stay stable for already-serialized histories.
+            80 => Self::AttestorReplaced,
             _ => return None,
         })
     }
@@ -1289,6 +1314,9 @@ impl EscrowEventKind {
             // AV-150: appended after vesting_paused so the name table
             // stays stable for already-serialized histories.
             Self::VestingResumed => "vesting_resumed",
+            // AV-154: appended after vesting_resumed so the name
+            // table stays stable for already-serialized histories.
+            Self::AttestorReplaced => "attestor_replaced",
         }
     }
 
@@ -1404,6 +1432,9 @@ impl EscrowEventKind {
             // AV-150: appended after vesting_paused so the name table
             // stays stable for already-serialized histories.
             "vesting_resumed" => Self::VestingResumed,
+            // AV-154: appended after vesting_resumed so the name
+            // table stays stable for already-serialized histories.
+            "attestor_replaced" => Self::AttestorReplaced,
             _ => return None,
         })
     }
@@ -4113,6 +4144,53 @@ impl IndexedEscrow {
             None,
             None,
         );
+        }
+        Ok(())
+    }
+
+    /// Rotate one quorum attestor's key by dual-signed governance
+    /// (mirrors [`Escrow::replace_attestor`](crate::Escrow::replace_attestor)).
+    /// Emits `AttestorReplaced` when the slot's key actually changes;
+    /// a no-op rotation (the same key) emits nothing — paralleling
+    /// `update_attestors`' no-op rule. `from == to ==` the current
+    /// state: the key, not the lifecycle state, is what changed. `at`
+    /// is the caller-supplied timestamp (on-chain: the clock sysvar).
+    pub fn replace_attestor(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        slot: u8,
+        new_attestor: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before: Option<[u8; 32]> = self
+            .inner
+            .quorum()
+            .and_then(|q| q.attestors().get(slot as usize).copied());
+        self.inner
+            .replace_attestor(initializer, taker, slot, new_attestor)?;
+        let after: Option<[u8; 32]> = self
+            .inner
+            .quorum()
+            .and_then(|q| q.attestors().get(slot as usize).copied());
+        // The inner call succeeds with a configured quorum or fails (no
+        // quorum / bad slot / bad key / wrong authority / bad state), so
+        // a changed key here always means real governance. A same-key
+        // rotation is the documented no-op and emits nothing.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::AttestorReplaced,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
         }
         Ok(())
     }
@@ -7640,6 +7718,68 @@ mod event_tests {
     }
 
     #[test]
+    fn replace_attestor_emits_governance_event() {
+        // AV-154: a real key rotation emits AttestorReplaced with
+        // from == to == the current state and zero amounts — the event
+        // is the ordering signal, the new key is read from the vault.
+        // The rotated slot's vote is cleared at the wrapper level too.
+        const NEW_KEY: [u8; 32] = [0xA4; 32];
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
+        let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.attest(ATTESTOR_1, T0 + 2).unwrap();
+        e.replace_attestor(ALICE, BOB, 0, NEW_KEY, T0 + 3).unwrap();
+        assert_event(
+            &last(&e),
+            EscrowEventKind::AttestorReplaced,
+            3,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            0,
+            0,
+            0,
+            T0 + 3,
+        );
+        // The compromised key's vote is gone: the 2-of-2 is no longer
+        // satisfied even though ATTESTOR_2 never voted.
+        assert!(!e.inner().quorum().unwrap().is_satisfied());
+        assert_eq!(e.inner().quorum().unwrap().approved_weight(), 0);
+    }
+
+    #[test]
+    fn replace_attestor_noop_emits_nothing() {
+        // The same key: the state machine succeeds but nothing
+        // observable changed, so no event — paralleling
+        // `update_attestors`' no-op rule.
+        const NEW_KEY: [u8; 32] = [0xA4; 32];
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
+        let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        assert_eq!(e.event_count(), 2);
+        e.replace_attestor(ALICE, BOB, 0, ATTESTOR_1, T0 + 2).unwrap();
+        assert_eq!(e.event_count(), 2);
+        assert_eq!(e.next_seq(), 2);
+        // Sanity: a real rotation right after still emits.
+        e.replace_attestor(ALICE, BOB, 0, NEW_KEY, T0 + 3).unwrap();
+        assert_eq!(e.event_count(), 3);
+    }
+
+    #[test]
+    fn failed_replace_attestor_emits_nothing() {
+        // A bad slot is AttestorSlotInvalid: the failed governance call
+        // emits no event and the set is untouched.
+        const NEW_KEY: [u8; 32] = [0xA4; 32];
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
+        let mut e = indexed(1_000_000).with_quorum(policy).unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        assert_eq!(
+            e.replace_attestor(ALICE, BOB, 5, NEW_KEY, T0 + 2),
+            Err(EscrowError::AttestorSlotInvalid)
+        );
+        assert!(e.drain_events().len() == 2, "failed rotation emitted an event");
+    }
+
+    #[test]
     fn builders_emit_nothing() {
         let e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
             .unwrap()
@@ -8346,7 +8486,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -8449,7 +8589,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -8986,7 +9126,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -9001,7 +9141,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -9013,7 +9153,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -9025,7 +9165,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -9037,7 +9177,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -9052,7 +9192,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -9067,7 +9207,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -9079,7 +9219,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -9091,7 +9231,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -9103,7 +9243,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -9115,7 +9255,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -9127,7 +9267,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -9139,7 +9279,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -9155,7 +9295,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]
@@ -9170,7 +9310,22 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(80), None);
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+    }
+
+    #[test]
+    fn attestor_replaced_kind_round_trips() {
+        // AV-154: discriminant 80, appended after VestingResumed —
+        // 0–79 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::AttestorReplaced;
+        assert_eq!(kind.discriminant(), 80);
+        assert_eq!(EscrowEventKind::from_discriminant(80), Some(kind));
+        assert_eq!(kind.name(), "attestor_replaced");
+        assert_eq!(
+            EscrowEventKind::from_name("attestor_replaced"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(81), None);
     }
 
     #[test]

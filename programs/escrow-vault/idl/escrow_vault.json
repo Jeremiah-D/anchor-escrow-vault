@@ -157,6 +157,15 @@
       ]
     },
     {
+      "name": "replace_attestor",
+      "discriminator": [63, 184, 225, 240, 102, 147, 220, 219],
+      "accounts": [],
+      "args": [
+        {"name": "slot", "type": "u8"},
+        {"name": "new_attestor", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "initialize_dual_sig",
       "discriminator": [35, 138, 15, 52, 181, 161, 70, 198],
       "accounts": [],
@@ -1693,7 +1702,8 @@
     {"code": 211, "name": "InvalidClaimantShares"},
     {"code": 212, "name": "VestingPaused"},
     {"code": 213, "name": "VestingAlreadyPaused"},
-    {"code": 214, "name": "VestingNotPaused"}
+    {"code": 214, "name": "VestingNotPaused"},
+    {"code": 215, "name": "AttestorSlotInvalid"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
