@@ -8,6 +8,10 @@
 mod events;
 mod keeper;
 mod snapshot;
+// AV-163: program-level emergency circuit breaker — the program-wide
+// kill switch (orthogonal to the AV-46 per-escrow pause), with the
+// halt guard and the structured pause/resume audit ring.
+mod circuit_breaker;
 // AV-74: deterministic indexer-event CSV export (RFC 4180, zero
 // dependencies) — `events_to_csv` / `csv_to_events`, the
 // data-analysis / audit-ingest complement to the AV-26 snapshot JSON.
@@ -327,6 +331,13 @@ pub use multisig::{
 // types. Purely additive: no existing signature changed.
 pub use events::{
     CpiRouteAudit, EscrowEvent, EscrowEventKind, EventAmounts, IndexedEscrow, SplitChild,
+};
+
+// AV-163: program-level emergency circuit breaker — the program-wide
+// kill switch with the halt guard (`require_running`) and the bounded
+// structured pause/resume audit ring. Purely additive.
+pub use circuit_breaker::{
+    CircuitAuditEntry, CircuitBreakerEventKind, ProgramCircuitBreaker, MAX_CIRCUIT_AUDIT_ENTRIES,
 };
 
 // AV-20: off-chain keeper report — scan a batch of escrows for executable
@@ -2996,6 +3007,29 @@ pub enum EscrowError {
     /// error, plus the no-config call path). Never renumbered (see
     /// [`EscrowError::code`]).
     InvalidGovernanceDelay,
+    /// AV-163: [`ProgramCircuitBreaker::require_running`](crate::ProgramCircuitBreaker::require_running)
+    /// refused — the program-level circuit breaker is engaged, so all
+    /// state-changing instructions except `unpause_program` and
+    /// `close_vault` halt. Orthogonal to [`EscrowError::Paused`] (the
+    /// AV-46 per-escrow freeze). Never renumbered (see
+    /// [`EscrowError::code`]).
+    ProgramPaused,
+    /// AV-163: [`ProgramCircuitBreaker::pause`](crate::ProgramCircuitBreaker::pause)
+    /// refused — the breaker is already engaged. Mirrors the strict
+    /// toggle of AV-46 (`InvalidStateTransition` on a second per-escrow
+    /// pause). Never renumbered (see [`EscrowError::code`]).
+    ProgramAlreadyPaused,
+    /// AV-163: [`ProgramCircuitBreaker::unpause`](crate::ProgramCircuitBreaker::unpause)
+    /// refused — the breaker is not engaged. Never renumbered (see
+    /// [`EscrowError::code`]).
+    ProgramNotPaused,
+    /// AV-163: [`ProgramCircuitBreaker::pause`](crate::ProgramCircuitBreaker::pause)
+    /// / [`ProgramCircuitBreaker::unpause`](crate::ProgramCircuitBreaker::unpause)
+    /// refused — the caller is not the bound pauser, or the breaker was
+    /// constructed with the zero key. The pauser is an independent
+    /// program-level role (not any escrow's initializer or taker).
+    /// Never renumbered (see [`EscrowError::code`]).
+    InvalidPauser,
 }
 
 impl EscrowError {
@@ -3173,6 +3207,14 @@ impl EscrowError {
             EscrowError::GovernanceDelayNotElapsed => 218,
             EscrowError::GovernanceActionNotProposed => 219,
             EscrowError::InvalidGovernanceDelay => 220,
+            // AV-163: appended, never renumbered.
+            EscrowError::ProgramPaused => 221,
+            // AV-163: appended, never renumbered.
+            EscrowError::ProgramAlreadyPaused => 222,
+            // AV-163: appended, never renumbered.
+            EscrowError::ProgramNotPaused => 223,
+            // AV-163: appended, never renumbered.
+            EscrowError::InvalidPauser => 224,
         }
     }
 
@@ -3332,6 +3374,14 @@ impl EscrowError {
             EscrowError::GovernanceDelayNotElapsed,
             EscrowError::GovernanceActionNotProposed,
             EscrowError::InvalidGovernanceDelay,
+            // AV-163: appended, never renumbered.
+            EscrowError::ProgramPaused,
+            // AV-163: appended, never renumbered.
+            EscrowError::ProgramAlreadyPaused,
+            // AV-163: appended, never renumbered.
+            EscrowError::ProgramNotPaused,
+            // AV-163: appended, never renumbered.
+            EscrowError::InvalidPauser,
         ]
     }
 }
@@ -26732,6 +26782,29 @@ pub(crate) mod anchor_idl_tests {
             method: "Escrow::release_many",
             input_mapping: "authority <- accounts.initializer (signer); legs <- params (ReleaseLeg -> (amount, payout_to) per vault, in vault order); mint <- param (Pubkey -> [u8; 32] conversion); now <- clock sysvar (NOT an instruction param — see module docs); accounts.remaining_accounts are the N vaults in leg order (all mut — N is caller-chosen, so the vaults ride remaining accounts, not the static account struct); two-phase atomicity — phase 1 dry-runs every leg's full `release` guard chain on a shadow copy (the first failing leg returns its error with all vaults untouched), phase 2 executes on the real vaults with a defensive whole-batch snapshot (a phase-2 failure restores every vault before the error propagates; unreachable in the pure model); any leg failing aborts the whole instruction (no partial release — on-chain the failed instruction rolls every vault write back); returns the per-leg (taker_payout, fee) detail in leg order; emits one `Released` indexer event per leg (from == Funded, to == Funded/Released; amounts follow the Released shape: payout = the leg's gross amount, fee = the leg's protocol fee)",
         },
+        InstructionSpec {
+            // AV-163: the program-level emergency circuit breaker —
+            // the program-wide kill switch, orthogonal to the AV-46
+            // per-escrow pause. IDL: discriminator =
+            // sha256("global:pause_program")[..8] — the Anchor
+            // instruction discriminator for the pause_program handler
+            // (pinned by the discriminator test below).
+            name: "pause_program",
+            params: &[],
+            method: "ProgramCircuitBreaker::pause",
+            input_mapping: "authority <- accounts.pauser (signer) — the bound pauser only (a stranger is InvalidPauser, code 224; the pauser is an independent program-level role, not any escrow's initializer or taker); `now` <- clock sysvar (never an instruction param); full check sequence — pauser authority (InvalidPauser) -> toggle (ProgramAlreadyPaused, code 222, on a second pause); engages the program halt: every state-changing instruction except `unpause_program` and `close_vault` fails fast with ProgramPaused (code 221) until released; appends a ProgramPaused audit entry (actor + timestamp) to the breaker's bounded 32-entry ring; emits the ProgramPaused program event",
+        },
+        InstructionSpec {
+            // AV-163: release the program-level circuit breaker — the
+            // program resumes. IDL: discriminator =
+            // sha256("global:unpause_program")[..8] — the Anchor
+            // instruction discriminator for the unpause_program
+            // handler (pinned by the discriminator test below).
+            name: "unpause_program",
+            params: &[],
+            method: "ProgramCircuitBreaker::unpause",
+            input_mapping: "authority <- accounts.pauser (signer) — the bound pauser only (InvalidPauser, code 224, otherwise); `now` <- clock sysvar (never an instruction param); full check sequence — pauser authority (InvalidPauser) -> toggle (ProgramNotPaused, code 223, when the breaker is not engaged); releases the program halt; appends a ProgramResumed audit entry (actor + timestamp) to the breaker's bounded ring; emits the ProgramResumed program event",
+        },
     ];
 
     fn funded_escrow() -> Escrow {
@@ -27028,6 +27101,11 @@ pub(crate) mod anchor_idl_tests {
             // AV-141: atomic batch release of N escrows in one
             // instruction (the initializer's fleet settlement).
             "Escrow::release_many",
+            // AV-163: the program-level emergency circuit breaker
+            // (program-wide kill switch; the halt guard and the
+            // structured pause/resume audit).
+            "ProgramCircuitBreaker::pause",
+            "ProgramCircuitBreaker::unpause",
         ];
         assert_eq!(
             INSTRUCTIONS.len(),
@@ -30572,6 +30650,30 @@ mod error_code_tests {
             EscrowError::InvalidGovernanceDelay,
             220,
             "with_governance_delay with delay_secs == 0, propose_governance with no delay configured, or proposed_at + delay_secs overflow (AV-158)",
+        ),
+        // AV-163: appended, never renumbered.
+        (
+            EscrowError::ProgramPaused,
+            221,
+            "require_running on an engaged program-level circuit breaker — all state-changing instructions except unpause_program and close_vault halt (AV-163)",
+        ),
+        // AV-163: appended, never renumbered.
+        (
+            EscrowError::ProgramAlreadyPaused,
+            222,
+            "ProgramCircuitBreaker::pause on an already-engaged breaker (AV-163)",
+        ),
+        // AV-163: appended, never renumbered.
+        (
+            EscrowError::ProgramNotPaused,
+            223,
+            "ProgramCircuitBreaker::unpause on a running breaker (AV-163)",
+        ),
+        // AV-163: appended, never renumbered.
+        (
+            EscrowError::InvalidPauser,
+            224,
+            "ProgramCircuitBreaker::pause / unpause by a non-pauser key, or construction with the zero key (AV-163)",
         ),
     ];
 
@@ -55931,7 +56033,16 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::GovernanceActionNotProposed));
         assert_eq!(EscrowError::InvalidGovernanceDelay.code(), 220);
         assert!(EscrowError::all().contains(&EscrowError::InvalidGovernanceDelay));
-        assert_eq!(EscrowError::all().len(), 121);
+        // AV-163: the program-level circuit-breaker errors.
+        assert_eq!(EscrowError::ProgramPaused.code(), 221);
+        assert!(EscrowError::all().contains(&EscrowError::ProgramPaused));
+        assert_eq!(EscrowError::ProgramAlreadyPaused.code(), 222);
+        assert!(EscrowError::all().contains(&EscrowError::ProgramAlreadyPaused));
+        assert_eq!(EscrowError::ProgramNotPaused.code(), 223);
+        assert!(EscrowError::all().contains(&EscrowError::ProgramNotPaused));
+        assert_eq!(EscrowError::InvalidPauser.code(), 224);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidPauser));
+        assert_eq!(EscrowError::all().len(), 125);
     }
 
     #[test]

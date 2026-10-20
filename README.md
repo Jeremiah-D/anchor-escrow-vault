@@ -5302,6 +5302,45 @@ the event). The schedule is consumed on fire; a manual `unpause`
 clears it. Keeper reports list armed vaults with their exact recovery
 timestamps (`pending_auto_unpause`).
 
+## Program-level circuit breaker (AV-163)
+
+`escrow-state/src/circuit_breaker.rs` — the program-wide kill switch,
+orthogonal to the AV-46 per-escrow pause. AV-46 freezes one escrow by
+its opted-in pause authority; this freezes the whole program by an
+independent pauser role (a security key / multisig — not any escrow's
+initializer or taker, which are per-escrow roles and mean nothing at
+program scope).
+
+- **The switch**: `ProgramCircuitBreaker::new(pauser)` binds the pauser
+  (the zero key is rejected — an unbound breaker is a silent footgun).
+  `pause(pauser, now)` / `unpause(pauser, now)` toggle it; the toggle is
+  strict like AV-46 (a second pause is `ProgramAlreadyPaused`, code 222;
+  unpausing a running program is `ProgramNotPaused`, code 223) and the
+  check order is the same: pauser authority (`InvalidPauser`, code 224)
+  first, then toggle state.
+- **The halt**: `require_running()` is the guard the program calls at
+  the top of every state-changing instruction handler except
+  `unpause_program` and `close_vault` (rent reclamation must stay
+  available — the breaker never bricks funds). While engaged it returns
+  `ProgramPaused` (code 221): fail fast, before any state is touched.
+- **Structured audit**: every successful toggle appends a
+  `CircuitAuditEntry` (`ProgramPaused` / `ProgramResumed` with the actor
+  and the timestamp) to a bounded 32-entry ring — the program-level
+  event log, oldest evicts first.
+- **Anchor surface**: `pause_program` / `unpause_program` instructions
+  (IDL discriminators `sha256("global:pause_program")[..8]` /
+  `sha256("global:unpause_program")[..8]`, pinned by the IDL pipeline),
+  the `CircuitBreaker` on-chain account mirror, and the four new error
+  codes (221–224) mapped one-per-variant in the skeleton's `ErrorCode`
+  enum. Adding instructions + errors is non-breaking under the AV-152
+  semver gate, so the baseline is untouched.
+
+Honest scope: the breaker does not reach into `Escrow` methods —
+per-escrow transitions are unchanged; the program consults the guard at
+the instruction boundary. There is no pauser rotation in this round
+(the AV-47 per-escrow rotation exists; program-level rotation is a
+governance action for a later item).
+
 Layout growth: the vault body grows from 5506 to 5515 bytes (+9:
 1-byte discriminant + 8-byte timestamp), `VAULT_SPACE_NO_QUORUM` from
 5024 to 5033, `VAULT_SPACE` from 5514 to 5523, and the close-time rent

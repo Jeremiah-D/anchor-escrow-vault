@@ -4492,6 +4492,45 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Engage the program-level circuit breaker (AV-163; mirrors
+    /// `ProgramCircuitBreaker::pause`). While engaged, every
+    /// state-changing instruction except `unpause_program` and
+    /// `close_vault` fails fast with `ProgramPaused` (code 221) — the
+    /// real build calls `breaker.require_running()` at the top of each
+    /// of those handlers. Only the bound pauser may call this
+    /// (`InvalidPauser`, code 224, otherwise); the pauser is an
+    /// independent program-level role, not any escrow's initializer or
+    /// taker. Emits the `ProgramPaused` program event (actor +
+    /// timestamp from the audit entry).
+    pub fn pause_program(ctx: Context<PauseProgram>) -> Result<()> {
+        let mut breaker = read_breaker(&ctx.accounts.circuit_breaker);
+        let now = Clock::get()?.unix_timestamp as u64;
+        breaker
+            .pause(ctx.accounts.pauser.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_breaker(&mut ctx.accounts.circuit_breaker, &breaker);
+        // The real build `emit!`s the ProgramPaused program event here
+        // (the audit entry's actor + timestamp).
+        Ok(())
+    }
+
+    /// Release the program-level circuit breaker (AV-163; mirrors
+    /// `ProgramCircuitBreaker::unpause`). Same pauser rules as
+    /// `pause_program`; releasing a running program is
+    /// `ProgramNotPaused` (code 223). Deliberately NOT gated by the
+    /// halt itself — the release is the exception that ends the halt.
+    /// Emits the `ProgramResumed` program event.
+    pub fn unpause_program(ctx: Context<UnpauseProgram>) -> Result<()> {
+        let mut breaker = read_breaker(&ctx.accounts.circuit_breaker);
+        let now = Clock::get()?.unix_timestamp as u64;
+        breaker
+            .unpause(ctx.accounts.pauser.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_breaker(&mut ctx.accounts.circuit_breaker, &breaker);
+        // The real build `emit!`s the ProgramResumed program event here.
+        Ok(())
+    }
+
     /// Rotate the emergency-pause authority by owner governance (AV-47;
     /// mirrors `Escrow::rotate_pause_authority`). Only the initializer
     /// signs — the *escrow* authority, not the pause key, so a lost pause
@@ -6932,6 +6971,27 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `governance_delay_secs`).
     pub governance_proposal: Option<GovernanceProposal>,
+}
+
+/// AV-163: the on-chain mirror of `escrow_state::ProgramCircuitBreaker`
+/// — the program-level emergency circuit breaker account. A single
+/// program-wide instance (PDA `seeds = [b"circuit_breaker"]` in the real
+/// build), separate from every per-escrow `Vault`.
+///
+/// Layout: `pauser` (32 bytes) ++ `paused` (1 byte) ++ the bounded
+/// audit ring (`escrow_state::MAX_CIRCUIT_AUDIT_ENTRIES` slots ×
+/// 41 bytes: 1-byte kind + 8-byte timestamp + 32-byte actor, oldest
+/// first, zeroed when unset) — mirroring the pure-logic struct so the
+/// skeleton's `read_breaker` / `write_breaker` stay byte-exact.
+#[account]
+pub struct CircuitBreaker {
+    /// The independent pauser role: the only key that may toggle the
+    /// breaker (mirrors `escrow_state`'s `pauser`).
+    pub pauser: Pubkey,
+    /// Whether the program is currently halted.
+    pub paused: bool,
+    // The audit ring tail is reserved bytes in the real build
+    // (zeroed when unset); see the layout note above.
 }
 
 /// Skeleton mirror of `escrow_state::VestingPause` (AV-150): the
@@ -9609,6 +9669,27 @@ pub struct Unpause<'info> {
     pub pause_authority: Signer<'info>,
 }
 
+// --- AV-163: program-level circuit breaker accounts ---
+
+#[derive(Accounts)]
+pub struct PauseProgram<'info> {
+    #[account(mut)]
+    pub circuit_breaker: Account<'info, CircuitBreaker>,
+    /// The bound pauser; the state machine checks it against the
+    /// program-level pauser role (`InvalidPauser`, code 224, for anyone
+    /// else). The pauser is an independent program-level role, not any
+    /// escrow's initializer or taker.
+    pub pauser: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UnpauseProgram<'info> {
+    #[account(mut)]
+    pub circuit_breaker: Account<'info, CircuitBreaker>,
+    /// The bound pauser (same rules as `PauseProgram`).
+    pub pauser: Signer<'info>,
+}
+
 #[derive(Accounts)]
 pub struct RotatePauseAuthority<'info> {
     #[account(mut)]
@@ -10094,6 +10175,22 @@ pub struct ReleaseAndClose<'info> {
 
 fn read_escrow(_vault: &Account<Vault>) -> escrow_state::Escrow {
     unimplemented!("deserialize Vault account into escrow_state::Escrow")
+}
+
+/// AV-163: read the program-level circuit-breaker account into the
+/// pure-logic `ProgramCircuitBreaker` (mirrors `read_escrow` for the
+/// per-escrow vault).
+fn read_breaker(_breaker: &Account<CircuitBreaker>) -> escrow_state::ProgramCircuitBreaker {
+    unimplemented!("deserialize CircuitBreaker account into escrow_state::ProgramCircuitBreaker")
+}
+
+/// AV-163: write the pure-logic breaker back into the account (mirrors
+/// `write_escrow`).
+fn write_breaker(
+    _breaker: &mut Account<CircuitBreaker>,
+    _state: &escrow_state::ProgramCircuitBreaker,
+) {
+    unimplemented!("serialize escrow_state::ProgramCircuitBreaker into the CircuitBreaker account")
 }
 
 /// Skeleton helper for AV-141 `release_many`: read one of the N vaults
@@ -10842,6 +10939,19 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidGovernanceDelay => {
             error!(ErrorCode::InvalidGovernanceDelay)
         }
+        // AV-163: one program error per new EscrowError variant.
+        escrow_state::EscrowError::ProgramPaused => {
+            error!(ErrorCode::ProgramPaused)
+        }
+        escrow_state::EscrowError::ProgramAlreadyPaused => {
+            error!(ErrorCode::ProgramAlreadyPaused)
+        }
+        escrow_state::EscrowError::ProgramNotPaused => {
+            error!(ErrorCode::ProgramNotPaused)
+        }
+        escrow_state::EscrowError::InvalidPauser => {
+            error!(ErrorCode::InvalidPauser)
+        }
     }
 }
 
@@ -11142,4 +11252,13 @@ pub enum ErrorCode {
     GovernanceActionNotProposed,
     #[msg("Invalid governance delay (AV-158): with_governance_delay with a zero window — a zero window is not a delay (InvalidGovernanceDelay, code 220)")]
     InvalidGovernanceDelay,
+    // AV-163: the program-level circuit-breaker errors (codes 221-224).
+    #[msg("Program halted (AV-163): the program-level circuit breaker is engaged — state-changing instructions fail until unpause_program releases it (ProgramPaused, code 221)")]
+    ProgramPaused,
+    #[msg("Program already paused (AV-163): pause_program on an engaged breaker (ProgramAlreadyPaused, code 222)")]
+    ProgramAlreadyPaused,
+    #[msg("Program not paused (AV-163): unpause_program on a running program (ProgramNotPaused, code 223)")]
+    ProgramNotPaused,
+    #[msg("Invalid pauser (AV-163): pause_program / unpause_program by a non-pauser key, or a zero pauser key (InvalidPauser, code 224)")]
+    InvalidPauser,
 }

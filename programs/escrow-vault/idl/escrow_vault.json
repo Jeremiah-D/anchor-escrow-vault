@@ -1176,6 +1176,18 @@
         {"name": "legs", "type": {"vec": {"defined": "ReleaseLeg"}}},
         {"name": "mint", "type": {"option": "publicKey"}}
       ]
+    },
+    {
+      "name": "pause_program",
+      "discriminator": [91, 86, 253, 175, 66, 236, 172, 124],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "unpause_program",
+      "discriminator": [43, 162, 233, 92, 254, 62, 69, 58],
+      "accounts": [],
+      "args": []
     }
   ],
   "accounts": [
@@ -1793,7 +1805,11 @@
     {"code": 217, "name": "MintNotAllowlisted"},
     {"code": 218, "name": "GovernanceDelayNotElapsed"},
     {"code": 219, "name": "GovernanceActionNotProposed"},
-    {"code": 220, "name": "InvalidGovernanceDelay"}
+    {"code": 220, "name": "InvalidGovernanceDelay"},
+    {"code": 221, "name": "ProgramPaused"},
+    {"code": 222, "name": "ProgramAlreadyPaused"},
+    {"code": 223, "name": "ProgramNotPaused"},
+    {"code": 224, "name": "InvalidPauser"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

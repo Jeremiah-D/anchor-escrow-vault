@@ -1428,15 +1428,16 @@ mod idl_compat_tests {
 
     #[test]
     fn full_idl_parses_and_self_diffs_clean() {
-        // The real 149-instruction IDL must parse (AV-160 added
-        // `crank_release_period`); the checked-in file diffed against
+        // The real 151-instruction IDL must parse (AV-160 added
+        // `crank_release_period`; AV-163 adds `pause_program` /
+        // `unpause_program`); the checked-in file diffed against
         // itself has no changes (exercises the parser on the
         // production artifact).
         let idl = std::fs::read_to_string("../programs/escrow-vault/idl/escrow_vault.json")
             .expect("read checked-in IDL");
         let spec = parse_idl(&idl).expect("parse checked-in IDL");
-        assert_eq!(spec.instructions.len(), 149);
-        assert_eq!(spec.errors.len(), 121);
+        assert_eq!(spec.instructions.len(), 151);
+        assert_eq!(spec.errors.len(), 125);
         assert_eq!(spec.types.len(), 33);
         let diff = diff_idl(&idl, &idl).unwrap();
         assert!(diff.changes.is_empty());

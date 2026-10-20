@@ -55,7 +55,11 @@ use super::{
 /// source of truth for the discriminator registry: the tests pin it
 /// against `programs/escrow-vault/src/program.rs`, so a new account type
 /// on the program side fails the build until it is registered here.
-pub const PROGRAM_ACCOUNT_NAMES: &[&str] = &["Vault"];
+pub const PROGRAM_ACCOUNT_NAMES: &[&str] = &[
+    "Vault",
+    // AV-163: the program-level circuit-breaker account.
+    "CircuitBreaker",
+];
 
 /// Anchor account discriminator: `sha256("account:<name>")[..8]`.
 /// The `account:` namespace is disjoint from the instruction `global:`
