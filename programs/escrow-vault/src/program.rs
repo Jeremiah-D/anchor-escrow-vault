@@ -10355,6 +10355,56 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidMilestoneAmendment => {
             error!(ErrorCode::InvalidMilestoneAmendment)
         }
+        // AV-156: backfill — these variants were added by their AV rounds
+        // without the one-error-per-variant skeleton mapping (AV-06).
+        // Appended, never renumbered.
+        escrow_state::EscrowError::InvalidSplit => error!(ErrorCode::InvalidSplit),
+        escrow_state::EscrowError::InvalidMultisigAuthority => {
+            error!(ErrorCode::InvalidMultisigAuthority)
+        }
+        escrow_state::EscrowError::InvalidVaultSeeds => {
+            error!(ErrorCode::InvalidVaultSeeds)
+        }
+        escrow_state::EscrowError::CompoundInterestActive => {
+            error!(ErrorCode::CompoundInterestActive)
+        }
+        escrow_state::EscrowError::InvalidClaimCooldown => {
+            error!(ErrorCode::InvalidClaimCooldown)
+        }
+        escrow_state::EscrowError::InvalidCounterOffer => {
+            error!(ErrorCode::InvalidCounterOffer)
+        }
+        escrow_state::EscrowError::PartialRefundExceedsLocked => {
+            error!(ErrorCode::PartialRefundExceedsLocked)
+        }
+        escrow_state::EscrowError::TwapGateNotSatisfied => {
+            error!(ErrorCode::TwapGateNotSatisfied)
+        }
+        escrow_state::EscrowError::InvalidTwapGate => {
+            error!(ErrorCode::InvalidTwapGate)
+        }
+        escrow_state::EscrowError::BlindVoteMustReveal => {
+            error!(ErrorCode::BlindVoteMustReveal)
+        }
+        escrow_state::EscrowError::SweepGraceNotElapsed => {
+            error!(ErrorCode::SweepGraceNotElapsed)
+        }
+        escrow_state::EscrowError::ClaimantNotInRoster => {
+            error!(ErrorCode::ClaimantNotInRoster)
+        }
+        escrow_state::EscrowError::ClaimantAlreadyClaimed => {
+            error!(ErrorCode::ClaimantAlreadyClaimed)
+        }
+        escrow_state::EscrowError::InvalidClaimantShares => {
+            error!(ErrorCode::InvalidClaimantShares)
+        }
+        escrow_state::EscrowError::VestingPaused => error!(ErrorCode::VestingPaused),
+        escrow_state::EscrowError::VestingAlreadyPaused => {
+            error!(ErrorCode::VestingAlreadyPaused)
+        }
+        escrow_state::EscrowError::VestingNotPaused => {
+            error!(ErrorCode::VestingNotPaused)
+        }
     }
 }
 
@@ -10603,10 +10653,46 @@ pub enum ErrorCode {
     LegsCountMismatch,
     #[msg("Vesting paused (AV-150): pause_vesting froze the taker's unlock clock mid-flight — claim is refused (VestingPaused, code 212) until the initializer resumes")]
     VestingPaused,
-    #[msg("Vesting resumed (AV-150): resume_vesting restarted the unlock clock — the schedule's start/end/cliff shifted forward by the paused duration, so the taker loses no unlock time")]
-    VestingResumed,
+    // AV-156: this slot previously held `VestingResumed` — an indexer
+    // *event* name (EscrowEventKind, discriminant 79) mistakenly added as
+    // an error variant. Replaced in place with the real error variant so
+    // every ErrorCode after it keeps its Anchor discriminant.
+    #[msg("Vesting not paused (AV-150): resume_vesting on a live schedule — there is no paused unlock clock to resume (VestingNotPaused, code 214)")]
+    VestingNotPaused,
     #[msg("Invalid attestor slot (AV-154): replace_attestor with an out-of-range slot (no registered attestor occupies it) or a zero replacement key — a rotation target must be a real key")]
     AttestorSlotInvalid,
     #[msg("Invalid milestone amendment (AV-155): amend_milestones repricing a confirmed/settled tranche, with the wrong tranche count, a zero amount, or a sum that differs from the locked amount")]
     InvalidMilestoneAmendment,
+    // AV-156: backfill — one-error-per-variant (AV-06) completions for
+    // variants added by their AV rounds without skeleton ErrorCode
+    // entries. Appended at the end so every existing Anchor error
+    // discriminant is unchanged.
+    #[msg("Invalid escrow split (AV-81): split_escrow with an empty amount table, more than MAX_SPLIT_CHILDREN children, a zero child amount, or child amounts that do not sum to the locked amount")]
+    InvalidSplit,
+    #[msg("Invalid multisig authority (AV-84): with_multisig_authority with a zero multisig program id, a zero authority PDA, or a zero threshold; or a proposed vault-transaction instruction that does not carry the bound authority PDA as a signer")]
+    InvalidMultisigAuthority,
+    #[msg("Invalid vault PDA derivation inputs (AV-92): VaultSeeds::new / derive_vault_address with more than MAX_PDA_SEEDS seeds or a seed longer than the Solana create_program_address limits")]
+    InvalidVaultSeeds,
+    #[msg("Compound interest active (AV-117): standalone claim_interest on a compound-interest escrow — compound mode folds yield into the lockup, there is nothing separate to harvest")]
+    CompoundInterestActive,
+    #[msg("Claim cooldown not elapsed (AV-121): taker claim before the per-taker claim cooldown window elapsed")]
+    InvalidClaimCooldown,
+    #[msg("Invalid counter-offer (AV-122): propose_counter_offer with amount == 0 or a non-future expiry, or counter-offer misuse")]
+    InvalidCounterOffer,
+    #[msg("Partial refund exceeds locked (AV-127): partial_refund with an amount above the still-locked remainder")]
+    PartialRefundExceedsLocked,
+    #[msg("TWAP price gate not satisfied (AV-128): release_twap_gated / claim_twap_gated on a TWAP-gated escrow whose feed yielded no quote, a stale quote, or a price on the wrong side of the target")]
+    TwapGateNotSatisfied,
+    #[msg("Invalid TWAP gate (AV-128): with_twap_gate with window_slots == 0 or an out-of-range direction")]
+    InvalidTwapGate,
+    #[msg("Sweep grace not elapsed (AV-139): sweep_unclaimed_rent on a terminal vault whose unclaimed-rent grace period has not elapsed")]
+    SweepGraceNotElapsed,
+    #[msg("Claimant not in roster (AV-149): claim_share by a claimant not on the escrow's claimant roster (or no roster configured at all)")]
+    ClaimantNotInRoster,
+    #[msg("Claimant already claimed (AV-149): claim_share by a claimant whose share was already pulled — a second pull would double-pay the leg")]
+    ClaimantAlreadyClaimed,
+    #[msg("Invalid claimant shares (AV-149): with_claimants with an empty or oversized table, a zero claimant address, a zero share, or shares that do not sum to the locked amount")]
+    InvalidClaimantShares,
+    #[msg("Vesting already paused (AV-150): pause_vesting on an already-paused schedule — the pause is a strict toggle, so a second stamp is refused rather than silently re-stamping paused_at (VestingAlreadyPaused, code 213)")]
+    VestingAlreadyPaused,
 }
