@@ -122,6 +122,12 @@
 //!   amounts zero; a no-op re-affirmation emits nothing. The event is
 //!   the ordering signal that the schedule moved, and the indexer
 //!   reads the new tranche amounts from the vault.
+//! - `amend_milestones` emits [`EscrowEventKind::MilestonesAmended`]
+//!   when the tranche amounts actually change (AV-155) — `from == to
+//!   ==` the current state, all amounts zero; a no-op re-affirmation
+//!   emits nothing. Unlike `MilestonesAdjusted` (the pre-settlement
+//!   re-split), this is the mid-flight renegotiation: confirmed /
+//!   settled tranches stay pinned while the unconfirmed ones move.
 //! - Partial `release` / `claim` calls emit [`EscrowEventKind::Released`]
 //!   / [`EscrowEventKind::Claimed`] with `from == to == Funded`: the
 //!   `EscrowState` variant does not change, but funds moved and the
@@ -236,7 +242,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), PartiallyCancelled, ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-73), SchemaMigrated (AV-75), TemplateApplied (AV-77), VestingPaused (AV-150), VestingResumed (AV-150), AttestorReplaced (AV-154) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), PartiallyCancelled, ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-73), SchemaMigrated (AV-75), TemplateApplied (AV-77), VestingPaused (AV-150), VestingResumed (AV-150), AttestorReplaced (AV-154), MilestonesAmended (AV-155) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, ShareClaimed (AV-149), MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | ReleasedSplit (AV-93) | gross taker amount (Σ net legs + fee) | protocol fee (AV-17, charged on the gross before the split) | 0 | 0 — the per-recipient `(recipient, net_share)` legs ride the event's `release_split` field |
 //! | BasketReleased (AV-95b) | the leg's gross remainder (taker payout + fee) | protocol fee (AV-17, charged on the leg's remainder) | 0 | 0 |
@@ -1001,6 +1007,21 @@ pub enum EscrowEventKind {
     /// rotated slot's recorded vote was cleared — the event marks the
     /// moment the old key lost its approval.
     AttestorReplaced,
+    /// AV-155: the milestone tranche amounts were renegotiated by
+    /// dual-signed governance
+    /// ([`Escrow::amend_milestones`](crate::Escrow::amend_milestones)).
+    /// `from == to ==` the current state (a config change, not a
+    /// lifecycle move — like [`EscrowEventKind::QuorumUpdated`]); the
+    /// new amounts are read from the vault, the event is the ordering
+    /// signal. Emitted only on an actual change: re-affirming the
+    /// current amounts is an idempotent no-op that emits nothing
+    /// (paralleling [`EscrowEventKind::MilestonesAdjusted`]'s no-op
+    /// rule). Unlike `MilestonesAdjusted` (AV-70's pre-settlement
+    /// re-split), this fires mid-flight: confirmed/settled tranches
+    /// stay pinned while the unconfirmed ones move. All amounts are
+    /// zero — repricing moves no funds (the later tranche releases
+    /// carry the new amounts with their fees).
+    MilestonesAmended,
 }
 
 impl EscrowEventKind {
@@ -1203,6 +1224,9 @@ impl EscrowEventKind {
             // AV-154: appended after VestingResumed so discriminants
             // 0–79 stay stable for already-serialized histories.
             80 => Self::AttestorReplaced,
+            // AV-155: appended after AttestorReplaced so discriminants
+            // 0–80 stay stable for already-serialized histories.
+            81 => Self::MilestonesAmended,
             _ => return None,
         })
     }
@@ -1317,6 +1341,9 @@ impl EscrowEventKind {
             // AV-154: appended after vesting_resumed so the name
             // table stays stable for already-serialized histories.
             Self::AttestorReplaced => "attestor_replaced",
+            // AV-155: appended after attestor_replaced so the name
+            // table stays stable for already-serialized histories.
+            Self::MilestonesAmended => "milestones_amended",
         }
     }
 
@@ -1435,6 +1462,9 @@ impl EscrowEventKind {
             // AV-154: appended after vesting_resumed so the name
             // table stays stable for already-serialized histories.
             "attestor_replaced" => Self::AttestorReplaced,
+            // AV-155: appended after attestor_replaced so the name
+            // table stays stable for already-serialized histories.
+            "milestones_amended" => Self::MilestonesAmended,
             _ => return None,
         })
     }
@@ -5465,9 +5495,53 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Renegotiate the milestone tranche amounts by dual-signed
+    /// governance (mirrors [`Escrow::amend_milestones`]). Emits
+    /// `MilestonesAmended` when the amounts actually change (`from ==
+    /// to ==` the current state — the schedule, not the lifecycle
+    /// state, is what changed); a no-op re-affirmation emits nothing,
+    /// paralleling [`Escrow::adjust_milestone_amounts`]'s no-op rule.
+    /// `at` is the caller-supplied timestamp (on-chain: the clock
+    /// sysvar).
+    pub fn amend_milestones(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_amounts: &[u64],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let before: Vec<u64> = self
+            .inner
+            .milestone_plan()
+            .map(|p| (0..p.count()).map(|i| p.amount_at(i as usize).unwrap_or(0)).collect())
+            .unwrap_or_default();
+        self.inner
+            .amend_milestones(initializer, taker, new_amounts)?;
+        let after: Vec<u64> = self
+            .inner
+            .milestone_plan()
+            .map(|p| (0..p.count()).map(|i| p.amount_at(i as usize).unwrap_or(0)).collect())
+            .unwrap_or_default();
+        if after != before {
+            self.push_event(
+                EscrowEventKind::MilestonesAmended,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Re-split the subscription per-period amounts by dual-signed
-    /// governance (mirrors [`Escrow::adjust_period_amounts`]). Emits
-    /// `SubscriptionAmountsAdjusted` when the amounts actually change
+    /// governance (mirrors [`Escrow::adjust_period_amounts`]). Emits    /// `SubscriptionAmountsAdjusted` when the amounts actually change
     /// (`from == to ==` the current state — the schedule, not the
     /// lifecycle state, is what changed); a no-op re-affirmation
     /// emits nothing, paralleling
@@ -7780,6 +7854,82 @@ mod event_tests {
     }
 
     #[test]
+    fn amend_milestones_emits_governance_event() {
+        // AV-155: a mid-flight renegotiation emits MilestonesAmended
+        // with from == to == the current state and zero amounts — the
+        // event is the ordering signal, the new amounts are read from
+        // the vault. Tranche 0 is dual-confirmed (locked); the
+        // unconfirmed tranches move.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[300_000, 300_000, 400_000]).unwrap())
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.confirm_milestone(ALICE, 0, T0 + 2).unwrap();
+        e.confirm_milestone(BOB, 0, T0 + 3).unwrap();
+        assert!(e.inner().milestone_confirmed(0));
+        e.amend_milestones(ALICE, BOB, &[300_000, 400_000, 300_000], T0 + 4)
+            .unwrap();
+        assert_event(
+            &last(&e),
+            EscrowEventKind::MilestonesAmended,
+            3,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            0,
+            0,
+            0,
+            T0 + 4,
+        );
+        // The locked tranche kept its amount; the free ones moved, and
+        // the plan still covers the lockup exactly.
+        let plan = e.inner().milestone_plan().unwrap();
+        assert_eq!(plan.amount_at(0), Some(300_000));
+        assert_eq!(plan.amount_at(1), Some(400_000));
+        assert_eq!(plan.amount_at(2), Some(300_000));
+        assert_eq!(plan.total(), 1_000_000);
+    }
+
+    #[test]
+    fn amend_milestones_noop_emits_nothing() {
+        // Re-affirming the current amounts succeeds but changes
+        // nothing observable, so no event — paralleling
+        // `adjust_milestone_amounts`' no-op rule.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        assert_eq!(e.event_count(), 2);
+        e.amend_milestones(ALICE, BOB, &[400_000, 600_000], T0 + 2)
+            .unwrap();
+        assert_eq!(e.event_count(), 2);
+        assert_eq!(e.next_seq(), 2);
+    }
+
+    #[test]
+    fn failed_amend_milestones_emits_nothing() {
+        // Repricing a confirmed tranche is InvalidMilestoneAmendment:
+        // the failed governance call emits no event and the plan is
+        // untouched.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.confirm_milestone(ALICE, 0, T0 + 2).unwrap();
+        e.confirm_milestone(BOB, 0, T0 + 3).unwrap();
+        assert_eq!(
+            e.amend_milestones(ALICE, BOB, &[500_000, 500_000], T0 + 4),
+            Err(EscrowError::InvalidMilestoneAmendment)
+        );
+        assert!(e.drain_events().len() == 3, "failed amendment emitted an event");
+        let plan = e.inner().milestone_plan().unwrap();
+        assert_eq!(plan.amount_at(0), Some(400_000));
+        assert_eq!(plan.amount_at(1), Some(600_000));
+    }
+
+    #[test]
     fn builders_emit_nothing() {
         let e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
             .unwrap()
@@ -8486,7 +8636,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -8589,7 +8739,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9126,7 +9276,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9141,7 +9291,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9153,7 +9303,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9165,7 +9315,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9177,7 +9327,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9192,7 +9342,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9207,7 +9357,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9219,7 +9369,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9231,7 +9381,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9243,7 +9393,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9255,7 +9405,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9267,7 +9417,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9279,7 +9429,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9295,7 +9445,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9310,7 +9460,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -9325,7 +9475,22 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+    }
+
+    #[test]
+    fn milestones_amended_kind_round_trips() {
+        // AV-155: discriminant 81, appended after AttestorReplaced —
+        // 0–80 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::MilestonesAmended;
+        assert_eq!(kind.discriminant(), 81);
+        assert_eq!(EscrowEventKind::from_discriminant(81), Some(kind));
+        assert_eq!(kind.name(), "milestones_amended");
+        assert_eq!(
+            EscrowEventKind::from_name("milestones_amended"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]

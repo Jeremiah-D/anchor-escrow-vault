@@ -90,6 +90,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `release_milestone(authority, now, index)`        | `Funded`       | `Funded` (partial) / `Released` (final tranche) | initializer; milestone dual-confirmed (+ quorum satisfied when configured; the timelock gate when a lock is configured — `now >= unlock_at` (AV-27) or `now >= fund_at + secs` (AV-64) — `TimelockNotReached` otherwise) |
 | `skip_milestone(authority, index)`           | `Funded`       | — (no state change) | initializer **or** taker, **both** must approve (dual-sig skip; skipped tranche refunded to the initializer) |
 | `adjust_milestone_amounts(initializer, taker, new_amounts)` (AV-70) | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the tranche table) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition`; rejected once any tranche settled (`released > 0` or `skipped > 0`); new amounts must have the plan's tranche count, be all positive, and sum to exactly the locked amount; per-tranche confirmations survive (they accept the deliverable, not the amount); protocol fees charge on the new amounts at release time (still floored by `fee_cap`); emits `MilestonesAdjusted` only on an actual change |
+| `amend_milestones(initializer, taker, new_amounts)` (AV-155) | `Uninitialized`/`Funded` | — (no state change; rewrites the tranche table) | **both** parties must sign (dual-signature governance); terminal states and `Disputed` are `InvalidStateTransition`; confirmed or settled tranches keep their exact amounts (`InvalidMilestoneAmendment` on reprice); new amounts must have the plan's tranche count, be all positive, and sum to exactly the locked amount; unconfirmed tranches may be repriced mid-flight; in-place rewrite (no realloc); emits `MilestonesAmended` only on an actual change |
 | `adjust_period_amounts(initializer, taker, new_amounts)` (AV-73) | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the per-period table) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition`; released periods lock their recorded amounts (the re-split must reaffirm them — `InvalidSubscription` otherwise); new amounts must have the schedule's period count, be all positive, and sum to exactly the locked amount; protocol fees charge on the new amounts at release time (still floored by `fee_cap`); the keeper's `ReleasePeriod` action prices from the live table; emits `SubscriptionAmountsAdjusted` only on an actual change |
 | `migrate_schema()` (AV-75; AV-85: chain) | any | — (no state change; stamps the schema version) | initializer **only** (`Unauthorized` otherwise, checked before state validity); a paused escrow fails fast (`Paused`); the gate is a catch-up gate (AV-82: `schema_version < SCHEMA_VERSION` runs — an already-current vault refuses the second call and an unknown future version refuses loudly instead of skipping forward, `InvalidSchemaMigration`, code 140, either way); AV-85: the catch-up is now an explicit N → M step chain — each step re-validates the conservation invariants over the field set it carries (`released <= amount`, `released + skipped <= amount`, `fees_paid <= released`, milestone tranche sum `== amount`, plus `released + penalty_paid <= amount` from the 1 → 2 step on) and any failing step rolls the chain back to the pre-chain snapshot (zero partial migration) — a corrupt vault is refused, never migrated; emits one `SchemaMigrated` per applied step (from == to == the current state, each carrying its from → to versions), always on success; the read-only `migrate_dry_run` previews the step/field plan with zero write impact |
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
@@ -1006,6 +1007,28 @@ Protocol fees charge on the new amounts at release time via
 `protocol_fee_for` (still floored by `fee_cap`), and the indexer sees
 one `MilestonesAdjusted` event on an actual change.
 
+**Milestone tranche renegotiation (AV-155).** The mid-flight twin of the
+AV-70 re-split: `amend_milestones(initializer, taker, new_amounts)` lets
+the two parties reprice the tranche amounts *after* the plan is live —
+even once other tranches have settled — as long as every confirmed or
+settled tranche keeps its exact amount. A confirmed tranche is locked
+because the dual confirmation accepted the declared amount (repricing it
+would rewrite the accepted deal); a settled tranche is locked because
+funds already moved at its amount. Only the still-unconfirmed tranches
+may move, so a deal can be renegotiated tranche-by-tranche as
+deliverables change — e.g. with plan `[300k, 300k, 400k]` and tranche 0
+released, `[300k, 400k, 300k]` front-loads the next deliverable while the
+settled 300k stays put. Both parties must sign (dual-signature
+governance); `Uninitialized` or `Funded` only. The new amounts must have
+exactly the plan's tranche count, be all positive, and sum to *exactly*
+the locked amount (`InvalidMilestoneAmendment` otherwise; no plan
+attached is `InvalidMilestones`). The rewrite is in place — no realloc,
+no rent change; fees charge on the new amounts at release time. The
+indexer sees one `MilestonesAmended` event on an actual change. Orthogonal
+to `skip_milestone`: skipping reroutes a tranche to the refund without
+changing its amount; amending reprices unconfirmed tranches without
+rerouting them.
+
 **Subscription per-period re-split (AV-73).** The subscription twin of
 the AV-70 milestone re-split: before any release, the initializer and
 taker may jointly re-balance the per-period payout amounts via
@@ -1501,6 +1524,7 @@ program error per variant):
 | `VestingAlreadyPaused` | 213 | `pause_vesting` (AV-150) on an already-paused schedule — the pause is a strict toggle, so a second stamp is refused rather than silently re-stamping `paused_at` |
 | `VestingNotPaused` | 214 | `resume_vesting` (AV-150) on a live (unpaused) schedule |
 | `AttestorSlotInvalid` | 215 | `replace_attestor` (AV-154) with an out-of-range slot (no registered attestor occupies it) or a zero replacement key |
+| `InvalidMilestoneAmendment` | 216 | `amend_milestones` (AV-155) repricing a confirmed/settled tranche, wrong tranche count, zero amount, or sum ≠ locked amount |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1954,7 +1978,7 @@ changes in per-escrow `seq` order instead of polling account data.
 
 | field | meaning |
 |-------|---------|
-| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `KeeperBountyPaid` (AV-124), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `ShareClaimed` (AV-149), `VestingPaused` (AV-150), `VestingResumed` (AV-150), `AttestorReplaced` (AV-154), `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82), `CpiAllowlistUpdated` (AV-83), `AppealFiled` (AV-86), `AppealResolved` (AV-86), `EvidenceFiled` (AV-91), `ReleasedSplit` (AV-93), `Declined` (AV-122), `CounterOfferProposed` (AV-122), `CounterOfferAccepted` (AV-122), `CounterOfferRejected` (AV-122) |
+| `kind` | `EscrowEventKind`: `Initialized`, `Activated`, `Funded`, `Released`, `Cancelled`, `ExpiredCancelled`, `ExpiredCranked` (AV-48), `KeeperBountyPaid` (AV-124), `Attested`, `QuorumUpdated`, `AttestorsUpdated`, `Claimed`, `ShareClaimed` (AV-149), `VestingPaused` (AV-150), `VestingResumed` (AV-150), `AttestorReplaced` (AV-154), `MilestonesAmended` (AV-155), `Escalated`, `Resolved`, `MilestoneConfirmed`, `MilestoneReleased`, `MilestoneSkipped`, `MilestonesAdjusted` (AV-70), `EmergencyUnlock`, `VaultClosed`, `TakerRotated` (AV-52), `ArbiterRotated` (AV-62), `PartiallyCancelled` (AV-60), `PanelJudgment` (AV-65), `PanelResolved` (AV-65), `EvidenceSubmitted` (AV-68), `PanelThresholdChanged` (AV-69), `SubscriptionAmountsAdjusted` (AV-73), `SchemaMigrated` (AV-75), `BundlePartiallyExecuted` (AV-76), `TemplateApplied` (AV-77), `EscrowSplit` (AV-81), `Slashed` (AV-82), `CpiAllowlistUpdated` (AV-83), `AppealFiled` (AV-86), `AppealResolved` (AV-86), `EvidenceFiled` (AV-91), `ReleasedSplit` (AV-93), `Declined` (AV-122), `CounterOfferProposed` (AV-122), `CounterOfferAccepted` (AV-122), `CounterOfferRejected` (AV-122) |
 | `escrow_id` | caller-supplied 32-byte escrow identity (on-chain: the vault PDA public key) |
 | `seq` | per-escrow monotonic sequence; `0` is the `Initialized` event |
 | `from` → `to` | `EscrowState` before and after the call |

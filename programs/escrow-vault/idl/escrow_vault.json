@@ -316,6 +316,14 @@
       ]
     },
     {
+      "name": "amend_milestones",
+      "discriminator": [210, 68, 113, 187, 240, 64, 122, 162],
+      "accounts": [],
+      "args": [
+        {"name": "new_amounts", "type": {"vec": "u64"}}
+      ]
+    },
+    {
       "name": "adjust_period_amounts",
       "discriminator": [245, 12, 78, 243, 243, 197, 33, 156],
       "accounts": [],
@@ -1703,7 +1711,8 @@
     {"code": 212, "name": "VestingPaused"},
     {"code": 213, "name": "VestingAlreadyPaused"},
     {"code": 214, "name": "VestingNotPaused"},
-    {"code": 215, "name": "AttestorSlotInvalid"}
+    {"code": 215, "name": "AttestorSlotInvalid"},
+    {"code": 216, "name": "InvalidMilestoneAmendment"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

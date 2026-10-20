@@ -146,6 +146,8 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         | EscrowEventKind::AttestorsUpdated
         // AV-154: a quorum key rotation moves no funds.
         | EscrowEventKind::AttestorReplaced
+        // AV-155: a milestone repricing moves no funds.
+        | EscrowEventKind::MilestonesAmended
         | EscrowEventKind::EmergencyUnlock
         | EscrowEventKind::VaultClosed
         | EscrowEventKind::ReentryRejected
@@ -690,7 +692,7 @@ mod event_sourcing_tests {
         const FEE: u64 = 100;
         const REFUND: u64 = 700;
         const PENALTY: u64 = 50;
-        for d in 0..=80u8 {
+        for d in 0..=81u8 {
             let kind = EscrowEventKind::from_discriminant(d)
                 .unwrap_or_else(|| panic!("missing discriminant {d}"));
             let event = synth(kind, 0, PAYOUT, FEE, REFUND, PENALTY);
@@ -748,6 +750,8 @@ mod event_sourcing_tests {
                 | EscrowEventKind::AttestorsUpdated
                 // AV-154: a quorum key rotation moves no funds.
                 | EscrowEventKind::AttestorReplaced
+                // AV-155: a milestone repricing moves no funds.
+                | EscrowEventKind::MilestonesAmended
                 | EscrowEventKind::EmergencyUnlock
                 | EscrowEventKind::VaultClosed
                 | EscrowEventKind::ReentryRejected

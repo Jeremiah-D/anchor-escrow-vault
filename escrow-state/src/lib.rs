@@ -2886,6 +2886,14 @@ pub enum EscrowError {
     /// duplicate key, a key that already votes at another slot). Never
     /// renumbered (see [`EscrowError::code`]).
     AttestorSlotInvalid,
+    /// AV-155: [`Escrow::amend_milestones`] refused — the amendment
+    /// changes a confirmed or settled tranche's amount, the new
+    /// amounts have the wrong tranche count or a zero amount, or
+    /// their exact `u128` sum differs from the locked amount.
+    /// Parallels [`EscrowError::InvalidMilestones`] (the plan-shape
+    /// errors stay there: no plan attached). Never renumbered (see
+    /// [`EscrowError::code`]).
+    InvalidMilestoneAmendment,
 }
 
 impl EscrowError {
@@ -3055,6 +3063,8 @@ impl EscrowError {
             EscrowError::VestingNotPaused => 214,
             // AV-154: appended, never renumbered.
             EscrowError::AttestorSlotInvalid => 215,
+            // AV-155: appended, never renumbered.
+            EscrowError::InvalidMilestoneAmendment => 216,
         }
     }
 
@@ -3206,6 +3216,8 @@ impl EscrowError {
             EscrowError::VestingNotPaused,
             // AV-154: appended, never renumbered.
             EscrowError::AttestorSlotInvalid,
+            // AV-155: appended, never renumbered.
+            EscrowError::InvalidMilestoneAmendment,
         ]
     }
 }
@@ -18445,6 +18457,119 @@ let fee = self.charge_protocol_fee(tranche)?;
         }
         Ok(())
     }
+
+    /// Renegotiate the milestone tranche amounts by dual-signed
+    /// governance (AV-155 — Solana milestone payments / payment
+    /// fintech): the initializer and the taker may jointly rebalance
+    /// the tranche amounts *after* the plan is live — even mid-flight,
+    /// once other tranches have settled — as long as every confirmed
+    /// or settled tranche keeps its exact amount.
+    ///
+    /// The delta over [`Escrow::adjust_milestone_amounts`] (AV-70) is
+    /// the per-tranche lock: AV-70 re-splits the whole plan but only
+    /// before any settlement, and it freely re-splits confirmed
+    /// tranches. `amend_milestones` instead locks each tranche the
+    /// moment both parties confirmed it (the confirmation was given
+    /// against the declared amount — repricing it afterwards would
+    /// rewrite the accepted deal) or settled it (released or skipped —
+    /// funds already moved). Only the still-unconfirmed tranches may
+    /// move, so a deal can be renegotiated tranche-by-tranche as
+    /// deliverables change: e.g. with plan `[3000, 3000, 4000]` and
+    /// tranche 0 released, `[3000, 4000, 3000]` front-loads the next
+    /// deliverable while the settled 3000 stays put.
+    ///
+    /// The plan stays the *complete* release schedule: the new amounts
+    /// must have exactly the plan's tranche count, every amount must
+    /// be positive, and their exact `u128` sum must equal the locked
+    /// amount (so locked tranches pin their slice of the total and the
+    /// free tranches split the remainder — conservation holds by
+    /// construction, paralleling [`Escrow::with_milestones`]).
+    ///
+    /// Orthogonal to [`Escrow::skip_milestone`] (AV-15): skipping
+    /// reroutes a tranche to the initializer's refund without changing
+    /// its amount; amending reprices unconfirmed tranches without
+    /// rerouting them.
+    ///
+    /// The rewrite is in place — `VAULT_FIELDS` is untouched (the
+    /// tranche table is already reserved), so no account realloc and no
+    /// rent change. Protocol fees (AV-17/AV-63/AV-66) are computed at
+    /// release time from the live plan via [`Escrow::protocol_fee_for`],
+    /// so later tranche releases are automatically fee'd on the new
+    /// amounts (still floored by `fee_cap`).
+    ///
+    /// Check order is deliberate — pause, then dual authority, then
+    /// state, then plan configuration, then the new amounts —
+    /// mirroring [`Escrow::update_quorum`]:
+    /// 1. `Paused` while paused (AV-46) — amending is a config
+    ///    transition, not the pause key-loss escape hatch;
+    /// 2. both parties must sign: one party alone or a stranger pair
+    ///    is `Unauthorized` (independent `==` checks — the degenerate
+    ///    initializer == taker self-escrow authorizes with one key
+    ///    passed twice, like AV-12's activation);
+    /// 3. `Uninitialized` or `Funded` only: the terminal states have
+    ///    no live tranches left to amend, and `Disputed` is
+    ///    `InvalidStateTransition` (arbitration is in flight, and the
+    ///    tranches are part of what [`Escrow::resolve`] adjudicates);
+    /// 4. a milestone plan must be attached (`InvalidMilestones`
+    ///    otherwise — the plan-shape errors stay there);
+    /// 5. the new amounts must match the plan's tranche count, be all
+    ///    positive, keep every confirmed/settled tranche's amount
+    ///    exactly, and sum to exactly the locked amount
+    ///    ([`EscrowError::InvalidMilestoneAmendment`] otherwise).
+    pub fn amend_milestones(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_amounts: &[u64],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the initializer and the
+        // taker must authorize the amendment — one party alone cannot
+        // reprice the payment schedule, paralleling
+        // `adjust_milestone_amounts`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let plan = self.milestones.ok_or(EscrowError::InvalidMilestones)?;
+        let count = plan.count as usize;
+        if new_amounts.len() != count {
+            return Err(EscrowError::InvalidMilestoneAmendment);
+        }
+        let mut total: u128 = 0;
+        for (i, &amount) in new_amounts.iter().enumerate() {
+            // A tranche that releases nothing is a config error, like
+            // `MilestonePlan::new`.
+            if amount == 0 {
+                return Err(EscrowError::InvalidMilestoneAmendment);
+            }
+            // Confirmed or settled tranches are locked: the dual
+            // confirmation accepted the declared amount, and a settled
+            // tranche already moved funds. Only the still-unconfirmed
+            // tranches may be repriced.
+            if self.milestone_confirmed(i) || self.milestone_settled(i) {
+                if amount != plan.amounts[i] {
+                    return Err(EscrowError::InvalidMilestoneAmendment);
+                }
+            }
+            total += amount as u128;
+        }
+        // The plan stays the complete release schedule: the exact u128
+        // sum must equal the locked amount, so the free tranches split
+        // exactly the remainder the locked tranches leave behind.
+        if total != self.amount as u128 {
+            return Err(EscrowError::InvalidMilestoneAmendment);
+        }
+        let plan = self.milestones.as_mut().expect("plan checked above");
+        for (i, &amount) in new_amounts.iter().enumerate() {
+            plan.amounts[i] = amount;
+        }
+        Ok(())
+    }
     /// True when both parties confirmed milestone `index` for the release
     /// path (see [`Escrow::confirm_milestone`]). Out-of-range indices
     /// report `false`.
@@ -23094,6 +23219,41 @@ pub(crate) mod anchor_idl_tests {
                             protocol_fee_for (still floored by fee_cap)",
         },
         InstructionSpec {
+            // AV-155: milestone tranche renegotiation by dual-signed
+            // governance (mid-flight — confirmed/settled tranches stay
+            // pinned, the unconfirmed ones may move).
+            name: "amend_milestones",
+            params: &[(
+                "new_amounts",
+                "Vec<u64>",
+                "instruction param; the replacement tranche amounts in \
+                 release order — must have exactly the plan's tranche \
+                 count, every amount positive, every confirmed/settled \
+                 tranche's amount unchanged, and the exact u128 sum \
+                 must equal the locked amount; confirmed/settled \
+                 tranches are locked, only unconfirmed ones may move",
+            )],
+            method: "Escrow::amend_milestones",
+            input_mapping: "initializer <- accounts.initializer (signer) \
+                            AND taker <- accounts.taker (signer) — both \
+                            parties must sign, one alone (or a stranger \
+                            pair) is Unauthorized; the degenerate \
+                            initializer == taker self-escrow authorizes \
+                            with one key passed twice, like AV-12 \
+                            activation; Uninitialized / Funded only \
+                            (terminal states / Disputed are \
+                            InvalidStateTransition); new_amounts <- \
+                            param; no plan attached is InvalidMilestones; \
+                            a changed confirmed/settled tranche amount, \
+                            a wrong tranche count, a zero amount, or a \
+                            sum != locked amount is \
+                            InvalidMilestoneAmendment; rewrites the \
+                            milestone amount table in place — no layout \
+                            / rent change; protocol fees charge on the \
+                            new amounts at release time via \
+                            protocol_fee_for (still floored by fee_cap)",
+        },
+        InstructionSpec {
             // AV-73: subscription per-period re-split by dual-signed
             // governance (released periods locked).
             name: "adjust_period_amounts",
@@ -25447,6 +25607,10 @@ pub(crate) mod anchor_idl_tests {
             // AV-70: milestone tranche re-split by dual-signed
             // governance (before any settlement).
             "Escrow::adjust_milestone_amounts",
+            // AV-155: milestone tranche renegotiation by dual-signed
+            // governance (mid-flight — confirmed/settled tranches stay
+            // pinned).
+            "Escrow::amend_milestones",
             // AV-73: subscription per-period re-split by dual-signed
             // governance (released periods locked).
             "Escrow::adjust_period_amounts",
@@ -25724,6 +25888,10 @@ pub(crate) mod anchor_idl_tests {
                 &"release_milestone",
                 &"skip_milestone",
                 &"adjust_milestone_amounts",
+                // AV-155: the renegotiated tranche amounts ride as the
+                // instruction param; confirmed/settled tranches stay
+                // pinned.
+                &"amend_milestones",
                 &"adjust_period_amounts",
                 &"initialize_mint",
                 &"initialize_protocol_fee",
@@ -27572,6 +27740,11 @@ pub(crate) mod anchor_idl_tests {
         // `milestones.amounts` (params xor one field source allows
         // several params, like `released`'s two release paths).
         ("adjust_milestone_amounts", "new_amounts", "milestones.amounts"),
+        // AV-155: the mid-flight renegotiation rewrites the same
+        // amount table in place — a third param source for
+        // `milestones.amounts` (confirmed/settled tranches stay
+        // pinned, unlike AV-70's pre-settlement re-split).
+        ("amend_milestones", "new_amounts", "milestones.amounts"),
         // AV-73: the dual-signed governance adjustment rewrites the
         // live per-period amount table in place — the second writer of
         // a per-period amount region (`with_subscription` seeds it),
@@ -29129,6 +29302,12 @@ mod error_code_tests {
             215,
             "replace_attestor with an out-of-range slot or a zero replacement key (AV-154)",
         ),
+        // AV-155: appended, never renumbered.
+        (
+            EscrowError::InvalidMilestoneAmendment,
+            216,
+            "amend_milestones repricing a confirmed/settled tranche, wrong tranche count, zero amount, or sum != locked (AV-155)",
+        ),
     ];
 
     #[test]
@@ -29858,6 +30037,34 @@ mod error_code_tests {
         let err = e.replace_attestor(ALICE, BOB, 0, [0u8; 32]).unwrap_err();
         assert_eq!(err, EscrowError::AttestorSlotInvalid);
         assert_eq!(err.code(), 215);
+    }
+
+    #[test]
+    fn invalid_milestone_amendment_triggered_by_confirmed_tranche_reprice() {
+        // AV-155: tranche 0 is dual-confirmed — repricing it is refused.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        let err = e.amend_milestones(ALICE, BOB, &[500_000, 500_000]).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMilestoneAmendment);
+        assert_eq!(err.code(), 216);
+    }
+
+    #[test]
+    fn invalid_milestone_amendment_triggered_by_sum_mismatch() {
+        // AV-155: the new amounts must sum to exactly the locked amount.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let err = e.amend_milestones(ALICE, BOB, &[400_000, 500_000]).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMilestoneAmendment);
+        assert_eq!(err.code(), 216);
     }
 }
 
@@ -36034,8 +36241,8 @@ mod funding_tranche_tests {
         // AV-112 claims 59/60 next, AV-114 claims 61, AV-124 claims 67,
         // AV-127 claims 68, AV-139 claims 74, AV-140 claims 75,
         // AV-148 claims 76, AV-149 claims 77, AV-150 claims 78/79,
-        // AV-154 claims 80 (append-only, never renumbered).
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        // AV-154 claims 80, AV-155 claims 81 (append-only, never renumbered).
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
     }
 
     #[test]
@@ -41050,6 +41257,177 @@ mod adjust_milestone_amounts_tests {
         e.adjust_milestone_amounts(ALICE, BOB, &[300_000, 300_000, 400_000])
             .unwrap();
         assert_eq!(amounts_of(&e), vec![300_000, 300_000, 400_000]);
+    }
+}
+
+// ---------- AV-155: dual-signed milestone tranche renegotiation ----------
+//
+// `amend_milestones` is the mid-flight twin of AV-70's re-split:
+// confirmed or settled tranches lock their amounts (the confirmation
+// was given against the declared amount; a settled tranche already
+// moved funds) while the still-unconfirmed tranches may be repriced —
+// even after other tranches settled. The new amounts must have exactly
+// the plan's tranche count, be all positive, and sum to exactly the
+// locked amount. Only `Uninitialized` / `Funded`; a paused escrow fails
+// fast. The rewrite is in place (the tranche table is already
+// reserved) — no realloc, no rent change. Protocol fees charge on the
+// new amounts at release time via `protocol_fee_for`.
+#[cfg(test)]
+mod amend_milestones_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn plan_3() -> MilestonePlan {
+        MilestonePlan::new(&[300_000, 300_000, 400_000]).unwrap()
+    }
+
+    fn funded_3() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_3())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    fn confirm_both(e: &mut Escrow, index: u8) {
+        e.confirm_milestone(ALICE, index).unwrap();
+        e.confirm_milestone(BOB, index).unwrap();
+        assert!(e.milestone_confirmed(index as usize));
+    }
+
+    fn amounts_of(e: &Escrow) -> Vec<u64> {
+        let p = e.milestone_plan().unwrap();
+        (0..p.count()).map(|i| p.amount_at(i as usize).unwrap()).collect()
+    }
+
+    #[test]
+    fn amend_unconfirmed_tranches_mid_flight() {
+        // Tranche 0 is released (settled); tranches 1-2 are still
+        // unconfirmed and may be repriced — the settled 300_000 stays
+        // put while the free tranches split the remainder.
+        let mut e = funded_3();
+        confirm_both(&mut e, 0);
+        let (payout, fee) = e.release_milestone(ALICE, EXPIRES_AT - 1_800, 0, None, BOB).unwrap();
+        assert_eq!((payout, fee), (300_000, 0));
+        e.amend_milestones(ALICE, BOB, &[300_000, 400_000, 300_000]).unwrap();
+        assert_eq!(amounts_of(&e), vec![300_000, 400_000, 300_000]);
+        assert_eq!(e.milestone_plan().unwrap().total(), 1_000_000);
+        // The later release prices from the amended plan.
+        confirm_both(&mut e, 1);
+        let (payout, _) = e.release_milestone(ALICE, EXPIRES_AT - 900, 1, None, BOB).unwrap();
+        assert_eq!(payout, 400_000);
+    }
+
+    #[test]
+    fn amend_after_skip_settlement() {
+        // A skipped tranche is settled too: its amount is locked, the
+        // unconfirmed remainder may move.
+        let mut e = funded_3();
+        e.skip_milestone(ALICE, 0).unwrap();
+        e.skip_milestone(BOB, 0).unwrap();
+        assert!(e.milestone_settled(0));
+        e.amend_milestones(ALICE, BOB, &[300_000, 250_000, 450_000]).unwrap();
+        assert_eq!(amounts_of(&e), vec![300_000, 250_000, 450_000]);
+    }
+
+    #[test]
+    fn confirmed_tranche_amount_is_locked() {
+        // AV-155 vs AV-70: a confirmed-but-unreleased tranche cannot be
+        // repriced — the dual confirmation accepted the declared
+        // amount. AV-70's re-split allowed this before any settlement.
+        let mut e = funded_3();
+        confirm_both(&mut e, 0);
+        assert_eq!(
+            e.amend_milestones(ALICE, BOB, &[250_000, 350_000, 400_000]),
+            Err(EscrowError::InvalidMilestoneAmendment)
+        );
+        assert_eq!(amounts_of(&e), vec![300_000, 300_000, 400_000]);
+        // Re-affirming the locked amount while moving the free ones is
+        // fine.
+        e.amend_milestones(ALICE, BOB, &[300_000, 350_000, 350_000]).unwrap();
+        assert_eq!(amounts_of(&e), vec![300_000, 350_000, 350_000]);
+    }
+
+    #[test]
+    fn settled_tranche_amount_is_locked() {
+        let mut e = funded_3();
+        confirm_both(&mut e, 0);
+        e.release_milestone(ALICE, EXPIRES_AT - 1_800, 0, None, BOB).unwrap();
+        // The settled tranche moved funds at 300_000 — repricing it is
+        // refused even though the total still sums to the lockup.
+        assert_eq!(
+            e.amend_milestones(ALICE, BOB, &[300_001, 299_999, 400_000]),
+            Err(EscrowError::InvalidMilestoneAmendment)
+        );
+        assert_eq!(amounts_of(&e), vec![300_000, 300_000, 400_000]);
+    }
+
+    #[test]
+    fn amend_rejects_bad_shapes() {
+        let mut e = funded_3();
+        // Wrong tranche count.
+        assert_eq!(
+            e.amend_milestones(ALICE, BOB, &[500_000, 500_000]),
+            Err(EscrowError::InvalidMilestoneAmendment)
+        );
+        // Zero amount.
+        assert_eq!(
+            e.amend_milestones(ALICE, BOB, &[300_000, 0, 700_000]),
+            Err(EscrowError::InvalidMilestoneAmendment)
+        );
+        // Sum != locked.
+        assert_eq!(
+            e.amend_milestones(ALICE, BOB, &[300_000, 300_000, 300_000]),
+            Err(EscrowError::InvalidMilestoneAmendment)
+        );
+        // No plan attached is the plan-shape error, not the amendment
+        // error.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            plain.amend_milestones(ALICE, BOB, &[1_000_000]),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(amounts_of(&e), vec![300_000, 300_000, 400_000]);
+    }
+
+    #[test]
+    fn amend_requires_dual_sig_and_live_state() {
+        let mut e = funded_3();
+        // One party alone (or a stranger pair) cannot reprice.
+        assert_eq!(
+            e.amend_milestones(ALICE, MALLORY, &[300_000, 350_000, 350_000]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_milestones(MALLORY, BOB, &[300_000, 350_000, 350_000]),
+            Err(EscrowError::Unauthorized)
+        );
+        // Uninitialized allows the amendment (nothing confirmed yet).
+        let mut pre = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_3())
+            .unwrap();
+        pre.amend_milestones(ALICE, BOB, &[200_000, 300_000, 500_000]).unwrap();
+        // A terminal state refuses it.
+        e.cancel(ALICE, None, ALICE, EXPIRES_AT - 1).unwrap();
+        assert_eq!(
+            e.amend_milestones(ALICE, BOB, &[300_000, 350_000, 350_000]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_is_noop_when_amounts_unchanged() {
+        let mut e = funded_3();
+        e.amend_milestones(ALICE, BOB, &[300_000, 300_000, 400_000]).unwrap();
+        assert_eq!(amounts_of(&e), vec![300_000, 300_000, 400_000]);
+        assert_eq!(e.state(), EscrowState::Funded);
     }
 }
 
@@ -50011,7 +50389,12 @@ mod event_history_tests {
             Some(EscrowEventKind::AttestorReplaced),
             "AV-154: appended after VestingResumed"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(81), None);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(81),
+            Some(EscrowEventKind::MilestonesAmended),
+            "AV-155: appended after AttestorReplaced"
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(82), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -50169,8 +50552,9 @@ mod event_history_tests {
         // (AV-148), 77 is `ShareClaimed`
         // (AV-149), 78 is `VestingPaused` (AV-150), 79 is
         // `VestingResumed` (AV-150), 80 is `AttestorReplaced`
-        // (AV-154); 81 is the first still-unknown byte.
-        for bad in [81u8, 82, 255] {
+        // (AV-154), 81 is `MilestonesAmended` (AV-155); 82 is the
+        // first still-unknown byte.
+        for bad in [82u8, 83, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -53558,7 +53942,10 @@ mod arbiter_panel_tests {
         // AV-154: the attestor key-rotation errors.
         assert_eq!(EscrowError::AttestorSlotInvalid.code(), 215);
         assert!(EscrowError::all().contains(&EscrowError::AttestorSlotInvalid));
-        assert_eq!(EscrowError::all().len(), 116);
+        // AV-155: the milestone renegotiation errors.
+        assert_eq!(EscrowError::InvalidMilestoneAmendment.code(), 216);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidMilestoneAmendment));
+        assert_eq!(EscrowError::all().len(), 117);
     }
 
     #[test]

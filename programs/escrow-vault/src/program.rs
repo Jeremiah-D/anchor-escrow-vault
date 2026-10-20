@@ -4652,6 +4652,73 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Renegotiate the milestone tranche amounts by dual-signed
+    /// governance (AV-155; mirrors `Escrow::amend_milestones`). Both
+    /// the *current* initializer and the *current* taker must sign —
+    /// one party alone (or a stranger pair) is `Unauthorized`; the
+    /// degenerate initializer == taker self-escrow authorizes with one
+    /// key passed twice, like AV-12 activation. Only `Uninitialized` /
+    /// `Funded`: the terminal states have no live tranches left to
+    /// amend, and `Disputed` is `InvalidStateTransition` (arbitration in
+    /// flight adjudicates the tranches). Confirmed or settled tranches
+    /// keep their exact amounts — repricing one is
+    /// `InvalidMilestoneAmendment`; only the still-unconfirmed tranches
+    /// may move, so the deal can be renegotiated mid-flight. The new
+    /// amounts must have exactly the plan's tranche count, be all
+    /// positive, and sum to exactly the locked amount
+    /// (`InvalidMilestoneAmendment` otherwise); no plan attached is
+    /// `InvalidMilestones`. A paused escrow fails fast (`Paused`). The
+    /// rewrite is in place (the tranche table is always reserved) — no
+    /// realloc, no rent change. Protocol fees charge on the new amounts
+    /// at release time via `protocol_fee_for` (still floored by
+    /// `fee_cap`). Emits `MilestonesAmended` only on an actual change
+    /// (a no-op re-affirmation emits nothing), mirroring
+    /// `IndexedEscrow::amend_milestones`.
+    pub fn amend_milestones(
+        ctx: Context<AmendMilestones>,
+        new_amounts: Vec<u64>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before: Vec<u64> = escrow
+            .milestone_plan()
+            .map(|p| (0..p.count()).map(|i| p.amount_at(i as usize).unwrap_or(0)).collect())
+            .unwrap_or_default();
+        escrow
+            .amend_milestones(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &new_amounts,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `vault.milestones.amounts` table in place (the
+        // 8-slot region is always reserved, zeroed when no plan) — no
+        // realloc, no rent change.
+        let after: Vec<u64> = escrow
+            .milestone_plan()
+            .map(|p| (0..p.count()).map(|i| p.amount_at(i as usize).unwrap_or(0)).collect())
+            .unwrap_or_default();
+        if after != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::MilestonesAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Re-split the subscription per-period amounts by dual-signed
     /// governance (AV-73; mirrors `Escrow::adjust_period_amounts`). Both
     /// the *current* initializer and the *current* taker must sign —
@@ -7266,6 +7333,12 @@ pub enum EscrowVaultEventKind {
     /// vote was cleared. Mirrors
     /// `escrow_state::EscrowEventKind::AttestorReplaced`.
     AttestorReplaced,
+    /// AV-155: the milestone tranche amounts were renegotiated by
+    /// dual-signed governance (`Escrow::amend_milestones`) —
+    /// confirmed/settled tranches stayed pinned while the unconfirmed
+    /// ones moved. Mirrors
+    /// `escrow_state::EscrowEventKind::MilestonesAmended`.
+    MilestonesAmended,
     /// AV-36: a fund-moving transition was rejected as a reentrant call
     /// (`EscrowError::ReentrantCall`). Mirrors
     /// `escrow_state::EscrowEventKind::ReentryRejected`.
@@ -7429,6 +7502,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::AttestorReplaced => {
             EscrowVaultEventKind::AttestorReplaced
+        }
+        escrow_state::EscrowEventKind::MilestonesAmended => {
+            EscrowVaultEventKind::MilestonesAmended
         }
         escrow_state::EscrowEventKind::ReentryRejected => {
             EscrowVaultEventKind::ReentryRejected
@@ -9330,6 +9406,23 @@ pub struct AdjustMilestoneAmounts<'info> {
     pub taker: Signer<'info>,
 }
 
+/// AV-155: accounts for `amend_milestones` — the dual-signed
+/// milestone tranche renegotiation (confirmed/settled tranches stay
+/// pinned, the unconfirmed ones may move).
+pub struct AmendMilestones<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's *current*
+    /// initializer. Both parties must sign — one alone (or a stranger
+    /// pair) is `Unauthorized`; the degenerate initializer == taker
+    /// self-escrow authorizes with one key passed twice, like AV-12
+    /// activation.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's *current*
+    /// taker.
+    pub taker: Signer<'info>,
+}
+
 #[derive(Accounts)]
 /// AV-73: accounts for `adjust_period_amounts` — the dual-signed
 /// subscription per-period re-split.
@@ -10258,6 +10351,10 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::AttestorSlotInvalid => {
             error!(ErrorCode::AttestorSlotInvalid)
         }
+        // AV-155: appended, never renumbered.
+        escrow_state::EscrowError::InvalidMilestoneAmendment => {
+            error!(ErrorCode::InvalidMilestoneAmendment)
+        }
     }
 }
 
@@ -10510,4 +10607,6 @@ pub enum ErrorCode {
     VestingResumed,
     #[msg("Invalid attestor slot (AV-154): replace_attestor with an out-of-range slot (no registered attestor occupies it) or a zero replacement key — a rotation target must be a real key")]
     AttestorSlotInvalid,
+    #[msg("Invalid milestone amendment (AV-155): amend_milestones repricing a confirmed/settled tranche, with the wrong tranche count, a zero amount, or a sum that differs from the locked amount")]
+    InvalidMilestoneAmendment,
 }
