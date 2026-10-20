@@ -3558,6 +3558,29 @@ consume directly.
   keeper's dry-run report (`all_ok` green light, per-action
   `executed`/`failed`/`skipped` with `error:{name,code}`).
 
+## Release preview (AV-159)
+
+`Escrow::preview_release(authority, now, amount, mint, payout_to)`
+is the keeper's pre-execution sizing tool: it runs the exact
+`release` guard chain and settlement math on a discarded shadow
+clone and returns the `{payout, fee, refund}` split the real call
+would produce — zero state change, zero events.
+
+```rust
+let preview = escrow.preview_release(ALICE, now, amount, None, BOB)?;
+println!("payout: {}, fee: {}, refund: {}", preview.payout, preview.fee, preview.refund);
+assert_eq!(preview.payout + preview.fee + preview.refund, escrow.lockup_total());
+```
+
+Use it before assembling `release` / `claim` /
+`release_milestone` / CPI calls to size transfers, validate that a
+planned amount passes every gate (authority → state → mint
+allowlist → quorum → timelock → amount), and confirm the fee split —
+without touching the escrow. This complements
+`cpi::payout_plan` (post-hoc consistency validation):
+`preview_release` is for pre-execution measurement,
+`payout_plan` for post-execution verification.
+
 ## Signable transaction messages (AV-71)
 
 `escrow-state/src/tx_message.rs` is the last mile after the AV-61

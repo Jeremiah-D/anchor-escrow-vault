@@ -712,6 +712,20 @@ pub const DEFAULT_RENT_SWEEP_GRACE_SECS: u64 = 30 * 24 * 3600;
 /// authority). Pass `u64::MAX` as `expires_at` for an escrow with no
 /// timeout; `0` means it is eligible for expiry cancellation as soon as
 /// it is funded.
+// AV-159: the pre-execution release preview — the exact {payout, fee,
+// refund} split a `release` call would produce, computed without
+// executing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleasePreview {
+    /// The net payout the taker would receive.
+    pub payout: u64,
+    /// The protocol fee the release would charge.
+    pub fee: u64,
+    /// The gross lockup remainder (`lockup_total() - amount`) — the
+    /// notional refund base, not a settled refund.
+    pub refund: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Escrow {
     initializer: [u8; 32],
@@ -9227,6 +9241,42 @@ impl Escrow {
         // caller. Thin by design: one settlement implementation, zero
         // gate drift between the paths.
         self.release_impl(authority, now, amount, mint, payout_to, false)
+    }
+
+    /// Preview a release without executing it (AV-159).
+    ///
+    /// Runs the exact `release` guard chain and settlement math on a
+    /// discarded shadow clone, so the preview penetrates every gate
+    /// (authority → state → mint allowlist → quorum → timelock →
+    /// amount) with the caller-chosen values and returns the exact
+    /// {payout, fee, refund} split the real call would produce.
+    /// Zero state change and zero events by construction (the shadow
+    /// is dropped; `&self` is never mutated).
+    ///
+    /// `refund` is the gross lockup remainder (`lockup_total() -
+    /// amount`) — the notional refund base, not a settled refund.
+    /// Conservation: `payout + fee + refund == lockup_total()` (+ any
+    /// bundled AV-107 interest, which rides the payout).
+    ///
+    /// This complements `cpi::payout_plan` (which does post-hoc
+    /// consistency validation): `preview_release` is the pre-execution
+    /// sizing tool for keepers assembling
+    /// release/claim/release_milestone/CPI calls.
+    pub fn preview_release(
+        &self,
+        authority: [u8; 32],
+        now: u64,
+        amount: u64,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+    ) -> Result<ReleasePreview, EscrowError> {
+        // Clone-and-run: the shadow executes the full `release`
+        // (including event emission into its own discarded log), then
+        // is dropped. `self` is behind `&`, so no mutation is possible.
+        let mut shadow = self.clone();
+        let (payout, fee) = shadow.release(authority, now, amount, mint, payout_to)?;
+        let refund = self.lockup_total().saturating_sub(amount);
+        Ok(ReleasePreview { payout, fee, refund })
     }
 
     /// The shared release settlement engine behind [`Escrow::release`]
@@ -38348,6 +38398,206 @@ mod governance_delay_tests {
         assert_eq!(EscrowError::GovernanceDelayNotElapsed.code(), 218);
         assert_eq!(EscrowError::GovernanceActionNotProposed.code(), 219);
         assert_eq!(EscrowError::InvalidGovernanceDelay.code(), 220);
+    }
+}
+
+// ---------- AV-159: pre-execution release preview ----------
+//
+// `preview_release` runs the exact `release` logic on a discarded
+// shadow clone — zero state change, zero events. Deterministic
+// injected clocks throughout; no network.
+#[cfg(test)]
+mod preview_release_tests {
+    use super::*;
+    use crate::account_space_tests::encode_escrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const AMOUNT: u64 = 1_000_000;
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+
+    fn funded_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn preview_matches_release_exactly() {
+        // The preview's {payout, fee} are bit-identical to the real
+        // release's, and payout + fee + refund == lockup_total.
+        let e = funded_escrow();
+        let preview = e.preview_release(ALICE, T0, AMOUNT, None, BOB).unwrap();
+        let mut live = e.clone();
+        let (payout, fee) = live.release(ALICE, T0, AMOUNT, None, BOB).unwrap();
+        assert_eq!(preview.payout, payout);
+        assert_eq!(preview.fee, fee);
+        assert_eq!(preview.payout + preview.fee + preview.refund, AMOUNT);
+    }
+
+    #[test]
+    fn preview_partial_release_splits_correctly() {
+        // A partial release: the refund is the gross remainder.
+        let e = funded_escrow();
+        let half = AMOUNT / 2;
+        let preview = e.preview_release(ALICE, T0, half, None, BOB).unwrap();
+        assert_eq!(preview.payout + preview.fee, half);
+        assert_eq!(preview.refund, AMOUNT - half);
+        assert_eq!(preview.payout + preview.fee + preview.refund, AMOUNT);
+    }
+
+    #[test]
+    fn preview_is_zero_state_change() {
+        // The escrow is untouched: byte-identical encoding before and
+        // after, and no events were emitted.
+        let e = funded_escrow();
+        let before = encode_escrow(&e);
+        let events_before = e.event_count();
+        let preview = e.preview_release(ALICE, T0, AMOUNT, None, BOB).unwrap();
+        assert!(preview.payout > 0);
+        let after = encode_escrow(&e);
+        assert_eq!(before, after, "preview must not mutate the escrow");
+        assert_eq!(e.event_count(), events_before, "preview must not emit events");
+        // And the escrow still releases fine afterwards.
+        let mut live = e.clone();
+        let (payout, fee) = live.release(ALICE, T0, AMOUNT, None, BOB).unwrap();
+        assert_eq!((payout, fee), (preview.payout, preview.fee));
+    }
+
+    #[test]
+    fn preview_penetrates_authority_gate() {
+        // A stranger's preview fails exactly like the stranger's
+        // release.
+        let e = funded_escrow();
+        let preview_err = e.preview_release(MALLORY, T0, AMOUNT, None, BOB).unwrap_err();
+        let mut live = e.clone();
+        let release_err = live.release(MALLORY, T0, AMOUNT, None, BOB).unwrap_err();
+        assert_eq!(preview_err, release_err);
+        assert_eq!(preview_err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn preview_penetrates_state_gate() {
+        // An unfunded escrow's preview fails like its release.
+        let e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        let preview_err = e.preview_release(ALICE, T0, AMOUNT, None, BOB).unwrap_err();
+        let mut live = e.clone();
+        let release_err = live.release(ALICE, T0, AMOUNT, None, BOB).unwrap_err();
+        assert_eq!(preview_err, release_err);
+        assert_eq!(preview_err, EscrowError::InvalidStateTransition);
+    }
+
+    #[test]
+    fn preview_penetrates_amount_gate() {
+        // Releasing more than locked fails identically.
+        let e = funded_escrow();
+        let preview_err = e
+            .preview_release(ALICE, T0, AMOUNT + 1, None, BOB)
+            .unwrap_err();
+        let mut live = e.clone();
+        let release_err = live.release(ALICE, T0, AMOUNT + 1, None, BOB).unwrap_err();
+        assert_eq!(preview_err, release_err);
+    }
+
+    #[test]
+    fn preview_penetrates_mint_allowlist_gate() {
+        // With a mint bound, a mismatched mint's preview fails like
+        // its release (the allowlist gates `with_mint`, the bound mint
+        // gates `release`).
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        let mint_a = [0x11; 32];
+        let mint_b = [0x22; 32];
+        e.with_mint_allowlist(&[mint_a]).unwrap();
+        e = e.with_mint(mint_a).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let preview_err = e
+            .preview_release(ALICE, T0, AMOUNT, Some(mint_b), BOB)
+            .unwrap_err();
+        let mut live = e.clone();
+        let release_err = live
+            .release(ALICE, T0, AMOUNT, Some(mint_b), BOB)
+            .unwrap_err();
+        assert_eq!(preview_err, release_err);
+        assert_eq!(preview_err, EscrowError::MintMismatch);
+        // The bound mint previews fine.
+        let preview = e
+            .preview_release(ALICE, T0, AMOUNT, Some(mint_a), BOB)
+            .unwrap();
+        assert_eq!(preview.payout + preview.fee, AMOUNT);
+    }
+
+    #[test]
+    fn preview_penetrates_quorum_gate() {
+        // A quorum escrow's preview without attestations fails like
+        // its release.
+        let a1 = [0x11; 32];
+        let a2 = [0x12; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[a1, a2], &[1, 1], 2).unwrap())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let preview_err = e.preview_release(ALICE, T0, AMOUNT, None, BOB).unwrap_err();
+        let mut live = e.clone();
+        let release_err = live.release(ALICE, T0, AMOUNT, None, BOB).unwrap_err();
+        assert_eq!(preview_err, release_err);
+        assert_eq!(preview_err, EscrowError::QuorumNotReached);
+        // With attestations, the preview succeeds.
+        e.attest(a1).unwrap();
+        e.attest(a2).unwrap();
+        let preview = e.preview_release(ALICE, T0, AMOUNT, None, BOB).unwrap();
+        assert_eq!(preview.payout + preview.fee, AMOUNT);
+    }
+
+    #[test]
+    fn preview_penetrates_timelock_gate() {
+        // A timelocked escrow's early preview fails like its early
+        // release.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(T0 + 3_600)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let preview_err = e.preview_release(ALICE, T0, AMOUNT, None, BOB).unwrap_err();
+        let mut live = e.clone();
+        let release_err = live.release(ALICE, T0, AMOUNT, None, BOB).unwrap_err();
+        assert_eq!(preview_err, release_err);
+        // After the timelock, the preview succeeds.
+        let preview = e
+            .preview_release(ALICE, T0 + 3_600, AMOUNT, None, BOB)
+            .unwrap();
+        assert_eq!(preview.payout + preview.fee, AMOUNT);
+    }
+
+    #[test]
+    fn preview_reflects_protocol_fee() {
+        // With a protocol fee, the preview splits payout/fee exactly
+        // like the release.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(100) // 1%
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let preview = e.preview_release(ALICE, T0, AMOUNT, None, BOB).unwrap();
+        let mut live = e.clone();
+        let (payout, fee) = live.release(ALICE, T0, AMOUNT, None, BOB).unwrap();
+        assert_eq!((preview.payout, preview.fee), (payout, fee));
+        assert!(preview.fee > 0, "1% fee must be non-zero");
+        assert_eq!(preview.payout + preview.fee + preview.refund, AMOUNT);
+    }
+
+    #[test]
+    fn preview_is_repeatable_and_order_independent() {
+        // Multiple previews don't interfere with each other or with a
+        // later real release.
+        let e = funded_escrow();
+        let p1 = e.preview_release(ALICE, T0, AMOUNT, None, BOB).unwrap();
+        let p2 = e.preview_release(ALICE, T0, AMOUNT / 2, None, BOB).unwrap();
+        let p3 = e.preview_release(ALICE, T0, AMOUNT, None, BOB).unwrap();
+        assert_eq!(p1, p3, "same inputs give the same preview");
+        assert_ne!(p1.refund, p2.refund, "different amounts give different refunds");
     }
 }
 
