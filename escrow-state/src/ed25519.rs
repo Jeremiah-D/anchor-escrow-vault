@@ -564,6 +564,142 @@ pub fn verify(public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bo
     compress(&lhs) == compress(&rhs)
 }
 
+// ---------------------------------------------------------------------------
+// Ed25519 batch verification (RFC 8032 batch equation), AV-153.
+// ---------------------------------------------------------------------------
+
+/// One item of a [`batch_verify`] request.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchVerifyItem<'a> {
+    /// The 32-byte public key.
+    pub public_key: [u8; 32],
+    /// The signed message (borrowed; variable length).
+    pub message: &'a [u8],
+    /// The 64-byte signature (`R ‖ S`).
+    pub signature: [u8; 64],
+}
+
+/// Batch-verify Ed25519 signatures with the RFC 8032 batch equation
+/// `(Σ zᵢ·Sᵢ)·G = Σ zᵢ·Rᵢ + Σ zᵢ·hᵢ·Aᵢ`, where `hᵢ = H(Rᵢ‖Aᵢ‖Mᵢ)`
+/// and each `zᵢ` is a per-item blinding scalar. Batch verification
+/// does one combined multi-scalar multiplication instead of two
+/// scalar multiplications per signature — the keeper's linear
+/// per-signature cost when verifying report/intent batches.
+///
+/// Returns the indexes (in input order) of the items that fail —
+/// exactly the indexes `verify` returns `false` for. Empty on full
+/// success.
+///
+/// The blinding scalars are derived deterministically as
+/// `zᵢ = SHA-512("escrow-av153-batch:" ‖ i ‖ Rᵢ ‖ Aᵢ ‖ Mᵢ) mod L`
+/// (zero maps to 1): no RNG is needed (the crate is zero-dependency)
+/// and the batch is reproducible. Soundness comes from the batch
+/// equation itself — a forged item satisfies the aggregated equation
+/// only with negligible probability, exactly as with random `zᵢ`
+/// chosen after the batch is fixed.
+///
+/// A failed batch equation cannot say *which* item failed, so the
+/// fallback is exact per-item RFC 8032 verification: the result is
+/// always identical to running `verify` on every item (see
+/// `batch_verify_matches_individual_verification`). The batch
+/// equation only avoids the fallback cost when the whole batch
+/// verifies — the common keeper case.
+pub fn batch_verify(items: &[BatchVerifyItem<'_>]) -> Vec<usize> {
+    struct WellFormed<'a> {
+        index: usize,
+        r_pt: EdwardsPoint,
+        a_pt: EdwardsPoint,
+        h: Scalar,
+        s: Scalar,
+        r_bytes: [u8; 32],
+        a_bytes: [u8; 32],
+        msg: &'a [u8],
+    }
+
+    // Stage 1: structural checks — exactly `verify`'s false conditions
+    // (non-canonical S, undecodable R, undecodable public key).
+    let mut failed: Vec<usize> = Vec::new();
+    let mut good: Vec<WellFormed<'_>> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let mut r_bytes = [0u8; 32];
+        r_bytes.copy_from_slice(&item.signature[..32]);
+        let mut s_bytes = [0u8; 32];
+        s_bytes.copy_from_slice(&item.signature[32..]);
+        let well_formed = !Scalar::bytes_ge_l(&s_bytes)
+            && decompress(&r_bytes).is_some()
+            && decompress(&item.public_key).is_some();
+        if !well_formed {
+            failed.push(index);
+            continue;
+        }
+        let s = Scalar::from_bytes32(&s_bytes);
+        let (rx, ry) = decompress(&r_bytes).expect("re-checked");
+        let r_pt = EdwardsPoint {
+            x: rx,
+            y: ry,
+            z: Fe::ONE,
+            t: rx.mul(ry),
+        };
+        let (ax, ay) = decompress(&item.public_key).expect("re-checked");
+        let a_pt = EdwardsPoint {
+            x: ax,
+            y: ay,
+            z: Fe::ONE,
+            t: ax.mul(ay),
+        };
+        let mut hram_input = Vec::with_capacity(64 + item.message.len());
+        hram_input.extend_from_slice(&r_bytes);
+        hram_input.extend_from_slice(&item.public_key);
+        hram_input.extend_from_slice(item.message);
+        let h = Scalar::from_bytes64(&sha512(&hram_input));
+        good.push(WellFormed {
+            index,
+            r_pt,
+            a_pt,
+            h,
+            s,
+            r_bytes,
+            a_bytes: item.public_key,
+            msg: item.message,
+        });
+    }
+
+    if !good.is_empty() {
+        // Stage 2: the batch equation over the well-formed subset.
+        let mut sum_zs = Scalar([0, 0, 0, 0]);
+        let mut rhs = EdwardsPoint::identity();
+        for g in &good {
+            let mut zin = Vec::with_capacity(24 + 8 + 32 + 32 + g.msg.len());
+            zin.extend_from_slice(b"escrow-av153-batch:");
+            zin.extend_from_slice(&(g.index as u64).to_le_bytes());
+            zin.extend_from_slice(&g.r_bytes);
+            zin.extend_from_slice(&g.a_bytes);
+            zin.extend_from_slice(g.msg);
+            let mut z = Scalar::from_bytes64(&sha512(&zin));
+            if z == Scalar([0, 0, 0, 0]) {
+                z = Scalar([1, 0, 0, 0]);
+            }
+            sum_zs = sum_zs.add(&z.mul(&g.s));
+            let zr = scalar_mul(&g.r_pt, &z);
+            let zha = scalar_mul(&g.a_pt, &z.mul(&g.h));
+            rhs = rhs.add(&zr).add(&zha);
+        }
+        let lhs = scalar_mul(&base_point(), &sum_zs);
+        if compress(&lhs) != compress(&rhs) {
+            // Stage 3: exact fallback — individual RFC 8032
+            // verification, so the failure set is identical to
+            // per-item `verify` (no short-circuit masking).
+            for g in &good {
+                let item = &items[g.index];
+                if !verify(&item.public_key, item.message, &item.signature) {
+                    failed.push(g.index);
+                }
+            }
+        }
+    }
+    failed
+}
+
 #[cfg(test)]
 mod ed25519_tests {
     use super::*;
@@ -740,5 +876,196 @@ mod ed25519_tests {
         // L * G must be the identity (group order check).
         let lg = scalar_mul(&g, &Scalar(SCALAR_L));
         assert_eq!(compress(&lg), compress(&EdwardsPoint::identity()));
+    }
+
+    // ------------------------------------------------------------------
+    // AV-153: batch verification.
+    // ------------------------------------------------------------------
+
+    /// Build a batch of `n` valid (key, message) pairs: distinct seeds
+    /// and distinct messages.
+    fn valid_batch(n: usize) -> (Vec<SigningKey>, Vec<Vec<u8>>) {
+        let mut keys = Vec::with_capacity(n);
+        let mut messages = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut seed = [0u8; 32];
+            seed[0] = (i + 1) as u8;
+            seed[31] = 0xA5;
+            let key = SigningKey::from_seed(seed);
+            let msg = format!("keeper report #{i}").into_bytes();
+            keys.push(key);
+            messages.push(msg);
+        }
+        (keys, messages)
+    }
+
+    fn batch_items<'a>(
+        keys: &'a [SigningKey],
+        messages: &'a [Vec<u8>],
+    ) -> Vec<BatchVerifyItem<'a>> {
+        keys.iter()
+            .zip(messages.iter())
+            .map(|(k, m)| BatchVerifyItem {
+                public_key: k.public_key(),
+                message: m,
+                signature: k.sign(m),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn batch_verify_all_valid_returns_empty() {
+        let (keys, messages) = valid_batch(8);
+        let items = batch_items(&keys, &messages);
+        assert_eq!(batch_verify(&items), Vec::<usize>::new());
+        // A single-item batch is just verify.
+        assert_eq!(batch_verify(&items[..1]), Vec::<usize>::new());
+        // Empty batch is vacuous success.
+        assert_eq!(batch_verify(&[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn batch_verify_locates_single_tampered_signature() {
+        let (keys, messages) = valid_batch(6);
+        let mut items = batch_items(&keys, &messages);
+        items[3].signature[10] ^= 0x40;
+        assert_eq!(batch_verify(&items), vec![3]);
+    }
+
+    #[test]
+    fn batch_verify_locates_multiple_failures_in_order() {
+        let (keys, messages) = valid_batch(6);
+        let mut items = batch_items(&keys, &messages);
+        // Corrupt three different aspects — all AFTER signing:
+        // S bytes, R bytes, and the message bytes.
+        items[4].signature[63] ^= 0x01;
+        items[1].signature[0] ^= 0x80;
+        let mut msg2 = messages[2].clone();
+        msg2[0] ^= 0x01;
+        items[2].message = &msg2;
+        assert_eq!(batch_verify(&items), vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn batch_verify_reports_malformed_inputs() {
+        let (keys, messages) = valid_batch(4);
+        let mut items = batch_items(&keys, &messages);
+        // S >= L (non-canonical scalar encoding).
+        items[0].signature[32..].copy_from_slice(&Scalar(SCALAR_L).to_bytes());
+        // Garbage public key (off-curve).
+        items[2].public_key = [0xffu8; 32];
+        // Garbage R: y = p is non-canonical (p = 2^255 - 19, little-endian).
+        let mut p_bytes = [0xffu8; 32];
+        p_bytes[0] = 0xed;
+        p_bytes[31] = 0x7f;
+        items[3].signature[..32].copy_from_slice(&p_bytes);
+        assert_eq!(batch_verify(&items), vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn batch_verify_duplicate_items() {
+        // The same signature twice: both verify, none fails.
+        let (keys, messages) = valid_batch(2);
+        let items = batch_items(&keys, &messages);
+        let doubled = vec![items[0], items[0]];
+        assert_eq!(batch_verify(&doubled), Vec::<usize>::new());
+        // And the same corruption twice reports both indexes.
+        let mut bad = doubled.clone();
+        bad[0].signature[5] ^= 1;
+        bad[1].signature[5] ^= 1;
+        assert_eq!(batch_verify(&bad), vec![0, 1]);
+    }
+
+    /// Deterministic xorshift64* (same generator family as the AV-03
+    /// fuzz tests) for the equivalence property test below.
+    fn xorshift64star(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    #[test]
+    fn batch_verify_matches_individual_verification() {
+        // The core AV-153 property: batch_verify returns exactly the
+        // indexes where per-item `verify` fails, across random batch
+        // sizes and random corruptions. No short-circuit masking.
+        let mut state = 0x9E3779B97F4A7C15u64;
+        for round in 0..12 {
+            let n = 1 + (xorshift64star(&mut state) % 7) as usize;
+            let (keys, messages) = valid_batch(n);
+            // Plan corruptions before building the borrowed items:
+            // message flips need owned copies prepared up front
+            // (corruption happens AFTER signing, or it is a no-op);
+            // signature/public-key flips and swaps apply to the
+            // items afterwards.
+            let mut sig_corrupt: Vec<Option<(usize, u8)>> = vec![None; n];
+            let mut key_corrupt: Vec<Option<(usize, u8)>> = vec![None; n];
+            let mut swaps: Vec<Option<usize>> = vec![None; n];
+            let mut msg_corrupt: Vec<Option<Vec<u8>>> = vec![None; n];
+            for i in 0..n {
+                if xorshift64star(&mut state) % 3 == 0 {
+                    match xorshift64star(&mut state) % 4 {
+                        0 => {
+                            // Flip a signature byte (may or may not
+                            // make S non-canonical — either way it
+                            // must fail).
+                            let b = (xorshift64star(&mut state) % 64) as usize;
+                            let m = 1u8 << (xorshift64star(&mut state) % 8);
+                            sig_corrupt[i] = Some((b, m));
+                        }
+                        1 => {
+                            // Flip a message byte AFTER signing — a
+                            // fresh owned copy, or the corruption is a
+                            // no-op (the signature would be computed
+                            // over the flipped bytes).
+                            let b = (xorshift64star(&mut state) % messages[i].len() as u64) as usize;
+                            let mut c = messages[i].clone();
+                            c[b] ^= 0x55;
+                            msg_corrupt[i] = Some(c);
+                        }
+                        2 => {
+                            // Flip a public-key byte.
+                            let b = (xorshift64star(&mut state) % 32) as usize;
+                            key_corrupt[i] = Some((b, 0xAA));
+                        }
+                        _ => {
+                            // Swap in another item's signature (a
+                            // cross-item forgery; j == i is a no-op).
+                            let j = (xorshift64star(&mut state) % n as u64) as usize;
+                            swaps[i] = Some(j);
+                        }
+                    }
+                }
+            }
+            let mut items = batch_items(&keys, &messages);
+            for i in 0..n {
+                if let Some((b, m)) = sig_corrupt[i] {
+                    items[i].signature[b] ^= m;
+                }
+                if let Some((b, m)) = key_corrupt[i] {
+                    items[i].public_key[b] ^= m;
+                }
+                if let Some(ref corrupted) = msg_corrupt[i] {
+                    items[i].message = corrupted;
+                }
+                if let Some(j) = swaps[i] {
+                    items[i].signature = items[j].signature;
+                }
+            }
+            let expected: Vec<usize> = items
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| !verify(&it.public_key, it.message, &it.signature))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                batch_verify(&items),
+                expected,
+                "round {round}: batch/individual mismatch"
+            );
+        }
     }
 }

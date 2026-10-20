@@ -535,7 +535,9 @@ pub use pda::{
 };
 // AV-101: Ed25519 signing keys (RFC 8032, hand-rolled) for keeper
 // report signatures, plus the stateless verifier.
-pub use ed25519::{verify as verify_ed25519_signature, SigningKey};
+// AV-153: batch verification (RFC 8032 batch equation) for keeper
+// report/intent batches — returns exactly the failing indexes.
+pub use ed25519::{batch_verify, verify as verify_ed25519_signature, BatchVerifyItem, SigningKey};
 
 // AV-101: keeper report signatures — the signed envelope plus the
 // `SignableReport` opt-in surface for all seven keeper report types.

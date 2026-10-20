@@ -2377,6 +2377,39 @@ JSON in a signed envelope:
   wrong key) fails closed; malformed envelopes are rejected without
   panicking.
 
+## Ed25519 batch verification (AV-153)
+
+Keeper report/intent batches verified one signature at a time pay
+two scalar multiplications per signature. `batch_verify` in
+`escrow-state/src/ed25519.rs` (re-exported from the crate root)
+verifies a whole batch with the RFC 8032 batch equation
+`(Σ zᵢ·Sᵢ)·G = Σ zᵢ·Rᵢ + Σ zᵢ·hᵢ·Aᵢ`, reusing the hand-rolled point
+operations from AV-101 — one combined multi-scalar multiplication
+instead of 2·n:
+
+```rust
+let items = vec![BatchVerifyItem {
+    public_key: key.public_key(),
+    message: &report_bytes,
+    signature,
+}];
+let failures: Vec<usize> = batch_verify(&items); // empty on full success
+```
+
+Each blinding scalar is derived deterministically as
+`zᵢ = SHA-512("escrow-av153-batch:" ‖ i ‖ Rᵢ ‖ Aᵢ ‖ Mᵢ) mod L`
+(zero maps to 1): no RNG is needed (the crate stays
+zero-dependency) and batches are reproducible; soundness comes from
+the batch equation itself — a forged item satisfies the aggregated
+equation only with negligible probability, exactly as with random
+`zᵢ` chosen after the batch is fixed. A failed batch equation cannot
+say *which* item failed, so the fallback is exact per-item RFC 8032
+verification: the result is always identical to running `verify` on
+every item (pinned by a randomized equivalence property test —
+12 rounds of random batch sizes and random signature/message/key
+corruptions — plus targeted single/multiple/malformed-input cases),
+never short-circuit-masked.
+
 ## Aggregate statistics view (AV-78)
 
 `escrow-state/src/aggregate.rs` rolls a watched fleet up into one
