@@ -184,6 +184,8 @@ fn idl_type_of(vault_ty: &str) -> IdlType {
         "Option<MilestonePlan>" => IdlType::Option(Box::new(IdlType::Named("MilestonePlan"))),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         "Option<PayoutAllowlist>" => IdlType::Option(Box::new(IdlType::Named("PayoutAllowlist"))),
+        // AV-157: the SPL mint governance allowlist.
+        "Option<MintAllowlist>" => IdlType::Option(Box::new(IdlType::Named("MintAllowlist"))),
         // AV-95: opt-in multi-mint basket leg table.
         "Option<BasketLegs>" => IdlType::Option(Box::new(IdlType::Named("BasketLegs"))),
         // AV-96: opt-in payout destination denylist (initializer's
@@ -305,6 +307,9 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         "Vec<ClaimantShare>" => {
             IdlType::Vec(Box::new(IdlType::Named("ClaimantShare")))
         }
+        // AV-157: the initialize_mint_allowlist instruction's base58
+        // mint address list.
+        "Vec<String>" => IdlType::Vec(Box::new(IdlType::Str)),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         // AV-130: the initiate_release instruction's optional SPL mint
         // binding (a real pubkey, not raw bytes).
@@ -385,6 +390,12 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
         // The 4 payout keys serialize as 4 consecutive 32-byte pubkeys.
         "PayoutAllowlist" => vec![
             ("addrs", IdlType::Array(ArrayElem::PublicKey, 4)),
+            ("len", IdlType::U8),
+        ],
+        // MintAllowlist { mints: [[u8; 32]; 8], len: u8 } (AV-157).
+        // The 8 mint addresses serialize as 8 consecutive 32-byte pubkeys.
+        "MintAllowlist" => vec![
+            ("mints", IdlType::Array(ArrayElem::PublicKey, 8)),
             ("len", IdlType::U8),
         ],
         // PayoutDenylist { addrs: [[u8; 32]; 4], len: u8 } (AV-96).
@@ -855,6 +866,7 @@ fn render_idl_json() -> String {
         "VestingSchedule",
         "MilestonePlan",
         "PayoutAllowlist",
+        "MintAllowlist",
         "DefaultJudgment",
         "SubscriptionSchedule",
         "EventHistorySlot",
@@ -1051,6 +1063,8 @@ fn named_type_sizes_pin_constants() {
     assert_eq!(size("VestingCurve"), 81);
     assert_eq!(size("MilestonePlan"), MILESTONE_PLAN_LEN);
     assert_eq!(size("PayoutAllowlist"), PAYOUT_ALLOWLIST_LEN);
+    // AV-157: 8 mint pubkeys + the live-entry count byte.
+    assert_eq!(size("MintAllowlist"), MINT_ALLOWLIST_LEN);
     // AV-96: same wire shape as the allowlist (4 pubkeys + count byte).
     assert_eq!(size("PayoutDenylist"), PAYOUT_DENYLIST_LEN);
     // AV-97: start_at u64 + end_at u64 + reserve_bps u16.
@@ -1195,12 +1209,12 @@ fn idl_errors_pin_enum() {
         let name = format!("{e:?}");
         assert!(seen.insert(name.clone()), "duplicate error variant {name}");
         assert!(
-            (100..217).contains(&e.code()),
+            (100..218).contains(&e.code()),
             "error code out of pinned range: {name} = {}",
             e.code()
         );
     }
-    assert_eq!(errors.len(), 117, "error variant count drift");
+    assert_eq!(errors.len(), 118, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -1584,8 +1598,10 @@ fn idl_field_offsets_pin_borsh_encoder() {
     // claimant-roster tail after that (same from-the-end drift).
     // AV-150 appends the 9-byte vesting-pause tail after the roster
     // tail — every earlier tail sits a further 9 bytes from the
-    // body's end than at AV-149.
-    assert_eq!(pg_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - 4 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - VESTING_PAUSE_TAIL_LEN);
+    // body's end than at AV-149. AV-157 appends the 258-byte
+    // mint-allowlist tail after the vesting-pause tail — every earlier
+    // tail sits a further 258 bytes from the body's end.
+    assert_eq!(pg_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - PRICE_GATE_LEN - 4 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - VESTING_PAUSE_TAIL_LEN - MINT_ALLOWLIST_TAIL_LEN);
     // AV-115: the escalation tail sits just before the AV-116 tail.
     let rate = body_field(&enc, &offsets, "penalty_escalation_rate_bps");
     assert_eq!(rate.len(), 2);
@@ -1594,7 +1610,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "penalty_escalation_rate_bps")
         .copied()
         .expect("penalty_escalation_rate_bps in IDL offsets");
-    assert_eq!(rate_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - 4 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - VESTING_PAUSE_TAIL_LEN);
+    assert_eq!(rate_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - 4 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - VESTING_PAUSE_TAIL_LEN - MINT_ALLOWLIST_TAIL_LEN);
     let cap = body_field(&enc, &offsets, "penalty_escalation_cap_bps");
     assert_eq!(cap.len(), 2);
     let (_, cap_offset, _) = offsets
@@ -1602,7 +1618,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "penalty_escalation_cap_bps")
         .copied()
         .expect("penalty_escalation_cap_bps in IDL offsets");
-    assert_eq!(cap_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - 2 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - VESTING_PAUSE_TAIL_LEN);
+    assert_eq!(cap_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - 2 - SLOT_TIMELOCK_TAIL_LEN - COMPOUND_INTEREST_TAIL_LEN - VESTING_PAUSE_TAIL_LEN - MINT_ALLOWLIST_TAIL_LEN);
     // AV-116: the slot-timelock tail is the last 16 bytes of the body.
     let slots = body_field(&enc, &offsets, "slot_timelock_slots");
     assert_eq!(slots.len(), 8);
@@ -1611,7 +1627,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "slot_timelock_slots")
         .copied()
         .expect("slot_timelock_slots in IDL offsets");
-    assert_eq!(slots_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - VESTING_PAUSE_TAIL_LEN);
+    assert_eq!(slots_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - SLOT_TIMELOCK_TAIL_LEN - VESTING_PAUSE_TAIL_LEN - MINT_ALLOWLIST_TAIL_LEN);
     let fslot = body_field(&enc, &offsets, "fund_slot");
     assert_eq!(fslot.len(), 8);
     let (_, fslot_offset, _) = offsets
@@ -1619,7 +1635,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "fund_slot")
         .copied()
         .expect("fund_slot in IDL offsets");
-    assert_eq!(fslot_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - 8 - VESTING_PAUSE_TAIL_LEN);
+    assert_eq!(fslot_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - 8 - VESTING_PAUSE_TAIL_LEN - MINT_ALLOWLIST_TAIL_LEN);
     // AV-117: the compound-interest tail sits just before the AV-119
     // dispute-interest tail (the absolute tail is the AV-150
     // vesting-pause marker).
@@ -1628,13 +1644,13 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "compound_interest")
         .copied()
         .expect("compound_interest in IDL offsets");
-    assert_eq!(ci_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - VESTING_PAUSE_TAIL_LEN);
+    assert_eq!(ci_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - COMPOUND_INTEREST_TAIL_LEN - VESTING_PAUSE_TAIL_LEN - MINT_ALLOWLIST_TAIL_LEN);
     let (_, ic_offset, _) = offsets
         .iter()
         .find(|(n, _, _)| *n == "interest_compounded")
         .copied()
         .expect("interest_compounded in IDL offsets");
-    assert_eq!(ic_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - 8 - VESTING_PAUSE_TAIL_LEN);
+    assert_eq!(ic_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - 8 - VESTING_PAUSE_TAIL_LEN - MINT_ALLOWLIST_TAIL_LEN);
     // AV-119: the dispute-interest tail (no longer the absolute
     // tail since AV-121).
     let di = body_field(&enc, &offsets, "dispute_interest");
@@ -1644,7 +1660,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "dispute_interest")
         .copied()
         .expect("dispute_interest in IDL offsets");
-    assert_eq!(di_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - VESTING_PAUSE_TAIL_LEN);
+    assert_eq!(di_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - DISPUTE_INTEREST_LEN - VESTING_PAUSE_TAIL_LEN - MINT_ALLOWLIST_TAIL_LEN);
     // AV-121: the claim-cooldown tail (no longer the absolute tail
     // since AV-122) — the 8-byte opt-in duration plus the 9-byte
     // last-claim slot anchor.
@@ -1655,7 +1671,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "claim_cooldown_slots")
         .copied()
         .expect("claim_cooldown_slots in IDL offsets");
-    assert_eq!(ccd_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - VESTING_PAUSE_TAIL_LEN);
+    assert_eq!(ccd_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - VESTING_PAUSE_TAIL_LEN - MINT_ALLOWLIST_TAIL_LEN);
     let lcs = body_field(&enc, &offsets, "last_claim_slot");
     assert_eq!(lcs.len(), 9);
     let (_, lcs_offset, _) = offsets
@@ -1663,7 +1679,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "last_claim_slot")
         .copied()
         .expect("last_claim_slot in IDL offsets");
-    assert_eq!(lcs_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN + 8 - VESTING_PAUSE_TAIL_LEN);
+    assert_eq!(lcs_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - CLAIM_COOLDOWN_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN + 8 - VESTING_PAUSE_TAIL_LEN - MINT_ALLOWLIST_TAIL_LEN);
     // AV-122: the counter-offer tail — the 1-byte `Option`
     // discriminant plus the 16-byte live terms — trails the AV-121
     // claim-cooldown tail (AV-124: the keeper-bounty tail is the new
@@ -1675,7 +1691,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "counter_offer")
         .copied()
         .expect("counter_offer in IDL offsets");
-    assert_eq!(co_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - VESTING_PAUSE_TAIL_LEN);
+    assert_eq!(co_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - SLASH_LADDER_TAIL_LEN - COUNTER_OFFER_TAIL_LEN - RELEASE_INTENT_TAIL_LEN - KEEPER_BOUNTY_TAIL_LEN - VESTING_PAUSE_TAIL_LEN - MINT_ALLOWLIST_TAIL_LEN);
     // AV-127: the refunded counter is the last 8 bytes of the body.
     let rf = body_field(&enc, &offsets, "refunded");
     assert_eq!(rf.len(), 8);
@@ -1684,7 +1700,7 @@ fn idl_field_offsets_pin_borsh_encoder() {
         .find(|(n, _, _)| *n == "refunded")
         .copied()
         .expect("refunded in IDL offsets");
-    assert_eq!(rf_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - VESTING_PAUSE_TAIL_LEN);
+    assert_eq!(rf_offset, 8 + ESCROW_BODY_LEN - CLAIMANT_ROSTER_TAIL_LEN - TAKER_LOCKED_TAIL_LEN - ARBITER_FEE_TAIL_LEN - RENT_SWEEP_TAIL_LEN - DISPUTED_AMOUNT_TAIL_LEN - AUTO_UNPAUSE_TAIL_LEN - AMOUNT_BOUNDS_TAIL_LEN - DUAL_CONTROL_TAIL_LEN - TWAP_GATE_LEN - REFUNDED_TAIL_LEN - VESTING_PAUSE_TAIL_LEN - MINT_ALLOWLIST_TAIL_LEN);
     assert_eq!(u64_at(rf), 0, "no partial refund on the max-config escrow");
 }
 

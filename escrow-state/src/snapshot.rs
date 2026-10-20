@@ -325,6 +325,9 @@ pub struct EscrowSnapshot {
     /// SPL token mint bound to this escrow, or `None` for native SOL
     /// (AV-16).
     pub mint: Option<[u8; 32]>,
+    /// SPL mint governance allowlist (AV-157): the allowlisted mint
+    /// addresses, or `None` when the allowlist is off.
+    pub mint_allowlist: Option<Vec<[u8; 32]>>,
     /// Token-2022 transfer-hook program declared for this escrow, or
     /// `None` when no hook is bound (AV-99).
     pub transfer_hook: Option<[u8; 32]>,
@@ -798,6 +801,9 @@ impl Escrow {
             claimable: self.claimable_amount(now),
             arbiter: self.arbiter(),
             mint: self.mint(),
+            mint_allowlist: self
+                .mint_allowlist()
+                .map(|list| list.as_slice().to_vec()),
             transfer_hook: self.transfer_hook(),
             streaming_fee_rate: self.streaming_fee_rate(),
             streaming_fees_accrued: self.streaming_fees_accrued(),
@@ -1207,6 +1213,26 @@ impl EscrowSnapshot {
         write_opt_hex(&mut s, self.arbiter);
         s.push_str(",\"mint\":");
         write_opt_hex(&mut s, self.mint);
+        // AV-157: the SPL mint governance allowlist — array of 64-char
+        // lowercase hex addresses, or `null` when the allowlist is off.
+        s.push_str(",\"mint_allowlist\":");
+        match &self.mint_allowlist {
+            None => s.push_str("null"),
+            Some(list) => {
+                s.push('[');
+                for (i, m) in list.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push('"');
+                    for b in m.iter() {
+                        s.push_str(&format!("{:02x}", b));
+                    }
+                    s.push('"');
+                }
+                s.push(']');
+            }
+        }
         // AV-99: the declared Token-2022 transfer-hook program — 64-char
         // lowercase hex or `null` — so indexers see the hook binding.
         s.push_str(",\"transfer_hook\":");
@@ -1864,7 +1890,7 @@ mod snapshot_tests {
              \"dual_sig\":{{\"required\":false,\"initializer_activated\":false,\"taker_activated\":false}},\
              \"quorum\":null,\
              \"vesting\":null,\"vesting_curve\":null,\"vested\":0,\"display_vested\":\"0\",\"claimable\":0,\"display_claimable\":\"0\",\
-             \"arbiter\":null,\"mint\":null,\"transfer_hook\":null,\"streaming_fee_rate\":0,\"streaming_fees_accrued\":0,\
+             \"arbiter\":null,\"mint\":null,\"mint_allowlist\":null,\"transfer_hook\":null,\"streaming_fee_rate\":0,\"streaming_fees_accrued\":0,\
              \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\

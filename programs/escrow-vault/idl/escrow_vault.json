@@ -340,6 +340,14 @@
       ]
     },
     {
+      "name": "initialize_mint_allowlist",
+      "discriminator": [132, 223, 5, 70, 96, 239, 66, 43],
+      "accounts": [],
+      "args": [
+        {"name": "mints", "type": {"vec": "string"}}
+      ]
+    },
+    {
       "name": "initialize_protocol_fee",
       "discriminator": [60, 79, 173, 116, 35, 243, 151, 134],
       "accounts": [],
@@ -1263,7 +1271,8 @@
           {"name": "rent_sweep_grace_secs", "type": "u64", "offset": 5962},
           {"name": "taker_locked", "type": "u64", "offset": 5970},
           {"name": "claimants", "type": {"option": {"defined": "ClaimantRoster"}}, "offset": 5978},
-          {"name": "vesting_pause", "type": {"option": {"defined": "VestingPause"}}, "offset": 6253}
+          {"name": "vesting_pause", "type": {"option": {"defined": "VestingPause"}}, "offset": 6253},
+          {"name": "mint_allowlist", "type": {"option": {"defined": "MintAllowlist"}}, "offset": 6262}
         ]
       }
     }
@@ -1310,6 +1319,16 @@
         "fields": [
           {"name": "addrs", "type": {"array": ["publicKey", 4]}, "offset": 0},
           {"name": "len", "type": "u8", "offset": 128}
+        ]
+      }
+    },
+    {
+      "name": "MintAllowlist",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "mints", "type": {"array": ["publicKey", 8]}, "offset": 0},
+          {"name": "len", "type": "u8", "offset": 256}
         ]
       }
     },
@@ -1712,7 +1731,8 @@
     {"code": 213, "name": "VestingAlreadyPaused"},
     {"code": 214, "name": "VestingNotPaused"},
     {"code": 215, "name": "AttestorSlotInvalid"},
-    {"code": 216, "name": "InvalidMilestoneAmendment"}
+    {"code": 216, "name": "InvalidMilestoneAmendment"},
+    {"code": 217, "name": "MintNotAllowlisted"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

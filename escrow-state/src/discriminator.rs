@@ -39,12 +39,13 @@ use super::{
     sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, ClaimantRoster, CounterOffer, CpiAllowlist,
     DefaultJudgment, DualControlIntent, DutchAuction, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
     Delegation, FundingPlan, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, PayoutSplit, QuorumPolicy,
+    MintAllowlist,
     SlashTerms, SlashLadder, SlashRung, SubscriptionSchedule, VestingCurve, VestingPause, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
     APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, CLAIMANT_ROSTER_LEN, COUNTER_OFFER_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
     DELEGATION_LEN, DUAL_CONTROL_INTENT_LEN, DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
-    MAX_CLAIMANTS, MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_PANEL_MEMBERS,
+    MAX_CLAIMANTS, MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_MINT_ALLOWLIST, MAX_PANEL_MEMBERS,
     MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_RELEASE_SPLIT_RECIPIENTS, MAX_SLASH_LADDER_RUNGS, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
-    MILESTONE_PLAN_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN,
+    MILESTONE_PLAN_LEN, MINT_ALLOWLIST_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN,
     PAYOUT_DENYLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_LADDER_LEN, SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN,
     SWAP_LINK_REGION_LEN, VAULT_SPACE, VESTING_CURVE_LEN,
 };
@@ -1477,6 +1478,21 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(8)?;
         None
     };
+    // AV-157: the SPL mint governance allowlist — 1-byte `Option`
+    // discriminant + 256-byte mint array + 1-byte entry count.
+    // Structural decode only — the allowlist invariants are enforced
+    // by `with_mint_allowlist` / `with_mint`, not re-litigated here.
+    let mint_allowlist = if c.option_present("mint_allowlist")? {
+        let mut mints = [[0u8; 32]; MAX_MINT_ALLOWLIST];
+        for m in mints.iter_mut() {
+            *m = c.pubkey()?;
+        }
+        let len = c.u8()?;
+        Some(MintAllowlist { mints, len })
+    } else {
+        c.skip(MINT_ALLOWLIST_LEN)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1772,6 +1788,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-150: the vesting pause marker — a decoded escrow carries
         // the same `paused_at` the live one recorded.
         vesting_pause,
+        // AV-157: the SPL mint governance allowlist — a decoded
+        // escrow carries the same allowlist the live one recorded.
+        mint_allowlist,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

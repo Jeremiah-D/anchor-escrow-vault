@@ -3662,6 +3662,37 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to the SPL mint governance allowlist (AV-157; mirrors
+    /// `Escrow::with_mint_allowlist`). `Uninitialized` only: the
+    /// allowlist is fixed before funds move. Takes up to 8 mint
+    /// addresses; an empty list disables the allowlist (`None`).
+    /// `with_mint` thereafter rejects any mint not on the list
+    /// (`MintNotAllowlisted`).
+    pub fn initialize_mint_allowlist(
+        ctx: Context<InitializeMintAllowlist>,
+        mints: Vec<String>,
+    ) -> Result<()> {
+        let mut bytes = [[0u8; 32]; 8];
+        // AV-157: the skeleton caps the list at 8 (mirrors
+        // `MAX_MINT_ALLOWLIST`); longer lists are `InvalidMint`.
+        if mints.len() > 8 {
+            return Err(escrow_error(escrow_state::EscrowError::InvalidMint));
+        }
+        for (i, s) in mints.iter().enumerate() {
+            bytes[i] = escrow_state::parse_mint_address(s).map_err(|e| escrow_error(e))?;
+        }
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let list: &[[u8; 32]] = &bytes[..mints.len()];
+        let escrow = escrow
+            .with_mint_allowlist(list)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the full allowlist region
+        // (258 bytes, zeroed when `None`), so the list is written in
+        // place — no realloc needed in the real build.
+        Ok(())
+    }
+
     /// Opt in to a protocol fee on taker payouts (AV-17; mirrors
     /// `Escrow::with_protocol_fee`). `Uninitialized` only, like
     /// `initialize_quorum`: the fee rate is fixed before funds move.
@@ -6740,6 +6771,11 @@ pub struct Vault {
     /// Layout position matches `escrow_state::VAULT_FIELDS`
     /// (appended last, after `claimants`).
     pub vesting_pause: Option<VestingPause>,
+    /// AV-157: the SPL mint governance allowlist (mirrors
+    /// `escrow_state`'s `mint_allowlist`); `None` when the allowlist
+    /// is off. Layout position matches `escrow_state::VAULT_FIELDS`
+    /// (appended last, after `vesting_pause`).
+    pub mint_allowlist: Option<MintAllowlist>,
 }
 
 /// Skeleton mirror of `escrow_state::VestingPause` (AV-150): the
@@ -6755,6 +6791,19 @@ pub struct VestingPause {
     /// Unix timestamp the pause was stamped at; `resume_vesting`
     /// shifts the schedule by `now - paused_at`.
     pub paused_at: u64,
+}
+
+/// Skeleton mirror of `escrow_state::MintAllowlist` (AV-157): the
+/// SPL mint governance allowlist — up to 8 mint addresses with a
+/// live-entry count.
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, Debug, PartialEq, Eq,
+)]
+pub struct MintAllowlist {
+    /// The allowlisted mint addresses (only the first `len` are live).
+    pub mints: [[u8; 32]; 8],
+    /// Number of live entries in `mints`.
+    pub len: u8,
 }
 
 /// Skeleton mirror of `escrow_state::ClaimantRoster` (AV-149): the
@@ -9621,6 +9670,16 @@ pub struct InitializeMint<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-157: accounts for `initialize_mint_allowlist`.
+#[derive(Accounts)]
+pub struct InitializeMintAllowlist<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer sets the mint allowlist; the state machine
+    /// rejects re-configuration once the escrow leaves `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
 #[derive(Accounts)]
 pub struct InitializeProtocolFee<'info> {
     #[account(mut)]
@@ -10405,6 +10464,10 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::VestingNotPaused => {
             error!(ErrorCode::VestingNotPaused)
         }
+        // AV-157: the SPL mint governance allowlist rejection.
+        escrow_state::EscrowError::MintNotAllowlisted => {
+            error!(ErrorCode::MintNotAllowlisted)
+        }
     }
 }
 
@@ -10695,4 +10758,8 @@ pub enum ErrorCode {
     InvalidClaimantShares,
     #[msg("Vesting already paused (AV-150): pause_vesting on an already-paused schedule — the pause is a strict toggle, so a second stamp is refused rather than silently re-stamping paused_at (VestingAlreadyPaused, code 213)")]
     VestingAlreadyPaused,
+    // AV-157: the SPL mint governance allowlist error. Appended at
+    // the end so every existing Anchor error discriminant is unchanged.
+    #[msg("Mint not allowlisted (AV-157): with_mint with a token mint not on the escrow's mint allowlist — the allowlist is opt-in governance, and unlisted mints are rejected (MintNotAllowlisted, code 217)")]
+    MintNotAllowlisted,
 }
