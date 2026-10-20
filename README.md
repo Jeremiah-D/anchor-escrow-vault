@@ -3034,6 +3034,38 @@ discriminator); Anchor tooling ignores unknown JSON fields. When the
 Anchor toolchain is available, `anchor build` output should replace
 this file — the pinning tests then guard the real artifact instead.
 
+## IDL semver breaking-change gate (AV-152)
+
+Generation from sources can still *intentionally* change the IDL
+between releases — a removed instruction, a reordered account field,
+a reused error code — and each of those silently breaks off-chain
+clients (indexers, the keeper CLI, SDKs) at the wire level.
+`escrow-state/src/idl_compat.rs` (a test-only pipeline, like AV-29)
+diffs the checked-in IDL against the last release's baseline
+(`programs/escrow-vault/idl/escrow_vault.baseline.json`) and
+classifies every change:
+
+- **breaking**: instruction removed; instruction arg
+  added/removed/renamed/type-changed/reordered (args are positional
+  Borsh); account or named-type field removed/renamed/type-changed/
+  reordered; a *required* (non-`Option`) field added; named type
+  removed; error removed; error code changed or reused.
+- **non-breaking**: instruction added; `Option<…>` field added (the
+  vault's opt-in convention — zeroed when unset); named type added;
+  error code added; version bump.
+
+The diff works on a semantic model parsed by a hand-rolled
+zero-dependency JSON parser, so reformatting the IDL never reports
+as a change. CI gate: every breaking change needs an explicit entry
+in `BREAKING_CHANGE_ALLOWLIST` (stable keys like
+`instruction_removed:release`), otherwise the `idl_semver_gate`
+test fails. When cutting a release, refresh the baseline:
+
+```bash
+cp programs/escrow-vault/idl/escrow_vault.json \
+   programs/escrow-vault/idl/escrow_vault.baseline.json
+```
+
 ## Concurrent simulation runner (AV-30)
 
 `escrow-state/src/sim.rs` (test-only) is a deterministic off-chain

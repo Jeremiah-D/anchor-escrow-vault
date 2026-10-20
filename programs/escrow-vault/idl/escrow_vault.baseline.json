@@ -1,0 +1,1703 @@
+{
+  "version": "0.1.0",
+  "name": "escrow_vault",
+  "instructions": [
+    {
+      "name": "initialize",
+      "discriminator": [175, 175, 109, 31, 13, 152, 155, 237],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"},
+        {"name": "expires_at", "type": "u64"},
+        {"name": "keeper_bounty_pool", "type": "u64"},
+        {"name": "keeper_bounty_per_crank", "type": "u64"}
+      ]
+    },
+    {
+      "name": "fund",
+      "discriminator": [218, 188, 111, 221, 152, 113, 174, 7],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "fund_taker",
+      "discriminator": [207, 221, 78, 199, 178, 209, 54, 197],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_claimants",
+      "discriminator": [110, 22, 93, 158, 22, 20, 188, 6],
+      "accounts": [],
+      "args": [
+        {"name": "shares", "type": {"vec": {"defined": "ClaimantShare"}}}
+      ]
+    },
+    {
+      "name": "claim_share",
+      "discriminator": [42, 18, 161, 15, 129, 155, 240, 52],
+      "accounts": [],
+      "args": [
+        {"name": "claimant", "type": {"array": ["u8", 32]}}
+      ]
+    },
+    {
+      "name": "pause_vesting",
+      "discriminator": [236, 70, 50, 112, 203, 144, 171, 1],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "resume_vesting",
+      "discriminator": [220, 59, 250, 22, 78, 191, 12, 174],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "release",
+      "discriminator": [253, 249, 15, 206, 28, 127, 193, 241],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"}
+      ]
+    },
+    {
+      "name": "release_via_intent",
+      "discriminator": [158, 25, 49, 55, 26, 145, 15, 117],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"},
+        {"name": "payout_to", "type": "publicKey"},
+        {"name": "nonce", "type": "u64"},
+        {"name": "expiry_slot", "type": "u64"},
+        {"name": "signature", "type": {"vec": "u8"}}
+      ]
+    },
+    {
+      "name": "release_split",
+      "discriminator": [51, 139, 250, 190, 137, 198, 127, 246],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"},
+        {"name": "recipients", "type": {"vec": "publicKey"}},
+        {"name": "bps", "type": {"vec": "u16"}}
+      ]
+    },
+    {
+      "name": "release_via_cpi",
+      "discriminator": [25, 119, 163, 178, 107, 93, 139, 68],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"},
+        {"name": "min_payout", "type": "u64"},
+        {"name": "cpi_data", "type": {"vec": "u8"}}
+      ]
+    },
+    {
+      "name": "cancel",
+      "discriminator": [232, 219, 223, 41, 219, 236, 220, 190],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "cancel_expired",
+      "discriminator": [248, 138, 112, 93, 177, 89, 249, 246],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "cancel_partial",
+      "discriminator": [150, 240, 43, 134, 158, 7, 111, 216],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"}
+      ]
+    },
+    {
+      "name": "partial_refund",
+      "discriminator": [159, 106, 64, 137, 77, 16, 94, 133],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"}
+      ]
+    },
+    {
+      "name": "crank_expired",
+      "discriminator": [242, 214, 197, 141, 189, 175, 150, 24],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "initialize_quorum",
+      "discriminator": [78, 18, 53, 161, 28, 58, 249, 102],
+      "accounts": [],
+      "args": [
+        {"name": "attestors", "type": {"vec": "publicKey"}},
+        {"name": "weights", "type": {"vec": "u64"}},
+        {"name": "threshold", "type": "u64"}
+      ]
+    },
+    {
+      "name": "update_quorum",
+      "discriminator": [74, 161, 172, 92, 0, 64, 134, 242],
+      "accounts": [],
+      "args": [
+        {"name": "threshold", "type": "u64"}
+      ]
+    },
+    {
+      "name": "update_attestors",
+      "discriminator": [39, 65, 233, 198, 170, 184, 251, 35],
+      "accounts": [],
+      "args": [
+        {"name": "attestors", "type": {"vec": "publicKey"}},
+        {"name": "weights", "type": {"vec": "u64"}}
+      ]
+    },
+    {
+      "name": "initialize_dual_sig",
+      "discriminator": [35, 138, 15, 52, 181, 161, 70, 198],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "activate",
+      "discriminator": [194, 203, 35, 100, 151, 55, 170, 82],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "initialize_vesting",
+      "discriminator": [5, 29, 245, 237, 50, 242, 35, 13],
+      "accounts": [],
+      "args": [
+        {"name": "start", "type": "u64"},
+        {"name": "end", "type": "u64"},
+        {"name": "cliff", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_vesting_curve",
+      "discriminator": [70, 255, 18, 39, 11, 76, 39, 76],
+      "accounts": [],
+      "args": [
+        {"name": "start", "type": "u64"},
+        {"name": "end", "type": "u64"},
+        {"name": "cliff", "type": "u64"},
+        {"name": "tiers", "type": {"vec": {"defined": "VestingTier"}}}
+      ]
+    },
+    {
+      "name": "claim",
+      "discriminator": [62, 198, 214, 193, 213, 159, 108, 210],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "decline_escrow",
+      "discriminator": [111, 167, 119, 192, 35, 99, 36, 84],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "propose_counter_offer",
+      "discriminator": [61, 70, 107, 218, 131, 161, 227, 247],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"},
+        {"name": "expiry", "type": "u64"}
+      ]
+    },
+    {
+      "name": "accept_counter_offer",
+      "discriminator": [94, 106, 245, 253, 116, 96, 27, 165],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "reject_counter_offer",
+      "discriminator": [15, 233, 114, 177, 34, 171, 222, 60],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "attest",
+      "discriminator": [83, 148, 120, 119, 144, 139, 117, 160],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "initialize_arbiter",
+      "discriminator": [251, 216, 98, 136, 46, 115, 9, 150],
+      "accounts": [],
+      "args": [
+        {"name": "arbiter", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "escalate",
+      "discriminator": [123, 99, 100, 10, 66, 238, 154, 23],
+      "accounts": [],
+      "args": [
+        {"name": "dispute_amount", "type": "u64"},
+        {"name": "evidence_hash", "type": {"option": {"array": ["u8", 32]}}},
+        {"name": "evidence_root", "type": {"option": {"array": ["u8", 32]}}},
+        {"name": "evidence_leaves", "type": "u8"}
+      ]
+    },
+    {
+      "name": "file_evidence",
+      "discriminator": [187, 167, 242, 252, 30, 124, 123, 199],
+      "accounts": [],
+      "args": [
+        {"name": "doc_hash", "type": {"array": ["u8", 32]}},
+        {"name": "leaf_index", "type": "u8"},
+        {"name": "proof", "type": {"vec": {"array": ["u8", 32]}}}
+      ]
+    },
+    {
+      "name": "resolve",
+      "discriminator": [246, 150, 236, 206, 108, 63, 58, 10],
+      "accounts": [],
+      "args": [
+        {"name": "taker_amount", "type": "u64"},
+        {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}}
+      ]
+    },
+    {
+      "name": "initialize_milestones",
+      "discriminator": [137, 195, 64, 87, 251, 182, 249, 44],
+      "accounts": [],
+      "args": [
+        {"name": "milestones", "type": {"vec": "u64"}}
+      ]
+    },
+    {
+      "name": "confirm_milestone",
+      "discriminator": [236, 44, 53, 130, 120, 214, 40, 73],
+      "accounts": [],
+      "args": [
+        {"name": "index", "type": "u8"}
+      ]
+    },
+    {
+      "name": "release_milestone",
+      "discriminator": [56, 2, 199, 164, 184, 108, 167, 222],
+      "accounts": [],
+      "args": [
+        {"name": "index", "type": "u8"}
+      ]
+    },
+    {
+      "name": "skip_milestone",
+      "discriminator": [167, 162, 64, 21, 105, 209, 152, 216],
+      "accounts": [],
+      "args": [
+        {"name": "index", "type": "u8"}
+      ]
+    },
+    {
+      "name": "adjust_milestone_amounts",
+      "discriminator": [240, 224, 99, 74, 41, 45, 129, 178],
+      "accounts": [],
+      "args": [
+        {"name": "new_amounts", "type": {"vec": "u64"}}
+      ]
+    },
+    {
+      "name": "adjust_period_amounts",
+      "discriminator": [245, 12, 78, 243, 243, 197, 33, 156],
+      "accounts": [],
+      "args": [
+        {"name": "new_amounts", "type": {"vec": "u64"}}
+      ]
+    },
+    {
+      "name": "initialize_mint",
+      "discriminator": [209, 42, 195, 4, 129, 85, 209, 44],
+      "accounts": [],
+      "args": [
+        {"name": "mint", "type": "string"}
+      ]
+    },
+    {
+      "name": "initialize_protocol_fee",
+      "discriminator": [60, 79, 173, 116, 35, 243, 151, 134],
+      "accounts": [],
+      "args": [
+        {"name": "fee_bps", "type": "u16"}
+      ]
+    },
+    {
+      "name": "initialize_grace_period",
+      "discriminator": [35, 222, 92, 52, 137, 150, 61, 247],
+      "accounts": [],
+      "args": [
+        {"name": "grace_period", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_refund_address",
+      "discriminator": [80, 251, 32, 2, 66, 57, 106, 177],
+      "accounts": [],
+      "args": [
+        {"name": "refund_to", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "initialize_penalty",
+      "discriminator": [212, 113, 28, 90, 86, 81, 102, 244],
+      "accounts": [],
+      "args": [
+        {"name": "penalty_bps", "type": "u16"}
+      ]
+    },
+    {
+      "name": "initialize_penalty_escalation",
+      "discriminator": [234, 39, 208, 42, 43, 251, 64, 224],
+      "accounts": [],
+      "args": [
+        {"name": "rate_bps_per_day", "type": "u16"},
+        {"name": "cap_bps", "type": "u16"}
+      ]
+    },
+    {
+      "name": "initialize_timelock",
+      "discriminator": [47, 125, 243, 32, 170, 86, 24, 243],
+      "accounts": [],
+      "args": [
+        {"name": "unlock_at", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_decimals",
+      "discriminator": [186, 181, 39, 157, 205, 168, 173, 43],
+      "accounts": [],
+      "args": [
+        {"name": "decimals", "type": "u8"}
+      ]
+    },
+    {
+      "name": "initialize_emergency_unlock",
+      "discriminator": [153, 121, 160, 71, 132, 213, 75, 93],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "initialize_fee_recipient",
+      "discriminator": [218, 87, 142, 200, 206, 197, 22, 200],
+      "accounts": [],
+      "args": [
+        {"name": "fee_recipient", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "emergency_unlock",
+      "discriminator": [17, 106, 80, 63, 244, 220, 225, 70],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "close_vault",
+      "discriminator": [141, 103, 17, 126, 72, 75, 29, 29],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "release_and_close",
+      "discriminator": [76, 58, 136, 168, 185, 105, 132, 167],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "initialize_pause_authority",
+      "discriminator": [138, 78, 3, 35, 190, 65, 44, 196],
+      "accounts": [],
+      "args": [
+        {"name": "pause_authority", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "pause",
+      "discriminator": [211, 22, 221, 251, 74, 121, 193, 47],
+      "accounts": [],
+      "args": [
+        {"name": "auto_unpause_at", "type": {"option": "u64"}}
+      ]
+    },
+    {
+      "name": "unpause",
+      "discriminator": [169, 144, 4, 38, 10, 141, 188, 255],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "rotate_pause_authority",
+      "discriminator": [30, 65, 235, 29, 171, 205, 28, 136],
+      "accounts": [],
+      "args": [
+        {"name": "new_authority", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "rotate_taker",
+      "discriminator": [188, 9, 114, 76, 124, 78, 249, 122],
+      "accounts": [],
+      "args": [
+        {"name": "new_taker", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "rotate_initializer",
+      "discriminator": [117, 75, 191, 252, 13, 163, 28, 68],
+      "accounts": [],
+      "args": [
+        {"name": "new_initializer", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "rotate_arbiter",
+      "discriminator": [249, 81, 161, 140, 86, 60, 98, 68],
+      "accounts": [],
+      "args": [
+        {"name": "new_arbiter", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "rotate_fee_recipient",
+      "discriminator": [184, 47, 132, 149, 242, 158, 63, 216],
+      "accounts": [],
+      "args": [
+        {"name": "new_recipient", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "initialize_arbiter_panel",
+      "discriminator": [208, 8, 89, 195, 89, 157, 227, 90],
+      "accounts": [],
+      "args": [
+        {"name": "members", "type": {"vec": "publicKey"}},
+        {"name": "threshold", "type": "u8"}
+      ]
+    },
+    {
+      "name": "submit_panel_judgment",
+      "discriminator": [63, 19, 185, 245, 126, 72, 146, 215],
+      "accounts": [],
+      "args": [
+        {"name": "taker_amount", "type": "u64"},
+        {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}}
+      ]
+    },
+    {
+      "name": "initialize_blind_panel",
+      "discriminator": [111, 86, 53, 71, 116, 194, 219, 218],
+      "accounts": [],
+      "args": [
+        {"name": "members", "type": {"vec": "publicKey"}},
+        {"name": "threshold", "type": "u8"},
+        {"name": "reveal_window_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "submit_judgment_commit",
+      "discriminator": [205, 107, 171, 60, 216, 52, 157, 201],
+      "accounts": [],
+      "args": [
+        {"name": "commitment", "type": {"array": ["u8", 32]}}
+      ]
+    },
+    {
+      "name": "reveal_judgment",
+      "discriminator": [33, 156, 66, 81, 120, 217, 205, 11],
+      "accounts": [],
+      "args": [
+        {"name": "taker_amount", "type": "u64"},
+        {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}},
+        {"name": "salt", "type": {"array": ["u8", 32]}}
+      ]
+    },
+    {
+      "name": "initialize_payout_allowlist",
+      "discriminator": [155, 187, 116, 255, 95, 174, 219, 118],
+      "accounts": [],
+      "args": [
+        {"name": "allowlist", "type": {"vec": "publicKey"}}
+      ]
+    },
+    {
+      "name": "update_payout_allowlist",
+      "discriminator": [191, 47, 164, 103, 31, 55, 11, 226],
+      "accounts": [],
+      "args": [
+        {"name": "allowlist", "type": {"vec": "publicKey"}}
+      ]
+    },
+    {
+      "name": "initialize_payout_denylist",
+      "discriminator": [93, 18, 4, 14, 58, 95, 161, 162],
+      "accounts": [],
+      "args": [
+        {"name": "denylist", "type": {"vec": "publicKey"}}
+      ]
+    },
+    {
+      "name": "update_payout_denylist",
+      "discriminator": [21, 69, 155, 229, 219, 133, 150, 63],
+      "accounts": [],
+      "args": [
+        {"name": "denylist", "type": {"vec": "publicKey"}}
+      ]
+    },
+    {
+      "name": "initialize_cpi_allowlist",
+      "discriminator": [156, 187, 23, 210, 103, 8, 231, 39],
+      "accounts": [],
+      "args": [
+        {"name": "program_ids", "type": {"vec": "publicKey"}}
+      ]
+    },
+    {
+      "name": "update_cpi_allowlist",
+      "discriminator": [180, 248, 58, 41, 108, 201, 10, 92],
+      "accounts": [],
+      "args": [
+        {"name": "program_ids", "type": {"vec": "publicKey"}}
+      ]
+    },
+    {
+      "name": "initialize_multisig_authority",
+      "discriminator": [237, 121, 3, 75, 41, 195, 244, 196],
+      "accounts": [],
+      "args": [
+        {"name": "multisig_authority", "type": {"defined": "MultisigAuthority"}}
+      ]
+    },
+    {
+      "name": "initialize_reference",
+      "discriminator": [199, 226, 9, 15, 40, 9, 131, 223],
+      "accounts": [],
+      "args": [
+        {"name": "reference", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "initialize_default_judgment",
+      "discriminator": [226, 82, 98, 69, 224, 5, 17, 229],
+      "accounts": [],
+      "args": [
+        {"name": "deadline_secs", "type": "u64"},
+        {"name": "default_taker_amount", "type": "u64"}
+      ]
+    },
+    {
+      "name": "confirm_default_judgment",
+      "discriminator": [130, 131, 227, 236, 158, 112, 123, 109],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "trigger_default_judgment",
+      "discriminator": [191, 214, 53, 76, 192, 229, 127, 24],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "initialize_subscription",
+      "discriminator": [208, 156, 144, 38, 56, 65, 152, 18],
+      "accounts": [],
+      "args": [
+        {"name": "period_secs", "type": "u64"},
+        {"name": "periods", "type": "u8"},
+        {"name": "per_period", "type": "u64"}
+      ]
+    },
+    {
+      "name": "release_period",
+      "discriminator": [157, 185, 134, 132, 89, 6, 95, 95],
+      "accounts": [],
+      "args": [
+        {"name": "period_index", "type": "u8"}
+      ]
+    },
+    {
+      "name": "initialize_extension",
+      "discriminator": [147, 62, 136, 75, 36, 117, 185, 148],
+      "accounts": [],
+      "args": [
+        {"name": "max_extension_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_fee_cap",
+      "discriminator": [252, 51, 179, 111, 77, 245, 39, 246],
+      "accounts": [],
+      "args": [
+        {"name": "max_fee_cents", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_fee_schedule",
+      "discriminator": [125, 35, 60, 135, 23, 192, 56, 185],
+      "accounts": [],
+      "args": [
+        {"name": "tiers", "type": {"vec": {"defined": "FeeTier"}}}
+      ]
+    },
+    {
+      "name": "extend_expiry",
+      "discriminator": [216, 39, 141, 15, 230, 100, 24, 26],
+      "accounts": [],
+      "args": [
+        {"name": "new_expires_at", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_relative_timelock",
+      "discriminator": [130, 0, 30, 18, 28, 26, 206, 111],
+      "accounts": [],
+      "args": [
+        {"name": "secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_slot_timelock",
+      "discriminator": [59, 167, 173, 199, 125, 77, 142, 103],
+      "accounts": [],
+      "args": [
+        {"name": "slots", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_claim_cooldown",
+      "discriminator": [142, 108, 223, 48, 74, 229, 128, 30],
+      "accounts": [],
+      "args": [
+        {"name": "slots", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_evidence_deadline",
+      "discriminator": [204, 4, 240, 39, 232, 161, 251, 234],
+      "accounts": [],
+      "args": [
+        {"name": "deadline_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "submit_evidence",
+      "discriminator": [12, 169, 228, 194, 229, 31, 44, 39],
+      "accounts": [],
+      "args": [
+        {"name": "evidence_hash", "type": {"array": ["u8", 32]}}
+      ]
+    },
+    {
+      "name": "update_panel_threshold",
+      "discriminator": [41, 32, 206, 239, 57, 111, 208, 123],
+      "accounts": [],
+      "args": [
+        {"name": "new_threshold", "type": "u8"}
+      ]
+    },
+    {
+      "name": "migrate_schema",
+      "discriminator": [223, 9, 156, 218, 187, 90, 169, 85],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "split_escrow",
+      "discriminator": [103, 146, 190, 211, 86, 42, 207, 91],
+      "accounts": [],
+      "args": [
+        {"name": "amounts", "type": {"vec": "u64"}},
+        {"name": "vesting", "type": {"option": {"defined": "VestingSchedule"}}},
+        {"name": "quorum", "type": {"option": {"defined": "QuorumPolicy"}}},
+        {"name": "dual_sig", "type": "bool"},
+        {"name": "milestones", "type": {"option": {"vec": {"defined": "MilestonePlan"}}}}
+      ]
+    },
+    {
+      "name": "initialize_slash_terms",
+      "discriminator": [192, 200, 188, 111, 132, 5, 236, 101],
+      "accounts": [],
+      "args": [
+        {"name": "penalty_account", "type": "publicKey"},
+        {"name": "slash_deadline", "type": "u64"}
+      ]
+    },
+    {
+      "name": "slash",
+      "discriminator": [204, 141, 18, 161, 8, 177, 92, 142],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_slash_ladder",
+      "discriminator": [88, 71, 75, 39, 135, 169, 163, 32],
+      "accounts": [],
+      "args": [
+        {"name": "penalty_account", "type": "publicKey"},
+        {"name": "rungs", "type": {"vec": {"defined": "SlashRung"}}}
+      ]
+    },
+    {
+      "name": "initialize_appeal_window",
+      "discriminator": [2, 177, 162, 186, 74, 115, 177, 120],
+      "accounts": [],
+      "args": [
+        {"name": "window_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_appeal_bond",
+      "discriminator": [212, 156, 40, 145, 244, 132, 190, 84],
+      "accounts": [],
+      "args": [
+        {"name": "bond", "type": "u64"}
+      ]
+    },
+    {
+      "name": "file_appeal",
+      "discriminator": [254, 237, 206, 155, 40, 232, 240, 211],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "review_appeal",
+      "discriminator": [205, 51, 73, 250, 74, 104, 0, 169],
+      "accounts": [],
+      "args": [
+        {"name": "uphold", "type": "bool"}
+      ]
+    },
+    {
+      "name": "expire_appeal",
+      "discriminator": [103, 85, 227, 157, 166, 89, 78, 46],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "release_basket",
+      "discriminator": [11, 43, 169, 142, 42, 81, 185, 60],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "cancel_basket",
+      "discriminator": [144, 180, 67, 56, 10, 10, 160, 185],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "cancel_expired_basket",
+      "discriminator": [222, 213, 189, 98, 242, 39, 219, 173],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "release_basket_all",
+      "discriminator": [23, 48, 193, 215, 203, 74, 77, 103],
+      "accounts": [],
+      "args": [
+        {"name": "payout_to", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "cancel_basket_all",
+      "discriminator": [43, 52, 14, 218, 196, 230, 11, 3],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "initialize_basket",
+      "discriminator": [246, 234, 106, 12, 103, 95, 178, 166],
+      "accounts": [],
+      "args": [
+        {"name": "legs", "type": {"vec": {"defined": "BasketLeg"}}},
+        {"name": "expires_at", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_dutch_auction",
+      "discriminator": [42, 252, 88, 140, 232, 114, 60, 135],
+      "accounts": [],
+      "args": [
+        {"name": "start_at", "type": "u64"},
+        {"name": "end_at", "type": "u64"},
+        {"name": "reserve_bps", "type": "u16"}
+      ]
+    },
+    {
+      "name": "initialize_transfer_hook",
+      "discriminator": [22, 166, 19, 247, 193, 62, 186, 143],
+      "accounts": [],
+      "args": [
+        {"name": "program_id", "type": {"array": ["u8", 32]}}
+      ]
+    },
+    {
+      "name": "initialize_streaming_fee",
+      "discriminator": [233, 79, 136, 207, 103, 126, 38, 180],
+      "accounts": [],
+      "args": [
+        {"name": "rate", "type": "u64"}
+      ]
+    },
+    {
+      "name": "delegate_authority",
+      "discriminator": [228, 17, 85, 163, 65, 139, 36, 206],
+      "accounts": [],
+      "args": [
+        {"name": "delegate", "type": "publicKey"},
+        {"name": "scopes", "type": "u32"}
+      ]
+    },
+    {
+      "name": "revoke_delegation",
+      "discriminator": [188, 92, 135, 67, 160, 181, 54, 62],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "link_swap",
+      "discriminator": [165, 119, 91, 2, 66, 143, 234, 181],
+      "accounts": [],
+      "args": [
+        {"name": "escrow_id_a", "type": {"array": ["u8", 32]}},
+        {"name": "escrow_id_b", "type": {"array": ["u8", 32]}},
+        {"name": "amount_a", "type": "u64"},
+        {"name": "amount_b", "type": "u64"}
+      ]
+    },
+    {
+      "name": "release_swap",
+      "discriminator": [61, 205, 84, 196, 165, 106, 157, 210],
+      "accounts": [],
+      "args": [
+        {"name": "escrow_id_a", "type": {"array": ["u8", 32]}},
+        {"name": "escrow_id_b", "type": {"array": ["u8", 32]}},
+        {"name": "amount_a", "type": "u64"},
+        {"name": "amount_b", "type": "u64"}
+      ]
+    },
+    {
+      "name": "cancel_swap",
+      "discriminator": [88, 174, 98, 148, 24, 252, 93, 89],
+      "accounts": [],
+      "args": [
+        {"name": "escrow_id_a", "type": {"array": ["u8", 32]}},
+        {"name": "escrow_id_b", "type": {"array": ["u8", 32]}}
+      ]
+    },
+    {
+      "name": "cancel_swap_expired",
+      "discriminator": [148, 19, 233, 185, 202, 202, 213, 118],
+      "accounts": [],
+      "args": [
+        {"name": "escrow_id_a", "type": {"array": ["u8", 32]}},
+        {"name": "escrow_id_b", "type": {"array": ["u8", 32]}}
+      ]
+    },
+    {
+      "name": "initialize_insurance_pool",
+      "discriminator": [109, 87, 201, 131, 246, 236, 11, 238],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "pool_payout",
+      "discriminator": [96, 126, 156, 222, 124, 179, 148, 159],
+      "accounts": [],
+      "args": [
+        {"name": "beneficiary", "type": "publicKey"},
+        {"name": "amount", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_interest",
+      "discriminator": [242, 97, 202, 5, 151, 248, 36, 237],
+      "accounts": [],
+      "args": [
+        {"name": "rate_bps", "type": "u16"}
+      ]
+    },
+    {
+      "name": "claim_interest",
+      "discriminator": [62, 142, 132, 209, 206, 8, 79, 175],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "initialize_compound_interest",
+      "discriminator": [178, 122, 174, 98, 7, 63, 5, 238],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "initialize_payout_split",
+      "discriminator": [165, 22, 40, 62, 191, 161, 250, 138],
+      "accounts": [],
+      "args": [
+        {"name": "shares", "type": {"vec": {"defined": "PayoutSplitShare"}}}
+      ]
+    },
+    {
+      "name": "release_payout_split",
+      "discriminator": [237, 47, 58, 238, 37, 185, 245, 101],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "initialize_deadman_switch",
+      "discriminator": [227, 118, 253, 183, 67, 134, 220, 86],
+      "accounts": [],
+      "args": [
+        {"name": "inactivity_secs", "type": "u64"},
+        {"name": "heir", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "claim_deadman",
+      "discriminator": [179, 124, 46, 54, 34, 232, 80, 77],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "top_up_rent",
+      "discriminator": [228, 107, 203, 188, 137, 169, 152, 122],
+      "accounts": [],
+      "args": [
+        {"name": "lamports", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_funding_plan",
+      "discriminator": [163, 209, 171, 116, 156, 37, 54, 133],
+      "accounts": [],
+      "args": [
+        {"name": "total_amount", "type": "u64"},
+        {"name": "max_tranches", "type": "u8"}
+      ]
+    },
+    {
+      "name": "fund_tranche",
+      "discriminator": [235, 63, 170, 15, 101, 90, 189, 90],
+      "accounts": [],
+      "args": [
+        {"name": "tranche_amount", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_release_cooling",
+      "discriminator": [95, 16, 202, 51, 84, 123, 159, 95],
+      "accounts": [],
+      "args": [
+        {"name": "cooling_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "announce_release",
+      "discriminator": [84, 187, 43, 165, 93, 79, 45, 130],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "veto_release",
+      "discriminator": [24, 147, 251, 20, 117, 37, 114, 81],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "initialize_price_gate",
+      "discriminator": [37, 100, 132, 38, 155, 97, 69, 21],
+      "accounts": [],
+      "args": [
+        {"name": "direction", "type": "u8"},
+        {"name": "target", "type": "u64"},
+        {"name": "max_staleness_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_twap_gate",
+      "discriminator": [52, 134, 25, 173, 33, 217, 15, 110],
+      "accounts": [],
+      "args": [
+        {"name": "window_slots", "type": "u64"},
+        {"name": "target", "type": "u64"},
+        {"name": "direction", "type": "u8"},
+        {"name": "max_staleness_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "merge_escrows",
+      "discriminator": [107, 14, 126, 41, 132, 158, 212, 191],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "net_escrows",
+      "discriminator": [187, 108, 28, 32, 155, 188, 181, 81],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "initialize_dual_control",
+      "discriminator": [136, 210, 181, 255, 218, 150, 179, 66],
+      "accounts": [],
+      "args": [
+        {"name": "checker", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "initiate_release",
+      "discriminator": [207, 117, 219, 170, 61, 0, 71, 211],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"},
+        {"name": "mint", "type": {"option": "publicKey"}},
+        {"name": "payout_to", "type": "publicKey"},
+        {"name": "intent_ttl_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "confirm_release",
+      "discriminator": [181, 157, 89, 7, 37, 54, 72, 90],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "cancel_release",
+      "discriminator": [109, 170, 172, 190, 125, 251, 1, 66],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "initialize_amount_bounds",
+      "discriminator": [79, 16, 125, 146, 48, 120, 89, 84],
+      "accounts": [],
+      "args": [
+        {"name": "min_amount", "type": "u64"},
+        {"name": "max_amount", "type": "u64"}
+      ]
+    },
+    {
+      "name": "initialize_arbiter_fee",
+      "discriminator": [7, 78, 191, 38, 252, 92, 232, 217],
+      "accounts": [],
+      "args": [
+        {"name": "flat_lamports", "type": "u64"},
+        {"name": "fee_bps", "type": "u16"}
+      ]
+    },
+    {
+      "name": "initialize_rent_sweep_grace",
+      "discriminator": [218, 5, 125, 150, 92, 219, 236, 86],
+      "accounts": [],
+      "args": [
+        {"name": "grace_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "sweep_unclaimed_rent",
+      "discriminator": [73, 149, 99, 99, 73, 30, 169, 98],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "release_many",
+      "discriminator": [217, 182, 57, 99, 159, 160, 26, 168],
+      "accounts": [],
+      "args": [
+        {"name": "legs", "type": {"vec": {"defined": "ReleaseLeg"}}},
+        {"name": "mint", "type": {"option": "publicKey"}}
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Vault",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "initializer", "type": "publicKey", "offset": 8},
+          {"name": "taker", "type": "publicKey", "offset": 40},
+          {"name": "amount", "type": "u64", "offset": 72},
+          {"name": "released", "type": "u64", "offset": 80},
+          {"name": "expires_at", "type": "u64", "offset": 88},
+          {"name": "state", "type": "u8", "offset": 96},
+          {"name": "quorum", "type": {"option": {"defined": "QuorumPolicy"}}, "offset": 97},
+          {"name": "activation", "type": "u8", "offset": 435},
+          {"name": "vesting", "type": {"option": {"defined": "VestingSchedule"}}, "offset": 436},
+          {"name": "arbiter", "type": {"option": "publicKey"}, "offset": 461},
+          {"name": "milestones", "type": {"option": {"defined": "MilestonePlan"}}, "offset": 494},
+          {"name": "milestone_flags", "type": "u64", "offset": 560},
+          {"name": "skipped", "type": "u64", "offset": 568},
+          {"name": "mint", "type": {"option": "publicKey"}, "offset": 576},
+          {"name": "fee_bps", "type": "u16", "offset": 609},
+          {"name": "fees_paid", "type": "u64", "offset": 611},
+          {"name": "grace_period", "type": "u64", "offset": 619},
+          {"name": "evidence_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 627},
+          {"name": "refund_to", "type": {"option": "publicKey"}, "offset": 660},
+          {"name": "penalty_bps", "type": "u16", "offset": 693},
+          {"name": "timelock", "type": "u64", "offset": 695},
+          {"name": "decimals", "type": "u8", "offset": 703},
+          {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 704},
+          {"name": "emergency_unlock", "type": "bool", "offset": 737},
+          {"name": "fee_recipient", "type": {"option": "publicKey"}, "offset": 738},
+          {"name": "pause_authority", "type": {"option": "publicKey"}, "offset": 771},
+          {"name": "paused", "type": "bool", "offset": 804},
+          {"name": "payout_allowlist", "type": {"option": {"defined": "PayoutAllowlist"}}, "offset": 805},
+          {"name": "reference", "type": {"option": {"array": ["u8", 32]}}, "offset": 935},
+          {"name": "disputed_at", "type": "u64", "offset": 968},
+          {"name": "default_judgment", "type": {"option": {"defined": "DefaultJudgment"}}, "offset": 976},
+          {"name": "default_confirmed", "type": "bool", "offset": 993},
+          {"name": "subscription", "type": {"option": {"defined": "SubscriptionSchedule"}}, "offset": 994},
+          {"name": "subscription_next", "type": "u8", "offset": 1012},
+          {"name": "subscription_released", "type": "u64", "offset": 1013},
+          {"name": "event_head", "type": "u8", "offset": 1021},
+          {"name": "event_total", "type": "u64", "offset": 1022},
+          {"name": "event_count", "type": "u8", "offset": 1030},
+          {"name": "event_capacity", "type": "u8", "offset": 1031},
+          {"name": "event_slots", "type": {"array": [{"defined": "EventHistorySlot"}, 64]}, "offset": 1032},
+          {"name": "max_extension_secs", "type": "u64", "offset": 2184},
+          {"name": "extension_count", "type": "u64", "offset": 2192},
+          {"name": "fee_cap", "type": "u64", "offset": 2200},
+          {"name": "relative_timelock_secs", "type": "u64", "offset": 2208},
+          {"name": "fund_at", "type": "u64", "offset": 2216},
+          {"name": "arbiter_panel", "type": {"option": {"defined": "ArbiterPanel"}}, "offset": 2224},
+          {"name": "fee_schedule", "type": {"defined": "FeeSchedule"}, "offset": 3220},
+          {"name": "evidence_deadline_secs", "type": "u64", "offset": 3301},
+          {"name": "escalated_by", "type": {"option": "publicKey"}, "offset": 3309},
+          {"name": "subscription_amounts", "type": {"array": ["u64", 64]}, "offset": 3342},
+          {"name": "schema_version", "type": "u8", "offset": 3854},
+          {"name": "slash_terms", "type": {"option": {"defined": "SlashTerms"}}, "offset": 3855},
+          {"name": "penalty_paid", "type": "u64", "offset": 3896},
+          {"name": "cpi_allowlist", "type": {"option": {"defined": "CpiAllowlist"}}, "offset": 3904},
+          {"name": "multisig_authority", "type": {"option": {"defined": "MultisigAuthority"}}, "offset": 4162},
+          {"name": "appeal_window_secs", "type": "u64", "offset": 4229},
+          {"name": "appeal_deadline", "type": "u64", "offset": 4237},
+          {"name": "appeal_state", "type": "u8", "offset": 4245},
+          {"name": "appeal_ballot", "type": {"defined": "AppealBallot"}, "offset": 4246},
+          {"name": "vesting_curve", "type": {"option": {"defined": "VestingCurve"}}, "offset": 4255},
+          {"name": "evidence_root", "type": {"option": {"array": ["u8", 32]}}, "offset": 4337},
+          {"name": "evidence_leaves", "type": "u8", "offset": 4370},
+          {"name": "evidence_disclosed", "type": "u64", "offset": 4371},
+          {"name": "basket", "type": {"option": {"defined": "BasketLegs"}}, "offset": 4379},
+          {"name": "payout_denylist", "type": {"option": {"defined": "PayoutDenylist"}}, "offset": 4765},
+          {"name": "auction", "type": {"option": {"defined": "DutchAuction"}}, "offset": 4895},
+          {"name": "transfer_hook", "type": {"option": {"array": ["u8", 32]}}, "offset": 4914},
+          {"name": "streaming_fee_rate", "type": "u64", "offset": 4947},
+          {"name": "streaming_fees_accrued", "type": "u64", "offset": 4955},
+          {"name": "appeal_bond", "type": "u64", "offset": 4963},
+          {"name": "appeal_bond_paid", "type": "u64", "offset": 4971},
+          {"name": "delegation", "type": {"option": {"defined": "Delegation"}}, "offset": 4979},
+          {"name": "swap_link", "type": {"option": {"array": ["u8", 32]}}, "offset": 5016},
+          {"name": "insurance_pool", "type": "bool", "offset": 5049},
+          {"name": "pool_paid", "type": "u64", "offset": 5050},
+          {"name": "pool_slashed", "type": "u64", "offset": 5058},
+          {"name": "pool_inflow", "type": "u64", "offset": 5066},
+          {"name": "pool_payout_paid", "type": "u64", "offset": 5074},
+          {"name": "interest_rate_bps", "type": "u16", "offset": 5082},
+          {"name": "interest_accrual_base", "type": "u64", "offset": 5084},
+          {"name": "interest_accrued", "type": "u64", "offset": 5092},
+          {"name": "interest_paid", "type": "u64", "offset": 5100},
+          {"name": "payout_split", "type": {"defined": "PayoutSplit"}, "offset": 5108},
+          {"name": "deadman_inactivity_secs", "type": "u64", "offset": 5429},
+          {"name": "deadman_heir", "type": {"option": "publicKey"}, "offset": 5437},
+          {"name": "deadman_last_activity", "type": "u64", "offset": 5470},
+          {"name": "rent_topped_up_total", "type": "u64", "offset": 5478},
+          {"name": "funded_total", "type": "u64", "offset": 5486},
+          {"name": "funding_plan", "type": {"option": {"defined": "FundingPlan"}}, "offset": 5494},
+          {"name": "release_cooling_secs", "type": "u64", "offset": 5505},
+          {"name": "release_intent_at", "type": {"option": "u64"}, "offset": 5513},
+          {"name": "price_gate", "type": {"option": {"defined": "PriceGate"}}, "offset": 5522},
+          {"name": "penalty_escalation_rate_bps", "type": "u16", "offset": 5540},
+          {"name": "penalty_escalation_cap_bps", "type": "u16", "offset": 5542},
+          {"name": "slot_timelock_slots", "type": "u64", "offset": 5544},
+          {"name": "fund_slot", "type": "u64", "offset": 5552},
+          {"name": "compound_interest", "type": "bool", "offset": 5560},
+          {"name": "interest_compounded", "type": "u64", "offset": 5561},
+          {"name": "dispute_interest", "type": "u64", "offset": 5569},
+          {"name": "claim_cooldown_slots", "type": "u64", "offset": 5577},
+          {"name": "last_claim_slot", "type": {"option": "u64"}, "offset": 5585},
+          {"name": "counter_offer", "type": {"option": {"defined": "CounterOffer"}}, "offset": 5594},
+          {"name": "last_intent_nonce", "type": "u64", "offset": 5611},
+          {"name": "keeper_bounty_pool", "type": "u64", "offset": 5619},
+          {"name": "keeper_bounty_per_crank", "type": "u64", "offset": 5627},
+          {"name": "slash_ladder", "type": {"option": {"defined": "SlashLadder"}}, "offset": 5635},
+          {"name": "slash_ladder_index", "type": "u8", "offset": 5749},
+          {"name": "refunded", "type": "u64", "offset": 5750},
+          {"name": "twap_gate", "type": {"option": {"defined": "TwapGate"}}, "offset": 5758},
+          {"name": "dual_control_checker", "type": {"option": "publicKey"}, "offset": 5784},
+          {"name": "dual_control_intent", "type": {"option": {"defined": "DualControlIntent"}}, "offset": 5817},
+          {"name": "disputed_amount", "type": "u64", "offset": 5907},
+          {"name": "auto_unpause_at", "type": {"option": "u64"}, "offset": 5915},
+          {"name": "min_funding_amount", "type": {"option": "u64"}, "offset": 5924},
+          {"name": "max_funding_amount", "type": {"option": "u64"}, "offset": 5933},
+          {"name": "arbiter_fee_flat", "type": {"option": "u64"}, "offset": 5942},
+          {"name": "arbiter_fee_bps", "type": {"option": "u16"}, "offset": 5951},
+          {"name": "terminal_at", "type": "u64", "offset": 5954},
+          {"name": "rent_sweep_grace_secs", "type": "u64", "offset": 5962},
+          {"name": "taker_locked", "type": "u64", "offset": 5970},
+          {"name": "claimants", "type": {"option": {"defined": "ClaimantRoster"}}, "offset": 5978},
+          {"name": "vesting_pause", "type": {"option": {"defined": "VestingPause"}}, "offset": 6253}
+        ]
+      }
+    }
+  ],
+  "types": [
+    {
+      "name": "QuorumPolicy",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "attestors", "type": {"array": ["publicKey", 8]}, "offset": 0},
+          {"name": "weights", "type": {"array": ["u64", 8]}, "offset": 256},
+          {"name": "registered", "type": "u8", "offset": 320},
+          {"name": "threshold", "type": "u64", "offset": 321},
+          {"name": "approvals", "type": "u64", "offset": 329}
+        ]
+      }
+    },
+    {
+      "name": "VestingSchedule",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "start", "type": "u64", "offset": 0},
+          {"name": "end", "type": "u64", "offset": 8},
+          {"name": "cliff_at", "type": "u64", "offset": 16}
+        ]
+      }
+    },
+    {
+      "name": "MilestonePlan",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "amounts", "type": {"array": ["u64", 8]}, "offset": 0},
+          {"name": "count", "type": "u8", "offset": 64}
+        ]
+      }
+    },
+    {
+      "name": "PayoutAllowlist",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "addrs", "type": {"array": ["publicKey", 4]}, "offset": 0},
+          {"name": "len", "type": "u8", "offset": 128}
+        ]
+      }
+    },
+    {
+      "name": "DefaultJudgment",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "deadline_secs", "type": "u64", "offset": 0},
+          {"name": "default_taker_amount", "type": "u64", "offset": 8}
+        ]
+      }
+    },
+    {
+      "name": "SubscriptionSchedule",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "period_secs", "type": "u64", "offset": 0},
+          {"name": "periods", "type": "u8", "offset": 8},
+          {"name": "per_period", "type": "u64", "offset": 9}
+        ]
+      }
+    },
+    {
+      "name": "EventHistorySlot",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "kind", "type": "u8", "offset": 0},
+          {"name": "at", "type": "u64", "offset": 1},
+          {"name": "actor", "type": {"option": {"array": ["u8", 8]}}, "offset": 9}
+        ]
+      }
+    },
+    {
+      "name": "PanelVote",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "taker_amount", "type": "u64", "offset": 0},
+          {"name": "rationale_hash", "type": {"option": {"array": ["u8", 32]}}, "offset": 8}
+        ]
+      }
+    },
+    {
+      "name": "ArbiterPanel",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "n", "type": "u8", "offset": 0},
+          {"name": "threshold", "type": "u8", "offset": 1},
+          {"name": "members", "type": {"array": ["publicKey", 8]}, "offset": 2},
+          {"name": "votes", "type": {"array": [{"defined": "PanelVote"}, 8]}, "offset": 258},
+          {"name": "voted", "type": "u64", "offset": 586},
+          {"name": "blind", "type": "bool", "offset": 594},
+          {"name": "reveal_window_secs", "type": "u64", "offset": 595},
+          {"name": "commitments", "type": {"array": ["publicKey", 8]}, "offset": 603},
+          {"name": "committed_at", "type": {"array": ["u64", 8]}, "offset": 859},
+          {"name": "commit_disputed_at", "type": {"array": ["u64", 8]}, "offset": 923},
+          {"name": "revealed", "type": "u64", "offset": 987}
+        ]
+      }
+    },
+    {
+      "name": "FeeTier",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "min_amount", "type": "u64", "offset": 0},
+          {"name": "bps", "type": "u16", "offset": 8}
+        ]
+      }
+    },
+    {
+      "name": "FeeSchedule",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "tier_count", "type": "u8", "offset": 0},
+          {"name": "tiers", "type": {"array": [{"defined": "FeeTier"}, 8]}, "offset": 1}
+        ]
+      }
+    },
+    {
+      "name": "SlashTerms",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "penalty_account", "type": "publicKey", "offset": 0},
+          {"name": "slash_deadline", "type": "u64", "offset": 32}
+        ]
+      }
+    },
+    {
+      "name": "CpiAllowlist",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "addrs", "type": {"array": ["publicKey", 8]}, "offset": 0},
+          {"name": "len", "type": "u8", "offset": 256}
+        ]
+      }
+    },
+    {
+      "name": "MultisigAuthority",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "program_id", "type": "publicKey", "offset": 0},
+          {"name": "authority", "type": "publicKey", "offset": 32},
+          {"name": "threshold", "type": "u16", "offset": 64}
+        ]
+      }
+    },
+    {
+      "name": "AppealBallot",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "voted", "type": "u8", "offset": 0},
+          {"name": "votes", "type": {"array": ["u8", 8]}, "offset": 1}
+        ]
+      }
+    },
+    {
+      "name": "BasketLeg",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "mint", "type": "publicKey", "offset": 0},
+          {"name": "amount", "type": "u64", "offset": 32},
+          {"name": "released", "type": "u64", "offset": 40}
+        ]
+      }
+    },
+    {
+      "name": "BasketLegs",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "legs", "type": {"array": [{"defined": "BasketLeg"}, 8]}, "offset": 0},
+          {"name": "len", "type": "u8", "offset": 384}
+        ]
+      }
+    },
+    {
+      "name": "PayoutDenylist",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "addrs", "type": {"array": ["publicKey", 4]}, "offset": 0},
+          {"name": "len", "type": "u8", "offset": 128}
+        ]
+      }
+    },
+    {
+      "name": "DutchAuction",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "start_at", "type": "u64", "offset": 0},
+          {"name": "end_at", "type": "u64", "offset": 8},
+          {"name": "reserve_bps", "type": "u16", "offset": 16}
+        ]
+      }
+    },
+    {
+      "name": "Delegation",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "delegate", "type": "publicKey", "offset": 0},
+          {"name": "scopes", "type": "u32", "offset": 32}
+        ]
+      }
+    },
+    {
+      "name": "PayoutSplit",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "split_count", "type": "u8", "offset": 0},
+          {"name": "recipients", "type": {"array": ["publicKey", 8]}, "offset": 1},
+          {"name": "amounts", "type": {"array": ["u64", 8]}, "offset": 257}
+        ]
+      }
+    },
+    {
+      "name": "PayoutSplitShare",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "recipient", "type": "publicKey", "offset": 0},
+          {"name": "amount", "type": "u64", "offset": 32}
+        ]
+      }
+    },
+    {
+      "name": "ClaimantShare",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "claimant", "type": "publicKey", "offset": 0},
+          {"name": "share_bps", "type": "u16", "offset": 32}
+        ]
+      }
+    },
+    {
+      "name": "VestingPause",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "paused_at", "type": "u64", "offset": 0}
+        ]
+      }
+    },
+    {
+      "name": "FundingPlan",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "total_amount", "type": "u64", "offset": 0},
+          {"name": "max_tranches", "type": "u8", "offset": 8},
+          {"name": "tranches_used", "type": "u8", "offset": 9}
+        ]
+      }
+    },
+    {
+      "name": "PriceGate",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "direction", "type": "u8", "offset": 0},
+          {"name": "target", "type": "u64", "offset": 1},
+          {"name": "max_staleness_secs", "type": "u64", "offset": 9}
+        ]
+      }
+    },
+    {
+      "name": "TwapGate",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "direction", "type": "u8", "offset": 0},
+          {"name": "target", "type": "u64", "offset": 1},
+          {"name": "window_slots", "type": "u64", "offset": 9},
+          {"name": "max_staleness_secs", "type": "u64", "offset": 17}
+        ]
+      }
+    },
+    {
+      "name": "CounterOffer",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "amount", "type": "u64", "offset": 0},
+          {"name": "expiry", "type": "u64", "offset": 8}
+        ]
+      }
+    },
+    {
+      "name": "DualControlIntent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "amount", "type": "u64", "offset": 0},
+          {"name": "mint", "type": {"option": "publicKey"}, "offset": 8},
+          {"name": "payout_to", "type": "publicKey", "offset": 41},
+          {"name": "initiated_at", "type": "u64", "offset": 73},
+          {"name": "intent_expires_at", "type": "u64", "offset": 81}
+        ]
+      }
+    },
+    {
+      "name": "ReleaseLeg",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "amount", "type": "u64", "offset": 0},
+          {"name": "payout_to", "type": "publicKey", "offset": 8}
+        ]
+      }
+    }
+  ],
+  "errors": [
+    {"code": 100, "name": "Unauthorized"},
+    {"code": 101, "name": "InvalidStateTransition"},
+    {"code": 102, "name": "AmountMismatch"},
+    {"code": 103, "name": "NotExpired"},
+    {"code": 104, "name": "InvalidQuorum"},
+    {"code": 105, "name": "QuorumNotReached"},
+    {"code": 106, "name": "ReleaseExceedsLocked"},
+    {"code": 107, "name": "InvalidVesting"},
+    {"code": 108, "name": "InvalidArbiter"},
+    {"code": 109, "name": "DisputeWindowClosed"},
+    {"code": 110, "name": "InvalidMilestones"},
+    {"code": 111, "name": "MilestoneNotConfirmed"},
+    {"code": 112, "name": "InvalidMint"},
+    {"code": 113, "name": "MintMismatch"},
+    {"code": 114, "name": "InvalidProtocolFee"},
+    {"code": 115, "name": "InvalidGracePeriod"},
+    {"code": 116, "name": "RefundAddressMismatch"},
+    {"code": 117, "name": "InvalidPenalty"},
+    {"code": 118, "name": "TimelockNotReached"},
+    {"code": 119, "name": "InvalidDecimals"},
+    {"code": 120, "name": "InvalidCpiTarget"},
+    {"code": 121, "name": "CpiExecutionFailed"},
+    {"code": 122, "name": "ReentrantCall"},
+    {"code": 123, "name": "InvalidFeeRecipient"},
+    {"code": 124, "name": "Paused"},
+    {"code": 125, "name": "InvalidPauseAuthority"},
+    {"code": 126, "name": "InvalidPayoutAllowlist"},
+    {"code": 127, "name": "PayoutNotAllowlisted"},
+    {"code": 128, "name": "InvalidTaker"},
+    {"code": 129, "name": "DefaultJudgmentNotDue"},
+    {"code": 130, "name": "InvalidSubscription"},
+    {"code": 131, "name": "PeriodNotDue"},
+    {"code": 132, "name": "InvalidEventCapacity"},
+    {"code": 133, "name": "InvalidInitializer"},
+    {"code": 134, "name": "InvalidExpiryExtension"},
+    {"code": 135, "name": "InvalidTimelock"},
+    {"code": 136, "name": "InvalidArbiterPanel"},
+    {"code": 137, "name": "PanelResolveDisabled"},
+    {"code": 138, "name": "InvalidEvidenceDeadline"},
+    {"code": 139, "name": "EvidenceDisclosureLate"},
+    {"code": 140, "name": "InvalidSchemaMigration"},
+    {"code": 141, "name": "TemplateOverrideRejected"},
+    {"code": 142, "name": "InvalidSplit"},
+    {"code": 143, "name": "SlashNotEligible"},
+    {"code": 144, "name": "InvalidCpiAllowlist"},
+    {"code": 145, "name": "InvalidMultisigAuthority"},
+    {"code": 146, "name": "InvalidAppealWindow"},
+    {"code": 147, "name": "InvalidVestingCurve"},
+    {"code": 148, "name": "InvalidEvidenceProof"},
+    {"code": 149, "name": "InvalidVaultSeeds"},
+    {"code": 150, "name": "InvalidReleaseSplit"},
+    {"code": 151, "name": "GapInEventStream"},
+    {"code": 152, "name": "InvalidBasket"},
+    {"code": 154, "name": "InvalidPayoutDenylist"},
+    {"code": 153, "name": "PayoutDenied"},
+    {"code": 155, "name": "InvalidAuctionParams"},
+    {"code": 156, "name": "AuctionNotActive"},
+    {"code": 157, "name": "InvalidTransferHook"},
+    {"code": 158, "name": "InvalidAppealBond"},
+    {"code": 159, "name": "AppealExpiryNotDue"},
+    {"code": 160, "name": "InvalidDelegation"},
+    {"code": 161, "name": "InvalidSwapParties"},
+    {"code": 162, "name": "InvalidSwapAmounts"},
+    {"code": 163, "name": "SwapLinkActive"},
+    {"code": 164, "name": "InvalidPoolPayout"},
+    {"code": 165, "name": "InvalidInterestRate"},
+    {"code": 166, "name": "InterestNotEnabled"},
+    {"code": 167, "name": "InvalidPayoutSplit"},
+    {"code": 168, "name": "InvalidDeadmanConfig"},
+    {"code": 169, "name": "DeadmanNotElapsed"},
+    {"code": 170, "name": "InvalidRentTopUp"},
+    {"code": 171, "name": "FundingIncomplete"},
+    {"code": 172, "name": "FundingTranchesExhausted"},
+    {"code": 173, "name": "InvalidFundingPlan"},
+    {"code": 174, "name": "ReleaseCoolingNotElapsed"},
+    {"code": 175, "name": "PriceGateNotSatisfied"},
+    {"code": 176, "name": "InvalidPriceGate"},
+    {"code": 177, "name": "MergeIncompatible"},
+    {"code": 178, "name": "CompoundInterestActive"},
+    {"code": 179, "name": "InvalidClaimCooldown"},
+    {"code": 180, "name": "InvalidCounterOffer"},
+    {"code": 181, "name": "InvalidReleaseIntent"},
+    {"code": 182, "name": "IntentNonceReused"},
+    {"code": 183, "name": "IntentExpired"},
+    {"code": 184, "name": "InvalidSlashLadder"},
+    {"code": 185, "name": "PartialRefundExceedsLocked"},
+    {"code": 186, "name": "TwapGateNotSatisfied"},
+    {"code": 187, "name": "InvalidTwapGate"},
+    {"code": 188, "name": "InvalidDualControl"},
+    {"code": 189, "name": "DualControlIntentExists"},
+    {"code": 190, "name": "DualControlNotInitiated"},
+    {"code": 191, "name": "DualControlExpired"},
+    {"code": 192, "name": "DualControlRequired"},
+    {"code": 193, "name": "InvalidDisputeAmount"},
+    {"code": 194, "name": "DisputedAmountLocked"},
+    {"code": 195, "name": "SlippageExceeded"},
+    {"code": 196, "name": "InvalidAmountBounds"},
+    {"code": 197, "name": "AmountOutOfBounds"},
+    {"code": 198, "name": "InvalidArbiterFee"},
+    {"code": 199, "name": "BlindInvalidCommitment"},
+    {"code": 200, "name": "BlindCommitMismatch"},
+    {"code": 201, "name": "BlindDuplicateReveal"},
+    {"code": 202, "name": "BlindRevealWindowClosed"},
+    {"code": 203, "name": "BlindCommitStale"},
+    {"code": 204, "name": "BlindNoCommit"},
+    {"code": 205, "name": "BlindVoteMustReveal"},
+    {"code": 206, "name": "SweepGraceNotElapsed"},
+    {"code": 207, "name": "NettingIncompatible"},
+    {"code": 208, "name": "LegsCountMismatch"},
+    {"code": 209, "name": "ClaimantNotInRoster"},
+    {"code": 210, "name": "ClaimantAlreadyClaimed"},
+    {"code": 211, "name": "InvalidClaimantShares"},
+    {"code": 212, "name": "VestingPaused"},
+    {"code": 213, "name": "VestingAlreadyPaused"},
+    {"code": 214, "name": "VestingNotPaused"}
+  ],
+  "metadata": {
+    "generator": "escrow-state idl_json pipeline (AV-29)",
+    "provenance": "generated from VAULT_FIELDS + INSTRUCTIONS spec + EscrowError; the Anchor toolchain is unavailable in this environment, so this file stands in for `anchor build` output until the toolchain can regenerate it",
+    "borsh_offsets": "field \"offset\" values are a pipeline extension: byte offsets into the account data INCLUDING the 8-byte Anchor discriminator, computed from Borsh layout (sequential fields, no padding); named-type offsets are relative to the start of the type"
+  }
+}

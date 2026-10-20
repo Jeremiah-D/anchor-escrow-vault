@@ -151,6 +151,11 @@ pub use fee_history::{
 };
 #[cfg(test)]
 mod idl_json;
+// AV-152: the IDL semver breaking-change gate (baseline vs. current
+// checked-in IDL JSON, breaking changes need an allowlist entry).
+// Test-only release pipeline, like `idl_json` above.
+#[cfg(test)]
+mod idl_compat;
 #[cfg(test)]
 mod sim;
 mod multisig;
