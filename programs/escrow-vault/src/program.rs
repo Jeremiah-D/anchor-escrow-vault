@@ -3693,6 +3693,78 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt in to the delayed-governance protocol (AV-158; mirrors
+    /// `Escrow::with_governance_delay`). `Uninitialized` only, like
+    /// `initialize_quorum`: the delay window is fixed before funds
+    /// move. `0` is `InvalidGovernanceDelay` (a zero window is not a
+    /// delay); once set, the four dual-signed config changes
+    /// (`update_quorum`, `update_attestors`, `rotate_taker`,
+    /// `update_payout_allowlist`) move only through the
+    /// propose → delay → execute/cancel protocol.
+    pub fn initialize_governance_delay(
+        ctx: Context<InitializeGovernanceDelay>,
+        delay_secs: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_governance_delay(delay_secs)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the 8-byte delay window
+        // (zeroed when `0` = no delay), so the window is written in
+        // place — no realloc needed in the real build.
+        Ok(())
+    }
+
+    /// Propose a delayed governance action (AV-158; mirrors
+    /// `Escrow::propose_governance`). Either the initializer or the
+    /// taker may propose; the proposal records the action, the
+    /// proposer, and the current timestamp. Re-proposing replaces a
+    /// live proposal (and restarts the delay clock). A paused escrow
+    /// rejects the proposal.
+    pub fn propose_governance(
+        ctx: Context<ProposeGovernance>,
+        action: GovernanceAction,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let action = convert_governance_action(action)?;
+        let now = Clock::get()?.unix_timestamp as u64;
+        let escrow = escrow
+            .propose_governance(ctx.accounts.authority.key().to_bytes(), action, now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        emit_governance_event(&escrow, GovernanceEvent::Proposed)?;
+        Ok(())
+    }
+
+    /// Execute a live governance proposal once the delay has elapsed
+    /// (AV-158; mirrors `Escrow::execute_governance`). Either party
+    /// may execute; the delay is measured from the proposal
+    /// timestamp. A paused escrow rejects the execution.
+    pub fn execute_governance(ctx: Context<ExecuteGovernance>) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let now = Clock::get()?.unix_timestamp as u64;
+        let escrow = escrow
+            .execute_governance(ctx.accounts.authority.key().to_bytes(), now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        emit_governance_event(&escrow, GovernanceEvent::Executed)?;
+        Ok(())
+    }
+
+    /// Cancel a live governance proposal (AV-158; mirrors
+    /// `Escrow::cancel_governance`). Either party may cancel — the
+    /// defensive veto. Works even while the escrow is paused.
+    pub fn cancel_governance(ctx: Context<CancelGovernance>) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .cancel_governance(ctx.accounts.authority.key().to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        emit_governance_event(&escrow, GovernanceEvent::Cancelled)?;
+        Ok(())
+    }
+
     /// Opt in to a protocol fee on taker payouts (AV-17; mirrors
     /// `Escrow::with_protocol_fee`). `Uninitialized` only, like
     /// `initialize_quorum`: the fee rate is fixed before funds move.
@@ -6776,6 +6848,17 @@ pub struct Vault {
     /// is off. Layout position matches `escrow_state::VAULT_FIELDS`
     /// (appended last, after `vesting_pause`).
     pub mint_allowlist: Option<MintAllowlist>,
+    /// AV-158: the opt-in governance delay window in seconds (mirrors
+    /// `escrow_state`'s `governance_delay_secs`); `0` = no delay.
+    /// Layout position matches `escrow_state::VAULT_FIELDS`
+    /// (appended last, after `mint_allowlist`).
+    pub governance_delay_secs: u64,
+    /// AV-158: the live delayed-governance proposal (mirrors
+    /// `escrow_state`'s `governance_proposal`); `None` when no
+    /// proposal is live. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `governance_delay_secs`).
+    pub governance_proposal: Option<GovernanceProposal>,
 }
 
 /// Skeleton mirror of `escrow_state::VestingPause` (AV-150): the
@@ -6804,6 +6887,48 @@ pub struct MintAllowlist {
     pub mints: [[u8; 32]; 8],
     /// Number of live entries in `mints`.
     pub len: u8,
+}
+
+/// Skeleton mirror of `escrow_state::GovernanceAction` (AV-158): the
+/// staged governance action — one of the four dual-signed config
+/// changes. The `UpdateAttestors` variant carries fixed-size arrays
+/// (only the first `count` entries are live).
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq,
+)]
+pub enum GovernanceAction {
+    /// Change the quorum threshold.
+    UpdateQuorum { new_threshold: u8 },
+    /// Replace the attestor set and weights.
+    UpdateAttestors {
+        attestors: [[u8; 32]; 8],
+        weights: [u64; 8],
+        count: u8,
+    },
+    /// Rotate the taker.
+    RotateTaker { new_taker: [u8; 32] },
+    /// Update the payout allowlist.
+    UpdatePayoutAllowlist { addrs: [[u8; 32]; 4], count: u8 },
+}
+
+/// Skeleton mirror of `escrow_state::GovernanceProposal` (AV-158):
+/// the live delayed-governance proposal — the staged action plus the
+/// proposer, the proposal timestamp, and the delay window snapshot.
+/// Serialized size is pinned by
+/// `escrow_state::GOVERNANCE_PROPOSAL_TAIL_LEN` (371 bytes: 1-byte
+/// `Option` discriminant + 370-byte proposal).
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq,
+)]
+pub struct GovernanceProposal {
+    /// The staged governance action.
+    pub action: GovernanceAction,
+    /// The party that proposed (initializer or taker).
+    pub proposed_by: [u8; 32],
+    /// Unix timestamp the proposal was made.
+    pub proposed_at: u64,
+    /// The delay window in seconds (snapshot at proposal time).
+    pub delay_secs: u64,
 }
 
 /// Skeleton mirror of `escrow_state::ClaimantRoster` (AV-149): the
@@ -7388,6 +7513,18 @@ pub enum EscrowVaultEventKind {
     /// ones moved. Mirrors
     /// `escrow_state::EscrowEventKind::MilestonesAmended`.
     MilestonesAmended,
+    /// AV-158: a delayed governance action was proposed
+    /// (`Escrow::propose_governance`). Mirrors
+    /// `escrow_state::EscrowEventKind::GovernanceProposed`.
+    GovernanceProposed,
+    /// AV-158: a delayed governance action was executed after the
+    /// delay elapsed (`Escrow::execute_governance`). Mirrors
+    /// `escrow_state::EscrowEventKind::GovernanceExecuted`.
+    GovernanceExecuted,
+    /// AV-158: a delayed governance action was cancelled
+    /// (`Escrow::cancel_governance`). Mirrors
+    /// `escrow_state::EscrowEventKind::GovernanceCancelled`.
+    GovernanceCancelled,
     /// AV-36: a fund-moving transition was rejected as a reentrant call
     /// (`EscrowError::ReentrantCall`). Mirrors
     /// `escrow_state::EscrowEventKind::ReentryRejected`.
@@ -7554,6 +7691,15 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::MilestonesAmended => {
             EscrowVaultEventKind::MilestonesAmended
+        }
+        escrow_state::EscrowEventKind::GovernanceProposed => {
+            EscrowVaultEventKind::GovernanceProposed
+        }
+        escrow_state::EscrowEventKind::GovernanceExecuted => {
+            EscrowVaultEventKind::GovernanceExecuted
+        }
+        escrow_state::EscrowEventKind::GovernanceCancelled => {
+            EscrowVaultEventKind::GovernanceCancelled
         }
         escrow_state::EscrowEventKind::ReentryRejected => {
             EscrowVaultEventKind::ReentryRejected
@@ -9680,6 +9826,48 @@ pub struct InitializeMintAllowlist<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-158: accounts for `initialize_governance_delay`.
+#[derive(Accounts)]
+pub struct InitializeGovernanceDelay<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer sets the governance delay; the state
+    /// machine rejects re-configuration once the escrow leaves
+    /// `Uninitialized`.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-158: accounts for `propose_governance`.
+#[derive(Accounts)]
+pub struct ProposeGovernance<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker may propose; the state
+    /// machine enforces the two-party rule.
+    pub authority: Signer<'info>,
+}
+
+/// AV-158: accounts for `execute_governance`.
+#[derive(Accounts)]
+pub struct ExecuteGovernance<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker may execute once the
+    /// delay has elapsed; the state machine enforces the two-party
+    /// rule and the delay window.
+    pub authority: Signer<'info>,
+}
+
+/// AV-158: accounts for `cancel_governance`.
+#[derive(Accounts)]
+pub struct CancelGovernance<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker may cancel; the state
+    /// machine enforces the two-party rule. Works even while paused.
+    pub authority: Signer<'info>,
+}
+
 #[derive(Accounts)]
 pub struct InitializeProtocolFee<'info> {
     #[account(mut)]
@@ -9981,6 +10169,81 @@ fn emit_transition(
         // always agrees with the account.
         reference: read_escrow(vault).reference(),
     });
+}
+
+/// AV-158: the governance lifecycle event (proposed / executed /
+/// cancelled). The skeleton emits it via the Anchor event system;
+/// the state machine records the corresponding `EscrowEventKind`
+/// in the vault's event history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GovernanceEvent {
+    Proposed,
+    Executed,
+    Cancelled,
+}
+
+/// AV-158: convert the skeleton's `GovernanceAction` mirror into the
+/// state machine's `escrow_state::GovernanceAction`.
+fn convert_governance_action(
+    action: GovernanceAction,
+) -> Result<escrow_state::GovernanceAction> {
+    match action {
+        GovernanceAction::UpdateQuorum { new_threshold } => {
+            Ok(escrow_state::GovernanceAction::UpdateQuorum { new_threshold })
+        }
+        GovernanceAction::UpdateAttestors {
+            attestors,
+            weights,
+            count,
+        } => {
+            if count as usize > 8 {
+                return Err(escrow_error(escrow_state::EscrowError::InvalidQuorum));
+            }
+            let mut a = [[0u8; 32]; 8];
+            let mut w = [0u64; 8];
+            a[..count as usize].copy_from_slice(&attestors[..count as usize]);
+            w[..count as usize].copy_from_slice(&weights[..count as usize]);
+            escrow_state::GovernanceAction::update_attestors(
+                &a[..count as usize],
+                &w[..count as usize],
+            )
+            .map_err(|e| escrow_error(e))
+        }
+        GovernanceAction::RotateTaker { new_taker } => {
+            Ok(escrow_state::GovernanceAction::RotateTaker { new_taker })
+        }
+        GovernanceAction::UpdatePayoutAllowlist { addrs, count } => {
+            if count as usize > 4 {
+                return Err(escrow_error(escrow_state::EscrowError::InvalidAllowlist));
+            }
+            escrow_state::GovernanceAction::update_payout_allowlist(
+                &addrs[..count as usize],
+            )
+            .map_err(|e| escrow_error(e))
+        }
+    }
+}
+
+/// AV-158: emit the governance lifecycle event. The skeleton maps
+/// the lifecycle to the state machine's `EscrowEventKind`
+/// (GovernanceProposed / GovernanceExecuted / GovernanceCancelled).
+fn emit_governance_event(
+    _escrow: &escrow_state::Escrow,
+    event: GovernanceEvent,
+) -> Result<()> {
+    let kind = match event {
+        GovernanceEvent::Proposed => escrow_state::EscrowEventKind::GovernanceProposed,
+        GovernanceEvent::Executed => escrow_state::EscrowEventKind::GovernanceExecuted,
+        GovernanceEvent::Cancelled => escrow_state::EscrowEventKind::GovernanceCancelled,
+    };
+    // The state machine already recorded the event in the vault's
+    // event history; the skeleton surfaces it via the Anchor event
+    // system for off-chain indexers.
+    emit!(VaultEvent {
+        kind: kind.discriminant(),
+        ..Default::default()
+    });
+    Ok(())
 }
 
 /// AV-18: read the vault's persisted per-escrow event sequence counter.
@@ -10468,6 +10731,16 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::MintNotAllowlisted => {
             error!(ErrorCode::MintNotAllowlisted)
         }
+        // AV-158: the delayed-governance errors.
+        escrow_state::EscrowError::GovernanceDelayNotElapsed => {
+            error!(ErrorCode::GovernanceDelayNotElapsed)
+        }
+        escrow_state::EscrowError::GovernanceActionNotProposed => {
+            error!(ErrorCode::GovernanceActionNotProposed)
+        }
+        escrow_state::EscrowError::InvalidGovernanceDelay => {
+            error!(ErrorCode::InvalidGovernanceDelay)
+        }
     }
 }
 
@@ -10762,4 +11035,10 @@ pub enum ErrorCode {
     // the end so every existing Anchor error discriminant is unchanged.
     #[msg("Mint not allowlisted (AV-157): with_mint with a token mint not on the escrow's mint allowlist — the allowlist is opt-in governance, and unlisted mints are rejected (MintNotAllowlisted, code 217)")]
     MintNotAllowlisted,
+    #[msg("Governance delay not elapsed (AV-158): execute_governance on a live proposal whose delay window has not elapsed — the proposal executes only when now >= proposed_at + governance_delay_secs (GovernanceDelayNotElapsed, code 218)")]
+    GovernanceDelayNotElapsed,
+    #[msg("Governance action not proposed (AV-158): execute_governance / cancel_governance with no live proposal, or a direct dual-signed config change on a delay-opted-in escrow — the action must be proposed first (GovernanceActionNotProposed, code 219)")]
+    GovernanceActionNotProposed,
+    #[msg("Invalid governance delay (AV-158): with_governance_delay with a zero window — a zero window is not a delay (InvalidGovernanceDelay, code 220)")]
+    InvalidGovernanceDelay,
 }

@@ -38,13 +38,14 @@
 use super::{
     sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, ClaimantRoster, CounterOffer, CpiAllowlist,
     DefaultJudgment, DualControlIntent, DutchAuction, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
-    Delegation, FundingPlan, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, PayoutSplit, QuorumPolicy,
+    Delegation, FundingPlan, GovernanceAction, GovernanceProposal, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, PayoutSplit, QuorumPolicy,
     MintAllowlist,
     SlashTerms, SlashLadder, SlashRung, SubscriptionSchedule, VestingCurve, VestingPause, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
     APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, CLAIMANT_ROSTER_LEN, COUNTER_OFFER_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
     DELEGATION_LEN, DUAL_CONTROL_INTENT_LEN, DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
     MAX_CLAIMANTS, MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_MINT_ALLOWLIST, MAX_PANEL_MEMBERS,
     MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_RELEASE_SPLIT_RECIPIENTS, MAX_SLASH_LADDER_RUNGS, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
+    GOVERNANCE_ACTION_PAYLOAD_LEN, GOVERNANCE_PROPOSAL_LEN,
     MILESTONE_PLAN_LEN, MINT_ALLOWLIST_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN,
     PAYOUT_DENYLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_LADDER_LEN, SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN,
     SWAP_LINK_REGION_LEN, VAULT_SPACE, VESTING_CURVE_LEN,
@@ -192,6 +193,19 @@ pub enum AccountDecodeError {
     /// the accessors cannot safely read (AV-126; AV-32 panic-free
     /// guarantee).
     InvalidSlashLadderLen(u8),
+    /// A present governance proposal's action kind byte is not a known
+    /// [`GovernanceAction`](crate::GovernanceAction) discriminant
+    /// (0–3). The mapping is pinned to declaration order (AV-158;
+    /// AV-32 panic-free guarantee).
+    InvalidGovernanceActionKind(u8),
+    /// A present governance proposal's action carries a live count
+    /// outside the variant's range (attestor count outside `1..=8`,
+    /// allowlist count outside `0..=4`). The count byte is part of the
+    /// field's layout — an out-of-range count would make the action
+    /// accessors read past the live slots, so the decoder rejects it
+    /// rather than decoding a value the accessors cannot safely read
+    /// (AV-158; AV-32 panic-free guarantee).
+    InvalidGovernanceActionLen { kind: u8, count: u8 },
 }
 
 /// Bounds-checked cursor over the account body. Every read is
@@ -1493,6 +1507,48 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(MINT_ALLOWLIST_LEN)?;
         None
     };
+    // AV-158: the opt-in governance delay window — the 8-byte
+    // `governance_delay_secs` (`0` = no delay, backward compatible).
+    // Structural decode only — the window is validated by
+    // `with_governance_delay`, not re-litigated here.
+    let governance_delay_secs = c.u64_le()?;
+    // AV-158: the live delayed-governance proposal — 1-byte `Option`
+    // discriminant + the fixed proposal region (1-byte action kind +
+    // payload + 32-byte proposer + 8-byte `proposed_at` + 8-byte
+    // `delay_secs`). Structural decode only — the proposal
+    // invariants are enforced by `propose_governance` /
+    // `execute_governance`, not re-litigated here.
+    let governance_proposal = if c.option_present("governance_proposal")? {
+        let kind = c.u8()?;
+        if kind > 3 {
+            return Err(AccountDecodeError::InvalidGovernanceActionKind(kind));
+        }
+        let payload_bytes = c.read(GOVERNANCE_ACTION_PAYLOAD_LEN)?;
+        let mut payload = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
+        payload.copy_from_slice(payload_bytes);
+        let action = GovernanceAction::decode(kind, &payload).ok_or_else(|| {
+            // The kind byte is valid, so the failure is a live-count
+            // range violation — surface the offending count.
+            let count = match kind {
+                1 => payload[320],
+                3 => payload[128],
+                _ => 0,
+            };
+            AccountDecodeError::InvalidGovernanceActionLen { kind, count }
+        })?;
+        let proposed_by = c.pubkey()?;
+        let proposed_at = c.u64_le()?;
+        let delay_secs = c.u64_le()?;
+        Some(GovernanceProposal {
+            action,
+            proposed_by,
+            proposed_at,
+            delay_secs,
+        })
+    } else {
+        c.skip(GOVERNANCE_PROPOSAL_LEN)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1791,6 +1847,12 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-157: the SPL mint governance allowlist — a decoded
         // escrow carries the same allowlist the live one recorded.
         mint_allowlist,
+        // AV-158: the governance delay window — a decoded escrow
+        // carries the same window the live one recorded.
+        governance_delay_secs,
+        // AV-158: the live delayed-governance proposal — a decoded
+        // escrow carries the same proposal the live one recorded.
+        governance_proposal,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

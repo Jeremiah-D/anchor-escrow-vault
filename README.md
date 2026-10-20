@@ -95,6 +95,10 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `migrate_schema()` (AV-75; AV-85: chain) | any | — (no state change; stamps the schema version) | initializer **only** (`Unauthorized` otherwise, checked before state validity); a paused escrow fails fast (`Paused`); the gate is a catch-up gate (AV-82: `schema_version < SCHEMA_VERSION` runs — an already-current vault refuses the second call and an unknown future version refuses loudly instead of skipping forward, `InvalidSchemaMigration`, code 140, either way); AV-85: the catch-up is now an explicit N → M step chain — each step re-validates the conservation invariants over the field set it carries (`released <= amount`, `released + skipped <= amount`, `fees_paid <= released`, milestone tranche sum `== amount`, plus `released + penalty_paid <= amount` from the 1 → 2 step on) and any failing step rolls the chain back to the pre-chain snapshot (zero partial migration) — a corrupt vault is refused, never migrated; emits one `SchemaMigrated` per applied step (from == to == the current state, each carrying its from → to versions), always on success; the read-only `migrate_dry_run` previews the step/field plan with zero write impact |
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
 | `initialize_mint_allowlist(mints)` (AV-157) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; up to 8 base58 SPL mint addresses — empty list disables the allowlist; `with_mint` thereafter rejects unlisted mints with `MintNotAllowlisted`, code 217) |
+| `initialize_governance_delay(delay_secs)` (AV-158) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; the opt-in delay window in seconds for the four dual-signed config changes — `0` is `InvalidGovernanceDelay`, code 220; once set, `update_quorum` / `update_attestors` / `rotate_taker` / `update_payout_allowlist` move only through the propose → delay → execute/cancel protocol) |
+| `propose_governance(action)` (AV-158) | any | — (no state change; stages the action) | initializer **or** taker (`Unauthorized` otherwise); records the action + proposer + timestamp; re-proposing replaces a live proposal and restarts the delay clock; a paused escrow fails fast (`Paused`); emits `GovernanceProposed` |
+| `execute_governance()` (AV-158) | any | — (applies the staged config change) | initializer **or** taker (`Unauthorized` otherwise); runs only when `now >= proposed_at + governance_delay_secs` (`GovernanceDelayNotElapsed`, code 218, otherwise) and a proposal is live (`GovernanceActionNotProposed`, code 219, otherwise); a paused escrow fails fast (`Paused`); clears the proposal on success; emits `GovernanceExecuted` |
+| `cancel_governance()` (AV-158) | any | — (no state change; clears the staged action) | initializer **or** taker (`Unauthorized` otherwise); requires a live proposal (`GovernanceActionNotProposed`, code 219, otherwise); works even while paused (the defensive veto); emits `GovernanceCancelled` |
 | `initialize_protocol_fee(fee_bps)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `fee_bps` in 0–10000 basis points; the fee slices every taker payout into net payout + protocol fee; the AV-63 fee cap can floor it per payout) |
 | `initialize_fee_cap(max_fee_cents)`           | `Uninitialized`| `Uninitialized` | initializer (once, before funding; absolute per-payout fee ceiling in lamports — the effective fee is `min(bps fee, fee_cap)`; `0` means uncapped; no new error code) |
 | `initialize_fee_schedule(tiers)` (AV-66)     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opt-in volume-priced fee tiers as `(min_amount, bps)` pairs — the fee for a gross payout uses the rate of the highest tier with `min_amount <= amount`, still floored by the AV-63 cap; 1–8 tiers, each `bps` 0–10000, floors strictly ascending; mutually exclusive with the flat rate — fail-fast `InvalidProtocolFee`, code 114, in either direction) |
@@ -1527,6 +1531,9 @@ program error per variant):
 | `AttestorSlotInvalid` | 215 | `replace_attestor` (AV-154) with an out-of-range slot (no registered attestor occupies it) or a zero replacement key |
 | `InvalidMilestoneAmendment` | 216 | `amend_milestones` (AV-155) repricing a confirmed/settled tranche, wrong tranche count, zero amount, or sum ≠ locked amount |
 | `MintNotAllowlisted` | 217 | `with_mint` (AV-157) with a token mint not on the escrow's mint allowlist |
+| `GovernanceDelayNotElapsed` | 218 | `execute_governance` (AV-158) on a live proposal whose delay window has not elapsed |
+| `GovernanceActionNotProposed` | 219 | `execute_governance` / `cancel_governance` (AV-158) with no live proposal, or a direct dual-signed config change on a delay-opted-in escrow |
+| `InvalidGovernanceDelay` | 220 | `with_governance_delay` (AV-158) with a zero window |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -1967,6 +1974,42 @@ is unchanged. The freeze is scoped to the taker's schedule-priced
 `claim`: the initializer's `release` push path, the roster's
 `claim_share`, and `cancel`/`cancel_expired` refunds are unaffected
 (by design — a pause halts the unlock clock, not the escrow).
+
+### Delayed governance (AV-158)
+
+The four dual-signed config changes — `update_quorum`,
+`update_attestors`, `rotate_taker`, `update_payout_allowlist` — can
+opt in to a propose → delay → execute/cancel protocol via
+`initialize_governance_delay(delay_secs)`. The delay is a
+flash-governance defense: if an attestor goes dark, a malicious
+threshold change cannot take effect immediately.
+
+```
+initializer      taker          escrow
+   |  propose_governance(UpdateQuorum{1})  |
+   |------------------------------------->| (proposal live;
+   |                    |  proposed_at = now)
+   |  execute_governance()  |              |
+   |----------------------->| Err(GovernanceDelayNotElapsed)
+   |                    |                   |
+   |  ... delay elapses ... |               |
+   |                    |                   |
+   |               cancel_governance()       |
+   |               ------------------->| (either party may
+   |                    |  veto; proposal cleared)
+   |  execute_governance()  |              |
+   |----------------------->| (threshold = 1;
+   |                         |  proposal cleared)
+```
+
+Either party may propose, execute (once the delay elapses), or
+cancel (the defensive veto — works even while paused). Re-proposing
+replaces a live proposal and restarts the delay clock. The delay
+gates **config changes only** — fund flows (`release`, `claim`,
+`cancel`, etc.) are never delayed. On a delay-opted-in escrow, the
+direct dual-signed calls refuse with `GovernanceActionNotProposed`
+(code 219); escrows without the opt-in keep the immediate
+dual-signed governance (backward compatible).
 
 ## Indexer events (AV-18)
 

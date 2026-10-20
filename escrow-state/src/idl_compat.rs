@@ -965,8 +965,12 @@ pub fn diff_idl(old_json: &str, new_json: &str) -> Result<IdlDiff, String> {
 /// Breaking changes that this release explicitly accepts. One stable
 /// key per change (see [`CompatChange::allowlist_key`]); any breaking
 /// change whose key is absent fails the `idl_semver_gate` test.
-/// Empty today: no release has ever shipped a breaking IDL change.
-pub const BREAKING_CHANGE_ALLOWLIST: &[&str] = &[];
+/// AV-158: the delayed-governance tails are appended to the Vault
+/// account (backward-compatible wire growth, like AV-157).
+pub const BREAKING_CHANGE_ALLOWLIST: &[&str] = &[
+    "field_added:account Vault.governance_delay_secs",
+    "field_added:account Vault.governance_proposal",
+];
 
 fn unallowed_breaking_with(diff: &IdlDiff, allowlist: &[&str]) -> Vec<String> {
     diff.breaking()
@@ -1424,15 +1428,15 @@ mod idl_compat_tests {
 
     #[test]
     fn full_idl_parses_and_self_diffs_clean() {
-        // The real 144-instruction IDL must parse; the checked-in file
+        // The real 148-instruction IDL must parse; the checked-in file
         // diffed against itself has no changes (exercises the parser
         // on the production artifact).
         let idl = std::fs::read_to_string("../programs/escrow-vault/idl/escrow_vault.json")
             .expect("read checked-in IDL");
         let spec = parse_idl(&idl).expect("parse checked-in IDL");
-        assert_eq!(spec.instructions.len(), 144);
-        assert_eq!(spec.errors.len(), 118);
-        assert_eq!(spec.types.len(), 31);
+        assert_eq!(spec.instructions.len(), 148);
+        assert_eq!(spec.errors.len(), 121);
+        assert_eq!(spec.types.len(), 33);
         let diff = diff_idl(&idl, &idl).unwrap();
         assert!(diff.changes.is_empty());
     }

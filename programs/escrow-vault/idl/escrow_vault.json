@@ -324,6 +324,26 @@
       ]
     },
     {
+      "name": "propose_governance",
+      "discriminator": [129, 138, 213, 117, 56, 242, 208, 54],
+      "accounts": [],
+      "args": [
+        {"name": "action", "type": {"defined": "GovernanceAction"}}
+      ]
+    },
+    {
+      "name": "execute_governance",
+      "discriminator": [122, 166, 227, 13, 6, 111, 46, 110],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "cancel_governance",
+      "discriminator": [186, 40, 186, 35, 87, 55, 222, 181],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "adjust_period_amounts",
       "discriminator": [245, 12, 78, 243, 243, 197, 33, 156],
       "accounts": [],
@@ -345,6 +365,14 @@
       "accounts": [],
       "args": [
         {"name": "mints", "type": {"vec": "string"}}
+      ]
+    },
+    {
+      "name": "initialize_governance_delay",
+      "discriminator": [183, 43, 59, 249, 155, 248, 27, 139],
+      "accounts": [],
+      "args": [
+        {"name": "delay_secs", "type": "u64"}
       ]
     },
     {
@@ -1272,7 +1300,9 @@
           {"name": "taker_locked", "type": "u64", "offset": 5970},
           {"name": "claimants", "type": {"option": {"defined": "ClaimantRoster"}}, "offset": 5978},
           {"name": "vesting_pause", "type": {"option": {"defined": "VestingPause"}}, "offset": 6253},
-          {"name": "mint_allowlist", "type": {"option": {"defined": "MintAllowlist"}}, "offset": 6262}
+          {"name": "mint_allowlist", "type": {"option": {"defined": "MintAllowlist"}}, "offset": 6262},
+          {"name": "governance_delay_secs", "type": "u64", "offset": 6520},
+          {"name": "governance_proposal", "type": {"option": {"defined": "GovernanceProposal"}}, "offset": 6528}
         ]
       }
     }
@@ -1612,6 +1642,28 @@
           {"name": "payout_to", "type": "publicKey", "offset": 8}
         ]
       }
+    },
+    {
+      "name": "GovernanceAction",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "kind", "type": "u8", "offset": 0},
+          {"name": "payload", "type": {"array": ["u8", 321]}, "offset": 1}
+        ]
+      }
+    },
+    {
+      "name": "GovernanceProposal",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "action", "type": {"defined": "GovernanceAction"}, "offset": 0},
+          {"name": "proposed_by", "type": "publicKey", "offset": 322},
+          {"name": "proposed_at", "type": "u64", "offset": 354},
+          {"name": "delay_secs", "type": "u64", "offset": 362}
+        ]
+      }
     }
   ],
   "errors": [
@@ -1732,7 +1784,10 @@
     {"code": 214, "name": "VestingNotPaused"},
     {"code": 215, "name": "AttestorSlotInvalid"},
     {"code": 216, "name": "InvalidMilestoneAmendment"},
-    {"code": 217, "name": "MintNotAllowlisted"}
+    {"code": 217, "name": "MintNotAllowlisted"},
+    {"code": 218, "name": "GovernanceDelayNotElapsed"},
+    {"code": 219, "name": "GovernanceActionNotProposed"},
+    {"code": 220, "name": "InvalidGovernanceDelay"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

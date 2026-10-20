@@ -242,7 +242,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), PartiallyCancelled, ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-73), SchemaMigrated (AV-75), TemplateApplied (AV-77), VestingPaused (AV-150), VestingResumed (AV-150), AttestorReplaced (AV-154), MilestonesAmended (AV-155) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), PartiallyCancelled, ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-73), SchemaMigrated (AV-75), TemplateApplied (AV-77), VestingPaused (AV-150), VestingResumed (AV-150), AttestorReplaced (AV-154), MilestonesAmended (AV-155), GovernanceProposed (AV-158), GovernanceExecuted (AV-158), GovernanceCancelled (AV-158) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, ShareClaimed (AV-149), MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | ReleasedSplit (AV-93) | gross taker amount (Σ net legs + fee) | protocol fee (AV-17, charged on the gross before the split) | 0 | 0 — the per-recipient `(recipient, net_share)` legs ride the event's `release_split` field |
 //! | BasketReleased (AV-95b) | the leg's gross remainder (taker payout + fee) | protocol fee (AV-17, charged on the leg's remainder) | 0 | 0 |
@@ -1022,6 +1022,34 @@ pub enum EscrowEventKind {
     /// zero — repricing moves no funds (the later tranche releases
     /// carry the new amounts with their fees).
     MilestonesAmended,
+    /// AV-158: a delayed-governance action was proposed by either
+    /// party
+    /// ([`Escrow::propose_governance`](crate::Escrow::propose_governance)).
+    /// `from == to ==` the current state (a proposal, not a config
+    /// change yet — like [`EscrowEventKind::QuorumUpdated`]'s
+    /// no-op rule, the proposal itself moves nothing). The staged
+    /// action is read from the vault's live proposal, the event is
+    /// the ordering signal — indexers watch this to learn the delay
+    /// window's start. All amounts are zero.
+    GovernanceProposed,
+    /// AV-158: a delayed-governance proposal survived its delay
+    /// window and was executed by either party
+    /// ([`Escrow::execute_governance`](crate::Escrow::execute_governance)).
+    /// `from == to ==` the current state (a config change, not a
+    /// lifecycle move — like [`EscrowEventKind::QuorumUpdated`]);
+    /// the applied action is read from the vault, the event is the
+    /// ordering signal. All amounts are zero — executing a
+    /// governance action moves no funds (the later payouts carry the
+    /// new config).
+    GovernanceExecuted,
+    /// AV-158: a live delayed-governance proposal was cancelled by
+    /// either party
+    /// ([`Escrow::cancel_governance`](crate::Escrow::cancel_governance)).
+    /// `from == to ==` the current state (the proposal is dropped,
+    /// the config is untouched — like
+    /// [`EscrowEventKind::QuorumUpdated`]'s no-op rule). All amounts
+    /// are zero.
+    GovernanceCancelled,
 }
 
 impl EscrowEventKind {
@@ -1227,6 +1255,12 @@ impl EscrowEventKind {
             // AV-155: appended after AttestorReplaced so discriminants
             // 0–80 stay stable for already-serialized histories.
             81 => Self::MilestonesAmended,
+            // AV-158: appended after MilestonesAmended so
+            // discriminants 0–81 stay stable for already-serialized
+            // histories.
+            82 => Self::GovernanceProposed,
+            83 => Self::GovernanceExecuted,
+            84 => Self::GovernanceCancelled,
             _ => return None,
         })
     }
@@ -1344,6 +1378,11 @@ impl EscrowEventKind {
             // AV-155: appended after attestor_replaced so the name
             // table stays stable for already-serialized histories.
             Self::MilestonesAmended => "milestones_amended",
+            // AV-158: appended after milestones_amended so the name
+            // table stays stable for already-serialized histories.
+            Self::GovernanceProposed => "governance_proposed",
+            Self::GovernanceExecuted => "governance_executed",
+            Self::GovernanceCancelled => "governance_cancelled",
         }
     }
 
@@ -1465,6 +1504,11 @@ impl EscrowEventKind {
             // AV-155: appended after attestor_replaced so the name
             // table stays stable for already-serialized histories.
             "milestones_amended" => Self::MilestonesAmended,
+            // AV-158: appended after milestones_amended so the name
+            // table stays stable for already-serialized histories.
+            "governance_proposed" => Self::GovernanceProposed,
+            "governance_executed" => Self::GovernanceExecuted,
+            "governance_cancelled" => Self::GovernanceCancelled,
             _ => return None,
         })
     }
@@ -5540,6 +5584,90 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Stage a delayed-governance action (mirrors
+    /// [`Escrow::propose_governance`](crate::Escrow::propose_governance)).
+    /// Emits `GovernanceProposed` (`from == to ==` the current state
+    /// — the proposal itself moves nothing). `at` is the
+    /// caller-supplied timestamp (on-chain: the clock sysvar) and
+    /// doubles as the proposal's `now`.
+    pub fn propose_governance(
+        &mut self,
+        proposer: [u8; 32],
+        action: crate::GovernanceAction,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let state = self.inner.state();
+        self.inner.propose_governance(proposer, action, at)?;
+        self.push_event(
+            EscrowEventKind::GovernanceProposed,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
+    /// Apply the live delayed-governance proposal (mirrors
+    /// [`Escrow::execute_governance`](crate::Escrow::execute_governance)).
+    /// Emits `GovernanceExecuted` (`from == to ==` the current state
+    /// — a config change, not a lifecycle move). `at` is the
+    /// caller-supplied timestamp (on-chain: the clock sysvar) and
+    /// doubles as the execution's `now`.
+    pub fn execute_governance(
+        &mut self,
+        executor: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let state = self.inner.state();
+        self.inner.execute_governance(executor, at)?;
+        self.push_event(
+            EscrowEventKind::GovernanceExecuted,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
+    /// Drop the live delayed-governance proposal (mirrors
+    /// [`Escrow::cancel_governance`](crate::Escrow::cancel_governance)).
+    /// Emits `GovernanceCancelled` (`from == to ==` the current state
+    /// — the proposal is dropped, the config untouched). `at` is the
+    /// caller-supplied timestamp (on-chain: the clock sysvar).
+    pub fn cancel_governance(
+        &mut self,
+        canceller: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let state = self.inner.state();
+        self.inner.cancel_governance(canceller)?;
+        self.push_event(
+            EscrowEventKind::GovernanceCancelled,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// Re-split the subscription per-period amounts by dual-signed
     /// governance (mirrors [`Escrow::adjust_period_amounts`]). Emits    /// `SubscriptionAmountsAdjusted` when the amounts actually change
     /// (`from == to ==` the current state — the schedule, not the
@@ -8636,7 +8764,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -8739,7 +8867,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9276,7 +9404,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9291,7 +9419,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9303,7 +9431,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9315,7 +9443,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9327,7 +9455,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9342,7 +9470,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9357,7 +9485,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9369,7 +9497,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9381,7 +9509,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9393,7 +9521,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9405,7 +9533,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9417,7 +9545,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9429,7 +9557,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9445,7 +9573,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9460,7 +9588,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9475,7 +9603,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]
@@ -9490,7 +9618,39 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(82), None);
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+    }
+
+    #[test]
+    fn governance_kinds_round_trip() {
+        // AV-158: discriminants 82–84, appended after
+        // MilestonesAmended — 0–81 stay stable for
+        // already-serialized histories.
+        let proposed = EscrowEventKind::GovernanceProposed;
+        assert_eq!(proposed.discriminant(), 82);
+        assert_eq!(EscrowEventKind::from_discriminant(82), Some(proposed));
+        assert_eq!(proposed.name(), "governance_proposed");
+        assert_eq!(
+            EscrowEventKind::from_name("governance_proposed"),
+            Some(proposed)
+        );
+        let executed = EscrowEventKind::GovernanceExecuted;
+        assert_eq!(executed.discriminant(), 83);
+        assert_eq!(EscrowEventKind::from_discriminant(83), Some(executed));
+        assert_eq!(executed.name(), "governance_executed");
+        assert_eq!(
+            EscrowEventKind::from_name("governance_executed"),
+            Some(executed)
+        );
+        let cancelled = EscrowEventKind::GovernanceCancelled;
+        assert_eq!(cancelled.discriminant(), 84);
+        assert_eq!(EscrowEventKind::from_discriminant(84), Some(cancelled));
+        assert_eq!(cancelled.name(), "governance_cancelled");
+        assert_eq!(
+            EscrowEventKind::from_name("governance_cancelled"),
+            Some(cancelled)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(85), None);
     }
 
     #[test]

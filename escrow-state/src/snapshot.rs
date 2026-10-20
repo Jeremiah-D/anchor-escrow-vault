@@ -43,8 +43,8 @@
 //! and advances no state — a dry run by construction.
 
 use crate::{
-    format_amount, AppealState, Escrow, EscrowState, EventHistoryEntry, MultisigAuthority,
-    StateSummary,
+    format_amount, AppealState, Escrow, EscrowState, EventHistoryEntry, GovernanceAction,
+    GovernanceProposal, MultisigAuthority, StateSummary,
 };
 
 /// Render 32 bytes as 64 lowercase hex characters (same convention as
@@ -328,6 +328,12 @@ pub struct EscrowSnapshot {
     /// SPL mint governance allowlist (AV-157): the allowlisted mint
     /// addresses, or `None` when the allowlist is off.
     pub mint_allowlist: Option<Vec<[u8; 32]>>,
+    /// Opt-in delayed-governance window in seconds (AV-158); `0` when
+    /// the delay is off.
+    pub governance_delay_secs: u64,
+    /// Live delayed-governance proposal (AV-158); `None` when no
+    /// proposal is pending.
+    pub governance_proposal: Option<GovernanceProposal>,
     /// Token-2022 transfer-hook program declared for this escrow, or
     /// `None` when no hook is bound (AV-99).
     pub transfer_hook: Option<[u8; 32]>,
@@ -804,6 +810,10 @@ impl Escrow {
             mint_allowlist: self
                 .mint_allowlist()
                 .map(|list| list.as_slice().to_vec()),
+            // AV-158: the delay window and the live proposal ride the
+            // snapshot so indexers see the pending governance.
+            governance_delay_secs: self.governance_delay_secs(),
+            governance_proposal: self.governance_proposal(),
             transfer_hook: self.transfer_hook(),
             streaming_fee_rate: self.streaming_fee_rate(),
             streaming_fees_accrued: self.streaming_fees_accrued(),
@@ -1086,6 +1096,58 @@ fn write_opt_u64(s: &mut String, value: Option<u64>) {
     }
 }
 
+/// Write a [`GovernanceAction`] as a small JSON object: the kind plus
+/// the live params for that kind (AV-158).
+fn write_governance_action(s: &mut String, action: &GovernanceAction) {
+    match action {
+        GovernanceAction::UpdateQuorum { new_threshold } => {
+            s.push_str("{\"kind\":\"update_quorum\",\"new_threshold\":");
+            s.push_str(&new_threshold.to_string());
+            s.push('}');
+        }
+        GovernanceAction::UpdateAttestors {
+            attestors,
+            weights,
+            count,
+        } => {
+            s.push_str("{\"kind\":\"update_attestors\",\"attestors\":[");
+            for i in 0..*count as usize {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push('"');
+                s.push_str(&hex32(&attestors[i]));
+                s.push('"');
+            }
+            s.push_str("],\"weights\":[");
+            for i in 0..*count as usize {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&weights[i].to_string());
+            }
+            s.push_str("]}");
+        }
+        GovernanceAction::RotateTaker { new_taker } => {
+            s.push_str("{\"kind\":\"rotate_taker\",\"new_taker\":\"");
+            s.push_str(&hex32(new_taker));
+            s.push_str("\"}");
+        }
+        GovernanceAction::UpdatePayoutAllowlist { addrs, count } => {
+            s.push_str("{\"kind\":\"update_payout_allowlist\",\"addrs\":[");
+            for i in 0..*count as usize {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push('"');
+                s.push_str(&hex32(&addrs[i]));
+                s.push('"');
+            }
+            s.push_str("]}");
+        }
+    }
+}
+
 impl EscrowSnapshot {
     /// Hand-serialized canonical JSON (the crate is dependency-free).
     /// Deterministic field order; 32-byte keys are 64-char lowercase
@@ -1231,6 +1293,26 @@ impl EscrowSnapshot {
                     s.push('"');
                 }
                 s.push(']');
+            }
+        }
+        // AV-158: the delayed-governance window and the live proposal,
+        // so indexers see the pending governance action and its
+        // execute-eligibility clock.
+        s.push_str(",\"governance_delay_secs\":");
+        s.push_str(&self.governance_delay_secs.to_string());
+        s.push_str(",\"governance_proposal\":");
+        match &self.governance_proposal {
+            None => s.push_str("null"),
+            Some(p) => {
+                s.push_str("{\"action\":");
+                write_governance_action(&mut s, &p.action);
+                s.push_str(",\"proposed_by\":\"");
+                s.push_str(&hex32(&p.proposed_by));
+                s.push_str("\",\"proposed_at\":");
+                s.push_str(&p.proposed_at.to_string());
+                s.push_str(",\"delay_secs\":");
+                s.push_str(&p.delay_secs.to_string());
+                s.push('}');
             }
         }
         // AV-99: the declared Token-2022 transfer-hook program — 64-char
@@ -1890,7 +1972,7 @@ mod snapshot_tests {
              \"dual_sig\":{{\"required\":false,\"initializer_activated\":false,\"taker_activated\":false}},\
              \"quorum\":null,\
              \"vesting\":null,\"vesting_curve\":null,\"vested\":0,\"display_vested\":\"0\",\"claimable\":0,\"display_claimable\":\"0\",\
-             \"arbiter\":null,\"mint\":null,\"mint_allowlist\":null,\"transfer_hook\":null,\"streaming_fee_rate\":0,\"streaming_fees_accrued\":0,\
+             \"arbiter\":null,\"mint\":null,\"mint_allowlist\":null,\"governance_delay_secs\":0,\"governance_proposal\":null,\"transfer_hook\":null,\"streaming_fee_rate\":0,\"streaming_fees_accrued\":0,\
              \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
