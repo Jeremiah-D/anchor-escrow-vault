@@ -3597,9 +3597,10 @@ address = sha256(seeds.. ++ [bump] ++ program_id ++ "ProgramDerivedAddress")
   byte-for-byte Solana's `create_program_address` layout (the crate's
   hand-written SHA-256 is pinned by the Anchor discriminator vectors,
   and a test re-derives the layout independently so any drift fails
-  loudly). The reference seed convention is `[b"vault",
+  loudly). The reference seed convention is `[b"escrow-vault",
   initializer]` (see the `Initialize` accounts struct in
-  `programs/escrow-vault/src/program.rs`); each seed is ≤ 32 bytes,
+  `programs/escrow-vault/src/program.rs` and the AV-173 seed-domain
+  registry below); each seed is ≤ 32 bytes,
   at most 16 seeds — violations are `InvalidVaultSeeds` (code 149).
 - **Bump search**: `find_vault_bump` scans bumps 255 → 0 and returns
   the first whose derived address is *off* the ed25519 curve
@@ -3624,6 +3625,33 @@ address = sha256(seeds.. ++ [bump] ++ program_id ++ "ProgramDerivedAddress")
   the address the vault *will* have — the fleet bring-up
   cross-check), and on every `CloseVaultsReport` entry (the indexed
   close variant carries the recorded vault PDA directly).
+
+### Application seed-domain registry (AV-173)
+
+`"ProgramDerivedAddress"` stops cross-*program* PDA collisions; it says
+nothing about collisions *within* this program — a vault PDA and a
+config PDA are both valid PDAs, and tooling that parses "the PDA for X"
+from a bare seed list could silently confuse the two.
+`escrow-state/src/seed_domain.rs` adds the application layer: every PDA
+the program owns lives in exactly one `SeedDomain`
+(`Vault`/`Config`/`State`/`Nonce`/`Keeper`), the domain's canonical
+prefix (`b"escrow-vault"`, `b"escrow-config"`, `b"escrow-state"`,
+`b"escrow-nonce"`, `b"escrow-keeper"`) is the *first* seed of every
+derivation in that domain, and the prefix table is the single source of
+truth (no prefix is a prefix of another — pinned by test, so a seed
+list parses into at most one domain).
+
+Canonical derivation paths (`derive_domain_address`,
+`derive_vault_pda`, `derive_config_pda`) prepend the prefix themselves,
+so the first seed is a registered prefix by construction, not by caller
+discipline; `classify_seeds` explicitly rejects any raw seed list whose
+first seed is not registered — unregistered domains and bare ad-hoc
+seeds (like the pre-AV-173 `b"vault"` convention) fail with
+`InvalidVaultSeeds` instead of deriving a lookalike address. Same
+suffix seeds under different domains always derive different addresses
+(test-pinned), so a vault PDA can never be parsed as a config PDA. The
+Anchor skeleton's `seeds = [...]` constraints align to the canonical
+prefixes. 13 tests; `cargo test -p escrow-state` green.
 
 ## Keeper execution bundles (AV-61)
 

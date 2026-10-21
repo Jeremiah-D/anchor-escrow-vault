@@ -148,6 +148,18 @@ mod priority_fee;
 // recorded off-chain on the watch structs; the scans attach the
 // derived vault address to their reports. Purely additive.
 mod pda;
+// AV-173: application-level PDA seed-domain registry — the SeedDomain
+// enum plus the canonical prefix table as the single source of truth;
+// canonical derive_*_address paths prepend the registered prefix
+// themselves, and classify_seeds explicitly rejects unregistered /
+// ad-hoc seed lists. Prevents cross-purpose PDA confusion (a vault PDA
+// parsed as a config PDA). Orthogonal to pda's protocol-level
+// PDA_DOMAIN and AV-92's seed-length validation. Pure logic, zero
+// dependencies.
+mod seed_domain;
+pub use seed_domain::{
+    classify_seeds, derive_config_pda, derive_domain_address, derive_vault_pda, SeedDomain,
+};
 // AV-101: Ed25519 signatures (RFC 8032), hand-rolled, zero
 // dependencies — SHA-512, scalar arithmetic mod L, and
 // twisted-Edwards point operations over `pda`'s field arithmetic.

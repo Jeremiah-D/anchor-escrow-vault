@@ -6977,6 +6977,11 @@ pub struct Vault {
 /// — the program-level emergency circuit breaker account. A single
 /// program-wide instance (PDA `seeds = [b"circuit_breaker"]` in the real
 /// build), separate from every per-escrow `Vault`.
+/// AV-173: the program-wide instance lives in the
+/// `escrow_state::SeedDomain::Config` domain — the registry
+/// (`escrow_state::seed_domain`) is the single source of truth for
+/// domain prefixes, so no new program-wide PDA may invent an ad-hoc
+/// first seed.
 ///
 /// Layout: `pauser` (32 bytes) ++ `paused` (1 byte) ++ the bounded
 /// audit ring (`escrow_state::MAX_CIRCUIT_AUDIT_ENTRIES` slots ×
@@ -7912,16 +7917,21 @@ pub struct Initialize<'info> {
     //
     //     #[account(
     //         init, payer = initializer, space = escrow_state::VAULT_SPACE,
-    //         seeds = [b"vault", initializer.key().as_ref()],
+    //         seeds = [b"escrow-vault", initializer.key().as_ref()],
     //         bump,
     //     )]
     //
-    // i.e. `find_program_address([b"vault", initializer], program_id)`:
-    // the canonical address is
+    // i.e. `find_program_address([b"escrow-vault", initializer],
+    // program_id)`: the canonical address is
     // `sha256(seeds.. ++ [bump] ++ program_id ++ "ProgramDerivedAddress")`
     // with the bump scanned 255 → 0 for the first off-curve candidate
     // (Solana's `create_program_address` / `find_program_address`
-    // semantics). The seeds are chosen at initialize time and recorded
+    // semantics). AV-173: the first seed is the registered
+    // `escrow_state::SeedDomain::Vault` prefix — the seed-domain
+    // registry (`escrow_state::seed_domain`) is the single source of
+    // truth for domain prefixes, and ad-hoc first seeds (like the bare
+    // `b"vault"` this comment showed before AV-173) are rejected by
+    // `classify_seeds`. The seeds are chosen at initialize time and recorded
     // off-chain — PDAs never store their seeds on-chain — so the
     // keeper/batch/close watch structs carry them
     // (`WatchedEscrow::with_vault_seeds`, `BatchWatchItem`,
@@ -7931,7 +7941,7 @@ pub struct Initialize<'info> {
     // `find_program_address` / `derive_vault_address` /
     // `find_vault_bump` / `is_on_ed25519_curve`. Every later
     // instruction takes the vault PDA as a plain account and the
-    // program signs via `invoke_signed` with `&[b"vault",
+    // program signs via `invoke_signed` with `&[b"escrow-vault",
     // initializer.key().as_ref(), &[bump]]`.
     //
     // Full vault space: 8-byte discriminator + 2216-byte payload = 2224
