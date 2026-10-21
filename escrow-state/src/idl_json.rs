@@ -1243,12 +1243,12 @@ fn idl_errors_pin_enum() {
         let name = format!("{e:?}");
         assert!(seen.insert(name.clone()), "duplicate error variant {name}");
         assert!(
-            (100..231).contains(&e.code()),
+            (100..237).contains(&e.code()),
             "error code out of pinned range: {name} = {}",
             e.code()
         );
     }
-    assert_eq!(errors.len(), 131, "error variant count drift");
+    assert_eq!(errors.len(), 137, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -1412,6 +1412,18 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::SponsorCumulativeCapExceeded.code(), 229);
     // AV-164: appended, never renumbered.
     assert_eq!(EscrowError::SponsorBudgetExhausted.code(), 230);
+    // AV-165: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidHeartbeatConfig.code(), 231);
+    // AV-165: appended, never renumbered.
+    assert_eq!(EscrowError::KeeperNotRegistered.code(), 232);
+    // AV-165: appended, never renumbered.
+    assert_eq!(EscrowError::HeartbeatSignatureInvalid.code(), 233);
+    // AV-165: appended, never renumbered.
+    assert_eq!(EscrowError::KeeperHealthy.code(), 234);
+    // AV-165: appended, never renumbered.
+    assert_eq!(EscrowError::ClaimConflict.code(), 235);
+    // AV-165: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidClaim.code(), 236);
 }
 
 #[test]

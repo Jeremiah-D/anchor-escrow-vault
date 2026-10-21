@@ -1541,6 +1541,12 @@ program error per variant):
 | `SponsorAmountExceedsPerTxCap` | 228 | `SponsorPolicy::authorize` (AV-164) with an amount above the per-transaction lamport cap |
 | `SponsorCumulativeCapExceeded` | 229 | `SponsorPolicy::authorize` (AV-164) that would push the sponsor's booked cumulative spend over the cumulative cap |
 | `SponsorBudgetExhausted` | 230 | `SponsorBudget::deduct` (AV-164) with insufficient budget balance — nothing booked, nothing audited |
+| `InvalidHeartbeatConfig` | 231 | `HeartbeatRegistry::new` (AV-165) with zero `expected_interval_slots` or zero `max_missed_beats`, or `register` with the zero key |
+| `KeeperNotRegistered` | 232 | `HeartbeatRegistry::heartbeat` / `claim` (AV-165) for a keeper (or standby) not on the fleet roster |
+| `HeartbeatSignatureInvalid` | 233 | `HeartbeatRegistry::heartbeat` (AV-165) with an Ed25519 signature that does not verify against the registered keeper key |
+| `KeeperHealthy` | 234 | `HeartbeatRegistry::claim` (AV-165) on a keeper that is not unhealthy — its escrow set is not claimable |
+| `ClaimConflict` | 235 | `HeartbeatRegistry::claim` (AV-165) on an already-claimed escrow set — first-come-first-served, the lost race is audited |
+| `InvalidClaim` | 236 | `HeartbeatRegistry::claim` (AV-165) with a zero standby key, a self-claim, or a claimed set over `MAX_CLAIMED_ESCROWS` |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -5398,6 +5404,56 @@ and does not persist across restarts. The Anchor skeleton maps the six
 new error codes (225–230) one-per-variant; adding errors is
 non-breaking under the AV-152 semver gate, so the baseline is
 untouched.
+
+## Keeper fleet liveness (AV-165)
+
+`escrow-state/src/keeper_heartbeat.rs` — the liveness layer for a
+fleet of keeper bots. The keeper scans are dry-run by construction, so
+many bots can share the work — but a dead keeper silently drops its
+escrow set. Keepers prove they are alive with Ed25519-signed
+heartbeats; a missed-beat detector marks keepers that go quiet; a
+standby keeper can claim an unhealthy keeper's escrow set. Orthogonal
+to the AV-118 push notifications: that module *announces* actions,
+this module *detects dead operators and reassigns their work*.
+
+- **The heartbeat**: `Heartbeat { keeper, slot, at, last_action }`
+  (last action is a compact status code: idle / cancel-expired /
+  claim / rent-top-up / other), signed over canonical bytes prefixed
+  with `KEEPER-HEARTBEAT-v1` — the domain-separation convention from
+  AV-123, so a signature minted for any other envelope can never
+  verify as a heartbeat. Every heartbeat is verified against the
+  registered keeper key before any state moves (`HeartbeatSignatureInvalid`,
+  code 233, on forgery or tampering).
+- **The detector**: `HeartbeatRegistry::scan(current_slot, now)`
+  marks a keeper unhealthy when `missed = (current_slot - last_slot)
+  / expected_interval_slots >= max_missed_beats` *or* the slot
+  staleness passes `stale_slot_threshold` — deterministic given the
+  slot numbers. Transitions are edge-triggered (`HeartbeatMissed`
+  audit, reported once). A stale heartbeat (`slot <= last_slot`) is
+  an idempotent no-op: a delayed duplicate can neither rewind the
+  record nor revive an unhealthy keeper.
+- **The takeover**: `claim(standby, target, escrow_ids, now,
+  current_slot)` — check order: claim shape (`InvalidClaim`, code
+  236: zero standby, self-claim, over-long set), roster membership
+  (both parties registered: `KeeperNotRegistered`, code 232), target
+  health (`KeeperHealthy`, code 234: only unhealthy keepers are
+  claimable — computed on the spot, so no scan needs to have run),
+  then the first-come-first-served gate. The first standby wins; a
+  lost race gets `ClaimConflict` (code 235) *and* a `ClaimConflict`
+  audit entry (the AV-36 convention: the failed security-relevant
+  call is still audited). A win appends `TakeoverClaimed` with the
+  claimed escrow ids.
+- **The recovery**: a fresh heartbeat from a claimed keeper revokes
+  the claim (`ClaimRevoked` audit) — the original keeper is back, so
+  the standby stands down. No split-brain.
+
+Honest scope: the registry is off-chain fleet state, not an on-chain
+account — the caller feeds `current_slot` / `now` (the crate has no
+clock), and the escrow set is caller-supplied (capped at 256 per
+claim). The detector only marks; the operator (or automation) decides
+which standby claims which set. The Anchor skeleton maps the six new
+error codes (231–236) one-per-variant; adding errors is non-breaking
+under the AV-152 semver gate.
 
 ## Funding amount bounds (AV-134)
 

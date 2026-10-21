@@ -18,6 +18,10 @@ mod circuit_breaker;
 // structured sponsorship audit (sponsor key + amount + escrow). Purely
 // additive.
 mod sponsor;
+// AV-165: keeper fleet liveness — Ed25519-signed heartbeats, the
+// missed-beat detector, standby takeover of unhealthy keepers' escrow
+// sets, and the bounded heartbeat audit ring. Purely additive.
+mod keeper_heartbeat;
 // AV-74: deterministic indexer-event CSV export (RFC 4180, zero
 // dependencies) — `events_to_csv` / `csv_to_events`, the
 // data-analysis / audit-ingest complement to the AV-26 snapshot JSON.
@@ -351,6 +355,14 @@ pub use circuit_breaker::{
 // additive.
 pub use sponsor::{
     SponsorAuditEntry, SponsorBudget, SponsorPolicy, MAX_SPONSOR_AUDIT_ENTRIES, MAX_SPONSORS,
+};
+// AV-165: keeper fleet liveness — signed heartbeats, the missed-beat
+// detector, standby takeover of unhealthy keepers' escrow sets, and
+// the bounded heartbeat audit ring. Purely additive.
+pub use keeper_heartbeat::{
+    Heartbeat, HeartbeatAuditEntry, HeartbeatAuditKind, HeartbeatConfig, HeartbeatRegistry,
+    KeeperLastAction, KEEPER_HEARTBEAT_DOMAIN, HEARTBEAT_MSG_LEN, MAX_CLAIMED_ESCROWS,
+    MAX_KEEPER_AUDIT_ENTRIES,
 };
 
 // AV-20: off-chain keeper report — scan a batch of escrows for executable
@@ -3073,6 +3085,40 @@ pub enum EscrowError {
     /// requested amount. Nothing is booked and nothing is audited.
     /// Never renumbered (see [`EscrowError::code`]).
     SponsorBudgetExhausted,
+    /// AV-165: [`HeartbeatRegistry::new`](crate::HeartbeatRegistry::new)
+    /// / [`HeartbeatRegistry::register`](crate::HeartbeatRegistry::register)
+    /// refused — a vacuous detector config (zero
+    /// `expected_interval_slots` or zero `max_missed_beats`), or
+    /// registering the zero key. Never renumbered (see
+    /// [`EscrowError::code`]).
+    InvalidHeartbeatConfig,
+    /// AV-165: [`HeartbeatRegistry::heartbeat`](crate::HeartbeatRegistry::heartbeat)
+    /// / [`HeartbeatRegistry::claim`](crate::HeartbeatRegistry::claim)
+    /// refused — the keeper (or the claiming standby) is not on the
+    /// fleet roster. Never renumbered (see [`EscrowError::code`]).
+    KeeperNotRegistered,
+    /// AV-165: [`HeartbeatRegistry::heartbeat`](crate::HeartbeatRegistry::heartbeat)
+    /// refused — the heartbeat's Ed25519 signature does not verify
+    /// against the registered keeper key (tampered bytes, wrong key,
+    /// or a signature minted for a different domain). Never renumbered
+    /// (see [`EscrowError::code`]).
+    HeartbeatSignatureInvalid,
+    /// AV-165: [`HeartbeatRegistry::claim`](crate::HeartbeatRegistry::claim)
+    /// refused — the target keeper is not unhealthy, so its escrow set
+    /// is not claimable. Never renumbered (see [`EscrowError::code`]).
+    KeeperHealthy,
+    /// AV-165: [`HeartbeatRegistry::claim`](crate::HeartbeatRegistry::claim)
+    /// refused — the target keeper's escrow set is already claimed by
+    /// another standby (first-come-first-served); the lost race is
+    /// recorded as a `ClaimConflict` audit entry. Never renumbered (see
+    /// [`EscrowError::code`]).
+    ClaimConflict,
+    /// AV-165: [`HeartbeatRegistry::claim`](crate::HeartbeatRegistry::claim)
+    /// refused — the claim shape is invalid: a zero standby key, a
+    /// self-claim, or a claimed escrow set over
+    /// [`MAX_CLAIMED_ESCROWS`](crate::MAX_CLAIMED_ESCROWS). Never
+    /// renumbered (see [`EscrowError::code`]).
+    InvalidClaim,
 }
 
 impl EscrowError {
@@ -3270,6 +3316,18 @@ impl EscrowError {
             EscrowError::SponsorCumulativeCapExceeded => 229,
             // AV-164: appended, never renumbered.
             EscrowError::SponsorBudgetExhausted => 230,
+            // AV-165: appended, never renumbered.
+            EscrowError::InvalidHeartbeatConfig => 231,
+            // AV-165: appended, never renumbered.
+            EscrowError::KeeperNotRegistered => 232,
+            // AV-165: appended, never renumbered.
+            EscrowError::HeartbeatSignatureInvalid => 233,
+            // AV-165: appended, never renumbered.
+            EscrowError::KeeperHealthy => 234,
+            // AV-165: appended, never renumbered.
+            EscrowError::ClaimConflict => 235,
+            // AV-165: appended, never renumbered.
+            EscrowError::InvalidClaim => 236,
         }
     }
 
@@ -3449,6 +3507,18 @@ impl EscrowError {
             EscrowError::SponsorCumulativeCapExceeded,
             // AV-164: appended, never renumbered.
             EscrowError::SponsorBudgetExhausted,
+            // AV-165: appended, never renumbered.
+            EscrowError::InvalidHeartbeatConfig,
+            // AV-165: appended, never renumbered.
+            EscrowError::KeeperNotRegistered,
+            // AV-165: appended, never renumbered.
+            EscrowError::HeartbeatSignatureInvalid,
+            // AV-165: appended, never renumbered.
+            EscrowError::KeeperHealthy,
+            // AV-165: appended, never renumbered.
+            EscrowError::ClaimConflict,
+            // AV-165: appended, never renumbered.
+            EscrowError::InvalidClaim,
         ]
     }
 }
@@ -30778,6 +30848,42 @@ mod error_code_tests {
             230,
             "SponsorBudget::deduct with insufficient budget balance — nothing booked, nothing audited (AV-164)",
         ),
+        // AV-165: appended, never renumbered.
+        (
+            EscrowError::InvalidHeartbeatConfig,
+            231,
+            "HeartbeatRegistry::new with zero expected_interval_slots or zero max_missed_beats, or register with the zero key (AV-165)",
+        ),
+        // AV-165: appended, never renumbered.
+        (
+            EscrowError::KeeperNotRegistered,
+            232,
+            "HeartbeatRegistry::heartbeat / claim for a keeper (or standby) not on the fleet roster (AV-165)",
+        ),
+        // AV-165: appended, never renumbered.
+        (
+            EscrowError::HeartbeatSignatureInvalid,
+            233,
+            "HeartbeatRegistry::heartbeat with an Ed25519 signature that does not verify against the registered keeper key (AV-165)",
+        ),
+        // AV-165: appended, never renumbered.
+        (
+            EscrowError::KeeperHealthy,
+            234,
+            "HeartbeatRegistry::claim on a keeper that is not unhealthy — its escrow set is not claimable (AV-165)",
+        ),
+        // AV-165: appended, never renumbered.
+        (
+            EscrowError::ClaimConflict,
+            235,
+            "HeartbeatRegistry::claim on an already-claimed escrow set — first-come-first-served, the lost race is audited (AV-165)",
+        ),
+        // AV-165: appended, never renumbered.
+        (
+            EscrowError::InvalidClaim,
+            236,
+            "HeartbeatRegistry::claim with a zero standby key, a self-claim, or a claimed set over MAX_CLAIMED_ESCROWS (AV-165)",
+        ),
     ];
 
     #[test]
@@ -56158,7 +56264,20 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::SponsorCumulativeCapExceeded));
         assert_eq!(EscrowError::SponsorBudgetExhausted.code(), 230);
         assert!(EscrowError::all().contains(&EscrowError::SponsorBudgetExhausted));
-        assert_eq!(EscrowError::all().len(), 131);
+        // AV-165: the keeper-liveness errors.
+        assert_eq!(EscrowError::InvalidHeartbeatConfig.code(), 231);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidHeartbeatConfig));
+        assert_eq!(EscrowError::KeeperNotRegistered.code(), 232);
+        assert!(EscrowError::all().contains(&EscrowError::KeeperNotRegistered));
+        assert_eq!(EscrowError::HeartbeatSignatureInvalid.code(), 233);
+        assert!(EscrowError::all().contains(&EscrowError::HeartbeatSignatureInvalid));
+        assert_eq!(EscrowError::KeeperHealthy.code(), 234);
+        assert!(EscrowError::all().contains(&EscrowError::KeeperHealthy));
+        assert_eq!(EscrowError::ClaimConflict.code(), 235);
+        assert!(EscrowError::all().contains(&EscrowError::ClaimConflict));
+        assert_eq!(EscrowError::InvalidClaim.code(), 236);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidClaim));
+        assert_eq!(EscrowError::all().len(), 137);
     }
 
     #[test]

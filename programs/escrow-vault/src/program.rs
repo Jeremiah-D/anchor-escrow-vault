@@ -10971,6 +10971,25 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::SponsorBudgetExhausted => {
             error!(ErrorCode::SponsorBudgetExhausted)
         }
+        // AV-165: one program error per new EscrowError variant.
+        escrow_state::EscrowError::InvalidHeartbeatConfig => {
+            error!(ErrorCode::InvalidHeartbeatConfig)
+        }
+        escrow_state::EscrowError::KeeperNotRegistered => {
+            error!(ErrorCode::KeeperNotRegistered)
+        }
+        escrow_state::EscrowError::HeartbeatSignatureInvalid => {
+            error!(ErrorCode::HeartbeatSignatureInvalid)
+        }
+        escrow_state::EscrowError::KeeperHealthy => {
+            error!(ErrorCode::KeeperHealthy)
+        }
+        escrow_state::EscrowError::ClaimConflict => {
+            error!(ErrorCode::ClaimConflict)
+        }
+        escrow_state::EscrowError::InvalidClaim => {
+            error!(ErrorCode::InvalidClaim)
+        }
     }
 }
 
@@ -11293,4 +11312,17 @@ pub enum ErrorCode {
     SponsorCumulativeCapExceeded,
     #[msg("Sponsor budget exhausted (AV-164): the keeper's fee budget is short of the requested deduct — nothing booked, nothing audited (SponsorBudgetExhausted, code 230)")]
     SponsorBudgetExhausted,
+    // AV-165: the keeper-liveness errors (codes 231-236).
+    #[msg("Invalid heartbeat config (AV-165): zero expected_interval_slots or zero max_missed_beats, or registering the zero key (InvalidHeartbeatConfig, code 231)")]
+    InvalidHeartbeatConfig,
+    #[msg("Keeper not registered (AV-165): heartbeat or claim for a keeper not on the fleet roster (KeeperNotRegistered, code 232)")]
+    KeeperNotRegistered,
+    #[msg("Heartbeat signature invalid (AV-165): the heartbeat's Ed25519 signature does not verify against the registered keeper key (HeartbeatSignatureInvalid, code 233)")]
+    HeartbeatSignatureInvalid,
+    #[msg("Keeper healthy (AV-165): claim on a keeper that is not unhealthy — its escrow set is not claimable (KeeperHealthy, code 234)")]
+    KeeperHealthy,
+    #[msg("Claim conflict (AV-165): the escrow set is already claimed by another standby — first-come-first-served (ClaimConflict, code 235)")]
+    ClaimConflict,
+    #[msg("Invalid claim (AV-165): zero standby key, self-claim, or claimed set over MAX_CLAIMED_ESCROWS (InvalidClaim, code 236)")]
+    InvalidClaim,
 }

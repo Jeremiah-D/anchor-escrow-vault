@@ -1815,7 +1815,13 @@
     {"code": 227, "name": "SponsorWindowInactive"},
     {"code": 228, "name": "SponsorAmountExceedsPerTxCap"},
     {"code": 229, "name": "SponsorCumulativeCapExceeded"},
-    {"code": 230, "name": "SponsorBudgetExhausted"}
+    {"code": 230, "name": "SponsorBudgetExhausted"},
+    {"code": 231, "name": "InvalidHeartbeatConfig"},
+    {"code": 232, "name": "KeeperNotRegistered"},
+    {"code": 233, "name": "HeartbeatSignatureInvalid"},
+    {"code": 234, "name": "KeeperHealthy"},
+    {"code": 235, "name": "ClaimConflict"},
+    {"code": 236, "name": "InvalidClaim"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
