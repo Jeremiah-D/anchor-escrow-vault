@@ -3304,6 +3304,38 @@ legacy SPL program fails loud (`IncompatibleTokenExtension`), as does a
 fee schedule above 100% (`InvalidTransferFee`). The Anchor skeleton
 needs no changes: this is purely the CPI layer.
 
+### Token-2022 confidential transfers (AV-168)
+
+Mints carrying the confidential-transfer extension keep per-account
+balances as ElGamal ciphertexts with a *pending* and an *available*
+bucket, and paying out of one is a two-step dance:
+`ApplyPendingBalance` (instruction `14`) settles pending into
+available, then `Withdraw` (instruction `8`, 28-byte layout: index,
+`u64` amount, `u8` decimals, the 16-byte wallet-sealed
+`new_decryptable_available_balance`, and the two `i8` zero-knowledge
+proof instruction offsets — the proofs ride separately in the
+transaction, this module pins the offsets but never fabricates
+proofs) moves the settled amount out. Withdrawing without applying
+first strands the pending amount on-chain, so the
+`ConfidentialSettlementSequence` builder refuses to even construct
+that order: withdraw-before-apply fails with
+`ConfidentialPendingNotApplied`, double-apply with
+`ConfidentialAlreadyApplied`. `confidential_payout_plan` wires the
+sequence into the `release`/`claim` settlement plan (the fee leg
+settles through the standard token leg — the fee recipient is a
+plain account), with the same machine-reconciliation checks as the
+plain plan. The decryptable-available-balance query is the
+`ConfidentialBalanceQuery` trait, implemented by `ElgamalDecryptor`
+with a caller-held secret key — the crate never sees, stores, or
+transmits it. Honest scope: the ElGamal math is modeled over
+compressed Edwards25519 points (same group algebra as the on-chain
+Ristretto encoding, not wire-compatible), the public key is
+`(s·G, s·H)` (64 bytes — the handle equation needs the secret's
+multiple of the second generator), and the bounded-range discrete
+log covers `[0, 2^32)` (amounts above fail
+`DecryptionOutOfRange`, never silently wrapped). 17 tests;
+`cargo test -p escrow-state` green.
+
 ## CPI-routed release (AV-35)
 
 `escrow-state/src/cpi_call.rs` models the release path where the taker's

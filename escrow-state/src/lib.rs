@@ -27,6 +27,12 @@ mod keeper_heartbeat;
 // data-analysis / audit-ingest complement to the AV-26 snapshot JSON.
 mod event_csv;
 mod cpi;
+// AV-168: Token-2022 confidential transfer awareness — the mint
+// extension binding, byte-pinned ApplyPendingBalance / Withdraw
+// builders, the apply-before-withdraw settlement sequence, and the
+// ElGamal balance math behind the decryptable-available-balance
+// query (caller-held keys, pure logic).
+mod confidential;
 // AV-35: CPI-routed release — third-party program invocation modeled as
 // data, validated before settlement, with an injected executor seam and
 // rollback on executor failure (mirrors on-chain CPI atomicity).
@@ -332,6 +338,18 @@ pub use cpi::{
     TransferFeeSchedule, TransferInstruction, ValidatedMint, TRANSFER_CHECKED_IX,
 };
 
+// AV-168: Token-2022 confidential transfers — extension-aware mint
+// bindings, the apply-before-withdraw settlement sequence, and the
+// ElGamal balance math (pure logic, caller-held keys).
+pub use confidential::{
+    confidential_apply_pending_balance, confidential_payout_plan, confidential_withdraw,
+    elgamal_add, elgamal_encrypt, ConfidentialAccountBalance, ConfidentialBalanceQuery,
+    ConfidentialError, ConfidentialPayoutParams, ConfidentialSettlementSequence,
+    ConfidentialTransferMint, ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey, ElgamalDecryptor,
+    CONFIDENTIAL_TRANSFER_APPLY_PENDING_BALANCE_IX, CONFIDENTIAL_TRANSFER_WITHDRAW_DATA_LEN,
+    CONFIDENTIAL_TRANSFER_WITHDRAW_IX,
+};
+
 // AV-35: CPI-routed release — the third-party invocation as data, its
 // SHA-256 accounts-hash audit commitment, and the success receipt.
 // Purely additive: no existing signature changed.
@@ -539,6 +557,7 @@ pub use execution_bundle::{
     // errors. Purely additive and off-chain.
     JitoTip, JitoTipConfig, TipConfigError,
 };
+
 
 // AV-71: signable transaction-message serialization for keeper
 // execution bundles — real instruction bytes (discriminator + Borsh

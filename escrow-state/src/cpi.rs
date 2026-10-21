@@ -46,6 +46,7 @@
 use std::sync::OnceLock;
 
 use super::{parse_mint_address, Escrow, EscrowState};
+use crate::confidential::{ConfidentialTransferMint, CONFIDENTIAL_TRANSFER_WITHDRAW_IX};
 
 /// A 32-byte Solana public key.
 pub type Pubkey = [u8; 32];
@@ -70,21 +71,28 @@ pub struct TransferInstruction {
 impl TransferInstruction {
     /// Amount carried by this instruction, decoded from its data bytes.
     /// System transfers encode a u64 at bytes 4..12; token-program
-    /// transfers encode a u64 at bytes 1..9 — for both the plain
-    /// `Transfer` (index 3) and `TransferChecked` (index 12, AV-166),
-    /// on either the SPL Token program or Token-2022. An unknown
-    /// program or instruction index decodes to `None`.
+    /// transfers encode a u64 at bytes 1..9 — for the plain `Transfer`
+    /// (index 3), `TransferChecked` (index 12, AV-166), and the
+    /// Token-2022 confidential `Withdraw` (index 8 with the pinned
+    /// 28-byte layout, AV-168) — on either the SPL Token program or
+    /// Token-2022. An unknown program or instruction index decodes to
+    /// `None`.
     pub fn amount(&self) -> Option<u64> {
         let bytes: [u8; 8] = if self.program_id == system_program_id() {
             self.data.get(4..12)?.try_into().ok()?
         } else if self.program_id == spl_token_program_id()
             || self.program_id == token_2022_program_id()
         {
-            // Both token transfer layouts carry the u64 amount at
+            // The token transfer layouts carry the u64 amount at
             // bytes 1..9; anything else is not a transfer this module
             // built.
             match self.data.first() {
                 Some(3) | Some(&TRANSFER_CHECKED_IX) => {
+                    self.data.get(1..9)?.try_into().ok()?
+                }
+                // AV-168: the confidential Withdraw pins a 28-byte
+                // layout with the amount at bytes 1..9.
+                Some(&CONFIDENTIAL_TRANSFER_WITHDRAW_IX) if self.data.len() == 28 => {
                     self.data.get(1..9)?.try_into().ok()?
                 }
                 _ => return None,
@@ -103,6 +111,24 @@ impl TransferInstruction {
             && self.data.first() == Some(&TRANSFER_CHECKED_IX)
         {
             self.data.get(9).copied()
+        } else {
+            None
+        }
+    }
+
+    /// Amount carried by a Token-2022 confidential-transfer `Withdraw`
+    /// (index 8, AV-168): the `u64` at bytes 1..9 of the 28-byte
+    /// layout. Equivalent to [`amount`](Self::amount) for this
+    /// instruction — the dedicated accessor pins the layout
+    /// explicitly, mirroring
+    /// [`transfer_checked_decimals`](Self::transfer_checked_decimals).
+    /// `None` for anything else.
+    pub fn confidential_withdraw_amount(&self) -> Option<u64> {
+        if self.program_id == token_2022_program_id()
+            && self.data.first() == Some(&CONFIDENTIAL_TRANSFER_WITHDRAW_IX)
+            && self.data.len() == 28
+        {
+            self.data.get(1..9)?.try_into().ok().map(u64::from_le_bytes)
         } else {
             None
         }
@@ -170,6 +196,17 @@ pub enum CpiError {
     /// program — transfer fees and the metadata extension are
     /// Token-2022 concepts and meaningless there.
     IncompatibleTokenExtension,
+    /// AV-168: a confidential `Withdraw` was sequenced before
+    /// `ApplyPendingBalance` — withdrawing from a confidential
+    /// account whose pending balance was never applied would strand
+    /// the pending amount, so the sequence builder refuses to emit
+    /// the instruction instead of building a doomed transaction.
+    ConfidentialPendingNotApplied,
+    /// AV-168: `ApplyPendingBalance` was sequenced twice on the same
+    /// confidential settlement — the second apply is a caller bug
+    /// (the pending balance is already settled), failed loud instead
+    /// of emitting a duplicate instruction.
+    ConfidentialAlreadyApplied,
 }
 
 fn require_nonzero(key: &Pubkey) -> Result<(), CpiError> {
@@ -502,6 +539,10 @@ pub struct MintDescriptor {
     /// Token-2022 metadata extension, read-only. Same program gate as
     /// the transfer fee.
     pub metadata: Option<TokenMetadata>,
+    /// AV-168: Token-2022 confidential-transfer extension. Same
+    /// program gate as the transfer fee and metadata — a legacy SPL
+    /// Token mint carrying it fails validation.
+    pub confidential_transfer: Option<ConfidentialTransferMint>,
 }
 
 impl MintDescriptor {
@@ -515,10 +556,14 @@ impl MintDescriptor {
         }
         match program {
             TokenProgram::SplToken => {
-                // Transfer fees and the metadata extension are
-                // Token-2022 concepts — a legacy SPL mint carrying them
-                // is a caller bug, failed loud.
-                if self.transfer_fee.is_some() || self.metadata.is_some() {
+                // Transfer fees, the metadata extension, and the
+                // confidential-transfer extension are Token-2022
+                // concepts — a legacy SPL mint carrying any of them is
+                // a caller bug, failed loud.
+                if self.transfer_fee.is_some()
+                    || self.metadata.is_some()
+                    || self.confidential_transfer.is_some()
+                {
                     return Err(CpiError::IncompatibleTokenExtension);
                 }
             }
@@ -754,7 +799,7 @@ impl SettlementPlan {
 /// by `token_program` (AV-166): `None` keeps the legacy SPL Token
 /// plain-`Transfer` behavior; `Some` auto-dispatches SPL Token vs
 /// Token-2022 via [`token_program_kind`].
-fn leg(
+pub(crate) fn leg(
     escrow: &Escrow,
     source: Pubkey,
     vault_authority: Pubkey,
@@ -802,7 +847,7 @@ fn leg(
     }
 }
 
-fn push_fee_leg(
+pub(crate) fn push_fee_leg(
     escrow: &Escrow,
     source: Pubkey,
     vault_authority: Pubkey,
@@ -845,7 +890,7 @@ fn push_fee_leg(
 /// Pure logic never asserts the hook actually ran on-chain — that is
 /// Token-2022's job during the transfer. This gate only guarantees
 /// the plan and the declaration agree.
-fn check_transfer_hook(
+pub(crate) fn check_transfer_hook(
     escrow: &Escrow,
     hook: &Option<TransferHookPlan>,
 ) -> Result<(Option<Pubkey>, Vec<AccountMeta>), CpiError> {
@@ -2330,6 +2375,7 @@ mod cpi_tests {
                 "u".to_string(),
                 vec![],
             )),
+            confidential_transfer: None,
         }
     }
 
@@ -2348,6 +2394,7 @@ mod cpi_tests {
             decimals: 9,
             transfer_fee: None,
             metadata: None,
+            confidential_transfer: None,
         }
         .validate()
         .unwrap();
@@ -2404,6 +2451,7 @@ mod cpi_tests {
             decimals: 9,
             transfer_fee: None,
             metadata: None,
+            confidential_transfer: None,
         }
         .validate()
         .unwrap();

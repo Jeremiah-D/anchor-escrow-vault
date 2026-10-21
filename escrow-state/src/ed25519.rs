@@ -700,6 +700,256 @@ pub fn batch_verify(items: &[BatchVerifyItem<'_>]) -> Vec<usize> {
     failed
 }
 
+// ---------------------------------------------------------------------------
+// ElGamal arithmetic over the Ed25519 curve (AV-168).
+// ---------------------------------------------------------------------------
+//
+// Token-2022 confidential transfers encrypt balances with ElGamal on
+// the Ristretto encoding of this same curve group. This crate models
+// the *identical group algebra* on compressed Edwards25519 points —
+// the discrete-log problem, the commitment equation, and the additive
+// homomorphism are unchanged; only the point encoding differs
+// (compressed Edwards vs Ristretto). Anything this section proves
+// about the algebra transfers directly; nothing here claims
+// wire-compatibility with on-chain confidential accounts.
+//
+// Scalar inputs are little-endian 32-byte values, reduced mod `L`
+// (the same canonicalization [`Scalar::from_bytes32`] applies to
+// signatures). Every function returns `None` on an undecodable point
+// instead of panicking.
+
+use std::sync::OnceLock;
+
+/// Negate a point: `-(x, y, z, t) = (-x, y, z, -t)`.
+fn point_neg(p: &EdwardsPoint) -> EdwardsPoint {
+    EdwardsPoint {
+        x: p.x.neg(),
+        y: p.y,
+        z: p.z,
+        t: p.t.neg(),
+    }
+}
+
+/// Decompress to extended coordinates (`t = x·y`).
+fn decompress_point(bytes: &[u8; 32]) -> Option<EdwardsPoint> {
+    let (x, y) = decompress(bytes)?;
+    Some(EdwardsPoint {
+        x,
+        y,
+        z: Fe::ONE,
+        t: x.mul(y),
+    })
+}
+
+/// Modular inverse of a scalar via Fermat's little theorem:
+/// `s^(L-2) mod L`. `None` when `s` is 0 mod `L`.
+fn scalar_inv(s: &Scalar) -> Option<Scalar> {
+    if s.0 == [0, 0, 0, 0] {
+        return None;
+    }
+    // L - 2 in limbs: L = 2^252 + 27742317777372353535851937790883648493.
+    let exp: [u64; 4] = [
+        0x5812_631a_5cf5_d3eb,
+        0x14de_f9de_a2f7_9cd6,
+        0,
+        0x1000_0000_0000_0000,
+    ];
+    let mut result = Scalar([1, 0, 0, 0]);
+    let mut base = *s;
+    for i in 0..4 {
+        let mut w = exp[i];
+        for _ in 0..64 {
+            if w & 1 == 1 {
+                result = result.mul(&base);
+            }
+            base = base.mul(&base);
+            w >>= 1;
+        }
+    }
+    Some(result)
+}
+
+/// Add two compressed points. `None` on undecodable input.
+pub fn elgamal_point_add(a: &[u8; 32], b: &[u8; 32]) -> Option<[u8; 32]> {
+    let pa = decompress_point(a)?;
+    let pb = decompress_point(b)?;
+    Some(compress(&pa.add(&pb)))
+}
+
+/// Subtract two compressed points (`a - b`). `None` on undecodable input.
+pub fn elgamal_point_sub(a: &[u8; 32], b: &[u8; 32]) -> Option<[u8; 32]> {
+    let pa = decompress_point(a)?;
+    let pb = decompress_point(b)?;
+    Some(compress(&pa.add(&point_neg(&pb))))
+}
+
+/// Multiply a compressed point by a little-endian 32-byte scalar
+/// (reduced mod `L`). `None` on an undecodable point.
+pub fn elgamal_scalar_mul(point: &[u8; 32], scalar_le: &[u8; 32]) -> Option<[u8; 32]> {
+    let p = decompress_point(point)?;
+    Some(compress(&scalar_mul(&p, &Scalar::from_bytes32(scalar_le))))
+}
+
+/// Multiply the base point `G` by a little-endian 32-byte scalar
+/// (reduced mod `L`). Infallible — `G` always decodes.
+pub fn elgamal_scalar_mul_base(scalar_le: &[u8; 32]) -> [u8; 32] {
+    compress(&scalar_mul(&base_point(), &Scalar::from_bytes32(scalar_le)))
+}
+
+/// Modular inverse of a little-endian 32-byte scalar mod `L`.
+/// `None` when the scalar is 0 mod `L`.
+pub fn elgamal_scalar_inverse(scalar_le: &[u8; 32]) -> Option<[u8; 32]> {
+    scalar_inv(&Scalar::from_bytes32(scalar_le)).map(|s| s.to_bytes())
+}
+
+/// The crate's second Pedersen generator `H`.
+///
+/// Derived by try-and-increment hashing into the curve
+/// (`SHA-512("escrow-state confidential-transfer H" || counter)` as a
+/// compressed-`y` candidate, first success, cofactor-cleared ×8), so
+/// the discrete log of `H` with respect to `G` is unknown to anyone —
+/// the Pedersen commitment `amount·G + opening·H` is binding in this
+/// model, exactly the property ElGamal decryption relies on. Cached
+/// after the first derivation.
+pub fn elgamal_generator_h() -> [u8; 32] {
+    static H: OnceLock<[u8; 32]> = OnceLock::new();
+    *H.get_or_init(|| {
+        let identity = compress(&EdwardsPoint::identity());
+        let mut counter = 0u64;
+        loop {
+            let mut input = Vec::with_capacity(64);
+            input.extend_from_slice(b"escrow-state confidential-transfer H");
+            input.extend_from_slice(&counter.to_le_bytes());
+            let digest = sha512(&input);
+            let mut candidate = [0u8; 32];
+            candidate.copy_from_slice(&digest[..32]);
+            if let Some(p) = decompress_point(&candidate) {
+                // Cofactor clearing lands in the prime-order subgroup.
+                let cleared = scalar_mul(&p, &Scalar([8, 0, 0, 0]));
+                let encoded = compress(&cleared);
+                if encoded != identity {
+                    return encoded;
+                }
+            }
+            counter += 1;
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Bounded-range discrete logarithm (AV-168).
+// ---------------------------------------------------------------------------
+//
+// ElGamal decryption recovers `M = amount·G` and must find `amount`.
+// This is a baby-step giant-step discrete log over `[0, 2^32)`:
+// write `amount = lo + hi·2^16` with `lo, hi < 2^16`, so
+// `M = lo·G + hi·(2^16·G)`. For each `a` in `[0, 2^16)`, compute
+// `P_a = M − a·G`; when `a = lo`, `P_a = hi·(2^16·G)`, which the
+// precomputed giant-step table maps back to `hi`.
+//
+// The tables are built once (the baby points as projective
+// `EdwardsPoint`s, the giant table batch-compressed). Each decrypt
+// computes all 65536 `P_a`, batch-compresses them with Montgomery's
+// trick (one field inversion for all points instead of one per
+// point), and hash-lookups each — fast enough for the keeper's
+// balance queries, with no per-decrypt exponentiation blowup.
+
+use std::collections::HashMap;
+
+/// Batch-compress projective points: Montgomery's trick inverts all
+/// `z` coordinates with a single field exponentiation instead of one
+/// per point. Used for the dlog tables (built once) and per-decrypt
+/// giant steps.
+fn batch_compress(points: &[EdwardsPoint]) -> Vec<[u8; 32]> {
+    let n = points.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Prefix products of the z coordinates.
+    let mut prefix = Vec::with_capacity(n);
+    let mut acc = Fe::ONE;
+    for p in points {
+        acc = acc.mul(p.z);
+        prefix.push(acc);
+    }
+    // One inversion for the whole batch.
+    let mut inv = prefix[n - 1].pow(P_MINUS_2);
+    let mut out = vec![[0u8; 32]; n];
+    for i in (0..n).rev() {
+        let prev = if i == 0 { Fe::ONE } else { prefix[i - 1] };
+        let zinv = inv.mul(prev);
+        let x = points[i].x.mul(zinv);
+        let y = points[i].y.mul(zinv);
+        let mut enc = y.to_bytes();
+        if x.is_odd() {
+            enc[31] |= 0x80;
+        }
+        out[i] = enc;
+        inv = inv.mul(points[i].z);
+    }
+    out
+}
+
+/// Baby-step giant-step tables for the `[0, 2^32)` discrete log base `G`.
+pub(crate) struct DlogTables {
+    /// `a·G` as projective points, for `a` in `[0, 2^16)`.
+    baby_points: Vec<EdwardsPoint>,
+    /// `compressed(k·2^16·G) → k`, for `k` in `[0, 2^16)`.
+    giant_table: HashMap<[u8; 32], u32>,
+}
+
+pub(crate) fn dlog_tables() -> &'static DlogTables {
+    static TABLES: OnceLock<DlogTables> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        const CHUNKS: u32 = 1 << 16;
+        let g = base_point();
+        // Baby points: a·G by iterated add (no inversions).
+        let mut baby_points = Vec::with_capacity(CHUNKS as usize);
+        let mut cur = EdwardsPoint::identity();
+        for _ in 0..CHUNKS {
+            baby_points.push(cur);
+            cur = cur.add(&g);
+        }
+        // Giant points: k·(2^16·G) by iterated add, then one batch
+        // compression for the whole table.
+        let step = scalar_mul(&g, &Scalar([CHUNKS as u64, 0, 0, 0]));
+        let mut giant_points = Vec::with_capacity(CHUNKS as usize);
+        let mut cur = EdwardsPoint::identity();
+        for _ in 0..CHUNKS {
+            giant_points.push(cur);
+            cur = cur.add(&step);
+        }
+        let giant_compressed = batch_compress(&giant_points);
+        let mut giant_table = HashMap::with_capacity(CHUNKS as usize);
+        for (k, enc) in giant_compressed.iter().enumerate() {
+            giant_table.insert(*enc, k as u32);
+        }
+        DlogTables { baby_points, giant_table }
+    })
+}
+
+/// Bounded-range discrete log: find `m` in `[0, 2^32)` with
+/// `m·G == point`. `None` when the point is not in range (or
+/// undecodable — but this takes an already-decompressed encoding;
+/// callers pass the output of the point arithmetic, which always
+/// encodes).
+pub(crate) fn dlog_base_g(point: &[u8; 32]) -> Option<u64> {
+    let tables = dlog_tables();
+    let m = decompress_point(point)?;
+    // P_a = M − a·G for every a; batch-compress once, then lookup.
+    let mut candidates = Vec::with_capacity(tables.baby_points.len());
+    for baby in &tables.baby_points {
+        candidates.push(m.add(&point_neg(baby)));
+    }
+    let compressed = batch_compress(&candidates);
+    for (a, enc) in compressed.iter().enumerate() {
+        if let Some(&hi) = tables.giant_table.get(enc) {
+            return Some(a as u64 | ((hi as u64) << 16));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod ed25519_tests {
     use super::*;
