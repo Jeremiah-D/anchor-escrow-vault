@@ -68,6 +68,14 @@ mod execution_bundle;
 // landing-rate / confirmation-latency observations as audit events.
 // Never falls back to the public mempool.
 mod bundle_relay;
+// AV-170: native SOL stake delegation for escrowed funds — the stake
+// leg sidecar (delegation state machine, epoch-tracked activation /
+// deactivation, principal + reward-split settlement). Pure logic,
+// zero dependencies.
+mod stake;
+pub use stake::{
+    StakeDelegation, StakeError, StakeSettlement, StakeState, STAKE_BPS_DENOMINATOR,
+};
 // AV-145: keeper multi-bundle merge submission — pack several AV-61
 // execution bundles into multisig/CLI submission sessions with
 // cross-bundle ALT dedup (batch.rs convention), CU budgeting across

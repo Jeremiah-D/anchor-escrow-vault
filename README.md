@@ -5753,6 +5753,39 @@ two u64 fields), `VAULT_SPACE_NO_QUORUM` from 5464 to 5480,
 from 42_330_720 to 42_442_080 lamports
 (`(128 + VAULT_SPACE) * 3480 * 2`).
 
+## Native SOL stake delegation (AV-170)
+
+A funded escrow locks SOL in the vault account where it sits idle. When
+the initializer opts in at fund time, the keeper delegates the locked
+SOL to a stake account bound to a chosen vote account, so the escrow
+earns staking rewards while the funds stay locked. The stake leg is
+modeled as a pure-logic sidecar (`StakeDelegation`) bound to the
+escrow — the escrow state machine is untouched (no new vault fields,
+no layout change), because the stake account lives outside the vault.
+
+**Lifecycle.** `delegate_at_fund` (Funded only; the opt-in key must
+equal the escrow's initializer) snapshots the escrow's full amount as
+the delegated principal and binds the `(stake_account, vote_account)`
+pair. The stake state machine runs `Delegated → Active →
+Deactivating → Deactivated` on the keeper's epoch observations: warmup
+completes at `activation_epoch = delegation_epoch + 1`, deactivation
+cools down until `deactivation_epoch = current_epoch + 1`; early
+observations are `NotYetActive` / `NotYetDeactivated`, and a
+never-activated stake cannot begin deactivation.
+
+**Settlement.** `settle(taker_payout, current_stake_balance)` computes
+the entitlement split for one keeper-authorized taker payout (the
+amount the escrow state machine already approved): principal always
+settles — a pending deactivation never blocks the principal leg;
+rewards settle only once `Deactivated` (while `Active` /
+`Deactivating` they are reported as pending and keep earning); the
+taker's reward share is `floor(rewards × reward_split_bps / 10_000)`
+with the dust remainder to the initializer. A balance observed below
+the remaining principal is an explicit `BalanceBelowPrincipal`
+failure — the module never fabricates lamports. After the transfers
+land, the keeper calls `record_principal_release` so the sidecar's
+books stay exact.
+
 ### Local-validator integration stubs
 
 `tests/local_validator.rs` under `programs/escrow-vault/` holds Anchor
