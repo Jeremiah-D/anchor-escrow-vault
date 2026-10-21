@@ -1243,12 +1243,12 @@ fn idl_errors_pin_enum() {
         let name = format!("{e:?}");
         assert!(seen.insert(name.clone()), "duplicate error variant {name}");
         assert!(
-            (100..225).contains(&e.code()),
+            (100..231).contains(&e.code()),
             "error code out of pinned range: {name} = {}",
             e.code()
         );
     }
-    assert_eq!(errors.len(), 125, "error variant count drift");
+    assert_eq!(errors.len(), 131, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
@@ -1400,6 +1400,18 @@ fn idl_errors_pin_enum() {
     assert_eq!(EscrowError::ProgramNotPaused.code(), 223);
     // AV-163: appended, never renumbered.
     assert_eq!(EscrowError::InvalidPauser.code(), 224);
+    // AV-164: appended, never renumbered.
+    assert_eq!(EscrowError::InvalidSponsorPolicy.code(), 225);
+    // AV-164: appended, never renumbered.
+    assert_eq!(EscrowError::SponsorNotAllowed.code(), 226);
+    // AV-164: appended, never renumbered.
+    assert_eq!(EscrowError::SponsorWindowInactive.code(), 227);
+    // AV-164: appended, never renumbered.
+    assert_eq!(EscrowError::SponsorAmountExceedsPerTxCap.code(), 228);
+    // AV-164: appended, never renumbered.
+    assert_eq!(EscrowError::SponsorCumulativeCapExceeded.code(), 229);
+    // AV-164: appended, never renumbered.
+    assert_eq!(EscrowError::SponsorBudgetExhausted.code(), 230);
 }
 
 #[test]

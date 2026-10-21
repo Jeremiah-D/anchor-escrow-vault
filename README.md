@@ -1535,6 +1535,12 @@ program error per variant):
 | `GovernanceDelayNotElapsed` | 218 | `execute_governance` (AV-158) on a live proposal whose delay window has not elapsed |
 | `GovernanceActionNotProposed` | 219 | `execute_governance` / `cancel_governance` (AV-158) with no live proposal, or a direct dual-signed config change on a delay-opted-in escrow |
 | `InvalidGovernanceDelay` | 220 | `with_governance_delay` (AV-158) with a zero window |
+| `InvalidSponsorPolicy` | 225 | `SponsorPolicy::new` (AV-164) with an empty or over-long allowlist, a zero sponsor key, a duplicate key, or an inverted window |
+| `SponsorNotAllowed` | 226 | `SponsorPolicy::authorize` (AV-164) for a sponsor not in the policy allowlist |
+| `SponsorWindowInactive` | 227 | `SponsorPolicy::authorize` (AV-164) while the policy's effective window is not active |
+| `SponsorAmountExceedsPerTxCap` | 228 | `SponsorPolicy::authorize` (AV-164) with an amount above the per-transaction lamport cap |
+| `SponsorCumulativeCapExceeded` | 229 | `SponsorPolicy::authorize` (AV-164) that would push the sponsor's booked cumulative spend over the cumulative cap |
+| `SponsorBudgetExhausted` | 230 | `SponsorBudget::deduct` (AV-164) with insufficient budget balance — nothing booked, nothing audited |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -5346,6 +5352,52 @@ Layout growth: the vault body grows from 5506 to 5515 bytes (+9:
 5024 to 5033, `VAULT_SPACE` from 5514 to 5523, and the close-time rent
 reclamation from 39_268_320 to 39_330_960 lamports
 (`(128 + VAULT_SPACE) * 3480 * 2`).
+
+## Tx fee-payer sponsorship (AV-164)
+
+`escrow-state/src/sponsor.rs` — the policy layer over the
+meta-transaction pattern. A release intent (AV-123) is signed by the
+initializer, but the fee payer is whoever submits the transaction; this
+module decides which fee payers an escrow trusts, how much fee spend
+each trusted sponsor may incur, and how the operator's own fee budget
+is spent. Orthogonal to the intent's relayer semantics: the intent
+authorizes *what* happens (a release of a fixed amount to a fixed
+destination); this module authorizes *who may pay the fee* and *how
+much*.
+
+- **The policy**: `SponsorPolicy::new(allowed, per_tx_cap,
+  cumulative_cap, window_start, window_end)` — an allowlist of at most
+  16 sponsor keys (zero keys and duplicates are rejected), a
+  per-transaction lamport cap, a per-sponsor cumulative cap, and an
+  effective window. `per_tx_cap == 0` / `cumulative_cap == 0` mean
+  *unlimited*; `window_start == window_end == 0` means always active.
+- **The gate**: `authorize(sponsor, amount, now)` checks in the
+  crate's check order — allowlisted (`SponsorNotAllowed`, code 226)
+  first, then window (`SponsorWindowInactive`, code 227), then per-tx
+  cap (`SponsorAmountExceedsPerTxCap`, code 228), then cumulative cap
+  (`SponsorCumulativeCapExceeded`, code 229). On success the amount is
+  booked against the sponsor's cumulative usage (always tracked, even
+  when the cap is unlimited, so `used_by` stays an honest spend
+  meter); failed calls book nothing. Bad configuration fails at
+  construction (`InvalidSponsorPolicy`, code 225).
+- **The budget**: `SponsorBudget` is the keeper's fee-budget
+  accounting. `fund` tops it up; `deduct(amount, sponsor, escrow,
+  at)` spends it — a short deduct fails with `SponsorBudgetExhausted`
+  (code 230) and changes nothing. Every successful deduct appends a
+  `SponsorAuditEntry` (sponsor key + lamports + escrow + timestamp) to
+  a bounded 64-entry ring, oldest evicts first — the sponsorship audit
+  trail.
+
+Honest scope: policy enforcement is off-chain — the fee payer is a
+transaction-level property the program cannot compel; the keeper's bot
+enforces the policy before submitting. The budget holds no lamports;
+it is an accounting abstraction over the keeper's fee wallet, and the
+audit records the *intent* to spend for reconciliation against actual
+wallet balances. Cumulative usage is per-policy-instance (per escrow)
+and does not persist across restarts. The Anchor skeleton maps the six
+new error codes (225–230) one-per-variant; adding errors is
+non-breaking under the AV-152 semver gate, so the baseline is
+untouched.
 
 ## Funding amount bounds (AV-134)
 

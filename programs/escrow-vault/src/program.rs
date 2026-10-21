@@ -10952,6 +10952,25 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidPauser => {
             error!(ErrorCode::InvalidPauser)
         }
+        // AV-164: one program error per new EscrowError variant.
+        escrow_state::EscrowError::InvalidSponsorPolicy => {
+            error!(ErrorCode::InvalidSponsorPolicy)
+        }
+        escrow_state::EscrowError::SponsorNotAllowed => {
+            error!(ErrorCode::SponsorNotAllowed)
+        }
+        escrow_state::EscrowError::SponsorWindowInactive => {
+            error!(ErrorCode::SponsorWindowInactive)
+        }
+        escrow_state::EscrowError::SponsorAmountExceedsPerTxCap => {
+            error!(ErrorCode::SponsorAmountExceedsPerTxCap)
+        }
+        escrow_state::EscrowError::SponsorCumulativeCapExceeded => {
+            error!(ErrorCode::SponsorCumulativeCapExceeded)
+        }
+        escrow_state::EscrowError::SponsorBudgetExhausted => {
+            error!(ErrorCode::SponsorBudgetExhausted)
+        }
     }
 }
 
@@ -11261,4 +11280,17 @@ pub enum ErrorCode {
     ProgramNotPaused,
     #[msg("Invalid pauser (AV-163): pause_program / unpause_program by a non-pauser key, or a zero pauser key (InvalidPauser, code 224)")]
     InvalidPauser,
+    // AV-164: the fee-sponsorship policy/budget errors (codes 225-230).
+    #[msg("Invalid sponsor policy (AV-164): empty or over-long sponsor allowlist, zero sponsor key, duplicate key, or inverted effective window (InvalidSponsorPolicy, code 225)")]
+    InvalidSponsorPolicy,
+    #[msg("Sponsor not allowlisted (AV-164): the fee payer is not in the escrow's sponsor policy allowlist (SponsorNotAllowed, code 226)")]
+    SponsorNotAllowed,
+    #[msg("Sponsor window inactive (AV-164): the sponsor policy's effective window is not active at the submit time (SponsorWindowInactive, code 227)")]
+    SponsorWindowInactive,
+    #[msg("Sponsor per-tx cap exceeded (AV-164): the sponsored fee exceeds the policy's per-transaction lamport cap (SponsorAmountExceedsPerTxCap, code 228)")]
+    SponsorAmountExceedsPerTxCap,
+    #[msg("Sponsor cumulative cap exceeded (AV-164): the sponsored fee would push the sponsor's booked cumulative spend over the policy cap (SponsorCumulativeCapExceeded, code 229)")]
+    SponsorCumulativeCapExceeded,
+    #[msg("Sponsor budget exhausted (AV-164): the keeper's fee budget is short of the requested deduct — nothing booked, nothing audited (SponsorBudgetExhausted, code 230)")]
+    SponsorBudgetExhausted,
 }

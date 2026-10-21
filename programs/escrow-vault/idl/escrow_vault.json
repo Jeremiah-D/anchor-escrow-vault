@@ -1809,7 +1809,13 @@
     {"code": 221, "name": "ProgramPaused"},
     {"code": 222, "name": "ProgramAlreadyPaused"},
     {"code": 223, "name": "ProgramNotPaused"},
-    {"code": 224, "name": "InvalidPauser"}
+    {"code": 224, "name": "InvalidPauser"},
+    {"code": 225, "name": "InvalidSponsorPolicy"},
+    {"code": 226, "name": "SponsorNotAllowed"},
+    {"code": 227, "name": "SponsorWindowInactive"},
+    {"code": 228, "name": "SponsorAmountExceedsPerTxCap"},
+    {"code": 229, "name": "SponsorCumulativeCapExceeded"},
+    {"code": 230, "name": "SponsorBudgetExhausted"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

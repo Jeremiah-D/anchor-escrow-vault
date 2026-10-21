@@ -12,6 +12,12 @@ mod snapshot;
 // kill switch (orthogonal to the AV-46 per-escrow pause), with the
 // halt guard and the structured pause/resume audit ring.
 mod circuit_breaker;
+// AV-164: tx fee-payer sponsorship — per-escrow sponsor policy (allowlist
+// + per-tx / cumulative lamport caps + effective window), the keeper's
+// fee budget (fund / deduct / exhausted-refusal), and the bounded
+// structured sponsorship audit (sponsor key + amount + escrow). Purely
+// additive.
+mod sponsor;
 // AV-74: deterministic indexer-event CSV export (RFC 4180, zero
 // dependencies) — `events_to_csv` / `csv_to_events`, the
 // data-analysis / audit-ingest complement to the AV-26 snapshot JSON.
@@ -338,6 +344,13 @@ pub use events::{
 // structured pause/resume audit ring. Purely additive.
 pub use circuit_breaker::{
     CircuitAuditEntry, CircuitBreakerEventKind, ProgramCircuitBreaker, MAX_CIRCUIT_AUDIT_ENTRIES,
+};
+
+// AV-164: tx fee-payer sponsorship — the per-escrow sponsor policy, the
+// keeper's fee budget, and the bounded sponsorship audit ring. Purely
+// additive.
+pub use sponsor::{
+    SponsorAuditEntry, SponsorBudget, SponsorPolicy, MAX_SPONSOR_AUDIT_ENTRIES, MAX_SPONSORS,
 };
 
 // AV-20: off-chain keeper report — scan a batch of escrows for executable
@@ -3030,6 +3043,36 @@ pub enum EscrowError {
     /// program-level role (not any escrow's initializer or taker).
     /// Never renumbered (see [`EscrowError::code`]).
     InvalidPauser,
+    /// AV-164: [`SponsorPolicy::new`](crate::SponsorPolicy::new)
+    /// refused — the allowlist is empty or over
+    /// [`MAX_SPONSORS`](crate::MAX_SPONSORS), a sponsor key is zero, a
+    /// sponsor key is duplicated, or the window has `window_start >
+    /// window_end` with an end bound set. Never renumbered (see
+    /// [`EscrowError::code`]).
+    InvalidSponsorPolicy,
+    /// AV-164: [`SponsorPolicy::authorize`](crate::SponsorPolicy::authorize)
+    /// refused — the sponsor is not in the policy's allowlist. Never
+    /// renumbered (see [`EscrowError::code`]).
+    SponsorNotAllowed,
+    /// AV-164: [`SponsorPolicy::authorize`](crate::SponsorPolicy::authorize)
+    /// refused — the policy's effective window is not active at `now`.
+    /// Never renumbered (see [`EscrowError::code`]).
+    SponsorWindowInactive,
+    /// AV-164: [`SponsorPolicy::authorize`](crate::SponsorPolicy::authorize)
+    /// refused — the amount exceeds the policy's per-transaction
+    /// lamport cap. Never renumbered (see [`EscrowError::code`]).
+    SponsorAmountExceedsPerTxCap,
+    /// AV-164: [`SponsorPolicy::authorize`](crate::SponsorPolicy::authorize)
+    /// refused — the amount would push the sponsor's booked cumulative
+    /// spend over the policy's cumulative lamport cap (or the booking
+    /// would overflow `u64`). Never renumbered (see
+    /// [`EscrowError::code`]).
+    SponsorCumulativeCapExceeded,
+    /// AV-164: [`SponsorBudget::deduct`](crate::SponsorBudget::deduct)
+    /// refused — the keeper's fee budget balance is short of the
+    /// requested amount. Nothing is booked and nothing is audited.
+    /// Never renumbered (see [`EscrowError::code`]).
+    SponsorBudgetExhausted,
 }
 
 impl EscrowError {
@@ -3215,6 +3258,18 @@ impl EscrowError {
             EscrowError::ProgramNotPaused => 223,
             // AV-163: appended, never renumbered.
             EscrowError::InvalidPauser => 224,
+            // AV-164: appended, never renumbered.
+            EscrowError::InvalidSponsorPolicy => 225,
+            // AV-164: appended, never renumbered.
+            EscrowError::SponsorNotAllowed => 226,
+            // AV-164: appended, never renumbered.
+            EscrowError::SponsorWindowInactive => 227,
+            // AV-164: appended, never renumbered.
+            EscrowError::SponsorAmountExceedsPerTxCap => 228,
+            // AV-164: appended, never renumbered.
+            EscrowError::SponsorCumulativeCapExceeded => 229,
+            // AV-164: appended, never renumbered.
+            EscrowError::SponsorBudgetExhausted => 230,
         }
     }
 
@@ -3382,6 +3437,18 @@ impl EscrowError {
             EscrowError::ProgramNotPaused,
             // AV-163: appended, never renumbered.
             EscrowError::InvalidPauser,
+            // AV-164: appended, never renumbered.
+            EscrowError::InvalidSponsorPolicy,
+            // AV-164: appended, never renumbered.
+            EscrowError::SponsorNotAllowed,
+            // AV-164: appended, never renumbered.
+            EscrowError::SponsorWindowInactive,
+            // AV-164: appended, never renumbered.
+            EscrowError::SponsorAmountExceedsPerTxCap,
+            // AV-164: appended, never renumbered.
+            EscrowError::SponsorCumulativeCapExceeded,
+            // AV-164: appended, never renumbered.
+            EscrowError::SponsorBudgetExhausted,
         ]
     }
 }
@@ -30675,6 +30742,42 @@ mod error_code_tests {
             224,
             "ProgramCircuitBreaker::pause / unpause by a non-pauser key, or construction with the zero key (AV-163)",
         ),
+        // AV-164: appended, never renumbered.
+        (
+            EscrowError::InvalidSponsorPolicy,
+            225,
+            "SponsorPolicy::new with an empty or over-long allowlist, a zero sponsor key, a duplicate key, or an inverted window (AV-164)",
+        ),
+        // AV-164: appended, never renumbered.
+        (
+            EscrowError::SponsorNotAllowed,
+            226,
+            "SponsorPolicy::authorize for a sponsor not in the policy allowlist (AV-164)",
+        ),
+        // AV-164: appended, never renumbered.
+        (
+            EscrowError::SponsorWindowInactive,
+            227,
+            "SponsorPolicy::authorize while the policy's effective window is not active (AV-164)",
+        ),
+        // AV-164: appended, never renumbered.
+        (
+            EscrowError::SponsorAmountExceedsPerTxCap,
+            228,
+            "SponsorPolicy::authorize with an amount above the per-transaction lamport cap (AV-164)",
+        ),
+        // AV-164: appended, never renumbered.
+        (
+            EscrowError::SponsorCumulativeCapExceeded,
+            229,
+            "SponsorPolicy::authorize that would push the sponsor's booked cumulative spend over the cumulative cap (AV-164)",
+        ),
+        // AV-164: appended, never renumbered.
+        (
+            EscrowError::SponsorBudgetExhausted,
+            230,
+            "SponsorBudget::deduct with insufficient budget balance — nothing booked, nothing audited (AV-164)",
+        ),
     ];
 
     #[test]
@@ -56042,7 +56145,20 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::ProgramNotPaused));
         assert_eq!(EscrowError::InvalidPauser.code(), 224);
         assert!(EscrowError::all().contains(&EscrowError::InvalidPauser));
-        assert_eq!(EscrowError::all().len(), 125);
+        // AV-164: the fee-sponsorship policy/budget errors.
+        assert_eq!(EscrowError::InvalidSponsorPolicy.code(), 225);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidSponsorPolicy));
+        assert_eq!(EscrowError::SponsorNotAllowed.code(), 226);
+        assert!(EscrowError::all().contains(&EscrowError::SponsorNotAllowed));
+        assert_eq!(EscrowError::SponsorWindowInactive.code(), 227);
+        assert!(EscrowError::all().contains(&EscrowError::SponsorWindowInactive));
+        assert_eq!(EscrowError::SponsorAmountExceedsPerTxCap.code(), 228);
+        assert!(EscrowError::all().contains(&EscrowError::SponsorAmountExceedsPerTxCap));
+        assert_eq!(EscrowError::SponsorCumulativeCapExceeded.code(), 229);
+        assert!(EscrowError::all().contains(&EscrowError::SponsorCumulativeCapExceeded));
+        assert_eq!(EscrowError::SponsorBudgetExhausted.code(), 230);
+        assert!(EscrowError::all().contains(&EscrowError::SponsorBudgetExhausted));
+        assert_eq!(EscrowError::all().len(), 131);
     }
 
     #[test]
