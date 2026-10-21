@@ -83,6 +83,12 @@ pub use claim_sweep::{
 // multisig/CLI can sign and submit. Off-chain and unsigned by design:
 // the relay never holds keys. Purely additive.
 mod tx_message;
+// AV-167: durable-nonce transactions for keeper execution bundles —
+// nonce-account parsing, the AdvanceNonceAccount prefix instruction,
+// and legacy/v0 message assembly whose blockhash slot carries the nonce
+// value, so a bundle signed offline stays submittable until the nonce
+// advances. Pure logic, zero dependencies.
+mod durable_nonce;
 // AV-88: compute-unit budget estimation for keeper execution plans —
 // heuristic per-instruction CU costs (single source of truth table),
 // batch aggregation, and over-limit warnings against the per-transaction
@@ -540,17 +546,31 @@ pub use execution_bundle::{
 // base64 for a multisig/CLI to sign and submit. Off-chain and unsigned
 // by design; purely additive.
 pub use tx_message::{
-    bundle_action_message_v0_base64, compile_action_message_v0, compile_message, decode_base64,
-    decode_message, decode_v0_message, encode_base64, encode_message, encode_v0_message,
-    ensure_fits_packet_limit, instruction_for_action, signable_bundle_action_message_base64,
-    signable_message_base64, signable_message_v0_base64, wire_size_legacy, wire_size_v0,
-    AddressTableLookup, CompiledInstruction, MessageHeader, ProgramInstruction, TransactionMessage,
-    TxMessageError, V0TransactionMessage, MAX_TRANSACTION_PACKET_BYTES,
+    bundle_action_message_v0_base64, compile_action_message_v0,
+    compile_action_message_v0_with_prefix, compile_instructions, compile_message,
+    decode_base64, decode_message, decode_v0_message, encode_base64, encode_message,
+    encode_v0_message, ensure_fits_packet_limit, instruction_for_action,
+    signable_bundle_action_message_base64, signable_message_base64, signable_message_v0_base64,
+    wire_size_legacy, wire_size_v0, AddressTableLookup, CompiledInstruction, MessageHeader,
+    ProgramInstruction, TransactionMessage, TxMessageError, V0TransactionMessage,
+    MAX_TRANSACTION_PACKET_BYTES,
     // AV-89: compute-budget instruction data assembly — the passthrough
     // for the AV-88 CU estimate (limit) and the AV-89 oracle
     // recommendation (price) into a submittable transaction.
     compute_budget_set_compute_unit_limit, compute_budget_set_compute_unit_price,
     COMPUTE_BUDGET_IX_SET_COMPUTE_UNIT_LIMIT, COMPUTE_BUDGET_IX_SET_COMPUTE_UNIT_PRICE,
+};
+
+// AV-167: durable-nonce transaction support — nonce-account parsing,
+// the AdvanceNonceAccount prefix instruction, legacy/v0 message
+// assembly with the nonce value in the blockhash slot, and the
+// submit-time freshness session for offline-signed bundles.
+pub use durable_nonce::{
+    advance_nonce_instruction, compile_action_message_v0_with_nonce,
+    compile_message_with_nonce, parse_nonce_account, recent_blockhashes_sysvar_id,
+    signable_action_message_v0_with_nonce_base64, signable_action_message_with_nonce_base64,
+    DurableNonceError, DurableNonceSession, NonceAccount, ADVANCE_NONCE_IX,
+    NONCE_ACCOUNT_LEN, NONCE_STATE_INITIALIZED, NONCE_VERSION_CURRENT, NONCE_VERSION_LEGACY,
 };
 
 // AV-88: compute-unit budget estimation — the single-source cost model

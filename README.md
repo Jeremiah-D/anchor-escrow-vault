@@ -3720,6 +3720,37 @@ base64 for a multisig or CLI to sign and submit.
   bytes against a golden vector, base64 against RFC 4648 vectors, and
   bundle-JSON ↔ message agreement end to end.
 
+### Durable-nonce transactions (AV-167)
+
+`escrow-state/src/durable_nonce.rs` frees keeper bundles from the
+~150-slot recent-blockhash expiry: a **durable nonce** account's stored
+blockhash plays the blockhash role, so a bundle signed offline now
+stays submittable until the nonce account is advanced.
+
+- **Nonce-account parsing**: `parse_nonce_account(address, data)`
+  decodes the 80-byte layout (`u32` version \|\| `u32` state \|\|
+  authority \|\| stored blockhash \|\| `u64` lamports-per-signature);
+  uninitialized accounts and unknown version/state discriminants fail
+  loud (`UninitializedNonce` / `InvalidVersion`).
+- **Advance instruction**: `advance_nonce_instruction` builds the
+  System Program `AdvanceNonceAccount` (index `4`, 4-byte data) with
+  the nonce account (writable), the recent-blockhashes sysvar, and the
+  nonce authority (signer) — spending someone else's nonce is refused
+  at build time (`AuthorityMismatch`).
+- **Message assembly**: `compile_message_with_nonce` (legacy) and
+  `compile_action_message_v0_with_nonce` (ALT v0, AV-87) put the
+  advance instruction first and the nonce value in the blockhash slot;
+  `signable_action_message_with_nonce_base64` /
+  `signable_action_message_v0_with_nonce_base64` emit the
+  offline-signing artifact. The nonce authority is a signer of the
+  whole transaction; prefix accounts never resolve through lookup
+  tables.
+- **Submit-time freshness**: `DurableNonceSession::check_fresh`
+  re-parses the account before submission and refuses a moved nonce
+  (`NonceChanged`) or a changed authority (`AuthorityMismatch`) —
+  submitting against an advanced nonce would burn the signature
+  round-trip on a blockhash the runtime rejects.
+
 ## Priority-fee oracle (AV-89)
 
 `escrow-state/src/priority_fee.rs` closes the cost loop the AV-88 CU

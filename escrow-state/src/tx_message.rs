@@ -312,8 +312,14 @@ pub fn compute_budget_set_compute_unit_price(
 /// non-signers; the program id trails as a readonly non-signer. The
 /// header counts are derived from that ordering, so the message is
 /// well-formed by construction.
-pub fn compile_message(
-    ix: &ProgramInstruction,
+/// Compile one or more program instructions into a legacy transaction
+/// message, in order: account keys are interned across all
+/// instructions (flags OR-merged on duplicates) and laid out in the
+/// canonical class order, stable within each class — deterministic for
+/// a given instruction list. AV-167 generalizes the single-instruction
+/// path so a durable-nonce `AdvanceNonceAccount` can ride first.
+pub fn compile_instructions(
+    ixs: &[ProgramInstruction],
     recent_blockhash: Pubkey,
 ) -> TransactionMessage {
     // Intern keys, merging flags on duplicates.
@@ -328,11 +334,15 @@ pub fn compile_message(
             uniq.len() - 1
         }
     };
-    let mut meta_idx = Vec::with_capacity(ix.accounts.len());
-    for m in &ix.accounts {
-        meta_idx.push(intern(m.pubkey, m.is_signer, m.is_writable));
+    let mut compiled: Vec<(Vec<usize>, usize, Vec<u8>)> = Vec::with_capacity(ixs.len());
+    for ix in ixs {
+        let mut meta_idx = Vec::with_capacity(ix.accounts.len());
+        for m in &ix.accounts {
+            meta_idx.push(intern(m.pubkey, m.is_signer, m.is_writable));
+        }
+        let program_idx = intern(ix.program_id, false, false);
+        compiled.push((meta_idx, program_idx, ix.data.clone()));
     }
-    let program_idx = intern(ix.program_id, false, false);
 
     // Canonical order, stable within each class.
     let mut order: Vec<usize> = (0..uniq.len()).collect();
@@ -346,7 +356,7 @@ pub fn compile_message(
         }
     });
     // `sort_by_key` is stable, so first-seen order survives inside each
-    // class — deterministic for a given instruction.
+    // class — deterministic for a given instruction list.
     let mut new_index = vec![0usize; uniq.len()];
     for (new, &old) in order.iter().enumerate() {
         new_index[old] = new;
@@ -363,6 +373,15 @@ pub fn compile_message(
         .filter(|(_, s, w)| !*s && !*w)
         .count() as u8;
 
+    let instructions = compiled
+        .into_iter()
+        .map(|(meta_idx, program_idx, data)| CompiledInstruction {
+            program_id_index: new_index[program_idx] as u8,
+            accounts: meta_idx.iter().map(|&i| new_index[i] as u8).collect(),
+            data,
+        })
+        .collect();
+
     TransactionMessage {
         header: MessageHeader {
             num_required_signatures,
@@ -371,12 +390,15 @@ pub fn compile_message(
         },
         account_keys,
         recent_blockhash,
-        instructions: vec![CompiledInstruction {
-            program_id_index: new_index[program_idx] as u8,
-            accounts: meta_idx.iter().map(|&i| new_index[i] as u8).collect(),
-            data: ix.data.clone(),
-        }],
+        instructions,
     }
+}
+
+pub fn compile_message(
+    ix: &ProgramInstruction,
+    recent_blockhash: Pubkey,
+) -> TransactionMessage {
+    compile_instructions(std::slice::from_ref(ix), recent_blockhash)
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +597,13 @@ impl V0TransactionMessage {
 /// accounts against the caller's snapshot of the on-chain lookup table
 /// at `address_table_key`.
 ///
+/// Caller-supplied `prefix` instructions compile first, in order
+/// (AV-167: the durable-nonce `AdvanceNonceAccount` rides here). Prefix
+/// accounts intern as static slots ahead of the action's accounts —
+/// first-seen order is preserved inside each canonical class — and
+/// never resolve through the lookup table (system-program instructions
+/// have no ALT indexes).
+///
 /// Resolution rules (static — no chain access):
 /// - Signers never resolve through a lookup table (the runtime forbids
 ///   signer lookups); they stay static even if an `alt_index` was
@@ -587,8 +616,9 @@ impl V0TransactionMessage {
 ///
 /// The legacy path is untouched: same action, no table snapshot, still
 /// builds the identical legacy message as before.
-pub fn compile_action_message_v0(
+pub fn compile_action_message_v0_with_prefix(
     program_id: Pubkey,
+    prefix: &[ProgramInstruction],
     action: &BundledAction,
     recent_blockhash: Pubkey,
     address_table_key: [u8; 32],
@@ -609,6 +639,19 @@ pub fn compile_action_message_v0(
             uniq.len() - 1
         }
     };
+
+    // Prefix instructions first: static slots, in prefix order, no ALT
+    // resolution — the action's accounts follow.
+    let mut prefix_compiled: Vec<(Vec<usize>, usize, Vec<u8>)> =
+        Vec::with_capacity(prefix.len());
+    for pix in prefix {
+        let mut slots = Vec::with_capacity(pix.accounts.len());
+        for m in &pix.accounts {
+            slots.push(intern(m.pubkey, m.is_signer, m.is_writable));
+        }
+        let program_slot = intern(pix.program_id, false, false);
+        prefix_compiled.push((slots, program_slot, pix.data.clone()));
+    }
 
     // Per account, in program-declared order: a static intern slot, or a
     // resolved table index plus its writability.
@@ -699,6 +742,23 @@ pub fn compile_action_message_v0(
         })
         .collect();
 
+    // Prefix instructions first, then the action — the message's
+    // instruction order is the submission order.
+    let mut instructions: Vec<CompiledInstruction> =
+        Vec::with_capacity(prefix_compiled.len() + 1);
+    for (slots, program_slot, data) in prefix_compiled {
+        instructions.push(CompiledInstruction {
+            program_id_index: new_index[program_slot] as u8,
+            accounts: slots.iter().map(|&s| new_index[s] as u8).collect(),
+            data,
+        });
+    }
+    instructions.push(CompiledInstruction {
+        program_id_index: new_index[program_idx] as u8,
+        accounts,
+        data: ix.data.clone(),
+    });
+
     Ok(V0TransactionMessage {
         header: MessageHeader {
             num_required_signatures,
@@ -707,17 +767,32 @@ pub fn compile_action_message_v0(
         },
         static_account_keys,
         recent_blockhash,
-        instructions: vec![CompiledInstruction {
-            program_id_index: new_index[program_idx] as u8,
-            accounts,
-            data: ix.data.clone(),
-        }],
+        instructions,
         address_table_lookups: vec![AddressTableLookup {
             address_table_key,
             writable_indexes: writable_loaded,
             readonly_indexes: readonly_loaded,
         }],
     })
+}
+
+/// Compile a bundled action into a v0 message with no prefix
+/// instructions — the pre-AV-167 behavior, byte-identical.
+pub fn compile_action_message_v0(
+    program_id: Pubkey,
+    action: &BundledAction,
+    recent_blockhash: Pubkey,
+    address_table_key: [u8; 32],
+    address_table: &[[u8; 32]],
+) -> Result<V0TransactionMessage, TxMessageError> {
+    compile_action_message_v0_with_prefix(
+        program_id,
+        &[],
+        action,
+        recent_blockhash,
+        address_table_key,
+        address_table,
+    )
 }
 
 /// Serialize a v0 message to its canonical wire bytes: the `0x80`
