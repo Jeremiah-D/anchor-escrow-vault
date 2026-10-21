@@ -5786,6 +5786,29 @@ failure — the module never fabricates lamports. After the transfers
 land, the keeper calls `record_principal_release` so the sidecar's
 books stay exact.
 
+## RPC commitment levels for off-chain reads (AV-171)
+
+Every keeper RPC read carries a commitment level — how final the
+observed data is — and treating a `processed` observation as settled
+truth is a dirty read. `CommitmentLevel` models the Solana RPC
+vocabulary (`Processed < Confirmed < Finalized`), and
+`required_commitment` tiers operations by risk: the keeper lifecycle
+scan and oracle price reads require `Confirmed` (monitoring-class:
+lower latency, the next tick's re-scan repairs an orphaned
+observation), while the pre-settlement check and bundle-landing
+confirmation require `Finalized`.
+
+`read_with_commitment` performs the injectable read until the
+observed commitment meets the requirement or the attempt budget runs
+out. The iron rule is **no silent downgrade**: a read that never
+reaches the required level is an explicit `CommitmentNotMet` — the
+value is never returned at a lower commitment. Transport failures
+surface as `ReadFailed`, never disguised as commitment misses. Every
+call, success or failure, yields a `CommitmentAudit` event
+(`commitment_read` JSON carrying the operation, the required and
+best-observed levels, and the attempt count) for the keeper's audit
+sink.
+
 ### Local-validator integration stubs
 
 `tests/local_validator.rs` under `programs/escrow-vault/` holds Anchor

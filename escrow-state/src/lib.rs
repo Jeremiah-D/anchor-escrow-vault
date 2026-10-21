@@ -76,6 +76,15 @@ mod stake;
 pub use stake::{
     StakeDelegation, StakeError, StakeSettlement, StakeState, STAKE_BPS_DENOMINATOR,
 };
+// AV-171: RPC commitment levels for off-chain reads — the
+// Processed/Confirmed/Finalized vocabulary, the risk-tiered read
+// table, the wait/retry gate with no silent downgrade, and
+// commitment-carrying audit events. Pure logic, zero dependencies.
+mod rpc_commitment;
+pub use rpc_commitment::{
+    check_commitment, read_with_commitment, required_commitment, CommitmentAudit, CommitmentError,
+    CommitmentLevel, CommitmentMismatch, CommittedRead, ReadOperation,
+};
 // AV-145: keeper multi-bundle merge submission — pack several AV-61
 // execution bundles into multisig/CLI submission sessions with
 // cross-bundle ALT dedup (batch.rs convention), CU budgeting across
