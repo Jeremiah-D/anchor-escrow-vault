@@ -30,6 +30,18 @@
 //! these constructors in its CPI calls; the IDL mapping tests pin the
 //! correspondence, so the on-chain code cannot drift from this tested
 //! byte layout.
+//!
+//! AV-166 adds the Token-2022 mint path: [`token_transfer_checked`]
+//! builds the `TransferChecked` instruction (index 12, shared by both
+//! token programs) for Token-2022 mints, [`token_program_kind`]
+//! auto-dispatches a program id to its [`TokenProgram`] kind, and
+//! [`MintDescriptor`] carries the extension awareness — the
+//! transfer-fee schedule ([`TransferFeeSchedule::net_amount`] computes
+//! the actual-to-arrive net under withheld fees), the mint decimals,
+//! and the metadata extension as a read-only view ([`TokenMetadata`]).
+//! Settlement plans take an optional `token_program` on their address
+//! structs: `None` keeps the legacy SPL `Transfer` behavior
+//! byte-identical; `Some` must name a known token program.
 
 use std::sync::OnceLock;
 
@@ -57,17 +69,43 @@ pub struct TransferInstruction {
 
 impl TransferInstruction {
     /// Amount carried by this instruction, decoded from its data bytes.
-    /// System transfers encode a u64 at bytes 4..12; SPL token transfers
-    /// encode a u64 at bytes 1..9.
+    /// System transfers encode a u64 at bytes 4..12; token-program
+    /// transfers encode a u64 at bytes 1..9 — for both the plain
+    /// `Transfer` (index 3) and `TransferChecked` (index 12, AV-166),
+    /// on either the SPL Token program or Token-2022. An unknown
+    /// program or instruction index decodes to `None`.
     pub fn amount(&self) -> Option<u64> {
         let bytes: [u8; 8] = if self.program_id == system_program_id() {
             self.data.get(4..12)?.try_into().ok()?
-        } else if self.program_id == spl_token_program_id() {
-            self.data.get(1..9)?.try_into().ok()?
+        } else if self.program_id == spl_token_program_id()
+            || self.program_id == token_2022_program_id()
+        {
+            // Both token transfer layouts carry the u64 amount at
+            // bytes 1..9; anything else is not a transfer this module
+            // built.
+            match self.data.first() {
+                Some(3) | Some(&TRANSFER_CHECKED_IX) => {
+                    self.data.get(1..9)?.try_into().ok()?
+                }
+                _ => return None,
+            }
         } else {
             return None;
         };
         Some(u64::from_le_bytes(bytes))
+    }
+
+    /// Decimals asserted by a `TransferChecked` instruction (index 12 on
+    /// either token program, AV-166); `None` for anything else.
+    pub fn transfer_checked_decimals(&self) -> Option<u8> {
+        if (self.program_id == spl_token_program_id()
+            || self.program_id == token_2022_program_id())
+            && self.data.first() == Some(&TRANSFER_CHECKED_IX)
+        {
+            self.data.get(9).copied()
+        } else {
+            None
+        }
     }
 }
 
@@ -115,6 +153,23 @@ pub enum CpiError {
     /// [`super::EscrowError::SlippageExceeded`]: the plan gate rejects
     /// before execution, the state machine rejects after it.
     SlippageExceeded,
+    /// AV-166: the named token program is neither the SPL Token program
+    /// nor Token-2022 — the CPI layer pins layouts for exactly those
+    /// two, so an instruction for anything else is never built. Also
+    /// raised when a token program is named on the native-SOL path
+    /// (there is no token program there).
+    UnsupportedTokenProgram,
+    /// AV-166: decimals out of range — above the AV-28 ceiling (18) on
+    /// a mint binding, or above 9 on a `TransferChecked` (on-chain mints
+    /// carry at most 9 decimals).
+    InvalidDecimals,
+    /// AV-166: a transfer-fee schedule that cannot exist on-chain —
+    /// `basis_points > 10_000` (more than 100%).
+    InvalidTransferFee,
+    /// AV-166: a Token-2022 extension declared on the legacy SPL Token
+    /// program — transfer fees and the metadata extension are
+    /// Token-2022 concepts and meaningless there.
+    IncompatibleTokenExtension,
 }
 
 fn require_nonzero(key: &Pubkey) -> Result<(), CpiError> {
@@ -191,6 +246,344 @@ pub fn spl_token_transfer(
     })
 }
 
+// ---------------------------------------------------------------------------
+// AV-166: Token-2022 `TransferChecked` + extension awareness.
+// ---------------------------------------------------------------------------
+
+/// The Token-2022 program
+/// (`TokenzQdBNbLqP5VEhdk8jV5pPdibZ5gLL8X26sFEY`), decoded with the same
+/// base58 decoder as the SPL Token program id — one decoder, one tested
+/// code path.
+pub fn token_2022_program_id() -> Pubkey {
+    static TOKEN_2022_PROGRAM: OnceLock<Pubkey> = OnceLock::new();
+    *TOKEN_2022_PROGRAM.get_or_init(|| {
+        parse_mint_address("TokenzQdBNbLqP5VEhdk8jV5pPdibZ5gLL8X26sFEY")
+            .expect("hardcoded Token-2022 program id must decode")
+    })
+}
+
+/// Which token program owns a mint: the legacy SPL Token program or
+/// Token-2022. Native SOL is not a token program — there is no mint to
+/// own — so the system program id (or any other unknown program id)
+/// does not map to a kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenProgram {
+    /// Legacy SPL Token
+    /// (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`).
+    SplToken,
+    /// Token-2022 (`TokenzQdBNbLqP5VEhdk8jV5pPdibZ5gLL8X26sFEY`).
+    Token2022,
+}
+
+/// Auto-dispatch a token program id to its [`TokenProgram`] kind — the
+/// AV-166 routing rule: the plan's `token_program` (or a keeper's mint
+/// binding) names the program, and this decides which transfer
+/// instruction the CPI layer builds. Anything that is not one of the
+/// two known token programs fails with
+/// [`CpiError::UnsupportedTokenProgram`] instead of building an
+/// instruction for a program whose layout this module does not pin.
+pub fn token_program_kind(program_id: Pubkey) -> Result<TokenProgram, CpiError> {
+    if program_id == spl_token_program_id() {
+        Ok(TokenProgram::SplToken)
+    } else if program_id == token_2022_program_id() {
+        Ok(TokenProgram::Token2022)
+    } else {
+        Err(CpiError::UnsupportedTokenProgram)
+    }
+}
+
+/// SPL Token / Token-2022 `TransferChecked` instruction index: `12`.
+/// Both programs define the checked transfer at the same index with
+/// the same layout, so one builder serves both.
+pub const TRANSFER_CHECKED_IX: u8 = 12;
+
+/// Build a `TransferChecked`: `authority` (signer) moves `amount` base
+/// units of `mint` from `source` to `destination`, asserting the
+/// amount's `decimals`.
+///
+/// Data layout (canonical): `u8` index `12` || `u64` amount (LE) || `u8`
+/// decimals — 10 bytes. Accounts: source (writable), mint (readonly),
+/// destination (writable), authority (signer) — the same meta order as
+/// the plain `Transfer`.
+///
+/// Why checked: the plain [`spl_token_transfer`] moves raw base units
+/// and trusts the caller to know the mint's decimals; `TransferChecked`
+/// has the token program verify `decimals` against the mint account
+/// on-chain, so a decimals mismatch between the escrow's AV-28
+/// metadata and the real mint fails the transaction instead of moving
+/// a mis-scaled amount. On-chain mints carry at most 9 decimals, so
+/// `decimals > 9` is [`CpiError::InvalidDecimals`] here — an escrow
+/// whose AV-28 decimals exceed 9 cannot settle through a real token
+/// mint, and the plan fails loud instead of building bytes the token
+/// program would reject.
+pub fn token_transfer_checked(
+    token_program: Pubkey,
+    source: Pubkey,
+    mint: Pubkey,
+    destination: Pubkey,
+    authority: Pubkey,
+    amount: u64,
+    decimals: u8,
+) -> Result<TransferInstruction, CpiError> {
+    // The layout is pinned per program — an unknown program never gets
+    // an instruction, even if the caller "knows" it speaks
+    // TransferChecked.
+    token_program_kind(token_program)?;
+    if amount == 0 {
+        return Err(CpiError::ZeroAmount);
+    }
+    require_nonzero(&source)?;
+    require_nonzero(&mint)?;
+    require_nonzero(&destination)?;
+    require_nonzero(&authority)?;
+    if source == destination {
+        return Err(CpiError::SelfTransfer);
+    }
+    if decimals > 9 {
+        return Err(CpiError::InvalidDecimals);
+    }
+    let mut data = Vec::with_capacity(10);
+    data.push(TRANSFER_CHECKED_IX);
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.push(decimals);
+    Ok(TransferInstruction {
+        program_id: token_program,
+        accounts: vec![
+            AccountMeta { pubkey: source, is_signer: false, is_writable: true },
+            AccountMeta { pubkey: mint, is_signer: false, is_writable: false },
+            AccountMeta { pubkey: destination, is_signer: false, is_writable: true },
+            AccountMeta { pubkey: authority, is_signer: true, is_writable: false },
+        ],
+        data,
+    })
+}
+
+/// A Token-2022 transfer-fee extension schedule, resolved by the caller
+/// from the mint's TLV extension data (the epoch fee pair collapsed to
+/// the active schedule — pure logic works on the resolved numbers,
+/// never on chain state).
+///
+/// The fee is withheld *by the Token-2022 program* during the transfer:
+/// the settlement instruction still moves the gross `amount`, but the
+/// destination receives `amount − fee` and the fee accrues to the
+/// mint's configured fee vault. [`TransferFeeSchedule::net_amount`]
+/// computes what the taker actually receives, so the keeper can
+/// reconcile gross (what the plan moved, pinned by the state machine)
+/// against net (what landed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferFeeSchedule {
+    /// Fee in basis points (hundredths of a percent): `100` = 1%.
+    pub basis_points: u16,
+    /// Maximum fee withheld per transfer, in base units.
+    pub maximum_fee: u64,
+}
+
+impl TransferFeeSchedule {
+    /// Validate the schedule: at most 100% (`basis_points <= 10_000`).
+    /// The on-chain program rejects anything higher; the mirror fails
+    /// loud instead of computing fees for a schedule that cannot exist.
+    pub fn validate(&self) -> Result<(), CpiError> {
+        if self.basis_points > 10_000 {
+            return Err(CpiError::InvalidTransferFee);
+        }
+        Ok(())
+    }
+
+    /// Fee withheld from a transfer of `amount` base units: the ceiling
+    /// of `amount * basis_points / 10_000`, capped at `maximum_fee` —
+    /// the on-chain `calculate_fee` rule, computed in u128 so a
+    /// `u64::MAX` transfer cannot overflow the intermediate. Callers
+    /// should [`validate`](Self::validate) first; on an unvalidated
+    /// schedule the cap still bounds the result.
+    pub fn withheld_fee(&self, amount: u64) -> u64 {
+        let raw = (amount as u128 * self.basis_points as u128 + 9_999) / 10_000;
+        raw.min(self.maximum_fee as u128).min(amount as u128) as u64
+    }
+
+    /// What the destination actually receives: `amount − withheld_fee`.
+    /// Infallible — the withheld fee never exceeds `amount` (see
+    /// [`withheld_fee`](Self::withheld_fee)).
+    pub fn net_amount(&self, amount: u64) -> u64 {
+        amount - self.withheld_fee(amount)
+    }
+}
+
+/// A Token-2022 metadata extension, as a **read-only view**.
+///
+/// The settlement layer never writes metadata — it only reads what the
+/// mint declares (name / symbol / uri for operator display and
+/// reconciliation labels). The struct therefore exposes getters only:
+/// there is no setter, no `&mut` API, and construction happens once
+/// through [`TokenMetadata::read`]. Cloning the view is the only way to
+/// carry it; mutating it is impossible by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenMetadata {
+    update_authority: Option<Pubkey>,
+    mint: Pubkey,
+    name: String,
+    symbol: String,
+    uri: String,
+    additional: Vec<(String, String)>,
+}
+
+impl TokenMetadata {
+    /// Read the metadata the mint declares. This is the single
+    /// construction point — the "read" in read-only.
+    pub fn read(
+        update_authority: Option<Pubkey>,
+        mint: Pubkey,
+        name: String,
+        symbol: String,
+        uri: String,
+        additional: Vec<(String, String)>,
+    ) -> Self {
+        Self { update_authority, mint, name, symbol, uri, additional }
+    }
+
+    /// The metadata update authority, if the mint sets one.
+    pub fn update_authority(&self) -> Option<Pubkey> {
+        self.update_authority
+    }
+
+    /// The mint this metadata describes.
+    pub fn mint(&self) -> Pubkey {
+        self.mint
+    }
+
+    /// The token name, as declared.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The token symbol, as declared.
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    /// The off-chain metadata URI, as declared.
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    /// Additional key/value metadata pairs, as declared.
+    pub fn additional_metadata(&self) -> &[(String, String)] {
+        &self.additional
+    }
+}
+
+/// The off-chain mint binding a settlement is built for: which mint,
+/// which token program owns it, how many decimals the amounts are
+/// denominated in, and the Token-2022 extensions the CPI layer is
+/// aware of.
+///
+/// The caller assembles this from on-chain mint-account data (the
+/// program id from the account owner, the decimals and TLV extensions
+/// from the account data) plus the escrow's AV-28 decimals for the
+/// cross-check. [`MintDescriptor::validate`] is the fail-loud gate:
+/// unknown token programs, extension/program mismatches (transfer fees
+/// and metadata are Token-2022 concepts — meaningless on the legacy SPL
+/// program), and out-of-range decimals never reach instruction
+/// construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintDescriptor {
+    /// The mint account.
+    pub mint: Pubkey,
+    /// The program owning the mint account: the SPL Token or the
+    /// Token-2022 program id.
+    pub token_program: Pubkey,
+    /// Decimals the settlement amounts are denominated in. Checked
+    /// against the AV-28 ceiling (18) here; the `TransferChecked` path
+    /// additionally requires `<= 9` (the on-chain mint maximum).
+    pub decimals: u8,
+    /// Token-2022 transfer-fee extension schedule, if the mint carries
+    /// it. `Some` on the legacy SPL program is rejected — the extension
+    /// does not exist there.
+    pub transfer_fee: Option<TransferFeeSchedule>,
+    /// Token-2022 metadata extension, read-only. Same program gate as
+    /// the transfer fee.
+    pub metadata: Option<TokenMetadata>,
+}
+
+impl MintDescriptor {
+    /// Validate the binding, returning the [`ValidatedMint`] the
+    /// instruction builders accept.
+    pub fn validate(&self) -> Result<ValidatedMint, CpiError> {
+        require_nonzero(&self.mint)?;
+        let program = token_program_kind(self.token_program)?;
+        if self.decimals > 18 {
+            return Err(CpiError::InvalidDecimals);
+        }
+        match program {
+            TokenProgram::SplToken => {
+                // Transfer fees and the metadata extension are
+                // Token-2022 concepts — a legacy SPL mint carrying them
+                // is a caller bug, failed loud.
+                if self.transfer_fee.is_some() || self.metadata.is_some() {
+                    return Err(CpiError::IncompatibleTokenExtension);
+                }
+            }
+            TokenProgram::Token2022 => {
+                if let Some(fee) = &self.transfer_fee {
+                    fee.validate()?;
+                }
+                if self.decimals > 9 {
+                    return Err(CpiError::InvalidDecimals);
+                }
+            }
+        }
+        Ok(ValidatedMint {
+            mint: self.mint,
+            program,
+            program_id: self.token_program,
+            decimals: self.decimals,
+        })
+    }
+}
+
+/// A [`MintDescriptor`] that passed [`MintDescriptor::validate`]: the
+/// token program is known, the decimals are in range, and the
+/// extensions are consistent with the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedMint {
+    /// The mint account.
+    pub mint: Pubkey,
+    /// The token program kind that owns the mint.
+    pub program: TokenProgram,
+    /// The token program id (the SPL Token or Token-2022 program id).
+    pub program_id: Pubkey,
+    /// Decimals the settlement amounts are denominated in (`<= 9` on
+    /// the Token-2022 path).
+    pub decimals: u8,
+}
+
+/// Build the token transfer for a validated mint binding — the AV-166
+/// auto-dispatch: legacy SPL Token mints keep the plain `Transfer`
+/// (whose decimals live off-chain per AV-28), Token-2022 mints get
+/// `TransferChecked` with the binding's decimals (verified on-chain
+/// against the mint account).
+pub fn token_leg(
+    binding: &ValidatedMint,
+    source: Pubkey,
+    destination: Pubkey,
+    authority: Pubkey,
+    amount: u64,
+) -> Result<TransferInstruction, CpiError> {
+    match binding.program {
+        TokenProgram::SplToken => {
+            spl_token_transfer(source, binding.mint, destination, authority, amount)
+        }
+        TokenProgram::Token2022 => token_transfer_checked(
+            binding.program_id,
+            source,
+            binding.mint,
+            destination,
+            authority,
+            amount,
+            binding.decimals,
+        ),
+    }
+}
+
 /// Which taker-payout transition this plan settles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayoutKind {
@@ -247,6 +640,18 @@ pub struct PayoutAddrs {
     /// declared hook program when it does (mismatch →
     /// [`CpiError::SettlementMismatch`]).
     pub transfer_hook: Option<TransferHookPlan>,
+    /// AV-166: the token program owning the escrow's mint. `None` keeps
+    /// the pre-AV-166 behavior — a bound mint settles through the legacy
+    /// SPL Token program with the plain `Transfer` (decimals live
+    /// off-chain per AV-28). `Some(id)` must be the SPL Token or the
+    /// Token-2022 program id ([`token_program_kind`] auto-dispatches):
+    /// Token-2022 mints settle through `TransferChecked` with the
+    /// escrow's AV-28 decimals, verified on-chain against the mint.
+    /// Naming a token program on the native-SOL path (or an unknown
+    /// program id anywhere) fails with
+    /// [`CpiError::UnsupportedTokenProgram`] — the plan is never built
+    /// for a program whose layout this module does not pin.
+    pub token_program: Option<Pubkey>,
 }
 
 /// Which refund transition this plan settles.
@@ -286,6 +691,9 @@ pub struct RefundAddrs {
     /// Token-2022 transfer-hook execution context (AV-99). Same
     /// semantics as [`PayoutAddrs::transfer_hook`].
     pub transfer_hook: Option<TransferHookPlan>,
+    /// AV-166: the token program owning the escrow's mint. Same
+    /// semantics as [`PayoutAddrs::token_program`].
+    pub token_program: Option<Pubkey>,
 }
 
 /// Addresses for a dispute-arbitration settlement (`resolve`).
@@ -310,6 +718,9 @@ pub struct ResolveAddrs {
     /// Token-2022 transfer-hook execution context (AV-99). Same
     /// semantics as [`PayoutAddrs::transfer_hook`].
     pub transfer_hook: Option<TransferHookPlan>,
+    /// AV-166: the token program owning the escrow's mint. Same
+    /// semantics as [`PayoutAddrs::token_program`].
+    pub token_program: Option<Pubkey>,
 }
 
 /// A validated settlement: the transfer instructions to submit, in order.
@@ -339,24 +750,55 @@ impl SettlementPlan {
 }
 
 /// Choose the transfer constructor from the escrow's mint binding:
-/// native SOL → System Program, bound mint → SPL Token.
+/// native SOL → System Program, bound mint → the token program named
+/// by `token_program` (AV-166): `None` keeps the legacy SPL Token
+/// plain-`Transfer` behavior; `Some` auto-dispatches SPL Token vs
+/// Token-2022 via [`token_program_kind`].
 fn leg(
     escrow: &Escrow,
     source: Pubkey,
     vault_authority: Pubkey,
     destination: Pubkey,
     amount: u64,
+    token_program: Option<Pubkey>,
 ) -> Result<TransferInstruction, CpiError> {
     match escrow.mint() {
         None => {
             // Native path: the vault PDA holds lamports directly, so the
-            // source *is* the signing authority.
+            // source *is* the signing authority — and there is no token
+            // program to name. A named program here is a caller bug,
+            // failed loud instead of silently ignored.
+            if token_program.is_some() {
+                return Err(CpiError::UnsupportedTokenProgram);
+            }
             if source != vault_authority {
                 return Err(CpiError::SettlementMismatch);
             }
             system_transfer(source, destination, amount)
         }
-        Some(mint) => spl_token_transfer(source, mint, destination, vault_authority, amount),
+        Some(mint) => {
+            // AV-166 auto-dispatch: no program named → the legacy SPL
+            // Token path (the pre-AV-166 behavior, byte-identical); a
+            // named program must be a known token program.
+            let kind = match token_program {
+                None => TokenProgram::SplToken,
+                Some(id) => token_program_kind(id)?,
+            };
+            match kind {
+                TokenProgram::SplToken => {
+                    spl_token_transfer(source, mint, destination, vault_authority, amount)
+                }
+                TokenProgram::Token2022 => token_transfer_checked(
+                    token_2022_program_id(),
+                    source,
+                    mint,
+                    destination,
+                    vault_authority,
+                    amount,
+                    escrow.decimals(),
+                ),
+            }
+        }
     }
 }
 
@@ -366,6 +808,7 @@ fn push_fee_leg(
     vault_authority: Pubkey,
     fee_leg: Pubkey,
     fee: u64,
+    token_program: Option<Pubkey>,
     transfers: &mut Vec<TransferInstruction>,
 ) -> Result<(), CpiError> {
     if fee == 0 {
@@ -381,7 +824,7 @@ fn push_fee_leg(
             return Err(CpiError::RecipientMismatch);
         }
     }
-    transfers.push(leg(escrow, source, vault_authority, fee_leg, fee)?);
+    transfers.push(leg(escrow, source, vault_authority, fee_leg, fee, token_program)?);
     Ok(())
 }
 
@@ -439,6 +882,12 @@ fn check_transfer_hook(
 /// - `addrs.fee_leg` equals the escrow's pinned fee recipient when one
 ///   is configured (AV-44);
 /// - the transfer program follows the escrow's mint binding;
+/// - AV-166: `addrs.token_program` auto-dispatches the mint path —
+///   `None` keeps the legacy SPL Token plain `Transfer`; the
+///   Token-2022 program id routes through `TransferChecked` with the
+///   escrow's AV-28 decimals; an unknown program (or any program named
+///   on the native-SOL path) fails with
+///   [`CpiError::UnsupportedTokenProgram`];
 /// - AV-99: the plan's transfer-hook context matches the escrow's
 ///   declared hook binding exactly (mismatch →
 ///   [`CpiError::SettlementMismatch`); the plan annotates the hook
@@ -497,9 +946,24 @@ pub fn payout_plan(
 
     let mut transfers = Vec::with_capacity(2);
     if payout > 0 {
-        transfers.push(leg(escrow, addrs.source, addrs.vault_authority, addrs.taker_leg, payout)?);
+        transfers.push(leg(
+            escrow,
+            addrs.source,
+            addrs.vault_authority,
+            addrs.taker_leg,
+            payout,
+            addrs.token_program,
+        )?);
     }
-    push_fee_leg(escrow, addrs.source, addrs.vault_authority, addrs.fee_leg, fee, &mut transfers)?;
+    push_fee_leg(
+        escrow,
+        addrs.source,
+        addrs.vault_authority,
+        addrs.fee_leg,
+        fee,
+        addrs.token_program,
+        &mut transfers,
+    )?;
     // AV-99: the hook gate runs after every other check — a plan that
     // fails amount/recipient validation never reaches hook annotation.
     let (transfer_hook_program, transfer_hook_accounts) =
@@ -589,14 +1053,28 @@ pub fn refund_plan(
     }
 
     let mut transfers = Vec::with_capacity(2);
-    transfers.push(leg(escrow, addrs.source, addrs.vault_authority, addrs.refund_leg, refund)?);
+    transfers.push(leg(
+        escrow,
+        addrs.source,
+        addrs.vault_authority,
+        addrs.refund_leg,
+        refund,
+        addrs.token_program,
+    )?);
     if penalty > 0 {
         require_nonzero(&addrs.penalty_leg)?;
         // Note: on the native path with no refund whitelist, the refund
         // and the penalty both land on the initializer wallet — two legs
         // to the same account are valid; each leg's amount is pinned
         // above, so nothing merges silently.
-        transfers.push(leg(escrow, addrs.source, addrs.vault_authority, addrs.penalty_leg, penalty)?);
+        transfers.push(leg(
+            escrow,
+            addrs.source,
+            addrs.vault_authority,
+            addrs.penalty_leg,
+            penalty,
+            addrs.token_program,
+        )?);
     }
     // AV-99: hook gate after every other check, like `payout_plan`.
     let (transfer_hook_program, transfer_hook_accounts) =
@@ -690,11 +1168,33 @@ pub fn resolve_plan(
 
     let mut transfers = Vec::with_capacity(3);
     if taker_payout > 0 {
-        transfers.push(leg(escrow, addrs.source, addrs.vault_authority, addrs.taker_leg, taker_payout)?);
+        transfers.push(leg(
+            escrow,
+            addrs.source,
+            addrs.vault_authority,
+            addrs.taker_leg,
+            taker_payout,
+            addrs.token_program,
+        )?);
     }
-    push_fee_leg(escrow, addrs.source, addrs.vault_authority, addrs.fee_leg, fee, &mut transfers)?;
+    push_fee_leg(
+        escrow,
+        addrs.source,
+        addrs.vault_authority,
+        addrs.fee_leg,
+        fee,
+        addrs.token_program,
+        &mut transfers,
+    )?;
     if refund > 0 {
-        transfers.push(leg(escrow, addrs.source, addrs.vault_authority, addrs.refund_leg, refund)?);
+        transfers.push(leg(
+            escrow,
+            addrs.source,
+            addrs.vault_authority,
+            addrs.refund_leg,
+            refund,
+            addrs.token_program,
+        )?);
     }
     // AV-99: hook gate after every other check, like `payout_plan`.
     let (transfer_hook_program, transfer_hook_accounts) =
@@ -734,6 +1234,7 @@ mod cpi_tests {
             taker_leg: key(2),       // native path: straight to the taker wallet
             fee_leg: key(9),
             transfer_hook: None,
+            token_program: None,
         }
     }
 
@@ -926,6 +1427,7 @@ mod cpi_tests {
             taker_leg: key(12), // taker's associated token account
             fee_leg: key(9),
             transfer_hook: None,
+            token_program: None,
         };
         let plan = payout_plan(PayoutKind::Release, &e, &addrs, payout, fee, None).unwrap();
         assert_eq!(plan.transfers.len(), 1);
@@ -951,6 +1453,7 @@ mod cpi_tests {
             refund_leg: key(1),
             penalty_leg: key(1),
             transfer_hook: None,
+            token_program: None,
         };
         let plan = refund_plan(RefundKind::Cancel, &e, &addrs, 1_000_000, 0).unwrap();
         assert_eq!(plan.transfers.len(), 1);
@@ -978,6 +1481,7 @@ mod cpi_tests {
             refund_leg: init,
             penalty_leg: init,
             transfer_hook: None,
+            token_program: None,
         };
         let plan = refund_plan(RefundKind::CancelExpired, &e, &addrs, refund, penalty).unwrap();
         assert_eq!(plan.transfers.len(), 2);
@@ -998,6 +1502,7 @@ mod cpi_tests {
             refund_leg: key(1),
             penalty_leg: key(1),
             transfer_hook: None,
+            token_program: None,
         };
         // Inflated refund: total != amount - released.
         assert_eq!(
@@ -1047,6 +1552,7 @@ mod cpi_tests {
             refund_leg: key(9),
             penalty_leg: key(9),
             transfer_hook: None,
+            token_program: None,
         };
         let plan = refund_plan(RefundKind::DeadmanClaim, &e, &addrs, 1_000_000, 0).unwrap();
         assert_eq!(plan.transfers.len(), 1);
@@ -1066,6 +1572,7 @@ mod cpi_tests {
             refund_leg: key(9),
             penalty_leg: key(9),
             transfer_hook: None,
+            token_program: None,
         };
         // Routing the heir's funds to the initializer: rejected — this
         // is exactly the misroute the heir pin exists to prevent.
@@ -1116,6 +1623,7 @@ mod cpi_tests {
             initializer: init,
             refund_leg: init,
             transfer_hook: None,
+            token_program: None,
         };
         let plan = resolve_plan(&e, &addrs, taker_payout, fee, refund).unwrap();
         assert_eq!(plan.transfers.len(), 2); // no fee leg at 0 bps
@@ -1171,6 +1679,7 @@ mod cpi_tests {
             initializer: init,
             refund_leg: init,
             transfer_hook: None,
+            token_program: None,
         };
         // Both legs exceed their principal-only bounds (600k / 400k)
         // and must still validate.
@@ -1211,6 +1720,7 @@ mod cpi_tests {
             initializer: init,
             refund_leg: init,
             transfer_hook: None,
+            token_program: None,
         };
         let plan = resolve_plan(&e, &addrs, taker_payout, fee, refund).unwrap();
         assert_eq!(plan.transfers.len(), 3);
@@ -1278,6 +1788,7 @@ mod cpi_tests {
             initializer: init,
             refund_leg: init,
             transfer_hook: None,
+            token_program: None,
         };
         assert_eq!(
             resolve_plan(&e, &addrs, taker_payout, fee, refund),
@@ -1385,6 +1896,7 @@ mod cpi_tests {
             taker_leg: key(12),
             fee_leg: key(9),
             transfer_hook: Some(hook_plan(hook)),
+            token_program: None,
         }
     }
 
@@ -1541,6 +2053,7 @@ mod cpi_tests {
             refund_leg: key(1),
             penalty_leg: key(1),
             transfer_hook: Some(hook_plan(hook)),
+            token_program: None,
         };
         let plan = refund_plan(RefundKind::Cancel, &e, &raddrs, 1_000_000, 0).unwrap();
         assert_eq!(plan.transfer_hook_program, Some(hook));
@@ -1599,4 +2112,413 @@ mod cpi_tests {
             &[0u8; 16]
         );
     }
+    // --- AV-166: Token-2022 TransferChecked + extension awareness -------
+
+    #[test]
+    fn token_2022_program_id_decodes_and_differs_from_spl() {
+        let t22 = token_2022_program_id();
+        assert_eq!(t22.len(), 32);
+        assert_ne!(t22, [0u8; 32]);
+        assert_ne!(t22, spl_token_program_id());
+        assert_ne!(t22, system_program_id());
+        // Deterministic: the OnceLock caches the same decode.
+        assert_eq!(token_2022_program_id(), t22);
+    }
+
+    #[test]
+    fn token_program_kind_dispatches_and_rejects_unknown() {
+        assert_eq!(
+            token_program_kind(spl_token_program_id()),
+            Ok(TokenProgram::SplToken)
+        );
+        assert_eq!(
+            token_program_kind(token_2022_program_id()),
+            Ok(TokenProgram::Token2022)
+        );
+        // Native SOL is not a token program; neither is a random key.
+        assert_eq!(
+            token_program_kind(system_program_id()),
+            Err(CpiError::UnsupportedTokenProgram)
+        );
+        assert_eq!(
+            token_program_kind(key(77)),
+            Err(CpiError::UnsupportedTokenProgram)
+        );
+    }
+
+    #[test]
+    fn transfer_checked_layout_is_pinned() {
+        let mint = key(7);
+        let ix = token_transfer_checked(
+            token_2022_program_id(),
+            key(11),
+            mint,
+            key(12),
+            key(10),
+            42_000,
+            6,
+        )
+        .unwrap();
+        assert_eq!(ix.program_id, token_2022_program_id());
+        assert_eq!(
+            ix.accounts,
+            vec![
+                AccountMeta { pubkey: key(11), is_signer: false, is_writable: true },
+                AccountMeta { pubkey: mint, is_signer: false, is_writable: false },
+                AccountMeta { pubkey: key(12), is_signer: false, is_writable: true },
+                AccountMeta { pubkey: key(10), is_signer: true, is_writable: false },
+            ]
+        );
+        // u8 index 12 || u64 amount LE || u8 decimals — 10 bytes.
+        let mut expected = vec![12u8];
+        expected.extend_from_slice(&42_000u64.to_le_bytes());
+        expected.push(6);
+        assert_eq!(ix.data, expected);
+        assert_eq!(ix.amount(), Some(42_000));
+        assert_eq!(ix.transfer_checked_decimals(), Some(6));
+    }
+
+    #[test]
+    fn transfer_checked_serves_both_token_programs() {
+        // Both token programs define TransferChecked at index 12 with
+        // the same layout — the builder is program-agnostic past the
+        // kind check.
+        let mint = key(7);
+        let ix = token_transfer_checked(
+            spl_token_program_id(),
+            key(11),
+            mint,
+            key(12),
+            key(10),
+            1_000,
+            9,
+        )
+        .unwrap();
+        assert_eq!(ix.program_id, spl_token_program_id());
+        assert_eq!(ix.data[0], TRANSFER_CHECKED_IX);
+        assert_eq!(ix.transfer_checked_decimals(), Some(9));
+        assert_eq!(ix.amount(), Some(1_000));
+    }
+
+    #[test]
+    fn transfer_checked_rejects_garbage() {
+        let mint = key(7);
+        let t22 = token_2022_program_id();
+        // Zero amount.
+        assert_eq!(
+            token_transfer_checked(t22, key(11), mint, key(12), key(10), 0, 6),
+            Err(CpiError::ZeroAmount)
+        );
+        // On-chain mints carry at most 9 decimals.
+        assert_eq!(
+            token_transfer_checked(t22, key(11), mint, key(12), key(10), 5, 10),
+            Err(CpiError::InvalidDecimals)
+        );
+        assert_eq!(
+            token_transfer_checked(t22, key(11), mint, key(12), key(10), 5, 19),
+            Err(CpiError::InvalidDecimals)
+        );
+        // Unknown program: no instruction, even a "compatible" one.
+        assert_eq!(
+            token_transfer_checked(key(77), key(11), mint, key(12), key(10), 5, 6),
+            Err(CpiError::UnsupportedTokenProgram)
+        );
+        // Native SOL is not a token program.
+        assert_eq!(
+            token_transfer_checked(
+                system_program_id(),
+                key(11),
+                mint,
+                key(12),
+                key(10),
+                5,
+                6
+            ),
+            Err(CpiError::UnsupportedTokenProgram)
+        );
+        assert_eq!(
+            token_transfer_checked(t22, key(11), mint, key(11), key(10), 5, 6),
+            Err(CpiError::SelfTransfer)
+        );
+        assert_eq!(
+            token_transfer_checked(t22, [0u8; 32], mint, key(12), key(10), 5, 6),
+            Err(CpiError::ZeroAddress)
+        );
+        // The plain Transfer (index 3) is not a checked transfer.
+        let plain =
+            spl_token_transfer(key(11), mint, key(12), key(10), 5).unwrap();
+        assert_eq!(plain.transfer_checked_decimals(), None);
+        assert_eq!(plain.amount(), Some(5));
+        let sys = system_transfer(key(11), key(12), 5).unwrap();
+        assert_eq!(sys.transfer_checked_decimals(), None);
+    }
+
+    #[test]
+    fn amount_decode_rejects_unknown_token_instruction() {
+        // A token-program instruction that is neither Transfer nor
+        // TransferChecked is not a transfer this module built.
+        let ix = TransferInstruction {
+            program_id: spl_token_program_id(),
+            accounts: vec![],
+            data: vec![9u8, 1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        assert_eq!(ix.amount(), None);
+    }
+
+    #[test]
+    fn transfer_fee_schedule_math_matches_onchain_rule() {
+        let fee = TransferFeeSchedule { basis_points: 100, maximum_fee: 50_000 };
+        fee.validate().unwrap();
+        // 1% of 1_000_000, under the cap.
+        assert_eq!(fee.withheld_fee(1_000_000), 10_000);
+        assert_eq!(fee.net_amount(1_000_000), 990_000);
+        // Ceiling: a fractional raw fee rounds up.
+        let tiny = TransferFeeSchedule { basis_points: 1, maximum_fee: u64::MAX };
+        assert_eq!(tiny.withheld_fee(1), 1, "ceil(1 * 1 / 10000) = 1");
+        assert_eq!(tiny.net_amount(1), 0);
+        // The cap binds before the percentage does.
+        let capped = TransferFeeSchedule { basis_points: 10_000, maximum_fee: 50 };
+        assert_eq!(capped.withheld_fee(1_000_000), 50);
+        assert_eq!(capped.net_amount(1_000_000), 999_950);
+        // u64::MAX cannot overflow the u128 intermediate.
+        let max = TransferFeeSchedule { basis_points: 10_000, maximum_fee: u64::MAX };
+        assert_eq!(max.withheld_fee(u64::MAX), u64::MAX);
+        assert_eq!(max.net_amount(u64::MAX), 0);
+        // More than 100% cannot exist on-chain.
+        let bad = TransferFeeSchedule { basis_points: 10_001, maximum_fee: 0 };
+        assert_eq!(bad.validate(), Err(CpiError::InvalidTransferFee));
+    }
+
+    #[test]
+    fn token_metadata_is_read_only_by_construction() {
+        let mint = key(7);
+        let meta = TokenMetadata::read(
+            Some(key(3)),
+            mint,
+            "Wrapped Test".to_string(),
+            "WTST".to_string(),
+            "https://example.com/meta.json".to_string(),
+            vec![("color".to_string(), "blue".to_string())],
+        );
+        assert_eq!(meta.update_authority(), Some(key(3)));
+        assert_eq!(meta.mint(), mint);
+        assert_eq!(meta.name(), "Wrapped Test");
+        assert_eq!(meta.symbol(), "WTST");
+        assert_eq!(meta.uri(), "https://example.com/meta.json");
+        assert_eq!(
+            meta.additional_metadata(),
+            &[("color".to_string(), "blue".to_string())]
+        );
+        // Clone carries the view; there is no setter to mutate it.
+        assert_eq!(meta.clone(), meta);
+    }
+
+    fn t22_descriptor() -> MintDescriptor {
+        MintDescriptor {
+            mint: key(7),
+            token_program: token_2022_program_id(),
+            decimals: 6,
+            transfer_fee: Some(TransferFeeSchedule {
+                basis_points: 100,
+                maximum_fee: 50_000,
+            }),
+            metadata: Some(TokenMetadata::read(
+                None,
+                key(7),
+                "T".to_string(),
+                "T".to_string(),
+                "u".to_string(),
+                vec![],
+            )),
+        }
+    }
+
+    #[test]
+    fn mint_descriptor_validate_gates_programs_and_extensions() {
+        // Full Token-2022 binding validates.
+        let ok = t22_descriptor().validate().unwrap();
+        assert_eq!(ok.program, TokenProgram::Token2022);
+        assert_eq!(ok.program_id, token_2022_program_id());
+        assert_eq!(ok.decimals, 6);
+        assert_eq!(ok.mint, key(7));
+        // Legacy SPL binding validates with no extensions.
+        let spl = MintDescriptor {
+            mint: key(7),
+            token_program: spl_token_program_id(),
+            decimals: 9,
+            transfer_fee: None,
+            metadata: None,
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(spl.program, TokenProgram::SplToken);
+        // Unknown program: never.
+        let mut bad = t22_descriptor();
+        bad.token_program = key(77);
+        assert_eq!(
+            bad.validate(),
+            Err(CpiError::UnsupportedTokenProgram)
+        );
+        // Transfer-fee and metadata are Token-2022 concepts — rejected
+        // on the legacy SPL program.
+        let mut bad = t22_descriptor();
+        bad.token_program = spl_token_program_id();
+        assert_eq!(
+            bad.validate(),
+            Err(CpiError::IncompatibleTokenExtension)
+        );
+        let mut bad = t22_descriptor();
+        bad.token_program = spl_token_program_id();
+        bad.transfer_fee = None;
+        assert_eq!(
+            bad.validate(),
+            Err(CpiError::IncompatibleTokenExtension)
+        );
+        // Bad fee schedule fails even on Token-2022.
+        let mut bad = t22_descriptor();
+        bad.transfer_fee = Some(TransferFeeSchedule {
+            basis_points: 10_001,
+            maximum_fee: 0,
+        });
+        assert_eq!(bad.validate(), Err(CpiError::InvalidTransferFee));
+        // Decimals above the AV-28 ceiling: no binding.
+        let mut bad = t22_descriptor();
+        bad.decimals = 19;
+        assert_eq!(bad.validate(), Err(CpiError::InvalidDecimals));
+        // Token-2022 path additionally requires on-chain-plausible
+        // decimals (<= 9).
+        let mut bad = t22_descriptor();
+        bad.decimals = 12;
+        assert_eq!(bad.validate(), Err(CpiError::InvalidDecimals));
+        // Zero mint: no binding.
+        let mut bad = t22_descriptor();
+        bad.mint = [0u8; 32];
+        assert_eq!(bad.validate(), Err(CpiError::ZeroAddress));
+    }
+
+    #[test]
+    fn token_leg_auto_dispatches_by_program() {
+        let spl = MintDescriptor {
+            mint: key(7),
+            token_program: spl_token_program_id(),
+            decimals: 9,
+            transfer_fee: None,
+            metadata: None,
+        }
+        .validate()
+        .unwrap();
+        let ix = token_leg(&spl, key(11), key(12), key(10), 5_000).unwrap();
+        // Legacy SPL keeps the plain Transfer (index 3).
+        assert_eq!(ix.program_id, spl_token_program_id());
+        assert_eq!(ix.data[0], 3u8);
+        assert_eq!(ix.amount(), Some(5_000));
+        assert_eq!(ix.transfer_checked_decimals(), None);
+
+        let t22 = t22_descriptor().validate().unwrap();
+        let ix = token_leg(&t22, key(11), key(12), key(10), 5_000).unwrap();
+        assert_eq!(ix.program_id, token_2022_program_id());
+        assert_eq!(ix.data[0], TRANSFER_CHECKED_IX);
+        assert_eq!(ix.amount(), Some(5_000));
+        assert_eq!(ix.transfer_checked_decimals(), Some(6));
+    }
+
+    fn payout_addrs_token2022() -> PayoutAddrs {
+        PayoutAddrs {
+            source: key(11),
+            vault_authority: key(10),
+            taker: key(2),
+            taker_leg: key(12),
+            fee_leg: key(9),
+            transfer_hook: None,
+            token_program: Some(token_2022_program_id()),
+        }
+    }
+
+    fn token2022_escrow() -> Escrow {
+        let mut e = Escrow::initialize(key(1), key(2), 1_000_000, u64::MAX)
+            .unwrap()
+            .with_mint(key(7))
+            .unwrap()
+            .with_decimals(6)
+            .unwrap();
+        e.fund(key(1), FUND_AT).unwrap();
+        e
+    }
+
+    #[test]
+    fn payout_plan_token2022_uses_transfer_checked() {
+        let mut e = token2022_escrow();
+        let (payout, fee) = e.release(key(1), 0, 1_000_000, Some(key(7)), key(2)).unwrap();
+        assert_eq!(fee, 0);
+        let plan =
+            payout_plan(PayoutKind::Release, &e, &payout_addrs_token2022(), payout, fee, None)
+                .unwrap();
+        assert_eq!(plan.transfers.len(), 1);
+        let ix = &plan.transfers[0];
+        assert_eq!(ix.program_id, token_2022_program_id());
+        assert_eq!(ix.data[0], TRANSFER_CHECKED_IX);
+        // The escrow's AV-28 decimals ride the checked transfer.
+        assert_eq!(ix.transfer_checked_decimals(), Some(6));
+        assert_eq!(ix.amount(), Some(1_000_000));
+        assert_eq!(ix.accounts[1].pubkey, key(7)); // the bound mint
+        assert_eq!(ix.accounts[3].pubkey, key(10)); // vault PDA authority
+        assert_eq!(plan.total_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn payout_plan_rejects_unknown_token_program() {
+        let mut e = token2022_escrow();
+        let (payout, fee) = e.release(key(1), 0, 1_000_000, Some(key(7)), key(2)).unwrap();
+        let mut addrs = payout_addrs_token2022();
+        addrs.token_program = Some(key(77));
+        assert_eq!(
+            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee, None),
+            Err(CpiError::UnsupportedTokenProgram)
+        );
+        // The SPL Token program id is accepted on a mint-bound escrow
+        // and keeps the plain Transfer.
+        addrs.token_program = Some(spl_token_program_id());
+        let plan =
+            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee, None).unwrap();
+        assert_eq!(plan.transfers[0].program_id, spl_token_program_id());
+        assert_eq!(plan.transfers[0].data[0], 3u8);
+    }
+
+    #[test]
+    fn native_path_rejects_any_token_program() {
+        let mut e = funded_escrow(1_000_000);
+        let (payout, fee) = e.release(key(1), 0, 1_000_000, None, key(2)).unwrap();
+        let mut addrs = payout_addrs_native();
+        addrs.token_program = Some(token_2022_program_id());
+        assert_eq!(
+            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee, None),
+            Err(CpiError::UnsupportedTokenProgram)
+        );
+        // None keeps the native system transfer.
+        addrs.token_program = None;
+        let plan =
+            payout_plan(PayoutKind::Release, &e, &addrs, payout, fee, None).unwrap();
+        assert_eq!(plan.transfers[0].program_id, system_program_id());
+    }
+
+    #[test]
+    fn transfer_fee_net_reconciles_against_plan_gross() {
+        // The keeper-side reconciliation story: the settlement plan
+        // moves the gross the state machine recorded; the transfer-fee
+        // schedule says what the taker actually receives.
+        let mut e = token2022_escrow();
+        let (payout, fee) = e.release(key(1), 0, 1_000_000, Some(key(7)), key(2)).unwrap();
+        let plan =
+            payout_plan(PayoutKind::Release, &e, &payout_addrs_token2022(), payout, fee, None)
+                .unwrap();
+        let schedule = TransferFeeSchedule { basis_points: 100, maximum_fee: 50_000 };
+        let gross = plan.total_amount();
+        assert_eq!(gross, 1_000_000);
+        // 1% withheld by the Token-2022 program during the transfer.
+        assert_eq!(schedule.net_amount(gross), 990_000);
+        // The plan itself still pins the gross — it never silently
+        // shrinks to the net.
+        assert_eq!(plan.transfers[0].amount(), Some(gross));
+    }
+
 }

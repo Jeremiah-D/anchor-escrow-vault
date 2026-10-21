@@ -3279,6 +3279,31 @@ matching `cpi::*_plan`, and executes each validated leg (native legs via
 `anchor_spl::token::transfer`). Because the program never hand-rolls
 instruction bytes, the on-chain code cannot drift from the tested layout.
 
+### Token-2022 settlement (AV-166)
+
+A mint-bound escrow can name its token program on the settlement
+addresses (`token_program: Some(...)`): `None` keeps the legacy SPL
+Token plain `Transfer` behavior byte-identical, while the Token-2022
+program id auto-dispatches to `TransferChecked` (index `12`, shared by
+both token programs) with the escrow's AV-28 decimals asserted on-chain
+against the mint account — a decimals mismatch fails the transaction
+instead of moving a mis-scaled amount. An unknown program id (or any
+program named on the native-SOL path) fails the plan with
+`UnsupportedTokenProgram`: the module pins layouts for exactly the two
+token programs and never builds an instruction for anything else.
+
+`MintDescriptor` is the off-chain mint binding with extension
+awareness: the transfer-fee schedule (`TransferFeeSchedule::net_amount`
+computes what the taker actually receives — the settlement instruction
+still moves the gross the state machine recorded, the Token-2022
+program withholds the fee during the transfer, so the keeper reconciles
+gross vs net), the mint decimals, and the metadata extension as a
+read-only view (`TokenMetadata` exposes getters only — the settlement
+layer never writes metadata). Declaring a Token-2022 extension on the
+legacy SPL program fails loud (`IncompatibleTokenExtension`), as does a
+fee schedule above 100% (`InvalidTransferFee`). The Anchor skeleton
+needs no changes: this is purely the CPI layer.
+
 ## CPI-routed release (AV-35)
 
 `escrow-state/src/cpi_call.rs` models the release path where the taker's

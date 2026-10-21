@@ -314,11 +314,16 @@ pub(crate) fn sha256(message: &[u8]) -> [u8; 32] {
 // AV-31: off-chain CPI transfer instruction construction — byte-exact
 // System Program / SPL Token transfer builders plus settlement plans
 // that validate amounts and recipients against the state machine's
-// transition results before anything is submitted on-chain.
+// transition results before anything is submitted on-chain. AV-166 adds
+// the Token-2022 path: `TransferChecked` construction, token-program
+// auto-dispatch, and extension-aware mint bindings (transfer-fee
+// schedules, decimals, read-only metadata views).
 pub use cpi::{
     payout_plan, refund_plan, resolve_plan, spl_token_program_id, spl_token_transfer,
-    system_program_id, system_transfer, AccountMeta, CpiError, PayoutAddrs, PayoutKind,
-    Pubkey, RefundAddrs, RefundKind, ResolveAddrs, SettlementPlan, TransferInstruction,
+    system_program_id, system_transfer, token_2022_program_id, token_leg, token_program_kind,
+    token_transfer_checked, AccountMeta, CpiError, MintDescriptor, PayoutAddrs, PayoutKind,
+    Pubkey, RefundAddrs, RefundKind, ResolveAddrs, SettlementPlan, TokenMetadata, TokenProgram,
+    TransferFeeSchedule, TransferInstruction, ValidatedMint, TRANSFER_CHECKED_IX,
 };
 
 // AV-35: CPI-routed release — the third-party invocation as data, its
