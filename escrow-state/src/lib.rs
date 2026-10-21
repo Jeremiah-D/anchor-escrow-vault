@@ -63,6 +63,11 @@ mod batch_close;
 // ALT tables, as deterministic multisig/CLI-ready JSON. Purely
 // additive and read-only (dry-run by construction).
 mod execution_bundle;
+// AV-169: private bundle-relay submission adapter — the BundleRelay
+// trait, the replay-protecting submit_bundle orchestrator, and
+// landing-rate / confirmation-latency observations as audit events.
+// Never falls back to the public mempool.
+mod bundle_relay;
 // AV-145: keeper multi-bundle merge submission — pack several AV-61
 // execution bundles into multisig/CLI submission sessions with
 // cross-bundle ALT dedup (batch.rs convention), CU budgeting across
@@ -558,6 +563,13 @@ pub use execution_bundle::{
     JitoTip, JitoTipConfig, TipConfigError,
 };
 
+// AV-169: private bundle-relay submission — the relay trait, the
+// replay-protecting submitter, and landing/latency observations as
+// audit events. No mempool fallback, by construction.
+pub use bundle_relay::{
+    BundleId, BundleReceipt, BundleRelay, BundleRelayEvent, BundleRelaySubmitter, BundleStatus,
+    RelayError, RelayObservation, RelayStats,
+};
 
 // AV-71: signable transaction-message serialization for keeper
 // execution bundles — real instruction bytes (discriminator + Borsh

@@ -3658,6 +3658,43 @@ consume directly.
   keeper's dry-run report (`all_ok` green light, per-action
   `executed`/`failed`/`skipped` with `error:{name,code}`).
 
+## Private bundle-relay submission (AV-169)
+
+Submitting a keeper execution bundle to the public mempool
+broadcasts the settlement intent to every watcher — including MEV
+searchers. `escrow-state/src/bundle_relay.rs` submits the bundle to
+a **private block-engine relay** (e.g. Jito) instead. The
+`BundleRelay` trait models the relay as an injectable dependency
+(`submit` / `status`); `BundleRelaySubmitter` orchestrates:
+
+- **Tip bidding**: the AV-98 `JitoTipConfig` rides the submission —
+  the tip instruction is already the bundle's last instruction, and
+  the config tells the relay what the bundle bids for auction
+  ordering.
+- **Replay protection**: submissions key on the `BundleId`
+  (SHA-256 of the bundle bytes). Resubmitting a pending bundle
+  returns the cached receipt without touching the relay again;
+  resubmitting an already-landed bundle fails with
+  `RelayError::AlreadyLanded` — a landed bundle is never
+  resubmitted, so no duplicate on-chain execution. A bundle the
+  relay reports failed is dropped from tracking, so the operator can
+  retry it deliberately.
+- **No mempool fallback, by construction**: when the relay is
+  unavailable the submission fails with `RelayError::Unavailable`
+  and the adapter has no mempool handle, flag, or fallback branch —
+  a silent fallback would broadcast the exact intent the private
+  relay was chosen to protect. An operator-approved fallback, if
+  ever wanted, lives outside the adapter where the decision is
+  visible.
+- **Landing observations as audit events**: each status poll that
+  resolves a bundle yields a `RelayObservation` (landed/failed, the
+  landing slot, `landed_slot − submitted_slot` confirmation
+  latency) rendered as hand-written JSON for the keeper's audit
+  sink, next to the AV-18 indexer events. `RelayStats` tracks the
+  landing rate in basis points and the mean confirmation latency —
+  the two numbers the operator watches. 12 tests;
+  `cargo test -p escrow-state` green.
+
 ## Release preview (AV-159)
 
 `Escrow::preview_release(authority, now, amount, mint, payout_to)`
