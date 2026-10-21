@@ -27,6 +27,18 @@ mod keeper_heartbeat;
 // data-analysis / audit-ingest complement to the AV-26 snapshot JSON.
 mod event_csv;
 mod cpi;
+// AV-172: post-CPI return-data verification — the callee's
+// `set_return_data` attestation checked against the declared return
+// layout *after* execution (the execution-after counterpart to the
+// AV-132 slippage pre-check and the CpiAllowlist program-id gate),
+// with a fail-closed / warn policy for missing return data and the
+// attestation carried on `CpiRouteAudit::return_data`. Pure logic,
+// zero dependencies.
+mod cpi_return;
+pub use cpi_return::{
+    verify_cpi_return_data, CpiReturnData, CpiReturnDataAudit, MissingReturnDataPolicy,
+    ReturnDataExpectation, ReturnDataVerification, MAX_RETURN_DATA_LEN,
+};
 // AV-168: Token-2022 confidential transfer awareness — the mint
 // extension binding, byte-pinned ApplyPendingBalance / Withdraw
 // builders, the apply-before-withdraw settlement sequence, and the

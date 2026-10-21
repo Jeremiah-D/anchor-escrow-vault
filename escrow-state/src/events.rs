@@ -291,6 +291,7 @@ use crate::{Escrow, EscrowError, EscrowState, MilestonePlan, PriceFeed, QuorumPo
 use crate::{AppealOutcome, BasketSettlement, OverrideValue, TemplatePreset};
 use crate::cpi::CpiError;
 use crate::cpi_call::{CpiInvocation, CpiReceipt};
+use crate::cpi_return::CpiReturnDataAudit;
 use crate::release_intent::ReleaseIntent;
 
 /// What kind of state change an [`EscrowEvent`] records.
@@ -1730,6 +1731,13 @@ pub struct CpiRouteAudit {
     /// [`CpiInvocation`](super::CpiInvocation): program id, accounts
     /// (key + signer/writable flags, in order), and data.
     pub accounts_hash: [u8; 32],
+    /// AV-172: the post-execution return-data attestation, when the
+    /// executor verified the callee's `set_return_data` against the
+    /// declared [`ReturnDataExpectation`](super::ReturnDataExpectation).
+    /// `None` when the executor did not (or could not) check return
+    /// data — e.g. a legacy target under the `Warn` missing-data
+    /// policy, or an executor that only checks balance deltas.
+    pub return_data: Option<CpiReturnDataAudit>,
 }
 
 /// One typed record of a state change, in per-escrow [`seq`](Self::seq)
@@ -3504,6 +3512,10 @@ impl IndexedEscrow {
             Some(CpiRouteAudit {
                 target: receipt.cpi_target,
                 accounts_hash: receipt.accounts_hash,
+                // AV-172: no return-data check ran on this path yet —
+                // the executor stamps `return_data` when it verifies
+                // the callee's attestation post-execution.
+                return_data: None,
             }),
             None,
             Some(authority),

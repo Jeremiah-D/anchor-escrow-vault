@@ -10517,6 +10517,28 @@ fn cpi_invoke_target(
     unimplemented!("invoke the target program via CPI with the vault PDA as signer in the real build; return the actual post-execution taker-leg amount (the taker-leg account's balance delta across the invoke) so the state machine can enforce the AV-132 min_payout slippage floor")
 }
 
+/// AV-172: post-CPI return-data verification (reference — not compiled
+/// by CI). The real build never trusts a bare CPI success for
+/// settlement: after `invoke`/`invoke_signed` against the CPI target it
+/// calls `anchor_lang::solana_program::program::get_return_data` and
+/// feeds the `(program_id, data)` into
+/// `escrow_state::verify_cpi_return_data` with the
+/// `ReturnDataExpectation` the instruction declared (discriminant +
+/// amount-field offset + planned amount). `CpiError::CpiReturnDataMismatch`
+/// / `CpiError::CpiReturnDataMissing` map to the program errors below
+/// and abort before the instruction returns — a callee that
+/// "succeeded" but delivered the wrong amount (or attested nothing
+/// under the fail-closed policy) never settles. On success the
+/// attestation rides the settlement event's
+/// `CpiRouteAudit::return_data` for the indexer.
+fn cpi_verify_return_data(
+    _target: &[u8; 32],
+    _expectation: &escrow_state::ReturnDataExpectation,
+    _observed: Option<escrow_state::CpiReturnData<'_>>,
+) -> std::result::Result<escrow_state::ReturnDataVerification, escrow_state::CpiError> {
+    unimplemented!("read get_return_data after the CPI invoke and verify against the declared ReturnDataExpectation in the real build")
+}
+
 /// AV-31: settlement CPI wiring (reference — not compiled by CI).
 ///
 /// The fund-moving instructions (`release`, `claim`, `release_milestone`,

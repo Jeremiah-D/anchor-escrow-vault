@@ -3336,6 +3336,42 @@ log covers `[0, 2^32)` (amounts above fail
 `DecryptionOutOfRange`, never silently wrapped). 17 tests;
 `cargo test -p escrow-state` green.
 
+### CPI return-data verification (AV-172)
+
+A settlement CPI whose instruction "succeeded" may still have delivered
+the wrong amount — a hostile or buggy callee. AV-172 adds the
+execution-*after* gate: after the CPI runs, the callee's
+`set_return_data` attestation is checked against the return layout the
+settlement declared up front.
+
+`escrow-state/src/cpi_return.rs` (pure logic, zero dependencies):
+`ReturnDataExpectation { discriminant, amount_offset, expected_amount }`
+declares the layout (one-byte discriminant + LE u64 amount field at
+`amount_offset`); `verify_cpi_return_data(target, expectation,
+observed, missing_policy)` checks, in order: return data was observed
+(else the missing-data policy decides), the payload fits the on-chain
+1024-byte cap, the attesting program *is* the CPI target (a return from
+any other program is the confused-deputy shape), the discriminant
+matches, the payload holds the amount field, and the attested amount
+equals the planned amount. Amount mismatch is the explicit
+`CpiError::CpiReturnDataMismatch`; missing data under the default
+`FailClosed` policy is `CpiError::CpiReturnDataMissing` — a program that
+attests nothing proves nothing. The `Warn` policy accepts the absence
+for legacy targets that predate `set_return_data`, but records a
+warning attestation: the money moved unverified. On success the
+attestation rides the settlement event's `CpiRouteAudit::return_data`
+(`CpiReturnDataAudit { expected_amount, attested_amount,
+accepted_without_attestation }`) for the indexer.
+
+This complements the two earlier gates rather than replacing either:
+`CpiAllowlist` (AV-83) decides *who* may be called (before anything
+runs), the AV-132 slippage pre-check rejects a plan whose quoted payout
+is already below the caller's floor (before execution) — and this check
+runs *after* execution, proving the money actually arrived. The Anchor
+skeleton's `cpi_verify_return_data` documents the on-chain wiring
+(`get_return_data` after the invoke; mismatch/missing map to program
+errors and abort). 13 tests; `cargo test -p escrow-state` green.
+
 ## CPI-routed release (AV-35)
 
 `escrow-state/src/cpi_call.rs` models the release path where the taker's

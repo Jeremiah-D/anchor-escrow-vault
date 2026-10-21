@@ -207,6 +207,23 @@ pub enum CpiError {
     /// (the pending balance is already settled), failed loud instead
     /// of emitting a duplicate instruction.
     ConfidentialAlreadyApplied,
+    /// AV-172: the callee's post-execution return data does not match
+    /// the declared return layout — wrong attesting program, wrong
+    /// discriminant, truncated payload, or an attested amount
+    /// different from the planned settlement amount. The settlement
+    /// is rejected *after* execution: a CPI that "succeeded" but
+    /// delivered the wrong amount never settles. The execution-after
+    /// counterpart to the AV-132 slippage pre-check
+    /// ([`CpiError::SlippageExceeded`], which rejects before
+    /// execution); see [`super::cpi_return::verify_cpi_return_data`]
+    /// and the Anchor skeleton's `cpi_verify_return_data`.
+    CpiReturnDataMismatch,
+    /// AV-172: no return data was observed and the missing-data policy
+    /// is
+    /// [`MissingReturnDataPolicy::FailClosed`](super::cpi_return::MissingReturnDataPolicy)
+    /// (the default) — a program that attests nothing proves nothing,
+    /// so the settlement fails instead of proceeding unverified.
+    CpiReturnDataMissing,
 }
 
 fn require_nonzero(key: &Pubkey) -> Result<(), CpiError> {
