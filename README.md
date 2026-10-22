@@ -3912,6 +3912,41 @@ base64 for a multisig or CLI to sign and submit.
   bytes against a golden vector, base64 against RFC 4648 vectors, and
   bundle-JSON ↔ message agreement end to end.
 
+### Address lookup table account parsing (AV-181)
+
+`escrow-state/src/alt_table.rs` is the parsing half of the AV-87 v0
+path: it turns the raw account-data bytes the keeper fetched from RPC
+into the address snapshot the v0 compiler takes.
+
+- **Real on-chain layout**: `ProgramState` variant index (`u32` LE;
+  `0` = uninitialized, rejected) + bincode `LookupTableMeta`
+  (`deactivation_slot` / `last_extended_slot` / `start_index` /
+  `authority: Option<Pubkey>` + `u16` padding = 56 bytes,
+  `LOOKUP_TABLE_META_SIZE`) + raw 32-byte addresses with no length
+  prefix — pinned against the `solana-program` 2.0.23
+  `address_lookup_table::state` source, including its
+  `test_lookup_table_meta_size` vectors (56 bytes with an authority,
+  24 + zero-fill without).
+- **Fail loud**: short data, uninitialized/unknown program state, bad
+  authority tag, misaligned address tail, over-full tables (> 256
+  addresses), and *empty* tables (a 56-byte account is valid on-chain
+  but resolves nothing) all return `AltTableError` — never a table
+  that silently resolves nothing.
+- **Lookup expansion**: `resolve_v0_lookups` expands a decoded v0
+  message's `address_table_lookups` back into loaded addresses
+  (writable first, then readonly — the runtime's ordering), failing on
+  unknown table keys or out-of-range indexes, so an auditor can verify
+  exactly what a signed message will load.
+- **One-call compile**: `compile_v0_from_account_data` goes from RPC
+  account bytes straight to a compiled v0 message; parse failures and
+  stale snapshots (`AltTableKeyMismatch`) both fail before any bytes
+  are signed.
+- **Honest activation check**: on-chain, a finite `deactivation_slot`
+  stays usable through a slot-hash cool-down that needs the
+  `SlotHashes` sysvar; off-chain `is_active()` only reports fully
+  active (`deactivation_slot == u64::MAX`) — the keeper should only
+  feed active tables here.
+
 ### Durable-nonce transactions (AV-167)
 
 `escrow-state/src/durable_nonce.rs` frees keeper bundles from the

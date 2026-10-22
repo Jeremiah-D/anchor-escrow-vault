@@ -67,7 +67,11 @@
 //!   caller's snapshot of the on-chain table: signers stay static (the
 //!   runtime forbids signer lookups), everything else shrinks the
 //!   static key list. The legacy path is byte-identical with or without
-//!   the v0 code present.
+//!   the v0 code present. AV-181 adds the parsing half:
+//!   `alt_table` deserializes raw lookup-table account data (the
+//!   keeper's RPC bytes) into that snapshot, expands a v0 message's
+//!   lookups back into loaded addresses, and compiles v0 straight from
+//!   account data — empty/bad tables fail loud there.
 //!
 //! - **Packet-size pre-flight + keeper auto-route** (AV-162) — via
 //!   [`MAX_TRANSACTION_PACKET_BYTES`] (1232, the Solana transaction

@@ -123,6 +123,14 @@ pub use claim_sweep::{
 // multisig/CLI can sign and submit. Off-chain and unsigned by design:
 // the relay never holds keys. Purely additive.
 mod tx_message;
+// AV-181: on-chain Address Lookup Table (ALT) account parsing —
+// deserialize raw lookup-table account data per the real on-chain
+// layout (bincode ProgramState + LookupTableMeta + raw addresses),
+// expand a v0 message's address_table_lookups into loaded addresses,
+// and compile a v0 message straight from account-data bytes. The
+// AV-87 v0 compiler keeps taking the caller's address snapshot; this
+// module is the parsing half. Pure logic, zero dependencies.
+mod alt_table;
 // AV-167: durable-nonce transactions for keeper execution bundles —
 // nonce-account parsing, the AdvanceNonceAccount prefix instruction,
 // and legacy/v0 message assembly whose blockhash slot carries the nonce
@@ -690,6 +698,15 @@ pub use tx_message::{
     // recommendation (price) into a submittable transaction.
     compute_budget_set_compute_unit_limit, compute_budget_set_compute_unit_price,
     COMPUTE_BUDGET_IX_SET_COMPUTE_UNIT_LIMIT, COMPUTE_BUDGET_IX_SET_COMPUTE_UNIT_PRICE,
+};
+
+// AV-181: on-chain Address Lookup Table (ALT) account parsing — the
+// parsing half of the AV-87 v0 message path: raw account data to a
+// deserialized table, lookup expansion, and table-backed v0
+// compilation.
+pub use alt_table::{
+    compile_v0_from_account_data, resolve_v0_lookups, AltTableError, AltTableMeta, LoadedAddress,
+    ParsedLookupTable, LOOKUP_TABLE_MAX_ADDRESSES, LOOKUP_TABLE_META_SIZE,
 };
 
 // AV-167: durable-nonce transaction support — nonce-account parsing,
