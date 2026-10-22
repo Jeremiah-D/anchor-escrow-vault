@@ -470,6 +470,15 @@ pub use keeper_sharding::{
 // clear with a light quorum, large releases demand the full panel).
 mod tiered_quorum;
 pub use tiered_quorum::{Tier, TieredQuorum, MAX_TIERS, TIERED_QUORUM_LEN};
+// AV-179: program upgrade-authority handover — two-step propose/accept
+// with an opt-in handover delay, the structured handover audit ring,
+// and the keeper's upgrade-authority drift scan. Purely additive and
+// off-chain.
+mod upgrade_authority;
+pub use upgrade_authority::{
+    scan_upgrade_authority_drift, UpgradeAuthority, UpgradeAuthorityDrift, UpgradeAuthorityEventKind,
+    UpgradeAuditEntry, MAX_UPGRADE_AUDIT_ENTRIES,
+};
 
 
 // AV-20: off-chain keeper report — scan a batch of escrows for executable
@@ -3304,6 +3313,30 @@ pub enum EscrowError {
     /// refused — the roster contains the zero key or a duplicate
     /// member. Never renumbered (see [`EscrowError::code`]).
     InvalidShardMembership,
+    /// AV-179: [`UpgradeAuthority::new`](crate::UpgradeAuthority::new)
+    /// / [`propose_handover`](crate::UpgradeAuthority::propose_handover)
+    /// / [`set_freeze_authority`](crate::ManagedFreezeAuthority::set_freeze_authority)
+    /// refused — the authority key is the zero key, or a handover /
+    /// rotation proposes the key already in effect. Never renumbered
+    /// (see [`EscrowError::code`]).
+    InvalidUpgradeAuthority,
+    /// AV-179:
+    /// [`propose_handover`](crate::UpgradeAuthority::propose_handover)
+    /// refused — a handover proposal is already live; cancel it before
+    /// proposing again. Never renumbered (see [`EscrowError::code`]).
+    UpgradeHandoverPending,
+    /// AV-179:
+    /// [`confirm_handover`](crate::UpgradeAuthority::confirm_handover) /
+    /// [`cancel_handover`](crate::UpgradeAuthority::cancel_handover)
+    /// refused — no handover proposal is live. Never renumbered (see
+    /// [`EscrowError::code`]).
+    NoUpgradeHandoverPending,
+    /// AV-179:
+    /// [`confirm_handover`](crate::UpgradeAuthority::confirm_handover)
+    /// refused — the handover delay has not elapsed since the
+    /// proposal; the successor must wait out the cooling period. Never
+    /// renumbered (see [`EscrowError::code`]).
+    UpgradeHandoverDelayNotElapsed,
 }
 
 impl EscrowError {
@@ -3518,6 +3551,10 @@ impl EscrowError {
             EscrowError::NotLeader => 239,
             EscrowError::LeaseExpired => 240,
             EscrowError::InvalidShardMembership => 241,
+            EscrowError::InvalidUpgradeAuthority => 242,
+            EscrowError::UpgradeHandoverPending => 243,
+            EscrowError::NoUpgradeHandoverPending => 244,
+            EscrowError::UpgradeHandoverDelayNotElapsed => 245,
         }
     }
 
@@ -3719,6 +3756,14 @@ impl EscrowError {
             EscrowError::LeaseExpired,
             // AV-177: appended, never renumbered.
             EscrowError::InvalidShardMembership,
+            // AV-179: appended, never renumbered.
+            EscrowError::InvalidUpgradeAuthority,
+            // AV-179: appended, never renumbered.
+            EscrowError::UpgradeHandoverPending,
+            // AV-179: appended, never renumbered.
+            EscrowError::NoUpgradeHandoverPending,
+            // AV-179: appended, never renumbered.
+            EscrowError::UpgradeHandoverDelayNotElapsed,
         ]
     }
 }
@@ -31495,6 +31540,30 @@ mod error_code_tests {
             241,
             "ShardMap::new/update_members with a zero member key or a duplicate member (AV-177)",
         ),
+        // AV-179: appended, never renumbered.
+        (
+            EscrowError::InvalidUpgradeAuthority,
+            242,
+            "UpgradeAuthority::new/propose_handover with a zero authority key, or a handover proposing the key already in effect (AV-179)",
+        ),
+        // AV-179: appended, never renumbered.
+        (
+            EscrowError::UpgradeHandoverPending,
+            243,
+            "UpgradeAuthority::propose_handover while a handover proposal is already live — cancel it first (AV-179)",
+        ),
+        // AV-179: appended, never renumbered.
+        (
+            EscrowError::NoUpgradeHandoverPending,
+            244,
+            "UpgradeAuthority::confirm_handover/cancel_handover with no live handover proposal (AV-179)",
+        ),
+        // AV-179: appended, never renumbered.
+        (
+            EscrowError::UpgradeHandoverDelayNotElapsed,
+            245,
+            "UpgradeAuthority::confirm_handover before proposed_at + handover_delay_secs (AV-179)",
+        ),
     ];
 
     #[test]
@@ -32224,6 +32293,52 @@ mod error_code_tests {
         assert_eq!(err.code(), 241);
         let err = ShardMap::new(&[ALICE, ALICE]).unwrap_err();
         assert_eq!(err, EscrowError::InvalidShardMembership);
+    }
+
+    #[test]
+    fn invalid_upgrade_authority_triggered_by_zero_key() {
+        let err = UpgradeAuthority::new([0u8; 32], 3_600).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidUpgradeAuthority);
+        assert_eq!(err.code(), 242);
+        let mut a = UpgradeAuthority::new(ALICE, 3_600).unwrap();
+        let err = a.propose_handover(ALICE, [0u8; 32], 1_000).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidUpgradeAuthority);
+        // Proposing the key already in effect is the same refuse.
+        let err = a.propose_handover(ALICE, ALICE, 1_000).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidUpgradeAuthority);
+    }
+
+    #[test]
+    fn upgrade_handover_pending_triggered_by_second_proposal() {
+        let mut a = UpgradeAuthority::new(ALICE, 3_600).unwrap();
+        a.propose_handover(ALICE, BOB, 1_000).unwrap();
+        let err = a.propose_handover(ALICE, MALLORY, 2_000).unwrap_err();
+        assert_eq!(err, EscrowError::UpgradeHandoverPending);
+        assert_eq!(err.code(), 243);
+        // The first proposal survives.
+        assert_eq!(a.pending_proposal(), Some((BOB, 1_000)));
+    }
+
+    #[test]
+    fn no_upgrade_handover_pending_triggered_without_proposal() {
+        let mut a = UpgradeAuthority::new(ALICE, 3_600).unwrap();
+        let err = a.confirm_handover(BOB, 5_000).unwrap_err();
+        assert_eq!(err, EscrowError::NoUpgradeHandoverPending);
+        assert_eq!(err.code(), 244);
+        let err = a.cancel_handover(ALICE, 5_000).unwrap_err();
+        assert_eq!(err, EscrowError::NoUpgradeHandoverPending);
+    }
+
+    #[test]
+    fn upgrade_handover_delay_not_elapsed_triggered_by_early_accept() {
+        let mut a = UpgradeAuthority::new(ALICE, 3_600).unwrap();
+        a.propose_handover(ALICE, BOB, 1_000).unwrap();
+        let err = a.confirm_handover(BOB, 1_000 + 3_599).unwrap_err();
+        assert_eq!(err, EscrowError::UpgradeHandoverDelayNotElapsed);
+        assert_eq!(err.code(), 245);
+        // At exactly the deadline the accept goes through.
+        a.confirm_handover(BOB, 1_000 + 3_600).unwrap();
+        assert_eq!(a.current(), BOB);
     }
 
 
@@ -57160,7 +57275,15 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::LeaseExpired));
         assert_eq!(EscrowError::InvalidShardMembership.code(), 241);
         assert!(EscrowError::all().contains(&EscrowError::InvalidShardMembership));
-        assert_eq!(EscrowError::all().len(), 142);
+        assert_eq!(EscrowError::InvalidUpgradeAuthority.code(), 242);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidUpgradeAuthority));
+        assert_eq!(EscrowError::UpgradeHandoverPending.code(), 243);
+        assert!(EscrowError::all().contains(&EscrowError::UpgradeHandoverPending));
+        assert_eq!(EscrowError::NoUpgradeHandoverPending.code(), 244);
+        assert!(EscrowError::all().contains(&EscrowError::NoUpgradeHandoverPending));
+        assert_eq!(EscrowError::UpgradeHandoverDelayNotElapsed.code(), 245);
+        assert!(EscrowError::all().contains(&EscrowError::UpgradeHandoverDelayNotElapsed));
+        assert_eq!(EscrowError::all().len(), 146);
     }
 
     #[test]

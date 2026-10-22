@@ -1553,6 +1553,10 @@ program error per variant):
 | `NotLeader` | 239 | `KeeperElection::renew` / `step_down` (AV-176) by a caller that is not the recorded leader |
 | `LeaseExpired` | 240 | `KeeperElection::renew` (AV-176) after the lease lapsed — re-acquire for a new term |
 | `InvalidShardMembership` | 241 | `ShardMap::new` / `update_members` (AV-177) with a zero member key or a duplicate member |
+| `InvalidUpgradeAuthority` | 242 | `UpgradeAuthority::new` / `propose_handover` (AV-179) with a zero authority key, or a handover proposing the key already in effect |
+| `UpgradeHandoverPending` | 243 | `UpgradeAuthority::propose_handover` (AV-179) while a handover proposal is already live |
+| `NoUpgradeHandoverPending` | 244 | `UpgradeAuthority::confirm_handover` / `cancel_handover` (AV-179) with no live handover proposal |
+| `UpgradeHandoverDelayNotElapsed` | 245 | `UpgradeAuthority::confirm_handover` (AV-179) before `proposed_at + handover_delay_secs` |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -6062,3 +6066,41 @@ payouts stay fast while high-value payouts harden into multi-sig
   rejects an out-of-range tier count (`InvalidTieredQuorumLen`) rather
   than decoding a value the accessors cannot safely read (AV-32
   panic-free guarantee).
+
+## Program upgrade-authority handover (AV-179)
+
+`escrow-state/src/upgrade_authority.rs` — the two-step propose/accept
+handover for the program's BPF-loader upgrade authority, with an
+opt-in handover delay and keeper drift alerts (Solana governance /
+backend engineering).
+
+On Solana, `set_upgrade_authority` is a single instruction: whoever
+holds the upgrade authority can reassign it in one transaction,
+irreversibly and silently. A fat-fingered key or a compromised
+authority bricks the program's upgradability in one shot, and no
+on-chain record explains who moved the authority or why.
+`UpgradeAuthority` is the executable spec of the safe handover:
+
+- **Two-step**: the current authority *proposes* a successor
+  (`propose_handover`); the *proposed* key must *accept*
+  (`confirm_handover`). The current authority can never silently hand
+  the program to a key nobody controls — the recipient opts in (the
+  Ownable2Step shape, adapted to program governance).
+- **Delay**: `handover_delay_secs` (bound at construction) forces a
+  cooling period between proposal and acceptance; a rushed or coerced
+  handover cannot complete inside the window. The clock is injected
+  (`now: u64`), so the policy is fully testable off-chain.
+- **Structured audit**: propose / confirm / cancel append an
+  `UpgradeAuditEntry` (kind, timestamp, actor, successor) to a bounded
+  32-entry ring — the AV-163 circuit-breaker convention (fixed-size
+  tail, oldest evicts first).
+- **Keeper drift scan**: `scan_upgrade_authority_drift` diffs the live
+  authority against the operator-approved template and raises a drift
+  alert — the AV-175 config-drift vocabulary for program governance. A
+  drifted authority is either a completed handover the operator did not
+  approve or a tampered program account.
+
+New error codes (never renumbered): `InvalidUpgradeAuthority` (242),
+`UpgradeHandoverPending` (243), `NoUpgradeHandoverPending` (244),
+`UpgradeHandoverDelayNotElapsed` (245). Check order mirrors AV-163
+(authority first, then validity, then state).

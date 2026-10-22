@@ -1438,7 +1438,8 @@ mod idl_compat_tests {
             .expect("read checked-in IDL");
         let spec = parse_idl(&idl).expect("parse checked-in IDL");
         assert_eq!(spec.instructions.len(), 152);
-        assert_eq!(spec.errors.len(), 142);
+        // AV-179 adds 4 upgrade-authority errors.
+        assert_eq!(spec.errors.len(), 146);
         // AV-178 adds the TieredQuorum + Tier named types.
         assert_eq!(spec.types.len(), 35);
         let diff = diff_idl(&idl, &idl).unwrap();

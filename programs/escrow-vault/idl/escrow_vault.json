@@ -1857,7 +1857,11 @@
     {"code": 238, "name": "ElectionHeld"},
     {"code": 239, "name": "NotLeader"},
     {"code": 240, "name": "LeaseExpired"},
-    {"code": 241, "name": "InvalidShardMembership"}
+    {"code": 241, "name": "InvalidShardMembership"},
+    {"code": 242, "name": "InvalidUpgradeAuthority"},
+    {"code": 243, "name": "UpgradeHandoverPending"},
+    {"code": 244, "name": "NoUpgradeHandoverPending"},
+    {"code": 245, "name": "UpgradeHandoverDelayNotElapsed"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
