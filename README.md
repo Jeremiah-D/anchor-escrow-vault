@@ -1548,6 +1548,10 @@ program error per variant):
 | `KeeperHealthy` | 234 | `HeartbeatRegistry::claim` (AV-165) on a keeper that is not unhealthy — its escrow set is not claimable |
 | `ClaimConflict` | 235 | `HeartbeatRegistry::claim` (AV-165) on an already-claimed escrow set — first-come-first-served, the lost race is audited |
 | `InvalidClaim` | 236 | `HeartbeatRegistry::claim` (AV-165) with a zero standby key, a self-claim, or a claimed set over `MAX_CLAIMED_ESCROWS` |
+| `InvalidElectionConfig` | 237 | `KeeperElection::new` (AV-176) with zero `lease_ttl_secs`, or `acquire` with the zero key |
+| `ElectionHeld` | 238 | `KeeperElection::acquire` (AV-176) while another keeper holds a live lease |
+| `NotLeader` | 239 | `KeeperElection::renew` / `step_down` (AV-176) by a caller that is not the recorded leader |
+| `LeaseExpired` | 240 | `KeeperElection::renew` (AV-176) after the lease lapsed — re-acquire for a new term |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -5689,6 +5693,45 @@ claim). The detector only marks; the operator (or automation) decides
 which standby claims which set. The Anchor skeleton maps the six new
 error codes (231–236) one-per-variant; adding errors is non-breaking
 under the AV-152 semver gate.
+
+## Keeper leader election (AV-176)
+
+`escrow-state/src/keeper_election.rs` — lease-based mutual leadership
+for write operations across the keeper fleet. The keeper scans are
+dry-run, so many bots can share the *read* work — but submitting
+transactions needs exactly one writer, or two keepers race the same
+crank and one burns priority fees on a doomed transaction. Orthogonal
+to the AV-165 heartbeats: that module reports *liveness*, this module
+decides *who may write*.
+
+- **The campaign**: `acquire(keeper, now)` — the seat is open when no
+  leader is recorded or the lease lapsed (`now >= lease_expires_at`,
+  exclusive end). The winner takes term+1 and fencing-token+1 and a
+  fresh `now + lease_ttl_secs` lease (`LeaderElected` audit, with the
+  prior term so failovers are visible). Campaigning while holding a
+  live lease is an idempotent renew (same term/token, extended lease,
+  no audit noise); campaigning against another keeper's live lease is
+  `ElectionHeld` (code 238).
+- **The heartbeat**: `renew(keeper, now)` extends the lease but never
+  campaigns — after a lapse it returns `LeaseExpired` (code 240)
+  instead of silently re-electing, forcing an explicit re-`acquire`
+  (new term, new token). Renewing as a non-leader is `NotLeader`
+  (code 239).
+- **The resignation**: `step_down(keeper, now)` opens the seat
+  voluntarily; term and token are retained (monotonicity is never
+  rewound), so the next campaign continues the sequence.
+- **The fencing contract**: the new leader's token is strictly greater
+  than every previous token. Writers stamp operations with their
+  token; a write carrying a stale token belongs to a deposed leader
+  and must be rejected downstream — the crate *issues* the token, the
+  executor *enforces* it (a token nobody checks is just a number).
+
+Honest scope: off-chain coordination state, not an on-chain account —
+the caller feeds `now` (the crate has no clock). This is a
+single-writer lease, not Raft: every keeper must consult the *same*
+election state. The Anchor skeleton maps the four new error codes
+(237–240) one-per-variant; adding errors is non-breaking under the
+AV-152 semver gate.
 
 ## Funding amount bounds (AV-134)
 

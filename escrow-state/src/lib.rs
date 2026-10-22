@@ -449,6 +449,15 @@ pub use keeper_heartbeat::{
     KeeperLastAction, KEEPER_HEARTBEAT_DOMAIN, HEARTBEAT_MSG_LEN, MAX_CLAIMED_ESCROWS,
     MAX_KEEPER_AUDIT_ENTRIES,
 };
+// AV-176: keeper leader election — lease-based mutual leadership for
+// write operations across the keeper fleet (terms, fencing tokens,
+// acquire/renew/step_down). Purely additive and off-chain.
+mod keeper_election;
+pub use keeper_election::{
+    ElectionAuditEntry, ElectionAuditKind, ElectionConfig, ElectionGrant, KeeperElection,
+    MAX_ELECTION_AUDIT_ENTRIES,
+};
+
 
 // AV-20: off-chain keeper report — scan a batch of escrows for executable
 // `cancel_expired` / `claim` calls and serialize the call list as JSON.
@@ -3249,6 +3258,27 @@ pub enum EscrowError {
     /// [`MAX_CLAIMED_ESCROWS`](crate::MAX_CLAIMED_ESCROWS). Never
     /// renumbered (see [`EscrowError::code`]).
     InvalidClaim,
+    /// AV-176: [`KeeperElection::new`](crate::KeeperElection::new)
+    /// refused — zero `lease_ttl_secs`; or
+    /// [`KeeperElection::acquire`](crate::KeeperElection::acquire)
+    /// refused — the zero key can never be a leader. Never renumbered
+    /// (see [`EscrowError::code`]).
+    InvalidElectionConfig,
+    /// AV-176: [`KeeperElection::acquire`](crate::KeeperElection::acquire)
+    /// refused — another keeper holds a live lease. Never renumbered
+    /// (see [`EscrowError::code`]).
+    ElectionHeld,
+    /// AV-176: [`KeeperElection::renew`](crate::KeeperElection::renew)
+    /// / [`KeeperElection::step_down`](crate::KeeperElection::step_down)
+    /// refused — the caller is not the recorded leader. Never
+    /// renumbered (see [`EscrowError::code`]).
+    NotLeader,
+    /// AV-176: [`KeeperElection::renew`](crate::KeeperElection::renew)
+    /// refused — the lease already lapsed; the caller must
+    /// [`KeeperElection::acquire`](crate::KeeperElection::acquire)
+    /// again and take a new term. Never renumbered (see
+    /// [`EscrowError::code`]).
+    LeaseExpired,
 }
 
 impl EscrowError {
@@ -3458,6 +3488,10 @@ impl EscrowError {
             EscrowError::ClaimConflict => 235,
             // AV-165: appended, never renumbered.
             EscrowError::InvalidClaim => 236,
+            EscrowError::InvalidElectionConfig => 237,
+            EscrowError::ElectionHeld => 238,
+            EscrowError::NotLeader => 239,
+            EscrowError::LeaseExpired => 240,
         }
     }
 
@@ -3649,6 +3683,14 @@ impl EscrowError {
             EscrowError::ClaimConflict,
             // AV-165: appended, never renumbered.
             EscrowError::InvalidClaim,
+            // AV-176: appended, never renumbered.
+            EscrowError::InvalidElectionConfig,
+            // AV-176: appended, never renumbered.
+            EscrowError::ElectionHeld,
+            // AV-176: appended, never renumbered.
+            EscrowError::NotLeader,
+            // AV-176: appended, never renumbered.
+            EscrowError::LeaseExpired,
         ]
     }
 }
@@ -31127,6 +31169,30 @@ mod error_code_tests {
             236,
             "HeartbeatRegistry::claim with a zero standby key, a self-claim, or a claimed set over MAX_CLAIMED_ESCROWS (AV-165)",
         ),
+        // AV-176: appended, never renumbered.
+        (
+            EscrowError::InvalidElectionConfig,
+            237,
+            "KeeperElection::new with zero lease_ttl_secs, or KeeperElection::acquire with the zero key (AV-176)",
+        ),
+        // AV-176: appended, never renumbered.
+        (
+            EscrowError::ElectionHeld,
+            238,
+            "KeeperElection::acquire while another keeper holds a live lease (AV-176)",
+        ),
+        // AV-176: appended, never renumbered.
+        (
+            EscrowError::NotLeader,
+            239,
+            "KeeperElection::renew/step_down by a caller that is not the recorded leader (AV-176)",
+        ),
+        // AV-176: appended, never renumbered.
+        (
+            EscrowError::LeaseExpired,
+            240,
+            "KeeperElection::renew after the lease lapsed — re-acquire for a new term (AV-176)",
+        ),
     ];
 
     #[test]
@@ -31805,6 +31871,51 @@ mod error_code_tests {
         assert_eq!(err, EscrowError::InvalidPauseAuthority);
         assert_eq!(err.code(), 125);
     }
+
+    #[test]
+    fn invalid_election_config_triggered_by_zero_lease_ttl() {
+        let err = KeeperElection::new(ElectionConfig { lease_ttl_secs: 0 }).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidElectionConfig);
+        assert_eq!(err.code(), 237);
+    }
+
+    #[test]
+    fn election_held_triggered_by_second_campaigner_on_live_lease() {
+        let mut e =
+            KeeperElection::new(ElectionConfig { lease_ttl_secs: 30 }).unwrap();
+        e.acquire(ALICE, 1_000).unwrap();
+        let err = e.acquire(BOB, 1_010).unwrap_err();
+        assert_eq!(err, EscrowError::ElectionHeld);
+        assert_eq!(err.code(), 238);
+        // The refused campaign is not leadership: term and leader unchanged.
+        assert_eq!(e.term(), 1);
+        assert_eq!(e.leader(), Some(ALICE));
+    }
+
+    #[test]
+    fn not_leader_triggered_by_renew_from_non_leader() {
+        let mut e =
+            KeeperElection::new(ElectionConfig { lease_ttl_secs: 30 }).unwrap();
+        e.acquire(ALICE, 1_000).unwrap();
+        let err = e.renew(BOB, 1_010).unwrap_err();
+        assert_eq!(err, EscrowError::NotLeader);
+        assert_eq!(err.code(), 239);
+        let err = e.step_down(BOB, 1_010).unwrap_err();
+        assert_eq!(err, EscrowError::NotLeader);
+    }
+
+    #[test]
+    fn lease_expired_triggered_by_renew_after_lapse() {
+        let mut e =
+            KeeperElection::new(ElectionConfig { lease_ttl_secs: 30 }).unwrap();
+        e.acquire(ALICE, 1_000).unwrap();
+        let err = e.renew(ALICE, 1_030).unwrap_err();
+        assert_eq!(err, EscrowError::LeaseExpired);
+        assert_eq!(err.code(), 240);
+        assert!(!e.is_leader(ALICE, 1_030));
+    }
+
+
 
     #[test]
     fn default_judgment_not_due_triggered_by_early_trigger() {
@@ -56698,7 +56809,15 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::ClaimConflict));
         assert_eq!(EscrowError::InvalidClaim.code(), 236);
         assert!(EscrowError::all().contains(&EscrowError::InvalidClaim));
-        assert_eq!(EscrowError::all().len(), 137);
+        assert_eq!(EscrowError::InvalidElectionConfig.code(), 237);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidElectionConfig));
+        assert_eq!(EscrowError::ElectionHeld.code(), 238);
+        assert!(EscrowError::all().contains(&EscrowError::ElectionHeld));
+        assert_eq!(EscrowError::NotLeader.code(), 239);
+        assert!(EscrowError::all().contains(&EscrowError::NotLeader));
+        assert_eq!(EscrowError::LeaseExpired.code(), 240);
+        assert!(EscrowError::all().contains(&EscrowError::LeaseExpired));
+        assert_eq!(EscrowError::all().len(), 141);
     }
 
     #[test]

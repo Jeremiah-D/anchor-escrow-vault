@@ -11086,6 +11086,18 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidClaim => {
             error!(ErrorCode::InvalidClaim)
         }
+        escrow_state::EscrowError::InvalidElectionConfig => {
+            error!(ErrorCode::InvalidElectionConfig)
+        }
+        escrow_state::EscrowError::ElectionHeld => {
+            error!(ErrorCode::ElectionHeld)
+        }
+        escrow_state::EscrowError::NotLeader => {
+            error!(ErrorCode::NotLeader)
+        }
+        escrow_state::EscrowError::LeaseExpired => {
+            error!(ErrorCode::LeaseExpired)
+        }
     }
 }
 
@@ -11421,4 +11433,12 @@ pub enum ErrorCode {
     ClaimConflict,
     #[msg("Invalid claim (AV-165): zero standby key, self-claim, or claimed set over MAX_CLAIMED_ESCROWS (InvalidClaim, code 236)")]
     InvalidClaim,
+    #[msg("Invalid election config (AV-176): zero lease_ttl_secs, or acquiring leadership with the zero key (InvalidElectionConfig, code 237)")]
+    InvalidElectionConfig,
+    #[msg("Election held (AV-176): another keeper holds a live leadership lease — the seat is not open (ElectionHeld, code 238)")]
+    ElectionHeld,
+    #[msg("Not leader (AV-176): renew/step_down by a caller that is not the recorded leader (NotLeader, code 239)")]
+    NotLeader,
+    #[msg("Lease expired (AV-176): renew after the lease lapsed — re-acquire for a new term (LeaseExpired, code 240)")]
+    LeaseExpired,
 }

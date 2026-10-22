@@ -1830,7 +1830,11 @@
     {"code": 233, "name": "HeartbeatSignatureInvalid"},
     {"code": 234, "name": "KeeperHealthy"},
     {"code": 235, "name": "ClaimConflict"},
-    {"code": 236, "name": "InvalidClaim"}
+    {"code": 236, "name": "InvalidClaim"},
+    {"code": 237, "name": "InvalidElectionConfig"},
+    {"code": 238, "name": "ElectionHeld"},
+    {"code": 239, "name": "NotLeader"},
+    {"code": 240, "name": "LeaseExpired"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

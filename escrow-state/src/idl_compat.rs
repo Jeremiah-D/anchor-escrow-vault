@@ -1438,7 +1438,7 @@ mod idl_compat_tests {
             .expect("read checked-in IDL");
         let spec = parse_idl(&idl).expect("parse checked-in IDL");
         assert_eq!(spec.instructions.len(), 152);
-        assert_eq!(spec.errors.len(), 137);
+        assert_eq!(spec.errors.len(), 141);
         assert_eq!(spec.types.len(), 33);
         let diff = diff_idl(&idl, &idl).unwrap();
         assert!(diff.changes.is_empty());
