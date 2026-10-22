@@ -112,6 +112,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `rotate_initializer(new_initializer)`      | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the initializer) | **both** the *current* initializer and the taker must sign (dual-signature governance — the mirror of `rotate_taker`; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (arbitration in flight adjudicates the initializer's identity — the refund goes to the initializer); zero address is `InvalidInitializer`; on an actual change the initializer's activation signature bit is cleared (the new key never signed activation); the AV-23 whitelist pins the refund destination when configured, otherwise refunds resolve to the new initializer (keeper/snapshot follow automatically); emits `InitializerRotated` only on an actual change |
 | `rotate_arbiter(new_arbiter)`                | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the arbiter) | **both** the *current* initializer and the *current* taker must sign (dual-signature governance — the mirror of `rotate_initializer` for the arbitration role; the arbiter itself does not sign, so a lost arbiter key cannot block its own replacement; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (no live dispute path left to referee, and arbitration in flight must settle with the referee that heard it); a configured panel is `InvalidStateTransition` too (single-arbiter governance only — rotate the panel via `initialize_arbiter_panel`); no arbiter configured or the zero address is `InvalidArbiter`; the activation bitmask is untouched (it tracks only the initializer and taker); the keeper's `resolve` listing and the snapshot export read the live arbiter field (follow automatically); emits `ArbiterRotated` only on an actual change |
 | `rotate_fee_recipient(new_recipient)`         | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the fee recipient) | **both** the *current* initializer and the *current* taker must sign (dual-signature governance — the mirror of `rotate_arbiter` for the fee-destination role; the fee recipient itself does not sign, so a lost fee-recipient key cannot block its own replacement; degenerate initializer == taker self-escrow authorizes with one key passed twice); terminal states and `Disputed` are `InvalidStateTransition` (no future fee leg left to redirect, and the dispute settlement builders pin the fee leg to the configured recipient); no fee recipient configured or the zero address is `InvalidFeeRecipient` (code 123); the activation bitmask is untouched (it tracks only the initializer and taker); the keeper's fee listings and the snapshot export read the live `fee_recipient` field (follow automatically); emits `FeeRecipientRotated` only on an actual change |
+| `withdraw_protocol_fees(authority, amount)` | `Uninitialized`/`Activated`/`Funded`/`Disputed` (all non-terminal) | — (no state change; accumulates into `fees_withdrawn`) | authority must be the pinned `fee_recipient` or the initializer (`Unauthorized` otherwise); terminal states incl. `Closed` are `InvalidStateTransition`; paused is `Paused`; reentrancy-guarded (`ReentrantCall`); amount `0` or `> fees_paid - fees_withdrawn` is `AmountMismatch`; recipient is the pinned `fee_recipient` or the program-level fee account; emits `FeeWithdrawn` (fee == withdrawn, refund == remaining withdrawable) |
 | `delegate_authority(caller, delegate, scopes)` (AV-104) | `Uninitialized`/`Funded` | — (no state change; writes the operator grant) | **initializer or taker** (party power — a stranger, or the operator themselves, is `Unauthorized`, so grants never sub-delegate); the zero operator key, an empty scope bitmap, or scope bits outside the mask (`1` fund / `2` release / `4` cancel) is `InvalidDelegation` (code 160); terminal states and `Disputed` are `InvalidStateTransition`; a later grant overwrites the earlier one (single slot); `rotate_initializer` / `rotate_taker` clear the grant (fail-closed — the new party never inherits the old party's operator); emits `DelegationGranted` only on an actual change (an identical re-grant is a no-op success that emits nothing) |
 | `revoke_delegation(caller)` (AV-104)         | `Uninitialized`/`Funded` | — (no state change; clears the operator grant) | **either** party may revoke — the initializer can cut off a taker-appointed operator and vice versa; a stranger is `Unauthorized`; no live grant is `InvalidDelegation` (code 160); emits `DelegationRevoked` |
 | `link_swap(caller, escrow_id_a, escrow_id_b, amount_a, amount_b)` (AV-105) | `Uninitialized` (both legs) | — (no state change; writes each vault's counterparty id) | **one of the two parties** (an AV-104 operator is `Unauthorized`); mirrored parties required (`InvalidSwapParties` code 161 — zero/duplicate counterparty id is the same code); leg amounts must equal the locked amounts (`InvalidSwapAmounts` code 162); already-linked is `SwapLinkActive` (code 163); on-chain requires *both* parties as signers; emits `SwapLinked` on each vault |
@@ -2342,6 +2343,29 @@ is an annotation, not an executable action — the relay path is the
 entry's recorded seeds (`WatchedEscrow::with_vault_seeds`) — hex when
 seeds are known, `null` otherwise; informational, never an instruction
 input.
+
+## Protocol-fee collection scan (AV-174)
+
+Protocol fees accrue into each escrow's `fees_paid` counter as releases
+happen; the protocol side extracts them with
+`withdraw_protocol_fees(authority, amount)` (see the state-machine
+table — authority is the pinned `fee_recipient` or the initializer,
+terminal states and paused vaults are rejected, over-withdrawal is
+`AmountMismatch`, and `fees_withdrawn` tracks the cumulative extracted
+amount so `fees_withdrawn <= fees_paid` always holds). The keeper gets a
+dry-run `scan_fee_collection(watched)` report listing every watched
+vault with `withdrawable_fees() > 0`, each entry carrying the exact
+executable call — `escrow_id`, `state`, `caller` (the pinned fee
+recipient, else the initializer), `recipient` (the pinned fee recipient,
+or `null` when the escrow uses the program-level fee account), and
+`amount` (`fees_paid - fees_withdrawn`) — sorted by `escrow_id`
+ascending, plus `total_withdrawable`. Terminal, paused, and
+reentrancy-locked vaults are skipped (the chain would reject those
+calls — the `scan_unclaimed_rent` executable-only rule).
+`FeeCollectionReport::to_json()` emits hand-serialized JSON (fixed field
+order, 64-char lowercase hex keys, dependency-free like every other
+keeper report). The scan is pure: it reads `&Escrow` snapshots only and
+never withdraws.
 
 ## Initialize-config assembly validator (AV-161)
 

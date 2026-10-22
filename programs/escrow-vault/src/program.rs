@@ -4531,6 +4531,37 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Extract accumulated protocol fees to the protocol side (AV-174;
+    /// mirrors `Escrow::withdraw_protocol_fees`). The caller must be the
+    /// pinned fee_recipient or the initializer. The destination is the
+    /// pinned fee_recipient when set, otherwise the program-level fee
+    /// account (the `fee_destination` CHECK account). The withdrawn
+    /// amount accumulates into `fees_withdrawn`, bounded by
+    /// `fees_paid - fees_withdrawn`.
+    pub fn withdraw_protocol_fees(
+        ctx: Context<WithdrawProtocolFees>,
+        amount: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let from = escrow.state() as u8;
+        let withdrawal = escrow
+            .withdraw_protocol_fees(ctx.accounts.authority.key().to_bytes(), amount)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The FeeWithdrawn event carries the withdrawn amount as the
+        // fee leg and the remaining withdrawable as the refund leg.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::FeeWithdrawn,
+            from,
+            escrow.state() as u8,
+            ctx.accounts.authority.key().to_bytes(),
+            withdrawal.amount,
+            withdrawal.withdrawable,
+        );
+        Ok(())
+    }
+
     /// Rotate the emergency-pause authority by owner governance (AV-47;
     /// mirrors `Escrow::rotate_pause_authority`). Only the initializer
     /// signs — the *escrow* authority, not the pause key, so a lost pause
@@ -6971,6 +7002,12 @@ pub struct Vault {
     /// `escrow_state::VAULT_FIELDS` (appended last, after
     /// `governance_delay_secs`).
     pub governance_proposal: Option<GovernanceProposal>,
+    /// AV-174: cumulative protocol fees withdrawn to the protocol side
+    /// (mirrors `escrow_state`'s `fees_withdrawn`); always
+    /// `<= fees_paid`. Layout position matches
+    /// `escrow_state::VAULT_FIELDS` (appended last, after
+    /// `governance_proposal`).
+    pub fees_withdrawn: u64,
 }
 
 /// AV-163: the on-chain mirror of `escrow_state::ProgramCircuitBreaker`
@@ -7791,6 +7828,12 @@ pub enum EscrowVaultEventKind {
     /// Mirrors
     /// `escrow_state::EscrowEventKind::DualControlCancelled`.
     DualControlCancelled,
+    /// AV-174: protocol fees were extracted to the protocol side
+    /// (`Escrow::withdraw_protocol_fees`). Mirrors
+    /// `escrow_state::EscrowEventKind::FeeWithdrawn`; the event's
+    /// `amount` field carries the withdrawn amount and the
+    /// `refund` field carries the remaining withdrawable.
+    FeeWithdrawn,
 }
 
 /// AV-18: map `escrow_state::EscrowEventKind` onto the on-chain
@@ -7906,6 +7949,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::DualControlCancelled => {
             EscrowVaultEventKind::DualControlCancelled
+        }
+        escrow_state::EscrowEventKind::FeeWithdrawn => {
+            EscrowVaultEventKind::FeeWithdrawn
         }
     }
 }
@@ -9698,6 +9744,24 @@ pub struct UnpauseProgram<'info> {
     pub circuit_breaker: Account<'info, CircuitBreaker>,
     /// The bound pauser (same rules as `PauseProgram`).
     pub pauser: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawProtocolFees<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The withdrawal authority — the pinned fee_recipient or the
+    /// initializer (anyone else is `Unauthorized`).
+    pub authority: Signer<'info>,
+    /// The fee destination — the pinned fee_recipient when set,
+    /// otherwise the program-level fee account (CHECK: the
+    /// `push_fee_leg` convention accepts any nonzero address).
+    /// CHECK: the destination is validated by the fee-recipient pin,
+    /// not by the account constraint.
+    pub fee_destination: AccountInfo<'info>,
+    /// The clock sysvar (for the event timestamp).
+    /// CHECK: the sysvar is validated by address.
+    pub clock: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]

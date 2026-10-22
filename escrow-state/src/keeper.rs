@@ -6292,6 +6292,281 @@ pub fn scan_unclaimed_rent(watched: &[WatchedEscrow], now: u64) -> UnclaimedRent
     }
 }
 
+/// A vault whose accumulated protocol fee is withdrawable — the
+/// dry-run entry of [`scan_fee_collection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectableFees {
+    /// Caller-supplied 32-byte escrow identity (see
+    /// [`WatchedEscrow::escrow_id`]).
+    pub escrow_id: [u8; 32],
+    /// The state the vault sits in (always non-terminal — the scan
+    /// only lists vaults the chain would accept).
+    pub state: EscrowState,
+    /// The withdrawal caller: the pinned fee recipient, else the
+    /// initializer (the two keys
+    /// [`Escrow::withdraw_protocol_fees`](crate::Escrow::withdraw_protocol_fees)
+    /// accepts).
+    pub caller: [u8; 32],
+    /// The resolved fee destination: the pinned fee recipient, or
+    /// `None` when the escrow uses the program-level fee account
+    /// (backward compatible — the Anchor layer supplies it, exactly
+    /// like the AV-44 fee legs' `fee_leg`).
+    pub recipient: Option<[u8; 32]>,
+    /// The exact withdrawable amount (`fees_paid - fees_withdrawn`).
+    pub amount: u64,
+}
+
+/// The read-only result of [`scan_fee_collection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeeCollectionReport {
+    /// Every watched vault with withdrawable protocol fee, sorted by
+    /// `escrow_id` ascending (deterministic — the keeper collects the
+    /// smallest identity first).
+    pub collectable: Vec<CollectableFees>,
+    /// Total withdrawable protocol fee across all listed vaults.
+    pub total_withdrawable: u64,
+}
+
+impl FeeCollectionReport {
+    /// Hand-serialized JSON (the crate stays dependency-free; keys
+    /// are 64-char lowercase hex; fixed field order):
+    /// `{"scanned":N,"collectable":[{"escrow_id":"…","state":"…",
+    /// "action":"withdraw_protocol_fees","caller":"…","recipient":"…"|null,
+    /// "amount":N}],"total_withdrawable":N}`.
+    pub fn to_json(&self) -> String {
+        let mut s = String::with_capacity(64 + self.collectable.len() * 280);
+        s.push_str("{\"scanned\":");
+        s.push_str(&self.collectable.len().to_string());
+        s.push_str(",\"collectable\":[");
+        for (i, c) in self.collectable.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"escrow_id\":\"");
+            s.push_str(&hex32(&c.escrow_id));
+            s.push_str("\",\"state\":\"");
+            s.push_str(rent_health_state_name(c.state));
+            s.push_str("\",\"action\":\"withdraw_protocol_fees\",\"caller\":\"");
+            s.push_str(&hex32(&c.caller));
+            s.push_str("\",\"recipient\":");
+            match c.recipient {
+                Some(r) => {
+                    s.push('"');
+                    s.push_str(&hex32(&r));
+                    s.push('"');
+                }
+                None => s.push_str("null"),
+            }
+            s.push_str(",\"amount\":");
+            s.push_str(&c.amount.to_string());
+            s.push('}');
+        }
+        s.push_str("],\"total_withdrawable\":");
+        s.push_str(&self.total_withdrawable.to_string());
+        s.push('}');
+        s
+    }
+}
+
+/// Dry-run scan listing the watched vaults whose accumulated protocol
+/// fee is currently withdrawable via
+/// [`Escrow::withdraw_protocol_fees`](crate::Escrow::withdraw_protocol_fees)
+/// (AV-174).
+///
+/// A vault is listed when [`Escrow::withdrawable_fees`] is positive.
+/// The withdrawal's own guards would reject a terminal-state, paused,
+/// or reentrancy-locked vault — those are skipped here so the report
+/// only lists vaults the keeper can actually collect from now (the
+/// `scan_unclaimed_rent` executable-only rule).
+///
+/// Pure: reads `&Escrow` snapshots only — no mutation, no events, no
+/// clock. The keeper calls `withdraw_protocol_fees` for each listed
+/// vault; the scan itself never withdraws.
+pub fn scan_fee_collection(watched: &[WatchedEscrow]) -> FeeCollectionReport {
+    let mut collectable = Vec::new();
+    let mut total_withdrawable = 0u64;
+    for w in watched {
+        let e = &w.escrow;
+        let amount = e.withdrawable_fees();
+        if amount == 0 {
+            continue;
+        }
+        if e.state().is_terminal() || e.is_paused() || e.is_reentrancy_locked() {
+            continue;
+        }
+        let caller = e.fee_recipient().unwrap_or_else(|| e.initializer());
+        collectable.push(CollectableFees {
+            escrow_id: w.escrow_id,
+            state: e.state(),
+            caller,
+            recipient: e.fee_recipient(),
+            amount,
+        });
+        total_withdrawable = total_withdrawable.saturating_add(amount);
+    }
+    collectable.sort_by(|a, b| a.escrow_id.cmp(&b.escrow_id));
+    FeeCollectionReport {
+        collectable,
+        total_withdrawable,
+    }
+}
+
+#[cfg(test)]
+mod fee_collection_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const FEE_RECIPIENT: [u8; 32] = [0xFE; 32];
+    const ID1: [u8; 32] = [0x01; 32];
+    const ID2: [u8; 32] = [0x02; 32];
+    const ID3: [u8; 32] = [0x03; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn watch(id: [u8; 32], escrow: Escrow) -> WatchedEscrow {
+        let reference = escrow.reference();
+        WatchedEscrow {
+            escrow_id: id,
+            escrow,
+            reference,
+            vault_derivation: None,
+            pending_intent: None,
+        }
+    }
+
+    fn funded_escrow_with_fees() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(100) // 1% fee
+            .unwrap()
+            .with_fee_recipient(FEE_RECIPIENT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.release(ALICE, EXPIRES_AT - 1_800, 500_000, None, BOB)
+            .unwrap();
+        assert!(e.fees_paid() > 0);
+        e
+    }
+
+    #[test]
+    fn lists_withdrawable_vaults_with_exact_caller_and_amount() {
+        let e = funded_escrow_with_fees();
+        let withdrawable = e.withdrawable_fees();
+        // ID2 sorts before ID1: the report is deterministic by
+        // escrow_id ascending.
+        let watched = vec![watch(ID2, e.clone()), watch(ID1, e)];
+        let report = scan_fee_collection(&watched);
+        assert_eq!(report.collectable.len(), 2);
+        assert_eq!(report.collectable[0].escrow_id, ID1);
+        assert_eq!(report.collectable[1].escrow_id, ID2);
+        for c in &report.collectable {
+            assert_eq!(c.state, EscrowState::Funded);
+            assert_eq!(c.caller, FEE_RECIPIENT);
+            assert_eq!(c.recipient, Some(FEE_RECIPIENT));
+            assert_eq!(c.amount, withdrawable);
+        }
+        assert_eq!(report.total_withdrawable, withdrawable.saturating_mul(2));
+    }
+
+    #[test]
+    fn skips_vaults_with_nothing_withdrawable() {
+        let mut e = funded_escrow_with_fees();
+        // Drain the whole withdrawable amount: nothing left to list.
+        let w = e.withdrawable_fees();
+        e.withdraw_protocol_fees(FEE_RECIPIENT, w).unwrap();
+        assert_eq!(e.withdrawable_fees(), 0);
+        let report = scan_fee_collection(&[watch(ID1, e)]);
+        assert!(report.collectable.is_empty());
+        assert_eq!(report.total_withdrawable, 0);
+    }
+
+    #[test]
+    fn skips_paused_and_terminal_vaults() {
+        let mut paused = funded_escrow_with_fees();
+        paused.pause(ALICE, None).unwrap();
+        let mut terminal = funded_escrow_with_fees();
+        terminal.cancel(ALICE, None, ALICE, EXPIRES_AT + 3_600).unwrap();
+        terminal.close_vault(ALICE).unwrap();
+        let live = funded_escrow_with_fees();
+        let watched = vec![
+            watch(ID1, paused),
+            watch(ID2, terminal),
+            watch(ID3, live),
+        ];
+        let report = scan_fee_collection(&watched);
+        // Only the live vault is executable.
+        assert_eq!(report.collectable.len(), 1);
+        assert_eq!(report.collectable[0].escrow_id, ID3);
+    }
+
+    #[test]
+    fn falls_back_to_initializer_without_pinned_recipient() {
+        let mut e = funded_escrow_with_fees();
+        // Rebuild without the recipient pin: the program-level fee
+        // account convention applies (recipient None, caller ALICE).
+        let mut e2 = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(100)
+            .unwrap();
+        e2.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e2.release(ALICE, EXPIRES_AT - 1_800, 500_000, None, BOB)
+            .unwrap();
+        assert!(e2.fee_recipient().is_none());
+        let _ = e;
+        let report = scan_fee_collection(&[watch(ID1, e2)]);
+        assert_eq!(report.collectable.len(), 1);
+        assert_eq!(report.collectable[0].caller, ALICE);
+        assert_eq!(report.collectable[0].recipient, None);
+    }
+
+    #[test]
+    fn scan_is_dry_run_pure() {
+        let e = funded_escrow_with_fees();
+        let before = (
+            e.fees_paid(),
+            e.fees_withdrawn(),
+            e.withdrawable_fees(),
+            e.state(),
+        );
+        let watched = vec![watch(ID1, e)];
+        let _ = scan_fee_collection(&watched);
+        let after = (
+            watched[0].escrow.fees_paid(),
+            watched[0].escrow.fees_withdrawn(),
+            watched[0].escrow.withdrawable_fees(),
+            watched[0].escrow.state(),
+        );
+        assert_eq!(before, after, "scan must not mutate the escrow");
+    }
+
+    #[test]
+    fn to_json_is_deterministic() {
+        let e = funded_escrow_with_fees();
+        let withdrawable = e.withdrawable_fees();
+        let watched = vec![watch(ID2, e.clone()), watch(ID1, e)];
+        let json = scan_fee_collection(&watched).to_json();
+        // Fixed field order, 64-char lowercase hex keys, ID1 before
+        // ID2 (escrow_id ascending).
+        assert!(json.starts_with("{\"scanned\":2,\"collectable\":["));
+        let id1_hex = "0101010101010101010101010101010101010101010101010101010101010101";
+        let id2_hex = "0202020202020202020202020202020202020202020202020202020202020202";
+        let p1 = json.find(id1_hex).unwrap();
+        let p2 = json.find(id2_hex).unwrap();
+        assert!(p1 < p2, "escrow_id ascending");
+        assert!(json.contains("\"action\":\"withdraw_protocol_fees\""));
+        assert!(json.contains("\"state\":\"funded\""));
+        assert!(json.contains(&format!("\"amount\":{withdrawable}")));
+        assert!(json.ends_with(&format!(
+            "],\"total_withdrawable\":{}}}",
+            withdrawable.saturating_mul(2)
+        )));
+        // Second scan over the same input renders byte-identical JSON.
+        assert_eq!(json, scan_fee_collection(&watched).to_json());
+    }
+}
+
 #[cfg(test)]
 mod rent_health_tests {
     use super::*;

@@ -242,7 +242,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), PartiallyCancelled, ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-73), SchemaMigrated (AV-75), TemplateApplied (AV-77), VestingPaused (AV-150), VestingResumed (AV-150), AttestorReplaced (AV-154), MilestonesAmended (AV-155), GovernanceProposed (AV-158), GovernanceExecuted (AV-158), GovernanceCancelled (AV-158) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), PartiallyCancelled, ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-73), SchemaMigrated (AV-75), TemplateApplied (AV-77), VestingPaused (AV-150), VestingResumed (AV-150), AttestorReplaced (AV-154), MilestonesAmended (AV-155), GovernanceProposed (AV-158), GovernanceExecuted (AV-158), GovernanceCancelled (AV-158), FeeWithdrawn (AV-174) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, ShareClaimed (AV-149), MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | ReleasedSplit (AV-93) | gross taker amount (Σ net legs + fee) | protocol fee (AV-17, charged on the gross before the split) | 0 | 0 — the per-recipient `(recipient, net_share)` legs ride the event's `release_split` field |
 //! | BasketReleased (AV-95b) | the leg's gross remainder (taker payout + fee) | protocol fee (AV-17, charged on the leg's remainder) | 0 | 0 |
@@ -1051,6 +1051,19 @@ pub enum EscrowEventKind {
     /// [`EscrowEventKind::QuorumUpdated`]'s no-op rule). All amounts
     /// are zero.
     GovernanceCancelled,
+    /// AV-174: accumulated protocol fees were extracted to the
+    /// protocol side via
+    /// [`Escrow::withdraw_protocol_fees`](crate::Escrow::withdraw_protocol_fees).
+    /// `from == to ==` the current state — a treasury operation, not
+    /// a lifecycle move (like [`EscrowEventKind::QuorumUpdated`]).
+    /// `amounts.fee` carries the withdrawn amount and
+    /// `amounts.refund` the remaining withdrawable headroom, so
+    /// indexers see the post-withdrawal headroom without re-reading
+    /// the vault. The actor is the withdrawing authority (the pinned
+    /// fee recipient or the initializer). Always emitted on success —
+    /// a rejected call changes nothing, so a failed call emits
+    /// nothing.
+    FeeWithdrawn,
 }
 
 impl EscrowEventKind {
@@ -1262,6 +1275,10 @@ impl EscrowEventKind {
             82 => Self::GovernanceProposed,
             83 => Self::GovernanceExecuted,
             84 => Self::GovernanceCancelled,
+            // AV-174: appended after GovernanceCancelled so
+            // discriminants 0–84 stay stable for already-serialized
+            // vaults.
+            85 => Self::FeeWithdrawn,
             _ => return None,
         })
     }
@@ -1384,6 +1401,7 @@ impl EscrowEventKind {
             Self::GovernanceProposed => "governance_proposed",
             Self::GovernanceExecuted => "governance_executed",
             Self::GovernanceCancelled => "governance_cancelled",
+            Self::FeeWithdrawn => "fee_withdrawn",
         }
     }
 
@@ -1510,6 +1528,7 @@ impl EscrowEventKind {
             "governance_proposed" => Self::GovernanceProposed,
             "governance_executed" => Self::GovernanceExecuted,
             "governance_cancelled" => Self::GovernanceCancelled,
+            "fee_withdrawn" => Self::FeeWithdrawn,
             _ => return None,
         })
     }
@@ -1612,6 +1631,28 @@ impl EventAmounts {
     /// [`EscrowEventKind::VaultsBatchClosed`] summary event.
     pub(crate) fn batch_close(total_rent: u64) -> Self {
         Self::close(total_rent)
+    }
+
+    /// A protocol-fee withdrawal (AV-174): `withdrawn` lamports of
+    /// accumulated protocol fee extracted to the protocol side, with
+    /// `withdrawable` remaining. The `fee` leg carries the withdrawn
+    /// amount (it is fee money moving); `refund` carries the remaining
+    /// withdrawable headroom so indexers see the post-withdrawal
+    /// headroom without re-reading the vault. Rides the
+    /// [`EscrowEventKind::FeeWithdrawn`] event. The fold books nothing:
+    /// the fee already left the fold's `locked` at payout time as part
+    /// of the gross release (the AV-17 routing-slice rule), and
+    /// `fees_withdrawn` is the dedicated extraction counter (the
+    /// `penalty_paid` precedent).
+    fn fee_withdrawn(withdrawn: u64, withdrawable: u64) -> Self {
+        Self {
+            payout: 0,
+            fee: withdrawn,
+            refund: withdrawable,
+            penalty: 0,
+            rent_reclaimed: 0,
+            arbiter_fee: 0,
+        }
     }
 
     /// A permissionless rent top-up (AV-110): the topped-up `lamports`
@@ -6123,6 +6164,44 @@ impl IndexedEscrow {
         Ok(rent)
     }
 
+    /// Extract accumulated protocol fees to the protocol side (mirrors
+    /// [`Escrow::withdraw_protocol_fees`](crate::Escrow::withdraw_protocol_fees),
+    /// AV-174). The caller must be the pinned fee recipient or the
+    /// initializer (`Unauthorized` otherwise); terminal states,
+    /// a paused escrow, and a reentrant entry are refused by the inner
+    /// method's guard chain. Returns the resolved
+    /// [`FeeWithdrawal`](crate::FeeWithdrawal) — the destination the
+    /// executor routes the fee to (`None` means the program-level fee
+    /// account) and the remaining withdrawable headroom.
+    ///
+    /// Emits `FeeWithdrawn` with `from == to ==` the current state
+    /// (a treasury operation, not a lifecycle move);
+    /// `amounts.fee` is the withdrawn amount, `amounts.refund` the
+    /// remaining withdrawable. The actor is the withdrawing authority.
+    pub fn withdraw_protocol_fees(
+        &mut self,
+        authority: [u8; 32],
+        amount: u64,
+        at: u64,
+    ) -> Result<crate::FeeWithdrawal, EscrowError> {
+        let from = self.inner.state();
+        let result = self.inner.withdraw_protocol_fees(authority, amount);
+        let withdrawal = self.map_reentrant(result, at)?;
+        self.push_event(
+            EscrowEventKind::FeeWithdrawn,
+            from,
+            self.inner.state(),
+            EventAmounts::fee_withdrawn(withdrawal.amount, withdrawal.withdrawable),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok(withdrawal)
+    }
+
     /// Split a funded escrow into N child escrows by dual-signed
     /// governance (mirrors [`Escrow::split_escrow`](crate::Escrow::split_escrow),
     /// AV-81). Returns the child escrows as [`IndexedEscrow`]s — each
@@ -8826,7 +8905,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -8929,7 +9008,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9466,7 +9545,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9481,7 +9560,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9493,7 +9572,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9505,7 +9584,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9517,7 +9596,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9532,7 +9611,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9547,7 +9626,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9559,7 +9638,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9571,7 +9650,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9583,7 +9662,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9595,7 +9674,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9607,7 +9686,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9619,7 +9698,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9635,7 +9714,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9650,7 +9729,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9665,7 +9744,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9680,7 +9759,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]
@@ -9712,7 +9791,7 @@ mod event_tests {
             EscrowEventKind::from_name("governance_cancelled"),
             Some(cancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(85), None);
+        assert_eq!(EscrowEventKind::from_discriminant(86), None);
     }
 
     #[test]

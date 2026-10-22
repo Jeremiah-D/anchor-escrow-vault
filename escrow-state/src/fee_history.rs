@@ -272,8 +272,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // bookkeeping — no fee leg.
         // AV-150: freezing / restarting the vesting unlock clock
         // moves no funds — no fee leg.
+        // AV-174: a protocol-fee withdrawal carries no *new* fee leg
+        // — the fee was already attributed at payout time; the
+        // extraction is tracked by `fees_withdrawn`, not re-booked.
         | EscrowEventKind::VestingPaused
         | EscrowEventKind::VestingResumed
+        | EscrowEventKind::FeeWithdrawn
         | EscrowEventKind::TakerFunded => None,
     }
 }
@@ -896,8 +900,12 @@ mod fee_history_tests {
                 | EscrowEventKind::TakerFunded
                 // AV-150: freezing / restarting the vesting unlock
                 // clock moves no funds — no fee leg.
+                // AV-174: a protocol-fee withdrawal carries no *new*
+                // fee leg — the fee was already attributed at payout
+                // time.
                 | EscrowEventKind::VestingPaused
                 | EscrowEventKind::VestingResumed
+                | EscrowEventKind::FeeWithdrawn
                 | EscrowEventKind::ReleaseIntentAnnounced
                 | EscrowEventKind::ReleaseIntentVetoed
                 | EscrowEventKind::EscrowsMerged

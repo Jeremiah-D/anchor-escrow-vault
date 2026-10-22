@@ -347,6 +347,9 @@ pub struct EscrowSnapshot {
     pub fee_bps: u16,
     /// Cumulative protocol fee charged across all payouts (AV-17).
     pub fees_paid: u64,
+    /// Cumulative protocol fee withdrawn to the protocol side
+    /// (AV-174); always `<= fees_paid`.
+    pub fees_withdrawn: u64,
     /// Pinned protocol-fee recipient, or `None` when fees route to the
     /// program-level fee account (AV-44).
     pub fee_recipient: Option<[u8; 32]>,
@@ -819,6 +822,7 @@ impl Escrow {
             streaming_fees_accrued: self.streaming_fees_accrued(),
             fee_bps: self.fee_bps(),
             fees_paid: self.fees_paid(),
+            fees_withdrawn: self.fees_withdrawn(),
             fee_recipient: self.fee_recipient(),
             fee_cap: self.fee_cap(),
             // AV-66: the tiered fee schedule rides the export — `None`
@@ -1332,6 +1336,12 @@ impl EscrowSnapshot {
         s.push_str(&self.fees_paid.to_string());
         s.push_str(",\"display_fees_paid\":\"");
         s.push_str(&format_amount(self.fees_paid, self.decimals));
+        // AV-174: the cumulative protocol-fee withdrawal counter —
+        // always `<= fees_paid`.
+        s.push_str("\",\"fees_withdrawn\":");
+        s.push_str(&self.fees_withdrawn.to_string());
+        s.push_str(",\"display_fees_withdrawn\":\"");
+        s.push_str(&format_amount(self.fees_withdrawn, self.decimals));
         // AV-44: the pinned protocol-fee recipient — `null` when fees
         // route to the program-level fee account.
         s.push_str("\",\"fee_recipient\":");
@@ -1973,7 +1983,7 @@ mod snapshot_tests {
              \"quorum\":null,\
              \"vesting\":null,\"vesting_curve\":null,\"vested\":0,\"display_vested\":\"0\",\"claimable\":0,\"display_claimable\":\"0\",\
              \"arbiter\":null,\"mint\":null,\"mint_allowlist\":null,\"governance_delay_secs\":0,\"governance_proposal\":null,\"transfer_hook\":null,\"streaming_fee_rate\":0,\"streaming_fees_accrued\":0,\
-             \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
+             \"fee_bps\":0,\"fees_paid\":0,\"display_fees_paid\":\"0\",\"fees_withdrawn\":0,\"display_fees_withdrawn\":\"0\",\"fee_recipient\":null,\"fee_cap\":0,\"fee_schedule\":null,\
              \"milestones\":null,\"subscription\":null,\
              \"skipped\":0,\"display_skipped\":\"0\",\
              \"evidence_hash\":null,\"evidence_root\":null,\"evidence_disclosure\":null,\"evidence_deadline_secs\":0,\"escalated_by\":null,\"disputed_amount\":0,\"auto_unpause_at\":null,\"min_funding_amount\":null,\"max_funding_amount\":null,\"arbiter_fee_flat\":null,\"arbiter_fee_bps\":null,\"rationale_hash\":null,\"refund_to\":null,\"refund_recipient\":\"{init}\",\

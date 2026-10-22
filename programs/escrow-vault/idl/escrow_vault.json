@@ -1188,6 +1188,14 @@
       "discriminator": [43, 162, 233, 92, 254, 62, 69, 58],
       "accounts": [],
       "args": []
+    },
+    {
+      "name": "withdraw_protocol_fees",
+      "discriminator": [11, 68, 165, 98, 18, 208, 134, 73],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"}
+      ]
     }
   ],
   "accounts": [
@@ -1320,7 +1328,8 @@
           {"name": "vesting_pause", "type": {"option": {"defined": "VestingPause"}}, "offset": 6253},
           {"name": "mint_allowlist", "type": {"option": {"defined": "MintAllowlist"}}, "offset": 6262},
           {"name": "governance_delay_secs", "type": "u64", "offset": 6520},
-          {"name": "governance_proposal", "type": {"option": {"defined": "GovernanceProposal"}}, "offset": 6528}
+          {"name": "governance_proposal", "type": {"option": {"defined": "GovernanceProposal"}}, "offset": 6528},
+          {"name": "fees_withdrawn", "type": "u64", "offset": 6899}
         ]
       }
     }

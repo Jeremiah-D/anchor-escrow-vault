@@ -233,7 +233,13 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         | EscrowEventKind::VestingPaused
         | EscrowEventKind::VestingResumed
         | EscrowEventKind::AppealResolved
-        | EscrowEventKind::AppealExpired => (0, 0, 0),
+        | EscrowEventKind::AppealExpired
+        // AV-174: a protocol-fee withdrawal moves no *fold-tracked*
+        // funds — the fee already left `locked` at payout time as part
+        // of the gross release (the AV-17 routing-slice rule); the
+        // extraction is tracked by the state machine's dedicated
+        // `fees_withdrawn` counter (the `penalty_paid` precedent).
+        | EscrowEventKind::FeeWithdrawn => (0, 0, 0),
         // AV-124: a keeper-bounty payout — the bounty pool is
         // initializer-supplied funds the fold never booked (the pool
         // is additional inflow outside the principal, the AV-103
@@ -696,7 +702,7 @@ mod event_sourcing_tests {
         const FEE: u64 = 100;
         const REFUND: u64 = 700;
         const PENALTY: u64 = 50;
-        for d in 0..=84u8 {
+        for d in 0..=85u8 {
             let kind = EscrowEventKind::from_discriminant(d)
                 .unwrap_or_else(|| panic!("missing discriminant {d}"));
             let event = synth(kind, 0, PAYOUT, FEE, REFUND, PENALTY);
@@ -801,6 +807,10 @@ mod event_sourcing_tests {
                 // a Funded → Funded schedule-config flip, no funds move.
                 | EscrowEventKind::VestingPaused
                 | EscrowEventKind::VestingResumed
+                // AV-174: a protocol-fee withdrawal — the fee already
+                // left the fold's `locked` at payout time as part of
+                // the gross release (the AV-17 routing-slice rule).
+                | EscrowEventKind::FeeWithdrawn
                 // AV-104: config changes — no fund movement.
                 | EscrowEventKind::DelegationGranted
                 | EscrowEventKind::DelegationRevoked

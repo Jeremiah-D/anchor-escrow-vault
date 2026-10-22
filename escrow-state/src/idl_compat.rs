@@ -970,6 +970,7 @@ pub fn diff_idl(old_json: &str, new_json: &str) -> Result<IdlDiff, String> {
 pub const BREAKING_CHANGE_ALLOWLIST: &[&str] = &[
     "field_added:account Vault.governance_delay_secs",
     "field_added:account Vault.governance_proposal",
+    "field_added:account Vault.fees_withdrawn",
 ];
 
 fn unallowed_breaking_with(diff: &IdlDiff, allowlist: &[&str]) -> Vec<String> {
@@ -1436,7 +1437,7 @@ mod idl_compat_tests {
         let idl = std::fs::read_to_string("../programs/escrow-vault/idl/escrow_vault.json")
             .expect("read checked-in IDL");
         let spec = parse_idl(&idl).expect("parse checked-in IDL");
-        assert_eq!(spec.instructions.len(), 151);
+        assert_eq!(spec.instructions.len(), 152);
         assert_eq!(spec.errors.len(), 137);
         assert_eq!(spec.types.len(), 33);
         let diff = diff_idl(&idl, &idl).unwrap();

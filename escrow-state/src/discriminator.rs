@@ -1553,6 +1553,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(GOVERNANCE_PROPOSAL_LEN)?;
         None
     };
+    // AV-174: the cumulative protocol-fee withdrawal counter — the
+    // 8-byte `fees_withdrawn` (`0` = no fee ever withdrawn).
+    // Structural decode only — the withdrawal invariants are
+    // enforced by `withdraw_protocol_fees`, not re-litigated here.
+    let fees_withdrawn = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1857,6 +1862,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-158: the live delayed-governance proposal — a decoded
         // escrow carries the same proposal the live one recorded.
         governance_proposal,
+        // AV-174: the cumulative protocol-fee withdrawal counter — a
+        // decoded escrow carries the same `fees_withdrawn` the live
+        // one recorded.
+        fees_withdrawn,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
