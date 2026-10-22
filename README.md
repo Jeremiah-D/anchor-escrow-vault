@@ -6022,3 +6022,43 @@ cargo test -p escrow-vault -- --ignored
 Each stub first probes `127.0.0.1:8899`; if no validator is reachable it
 fails with an explicit message rather than pretending to pass. The stubs
 use only the existing `escrow-state` dependency — no new crates.
+
+## Amount-tiered attestor quorum (AV-178)
+
+`escrow-state/src/tiered_quorum.rs` — the release amount selects the
+attestor weight threshold. A `TieredQuorum` wraps the AV-04
+`QuorumPolicy` (the weighted attestor registry and its accumulated
+votes) with a configurable tier table: a release of `amount <=
+max_amount` must reach that tier's weight-sum threshold. Small releases
+clear with a light quorum (e.g. 1-of-N weight), large releases demand
+the full panel (N-of-N weight) — the payment-risk pattern: low-value
+payouts stay fast while high-value payouts harden into multi-sig
+(Solana governance / payment risk control).
+
+- **The table**: `TieredQuorum::new(base, tiers)` validates the table —
+  1–4 tiers, strictly increasing amount ceilings, an open-ended top
+  tier (`u64::MAX`, so no amount falls through), non-decreasing
+  thresholds with the amount (a larger release can never demand less
+  weight — monotonicity), and every threshold inside
+  `1..=total_weight` (an unreachable threshold would lock funds behind
+  an unsatisfiable gate). Violations are `InvalidQuorum` (code 104),
+  the same family as the AV-04 policy errors.
+- **The gate**: `Escrow::with_tiered_quorum` is `Uninitialized`-only and
+  mutually exclusive with `with_quorum` (`InvalidQuorum` when the other
+  is already attached). `Escrow::attest` routes votes to the wrapped
+  policy, so attestations keep accumulating across transactions exactly
+  as before. Every taker payout path (`release`, `release_split`,
+  `release_payout_split`, `claim`, `release_milestone`,
+  `release_period_locked`, `release_basket`, `release_basket_all`)
+  checks the tier threshold for its release amount via
+  `require_release_quorum`, in the exact position the plain quorum check
+  held — authority, then state, then quorum — so the check order is
+  unchanged. `QuorumNotReached` on failure, like the plain gate.
+- **The layout**: the tiered policy persists in the vault tail
+  (`1 + TIERED_QUORUM_LEN` bytes: the `Option` discriminant, the
+  wrapped policy bytes, the tier slots, the tier-count byte), appended
+  last so every earlier field offset stays stable. The structural
+  decoder (`decode_vault_account`) rebuilds it field-by-field and
+  rejects an out-of-range tier count (`InvalidTieredQuorumLen`) rather
+  than decoding a value the accessors cannot safely read (AV-32
+  panic-free guarantee).

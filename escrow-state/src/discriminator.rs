@@ -39,7 +39,7 @@ use super::{
     sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, ClaimantRoster, CounterOffer, CpiAllowlist,
     DefaultJudgment, DualControlIntent, DutchAuction, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
     Delegation, FundingPlan, GovernanceAction, GovernanceProposal, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, PayoutSplit, QuorumPolicy,
-    MintAllowlist,
+    MintAllowlist, Tier, TieredQuorum,
     SlashTerms, SlashLadder, SlashRung, SubscriptionSchedule, VestingCurve, VestingPause, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
     APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, CLAIMANT_ROSTER_LEN, COUNTER_OFFER_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
     DELEGATION_LEN, DUAL_CONTROL_INTENT_LEN, DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
@@ -48,7 +48,7 @@ use super::{
     GOVERNANCE_ACTION_PAYLOAD_LEN, GOVERNANCE_PROPOSAL_LEN,
     MILESTONE_PLAN_LEN, MINT_ALLOWLIST_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN,
     PAYOUT_DENYLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_LADDER_LEN, SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN,
-    SWAP_LINK_REGION_LEN, VAULT_SPACE, VESTING_CURVE_LEN,
+    SWAP_LINK_REGION_LEN, VAULT_SPACE, VESTING_CURVE_LEN, MAX_TIERS, TIERED_QUORUM_LEN,
 };
 
 /// Program-side `#[account]` type names, in Anchor IDL order. The single
@@ -197,6 +197,14 @@ pub enum AccountDecodeError {
     /// the accessors cannot safely read (AV-126; AV-32 panic-free
     /// guarantee).
     InvalidSlashLadderLen(u8),
+    /// A present tiered quorum's tier count is outside `1..=4`
+    /// ([`MAX_TIERS`](crate::MAX_TIERS)). The count byte is part of the
+    /// field's layout — an out-of-range count would make
+    /// [`TieredQuorum::tiers`](crate::TieredQuorum::tiers) read past the
+    /// live slots, so the decoder rejects it rather than decoding a
+    /// value the accessors cannot safely read (AV-178; AV-32 panic-free
+    /// guarantee).
+    InvalidTieredQuorumLen(u8),
     /// A present governance proposal's action kind byte is not a known
     /// [`GovernanceAction`](crate::GovernanceAction) discriminant
     /// (0–3). The mapping is pinned to declaration order (AV-158;
@@ -1558,6 +1566,51 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // Structural decode only — the withdrawal invariants are
     // enforced by `withdraw_protocol_fees`, not re-litigated here.
     let fees_withdrawn = c.u64_le()?;
+    // AV-178: the amount-tiered attestor quorum tail — the 1-byte
+    // `Option` discriminant, then the wrapped AV-04 policy bytes, the
+    // tier slots, and the tier-count byte. Structural decode only —
+    // the tier-table invariants are enforced by `TieredQuorum::new`,
+    // not re-litigated here — except the count byte: an out-of-range
+    // count would make `TieredQuorum::tiers` read past the live slots,
+    // so the decoder rejects it (AV-32 panic-free guarantee).
+    let tiered_quorum = if c.option_present("tiered_quorum")? {
+        let mut attestors = [[0u8; 32]; MAX_ATTESTORS];
+        for a in attestors.iter_mut() {
+            *a = c.pubkey()?;
+        }
+        let mut weights = [0u64; MAX_ATTESTORS];
+        for w in weights.iter_mut() {
+            *w = c.u64_le()?;
+        }
+        let registered = c.u8()?;
+        let threshold = c.u64_le()?;
+        let approvals = c.u64_le()?;
+        let base = QuorumPolicy {
+            attestors,
+            weights,
+            registered,
+            threshold,
+            approvals,
+        };
+        let mut tiers = [Tier { max_amount: 0, threshold: 0 }; MAX_TIERS];
+        for t in tiers.iter_mut() {
+            t.max_amount = c.u64_le()?;
+            t.threshold = c.u64_le()?;
+        }
+        let tier_count = c.u8()?;
+        if tier_count == 0 || tier_count > MAX_TIERS as u8 {
+            return Err(AccountDecodeError::InvalidTieredQuorumLen(tier_count));
+        }
+        debug_assert_eq!(
+            QUORUM_POLICY_LEN + MAX_TIERS * 16 + 1,
+            TIERED_QUORUM_LEN,
+            "tiered quorum region drift vs TIERED_QUORUM_LEN"
+        );
+        Some(TieredQuorum { base, tiers, tier_count })
+    } else {
+        c.skip(TIERED_QUORUM_LEN)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1866,6 +1919,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // decoded escrow carries the same `fees_withdrawn` the live
         // one recorded.
         fees_withdrawn,
+        // AV-178: the amount-tiered attestor quorum — a decoded escrow
+        // carries the same tier table the live one recorded.
+        tiered_quorum,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

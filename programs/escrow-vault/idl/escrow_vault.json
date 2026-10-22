@@ -1329,7 +1329,8 @@
           {"name": "mint_allowlist", "type": {"option": {"defined": "MintAllowlist"}}, "offset": 6262},
           {"name": "governance_delay_secs", "type": "u64", "offset": 6520},
           {"name": "governance_proposal", "type": {"option": {"defined": "GovernanceProposal"}}, "offset": 6528},
-          {"name": "fees_withdrawn", "type": "u64", "offset": 6899}
+          {"name": "fees_withdrawn", "type": "u64", "offset": 6899},
+          {"name": "tiered_quorum", "type": {"option": {"defined": "TieredQuorum"}}, "offset": 6907}
         ]
       }
     }
@@ -1345,6 +1346,27 @@
           {"name": "registered", "type": "u8", "offset": 320},
           {"name": "threshold", "type": "u64", "offset": 321},
           {"name": "approvals", "type": "u64", "offset": 329}
+        ]
+      }
+    },
+    {
+      "name": "TieredQuorum",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "base", "type": {"defined": "QuorumPolicy"}, "offset": 0},
+          {"name": "tiers", "type": {"array": [{"defined": "Tier"}, 4]}, "offset": 337},
+          {"name": "tier_count", "type": "u8", "offset": 401}
+        ]
+      }
+    },
+    {
+      "name": "Tier",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "max_amount", "type": "u64", "offset": 0},
+          {"name": "threshold", "type": "u64", "offset": 8}
         ]
       }
     },
