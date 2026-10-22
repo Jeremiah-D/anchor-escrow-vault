@@ -11098,6 +11098,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::LeaseExpired => {
             error!(ErrorCode::LeaseExpired)
         }
+        escrow_state::EscrowError::InvalidShardMembership => {
+            error!(ErrorCode::InvalidShardMembership)
+        }
     }
 }
 
@@ -11441,4 +11444,6 @@ pub enum ErrorCode {
     NotLeader,
     #[msg("Lease expired (AV-176): renew after the lease lapsed — re-acquire for a new term (LeaseExpired, code 240)")]
     LeaseExpired,
+    #[msg("Invalid shard membership (AV-177): the shard roster contains the zero key or a duplicate member (InvalidShardMembership, code 241)")]
+    InvalidShardMembership,
 }

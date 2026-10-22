@@ -457,6 +457,14 @@ pub use keeper_election::{
     ElectionAuditEntry, ElectionAuditKind, ElectionConfig, ElectionGrant, KeeperElection,
     MAX_ELECTION_AUDIT_ENTRIES,
 };
+// AV-177: keeper task sharding — rendezvous-hash sharding of the
+// keeper watch list across fleet instances (minimal-disruption
+// membership changes, shard reports). Purely additive and off-chain.
+mod keeper_sharding;
+pub use keeper_sharding::{
+    MemberLoad, ShardAssignment, ShardAuditEntry, ShardAuditKind, ShardDiff, ShardMap, ShardMove,
+    ShardReport, MAX_SHARD_AUDIT_ENTRIES,
+};
 
 
 // AV-20: off-chain keeper report — scan a batch of escrows for executable
@@ -3279,6 +3287,11 @@ pub enum EscrowError {
     /// again and take a new term. Never renumbered (see
     /// [`EscrowError::code`]).
     LeaseExpired,
+    /// AV-177: [`ShardMap::new`](crate::ShardMap::new) /
+    /// [`ShardMap::update_members`](crate::ShardMap::update_members)
+    /// refused — the roster contains the zero key or a duplicate
+    /// member. Never renumbered (see [`EscrowError::code`]).
+    InvalidShardMembership,
 }
 
 impl EscrowError {
@@ -3492,6 +3505,7 @@ impl EscrowError {
             EscrowError::ElectionHeld => 238,
             EscrowError::NotLeader => 239,
             EscrowError::LeaseExpired => 240,
+            EscrowError::InvalidShardMembership => 241,
         }
     }
 
@@ -3691,6 +3705,8 @@ impl EscrowError {
             EscrowError::NotLeader,
             // AV-176: appended, never renumbered.
             EscrowError::LeaseExpired,
+            // AV-177: appended, never renumbered.
+            EscrowError::InvalidShardMembership,
         ]
     }
 }
@@ -31193,6 +31209,12 @@ mod error_code_tests {
             240,
             "KeeperElection::renew after the lease lapsed — re-acquire for a new term (AV-176)",
         ),
+        // AV-177: appended, never renumbered.
+        (
+            EscrowError::InvalidShardMembership,
+            241,
+            "ShardMap::new/update_members with a zero member key or a duplicate member (AV-177)",
+        ),
     ];
 
     #[test]
@@ -31913,6 +31935,15 @@ mod error_code_tests {
         assert_eq!(err, EscrowError::LeaseExpired);
         assert_eq!(err.code(), 240);
         assert!(!e.is_leader(ALICE, 1_030));
+    }
+
+    #[test]
+    fn invalid_shard_membership_triggered_by_zero_member_key() {
+        let err = ShardMap::new(&[ALICE, [0u8; 32]]).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidShardMembership);
+        assert_eq!(err.code(), 241);
+        let err = ShardMap::new(&[ALICE, ALICE]).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidShardMembership);
     }
 
 
@@ -56817,7 +56848,9 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::NotLeader));
         assert_eq!(EscrowError::LeaseExpired.code(), 240);
         assert!(EscrowError::all().contains(&EscrowError::LeaseExpired));
-        assert_eq!(EscrowError::all().len(), 141);
+        assert_eq!(EscrowError::InvalidShardMembership.code(), 241);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidShardMembership));
+        assert_eq!(EscrowError::all().len(), 142);
     }
 
     #[test]

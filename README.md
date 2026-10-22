@@ -1552,6 +1552,7 @@ program error per variant):
 | `ElectionHeld` | 238 | `KeeperElection::acquire` (AV-176) while another keeper holds a live lease |
 | `NotLeader` | 239 | `KeeperElection::renew` / `step_down` (AV-176) by a caller that is not the recorded leader |
 | `LeaseExpired` | 240 | `KeeperElection::renew` (AV-176) after the lease lapsed — re-acquire for a new term |
+| `InvalidShardMembership` | 241 | `ShardMap::new` / `update_members` (AV-177) with a zero member key or a duplicate member |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -5732,6 +5733,49 @@ single-writer lease, not Raft: every keeper must consult the *same*
 election state. The Anchor skeleton maps the four new error codes
 (237–240) one-per-variant; adding errors is non-breaking under the
 AV-152 semver gate.
+
+## Keeper task sharding (AV-177)
+
+`escrow-state/src/keeper_sharding.rs` — rendezvous-hash sharding of the
+keeper watch list across fleet instances. One keeper *can* scan the
+whole watch list, but as the fleet and vault count grow, every keeper
+scanning everything wastes RPC budget and risks duplicate submissions.
+Each vault is assigned to the member with the highest deterministic
+`weight(member, vault)`; every instance computes the same assignment
+independently, so the roster is either configured identically on every
+keeper or distributed by the AV-176 leader. Orthogonal to the AV-37
+batch lifecycle scan (that module scans *one* keeper's watch list;
+this module decides *which* list each keeper scans) and to the AV-176
+election (that module decides *who may write*; this module decides
+*who watches what*).
+
+- **The assignment**: `assign(vault)` → the winning keeper (ties break
+  toward the earliest roster member; the roster is sorted at
+  construction so caller argument order never matters).
+  `shard_watch_list(vaults)` shards a whole list in input order. An
+  empty roster assigns nothing (`None`) — the operator must notice
+  the empty report; the map will not invent a keeper.
+- **The membership change**: `update_members(new_members, vaults,
+  now)` validates the new roster (`InvalidShardMembership`, code 241:
+  zero key or duplicate), recomputes assignments, and returns the
+  `ShardDiff` — added/removed members plus every moved vault with
+  `from`/`to` (the zero key stands for "no keeper", so the diff stays
+  total when a roster is empty on either side). Minimal disruption is
+  a property of rendezvous hashing: removing a member moves exactly
+  that member's vaults; adding a member moves vaults only *to* the new
+  member. A `MembershipChanged` audit entry records the counts.
+- **The report**: `report(vaults, now)` builds per-member vault counts
+  (loads sum to the total; every member appears, even at zero) —
+  built to be embedded in the keeper reporting layer alongside the
+  `ShardDiff` change data.
+
+Honest scope: the weight function is FNV-1a-64 with a splitmix64
+finalizer — deterministic and well-distributed, but not
+cryptographic; sharding is load distribution, not a security
+boundary. Off-chain state, no on-chain account; the caller supplies
+the vault list (the keeper scans own the watch list). The Anchor
+skeleton maps the new error code (241) one-per-variant; adding errors
+is non-breaking under the AV-152 semver gate.
 
 ## Funding amount bounds (AV-134)
 

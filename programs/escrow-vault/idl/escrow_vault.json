@@ -1834,7 +1834,8 @@
     {"code": 237, "name": "InvalidElectionConfig"},
     {"code": 238, "name": "ElectionHeld"},
     {"code": 239, "name": "NotLeader"},
-    {"code": 240, "name": "LeaseExpired"}
+    {"code": 240, "name": "LeaseExpired"},
+    {"code": 241, "name": "InvalidShardMembership"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
