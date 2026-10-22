@@ -120,6 +120,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `cancel_swap(caller, escrow_id_a, escrow_id_b)` (AV-105) | `Funded` (both legs, cross-link matched) | `Cancelled` (both legs) | caller must be the initializer of at least one leg (party-only — a stranger or AV-104 operator is `Unauthorized`; on-chain requires both parties as signers); two-phase atomic like `release_swap`; emits `Cancelled` A→B |
 | `cancel_swap_expired(caller, escrow_id_a, escrow_id_b)` (AV-105) | `Funded` (both legs, cross-link matched, *both* expiry-eligible) | `Cancelled` (both legs) | either party (an AV-104 operator is `Unauthorized`); *both* legs must be expiry-eligible or the whole call refuses with `NotExpired` (no partial expiry); per-leg authority is the caller (AV-24 penalty keys per leg); emits `ExpiredCancelled` A→B |
 | `initialize_quorum(attestors, weights, threshold)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
+| `with_token_weighted_voting(snapshot)` (AV-183) | `Uninitialized`| `Uninitialized` | initializer (once, before funding); the snapshot's frozen token-balance weights land in the quorum slot — `release` needs a `threshold_bps`/10_000 weighted supermajority; mutually exclusive with plain/tiered quorum (`InvalidQuorum`); see "Token-weighted voting (AV-183)" |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `initialize_extension(max_extension_secs)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding); zero bound is `InvalidExpiryExtension`; persists the extension budget (`max_extension_secs`, `extension_count` starts 0) |
 | `extend_expiry(new_expires_at)`             | `Uninitialized`/`Funded` | — (no state change; pushes `expires_at` back) | initializer **only** (`Unauthorized` otherwise, checked before state validity); `Activated`/`Disputed`/terminal states are `InvalidStateTransition`; new deadline must be strictly later and each increment ≤ the bound (saturating counter); extending at/past keeper-eligibility (`now >= expires_at + grace_period`) is `InvalidExpiryExtension`; emits `ExpiryExtended` (old/new deadline, count) |
@@ -6132,6 +6133,45 @@ payouts stay fast while high-value payouts harden into multi-sig
   rejects an out-of-range tier count (`InvalidTieredQuorumLen`) rather
   than decoding a value the accessors cannot safely read (AV-32
   panic-free guarantee).
+
+## Token-weighted voting (AV-183)
+
+`escrow-state/src/weighted_voting.rs` — attestor weights derived from
+governance token balances, frozen at a snapshot slot. A
+`TokenWeightSnapshot` wraps the AV-04 `QuorumPolicy` (the weighted
+attestor registry and its accumulated votes): attestor `i` votes with
+weight `balances[i]`, the governance token balance read at
+`snapshot_slot`, and the release threshold is `ceil(threshold_bps /
+10_000 * total_weight)` — e.g. 6667 for a two-thirds supermajority,
+10_000 for unanimity.
+
+- **The flash-loan defense**: the snapshot is frozen at construction.
+  `Escrow::with_token_weighted_voting` is `Uninitialized`-only, and no
+  API mutates a weight afterwards — weights are never re-read from
+  token accounts, they are fixed numbers in the escrow config, so a
+  flash loan taken after the snapshot cannot inflate anyone's voting
+  power. Freezing is structural, not a runtime check.
+- **Validation** (`InvalidQuorum`, code 104, the AV-04 family): bps
+  outside `1..=10_000`, empty or `> 8` attestors, length mismatch,
+  duplicate or zero keys, zero balances (a zero-balance attestor has no
+  voting power — registering one is always a misconfiguration), or a
+  balances sum overflowing the `u64` weight domain. The ceiling
+  division keeps the threshold inside `1..=total_weight`, so a snapshot
+  can never lock funds behind an unsatisfiable gate.
+- **The gate**: the snapshot's derived policy lands in the escrow's
+  quorum slot, so `attest` and every taker payout path work unchanged —
+  only the weight source differs. Mutually exclusive with a plain or
+  tiered quorum. Orthogonal to AV-178 (the amount dimension): this
+  module is the weight-source dimension.
+- **Audit**: `TokenWeightSnapshot::to_json` exports the frozen snapshot
+  (bps threshold, snapshot slot, derived weight-sum threshold, every
+  attestor with its frozen balance-weight) as canonical JSON for the
+  off-chain governance audit trail. On-chain, the frozen weights ride
+  the quorum slot and are disclosed to indexers through the existing
+  quorum snapshot (`threshold`, `total_weight`, `approved_weight`).
+- **No layout change**: the derived policy reuses the existing quorum
+  account region, so `VAULT_FIELDS` / `VAULT_SPACE` / rent are
+  untouched.
 
 ## Program upgrade-authority handover (AV-179)
 

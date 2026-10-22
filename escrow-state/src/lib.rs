@@ -486,6 +486,13 @@ pub use keeper_sharding::{
 // clear with a light quorum, large releases demand the full panel).
 mod tiered_quorum;
 pub use tiered_quorum::{Tier, TieredQuorum, MAX_TIERS, TIERED_QUORUM_LEN};
+// AV-183: governance-token-weighted voting — attestor weights derived
+// from a frozen token-balance snapshot (flash-loan-proof by
+// construction), the release threshold in basis points. Wraps the AV-04
+// QuorumPolicy like the tiered quorum does; the weight source is the
+// new dimension.
+mod weighted_voting;
+pub use weighted_voting::{TokenWeightSnapshot, BPS_DENOMINATOR};
 // AV-179: program upgrade-authority handover — two-step propose/accept
 // with an opt-in handover delay, the structured handover audit ring,
 // and the keeper's upgrade-authority drift scan. Purely additive and
@@ -11610,6 +11617,38 @@ let fee = self.charge_protocol_fee(amount)?;
             return Err(EscrowError::InvalidQuorum);
         }
         self.tiered_quorum = Some(tiered);
+        Ok(self)
+    }
+
+    /// Attach governance-token-weighted voting to the release path
+    /// (AV-183): attestor weights are frozen token balances from the
+    /// snapshot, and `release` needs a `threshold_bps` / 10_000 weighted
+    /// supermajority instead of an operator-chosen weight sum.
+    ///
+    /// `Uninitialized`-only, like [`Escrow::with_quorum`]; mutually
+    /// exclusive with a plain or tiered quorum (`InvalidQuorum` when
+    /// either is already attached). The snapshot's derived policy lands
+    /// in the escrow's quorum slot, so [`Escrow::attest`] and the
+    /// release gate work unchanged — only the weight source differs
+    /// (frozen balances, never re-read from token accounts, which is
+    /// what makes flash-loan vote inflation impossible).
+    ///
+    /// Note the asymmetry with [`Escrow::with_quorum`]: calling
+    /// `with_quorum` after this replaces the policy (the existing
+    /// last-builder-wins behavior of `with_quorum`), while this
+    /// builder refuses an escrow that already carries any quorum.
+    pub fn with_token_weighted_voting(
+        mut self,
+        snapshot: TokenWeightSnapshot,
+    ) -> Result<Self, EscrowError> {
+        match self.state {
+            EscrowState::Uninitialized => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if self.quorum.is_some() || self.tiered_quorum.is_some() {
+            return Err(EscrowError::InvalidQuorum);
+        }
+        self.quorum = Some(snapshot.policy());
         Ok(self)
     }
 
