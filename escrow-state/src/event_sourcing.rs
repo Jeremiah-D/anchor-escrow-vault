@@ -662,6 +662,10 @@ mod event_sourcing_tests {
             // like the other kind-specific extras.
             slash_ladder_index: None,
             auto_unpause: false,
+            // AV-182: the memo note is a live-emit extra, not part of
+            // the synth projection — `None` here, like the other
+            // kind-specific extras.
+            memo: None,
         }
     }
 

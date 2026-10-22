@@ -3947,6 +3947,33 @@ into the address snapshot the v0 compiler takes.
   active (`deactivation_slot == u64::MAX`) — the keeper should only
   feed active tables here.
 
+### Memo program audit trail (AV-182)
+
+`escrow-state/src/memo.rs` attaches an on-chain audit note to a
+lifecycle transition's transaction via the SPL Memo program
+(`MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr`) — anyone can read the
+note from an explorer next to the program instruction.
+
+- **Real program behavior**: instruction data is the raw UTF-8 note
+  bytes (no discriminator); the program validates UTF-8 and enforces
+  no length cap itself (the runtime's instruction-data/packet limits
+  still apply). `MemoConfig.max_bytes` (default 256) is our policy
+  knob, not a chain rule. Zero accounts attached — the memo rides the
+  transaction's existing signers.
+- **Canonical note**: `transition_memo_note` is a pure function of
+  (transition, escrow_id, amount) —
+  `escrow-vault:<transition>:escrow=<64 hex>:amount=<u64>` — covering
+  `fund` / `release` / `cancel` / `resolve` / `claim`.
+- **Audit event agreement**: `IndexedEscrow::with_memo_config` opts in;
+  the five transition emitters stamp the same note on
+  `EscrowEvent.memo`, so the on-chain log and the off-chain event
+  agree by construction. The event never invents a note — `None` when
+  disabled.
+- **Opt-in, zero default-size impact**: a disabled config builds no
+  instruction and leaves compiled messages byte-identical (tested);
+  an empty note or an over-cap note fails loud (`EmptyNote` /
+  `TooLong`) instead of silently truncating the audit trail.
+
 ### Durable-nonce transactions (AV-167)
 
 `escrow-state/src/durable_nonce.rs` frees keeper bundles from the

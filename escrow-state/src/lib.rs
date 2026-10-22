@@ -131,6 +131,14 @@ mod tx_message;
 // AV-87 v0 compiler keeps taking the caller's address snapshot; this
 // module is the parsing half. Pure logic, zero dependencies.
 mod alt_table;
+// AV-182: on-chain Memo program audit trail for lifecycle transitions —
+// the SPL Memo program id, the opt-in MemoConfig, the canonical
+// transition note builder, and the memo instruction constructor. The
+// keeper attaches the instruction to a transition's transaction while
+// the IndexedEscrow wrapper pins the same note in the audit event, so
+// the on-chain log and the off-chain event agree by construction.
+// Pure logic, zero dependencies.
+mod memo;
 // AV-167: durable-nonce transactions for keeper execution bundles —
 // nonce-account parsing, the AdvanceNonceAccount prefix instruction,
 // and legacy/v0 message assembly whose blockhash slot carries the nonce
@@ -707,6 +715,15 @@ pub use tx_message::{
 pub use alt_table::{
     compile_v0_from_account_data, resolve_v0_lookups, AltTableError, AltTableMeta, LoadedAddress,
     ParsedLookupTable, LOOKUP_TABLE_MAX_ADDRESSES, LOOKUP_TABLE_META_SIZE,
+};
+
+// AV-182: on-chain Memo program audit trail — program id, opt-in
+// config, canonical transition notes, and the memo instruction
+// constructor for lifecycle transitions.
+pub use memo::{
+    build_memo_instruction, maybe_memo_instruction, transition_memo_note, MemoConfig, MemoError,
+    MemoNote, MemoTransition, DEFAULT_MEMO_MAX_BYTES, MEMO_EVENT_NOTE_MAX, MEMO_PROGRAM_ID,
+    MEMO_PROGRAM_ID_BASE58,
 };
 
 // AV-167: durable-nonce transaction support — nonce-account parsing,

@@ -293,6 +293,7 @@ use crate::cpi::CpiError;
 use crate::cpi_call::{CpiInvocation, CpiReceipt};
 use crate::cpi_return::CpiReturnDataAudit;
 use crate::release_intent::ReleaseIntent;
+use crate::memo::{transition_memo_note, MemoConfig, MemoNote, MemoTransition};
 
 /// What kind of state change an [`EscrowEvent`] records.
 ///
@@ -1986,6 +1987,16 @@ pub struct EscrowEvent {
     /// parameter — because the schedule is consumed by the recovery
     /// before the event is pushed.
     pub auto_unpause: bool,
+    /// AV-182: the canonical Memo program audit note for a lifecycle
+    /// transition (`fund` / `release` / `cancel` / `resolve` /
+    /// `claim`) — the exact UTF-8 bytes the keeper attaches as a Memo
+    /// program instruction on the transition's transaction, so the
+    /// on-chain log and the off-chain event agree by construction
+    /// (see [`crate::memo::transition_memo_note`]). Stamped by the
+    /// transition emitter after the push — never a `push_event`
+    /// parameter — and `None` when memo is disabled: the event log
+    /// never invents a note.
+    pub memo: Option<MemoNote>,
 }
 
 /// One split child on an [`EscrowEventKind::EscrowSplit`] event's
@@ -2037,6 +2048,12 @@ pub struct IndexedEscrow {
     escrow_id: [u8; 32],
     events: Vec<EscrowEvent>,
     next_seq: u64,
+    /// AV-182: opt-in Memo program audit trail. Unlike the `with_*`
+    /// builders below, this is wrapper-level state — the memo note is
+    /// an off-chain observability concern, not vault state, so it is
+    /// never persisted and never touches `VAULT_FIELDS`. `None`
+    /// (the default) disables memo stamping.
+    memo_config: Option<MemoConfig>,
 }
 
 impl IndexedEscrow {
@@ -2058,6 +2075,7 @@ impl IndexedEscrow {
             escrow_id,
             events: Vec::new(),
             next_seq: 0,
+            memo_config: None,
         };
         // The constructor has no prior state: from == to == Uninitialized
         // by convention, so the very first event still carries a
@@ -2096,6 +2114,7 @@ impl IndexedEscrow {
             escrow_id,
             events: Vec::new(),
             next_seq: 0,
+            memo_config: None,
         };
         indexed.push_event(
             EscrowEventKind::Initialized,
@@ -2146,6 +2165,7 @@ impl IndexedEscrow {
             escrow_id,
             events: Vec::new(),
             next_seq: 0,
+            memo_config: None,
         };
         indexed.push_event(
             EscrowEventKind::Initialized,
@@ -2289,6 +2309,12 @@ impl IndexedEscrow {
             // `push_event` leaves it `false` here — never a push_event
             // parameter (see above).
             auto_unpause: false,
+            // AV-182: the Memo program audit note rides the lifecycle
+            // transitions — stamped by the transition emitter after
+            // the push (it needs the transition's moved amount), so
+            // `push_event` leaves it `None` here — never a push_event
+            // parameter (see above).
+            memo: None,
         };
         self.next_seq += 1;
         self.events.push(event);
@@ -2424,6 +2450,7 @@ impl IndexedEscrow {
             escrow_id,
             events: Vec::new(),
             next_seq: 0,
+            memo_config: None,
         }
     }
 
@@ -2727,6 +2754,41 @@ impl IndexedEscrow {
         Ok(self)
     }
 
+    /// AV-182: opt in to the on-chain Memo program audit trail. Unlike
+    /// the `with_*` builders above, this is wrapper-level state: the
+    /// memo note is an off-chain observability concern, not vault
+    /// state, so it is never persisted and never touches
+    /// `VAULT_FIELDS`. When enabled, the `fund` / `release` /
+    /// `cancel` / `resolve` / `claim` emitters stamp the canonical
+    /// memo note ([`crate::memo::transition_memo_note`]) on the event,
+    /// and the keeper attaches the same note as a Memo program
+    /// instruction on the transition's transaction. Disabled by
+    /// default — pass [`MemoConfig::disabled`] (or omit the call) for
+    /// no memo anywhere.
+    pub fn with_memo_config(mut self, config: MemoConfig) -> Self {
+        self.memo_config = Some(config);
+        self
+    }
+
+    /// AV-182: stamp the canonical memo note on the just-pushed event.
+    /// No-op when memo is disabled. The note is a pure function of
+    /// (transition, escrow_id, amount) — the same bytes the keeper
+    /// puts in the Memo instruction — so the event never invents a
+    /// note. A failed note build is unreachable for the canonical
+    /// format; it leaves the event unstamped rather than failing the
+    /// transition.
+    fn stamp_memo(&mut self, transition: MemoTransition, amount: u64) {
+        let enabled = self.memo_config.map(|c| c.enabled).unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        if let Ok(note) = transition_memo_note(transition, &self.escrow_id, amount) {
+            if let Some(event) = self.events.last_mut() {
+                event.memo = Some(note);
+            }
+        }
+    }
+
     // ----- transitions: exactly one event per successful transition -----
 
     /// Record one party's activation signature (mirrors
@@ -2789,6 +2851,8 @@ impl IndexedEscrow {
             None,
             Some(authority),
         );
+        // AV-182: the memo note pins the funded amount.
+        self.stamp_memo(MemoTransition::Fund, self.inner.amount());
         Ok(())
     }
 
@@ -2842,6 +2906,9 @@ impl IndexedEscrow {
             None,
             Some(authority),
         );
+        // AV-182: the memo note pins the gross moved amount
+        // (`payout + fee == amount` by construction).
+        self.stamp_memo(MemoTransition::Release, payout + fee);
         Ok((payout, fee))
     }
 
@@ -3754,6 +3821,8 @@ impl IndexedEscrow {
             None,
             Some(authority),
         );
+        // AV-182: the memo note pins the total refunded amount.
+        self.stamp_memo(MemoTransition::Cancel, initializer_refund + taker_refund);
         Ok((initializer_refund, taker_refund))
     }
 
@@ -4991,6 +5060,8 @@ impl IndexedEscrow {
             None,
             Some(authority),
         );
+        // AV-182: the memo note pins the gross claimed amount.
+        self.stamp_memo(MemoTransition::Claim, payout + fee);
         Ok((payout, fee))
     }
 
@@ -5183,6 +5254,9 @@ impl IndexedEscrow {
             None,
             Some(authority),
         );
+        // AV-182: the memo note pins the total settled amount
+        // (taker payout + fee + initializer refund).
+        self.stamp_memo(MemoTransition::Resolve, payout + fee + refund);
         Ok((payout, fee, refund))
     }
 
@@ -6847,6 +6921,7 @@ impl IndexedEscrow {
             escrow_id,
             events: Vec::new(),
             next_seq: 0,
+            memo_config: None,
         };
         // The child's `Initialized` names its initializer as the actor
         // — like every other `Initialized` event — while the
@@ -7082,6 +7157,102 @@ mod event_tests {
             "amounts"
         );
         assert_eq!(event.at, at, "at");
+    }
+
+    // ----- AV-182: Memo program audit trail -----
+
+    #[test]
+    fn memo_disabled_by_default_stamps_nothing() {
+        let mut e = funded(1_000_000);
+        assert_eq!(last(&e).memo, None);
+        e.release(ALICE, 400_000, None, BOB, T0 + 2).unwrap();
+        assert_eq!(last(&e).memo, None);
+    }
+
+    #[test]
+    fn memo_disabled_config_stamps_nothing() {
+        let mut e = indexed(1_000_000)
+            .with_memo_config(MemoConfig::disabled())
+            .with_vesting(VestingSchedule::new(T0, T0 + 1_000).unwrap())
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        assert_eq!(last(&e).memo, None);
+    }
+
+    #[test]
+    fn memo_stamped_on_fund_release_cancel() {
+        let config = MemoConfig::enabled();
+        // fund
+        let mut e = indexed(1_000_000).with_memo_config(config);
+        e.fund(ALICE, T0 + 1).unwrap();
+        let expected = transition_memo_note(MemoTransition::Fund, &ESCROW_ID, 1_000_000).unwrap();
+        assert_eq!(last(&e).memo, Some(expected));
+        // release (partial): the note pins the gross moved amount.
+        let (payout, fee) = e.release(ALICE, 400_000, None, BOB, T0 + 2).unwrap();
+        let expected =
+            transition_memo_note(MemoTransition::Release, &ESCROW_ID, payout + fee).unwrap();
+        assert_eq!(last(&e).memo, Some(expected));
+        // cancel: the note pins the total refund.
+        let (init_refund, taker_refund) = e.cancel(ALICE, None, ALICE, T0 + 3).unwrap();
+        let expected = transition_memo_note(
+            MemoTransition::Cancel,
+            &ESCROW_ID,
+            init_refund + taker_refund,
+        )
+        .unwrap();
+        assert_eq!(last(&e).memo, Some(expected));
+    }
+
+    #[test]
+    fn memo_stamped_on_resolve_and_claim() {
+        let config = MemoConfig::enabled();
+        // resolve: the note pins the total settled amount.
+        let mut e = indexed(1_000_000)
+            .with_memo_config(config)
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, e.inner().remaining_amount(), None, None, 0)
+            .unwrap();
+        // escalate is not a memo transition.
+        assert_eq!(last(&e).memo, None);
+        let (payout, fee, refund) = e.resolve(ARBITER, 600_000, None, None, BOB, T0 + 3).unwrap();
+        let expected =
+            transition_memo_note(MemoTransition::Resolve, &ESCROW_ID, payout + fee + refund)
+                .unwrap();
+        assert_eq!(last(&e).memo, Some(expected));
+
+        // claim: the note pins the gross claimed amount.
+        let mut e = indexed(1_000_000)
+            .with_memo_config(config)
+            .with_vesting(VestingSchedule::new(T0, T0 + 1_000).unwrap())
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let (payout, fee) = e.claim(BOB, T0 + 1_000, None, BOB).unwrap();
+        let expected =
+            transition_memo_note(MemoTransition::Claim, &ESCROW_ID, payout + fee).unwrap();
+        assert_eq!(last(&e).memo, Some(expected));
+    }
+
+    #[test]
+    fn memo_event_note_matches_keeper_instruction_bytes() {
+        // The audit event and the on-chain Memo instruction carry the
+        // same bytes by construction: the stamped note equals the
+        // instruction data the keeper builds.
+        let config = MemoConfig::enabled();
+        let mut e = indexed(1_000_000).with_memo_config(config);
+        e.fund(ALICE, T0 + 1).unwrap();
+        let event_note = last(&e).memo.expect("memo stamped");
+        let ix = crate::maybe_memo_instruction(
+            MemoTransition::Fund,
+            &ESCROW_ID,
+            1_000_000,
+            &config,
+        )
+        .unwrap()
+        .expect("memo enabled");
+        assert_eq!(ix.program_id, crate::MEMO_PROGRAM_ID);
+        assert_eq!(ix.data, event_note.as_str().as_bytes());
     }
 
     // ----- core lifecycle: seq order, from/to, kinds -----
