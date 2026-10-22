@@ -1861,7 +1861,11 @@
     {"code": 242, "name": "InvalidUpgradeAuthority"},
     {"code": 243, "name": "UpgradeHandoverPending"},
     {"code": 244, "name": "NoUpgradeHandoverPending"},
-    {"code": 245, "name": "UpgradeHandoverDelayNotElapsed"}
+    {"code": 245, "name": "UpgradeHandoverDelayNotElapsed"},
+    {"code": 246, "name": "InvalidFreezeAuthority"},
+    {"code": 247, "name": "TokenAccountAlreadyFrozen"},
+    {"code": 248, "name": "TokenAccountNotFrozen"},
+    {"code": 249, "name": "EscrowFrozen"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

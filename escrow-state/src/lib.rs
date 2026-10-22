@@ -479,6 +479,15 @@ pub use upgrade_authority::{
     scan_upgrade_authority_drift, UpgradeAuthority, UpgradeAuthorityDrift, UpgradeAuthorityEventKind,
     UpgradeAuditEntry, MAX_UPGRADE_AUDIT_ENTRIES,
 };
+// AV-180: SPL freeze/thaw authority custody — the escrow program's
+// freeze switch over managed token accounts (strict freeze/thaw
+// toggle, the require_unfrozen settlement lock for release/cancel/
+// claim, audited freeze-authority rotation). Purely additive and
+// off-chain.
+mod freeze_authority;
+pub use freeze_authority::{
+    FreezeAuditEntry, FreezeAuthorityEventKind, ManagedFreezeAuthority, MAX_FREEZE_AUDIT_ENTRIES,
+};
 
 
 // AV-20: off-chain keeper report — scan a batch of escrows for executable
@@ -3337,6 +3346,28 @@ pub enum EscrowError {
     /// proposal; the successor must wait out the cooling period. Never
     /// renumbered (see [`EscrowError::code`]).
     UpgradeHandoverDelayNotElapsed,
+    /// AV-180:
+    /// [`ManagedFreezeAuthority::new`](crate::ManagedFreezeAuthority::new)
+    /// / [`set_freeze_authority`](crate::ManagedFreezeAuthority::set_freeze_authority)
+    /// refused — the token account or the freeze authority is the zero
+    /// key, or a rotation proposes the key already bound. Never
+    /// renumbered (see [`EscrowError::code`]).
+    InvalidFreezeAuthority,
+    /// AV-180: [`ManagedFreezeAuthority::freeze`](crate::ManagedFreezeAuthority::freeze)
+    /// refused — the token account is already frozen (strict toggle:
+    /// freezing is never a silent no-op). Never renumbered (see
+    /// [`EscrowError::code`]).
+    TokenAccountAlreadyFrozen,
+    /// AV-180: [`ManagedFreezeAuthority::thaw`](crate::ManagedFreezeAuthority::thaw)
+    /// refused — the token account is not frozen (strict toggle).
+    /// Never renumbered (see [`EscrowError::code`]).
+    TokenAccountNotFrozen,
+    /// AV-180:
+    /// [`require_unfrozen`](crate::ManagedFreezeAuthority::require_unfrozen)
+    /// refused — the managed token account is frozen: release, cancel
+    /// and claim are locked until thaw. Never renumbered (see
+    /// [`EscrowError::code`]).
+    EscrowFrozen,
 }
 
 impl EscrowError {
@@ -3555,6 +3586,10 @@ impl EscrowError {
             EscrowError::UpgradeHandoverPending => 243,
             EscrowError::NoUpgradeHandoverPending => 244,
             EscrowError::UpgradeHandoverDelayNotElapsed => 245,
+            EscrowError::InvalidFreezeAuthority => 246,
+            EscrowError::TokenAccountAlreadyFrozen => 247,
+            EscrowError::TokenAccountNotFrozen => 248,
+            EscrowError::EscrowFrozen => 249,
         }
     }
 
@@ -3764,6 +3799,14 @@ impl EscrowError {
             EscrowError::NoUpgradeHandoverPending,
             // AV-179: appended, never renumbered.
             EscrowError::UpgradeHandoverDelayNotElapsed,
+            // AV-180: appended, never renumbered.
+            EscrowError::InvalidFreezeAuthority,
+            // AV-180: appended, never renumbered.
+            EscrowError::TokenAccountAlreadyFrozen,
+            // AV-180: appended, never renumbered.
+            EscrowError::TokenAccountNotFrozen,
+            // AV-180: appended, never renumbered.
+            EscrowError::EscrowFrozen,
         ]
     }
 }
@@ -31564,6 +31607,30 @@ mod error_code_tests {
             245,
             "UpgradeAuthority::confirm_handover before proposed_at + handover_delay_secs (AV-179)",
         ),
+        // AV-180: appended, never renumbered.
+        (
+            EscrowError::InvalidFreezeAuthority,
+            246,
+            "ManagedFreezeAuthority::new/set_freeze_authority with a zero token account or freeze authority key, or a rotation to the key already bound (AV-180)",
+        ),
+        // AV-180: appended, never renumbered.
+        (
+            EscrowError::TokenAccountAlreadyFrozen,
+            247,
+            "ManagedFreezeAuthority::freeze on an already-frozen token account — strict toggle, never a silent no-op (AV-180)",
+        ),
+        // AV-180: appended, never renumbered.
+        (
+            EscrowError::TokenAccountNotFrozen,
+            248,
+            "ManagedFreezeAuthority::thaw on a token account that is not frozen — strict toggle (AV-180)",
+        ),
+        // AV-180: appended, never renumbered.
+        (
+            EscrowError::EscrowFrozen,
+            249,
+            "ManagedFreezeAuthority::require_unfrozen while the managed token account is frozen — release/cancel/claim locked (AV-180)",
+        ),
     ];
 
     #[test]
@@ -32339,6 +32406,53 @@ mod error_code_tests {
         // At exactly the deadline the accept goes through.
         a.confirm_handover(BOB, 1_000 + 3_600).unwrap();
         assert_eq!(a.current(), BOB);
+    }
+
+    #[test]
+    fn invalid_freeze_authority_triggered_by_zero_key() {
+        let err = ManagedFreezeAuthority::new([0u8; 32], ALICE).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidFreezeAuthority);
+        assert_eq!(err.code(), 246);
+        let err = ManagedFreezeAuthority::new(BOB, [0u8; 32]).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidFreezeAuthority);
+        let mut c = ManagedFreezeAuthority::new(BOB, ALICE).unwrap();
+        let err = c.set_freeze_authority(ALICE, [0u8; 32], 1_000).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidFreezeAuthority);
+        // Rotating to the key already bound is the same refuse.
+        let err = c.set_freeze_authority(ALICE, ALICE, 1_000).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidFreezeAuthority);
+    }
+
+    #[test]
+    fn token_account_already_frozen_triggered_by_double_freeze() {
+        let mut c = ManagedFreezeAuthority::new(BOB, ALICE).unwrap();
+        c.freeze(ALICE, 1_000).unwrap();
+        let err = c.freeze(ALICE, 2_000).unwrap_err();
+        assert_eq!(err, EscrowError::TokenAccountAlreadyFrozen);
+        assert_eq!(err.code(), 247);
+        assert!(c.is_frozen());
+    }
+
+    #[test]
+    fn token_account_not_frozen_triggered_by_thaw_when_unfrozen() {
+        let mut c = ManagedFreezeAuthority::new(BOB, ALICE).unwrap();
+        let err = c.thaw(ALICE, 1_000).unwrap_err();
+        assert_eq!(err, EscrowError::TokenAccountNotFrozen);
+        assert_eq!(err.code(), 248);
+        assert!(!c.is_frozen());
+    }
+
+    #[test]
+    fn escrow_frozen_triggered_by_guard_while_frozen() {
+        let mut c = ManagedFreezeAuthority::new(BOB, ALICE).unwrap();
+        assert!(c.require_unfrozen().is_ok());
+        c.freeze(ALICE, 1_000).unwrap();
+        let err = c.require_unfrozen().unwrap_err();
+        assert_eq!(err, EscrowError::EscrowFrozen);
+        assert_eq!(err.code(), 249);
+        // Thaw restores the settlement path.
+        c.thaw(ALICE, 2_000).unwrap();
+        assert!(c.require_unfrozen().is_ok());
     }
 
 
@@ -57283,7 +57397,15 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::NoUpgradeHandoverPending));
         assert_eq!(EscrowError::UpgradeHandoverDelayNotElapsed.code(), 245);
         assert!(EscrowError::all().contains(&EscrowError::UpgradeHandoverDelayNotElapsed));
-        assert_eq!(EscrowError::all().len(), 146);
+        assert_eq!(EscrowError::InvalidFreezeAuthority.code(), 246);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidFreezeAuthority));
+        assert_eq!(EscrowError::TokenAccountAlreadyFrozen.code(), 247);
+        assert!(EscrowError::all().contains(&EscrowError::TokenAccountAlreadyFrozen));
+        assert_eq!(EscrowError::TokenAccountNotFrozen.code(), 248);
+        assert!(EscrowError::all().contains(&EscrowError::TokenAccountNotFrozen));
+        assert_eq!(EscrowError::EscrowFrozen.code(), 249);
+        assert!(EscrowError::all().contains(&EscrowError::EscrowFrozen));
+        assert_eq!(EscrowError::all().len(), 150);
     }
 
     #[test]

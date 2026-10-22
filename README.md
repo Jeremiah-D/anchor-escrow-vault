@@ -1557,6 +1557,10 @@ program error per variant):
 | `UpgradeHandoverPending` | 243 | `UpgradeAuthority::propose_handover` (AV-179) while a handover proposal is already live |
 | `NoUpgradeHandoverPending` | 244 | `UpgradeAuthority::confirm_handover` / `cancel_handover` (AV-179) with no live handover proposal |
 | `UpgradeHandoverDelayNotElapsed` | 245 | `UpgradeAuthority::confirm_handover` (AV-179) before `proposed_at + handover_delay_secs` |
+| `InvalidFreezeAuthority` | 246 | `ManagedFreezeAuthority::new` / `set_freeze_authority` (AV-180) with a zero token account or freeze authority key, or a rotation to the key already bound |
+| `TokenAccountAlreadyFrozen` | 247 | `ManagedFreezeAuthority::freeze` (AV-180) on an already-frozen token account |
+| `TokenAccountNotFrozen` | 248 | `ManagedFreezeAuthority::thaw` (AV-180) on a token account that is not frozen |
+| `EscrowFrozen` | 249 | `ManagedFreezeAuthority::require_unfrozen` (AV-180) while the managed token account is frozen |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -6104,3 +6108,41 @@ New error codes (never renumbered): `InvalidUpgradeAuthority` (242),
 `UpgradeHandoverPending` (243), `NoUpgradeHandoverPending` (244),
 `UpgradeHandoverDelayNotElapsed` (245). Check order mirrors AV-163
 (authority first, then validity, then state).
+
+## SPL freeze/thaw authority custody (AV-180)
+
+`escrow-state/src/freeze_authority.rs` — the escrow program's SPL
+freeze switch over managed token accounts: the payments-risk tool for
+tainted funds (Solana / payments risk control).
+
+The program is the freeze authority of the vaults' SPL token accounts
+(bound at token-account initialization — the program, not a user key,
+holds the freeze switch). `ManagedFreezeAuthority` is the executable
+spec of that custody, one struct per managed token account:
+
+- **Strict toggle**: `freeze` / `thaw` flip only through the bound
+  freeze authority; freezing a frozen account (or thawing an unfrozen
+  one) is a loud refuse (`TokenAccountAlreadyFrozen` /
+  `TokenAccountNotFrozen`), never a silent no-op — the AV-163 toggle
+  semantics.
+- **The settlement lock**: `require_unfrozen` is the guard the program
+  calls at the top of `release` / `cancel` / `claim` — while the token
+  account is frozen, no settlement moves funds (`EscrowFrozen`, fail
+  fast before any state is touched). The account is immobilized in
+  place, not drained: freezing is the investigate-then-decide tool, not
+  the verdict. Orthogonal to the AV-46 per-escrow pause (an
+  escrow-level switch) and the AV-163 program breaker (a program-wide
+  halt) — this is the token-account-level freeze, the finest-grained
+  stop in the stack.
+- **Authority rotation with audit**: `set_freeze_authority` rotates the
+  bound key (only the current authority; the successor must be a live,
+  distinct key); every freeze / thaw / rotation appends a
+  `FreezeAuditEntry` to the bounded 32-entry ring. Rotating the
+  authority never thaws the account — the freeze survives custody
+  changes.
+
+New error codes (never renumbered): `InvalidFreezeAuthority` (246),
+`TokenAccountAlreadyFrozen` (247), `TokenAccountNotFrozen` (248),
+`EscrowFrozen` (249). Off-chain executable spec only: real
+`FreezeAccount` / `ThawAccount` are token-program CPIs the on-chain
+program issues after this custody check (the AV-163 honesty contract).
