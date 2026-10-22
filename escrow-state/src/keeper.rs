@@ -189,7 +189,9 @@
 //! execution.
 
 use crate::{
-    aggregate::EscrowAggregateView, format_amount, index::EscrowIndex, vault_close_rent_reclaimed,
+    aggregate::EscrowAggregateView,
+    config_drift::{diff_config, ConfigDriftReport, ExpectedVaultConfig, VaultConfig, VaultDrift},
+    format_amount, index::EscrowIndex, vault_close_rent_reclaimed,
     Escrow, EscrowError, EscrowState, IndexedEscrow, MultisigAuthority, SchemaFieldDelta,
     SignedReleaseIntent, VaultDerivation,
 };
@@ -6408,6 +6410,159 @@ pub fn scan_fee_collection(watched: &[WatchedEscrow]) -> FeeCollectionReport {
     FeeCollectionReport {
         collectable,
         total_withdrawable,
+    }
+}
+
+/// Dry-run scan detecting on-chain vault configuration drift (AV-175).
+///
+/// Each watched escrow's operational config is snapshotted via
+/// [`VaultConfig::from_escrow`] and diffed field-by-field against the
+/// operator-approved [`ExpectedVaultConfig`] template
+/// ([`diff_config`](crate::diff_config)). Vaults with at least one
+/// drifted field are listed (sorted by `escrow_id` ascending,
+/// deterministic); clean vaults are omitted — the report only carries
+/// actionable drift, like `scan_fee_collection`'s executable-only rule.
+///
+/// Pure: reads `&Escrow` snapshots only — no mutation, no events, no
+/// clock. A vault whose config drifted should not be funded until the
+/// operator reconciles it.
+pub fn scan_config_drift(
+    watched: &[WatchedEscrow],
+    expected: &ExpectedVaultConfig,
+) -> ConfigDriftReport {
+    let mut vaults = Vec::new();
+    let mut total_drifts = 0u64;
+    for w in watched {
+        let actual = VaultConfig::from_escrow(&w.escrow);
+        let drifts = diff_config(&actual, expected);
+        if drifts.is_empty() {
+            continue;
+        }
+        total_drifts += drifts.len() as u64;
+        vaults.push(VaultDrift {
+            escrow_id: w.escrow_id,
+            drifts,
+        });
+    }
+    vaults.sort_by(|a, b| a.escrow_id.cmp(&b.escrow_id));
+    ConfigDriftReport {
+        vaults,
+        total_drifts,
+    }
+}
+
+#[cfg(test)]
+mod config_drift_scan_tests {
+    use super::*;
+    use crate::config_drift::VaultConfig;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const FEE_RECIPIENT: [u8; 32] = [0xFE; 32];
+    const ID1: [u8; 32] = [0x01; 32];
+    const ID2: [u8; 32] = [0x02; 32];
+    const ID3: [u8; 32] = [0x03; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+
+    fn watch(id: [u8; 32], escrow: Escrow) -> WatchedEscrow {
+        let reference = escrow.reference();
+        WatchedEscrow {
+            escrow_id: id,
+            escrow,
+            reference,
+            vault_derivation: None,
+            pending_intent: None,
+        }
+    }
+
+    fn template_for(e: &Escrow) -> ExpectedVaultConfig {
+        let c = VaultConfig::from_escrow(e);
+        ExpectedVaultConfig {
+            fee_bps: c.fee_bps,
+            fee_schedule: c.fee_schedule,
+            fee_cap: c.fee_cap,
+            fee_recipient: c.fee_recipient,
+            payout_allowlist: c.payout_allowlist,
+            quorum_threshold: c.quorum_threshold,
+            mint: c.mint,
+            timelock: c.timelock,
+            relative_timelock_secs: c.relative_timelock_secs,
+        }
+    }
+
+    fn plain() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap()
+    }
+
+    fn fee_drifted() -> Escrow {
+        plain().with_protocol_fee(250).unwrap()
+    }
+
+    #[test]
+    fn clean_vaults_are_not_listed() {
+        let e = plain();
+        let expected = template_for(&e);
+        let report = scan_config_drift(&[watch(ID1, e)], &expected);
+        assert!(report.vaults.is_empty());
+        assert_eq!(report.total_drifts, 0);
+        assert_eq!(report.to_json(1), "{\"scanned\":1,\"drifted\":0,\"vaults\":[],\"total_drifts\":0}");
+    }
+
+    #[test]
+    fn drifted_vaults_are_listed_sorted_with_exact_fields() {
+        let e = fee_drifted();
+        let expected = template_for(&plain());
+        // ID2 sorts before ID1 in the report.
+        let watched = vec![watch(ID2, e.clone()), watch(ID1, e)];
+        let report = scan_config_drift(&watched, &expected);
+        assert_eq!(report.vaults.len(), 2);
+        assert_eq!(report.vaults[0].escrow_id, ID1);
+        assert_eq!(report.vaults[1].escrow_id, ID2);
+        assert_eq!(report.vaults[0].drifts.len(), 1);
+        assert_eq!(report.vaults[0].drifts[0].field, "fee_bps");
+        assert_eq!(report.vaults[0].drifts[0].expected, "0");
+        assert_eq!(report.vaults[0].drifts[0].actual, "250");
+        assert_eq!(report.total_drifts, 2);
+    }
+
+    #[test]
+    fn mixed_fleet_lists_only_drifted() {
+        let clean = plain();
+        let drifted = fee_drifted();
+        let expected = template_for(&clean);
+        let watched = vec![
+            watch(ID1, clean),
+            watch(ID2, drifted),
+            watch(ID3, plain()),
+        ];
+        let report = scan_config_drift(&watched, &expected);
+        assert_eq!(report.vaults.len(), 1);
+        assert_eq!(report.vaults[0].escrow_id, ID2);
+    }
+
+    #[test]
+    fn scan_is_dry_run_pure() {
+        let e = fee_drifted();
+        let expected = template_for(&plain());
+        let watched = vec![watch(ID1, e)];
+        let before = VaultConfig::from_escrow(&watched[0].escrow);
+        let _ = scan_config_drift(&watched, &expected);
+        let after = VaultConfig::from_escrow(&watched[0].escrow);
+        assert_eq!(before, after, "scan must not mutate the escrow");
+    }
+
+    #[test]
+    fn fee_recipient_pin_is_checked() {
+        let e = plain().with_fee_recipient(FEE_RECIPIENT).unwrap();
+        let mut expected = template_for(&plain());
+        expected.fee_recipient = Some(FEE_RECIPIENT);
+        let clean = scan_config_drift(&[watch(ID1, e.clone())], &expected);
+        assert!(clean.vaults.is_empty());
+        // Template without the pin: drift.
+        let expected2 = template_for(&plain());
+        let report = scan_config_drift(&[watch(ID1, e)], &expected2);
+        assert_eq!(report.vaults.len(), 1);
+        assert_eq!(report.vaults[0].drifts[0].field, "fee_recipient");
     }
 }
 

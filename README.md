@@ -2367,6 +2367,28 @@ order, 64-char lowercase hex keys, dependency-free like every other
 keeper report). The scan is pure: it reads `&Escrow` snapshots only and
 never withdraws.
 
+## Vault config drift detection (AV-175)
+
+Operators roll out vault fleets from one approved configuration; a
+vault whose on-chain config no longer matches the template is
+mis-provisioned or tampered with and must not be funded.
+`escrow-state/src/config_drift.rs` decodes a vault account's
+operational config — `fee_bps`, `fee_schedule`, `fee_cap`,
+`fee_recipient`, `payout_allowlist`, quorum threshold, `mint`,
+`timelock`, `relative_timelock_secs` — via `decode_vault_account`
+(the `vault_view` decode convention) and diffs it field-by-field
+against an `ExpectedVaultConfig` template, producing `{field,
+expected, actual}` drift entries in fixed field order
+(`diff_config`; empty means clean). Values render canonically
+(decimal integers, 64-char lowercase hex pubkeys, `"none"` for absent
+optionals) so the report is deterministic without a serializer. The
+keeper entry point `scan_config_drift(watched, expected)` lists only
+drifted vaults (sorted by `escrow_id`, with `total_drifts`) plus a
+`to_json()` report — dry-run, zero side effects. This is operational
+config drift, orthogonal to the AV-29 IDL byte-layout pipeline (which
+guards offsets/discriminators) and to the AV-143 template library
+(which blueprints *new* escrows — this monitors *deployed* ones).
+
 ## Initialize-config assembly validator (AV-161)
 
 A keeper or UI assembles the initialize config off-chain (typically

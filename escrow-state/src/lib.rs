@@ -256,6 +256,16 @@ pub use vault_view::{
     VaultView, VaultViewError, AMOUNT_OFFSET, EXPIRES_AT_OFFSET, HOT_FIELDS_END, INITIALIZER_OFFSET,
     RELEASED_OFFSET, STATE_OFFSET, TAKER_OFFSET,
 };
+// AV-175: chain-off vault configuration drift detection — decode a
+// vault account's operational config (the vault_view decode convention)
+// and diff it field-by-field against the operator-approved
+// ExpectedVaultConfig template. Pure, dry-run, zero side effects; the
+// keeper entry point is scan_config_drift.
+mod config_drift;
+pub use config_drift::{
+    decode_vault_config, diff_config, ConfigDriftError, ConfigDriftReport, ExpectedVaultConfig,
+    FieldDrift, VaultConfig, VaultDrift,
+};
 // AV-161: chain-off-chain initialize-config assembly validator — the
 // keeper/UI fails fast on a misassembled config (plan conflicts,
 // amount coverage, quorum reachability, fee rate, time consistency,
@@ -515,6 +525,15 @@ pub use keeper::{
 // AV-139: unclaimed-rent sweep keeper scan — dry-run listing of
 // sweepable vaults (see `scan_unclaimed_rent`).
 pub use keeper::{scan_unclaimed_rent, SweepableVault, UnclaimedRentReport};
+
+// AV-174: protocol-fee collection keeper scan — dry-run listing of
+// vaults with withdrawable protocol fees (see `scan_fee_collection`).
+pub use keeper::{scan_fee_collection, CollectableFees, FeeCollectionReport};
+
+// AV-175: vault config-drift keeper scan — dry-run listing of vaults
+// whose on-chain operational config drifted from the approved
+// ExpectedVaultConfig template (see `scan_config_drift`).
+pub use keeper::scan_config_drift;
 
 // AV-85: schema-migration keeper scan — walk watched vaults, dry-run
 // the N → M migration chain (`Escrow::migrate_dry_run`) for every
