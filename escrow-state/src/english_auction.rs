@@ -670,6 +670,6 @@ mod english_auction_tests {
             assert!(EscrowError::all().contains(&e));
         }
         // AV-190 appends 3 rental-escrow errors after these.
-        assert_eq!(EscrowError::all().len(), 172); // AV-191: +InvalidReferral
+        assert_eq!(EscrowError::all().len(), 179); // AV-192: +7 sealed-bid errors
     }
 }

@@ -551,6 +551,6 @@ mod rental_escrow_tests {
         ] {
             assert!(EscrowError::all().contains(&e));
         }
-        assert_eq!(EscrowError::all().len(), 172); // AV-191: +InvalidReferral
+        assert_eq!(EscrowError::all().len(), 179); // AV-192: +7 sealed-bid errors
     }
 }

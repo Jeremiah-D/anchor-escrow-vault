@@ -1583,6 +1583,13 @@ program error per variant):
 | `InvalidRentalTerms` | 268 | `RentalEscrow::new` (AV-190) with a zero owner/renter key, owner == renter, a zero rent amount, `term_end_slot <= term_start_slot`, a zero `slots_per_day`, or a late-fee rate/cap above 10_000 bps |
 | `RentalNotActive` | 269 | `RentalEscrow::return_asset` (AV-190) on a rental already in a terminal state |
 | `RentalCancelNotAllowed` | 270 | `RentalEscrow::cancel` (AV-190) after `term_start_slot` or on a terminal rental |
+| `InvalidSealedBid` | 272 | `SealedBidAuction::new` (AV-192) with a zero seller key, `commit_start_slot >= reveal_start_slot`, or `reveal_start_slot >= end_slot`; also `commit_bid` with a zero bidder key or zero commitment |
+| `SealedBidNotLive` | 273 | Sealed-bid commit/reveal (AV-192) outside its phase or on a terminal auction |
+| `SealedBidDuplicateCommit` | 274 | `SealedBidAuction::commit_bid` (AV-192) from a bidder that already committed |
+| `SealedBidRevealMismatch` | 275 | `SealedBidAuction::reveal_bid` (AV-192) whose `SHA-256(bid \|\| nonce \|\| bidder)` does not equal the stored commitment |
+| `SealedBidSettleTooEarly` | 276 | `SealedBidAuction::settle` (AV-192) at `current_slot < end_slot` |
+| `SealedBidNotCancellable` | 277 | `SealedBidAuction::cancel` (AV-192) after the first commitment, on a terminal auction, or past the commit phase |
+| `SealedBidBookFull` | 278 | `SealedBidAuction::commit_bid` (AV-192) past `MAX_SEALED_BIDS` (64) commitments |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2401,6 +2408,46 @@ calls — the `scan_unclaimed_rent` executable-only rule).
 order, 64-char lowercase hex keys, dependency-free like every other
 keeper report). The scan is pure: it reads `&Escrow` snapshots only and
 never withdraws.
+
+## Sealed-bid auction (AV-192)
+
+`escrow-state/src/sealed_bid.rs` — commit-reveal dark auction: bidders
+lock hidden bids, then disclose them. During the commit phase each
+bidder submits `SHA-256(bid || nonce || bidder)`; during the reveal
+phase they disclose `(bid, nonce)` and the commitment is verified. The
+highest *validly revealed* bid wins first-price — nobody learns a
+rival's bid until the reveal phase, so there is no bid shading or
+last-second sniping on price.
+
+- **Binding commitments**: the bidder key is part of the preimage, so
+  a commitment cannot be copied and revealed by a different bidder. A
+  reveal whose preimage does not verify is rejected; an unrevealed
+  commitment simply drops out of contention (it never blocks
+  settlement). Reveals are idempotent for the same `(bid, nonce)`.
+- **First-price settlement, deterministic ties**: the highest validly
+  revealed bid wins; ties break to the earliest reveal slot — no
+  randomness needed on-chain. Settlement is permissionless once the
+  reveal window closes and terminal.
+- **Minimum bid**: the seller's public floor (`0` disables it). Valid
+  reveals below it are recorded but cannot win; if the best valid bid
+  is under the floor the outcome is `ReserveNotMet`. With no reveals at
+  all the outcome is `NoBids`. One commitment per bidder (a second
+  commitment is refused — replacing it would let a bidder narrow the
+  field after seeing the commitment count), max 64 commitments.
+- **Cancel**: seller-only, before the first commitment and while the
+  commit phase is still open; a lapsed or committed auction is settled,
+  not cancelled.
+
+New error codes (never renumbered): `InvalidSealedBid` (272),
+`SealedBidNotLive` (273), `SealedBidDuplicateCommit` (274),
+`SealedBidRevealMismatch` (275), `SealedBidSettleTooEarly` (276),
+`SealedBidNotCancellable` (277), `SealedBidBookFull` (278). Pure logic:
+no Vault layout change, no `VAULT_SPACE` bump. Orthogonal to AV-189
+English (ascending, open bids), AV-97 Dutch (descending price), AV-137
+(commit-reveal for arbitration votes — the preimage there binds a
+judgment, here a bid), and AV-194 (opt-in bid deposits with no-reveal
+confiscation — this module tracks commitments, not funds). (Solana:
+auction primitives.)
 
 ## Referrer revenue share (AV-191)
 

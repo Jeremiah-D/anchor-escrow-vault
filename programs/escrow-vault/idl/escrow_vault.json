@@ -1899,7 +1899,14 @@
     {"code": 268, "name": "InvalidRentalTerms"},
     {"code": 269, "name": "RentalNotActive"},
     {"code": 270, "name": "RentalCancelNotAllowed"},
-    {"code": 271, "name": "InvalidReferral"}
+    {"code": 271, "name": "InvalidReferral"},
+    {"code": 272, "name": "InvalidSealedBid"},
+    {"code": 273, "name": "SealedBidNotLive"},
+    {"code": 274, "name": "SealedBidDuplicateCommit"},
+    {"code": 275, "name": "SealedBidRevealMismatch"},
+    {"code": 276, "name": "SealedBidSettleTooEarly"},
+    {"code": 277, "name": "SealedBidNotCancellable"},
+    {"code": 278, "name": "SealedBidBookFull"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

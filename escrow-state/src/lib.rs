@@ -551,6 +551,18 @@ pub use english_auction::{
     AuctionSettlement, AuctionState, BidReceipt, EnglishAuction,
     MAX_SNIPE_EXTENSIONS,
 };
+// AV-192: sealed-bid auction — commit-reveal dark auction. Bidders lock
+// `SHA-256(bid || nonce || bidder)` commitments in the commit phase and
+// disclose `(bid, nonce)` in the reveal phase; the highest validly
+// revealed bid wins first-price. Orthogonal to AV-189 English
+// (ascending, open bids) and AV-97 Dutch (descending price): here the
+// price is discovered privately. Pure logic: no Vault layout change, no
+// VAULT_SPACE bump.
+mod sealed_bid;
+pub use sealed_bid::{
+    sealed_bid_commitment, SealedBidAuction, SealedBidCommitReceipt, SealedBidPhase,
+    SealedBidRevealReceipt, SealedBidSettlement, SealedBidState, MAX_SEALED_BIDS,
+};
 // AV-190: rental escrow — time-boxed custody of an asset. The renter
 // pays rent and receives temporary custody (use, not ownership) for
 // the lease term; custody returns to the owner automatically when the
@@ -3630,6 +3642,51 @@ pub enum EscrowError {
     /// as a config error). Never renumbered (see
     /// [`EscrowError::code`]).
     InvalidReferral,
+    /// AV-192: [`SealedBidAuction::new`](crate::SealedBidAuction::new)
+    /// refused — zero seller key, `commit_start_slot >=
+    /// reveal_start_slot` (an empty commit window), or
+    /// `reveal_start_slot >= end_slot` (an empty reveal window). Also
+    /// reused for a zero bidder key or zero commitment in
+    /// [`SealedBidAuction::commit_bid`](crate::SealedBidAuction::commit_bid).
+    /// Never renumbered (see [`EscrowError::code`]).
+    InvalidSealedBid,
+    /// AV-192: [`SealedBidAuction::commit_bid`](crate::SealedBidAuction::commit_bid)
+    /// / [`SealedBidAuction::reveal_bid`](crate::SealedBidAuction::reveal_bid)
+    /// outside their phase (`commit` in the reveal window, `reveal` in
+    /// the commit window, either before the commit window opens or
+    /// after the reveal window closes), or any call on an auction
+    /// already in a terminal state (`Settled`, `NoSale`, `Cancelled`).
+    /// Never renumbered (see [`EscrowError::code`]).
+    SealedBidNotLive,
+    /// AV-192: [`SealedBidAuction::commit_bid`](crate::SealedBidAuction::commit_bid)
+    /// from a bidder that already committed — one commitment per
+    /// bidder, so a bidder cannot narrow the field after seeing the
+    /// commitment count. Never renumbered (see [`EscrowError::code`]).
+    SealedBidDuplicateCommit,
+    /// AV-192: [`SealedBidAuction::reveal_bid`](crate::SealedBidAuction::reveal_bid)
+    /// whose preimage `SHA-256(bid || nonce || bidder)` does not equal
+    /// the stored commitment — wrong bid, wrong nonce, a copied
+    /// commitment revealed under a different key, or a reveal with no
+    /// commitment on record. Never renumbered (see
+    /// [`EscrowError::code`]).
+    SealedBidRevealMismatch,
+    /// AV-192: [`SealedBidAuction::settle`](crate::SealedBidAuction::settle)
+    /// at `current_slot < end_slot` — the reveal window has not closed
+    /// yet. Never renumbered (see [`EscrowError::code`]).
+    SealedBidSettleTooEarly,
+    /// AV-192: [`SealedBidAuction::cancel`](crate::SealedBidAuction::cancel)
+    /// refused — a commitment has already landed, the auction is
+    /// already in a terminal state, or the commit phase has lapsed
+    /// (settle it instead of cancelling — cancelling would strand the
+    /// bidders' positions). Never renumbered (see
+    /// [`EscrowError::code`]).
+    SealedBidNotCancellable,
+    /// AV-192: [`SealedBidAuction::commit_bid`](crate::SealedBidAuction::commit_bid)
+    /// past [`MAX_SEALED_BIDS`](crate::MAX_SEALED_BIDS) commitments —
+    /// the book is a fixed-size array, so the 65th committer is refused
+    /// fail-closed rather than silently dropped. Never renumbered (see
+    /// [`EscrowError::code`]).
+    SealedBidBookFull,
 }
 
 impl EscrowError {
@@ -3895,6 +3952,20 @@ impl EscrowError {
             EscrowError::RentalCancelNotAllowed => 270,
             // AV-191: appended, never renumbered.
             EscrowError::InvalidReferral => 271,
+            // AV-192: appended, never renumbered.
+            EscrowError::InvalidSealedBid => 272,
+            // AV-192: appended, never renumbered.
+            EscrowError::SealedBidNotLive => 273,
+            // AV-192: appended, never renumbered.
+            EscrowError::SealedBidDuplicateCommit => 274,
+            // AV-192: appended, never renumbered.
+            EscrowError::SealedBidRevealMismatch => 275,
+            // AV-192: appended, never renumbered.
+            EscrowError::SealedBidSettleTooEarly => 276,
+            // AV-192: appended, never renumbered.
+            EscrowError::SealedBidNotCancellable => 277,
+            // AV-192: appended, never renumbered.
+            EscrowError::SealedBidBookFull => 278,
         }
     }
 
@@ -4156,6 +4227,20 @@ impl EscrowError {
             EscrowError::RentalCancelNotAllowed,
             // AV-191: appended, never renumbered.
             EscrowError::InvalidReferral,
+            // AV-192: appended, never renumbered.
+            EscrowError::InvalidSealedBid,
+            // AV-192: appended, never renumbered.
+            EscrowError::SealedBidNotLive,
+            // AV-192: appended, never renumbered.
+            EscrowError::SealedBidDuplicateCommit,
+            // AV-192: appended, never renumbered.
+            EscrowError::SealedBidRevealMismatch,
+            // AV-192: appended, never renumbered.
+            EscrowError::SealedBidSettleTooEarly,
+            // AV-192: appended, never renumbered.
+            EscrowError::SealedBidNotCancellable,
+            // AV-192: appended, never renumbered.
+            EscrowError::SealedBidBookFull,
         ]
     }
 }
@@ -32346,6 +32431,48 @@ mod error_code_tests {
             271,
             "with_referrer with the zero address or referral_bps > MAX_REFERRAL_BPS (2000)",
         ),
+        // AV-192: appended, never renumbered.
+        (
+            EscrowError::InvalidSealedBid,
+            272,
+            "SealedBidAuction::new with zero seller key or empty commit/reveal window; commit_bid with zero bidder key or zero commitment",
+        ),
+        // AV-192: appended, never renumbered.
+        (
+            EscrowError::SealedBidNotLive,
+            273,
+            "sealed-bid commit/reveal outside its phase, or any call on a terminal sealed-bid auction",
+        ),
+        // AV-192: appended, never renumbered.
+        (
+            EscrowError::SealedBidDuplicateCommit,
+            274,
+            "commit_bid from a bidder that already committed (one commitment per bidder)",
+        ),
+        // AV-192: appended, never renumbered.
+        (
+            EscrowError::SealedBidRevealMismatch,
+            275,
+            "reveal_bid whose SHA-256(bid || nonce || bidder) does not equal the stored commitment",
+        ),
+        // AV-192: appended, never renumbered.
+        (
+            EscrowError::SealedBidSettleTooEarly,
+            276,
+            "SealedBidAuction::settle at current_slot < end_slot",
+        ),
+        // AV-192: appended, never renumbered.
+        (
+            EscrowError::SealedBidNotCancellable,
+            277,
+            "SealedBidAuction::cancel after the first commitment, on a terminal auction, or past the commit phase",
+        ),
+        // AV-192: appended, never renumbered.
+        (
+            EscrowError::SealedBidBookFull,
+            278,
+            "commit_bid past MAX_SEALED_BIDS (64) commitments",
+        ),
     ];
 
     #[test]
@@ -58200,7 +58327,22 @@ mod arbiter_panel_tests {
         // AV-191: the referral error.
         assert_eq!(EscrowError::InvalidReferral.code(), 271);
         assert!(EscrowError::all().contains(&EscrowError::InvalidReferral));
-        assert_eq!(EscrowError::all().len(), 172);
+        // AV-192: the sealed-bid auction errors.
+        assert_eq!(EscrowError::InvalidSealedBid.code(), 272);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidSealedBid));
+        assert_eq!(EscrowError::SealedBidNotLive.code(), 273);
+        assert!(EscrowError::all().contains(&EscrowError::SealedBidNotLive));
+        assert_eq!(EscrowError::SealedBidDuplicateCommit.code(), 274);
+        assert!(EscrowError::all().contains(&EscrowError::SealedBidDuplicateCommit));
+        assert_eq!(EscrowError::SealedBidRevealMismatch.code(), 275);
+        assert!(EscrowError::all().contains(&EscrowError::SealedBidRevealMismatch));
+        assert_eq!(EscrowError::SealedBidSettleTooEarly.code(), 276);
+        assert!(EscrowError::all().contains(&EscrowError::SealedBidSettleTooEarly));
+        assert_eq!(EscrowError::SealedBidNotCancellable.code(), 277);
+        assert!(EscrowError::all().contains(&EscrowError::SealedBidNotCancellable));
+        assert_eq!(EscrowError::SealedBidBookFull.code(), 278);
+        assert!(EscrowError::all().contains(&EscrowError::SealedBidBookFull));
+        assert_eq!(EscrowError::all().len(), 179);
     }
 
     #[test]
