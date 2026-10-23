@@ -540,6 +540,6 @@ mod tests {
             assert!(EscrowError::all().contains(&e));
         }
         // Count covers the whole table; AV-190 bumps it to 171.
-        assert_eq!(EscrowError::all().len(), 179); // AV-192: +7 sealed-bid errors
+        assert_eq!(EscrowError::all().len(), 182); // AV-193: +3 oracle-adapter errors
     }
 }

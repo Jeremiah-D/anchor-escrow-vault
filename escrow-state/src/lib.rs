@@ -563,6 +563,22 @@ pub use sealed_bid::{
     sealed_bid_commitment, SealedBidAuction, SealedBidCommitReceipt, SealedBidPhase,
     SealedBidRevealReceipt, SealedBidSettlement, SealedBidState, MAX_SEALED_BIDS,
 };
+// AV-193: Pyth / Switchboard oracle adapters — concrete `PriceFeed`
+// implementations for the AV-113 price gate. `PythPriceFeed` parses a
+// Pyth v2 price account's raw bytes (header validation, exponent
+// scaling, aggregate price/confidence/status, staleness); the
+// Switchboard side validates a decoded v2 aggregator round (the Anchor
+// program decodes the packed account with the upstream crate — this
+// module owns validation, fixed-point normalization, and the
+// `PriceFeed` impl). Both normalize quotes to ORACLE_QUOTE_DECIMALS
+// decimals and are fail-closed. Pure logic: no Vault layout change, no
+// VAULT_SPACE bump.
+mod oracle_adapter;
+pub use oracle_adapter::{
+    oracle_audit_json, OracleSource, OracleValidationParams, PythPriceFeed, SwitchboardPriceFeed,
+    SwitchboardRound, CONF_BPS_DENOMINATOR, ORACLE_QUOTE_DECIMALS, PYTH_ATYPE_PRICE,
+    PYTH_MAGIC, PYTH_MIN_ACCOUNT_LEN, PYTH_PTYPE_PRICE, PYTH_STATUS_TRADING, PYTH_VERSION,
+};
 // AV-190: rental escrow — time-boxed custody of an asset. The renter
 // pays rent and receives temporary custody (use, not ownership) for
 // the lease term; custody returns to the owner automatically when the
@@ -3687,6 +3703,25 @@ pub enum EscrowError {
     /// fail-closed rather than silently dropped. Never renumbered (see
     /// [`EscrowError::code`]).
     SealedBidBookFull,
+    /// AV-193: [`PythPriceFeed::from_account_data`](crate::PythPriceFeed::from_account_data)
+    /// refused — the account is shorter than
+    /// [`PYTH_MIN_ACCOUNT_LEN`](crate::PYTH_MIN_ACCOUNT_LEN), the
+    /// header mismatches (`magic` / `ver` / `atype` / `ptype`), or the
+    /// exponent is outside `[-18, 0]` (cannot normalize safely).
+    /// Never renumbered (see [`EscrowError::code`]).
+    InvalidOracleAccount,
+    /// AV-193: the oracle's publish timestamp is missing,
+    /// non-positive, in the future, or older than the configured
+    /// `max_age_secs` — a stale quote never gates a payout. Never
+    /// renumbered (see [`EscrowError::code`]).
+    OraclePriceStale,
+    /// AV-193: the oracle quote exists but is not actionable — a
+    /// non-trading aggregate status, a non-positive price, a
+    /// confidence interval wider than `max_conf_bps` of the price, a
+    /// normalization overflow / round-to-zero, or (Switchboard) an
+    /// unmet oracle-result quorum. Never renumbered (see
+    /// [`EscrowError::code`]).
+    OraclePriceUnreliable,
 }
 
 impl EscrowError {
@@ -3966,6 +4001,12 @@ impl EscrowError {
             EscrowError::SealedBidNotCancellable => 277,
             // AV-192: appended, never renumbered.
             EscrowError::SealedBidBookFull => 278,
+            // AV-193: appended, never renumbered.
+            EscrowError::InvalidOracleAccount => 279,
+            // AV-193: appended, never renumbered.
+            EscrowError::OraclePriceStale => 280,
+            // AV-193: appended, never renumbered.
+            EscrowError::OraclePriceUnreliable => 281,
         }
     }
 
@@ -4241,6 +4282,12 @@ impl EscrowError {
             EscrowError::SealedBidNotCancellable,
             // AV-192: appended, never renumbered.
             EscrowError::SealedBidBookFull,
+            // AV-193: appended, never renumbered.
+            EscrowError::InvalidOracleAccount,
+            // AV-193: appended, never renumbered.
+            EscrowError::OraclePriceStale,
+            // AV-193: appended, never renumbered.
+            EscrowError::OraclePriceUnreliable,
         ]
     }
 }
@@ -32473,6 +32520,24 @@ mod error_code_tests {
             278,
             "commit_bid past MAX_SEALED_BIDS (64) commitments",
         ),
+        // AV-193: appended, never renumbered.
+        (
+            EscrowError::InvalidOracleAccount,
+            279,
+            "PythPriceFeed::from_account_data with a short account, header mismatch, or exponent outside [-18, 0]",
+        ),
+        // AV-193: appended, never renumbered.
+        (
+            EscrowError::OraclePriceStale,
+            280,
+            "oracle publish timestamp missing, in the future, or older than max_age_secs",
+        ),
+        // AV-193: appended, never renumbered.
+        (
+            EscrowError::OraclePriceUnreliable,
+            281,
+            "non-trading status, non-positive price, confidence wider than max_conf_bps, normalization failure, or unmet Switchboard quorum",
+        ),
     ];
 
     #[test]
@@ -58342,7 +58407,14 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::SealedBidNotCancellable));
         assert_eq!(EscrowError::SealedBidBookFull.code(), 278);
         assert!(EscrowError::all().contains(&EscrowError::SealedBidBookFull));
-        assert_eq!(EscrowError::all().len(), 179);
+        // AV-193: the oracle-adapter errors.
+        assert_eq!(EscrowError::InvalidOracleAccount.code(), 279);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidOracleAccount));
+        assert_eq!(EscrowError::OraclePriceStale.code(), 280);
+        assert!(EscrowError::all().contains(&EscrowError::OraclePriceStale));
+        assert_eq!(EscrowError::OraclePriceUnreliable.code(), 281);
+        assert!(EscrowError::all().contains(&EscrowError::OraclePriceUnreliable));
+        assert_eq!(EscrowError::all().len(), 182);
     }
 
     #[test]

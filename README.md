@@ -1590,6 +1590,9 @@ program error per variant):
 | `SealedBidSettleTooEarly` | 276 | `SealedBidAuction::settle` (AV-192) at `current_slot < end_slot` |
 | `SealedBidNotCancellable` | 277 | `SealedBidAuction::cancel` (AV-192) after the first commitment, on a terminal auction, or past the commit phase |
 | `SealedBidBookFull` | 278 | `SealedBidAuction::commit_bid` (AV-192) past `MAX_SEALED_BIDS` (64) commitments |
+| `InvalidOracleAccount` | 279 | `PythPriceFeed::from_account_data` (AV-193) with a short account, header mismatch, or exponent outside `[-18, 0]` |
+| `OraclePriceStale` | 280 | Oracle publish timestamp (AV-193) missing, in the future, or older than `max_age_secs` |
+| `OraclePriceUnreliable` | 281 | Non-trading aggregate status, non-positive price, confidence wider than `max_conf_bps`, normalization failure, or unmet Switchboard oracle-result quorum (AV-193) |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2408,6 +2411,43 @@ calls — the `scan_unclaimed_rent` executable-only rule).
 order, 64-char lowercase hex keys, dependency-free like every other
 keeper report). The scan is pure: it reads `&Escrow` snapshots only and
 never withdraws.
+
+## Pyth / Switchboard oracle adapters (AV-193)
+
+`escrow-state/src/oracle_adapter.rs` — concrete `PriceFeed`
+implementations for the AV-113 price gate (AV-113 defined the
+framework; these are the real oracle integrations). Both adapters are
+fail-closed and normalize quotes to 8 decimals (`ORACLE_QUOTE_DECIMALS`),
+so Pyth and Switchboard quotes are directly comparable by the gate.
+
+- **Pyth v2 price account parsing**: validates the account header
+  (`magic` 0xa1b2c3d4, `ver` 2, `atype` 2, `ptype` 1 — offsets pinned
+  against the pyth-client `Price` `#[repr(C)]` layout), then decodes
+  the aggregate `PriceInfo` (price, confidence, status, publish slot)
+  and the publish timestamp. The exponent is normalized into 8
+  decimals (`expo` in `[-18, 0]`; anything else cannot scale safely).
+- **Fail-closed validation**: a short account or header mismatch is
+  `InvalidOracleAccount`; a missing/future/older-than-`max_age_secs`
+  publish timestamp is `OraclePriceStale`; a non-trading aggregate
+  status, a non-positive price, a confidence interval wider than
+  `max_conf_bps` of the price, or a normalization overflow is
+  `OraclePriceUnreliable`. A stale or unreliable quote never gates a
+  payout — it fails before the AV-113 comparison runs.
+- **Switchboard v2 round validation**: the packed
+  `AggregatorAccountData` is decoded by the Anchor program with the
+  upstream `switchboard-v2` crate (zero-copy) — this module
+  deliberately does not re-implement its byte layout. The adapter
+  validates the decoded round: positive `SwitchboardDecimal` result,
+  oracle-result quorum (`num_success >= min_oracle_results`), round
+  timestamp freshness, and checked fixed-point normalization of
+  `mantissa * 10^-scale` into 8 decimals.
+
+New error codes (never renumbered): `InvalidOracleAccount` (279),
+`OraclePriceStale` (280), `OraclePriceUnreliable` (281). Pure logic:
+no Vault layout change, no `VAULT_SPACE` bump. Orthogonal to AV-113
+(the `PriceFeed` framework) and AV-128 (TWAP gate — a different
+manipulation-resistance strategy over the same quotes). (Solana/DeFi:
+oracle integrations.)
 
 ## Sealed-bid auction (AV-192)
 

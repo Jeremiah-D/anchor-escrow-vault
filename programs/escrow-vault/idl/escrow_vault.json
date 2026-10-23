@@ -1906,7 +1906,10 @@
     {"code": 275, "name": "SealedBidRevealMismatch"},
     {"code": 276, "name": "SealedBidSettleTooEarly"},
     {"code": 277, "name": "SealedBidNotCancellable"},
-    {"code": 278, "name": "SealedBidBookFull"}
+    {"code": 278, "name": "SealedBidBookFull"},
+    {"code": 279, "name": "InvalidOracleAccount"},
+    {"code": 280, "name": "OraclePriceStale"},
+    {"code": 281, "name": "OraclePriceUnreliable"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

@@ -1447,8 +1447,9 @@ mod idl_compat_tests {
         // 5 HTLC errors; AV-187 adds 2 NFT-escrow errors; AV-188 adds
         // 5 Merkle-distributor errors; AV-189 adds 5 English-auction
         // errors; AV-190 adds 3 rental-escrow errors; AV-191 adds
-        // InvalidReferral; AV-192 adds 7 sealed-bid auction errors.
-        assert_eq!(spec.errors.len(), 179);
+        // InvalidReferral; AV-192 adds 7 sealed-bid auction errors;
+        // AV-193 adds 3 oracle-adapter errors.
+        assert_eq!(spec.errors.len(), 182);
         // AV-178 adds the TieredQuorum + Tier named types.
         assert_eq!(spec.types.len(), 35);
         let diff = diff_idl(&idl, &idl).unwrap();

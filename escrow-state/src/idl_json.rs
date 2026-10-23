@@ -1273,14 +1273,14 @@ fn idl_errors_pin_enum() {
         assert!(seen.insert(name.clone()), "duplicate error variant {name}");
         assert!(
             // AV-190 extends the range with codes 268-270; AV-191
-            // with 271; AV-192 with 272-278 (never renumbered; each
-            // extension widens this bound).
-            (100..279).contains(&e.code()),
+            // with 271; AV-192 with 272-278; AV-193 with 279-281
+            // (never renumbered; each extension widens this bound).
+            (100..282).contains(&e.code()),
             "error code out of pinned range: {name} = {}",
             e.code()
         );
     }
-    assert_eq!(errors.len(), 179, "error variant count drift"); // AV-192: +7 sealed-bid errors
+    assert_eq!(errors.len(), 182, "error variant count drift"); // AV-193: +3 oracle-adapter errors
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);
