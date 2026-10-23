@@ -551,7 +551,8 @@ mod tests {
         ] {
             assert!(EscrowError::all().contains(&e));
         }
-        // AV-189 appends 5 English-auction errors after these.
-        assert_eq!(EscrowError::all().len(), 168);
+        // AV-189 appends 5 English-auction errors after these; AV-190
+        // appends 3 rental-escrow errors after those.
+        assert_eq!(EscrowError::all().len(), 171);
     }
 }

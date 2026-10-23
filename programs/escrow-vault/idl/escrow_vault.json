@@ -1883,7 +1883,10 @@
     {"code": 264, "name": "EnglishAuctionBidTooLow"},
     {"code": 265, "name": "EnglishAuctionNotLive"},
     {"code": 266, "name": "EnglishAuctionSettleTooEarly"},
-    {"code": 267, "name": "EnglishAuctionNotCancellable"}
+    {"code": 267, "name": "EnglishAuctionNotCancellable"},
+    {"code": 268, "name": "InvalidRentalTerms"},
+    {"code": 269, "name": "RentalNotActive"},
+    {"code": 270, "name": "RentalCancelNotAllowed"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

@@ -1580,6 +1580,9 @@ program error per variant):
 | `EnglishAuctionNotLive` | 265 | `EnglishAuction::place_bid` (AV-189) outside the live window (`current_slot >= end_slot`, strict end) or on a terminal auction |
 | `EnglishAuctionSettleTooEarly` | 266 | `EnglishAuction::settle` (AV-189) at `current_slot < end_slot` — the bidding window has not closed |
 | `EnglishAuctionNotCancellable` | 267 | `EnglishAuction::cancel` (AV-189) after a bid landed, on a terminal auction, or after the window lapsed |
+| `InvalidRentalTerms` | 268 | `RentalEscrow::new` (AV-190) with a zero owner/renter key, owner == renter, a zero rent amount, `term_end_slot <= term_start_slot`, a zero `slots_per_day`, or a late-fee rate/cap above 10_000 bps |
+| `RentalNotActive` | 269 | `RentalEscrow::return_asset` (AV-190) on a rental already in a terminal state |
+| `RentalCancelNotAllowed` | 270 | `RentalEscrow::cancel` (AV-190) after `term_start_slot` or on a terminal rental |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -6389,6 +6392,38 @@ New error codes (never renumbered): `InvalidEnglishAuction` (263),
 `EnglishAuctionNotCancellable` (267). Pure logic: no Vault layout
 change, no `VAULT_SPACE` bump. Orthogonal to AV-97 (Dutch auction,
 descending price). (Solana: auction primitives.)
+
+## Rental escrow (AV-190)
+
+`escrow-state/src/rental_escrow.rs` — time-boxed custody of an
+asset. The renter pays rent and receives *temporary custody* (use,
+not ownership) of the asset for the lease term; when the term
+expires, custody returns to the owner automatically.
+
+- **Use-right time box**: the asset is held by the escrow program
+  while the renter has use of it — it never transfers ownership, so
+  the term end is a custody handoff, not a sale. `asset_id` is the
+  caller's placeholder for whatever the program holds (an NFT mint,
+  a token account, …), exactly like AV-187's `MintDescriptor`
+  observer pattern.
+- **Overdue pricing, opt-in**: `LateFeeTerms` charges basis points
+  per overdue day (any partial day counts as a full day), capped at
+  `cap_bps` of the rent amount. `None` opts out — overdue returns
+  are then free but still recorded as late (`ReturnedLate` only
+  applies with a schedule).
+- **Clean edges**: returning exactly at `term_end_slot` is on time
+  (the end is inclusive); an early return is clean; the renter can
+  never re-return and the owner can only cancel before the term
+  starts — after that the asset must be returned, not cancelled.
+- **Fail-closed terms**: zero owner/renter keys, a self-lease, zero
+  rent, an empty term, a zero `slots_per_day`, or a rate/cap above
+  10_000 bps are all refused at construction.
+
+New error codes (never renumbered): `InvalidRentalTerms` (268),
+`RentalNotActive` (269), `RentalCancelNotAllowed` (270). Pure logic:
+no Vault layout change, no `VAULT_SPACE` bump. Orthogonal to AV-187
+NFT escrow (ownership transfer) and AV-13 vesting (linear release).
+(Solana: leasing primitives.)
 
 ## Program upgrade-authority handover (AV-179)
 

@@ -551,6 +551,18 @@ pub use english_auction::{
     AuctionSettlement, AuctionState, BidReceipt, EnglishAuction,
     MAX_SNIPE_EXTENSIONS,
 };
+// AV-190: rental escrow — time-boxed custody of an asset. The renter
+// pays rent and receives temporary custody (use, not ownership) for
+// the lease term; custody returns to the owner automatically when the
+// term expires. An opt-in late-fee schedule (bps/day, capped) prices
+// overdue returns. Orthogonal to AV-187 NFT escrow (ownership
+// transfer) and AV-13 vesting (linear release). Pure logic: no Vault
+// layout change, no VAULT_SPACE bump.
+mod rental_escrow;
+pub use rental_escrow::{
+    LateFeeTerms, RentalEscrow, RentalReturn, RentalState,
+    MAX_LATE_FEE_BPS,
+};
 // AV-179: program upgrade-authority handover — two-step propose/accept
 // with an opt-in handover delay, the structured handover audit ring,
 // and the keeper's upgrade-authority drift scan. Purely additive and
@@ -3566,6 +3578,26 @@ pub enum EscrowError {
     /// cancelling — cancelling would strand the bidders' funds).
     /// Never renumbered (see [`EscrowError::code`]).
     EnglishAuctionNotCancellable,
+    /// AV-190: [`RentalEscrow::new`](crate::RentalEscrow::new)
+    /// refused — a zero owner or renter key, owner and renter being
+    /// the same key (a self-lease), a zero rent amount, an empty term
+    /// (`term_end_slot <= term_start_slot`), a zero `slots_per_day`
+    /// (the overdue computation would divide by zero), or a late-fee
+    /// rate/cap above 10_000 bps. Never renumbered (see
+    /// [`EscrowError::code`]).
+    InvalidRentalTerms,
+    /// AV-190:
+    /// [`RentalEscrow::return_asset`](crate::RentalEscrow::return_asset)
+    /// on a rental already in a terminal state (`Returned`,
+    /// `ReturnedLate`, `Cancelled`). Never renumbered (see
+    /// [`EscrowError::code`]).
+    RentalNotActive,
+    /// AV-190: [`RentalEscrow::cancel`](crate::RentalEscrow::cancel)
+    /// refused — the term has already started (the renter has custody;
+    /// the asset must be returned, not cancelled) or the rental is
+    /// already in a terminal state. Never renumbered (see
+    /// [`EscrowError::code`]).
+    RentalCancelNotAllowed,
 }
 
 impl EscrowError {
@@ -3823,6 +3855,12 @@ impl EscrowError {
             EscrowError::EnglishAuctionSettleTooEarly => 266,
             // AV-189: appended, never renumbered.
             EscrowError::EnglishAuctionNotCancellable => 267,
+            // AV-190: appended, never renumbered.
+            EscrowError::InvalidRentalTerms => 268,
+            // AV-190: appended, never renumbered.
+            EscrowError::RentalNotActive => 269,
+            // AV-190: appended, never renumbered.
+            EscrowError::RentalCancelNotAllowed => 270,
         }
     }
 
@@ -4076,6 +4114,12 @@ impl EscrowError {
             EscrowError::EnglishAuctionSettleTooEarly,
             // AV-189: appended, never renumbered.
             EscrowError::EnglishAuctionNotCancellable,
+            // AV-190: appended, never renumbered.
+            EscrowError::InvalidRentalTerms,
+            // AV-190: appended, never renumbered.
+            EscrowError::RentalNotActive,
+            // AV-190: appended, never renumbered.
+            EscrowError::RentalCancelNotAllowed,
         ]
     }
 }
@@ -32040,6 +32084,24 @@ mod error_code_tests {
             267,
             "EnglishAuction::cancel after a bid landed, on a terminal auction, or after the window lapsed (AV-189)",
         ),
+        // AV-190: appended, never renumbered.
+        (
+            EscrowError::InvalidRentalTerms,
+            268,
+            "RentalEscrow::new with a zero owner/renter key, owner == renter, a zero rent amount, term_end_slot <= term_start_slot, a zero slots_per_day, or a late-fee rate/cap above 10_000 bps (AV-190)",
+        ),
+        // AV-190: appended, never renumbered.
+        (
+            EscrowError::RentalNotActive,
+            269,
+            "RentalEscrow::return_asset on a rental already in a terminal state (AV-190)",
+        ),
+        // AV-190: appended, never renumbered.
+        (
+            EscrowError::RentalCancelNotAllowed,
+            270,
+            "RentalEscrow::cancel after term_start_slot or on a terminal rental (AV-190)",
+        ),
     ];
 
     #[test]
@@ -57853,7 +57915,14 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::EnglishAuctionSettleTooEarly));
         assert_eq!(EscrowError::EnglishAuctionNotCancellable.code(), 267);
         assert!(EscrowError::all().contains(&EscrowError::EnglishAuctionNotCancellable));
-        assert_eq!(EscrowError::all().len(), 168);
+        // AV-190: the rental-escrow errors.
+        assert_eq!(EscrowError::InvalidRentalTerms.code(), 268);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidRentalTerms));
+        assert_eq!(EscrowError::RentalNotActive.code(), 269);
+        assert!(EscrowError::all().contains(&EscrowError::RentalNotActive));
+        assert_eq!(EscrowError::RentalCancelNotAllowed.code(), 270);
+        assert!(EscrowError::all().contains(&EscrowError::RentalCancelNotAllowed));
+        assert_eq!(EscrowError::all().len(), 171);
     }
 
     #[test]
