@@ -502,6 +502,16 @@ pub use mint_safety::{
     check_mint_safety, MintExtensionDescriptor, MintSafetyError, MintSafetyFinding,
     MintSafetyReport,
 };
+// AV-185: secp256k1 / EVM signature verification — hand-rolled Keccak-256
+// and secp256k1 (field, Jacobian point arithmetic, ECDSA recovery) for
+// the cross-chain release-authorization envelope (an EVM wallet bound to
+// the taker authorizes a release without a Solana key).
+mod secp256k1;
+pub use secp256k1::{
+    bind_evm_taker, keccak256, personal_sign_hash, recover_address,
+    release_authorization_hash, verify_eth_signature, verify_release_authorization,
+    EvmSignature, EvmTakerBinding, Keccak256, RELEASE_AUTH_DOMAIN,
+};
 // AV-179: program upgrade-authority handover — two-step propose/accept
 // with an opt-in handover delay, the structured handover audit ring,
 // and the keeper's upgrade-authority drift scan. Purely additive and

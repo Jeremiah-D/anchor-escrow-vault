@@ -6202,6 +6202,38 @@ vault: the mint bound via `with_mint` is the on-chain anchor, and the
 check runs before the escrow exists (Solana security / backend
 engineering: hostile-mint circuit breaker).
 
+## EVM release authorization via secp256k1 (AV-185)
+
+`escrow-state/src/secp256k1.rs` — hand-rolled Keccak-256 (the Ethereum
+variant) and secp256k1 (base-field arithmetic, Jacobian point
+operations, ECDSA public-key recovery), zero dependencies, for the
+cross-chain release-authorization envelope: the taker binds an EVM
+wallet (`bind_evm_taker`) to their escrow identity, and that wallet's
+signature then authorizes a `release` — the Ethereum signer never needs
+a Solana key.
+
+- **The envelope**: `release_authorization_hash` is
+  `keccak256(domain || escrow_id || taker || evm_address || amount_le
+  || nonce_le)`; `verify_release_authorization` recovers the signer
+  address from `(hash, r, s, v)` and compares it to the bound address.
+  The authorization is single-use by construction — a signature for a
+  different amount, nonce, or escrow is a different message and fails.
+  `personal_sign_hash` covers the EIP-191 wallet-signing path
+  (`"\x19Ethereum Signed Message:\n" || len || message`).
+- **Fail-closed**: `v` must be `27`/`28`, `r`/`s` must be in
+  `1..n`, the zero address can never be bound, and any malformed input
+  recovers to `None` / verifies as `false` — never a panic.
+- **Correctness pins** (independent ground truth, no self-generated
+  vectors): Keccak-256 against `pycryptodome` (empty, `"hello"`,
+  multi-block inputs); `2*G` and full sign→recover vectors against
+  `python-ecdsa` (RFC 6979 deterministic signatures); the recovered
+  address must equal the independently derived Ethereum address.
+- **Threat model**: like `ed25519.rs`, this is cross-chain tooling,
+  not consensus — no constant-time claims (double-and-add scalar
+  multiplication). Orthogonal to `ed25519.rs` (ed25519 for keeper
+  reports; this module is secp256k1/EVM). (Solana cross-chain /
+  backend engineering: EVM-signed escrow release.)
+
 ## Program upgrade-authority handover (AV-179)
 
 `escrow-state/src/upgrade_authority.rs` — the two-step propose/accept
