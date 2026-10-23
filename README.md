@@ -6630,3 +6630,39 @@ New error codes (never renumbered): `InvalidFreezeAuthority` (246),
 `EscrowFrozen` (249). Off-chain executable spec only: real
 `FreezeAccount` / `ThawAccount` are token-program CPIs the on-chain
 program issues after this custody check (the AV-163 honesty contract).
+
+## Social recovery for lost initializer keys (AV-195)
+
+`escrow-state/src/social_recovery.rs` — the key-loss escape hatch for
+escrows whose initializer lost their key: an M-of-N guardian policy
+that rotates the initializer to a fresh key after a timelock (Solana /
+wallet recovery UX).
+
+The initializer configures the policy (`configure_social_recovery`:
+1–8 guardian keys, threshold 1..=N, timelock in seconds; zero or
+duplicate guardians rejected as `InvalidRecoveryPolicy`, code 286;
+threshold above the guardian count is `InvalidRecoveryThreshold`,
+code 287). A guardian opens a recovery request naming the new
+authority (`request_recovery`; one live request at a time —
+`RecoveryAlreadyPending`, code 288); other guardians approve
+(`approve_recovery`; the requester counts as the first approval;
+double-approval is `RecoveryAlreadyApproved`, code 289). Once the
+threshold is met AND the timelock has elapsed since the request opened,
+anyone can execute (`execute_recovery` — the permissionless crank;
+`RecoveryThresholdNotMet`, code 290, or `RecoveryTimelockNotElapsed`,
+code 291, before that). The current initializer can veto at any time
+before execution (`veto_recovery`; a stranger's veto is
+`RecoveryVetoDenied`, code 292).
+
+The policy persists in the vault account (the 309-byte
+`SocialRecovery` tail: 8 guardian slots + count + threshold +
+timelock + the flattened pending request). Executing rewrites the
+initializer region in place — the escrow itself (amount, taker, state)
+is untouched. Approvals are never withdrawn (no take-backs: the
+timelock + veto is the safety, not revocation).
+
+Layout growth: the vault body grows from 7345 to 7654 bytes (+309:
+the 309-byte social-recovery tail), `VAULT_SPACE_NO_QUORUM` from 6863
+to 7172, `VAULT_SPACE` from 7353 to 7662, and the close-time rent
+reclamation from 52_067_760 to 54_218_400 lamports
+(`(128 + VAULT_SPACE) * 3480 * 2`).

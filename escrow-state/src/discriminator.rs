@@ -39,15 +39,15 @@ use super::{
     sha256, AppealBallot, AppealState, ArbiterPanel, BasketLeg, BasketLegs, ClaimantRoster, CounterOffer, CpiAllowlist,
     DefaultJudgment, DualControlIntent, DutchAuction, Escrow, EscrowEventKind, EscrowState, EventHistorySlot, FeeSchedule, FeeTier,
     Delegation, FundingPlan, GovernanceAction, GovernanceProposal, MilestonePlan, MultisigAuthority, PanelVote, PayoutAllowlist, PayoutDenylist, PayoutSplit, QuorumPolicy,
-    MintAllowlist, Tier, TieredQuorum,
+    MintAllowlist, Tier, TieredQuorum, SocialRecovery,
     SlashTerms, SlashLadder, SlashRung, SubscriptionSchedule, VestingCurve, VestingPause, VestingSchedule, ANCHOR_DISCRIMINATOR_LEN,
     APPEAL_BALLOT_LEN, ARBITER_PANEL_LEN, BASKET_LEGS_LEN, CLAIMANT_ROSTER_LEN, COUNTER_OFFER_LEN, CPI_ALLOWLIST_LEN, DEFAULT_JUDGMENT_LEN,
     DELEGATION_LEN, DUAL_CONTROL_INTENT_LEN, DUTCH_AUCTION_LEN, ESCROW_BODY_LEN, FEE_SCHEDULE_LEN, FEE_TIER_LEN, MAX_ATTESTORS, MAX_BASKET_LEGS,
     MAX_CLAIMANTS, MAX_CPI_ALLOWLIST, MAX_EVENT_HISTORY, MAX_FEE_TIERS, MAX_MILESTONES, MAX_MINT_ALLOWLIST, MAX_PANEL_MEMBERS,
-    MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_RELEASE_SPLIT_RECIPIENTS, MAX_SLASH_LADDER_RUNGS, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
+    MAX_PAYOUT_ALLOWLIST, MAX_PAYOUT_DENYLIST, MAX_RECOVERY_GUARDIANS, MAX_RELEASE_SPLIT_RECIPIENTS, MAX_SLASH_LADDER_RUNGS, MAX_SUBSCRIPTION_PERIODS, MAX_VESTING_CURVE_TIERS,
     GOVERNANCE_ACTION_PAYLOAD_LEN, GOVERNANCE_PROPOSAL_LEN,
     MILESTONE_PLAN_LEN, MINT_ALLOWLIST_LEN, MULTISIG_AUTHORITY_LEN, PANEL_VOTE_LEN, PAYOUT_ALLOWLIST_LEN,
-    PAYOUT_DENYLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_LADDER_LEN, SLASH_TERMS_LEN, SUBSCRIPTION_SCHEDULE_LEN,
+    PAYOUT_DENYLIST_LEN, PUBKEY_LEN, QUORUM_POLICY_LEN, SLASH_LADDER_LEN, SLASH_TERMS_LEN, RECOVERY_REQUEST_LEN, SOCIAL_RECOVERY_LEN, SUBSCRIPTION_SCHEDULE_LEN,
     SWAP_LINK_REGION_LEN, VAULT_SPACE, VESTING_CURVE_LEN, MAX_TIERS, TIERED_QUORUM_LEN,
 };
 
@@ -218,6 +218,15 @@ pub enum AccountDecodeError {
     /// rather than decoding a value the accessors cannot safely read
     /// (AV-158; AV-32 panic-free guarantee).
     InvalidGovernanceActionLen { kind: u8, count: u8 },
+    /// A present social-recovery policy carries a guardian count
+    /// outside `1..=8` ([`MAX_RECOVERY_GUARDIANS`](crate::MAX_RECOVERY_GUARDIANS))
+    /// or a threshold outside `1..=count`. The count byte is part of
+    /// the field's layout — an out-of-range count would make
+    /// [`SocialRecovery::guardians`](crate::SocialRecovery::guardians)
+    /// read past the live slots, so the decoder rejects it rather
+    /// than decoding a value the accessors cannot safely read
+    /// (AV-195; AV-32 panic-free guarantee).
+    InvalidSocialRecoveryLen { count: u8, threshold: u8 },
 }
 
 /// Bounds-checked cursor over the account body. Every read is
@@ -1625,7 +1634,45 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     let referral_bps = c.u16_le()?;
     // AV-191: the cumulative referral share charged.
     let referral_paid = c.u64_le()?;
-
+    // AV-195: the opt-in social-recovery policy — the 1-byte `Option`
+    // discriminant + the `SOCIAL_RECOVERY_LEN`-byte policy region
+    // (guardian slots, count, threshold, timelock, pending request).
+    // Structural decode only — the policy invariants are enforced by
+    // `with_social_recovery` / `open_request`, not re-litigated here
+    // (beyond the count/threshold range the accessors depend on).
+    let recovery = if c.option_present("recovery")? {
+        let mut guardians = [[0u8; 32]; MAX_RECOVERY_GUARDIANS];
+        for g in guardians.iter_mut() {
+            *g = c.pubkey()?;
+        }
+        let count = c.u8()?;
+        let threshold = c.u8()?;
+        if count == 0 || count as usize > MAX_RECOVERY_GUARDIANS || threshold == 0 || threshold > count
+        {
+            return Err(AccountDecodeError::InvalidSocialRecoveryLen { count, threshold });
+        }
+        let timelock_secs = c.u64_le()?;
+        let pending = if c.option_present("recovery.pending")? {
+            let new_authority = c.pubkey()?;
+            let approvals = c.u8()?;
+            let requested_at = c.u64_le()?;
+            Some(crate::RecoveryRequest {
+                new_authority,
+                approvals,
+                requested_at,
+            })
+        } else {
+            c.skip(RECOVERY_REQUEST_LEN)?;
+            None
+        };
+        Some(
+            SocialRecovery::from_parts(&guardians[..count as usize], threshold, timelock_secs, pending)
+                .map_err(|_| AccountDecodeError::InvalidSocialRecoveryLen { count, threshold })?,
+        )
+    } else {
+        c.skip(SOCIAL_RECOVERY_LEN)?;
+        None
+    };
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1945,6 +1992,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-191: the cumulative referral share — a decoded escrow
         // carries the same counter the live one recorded.
         referral_paid,
+        // AV-195: the social-recovery policy — a decoded escrow
+        // carries the same guardian set, threshold, timelock, and live
+        // request the setup and the recovery transitions recorded.
+        recovery,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

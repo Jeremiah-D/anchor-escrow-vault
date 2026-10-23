@@ -1205,6 +1205,42 @@
         {"name": "referrer", "type": "publicKey"},
         {"name": "referral_bps", "type": "u16"}
       ]
+    },
+    {
+      "name": "configure_social_recovery",
+      "discriminator": [198, 228, 5, 9, 116, 147, 10, 221],
+      "accounts": [],
+      "args": [
+        {"name": "guardians", "type": {"vec": "publicKey"}},
+        {"name": "threshold", "type": "u8"},
+        {"name": "timelock_secs", "type": "u64"}
+      ]
+    },
+    {
+      "name": "request_recovery",
+      "discriminator": [169, 44, 164, 157, 148, 175, 110, 130],
+      "accounts": [],
+      "args": [
+        {"name": "new_authority", "type": "publicKey"}
+      ]
+    },
+    {
+      "name": "approve_recovery",
+      "discriminator": [148, 96, 41, 38, 108, 189, 129, 214],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "execute_recovery",
+      "discriminator": [203, 133, 133, 228, 153, 121, 182, 237],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "veto_recovery",
+      "discriminator": [57, 30, 97, 87, 158, 139, 31, 7],
+      "accounts": [],
+      "args": []
     }
   ],
   "accounts": [
@@ -1342,7 +1378,8 @@
           {"name": "tiered_quorum", "type": {"option": {"defined": "TieredQuorum"}}, "offset": 6907},
           {"name": "referrer", "type": {"option": {"array": ["u8", 32]}}, "offset": 7310},
           {"name": "referral_bps", "type": "u16", "offset": 7343},
-          {"name": "referral_paid", "type": "u64", "offset": 7345}
+          {"name": "referral_paid", "type": "u64", "offset": 7345},
+          {"name": "recovery", "type": {"option": {"defined": "SocialRecovery"}}, "offset": 7353}
         ]
       }
     }
@@ -1682,6 +1719,22 @@
       }
     },
     {
+      "name": "SocialRecovery",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "guardians", "type": {"array": ["publicKey", 8]}, "offset": 0},
+          {"name": "guardian_count", "type": "u8", "offset": 256},
+          {"name": "threshold", "type": "u8", "offset": 257},
+          {"name": "timelock_secs", "type": "u64", "offset": 258},
+          {"name": "pending_present", "type": "bool", "offset": 266},
+          {"name": "pending_new_authority", "type": "publicKey", "offset": 267},
+          {"name": "pending_approvals", "type": "u8", "offset": 299},
+          {"name": "pending_requested_at", "type": "u64", "offset": 300}
+        ]
+      }
+    },
+    {
       "name": "DualControlIntent",
       "type": {
         "kind": "struct",
@@ -1913,7 +1966,14 @@
     {"code": 282, "name": "InvalidBidDeposit"},
     {"code": 283, "name": "BidDepositNotRegistered"},
     {"code": 284, "name": "BidDepositAlreadySettled"},
-    {"code": 285, "name": "BidDepositBookFull"}
+    {"code": 285, "name": "BidDepositBookFull"},
+    {"code": 286, "name": "InvalidSocialRecovery"},
+    {"code": 287, "name": "RecoveryNotConfigured"},
+    {"code": 288, "name": "RecoveryNotGuardian"},
+    {"code": 289, "name": "RecoveryRequestPending"},
+    {"code": 290, "name": "RecoveryNoPendingRequest"},
+    {"code": 291, "name": "RecoveryThresholdNotReached"},
+    {"code": 292, "name": "RecoveryTimelockNotElapsed"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
