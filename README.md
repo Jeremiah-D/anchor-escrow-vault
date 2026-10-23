@@ -1563,6 +1563,11 @@ program error per variant):
 | `TokenAccountNotFrozen` | 248 | `ManagedFreezeAuthority::thaw` (AV-180) on a token account that is not frozen |
 | `EscrowFrozen` | 249 | `ManagedFreezeAuthority::require_unfrozen` (AV-180) while the managed token account is frozen |
 | `UnsafeMint` | 250 | `Escrow::check_mint_safety` (AV-184) on a mint carrying an escrow-hostile Token-2022 extension — fail-closed |
+| `InvalidHtlcLock` | 251 | `HtlcLock::new` (AV-186) with a zero maker/taker key, a zero amount, or an expiry slot at or before the creation slot |
+| `HtlcInvalidPreimage` | 252 | `HtlcLock::claim` (AV-186) with an empty preimage or one longer than `MAX_HTLC_PREIMAGE_LEN` — never hashed |
+| `HtlcHashlockMismatch` | 253 | `HtlcLock::claim` (AV-186) with a preimage whose SHA-256 digest does not equal the lock's hashlock |
+| `HtlcClaimExpired` | 254 | `HtlcLock::claim` (AV-186) at `current_slot >= expiry_slot` — the taker's claim window is closed |
+| `HtlcRefundNotExpired` | 255 | `HtlcLock::refund` (AV-186) at `current_slot < expiry_slot` — the taker's claim window is still open |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -6233,6 +6238,46 @@ a Solana key.
   multiplication). Orthogonal to `ed25519.rs` (ed25519 for keeper
   reports; this module is secp256k1/EVM). (Solana cross-chain /
   backend engineering: EVM-signed escrow release.)
+
+## HTLC hash-time-locked release (AV-186)
+
+`escrow-state/src/htlc.rs` — the hashed time-lock contract (HTLC)
+primitive for cross-chain atomic swaps, pure logic with zero
+dependencies. The maker locks funds behind `SHA-256(preimage)` (the
+*hashlock*) and a slot deadline (the *timelock*): the taker claims by
+revealing the preimage before the deadline; the maker refunds after
+it. The same hashlock on both chains makes the two legs
+settle-or-refund together — atomicity without a trusted relayer.
+
+- **The double lock**: `HtlcLock::claim` requires `sha256(preimage) ==
+  hashlock && current_slot < expiry_slot`. The check order is
+  authority → state → timelock → preimage shape → hashlock, mirroring
+  the state machine's fail-closed ordering (a stranger gets
+  `Unauthorized` and learns nothing about the lock). `claim` and
+  `refund` return the locked amount for exact transfer sizing, and
+  both exits move the lock to a terminal state (`Claimed` /
+  `Refunded`) — double-claim and double-refund are
+  `InvalidStateTransition`.
+- **The preimage is never stored**: the lock carries only the digest,
+  and `claim` compares `sha256(preimage)` against it in memory (XOR-
+  accumulated, no per-byte oracle). There is no field, log line, or
+  serialization path that retains the preimage after the call
+  returns. `verify_htlc_preimage` is the stateless check for
+  off-chain keepers and wallets; `can_claim` simulates a claim
+  without moving state.
+- **Boundary semantics**: the taker's window is `current_slot <
+  expiry_slot` (strict — claiming *at* the expiry slot fails with
+  `HtlcClaimExpired`, codes 251–255); the maker's refund window is
+  `current_slot >= expiry_slot` (inclusive — refunding *at* expiry
+  succeeds). The maker cannot race the taker's open window
+  (`HtlcRefundNotExpired`).
+- **Orthogonality**: AV-185's `release_authorization_hash` unlocks
+  with an EVM *signature* — this unlocks with a hash *preimage*;
+  AV-137's commit-reveal hides an arbitration *vote* — this hides the
+  *payment secret*; the SLOT_TIMELOCK releases on slot expiry alone
+  — this adds the hash condition on top. Pure logic: no Vault layout
+  change, no `VAULT_SPACE` bump (the layout pin tests still hold).
+  (Solana: cross-chain atomic-swap primitive / backend engineering.)
 
 ## Program upgrade-authority handover (AV-179)
 

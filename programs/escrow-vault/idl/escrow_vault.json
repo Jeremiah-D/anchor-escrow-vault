@@ -1866,7 +1866,12 @@
     {"code": 247, "name": "TokenAccountAlreadyFrozen"},
     {"code": 248, "name": "TokenAccountNotFrozen"},
     {"code": 249, "name": "EscrowFrozen"},
-    {"code": 250, "name": "UnsafeMint"}
+    {"code": 250, "name": "UnsafeMint"},
+    {"code": 251, "name": "InvalidHtlcLock"},
+    {"code": 252, "name": "HtlcInvalidPreimage"},
+    {"code": 253, "name": "HtlcHashlockMismatch"},
+    {"code": 254, "name": "HtlcClaimExpired"},
+    {"code": 255, "name": "HtlcRefundNotExpired"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

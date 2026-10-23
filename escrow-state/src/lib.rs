@@ -512,6 +512,14 @@ pub use secp256k1::{
     release_authorization_hash, verify_eth_signature, verify_release_authorization,
     EvmSignature, EvmTakerBinding, Keccak256, RELEASE_AUTH_DOMAIN,
 };
+// AV-186: HTLC hash-time-locked release for cross-chain atomic swaps —
+// sha256 hashlock + expiry-slot timelock double condition, maker/taker
+// roles, the preimage compared in memory only and never stored. Pure
+// logic: no Vault layout change, no VAULT_SPACE bump.
+mod htlc;
+pub use htlc::{
+    verify_htlc_preimage, HtlcLock, HtlcState, MAX_HTLC_PREIMAGE_LEN,
+};
 // AV-179: program upgrade-authority handover — two-step propose/accept
 // with an opt-in handover delay, the structured handover audit ring,
 // and the keeper's upgrade-authority drift scan. Purely additive and
@@ -3434,6 +3442,32 @@ pub enum EscrowError {
     /// permanent delegate). Fail-closed: the escrow must not be created
     /// on such a mint. Never renumbered (see [`EscrowError::code`]).
     UnsafeMint,
+    /// AV-186: [`HtlcLock::new`](crate::HtlcLock::new) refused — zero
+    /// maker or taker key, a zero locked amount, or an expiry slot at
+    /// or before the creation slot (the taker's claim window would be
+    /// empty). Never renumbered (see [`EscrowError::code`]).
+    InvalidHtlcLock,
+    /// AV-186: [`HtlcLock::claim`](crate::HtlcLock::claim) with an
+    /// empty preimage or one longer than
+    /// [`MAX_HTLC_PREIMAGE_LEN`](crate::MAX_HTLC_PREIMAGE_LEN) — the
+    /// claim input is malformed, so it is never hashed. Never
+    /// renumbered (see [`EscrowError::code`]).
+    HtlcInvalidPreimage,
+    /// AV-186: [`HtlcLock::claim`](crate::HtlcLock::claim) with a
+    /// preimage whose SHA-256 digest does not equal the lock's
+    /// hashlock. The preimage is compared in memory only and never
+    /// stored. Never renumbered (see [`EscrowError::code`]).
+    HtlcHashlockMismatch,
+    /// AV-186: [`HtlcLock::claim`](crate::HtlcLock::claim) at
+    /// `current_slot >= expiry_slot` — the taker's claim window is
+    /// closed; only the maker can refund now. Never renumbered (see
+    /// [`EscrowError::code`]).
+    HtlcClaimExpired,
+    /// AV-186: [`HtlcLock::refund`](crate::HtlcLock::refund) at
+    /// `current_slot < expiry_slot` — the taker's claim window is
+    /// still open and the maker cannot race it. Never renumbered (see
+    /// [`EscrowError::code`]).
+    HtlcRefundNotExpired,
 }
 
 impl EscrowError {
@@ -3657,6 +3691,16 @@ impl EscrowError {
             EscrowError::TokenAccountNotFrozen => 248,
             EscrowError::EscrowFrozen => 249,
             EscrowError::UnsafeMint => 250,
+            // AV-186: appended, never renumbered.
+            EscrowError::InvalidHtlcLock => 251,
+            // AV-186: appended, never renumbered.
+            EscrowError::HtlcInvalidPreimage => 252,
+            // AV-186: appended, never renumbered.
+            EscrowError::HtlcHashlockMismatch => 253,
+            // AV-186: appended, never renumbered.
+            EscrowError::HtlcClaimExpired => 254,
+            // AV-186: appended, never renumbered.
+            EscrowError::HtlcRefundNotExpired => 255,
         }
     }
 
@@ -3876,6 +3920,16 @@ impl EscrowError {
             EscrowError::EscrowFrozen,
             // AV-184: appended, never renumbered.
             EscrowError::UnsafeMint,
+            // AV-186: appended, never renumbered.
+            EscrowError::InvalidHtlcLock,
+            // AV-186: appended, never renumbered.
+            EscrowError::HtlcInvalidPreimage,
+            // AV-186: appended, never renumbered.
+            EscrowError::HtlcHashlockMismatch,
+            // AV-186: appended, never renumbered.
+            EscrowError::HtlcClaimExpired,
+            // AV-186: appended, never renumbered.
+            EscrowError::HtlcRefundNotExpired,
         ]
     }
 }
@@ -31738,6 +31792,36 @@ mod error_code_tests {
             250,
             "Escrow::check_mint_safety on a mint with an escrow-hostile Token-2022 extension — fail-closed (AV-184)",
         ),
+        // AV-186: appended, never renumbered.
+        (
+            EscrowError::InvalidHtlcLock,
+            251,
+            "HtlcLock::new with a zero maker/taker key, a zero amount, or an expiry slot at or before the creation slot (AV-186)",
+        ),
+        // AV-186: appended, never renumbered.
+        (
+            EscrowError::HtlcInvalidPreimage,
+            252,
+            "HtlcLock::claim with an empty preimage or one longer than MAX_HTLC_PREIMAGE_LEN — never hashed (AV-186)",
+        ),
+        // AV-186: appended, never renumbered.
+        (
+            EscrowError::HtlcHashlockMismatch,
+            253,
+            "HtlcLock::claim with a preimage whose SHA-256 digest does not equal the lock's hashlock (AV-186)",
+        ),
+        // AV-186: appended, never renumbered.
+        (
+            EscrowError::HtlcClaimExpired,
+            254,
+            "HtlcLock::claim at current_slot >= expiry_slot — the taker's claim window is closed, only the maker can refund (AV-186)",
+        ),
+        // AV-186: appended, never renumbered.
+        (
+            EscrowError::HtlcRefundNotExpired,
+            255,
+            "HtlcLock::refund at current_slot < expiry_slot — the taker's claim window is still open (AV-186)",
+        ),
     ];
 
     #[test]
@@ -57514,7 +57598,17 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::EscrowFrozen));
         assert_eq!(EscrowError::UnsafeMint.code(), 250);
         assert!(EscrowError::all().contains(&EscrowError::UnsafeMint));
-        assert_eq!(EscrowError::all().len(), 151);
+        assert_eq!(EscrowError::InvalidHtlcLock.code(), 251);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidHtlcLock));
+        assert_eq!(EscrowError::HtlcInvalidPreimage.code(), 252);
+        assert!(EscrowError::all().contains(&EscrowError::HtlcInvalidPreimage));
+        assert_eq!(EscrowError::HtlcHashlockMismatch.code(), 253);
+        assert!(EscrowError::all().contains(&EscrowError::HtlcHashlockMismatch));
+        assert_eq!(EscrowError::HtlcClaimExpired.code(), 254);
+        assert!(EscrowError::all().contains(&EscrowError::HtlcClaimExpired));
+        assert_eq!(EscrowError::HtlcRefundNotExpired.code(), 255);
+        assert!(EscrowError::all().contains(&EscrowError::HtlcRefundNotExpired));
+        assert_eq!(EscrowError::all().len(), 156);
     }
 
     #[test]
