@@ -531,6 +531,6 @@ mod htlc_tests {
         // AV-188 pins its own codes in merkle_distributor::merkle_tests.
         // AV-189 pins its own codes in english_auction::english_auction_tests.
         // AV-190 pins its own codes in rental_escrow::rental_escrow_tests.
-        assert_eq!(EscrowError::all().len(), 182); // AV-193: +3 oracle-adapter errors
+        assert_eq!(EscrowError::all().len(), 186); // AV-194: +4 bid-deposit errors
     }
 }

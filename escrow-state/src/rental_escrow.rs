@@ -551,6 +551,6 @@ mod rental_escrow_tests {
         ] {
             assert!(EscrowError::all().contains(&e));
         }
-        assert_eq!(EscrowError::all().len(), 182); // AV-193: +3 oracle-adapter errors
+        assert_eq!(EscrowError::all().len(), 186); // AV-194: +4 bid-deposit errors
     }
 }

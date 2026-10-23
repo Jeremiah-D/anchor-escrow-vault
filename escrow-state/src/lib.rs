@@ -591,6 +591,20 @@ pub use rental_escrow::{
     LateFeeTerms, RentalEscrow, RentalReturn, RentalState,
     MAX_LATE_FEE_BPS,
 };
+// AV-194: opt-in bid deposits for auctions — a flat per-bidder
+// deposit locks at bid time; the winner's deposit is applied toward
+// the purchase price, honest losers are refunded in full, and
+// sealed-bid no-reveals (or a seller slash for misbehavior) are
+// forfeited. Orthogonal to AV-103 (the taker's appeal bond on a
+// slashed escrow) and to the auction modules (AV-189 English, AV-97
+// Dutch, AV-192 sealed-bid price the asset and pick the winner —
+// this module only moves deposits once the program reports the
+// outcome). Pure logic: no Vault layout change, no VAULT_SPACE bump.
+mod bid_deposit;
+pub use bid_deposit::{
+    AuctionKind, BidDepositAuction, BidDepositSettlement, DepositReceipt, DepositState,
+    MAX_BID_DEPOSITS,
+};
 // AV-179: program upgrade-authority handover — two-step propose/accept
 // with an opt-in handover delay, the structured handover audit ring,
 // and the keeper's upgrade-authority drift scan. Purely additive and
@@ -3722,6 +3736,29 @@ pub enum EscrowError {
     /// unmet oracle-result quorum. Never renumbered (see
     /// [`EscrowError::code`]).
     OraclePriceUnreliable,
+    /// AV-194: [`BidDepositAuction`](crate::BidDepositAuction) refused —
+    /// a zero auction id / zero seller key / zero deposit amount on
+    /// [`new`](crate::BidDepositAuction::new), a zero bidder key, a
+    /// duplicate registration, a settle/settle_sealed call on the wrong
+    /// auction kind, a settle whose winner's deposit is no longer
+    /// locked, a `settle_sealed` whose winner never revealed, or a
+    /// forfeit of an already-terminal deposit. Never renumbered (see
+    /// [`EscrowError::code`]).
+    InvalidBidDeposit,
+    /// AV-194: a [`BidDepositAuction`](crate::BidDepositAuction)
+    /// operation naming a bidder that never registered a deposit.
+    /// Never renumbered (see [`EscrowError::code`]).
+    BidDepositNotRegistered,
+    /// AV-194: [`BidDepositAuction`](crate::BidDepositAuction) mutated
+    /// after settlement — registering, revealing, forfeiting, or
+    /// settling twice. Never renumbered (see [`EscrowError::code`]).
+    BidDepositAlreadySettled,
+    /// AV-194: [`BidDepositAuction::register`](crate::BidDepositAuction::register)
+    /// past [`MAX_BID_DEPOSITS`](crate::MAX_BID_DEPOSITS) deposits —
+    /// the book is a fixed-size array, so the 65th bidder is refused
+    /// fail-closed rather than silently dropped. Never renumbered (see
+    /// [`EscrowError::code`]).
+    BidDepositBookFull,
 }
 
 impl EscrowError {
@@ -4007,6 +4044,14 @@ impl EscrowError {
             EscrowError::OraclePriceStale => 280,
             // AV-193: appended, never renumbered.
             EscrowError::OraclePriceUnreliable => 281,
+            // AV-194: appended, never renumbered.
+            EscrowError::InvalidBidDeposit => 282,
+            // AV-194: appended, never renumbered.
+            EscrowError::BidDepositNotRegistered => 283,
+            // AV-194: appended, never renumbered.
+            EscrowError::BidDepositAlreadySettled => 284,
+            // AV-194: appended, never renumbered.
+            EscrowError::BidDepositBookFull => 285,
         }
     }
 
@@ -4288,6 +4333,14 @@ impl EscrowError {
             EscrowError::OraclePriceStale,
             // AV-193: appended, never renumbered.
             EscrowError::OraclePriceUnreliable,
+            // AV-194: appended, never renumbered.
+            EscrowError::InvalidBidDeposit,
+            // AV-194: appended, never renumbered.
+            EscrowError::BidDepositNotRegistered,
+            // AV-194: appended, never renumbered.
+            EscrowError::BidDepositAlreadySettled,
+            // AV-194: appended, never renumbered.
+            EscrowError::BidDepositBookFull,
         ]
     }
 }
@@ -32538,6 +32591,30 @@ mod error_code_tests {
             281,
             "non-trading status, non-positive price, confidence wider than max_conf_bps, normalization failure, or unmet Switchboard quorum",
         ),
+        // AV-194: appended, never renumbered.
+        (
+            EscrowError::InvalidBidDeposit,
+            282,
+            "bid-deposit book misuse: zero auction/seller key, zero deposit amount, zero bidder, duplicate registration, wrong auction kind for the settle entrypoint, non-locked winner, unrevealed sealed-bid winner, or forfeit of a terminal deposit",
+        ),
+        // AV-194: appended, never renumbered.
+        (
+            EscrowError::BidDepositNotRegistered,
+            283,
+            "bid-deposit operation naming a bidder that never registered a deposit",
+        ),
+        // AV-194: appended, never renumbered.
+        (
+            EscrowError::BidDepositAlreadySettled,
+            284,
+            "bid-deposit book mutated after settlement: register, reveal, forfeit, or settle twice",
+        ),
+        // AV-194: appended, never renumbered.
+        (
+            EscrowError::BidDepositBookFull,
+            285,
+            "bid-deposit registration past MAX_BID_DEPOSITS (64) — the fixed-size book is full",
+        ),
     ];
 
     #[test]
@@ -58414,7 +58491,7 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceStale));
         assert_eq!(EscrowError::OraclePriceUnreliable.code(), 281);
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceUnreliable));
-        assert_eq!(EscrowError::all().len(), 182);
+        assert_eq!(EscrowError::all().len(), 186);
     }
 
     #[test]

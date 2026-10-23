@@ -1593,6 +1593,10 @@ program error per variant):
 | `InvalidOracleAccount` | 279 | `PythPriceFeed::from_account_data` (AV-193) with a short account, header mismatch, or exponent outside `[-18, 0]` |
 | `OraclePriceStale` | 280 | Oracle publish timestamp (AV-193) missing, in the future, or older than `max_age_secs` |
 | `OraclePriceUnreliable` | 281 | Non-trading aggregate status, non-positive price, confidence wider than `max_conf_bps`, normalization failure, or unmet Switchboard oracle-result quorum (AV-193) |
+| `InvalidBidDeposit` | 282 | `BidDepositAuction::new` (AV-194) with a zero auction id / zero seller key / zero deposit amount; also `register` with a zero bidder key or a duplicate registration, `settle`/`settle_sealed` on the wrong auction kind, a settle whose winner's deposit is no longer locked, `settle_sealed` whose winner never revealed, or a forfeit of an already-terminal deposit |
+| `BidDepositNotRegistered` | 283 | Bid-deposit (AV-194) operation naming a bidder that never registered a deposit |
+| `BidDepositAlreadySettled` | 284 | Bid-deposit (AV-194) register / reveal / forfeit / settle after the book was settled |
+| `BidDepositBookFull` | 285 | `BidDepositAuction::register` (AV-194) past `MAX_BID_DEPOSITS` (64) deposits |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -2488,6 +2492,33 @@ English (ascending, open bids), AV-97 Dutch (descending price), AV-137
 judgment, here a bid), and AV-194 (opt-in bid deposits with no-reveal
 confiscation — this module tracks commitments, not funds). (Solana:
 auction primitives.)
+
+## Bid deposits (AV-194)
+
+Auctions can carry an opt-in flat bid deposit — English (AV-189),
+Dutch (AV-97) or sealed-bid (AV-192). Every bidder locks the deposit
+at bid time (`BidDepositAuction::register`, one deposit per bidder,
+max 64); at settlement the winner's deposit is applied toward the
+purchase price and every honest loser's deposit is refunded in full.
+Two confiscation paths: sealed-bid bidders that never reveal lose the
+deposit on `settle_sealed` (no-reveal confiscation — the sealed-bid
+module tracks commitments, not funds, so the confiscation lands
+here), and the seller may `forfeit` a locked deposit before settlement
+for misbehavior outside the auction rules (e.g. a winner that ghosts a
+malicious no-sale). Settlement is permissionless once the auction
+closes; pre-settlement seller forfeits stand; a custody invariant
+holds at every step — `locked + applied + refunded + forfeited` always
+equals `deposit_count * deposit_amount`, funds are only reclassified,
+never created or destroyed.
+
+New error codes (never renumbered): `InvalidBidDeposit` (282),
+`BidDepositNotRegistered` (283), `BidDepositAlreadySettled` (284),
+`BidDepositBookFull` (285). Pure logic: no Vault layout change, no
+`VAULT_SPACE` bump. Orthogonal to AV-103 (the taker's appeal bond on a
+slashed escrow — a dispute collateral, not an auction bid bond) and to
+the auction modules themselves (they price the asset and pick the
+winner; this module moves the deposits once the program reports the
+outcome). (Solana: auction wind-down.)
 
 ## Referrer revenue share (AV-191)
 
