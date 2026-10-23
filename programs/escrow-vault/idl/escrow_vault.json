@@ -1241,6 +1241,14 @@
       "discriminator": [57, 30, 97, 87, 158, 139, 31, 7],
       "accounts": [],
       "args": []
+    },
+    {
+      "name": "configure_jury",
+      "discriminator": [117, 180, 90, 182, 207, 32, 124, 201],
+      "accounts": [],
+      "args": [
+        {"name": "panel_size", "type": "u8"}
+      ]
     }
   ],
   "accounts": [
@@ -1379,7 +1387,8 @@
           {"name": "referrer", "type": {"option": {"array": ["u8", 32]}}, "offset": 7310},
           {"name": "referral_bps", "type": "u16", "offset": 7343},
           {"name": "referral_paid", "type": "u64", "offset": 7345},
-          {"name": "recovery", "type": {"option": {"defined": "SocialRecovery"}}, "offset": 7353}
+          {"name": "recovery", "type": {"option": {"defined": "SocialRecovery"}}, "offset": 7353},
+          {"name": "jury_panel_size", "type": "u8", "offset": 7662}
         ]
       }
     }
@@ -1973,7 +1982,13 @@
     {"code": 289, "name": "RecoveryRequestPending"},
     {"code": 290, "name": "RecoveryNoPendingRequest"},
     {"code": 291, "name": "RecoveryThresholdNotReached"},
-    {"code": 292, "name": "RecoveryTimelockNotElapsed"}
+    {"code": 292, "name": "RecoveryTimelockNotElapsed"},
+    {"code": 293, "name": "InvalidJurorRegistry"},
+    {"code": 294, "name": "InvalidJurySize"},
+    {"code": 295, "name": "JuryNotPanelMember"},
+    {"code": 296, "name": "JuryDuplicateVote"},
+    {"code": 297, "name": "InvalidJuryVote"},
+    {"code": 298, "name": "JuryArbiterConflict"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

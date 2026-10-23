@@ -1673,6 +1673,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(SOCIAL_RECOVERY_LEN)?;
         None
     };
+    // AV-196: the opt-in dispute jury size.
+    let jury_panel_size = c.u8()?;
+
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
         "decode consumed != ESCROW_BODY_LEN: layout drift"
@@ -1996,6 +1999,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // carries the same guardian set, threshold, timelock, and live
         // request the setup and the recovery transitions recorded.
         recovery,
+        // AV-196: the dispute jury size — a decoded escrow carries the
+        // same panel size the setup recorded.
+        jury_panel_size,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

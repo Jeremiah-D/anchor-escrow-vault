@@ -6666,3 +6666,41 @@ the 309-byte social-recovery tail), `VAULT_SPACE_NO_QUORUM` from 6863
 to 7172, `VAULT_SPACE` from 7353 to 7662, and the close-time rent
 reclamation from 52_067_760 to 54_218_400 lamports
 (`(128 + VAULT_SPACE) * 3480 * 2`).
+
+## Dispute jury sortition (AV-196)
+
+`escrow-state/src/jury_sortition.rs` — the decentralized dispute
+resolution path: a staked juror registry with deterministic,
+verifiable sortition into dispute panels (Solana / DAO governance).
+
+The program (or DAO) maintains a `JurorRegistry` of staked jurors
+(`register_juror`: non-zero stake, live key; duplicate or zero-stake
+is `InvalidJuror`, code 293). When an escrow escalates with jury mode
+enabled (`configure_jury`: panel size 1–8, odd sizes recommended for
+clean majorities; `InvalidJuryPanelSize`, code 294), the panel is drawn
+by deterministic sortition: `seed = SHA-256(slot_hash || escrow_id)`,
+jurors sorted by `SHA-256(seed || juror_key)` — anyone can recompute
+the draw from the public seed, no trusted dealer. The initializer's
+AV-14 single arbiter and the jury are mutually exclusive (configuring
+either when the other is set is `JuryArbiterConflict`, code 295, both
+directions).
+
+Each drawn juror votes once (`cast_vote`: the juror's taker-amount
+ballot; double-vote is `JuryDoubleVote`, code 296); when every panel
+seat has voted, the median ballot is the verdict (`tally`: strict
+majority of the panel size; `JuryQuorumNotMet`, code 297, before
+that). The verdict settles exactly like an arbiter's `resolve` (fee
+slices, pro-rata splits). A juror who never votes can be slashed
+after the vote window (`slash_absent_juror`).
+
+The panel size persists as the 1-byte `jury_panel_size` tail on the
+vault (`0` = no jury); the registry and panel live in program PDAs
+(off-chain executable spec here). Sortition is seed-public and
+replayable: the same `(slot_hash, escrow_id)` always draws the same
+panel.
+
+Layout growth: the vault body grows from 7654 to 7655 bytes (+1: the
+jury panel-size byte), `VAULT_SPACE_NO_QUORUM` from 7172 to 7173,
+`VAULT_SPACE` from 7662 to 7663, and the close-time rent reclamation
+from 54_218_400 to 54_225_360 lamports (`(128 + VAULT_SPACE) * 3480 *
+2`).
