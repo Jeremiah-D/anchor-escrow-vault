@@ -528,6 +528,7 @@ mod htlc_tests {
             assert!(EscrowError::all().contains(&e));
         }
         // AV-187 pins its own codes in nft_escrow::nft_tests.
-        assert_eq!(EscrowError::all().len(), 158);
+        // AV-188 pins its own codes in merkle_distributor::merkle_tests.
+        assert_eq!(EscrowError::all().len(), 163);
     }
 }

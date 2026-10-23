@@ -530,6 +530,16 @@ pub use nft_escrow::{
     check_nft_mint, CollectionAllowlist, NftEscrow, NftEscrowState,
     NftMintDescriptor, NftMintReport, MAX_COLLECTION_ALLOWLIST, NFT_PIECE_AMOUNT,
 };
+// AV-188: Merkle distributor — one vault funds many claims. The maker
+// publishes a SHA-256 root over (recipient, amount) leaves; claimants
+// redeem with inclusion proofs against a nullifier bitmap; the maker
+// reclaims the unclaimed remainder after expiry. Pure logic: no Vault
+// layout change, no VAULT_SPACE bump.
+mod merkle_distributor;
+pub use merkle_distributor::{
+    leaf_hash, node_hash, DistributorState, MerkleDistributor,
+    MAX_DISTRIBUTION_LEAVES, MAX_MERKLE_DEPTH,
+};
 // AV-179: program upgrade-authority handover — two-step propose/accept
 // with an opt-in handover delay, the structured handover audit ring,
 // and the keeper's upgrade-authority drift scan. Purely additive and
@@ -3490,6 +3500,31 @@ pub enum EscrowError {
     /// Fail-closed: an unverifiable collection cannot release. Never
     /// renumbered (see [`EscrowError::code`]).
     CollectionNotAllowlisted,
+    /// AV-188: [`MerkleDistributor::new`](crate::MerkleDistributor::new)
+    /// refused — zero maker key, zero or over-capacity leaf count, or
+    /// an expiry slot at or before the creation slot (an empty claim
+    /// window). Never renumbered (see [`EscrowError::code`]).
+    InvalidDistribution,
+    /// AV-188: [`MerkleDistributor::claim`](crate::MerkleDistributor::claim)
+    /// or [`MerkleDistributor::verify_proof`](crate::MerkleDistributor::verify_proof)
+    /// with an inclusion proof that does not recompute the published
+    /// root (wrong recipient/amount, wrong proof, or an out-of-bounds
+    /// leaf index). Never renumbered (see [`EscrowError::code`]).
+    InvalidMerkleProof,
+    /// AV-188: [`MerkleDistributor::claim`](crate::MerkleDistributor::claim)
+    /// on a leaf whose nullifier bit is already set — the leaf was
+    /// claimed before. Never renumbered (see [`EscrowError::code`]).
+    AlreadyClaimed,
+    /// AV-188: [`MerkleDistributor::claim`](crate::MerkleDistributor::claim)
+    /// at `current_slot >= expiry_slot` — the claim window is closed;
+    /// only the maker can reclaim now. Never renumbered (see
+    /// [`EscrowError::code`]).
+    DistributionExpired,
+    /// AV-188: [`MerkleDistributor::reclaim`](crate::MerkleDistributor::reclaim)
+    /// at `current_slot < expiry_slot` — open claims are still live
+    /// and the maker cannot race them. Never renumbered (see
+    /// [`EscrowError::code`]).
+    DistributionNotExpired,
 }
 
 impl EscrowError {
@@ -3727,6 +3762,16 @@ impl EscrowError {
             EscrowError::InvalidNftMint => 256,
             // AV-187: appended, never renumbered.
             EscrowError::CollectionNotAllowlisted => 257,
+            // AV-188: appended, never renumbered.
+            EscrowError::InvalidDistribution => 258,
+            // AV-188: appended, never renumbered.
+            EscrowError::InvalidMerkleProof => 259,
+            // AV-188: appended, never renumbered.
+            EscrowError::AlreadyClaimed => 260,
+            // AV-188: appended, never renumbered.
+            EscrowError::DistributionExpired => 261,
+            // AV-188: appended, never renumbered.
+            EscrowError::DistributionNotExpired => 262,
         }
     }
 
@@ -3960,6 +4005,16 @@ impl EscrowError {
             EscrowError::InvalidNftMint,
             // AV-187: appended, never renumbered.
             EscrowError::CollectionNotAllowlisted,
+            // AV-188: appended, never renumbered.
+            EscrowError::InvalidDistribution,
+            // AV-188: appended, never renumbered.
+            EscrowError::InvalidMerkleProof,
+            // AV-188: appended, never renumbered.
+            EscrowError::AlreadyClaimed,
+            // AV-188: appended, never renumbered.
+            EscrowError::DistributionExpired,
+            // AV-188: appended, never renumbered.
+            EscrowError::DistributionNotExpired,
         ]
     }
 }
@@ -31864,6 +31919,36 @@ mod error_code_tests {
             257,
             "NftEscrow::release on a collection-gated escrow whose observed collection is unknown or not allowlisted — fail-closed (AV-187)",
         ),
+        // AV-188: appended, never renumbered.
+        (
+            EscrowError::InvalidDistribution,
+            258,
+            "MerkleDistributor::new with a zero maker key, zero or over-capacity leaf count, or expiry_slot <= created_slot (AV-188)",
+        ),
+        // AV-188: appended, never renumbered.
+        (
+            EscrowError::InvalidMerkleProof,
+            259,
+            "MerkleDistributor::claim / verify_proof with an inclusion proof that does not recompute the published root (AV-188)",
+        ),
+        // AV-188: appended, never renumbered.
+        (
+            EscrowError::AlreadyClaimed,
+            260,
+            "MerkleDistributor::claim on a leaf whose nullifier bit is already set (AV-188)",
+        ),
+        // AV-188: appended, never renumbered.
+        (
+            EscrowError::DistributionExpired,
+            261,
+            "MerkleDistributor::claim at current_slot >= expiry_slot — the claim window is closed, only the maker can reclaim (AV-188)",
+        ),
+        // AV-188: appended, never renumbered.
+        (
+            EscrowError::DistributionNotExpired,
+            262,
+            "MerkleDistributor::reclaim at current_slot < expiry_slot — open claims are still live (AV-188)",
+        ),
     ];
 
     #[test]
@@ -57655,7 +57740,18 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::InvalidNftMint));
         assert_eq!(EscrowError::CollectionNotAllowlisted.code(), 257);
         assert!(EscrowError::all().contains(&EscrowError::CollectionNotAllowlisted));
-        assert_eq!(EscrowError::all().len(), 158);
+        // AV-188: the Merkle-distributor errors.
+        assert_eq!(EscrowError::InvalidDistribution.code(), 258);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidDistribution));
+        assert_eq!(EscrowError::InvalidMerkleProof.code(), 259);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidMerkleProof));
+        assert_eq!(EscrowError::AlreadyClaimed.code(), 260);
+        assert!(EscrowError::all().contains(&EscrowError::AlreadyClaimed));
+        assert_eq!(EscrowError::DistributionExpired.code(), 261);
+        assert!(EscrowError::all().contains(&EscrowError::DistributionExpired));
+        assert_eq!(EscrowError::DistributionNotExpired.code(), 262);
+        assert!(EscrowError::all().contains(&EscrowError::DistributionNotExpired));
+        assert_eq!(EscrowError::all().len(), 163);
     }
 
     #[test]

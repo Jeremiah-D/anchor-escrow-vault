@@ -539,6 +539,7 @@ mod tests {
         ] {
             assert!(EscrowError::all().contains(&e));
         }
-        assert_eq!(EscrowError::all().len(), 158);
+        // Count covers the whole table; AV-188 bumps it to 163.
+        assert_eq!(EscrowError::all().len(), 163);
     }
 }

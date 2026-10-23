@@ -1570,6 +1570,11 @@ program error per variant):
 | `HtlcRefundNotExpired` | 255 | `HtlcLock::refund` (AV-186) at `current_slot < expiry_slot` — the taker's claim window is still open |
 | `InvalidNftMint` | 256 | `check_nft_mint` / `NftEscrow::new` (AV-187) on a mint with `supply != 1` or `decimals != 0` — fail-closed |
 | `CollectionNotAllowlisted` | 257 | `NftEscrow::release` (AV-187) on a collection-gated escrow whose observed collection is unknown or not allowlisted — fail-closed |
+| `InvalidDistribution` | 258 | `MerkleDistributor::new` (AV-188) with a zero maker key, zero or over-capacity leaf count, or `expiry_slot <= created_slot` |
+| `InvalidMerkleProof` | 259 | `MerkleDistributor::claim` / `verify_proof` (AV-188) with an inclusion proof that does not recompute the published root |
+| `AlreadyClaimed` | 260 | `MerkleDistributor::claim` (AV-188) on a leaf whose nullifier bit is already set |
+| `DistributionExpired` | 261 | `MerkleDistributor::claim` (AV-188) at `current_slot >= expiry_slot` — the claim window is closed |
+| `DistributionNotExpired` | 262 | `MerkleDistributor::reclaim` (AV-188) at `current_slot < expiry_slot` — open claims are still live |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -6311,6 +6316,40 @@ New error codes (never renumbered): `InvalidNftMint` (256),
 `CollectionNotAllowlisted` (257). Pure logic: no Vault layout change,
 no `VAULT_SPACE` bump (the layout pin tests still hold). (Solana: NFT
 custody.)
+
+## Merkle distributor (AV-188)
+
+`escrow-state/src/merkle_distributor.rs` — one vault funds many
+claims. The maker funds once and publishes a SHA-256 Merkle root over
+`(recipient, amount)` leaves; claimants redeem by presenting an
+inclusion proof; a nullifier bitmap stops double-claims; after the
+expiry slot the maker reclaims whatever was never claimed. This is the
+batch-distribution / airdrop shape: the on-chain footprint is one
+root, not N accounts.
+
+- **Canonical construction** (the off-chain builder must match it
+  exactly): `leaf = sha256("escrow-dist-leaf\x00" || recipient(32) ||
+  amount_le(8))`; internal nodes use canonical pair ordering,
+  `node = sha256("escrow-dist-node\x00" || min(a,b) || max(a,b))`, so
+  builder and verifier cannot disagree on orientation; an odd node is
+  promoted unchanged and contributes no proof element. The verifier
+  folds the proof against the stored root — a tampered amount,
+  recipient, or proof fails with `InvalidMerkleProof` (259).
+- **Double-claim is impossible**: one nullifier bit per leaf index
+  (`[u64; 4]`, 256 leaves max, heap-free) is set before the claim
+  returns, so a re-entrant caller cannot re-enter; a second claim is
+  `AlreadyClaimed` (260).
+- **No racing**: the claim window is `current_slot < expiry_slot`
+  (strict — claiming *at* expiry fails with `DistributionExpired`,
+  code 261); the maker's reclaim window is `current_slot >=
+  expiry_slot` (inclusive), and reclaiming early is
+  `DistributionNotExpired` (262). Reclaim is maker-only and terminal.
+
+New error codes (never renumbered): `InvalidDistribution` (258),
+`InvalidMerkleProof` (259), `AlreadyClaimed` (260),
+`DistributionExpired` (261), `DistributionNotExpired` (262). Pure
+logic: no Vault layout change, no `VAULT_SPACE` bump. (Solana /
+payments fintech: batch distribution / airdrops.)
 
 ## Program upgrade-authority handover (AV-179)
 
