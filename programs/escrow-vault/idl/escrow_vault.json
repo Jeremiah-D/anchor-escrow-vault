@@ -1865,7 +1865,8 @@
     {"code": 246, "name": "InvalidFreezeAuthority"},
     {"code": 247, "name": "TokenAccountAlreadyFrozen"},
     {"code": 248, "name": "TokenAccountNotFrozen"},
-    {"code": 249, "name": "EscrowFrozen"}
+    {"code": 249, "name": "EscrowFrozen"},
+    {"code": 250, "name": "UnsafeMint"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

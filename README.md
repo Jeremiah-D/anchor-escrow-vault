@@ -1562,6 +1562,7 @@ program error per variant):
 | `TokenAccountAlreadyFrozen` | 247 | `ManagedFreezeAuthority::freeze` (AV-180) on an already-frozen token account |
 | `TokenAccountNotFrozen` | 248 | `ManagedFreezeAuthority::thaw` (AV-180) on a token account that is not frozen |
 | `EscrowFrozen` | 249 | `ManagedFreezeAuthority::require_unfrozen` (AV-180) while the managed token account is frozen |
+| `UnsafeMint` | 250 | `Escrow::check_mint_safety` (AV-184) on a mint carrying an escrow-hostile Token-2022 extension — fail-closed |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -6172,6 +6173,34 @@ weight `balances[i]`, the governance token balance read at
 - **No layout change**: the derived policy reuses the existing quorum
   account region, so `VAULT_FIELDS` / `VAULT_SPACE` / rent are
   untouched.
+
+## Token-2022 extension safety gate (AV-184)
+
+`escrow-state/src/mint_safety.rs` — a pre-flight check over a mint's
+Token-2022 extensions, run *before* `initialize` / `fund`
+(`Escrow::check_mint_safety`). Some extensions are escrow-hostile and
+fail the gate closed (`EscrowError::UnsafeMint`, code 250):
+
+- `DefaultAccountState::Frozen` — every taker token account lands
+  frozen; the payout can never move without the mint's freeze authority.
+- `NonTransferable` — the taker can never move the payout at all.
+- a 100% `TransferFeeConfig` — every transfer is fully confiscated as
+  fee (a partial fee is tolerated and merely observed).
+- an *undisclosed* `PermanentDelegate` — the delegate can burn or
+  force-transfer escrowed funds at will. A delegate the initializer
+  disclosed out of band (e.g. in the escrow terms) is accepted.
+
+Safe extensions never deny: `ConfidentialTransfer` (transfer modeling
+lives in `confidential.rs` instruction 8 — orthogonal to this gate) and
+`TransferHook` (hook execution modeled in `cpi.rs` — orthogonal). The
+check is pure observation (`check_mint_safety` never fails); the
+fail-closed decision is `MintSafetyReport::require_allowed`, and every
+result renders as audit-event JSON (`MintSafetyReport::audit_json`,
+hand-written like `bundle_relay`'s lifecycle events) so indexers see
+the gate decision. The gate is intentionally not persisted on the
+vault: the mint bound via `with_mint` is the on-chain anchor, and the
+check runs before the escrow exists (Solana security / backend
+engineering: hostile-mint circuit breaker).
 
 ## Program upgrade-authority handover (AV-179)
 

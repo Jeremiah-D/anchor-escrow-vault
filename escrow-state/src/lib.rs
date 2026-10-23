@@ -493,6 +493,15 @@ pub use tiered_quorum::{Tier, TieredQuorum, MAX_TIERS, TIERED_QUORUM_LEN};
 // new dimension.
 mod weighted_voting;
 pub use weighted_voting::{TokenWeightSnapshot, BPS_DENOMINATOR};
+// AV-184: Token-2022 extension safety gate — pre-flight mint extension
+// check before initialize/fund, fail-closed on escrow-hostile extensions
+// (frozen default account state, non-transferable, 100% transfer fee,
+// undisclosed permanent delegate), with audit-event JSON output.
+mod mint_safety;
+pub use mint_safety::{
+    check_mint_safety, MintExtensionDescriptor, MintSafetyError, MintSafetyFinding,
+    MintSafetyReport,
+};
 // AV-179: program upgrade-authority handover — two-step propose/accept
 // with an opt-in handover delay, the structured handover audit ring,
 // and the keeper's upgrade-authority drift scan. Purely additive and
@@ -3409,6 +3418,12 @@ pub enum EscrowError {
     /// and claim are locked until thaw. Never renumbered (see
     /// [`EscrowError::code`]).
     EscrowFrozen,
+    /// AV-184: [`Escrow::check_mint_safety`] refused — the mint carries
+    /// an escrow-hostile Token-2022 extension (frozen default account
+    /// state, non-transferable, a 100% transfer fee, or an undisclosed
+    /// permanent delegate). Fail-closed: the escrow must not be created
+    /// on such a mint. Never renumbered (see [`EscrowError::code`]).
+    UnsafeMint,
 }
 
 impl EscrowError {
@@ -3631,6 +3646,7 @@ impl EscrowError {
             EscrowError::TokenAccountAlreadyFrozen => 247,
             EscrowError::TokenAccountNotFrozen => 248,
             EscrowError::EscrowFrozen => 249,
+            EscrowError::UnsafeMint => 250,
         }
     }
 
@@ -3848,6 +3864,8 @@ impl EscrowError {
             EscrowError::TokenAccountNotFrozen,
             // AV-180: appended, never renumbered.
             EscrowError::EscrowFrozen,
+            // AV-184: appended, never renumbered.
+            EscrowError::UnsafeMint,
         ]
     }
 }
@@ -31704,6 +31722,12 @@ mod error_code_tests {
             249,
             "ManagedFreezeAuthority::require_unfrozen while the managed token account is frozen — release/cancel/claim locked (AV-180)",
         ),
+        // AV-184: appended, never renumbered.
+        (
+            EscrowError::UnsafeMint,
+            250,
+            "Escrow::check_mint_safety on a mint with an escrow-hostile Token-2022 extension — fail-closed (AV-184)",
+        ),
     ];
 
     #[test]
@@ -57478,7 +57502,9 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::TokenAccountNotFrozen));
         assert_eq!(EscrowError::EscrowFrozen.code(), 249);
         assert!(EscrowError::all().contains(&EscrowError::EscrowFrozen));
-        assert_eq!(EscrowError::all().len(), 150);
+        assert_eq!(EscrowError::UnsafeMint.code(), 250);
+        assert!(EscrowError::all().contains(&EscrowError::UnsafeMint));
+        assert_eq!(EscrowError::all().len(), 151);
     }
 
     #[test]
