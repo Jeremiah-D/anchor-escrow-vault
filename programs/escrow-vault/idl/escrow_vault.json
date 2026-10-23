@@ -1871,7 +1871,9 @@
     {"code": 252, "name": "HtlcInvalidPreimage"},
     {"code": 253, "name": "HtlcHashlockMismatch"},
     {"code": 254, "name": "HtlcClaimExpired"},
-    {"code": 255, "name": "HtlcRefundNotExpired"}
+    {"code": 255, "name": "HtlcRefundNotExpired"},
+    {"code": 256, "name": "InvalidNftMint"},
+    {"code": 257, "name": "CollectionNotAllowlisted"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

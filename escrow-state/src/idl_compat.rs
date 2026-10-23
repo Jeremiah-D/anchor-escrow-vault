@@ -1440,8 +1440,8 @@ mod idl_compat_tests {
         assert_eq!(spec.instructions.len(), 152);
         // AV-179 adds 4 upgrade-authority errors; AV-180 adds 4
         // freeze-authority errors; AV-184 adds UnsafeMint; AV-186 adds
-        // 5 HTLC errors.
-        assert_eq!(spec.errors.len(), 156);
+        // 5 HTLC errors; AV-187 adds 2 NFT-escrow errors.
+        assert_eq!(spec.errors.len(), 158);
         // AV-178 adds the TieredQuorum + Tier named types.
         assert_eq!(spec.types.len(), 35);
         let diff = diff_idl(&idl, &idl).unwrap();

@@ -1568,6 +1568,8 @@ program error per variant):
 | `HtlcHashlockMismatch` | 253 | `HtlcLock::claim` (AV-186) with a preimage whose SHA-256 digest does not equal the lock's hashlock |
 | `HtlcClaimExpired` | 254 | `HtlcLock::claim` (AV-186) at `current_slot >= expiry_slot` — the taker's claim window is closed |
 | `HtlcRefundNotExpired` | 255 | `HtlcLock::refund` (AV-186) at `current_slot < expiry_slot` — the taker's claim window is still open |
+| `InvalidNftMint` | 256 | `check_nft_mint` / `NftEscrow::new` (AV-187) on a mint with `supply != 1` or `decimals != 0` — fail-closed |
+| `CollectionNotAllowlisted` | 257 | `NftEscrow::release` (AV-187) on a collection-gated escrow whose observed collection is unknown or not allowlisted — fail-closed |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -6278,6 +6280,37 @@ settle-or-refund together — atomicity without a trusted relayer.
   — this adds the hash condition on top. Pure logic: no Vault layout
   change, no `VAULT_SPACE` bump (the layout pin tests still hold).
   (Solana: cross-chain atomic-swap primitive / backend engineering.)
+
+## NFT escrow (AV-187)
+
+`escrow-state/src/nft_escrow.rs` — single-edition mint custody. An
+NFT is not a fungible amount, so its escrow must not inherit amount
+arithmetic: `NftEscrow` transfers the whole piece or nothing
+(`amount()` is structurally `1` — there is no partial-release,
+milestone, fee-leg, or vesting path to misuse), and it is orthogonal
+to the fungible `Escrow` path (shared `EscrowError` type and
+audit-JSON vocabulary, none of the amount machinery).
+
+- **The mint gate**: before `initialize`, the initializer reads the
+  mint account into an `NftMintDescriptor` (the AV-184
+  `mint_safety.rs` pattern — caller-observed state, pure logic) and
+  `check_nft_mint` asserts `supply == 1 && decimals == 0`. Anything
+  else fails *closed* (`InvalidNftMint`, code 256): a semi-fungible
+  edition or a decimal mint routed through the NFT path is a
+  counterfeit-escrow bug, not a supported use case.
+- **Collection allowlist**: `with_collection_allowlist` opts into a
+  release gate over the observed verified-collection mint
+  (`CollectionNotAllowlisted`, code 257). The gate fails closed — a
+  gated escrow whose collection is unobserved cannot be verified, so
+  it cannot release — and it never blocks `cancel`: gating must never
+  trap the piece.
+- **Check order** is authority → state → collection gate, so a
+  stranger learns nothing about the escrow's state or its collection.
+
+New error codes (never renumbered): `InvalidNftMint` (256),
+`CollectionNotAllowlisted` (257). Pure logic: no Vault layout change,
+no `VAULT_SPACE` bump (the layout pin tests still hold). (Solana: NFT
+custody.)
 
 ## Program upgrade-authority handover (AV-179)
 

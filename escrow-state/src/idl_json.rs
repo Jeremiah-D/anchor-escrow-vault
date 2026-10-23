@@ -1272,12 +1272,14 @@ fn idl_errors_pin_enum() {
         let name = format!("{e:?}");
         assert!(seen.insert(name.clone()), "duplicate error variant {name}");
         assert!(
-            (100..256).contains(&e.code()),
+            // AV-187 extends the range with codes 256-257 (never
+            // renumbered; each extension widens this bound).
+            (100..258).contains(&e.code()),
             "error code out of pinned range: {name} = {}",
             e.code()
         );
     }
-    assert_eq!(errors.len(), 156, "error variant count drift");
+    assert_eq!(errors.len(), 158, "error variant count drift");
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);

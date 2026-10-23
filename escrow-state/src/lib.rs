@@ -520,6 +520,16 @@ mod htlc;
 pub use htlc::{
     verify_htlc_preimage, HtlcLock, HtlcState, MAX_HTLC_PREIMAGE_LEN,
 };
+// AV-187: NFT escrow — single-edition mint custody. The mint gate
+// (supply == 1 && decimals == 0, fail-closed), an opt-in collection
+// allowlist, and a whole-piece release: amount semantics are
+// structurally 1, orthogonal to the fungible Escrow amount machinery.
+// Pure logic: no Vault layout change, no VAULT_SPACE bump.
+mod nft_escrow;
+pub use nft_escrow::{
+    check_nft_mint, CollectionAllowlist, NftEscrow, NftEscrowState,
+    NftMintDescriptor, NftMintReport, MAX_COLLECTION_ALLOWLIST, NFT_PIECE_AMOUNT,
+};
 // AV-179: program upgrade-authority handover — two-step propose/accept
 // with an opt-in handover delay, the structured handover audit ring,
 // and the keeper's upgrade-authority drift scan. Purely additive and
@@ -3468,6 +3478,18 @@ pub enum EscrowError {
     /// still open and the maker cannot race it. Never renumbered (see
     /// [`EscrowError::code`]).
     HtlcRefundNotExpired,
+    /// AV-187: [`check_nft_mint`](crate::check_nft_mint) refused — the
+    /// mint is not a single-edition NFT (`supply != 1` or `decimals !=
+    /// 0`). Fail-closed: a fungible or semi-fungible mint must never
+    /// route through the NFT escrow path. Never renumbered (see
+    /// [`EscrowError::code`]).
+    InvalidNftMint,
+    /// AV-187: [`NftEscrow::release`](crate::NftEscrow::release) on a
+    /// collection-gated escrow whose observed collection is unknown or
+    /// not in the [`CollectionAllowlist`](crate::CollectionAllowlist).
+    /// Fail-closed: an unverifiable collection cannot release. Never
+    /// renumbered (see [`EscrowError::code`]).
+    CollectionNotAllowlisted,
 }
 
 impl EscrowError {
@@ -3701,6 +3723,10 @@ impl EscrowError {
             EscrowError::HtlcClaimExpired => 254,
             // AV-186: appended, never renumbered.
             EscrowError::HtlcRefundNotExpired => 255,
+            // AV-187: appended, never renumbered.
+            EscrowError::InvalidNftMint => 256,
+            // AV-187: appended, never renumbered.
+            EscrowError::CollectionNotAllowlisted => 257,
         }
     }
 
@@ -3930,6 +3956,10 @@ impl EscrowError {
             EscrowError::HtlcClaimExpired,
             // AV-186: appended, never renumbered.
             EscrowError::HtlcRefundNotExpired,
+            // AV-187: appended, never renumbered.
+            EscrowError::InvalidNftMint,
+            // AV-187: appended, never renumbered.
+            EscrowError::CollectionNotAllowlisted,
         ]
     }
 }
@@ -31822,6 +31852,18 @@ mod error_code_tests {
             255,
             "HtlcLock::refund at current_slot < expiry_slot — the taker's claim window is still open (AV-186)",
         ),
+        // AV-187: appended, never renumbered.
+        (
+            EscrowError::InvalidNftMint,
+            256,
+            "check_nft_mint / NftEscrow::new on a mint with supply != 1 or decimals != 0 — a fungible or semi-fungible mint must not use the NFT escrow path (AV-187)",
+        ),
+        // AV-187: appended, never renumbered.
+        (
+            EscrowError::CollectionNotAllowlisted,
+            257,
+            "NftEscrow::release on a collection-gated escrow whose observed collection is unknown or not allowlisted — fail-closed (AV-187)",
+        ),
     ];
 
     #[test]
@@ -57608,7 +57650,12 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::HtlcClaimExpired));
         assert_eq!(EscrowError::HtlcRefundNotExpired.code(), 255);
         assert!(EscrowError::all().contains(&EscrowError::HtlcRefundNotExpired));
-        assert_eq!(EscrowError::all().len(), 156);
+        // AV-187: the NFT-escrow errors.
+        assert_eq!(EscrowError::InvalidNftMint.code(), 256);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidNftMint));
+        assert_eq!(EscrowError::CollectionNotAllowlisted.code(), 257);
+        assert!(EscrowError::all().contains(&EscrowError::CollectionNotAllowlisted));
+        assert_eq!(EscrowError::all().len(), 158);
     }
 
     #[test]
