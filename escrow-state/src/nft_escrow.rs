@@ -540,6 +540,6 @@ mod tests {
             assert!(EscrowError::all().contains(&e));
         }
         // Count covers the whole table; AV-190 bumps it to 171.
-        assert_eq!(EscrowError::all().len(), 171);
+        assert_eq!(EscrowError::all().len(), 172); // AV-191: +InvalidReferral
     }
 }

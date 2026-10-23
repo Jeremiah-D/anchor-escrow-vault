@@ -1196,6 +1196,15 @@
       "args": [
         {"name": "amount", "type": "u64"}
       ]
+    },
+    {
+      "name": "initialize_referrer",
+      "discriminator": [125, 201, 84, 20, 221, 156, 40, 238],
+      "accounts": [],
+      "args": [
+        {"name": "referrer", "type": "publicKey"},
+        {"name": "referral_bps", "type": "u16"}
+      ]
     }
   ],
   "accounts": [
@@ -1330,7 +1339,10 @@
           {"name": "governance_delay_secs", "type": "u64", "offset": 6520},
           {"name": "governance_proposal", "type": {"option": {"defined": "GovernanceProposal"}}, "offset": 6528},
           {"name": "fees_withdrawn", "type": "u64", "offset": 6899},
-          {"name": "tiered_quorum", "type": {"option": {"defined": "TieredQuorum"}}, "offset": 6907}
+          {"name": "tiered_quorum", "type": {"option": {"defined": "TieredQuorum"}}, "offset": 6907},
+          {"name": "referrer", "type": {"option": {"array": ["u8", 32]}}, "offset": 7310},
+          {"name": "referral_bps", "type": "u16", "offset": 7343},
+          {"name": "referral_paid", "type": "u64", "offset": 7345}
         ]
       }
     }
@@ -1886,7 +1898,8 @@
     {"code": 267, "name": "EnglishAuctionNotCancellable"},
     {"code": 268, "name": "InvalidRentalTerms"},
     {"code": 269, "name": "RentalNotActive"},
-    {"code": 270, "name": "RentalCancelNotAllowed"}
+    {"code": 270, "name": "RentalCancelNotAllowed"},
+    {"code": 271, "name": "InvalidReferral"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

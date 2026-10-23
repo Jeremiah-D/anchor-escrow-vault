@@ -1611,6 +1611,20 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(TIERED_QUORUM_LEN)?;
         None
     };
+    // AV-191: the opt-in referrer binding — the 1-byte `Option`
+    // discriminant + the 32-byte referrer address. Structural decode
+    // only — the binding invariants are enforced by `with_referrer`,
+    // not re-litigated here.
+    let referrer = if c.option_present("referrer")? {
+        Some(c.pubkey()?)
+    } else {
+        c.skip(PUBKEY_LEN)?;
+        None
+    };
+    // AV-191: the referrer revenue-share rate in basis points.
+    let referral_bps = c.u16_le()?;
+    // AV-191: the cumulative referral share charged.
+    let referral_paid = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -1922,6 +1936,15 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // AV-178: the amount-tiered attestor quorum — a decoded escrow
         // carries the same tier table the live one recorded.
         tiered_quorum,
+        // AV-191: the opt-in referrer binding — a decoded escrow
+        // carries the same referrer the live one recorded.
+        referrer,
+        // AV-191: the referrer revenue-share rate — a decoded escrow
+        // carries the same rate the live one recorded.
+        referral_bps,
+        // AV-191: the cumulative referral share — a decoded escrow
+        // carries the same counter the live one recorded.
+        referral_paid,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

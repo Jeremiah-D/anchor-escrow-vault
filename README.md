@@ -2402,6 +2402,18 @@ order, 64-char lowercase hex keys, dependency-free like every other
 keeper report). The scan is pure: it reads `&Escrow` snapshots only and
 never withdraws.
 
+## Referrer revenue share (AV-191)
+
+Escrows can carry an optional referrer: `with_referrer(referrer, bps)`
+pins a 32-byte referrer address and a basis-points rate (cap 2000 =
+20%, `InvalidReferral` on zero-address or over-cap) at initialization.
+On every release path, `referral_for(gross)` computes the floor share
+via u128 math and folds it into the returned fee so
+`payout + fee == gross` still holds — the `Released` event, preview,
+and CPI plan are untouched. The share accumulates in a dedicated
+`referral_paid` counter (never mixed into `fees_paid`), and CPI
+rollback snapshots restore it alongside the other counters.
+
 ## Vault config drift detection (AV-175)
 
 Operators roll out vault fleets from one approved configuration; a

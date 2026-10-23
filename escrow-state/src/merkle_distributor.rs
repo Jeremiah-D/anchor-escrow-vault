@@ -553,6 +553,6 @@ mod tests {
         }
         // AV-189 appends 5 English-auction errors after these; AV-190
         // appends 3 rental-escrow errors after those.
-        assert_eq!(EscrowError::all().len(), 171);
+        assert_eq!(EscrowError::all().len(), 172); // AV-191: +InvalidReferral
     }
 }
