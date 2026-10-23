@@ -628,6 +628,19 @@ pub use jury_sortition::{
     Juror, JurorRegistry, JuryPanel, JuryVerdict, JURY_BPS_DENOMINATOR, JURY_PANEL_SIZE_TAIL_LEN,
     MAX_JURORS,
 };
+// AV-197: bidirectional payment channel — escrow-locked funds open a
+// two-party channel; the parties co-sign off-chain balance updates
+// (strictly increasing nonce = replay protection); settlement is
+// cooperative (dual-signed final state, instant) or unilateral
+// (submit latest co-signed state + challenge window, counterparty may
+// dispute with a newer state). The channel state machine is
+// independent of the main `Escrow` machine: standalone structures the
+// program keeps in PDAs, no vault layout growth.
+mod payment_channel;
+pub use payment_channel::{
+    sign_channel_update, ChannelState, ChannelUpdate, PaymentChannel, SignedChannelUpdate,
+    CHANNEL_UPDATE_DOMAIN, CHANNEL_UPDATE_MSG_LEN,
+};
 // AV-179: program upgrade-authority handover — two-step propose/accept
 // with an opt-in handover delay, the structured handover audit ring,
 // and the keeper's upgrade-authority drift scan. Purely additive and
@@ -3867,6 +3880,36 @@ pub enum EscrowError {
     /// single-arbiter settlement are mutually exclusive. Never
     /// renumbered (see [`EscrowError::code`]).
     JuryArbiterConflict,
+    /// AV-197: payment-channel misconfiguration —
+    /// [`PaymentChannel::open`](crate::PaymentChannel::open) with a
+    /// zero party key, the same key for both parties, or `total == 0`;
+    /// or `close_unilateral` / `dispute` whose `now + challenge_period`
+    /// overflows `u64` (a challenge window the channel cannot bound).
+    /// Never renumbered (see [`EscrowError::code`]).
+    InvalidChannelConfig,
+    /// AV-197: payment-channel transition illegal from the current
+    /// [`ChannelState`](crate::ChannelState) — e.g. `apply_update` on
+    /// an unfunded or closing channel, `fund` twice, any transition
+    /// from [`ChannelState::Closed`](crate::ChannelState::Closed),
+    /// `finalize` before the challenge window elapses, or `dispute`
+    /// after it. Never renumbered (see [`EscrowError::code`]).
+    InvalidChannelState,
+    /// AV-197: a [`SignedChannelUpdate`](crate::SignedChannelUpdate)
+    /// whose Ed25519 signatures do not verify against the channel's
+    /// parties and total — including a signature minted for a different
+    /// channel or a tampered balance. Never renumbered (see
+    /// [`EscrowError::code`]).
+    InvalidChannelSignature,
+    /// AV-197: a [`ChannelUpdate`](crate::ChannelUpdate) whose nonce is
+    /// not strictly greater than the channel's current nonce
+    /// (`apply_update` requires exactly `nonce + 1`) — the replay
+    /// protection. Never renumbered (see [`EscrowError::code`]).
+    StaleChannelNonce,
+    /// AV-197: a channel update whose `balance_a + balance_b` (summed
+    /// in `u128`) does not equal the channel's `total` — no update may
+    /// mint or burn lamports. Never renumbered (see
+    /// [`EscrowError::code`]).
+    ChannelBalanceMismatch,
 }
 
 impl EscrowError {
@@ -4186,6 +4229,16 @@ impl EscrowError {
             EscrowError::InvalidJuryVote => 297,
             // AV-196: appended, never renumbered.
             EscrowError::JuryArbiterConflict => 298,
+            // AV-197: appended, never renumbered.
+            EscrowError::InvalidChannelConfig => 299,
+            // AV-197: appended, never renumbered.
+            EscrowError::InvalidChannelState => 300,
+            // AV-197: appended, never renumbered.
+            EscrowError::InvalidChannelSignature => 301,
+            // AV-197: appended, never renumbered.
+            EscrowError::StaleChannelNonce => 302,
+            // AV-197: appended, never renumbered.
+            EscrowError::ChannelBalanceMismatch => 303,
         }
     }
 
@@ -4501,6 +4554,16 @@ impl EscrowError {
             EscrowError::InvalidJuryVote,
             // AV-196: appended, never renumbered.
             EscrowError::JuryArbiterConflict,
+            // AV-197: appended, never renumbered.
+            EscrowError::InvalidChannelConfig,
+            // AV-197: appended, never renumbered.
+            EscrowError::InvalidChannelState,
+            // AV-197: appended, never renumbered.
+            EscrowError::InvalidChannelSignature,
+            // AV-197: appended, never renumbered.
+            EscrowError::StaleChannelNonce,
+            // AV-197: appended, never renumbered.
+            EscrowError::ChannelBalanceMismatch,
         ]
     }
 }
@@ -33167,6 +33230,36 @@ mod error_code_tests {
             298,
             "Escrow::with_jury on an escrow with the AV-14 single arbiter bound, Escrow::with_arbiter on a jury-configured escrow, or JurorRegistry::draw_panel for an arbiter-bound escrow — jury and single-arbiter settlement are mutually exclusive",
         ),
+        // AV-197: appended, never renumbered.
+        (
+            EscrowError::InvalidChannelConfig,
+            299,
+            "PaymentChannel::open with a zero party key, the same key twice, or total == 0; or close_unilateral/dispute whose now + challenge_period overflows u64",
+        ),
+        // AV-197: appended, never renumbered.
+        (
+            EscrowError::InvalidChannelState,
+            300,
+            "payment-channel transition illegal from the current ChannelState — update on unfunded/closing/closed channel, double fund, finalize before the challenge window elapses, dispute after it",
+        ),
+        // AV-197: appended, never renumbered.
+        (
+            EscrowError::InvalidChannelSignature,
+            301,
+            "SignedChannelUpdate whose Ed25519 signatures do not verify against the channel's parties and total — wrong signer, tampered balance, or signature minted for a different channel",
+        ),
+        // AV-197: appended, never renumbered.
+        (
+            EscrowError::StaleChannelNonce,
+            302,
+            "ChannelUpdate whose nonce is not strictly greater than the channel's current nonce (apply_update requires exactly nonce + 1) — replayed or out-of-order state",
+        ),
+        // AV-197: appended, never renumbered.
+        (
+            EscrowError::ChannelBalanceMismatch,
+            303,
+            "channel update whose balance_a + balance_b (u128 sum) does not equal the channel's total — no update may mint or burn lamports",
+        ),
     ];
 
     #[test]
@@ -59096,7 +59189,7 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceStale));
         assert_eq!(EscrowError::OraclePriceUnreliable.code(), 281);
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceUnreliable));
-        assert_eq!(EscrowError::all().len(), 199); // AV-195: +7, AV-196: +6
+        assert_eq!(EscrowError::all().len(), 204); // AV-195: +7, AV-196: +6, AV-197: +5
     }
 
     #[test]

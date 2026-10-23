@@ -1988,7 +1988,12 @@
     {"code": 295, "name": "JuryNotPanelMember"},
     {"code": 296, "name": "JuryDuplicateVote"},
     {"code": 297, "name": "InvalidJuryVote"},
-    {"code": 298, "name": "JuryArbiterConflict"}
+    {"code": 298, "name": "JuryArbiterConflict"},
+    {"code": 299, "name": "InvalidChannelConfig"},
+    {"code": 300, "name": "InvalidChannelState"},
+    {"code": 301, "name": "InvalidChannelSignature"},
+    {"code": 302, "name": "StaleChannelNonce"},
+    {"code": 303, "name": "ChannelBalanceMismatch"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

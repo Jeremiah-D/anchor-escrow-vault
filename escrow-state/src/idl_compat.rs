@@ -1456,8 +1456,9 @@ mod idl_compat_tests {
         // InvalidReferral; AV-192 adds 7 sealed-bid auction errors;
         // AV-193 adds 3 oracle-adapter errors; AV-194 adds 4
         // bid-deposit errors; AV-195 adds 7 social-recovery errors;
-        // AV-196 adds 6 jury-sortition errors.
-        assert_eq!(spec.errors.len(), 199);
+        // AV-196 adds 6 jury-sortition errors; AV-197 adds 5
+        // payment-channel errors.
+        assert_eq!(spec.errors.len(), 204);
         // AV-178 adds the TieredQuorum + Tier named types; AV-195 adds
         // the SocialRecovery named type.
         assert_eq!(spec.types.len(), 36);

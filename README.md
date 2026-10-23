@@ -6704,3 +6704,48 @@ jury panel-size byte), `VAULT_SPACE_NO_QUORUM` from 7172 to 7173,
 `VAULT_SPACE` from 7662 to 7663, and the close-time rent reclamation
 from 54_218_400 to 54_225_360 lamports (`(128 + VAULT_SPACE) * 3480 *
 2`).
+
+## Bidirectional payment channel (AV-197)
+
+`escrow-state/src/payment_channel.rs` — a Lightning-style
+bidirectional payment channel over escrow-locked funds (Solana / L2
+real-time systems).
+
+The channel state machine is independent of the main escrow machine:
+a `PaymentChannel` is a standalone structure the program keeps in its
+own PDA (off-chain executable spec here), so there is **no vault
+layout growth** and no rent math changes in this item.
+
+Lifecycle: `open` (two distinct non-zero parties, `total > 0`,
+`challenge_period`) → `fund(split_a)` commits the initial split and
+moves `Unfunded → Open` → off-chain `apply_update` (both parties
+co-sign each state) → settlement is either `close_cooperative`
+(dual-signed final state, instant) or `close_unilateral` (one party
+submits the latest co-signed state, challenge window opens;
+`dispute` with a newer co-signed state replaces it and restarts the
+window; `finalize` settles once the window elapses).
+
+Safety properties (all pinned by tests):
+
+- Every signed payload binds the channel identity
+  (`party_a || party_b || total`) in its canonical bytes
+  (`PAYMENT-CHANNEL-v1` domain), so a signature minted for one channel
+  can never be replayed on another — even between the same parties.
+- A state is valid only when **both** parties signed it; the
+  unilateral path is unilateral only in submission. A submitter can
+  never settle on a state the counterparty did not co-sign.
+- Nonce is strictly monotonic (`apply_update` requires exactly
+  `nonce + 1`; close/dispute require `nonce > current`) — the replay
+  protection.
+- Conservation is checked in `u128`: every split must sum to `total`
+  exactly (`ChannelBalanceMismatch`, code 303); no update can mint or
+  burn lamports.
+- Check order is authority-first: a stranger's
+  `close_unilateral`/`dispute` is `Unauthorized` (code 100) before any
+  state is examined.
+
+New error codes 299–303: `InvalidChannelConfig`,
+`InvalidChannelState`, `InvalidChannelSignature`, `StaleChannelNonce`,
+`ChannelBalanceMismatch`. `finalize` on an unelapsed window and
+`dispute` after expiry are `InvalidChannelState` (code 300) — the
+window state, not a new error, decides which call is legal.
