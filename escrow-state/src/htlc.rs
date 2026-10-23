@@ -529,6 +529,7 @@ mod htlc_tests {
         }
         // AV-187 pins its own codes in nft_escrow::nft_tests.
         // AV-188 pins its own codes in merkle_distributor::merkle_tests.
-        assert_eq!(EscrowError::all().len(), 163);
+        // AV-189 pins its own codes in english_auction::english_auction_tests.
+        assert_eq!(EscrowError::all().len(), 168);
     }
 }

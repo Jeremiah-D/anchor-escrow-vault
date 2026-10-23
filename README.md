@@ -1575,6 +1575,11 @@ program error per variant):
 | `AlreadyClaimed` | 260 | `MerkleDistributor::claim` (AV-188) on a leaf whose nullifier bit is already set |
 | `DistributionExpired` | 261 | `MerkleDistributor::claim` (AV-188) at `current_slot >= expiry_slot` — the claim window is closed |
 | `DistributionNotExpired` | 262 | `MerkleDistributor::reclaim` (AV-188) at `current_slot < expiry_slot` — open claims are still live |
+| `InvalidEnglishAuction` | 263 | `EnglishAuction::new` (AV-189) with a zero seller key, `start_slot >= end_slot`, a zero `min_increment`, or a degenerate anti-sniping config |
+| `EnglishAuctionBidTooLow` | 264 | `EnglishAuction::place_bid` (AV-189) below `highest_bid + min_increment` — the opening bid must clear `min_increment` |
+| `EnglishAuctionNotLive` | 265 | `EnglishAuction::place_bid` (AV-189) outside the live window (`current_slot >= end_slot`, strict end) or on a terminal auction |
+| `EnglishAuctionSettleTooEarly` | 266 | `EnglishAuction::settle` (AV-189) at `current_slot < end_slot` — the bidding window has not closed |
+| `EnglishAuctionNotCancellable` | 267 | `EnglishAuction::cancel` (AV-189) after a bid landed, on a terminal auction, or after the window lapsed |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
 deterministic seeds × 48 random operations over 6 escrows assert
@@ -6350,6 +6355,40 @@ New error codes (never renumbered): `InvalidDistribution` (258),
 `DistributionExpired` (261), `DistributionNotExpired` (262). Pure
 logic: no Vault layout change, no `VAULT_SPACE` bump. (Solana /
 payments fintech: batch distribution / airdrops.)
+
+## English auction (AV-189)
+
+`escrow-state/src/english_auction.rs` — ascending-bid settlement:
+bidders compete upward, every bid must beat the current highest by at
+least the minimum increment, and the seller's reserve price decides
+whether the sale happens at all.
+
+- **Ascending bids, minimum raise**: the minimum legal bid is
+  `highest_bid + min_increment`; the opening bid must itself clear
+  `min_increment`, so the increment doubles as the minimum opening
+  bid. A bid at the closing slot (`current_slot >= end_slot`) is too
+  late — the end is strict.
+- **Anti-sniping**: a bid landing inside the tail window pushes the
+  close out by the configured extension (bounded by a maximum number
+  of extensions, `MAX_SNIPE_EXTENSIONS` = 64, so a bidding war cannot
+  postpone settlement forever). The bid receipt reports whether the
+  bid extended the close and the new end slot.
+- **Reserve price**: the seller's floor, set once. If the highest bid
+  never reaches it, settlement returns `ReserveNotMet` and every
+  bidder is refunded in full; with no bids at all the outcome is
+  `NoBids`. The reserve is inclusive — a winning bid exactly at the
+  reserve sells.
+- **Refunds are exact**: `place_bid` returns a `BidReceipt` naming the
+  outbid leader and their amount, so the program refunds the full
+  previous bid atomically; `settle` is permissionless after the close
+  and terminal. The seller may `cancel` only before the first bid.
+
+New error codes (never renumbered): `InvalidEnglishAuction` (263),
+`EnglishAuctionBidTooLow` (264), `EnglishAuctionNotLive` (265),
+`EnglishAuctionSettleTooEarly` (266),
+`EnglishAuctionNotCancellable` (267). Pure logic: no Vault layout
+change, no `VAULT_SPACE` bump. Orthogonal to AV-97 (Dutch auction,
+descending price). (Solana: auction primitives.)
 
 ## Program upgrade-authority handover (AV-179)
 

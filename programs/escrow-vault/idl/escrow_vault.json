@@ -1878,7 +1878,12 @@
     {"code": 259, "name": "InvalidMerkleProof"},
     {"code": 260, "name": "AlreadyClaimed"},
     {"code": 261, "name": "DistributionExpired"},
-    {"code": 262, "name": "DistributionNotExpired"}
+    {"code": 262, "name": "DistributionNotExpired"},
+    {"code": 263, "name": "InvalidEnglishAuction"},
+    {"code": 264, "name": "EnglishAuctionBidTooLow"},
+    {"code": 265, "name": "EnglishAuctionNotLive"},
+    {"code": 266, "name": "EnglishAuctionSettleTooEarly"},
+    {"code": 267, "name": "EnglishAuctionNotCancellable"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

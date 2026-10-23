@@ -540,6 +540,17 @@ pub use merkle_distributor::{
     leaf_hash, node_hash, DistributorState, MerkleDistributor,
     MAX_DISTRIBUTION_LEAVES, MAX_MERKLE_DEPTH,
 };
+// AV-189: English auction — ascending-bid escrow. Bids must beat the
+// current highest by at least the minimum increment; bids in the tail
+// window push the close out (anti-sniping, extension-budgeted); a
+// reserve price fails the sale with full refunds when unmet.
+// Orthogonal to AV-97 Dutch (descending-price) auction. Pure logic: no
+// Vault layout change, no VAULT_SPACE bump.
+mod english_auction;
+pub use english_auction::{
+    AuctionSettlement, AuctionState, BidReceipt, EnglishAuction,
+    MAX_SNIPE_EXTENSIONS,
+};
 // AV-179: program upgrade-authority handover — two-step propose/accept
 // with an opt-in handover delay, the structured handover audit ring,
 // and the keeper's upgrade-authority drift scan. Purely additive and
@@ -3525,6 +3536,36 @@ pub enum EscrowError {
     /// and the maker cannot race them. Never renumbered (see
     /// [`EscrowError::code`]).
     DistributionNotExpired,
+    /// AV-189: [`EnglishAuction::new`](crate::EnglishAuction::new)
+    /// refused — zero seller key, `start_slot >= end_slot` (an empty
+    /// bidding window), a zero minimum increment (the auction could
+    /// never converge), or a degenerate anti-sniping config (a tail
+    /// window with no extension or no extension budget). Also reused
+    /// for a zero bidder key in
+    /// [`EnglishAuction::place_bid`](crate::EnglishAuction::place_bid).
+    /// Never renumbered (see [`EscrowError::code`]).
+    InvalidEnglishAuction,
+    /// AV-189: [`EnglishAuction::place_bid`](crate::EnglishAuction::place_bid)
+    /// with a bid below `highest_bid + min_increment` (the opening bid
+    /// must clear `min_increment` itself). Never renumbered (see
+    /// [`EscrowError::code`]).
+    EnglishAuctionBidTooLow,
+    /// AV-189: [`EnglishAuction::place_bid`](crate::EnglishAuction::place_bid)
+    /// outside the live window (`current_slot < start_slot` or
+    /// `current_slot >= end_slot` — the end is strict), or any call on
+    /// an auction already in a terminal state (`Settled`, `NoSale`,
+    /// `Cancelled`). Never renumbered (see [`EscrowError::code`]).
+    EnglishAuctionNotLive,
+    /// AV-189: [`EnglishAuction::settle`](crate::EnglishAuction::settle)
+    /// at `current_slot < end_slot` — the bidding window has not
+    /// closed yet. Never renumbered (see [`EscrowError::code`]).
+    EnglishAuctionSettleTooEarly,
+    /// AV-189: [`EnglishAuction::cancel`](crate::EnglishAuction::cancel)
+    /// refused — a bid has already landed, the auction is already in a
+    /// terminal state, or the window has lapsed (settle it instead of
+    /// cancelling — cancelling would strand the bidders' funds).
+    /// Never renumbered (see [`EscrowError::code`]).
+    EnglishAuctionNotCancellable,
 }
 
 impl EscrowError {
@@ -3772,6 +3813,16 @@ impl EscrowError {
             EscrowError::DistributionExpired => 261,
             // AV-188: appended, never renumbered.
             EscrowError::DistributionNotExpired => 262,
+            // AV-189: appended, never renumbered.
+            EscrowError::InvalidEnglishAuction => 263,
+            // AV-189: appended, never renumbered.
+            EscrowError::EnglishAuctionBidTooLow => 264,
+            // AV-189: appended, never renumbered.
+            EscrowError::EnglishAuctionNotLive => 265,
+            // AV-189: appended, never renumbered.
+            EscrowError::EnglishAuctionSettleTooEarly => 266,
+            // AV-189: appended, never renumbered.
+            EscrowError::EnglishAuctionNotCancellable => 267,
         }
     }
 
@@ -4015,6 +4066,16 @@ impl EscrowError {
             EscrowError::DistributionExpired,
             // AV-188: appended, never renumbered.
             EscrowError::DistributionNotExpired,
+            // AV-189: appended, never renumbered.
+            EscrowError::InvalidEnglishAuction,
+            // AV-189: appended, never renumbered.
+            EscrowError::EnglishAuctionBidTooLow,
+            // AV-189: appended, never renumbered.
+            EscrowError::EnglishAuctionNotLive,
+            // AV-189: appended, never renumbered.
+            EscrowError::EnglishAuctionSettleTooEarly,
+            // AV-189: appended, never renumbered.
+            EscrowError::EnglishAuctionNotCancellable,
         ]
     }
 }
@@ -31949,6 +32010,36 @@ mod error_code_tests {
             262,
             "MerkleDistributor::reclaim at current_slot < expiry_slot — open claims are still live (AV-188)",
         ),
+        // AV-189: appended, never renumbered.
+        (
+            EscrowError::InvalidEnglishAuction,
+            263,
+            "EnglishAuction::new with a zero seller key, start_slot >= end_slot, a zero min_increment, or a degenerate anti-sniping config (AV-189)",
+        ),
+        // AV-189: appended, never renumbered.
+        (
+            EscrowError::EnglishAuctionBidTooLow,
+            264,
+            "EnglishAuction::place_bid below highest_bid + min_increment — the opening bid must clear min_increment (AV-189)",
+        ),
+        // AV-189: appended, never renumbered.
+        (
+            EscrowError::EnglishAuctionNotLive,
+            265,
+            "EnglishAuction::place_bid outside the live window (current_slot < start_slot or >= end_slot, strict end) or on a terminal auction (AV-189)",
+        ),
+        // AV-189: appended, never renumbered.
+        (
+            EscrowError::EnglishAuctionSettleTooEarly,
+            266,
+            "EnglishAuction::settle at current_slot < end_slot — the bidding window has not closed (AV-189)",
+        ),
+        // AV-189: appended, never renumbered.
+        (
+            EscrowError::EnglishAuctionNotCancellable,
+            267,
+            "EnglishAuction::cancel after a bid landed, on a terminal auction, or after the window lapsed (AV-189)",
+        ),
     ];
 
     #[test]
@@ -57751,7 +57842,18 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::DistributionExpired));
         assert_eq!(EscrowError::DistributionNotExpired.code(), 262);
         assert!(EscrowError::all().contains(&EscrowError::DistributionNotExpired));
-        assert_eq!(EscrowError::all().len(), 163);
+        // AV-189: the English-auction errors.
+        assert_eq!(EscrowError::InvalidEnglishAuction.code(), 263);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidEnglishAuction));
+        assert_eq!(EscrowError::EnglishAuctionBidTooLow.code(), 264);
+        assert!(EscrowError::all().contains(&EscrowError::EnglishAuctionBidTooLow));
+        assert_eq!(EscrowError::EnglishAuctionNotLive.code(), 265);
+        assert!(EscrowError::all().contains(&EscrowError::EnglishAuctionNotLive));
+        assert_eq!(EscrowError::EnglishAuctionSettleTooEarly.code(), 266);
+        assert!(EscrowError::all().contains(&EscrowError::EnglishAuctionSettleTooEarly));
+        assert_eq!(EscrowError::EnglishAuctionNotCancellable.code(), 267);
+        assert!(EscrowError::all().contains(&EscrowError::EnglishAuctionNotCancellable));
+        assert_eq!(EscrowError::all().len(), 168);
     }
 
     #[test]
