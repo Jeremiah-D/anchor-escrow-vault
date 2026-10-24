@@ -984,6 +984,10 @@ pub const BREAKING_CHANGE_ALLOWLIST: &[&str] = &[
     "field_added:account Vault.delivery_confirmed",
     // AV-205: the per-call release cap tail — appended, never renumbered.
     "field_added:account Vault.max_release_per_call",
+    // AV-206: the milestone deadline + late-penalty tail — appended,
+    // never renumbered.
+    "field_added:account Vault.milestone_due_dates",
+    "field_added:account Vault.milestone_late_penalty_bps",
 ];
 
 fn unallowed_breaking_with(diff: &IdlDiff, allowlist: &[&str]) -> Vec<String> {

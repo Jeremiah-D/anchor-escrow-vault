@@ -1419,7 +1419,9 @@
           {"name": "jury_panel_size", "type": "u8", "offset": 7662},
           {"name": "delivery_confirmation", "type": "bool", "offset": 7663},
           {"name": "delivery_confirmed", "type": "bool", "offset": 7664},
-          {"name": "max_release_per_call", "type": "u64", "offset": 7665}
+          {"name": "max_release_per_call", "type": "u64", "offset": 7665},
+          {"name": "milestone_due_dates", "type": {"array": ["u64", 8]}, "offset": 7673},
+          {"name": "milestone_late_penalty_bps", "type": "u16", "offset": 7737}
         ]
       }
     }

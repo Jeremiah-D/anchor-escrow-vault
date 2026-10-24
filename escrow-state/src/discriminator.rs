@@ -1680,6 +1680,14 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     let delivery_confirmed = c.u8()? != 0;
     // AV-205: the per-call release cap (`0` = no cap).
     let max_release_per_call = c.u64_le()?;
+    // AV-206: the per-tranche milestone deadlines (one u64 per
+    // tranche slot, `0` = no deadline attached) + the late-penalty
+    // rate in basis points (`0` = no late penalty).
+    let mut milestone_due_dates = [0u64; MAX_MILESTONES];
+    for due in milestone_due_dates.iter_mut() {
+        *due = c.u64_le()?;
+    }
+    let milestone_late_penalty_bps = c.u16_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -2016,6 +2024,12 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // carries the same cap the setup or the dual-signed
         // adjustment recorded.
         max_release_per_call,
+        // AV-206: the milestone deadlines + late-penalty rate — a
+        // decoded escrow carries the same settlement calendar and
+        // late price the setup recorded, so `release_milestone`
+        // prices identically after a decode.
+        milestone_due_dates,
+        milestone_late_penalty_bps,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

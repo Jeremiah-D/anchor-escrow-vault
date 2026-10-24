@@ -994,6 +994,31 @@ of the split remainder), like it overrides vesting. Confirmation progress
 is persisted in a 6-bits-per-milestone bitmap in the vault account (see
 the layout table), so it survives serialization.
 
+**Milestone due dates and late penalties (AV-206).** A plan gives
+tranches no calendar: a tranche released a year late settles exactly
+like one released on time. `with_milestone_due_dates(due_at)` (after
+`with_milestones`, `Uninitialized`-only) attaches one strictly
+increasing deadline per tranche, and `with_late_penalty_bps(bps)`
+(0–10_000 bps, `InvalidPenalty` above) prices lateness: a
+`release_milestone` after its tranche's deadline settles as
+`released += tranche - penalty` with `penalty_paid += penalty`
+(`floor(tranche * bps / 10_000)`), so `released + penalty_paid +
+skipped + remaining == amount` with the conservation formula
+untouched, and the escrow closes exactly when `released +
+penalty_paid == amount` (the pre-AV-206 close test is that test with
+`penalty_paid == 0`). Releasing exactly at `due_at` is on time, not
+late. The protocol fee slices the *net* tranche (never the forfeited
+slice), while the AV-205 per-call cap still binds the *gross* tranche.
+A rate without deadlines prices nothing (no tranche has a deadline to
+miss), and deadlines without a rate price nothing — the two builders
+compose, neither implies the other. This reuses the AV-82
+`penalty_paid` sink safely because `slash` refuses
+milestone-scheduled escrows: on a milestone escrow that counter can
+only ever hold late penalties. Note the scope boundary: this item is
+the state machine (`escrow-state`) — the Anchor instruction that
+attaches deadlines at vault creation and the on-chain routing of the
+penalty slice are follow-up Anchor work, not claimed here.
+
 **Milestone tranche re-split (AV-70).** Before any settlement, the
 initializer and taker may jointly re-balance the tranche amounts via
 `adjust_milestone_amounts(initializer, taker, new_amounts)` — e.g.
