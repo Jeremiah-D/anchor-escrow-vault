@@ -650,6 +650,15 @@ pub use upgrade_authority::{
     scan_upgrade_authority_drift, UpgradeAuthority, UpgradeAuthorityDrift, UpgradeAuthorityEventKind,
     UpgradeAuditEntry, MAX_UPGRADE_AUDIT_ENTRIES,
 };
+// AV-198: Sablier-style per-second payment stream (salary stream) —
+// continuous per-second accrual, recipient withdraws earned funds,
+// initializer can cancel/pause/resume. Orthogonal to AV-13 vesting
+// (one lump sum, expiry-gated). Pure logic: no Vault layout change, no
+// VAULT_SPACE bump.
+mod stream;
+pub use stream::{
+    PaymentStream, StreamState,
+};
 // AV-180: SPL freeze/thaw authority custody — the escrow program's
 // freeze switch over managed token accounts (strict freeze/thaw
 // toggle, the require_unfrozen settlement lock for release/cancel/
@@ -3910,6 +3919,29 @@ pub enum EscrowError {
     /// mint or burn lamports. Never renumbered (see
     /// [`EscrowError::code`]).
     ChannelBalanceMismatch,
+    /// AV-198: [`PaymentStream`](crate::PaymentStream) creation or
+    /// operation with an invalid config: zero `rate_per_sec`, zero
+    /// `duration_secs`, `cliff_secs > duration_secs`, a zero
+    /// initializer key, a zero recipient key, or a `rate × duration`
+    /// product that does not fit `u64`. Never renumbered (see
+    /// [`EscrowError::code`]).
+    InvalidStream,
+    /// AV-198: a stream op by the wrong party — non-recipient
+    /// withdraw, non-initializer cancel/pause/resume. Checked before
+    /// state, so strangers learn nothing about the stream. Never
+    /// renumbered (see [`EscrowError::code`]).
+    StreamUnauthorized,
+    /// AV-198: any stream op on a `Cancelled` or `Exhausted` stream.
+    /// Never renumbered (see [`EscrowError::code`]).
+    StreamNotActive,
+    /// AV-198: [`PaymentStream::pause`](crate::PaymentStream::pause)
+    /// on an already-paused stream. Never renumbered (see
+    /// [`EscrowError::code`]).
+    StreamAlreadyPaused,
+    /// AV-198: [`PaymentStream::resume`](crate::PaymentStream::resume)
+    /// on a stream that is not paused. Never renumbered (see
+    /// [`EscrowError::code`]).
+    StreamNotPaused,
 }
 
 impl EscrowError {
@@ -4239,6 +4271,16 @@ impl EscrowError {
             EscrowError::StaleChannelNonce => 302,
             // AV-197: appended, never renumbered.
             EscrowError::ChannelBalanceMismatch => 303,
+            // AV-198: appended, never renumbered.
+            EscrowError::InvalidStream => 304,
+            // AV-198: appended, never renumbered.
+            EscrowError::StreamUnauthorized => 305,
+            // AV-198: appended, never renumbered.
+            EscrowError::StreamNotActive => 306,
+            // AV-198: appended, never renumbered.
+            EscrowError::StreamAlreadyPaused => 307,
+            // AV-198: appended, never renumbered.
+            EscrowError::StreamNotPaused => 308,
         }
     }
 

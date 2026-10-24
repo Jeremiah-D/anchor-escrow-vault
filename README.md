@@ -6749,3 +6749,41 @@ New error codes 299–303: `InvalidChannelConfig`,
 `ChannelBalanceMismatch`. `finalize` on an unelapsed window and
 `dispute` after expiry are `InvalidChannelState` (code 300) — the
 window state, not a new error, decides which call is legal.
+
+## Payment streams (AV-198)
+
+`escrow-state/src/stream.rs` — a Sablier-style per-second payment
+stream (Solana real-time finance: salary streams, per-second
+settlement).
+
+A `PaymentStream` pays a recipient continuously at a fixed
+`rate_per_sec`: the earned amount grows with every passing second
+(`earned = rate × elapsed`, all computed in `u128` so it cannot
+overflow, then capped at the funded total) and the recipient may
+withdraw any earned-but-unwithdrawn amount at any time. The
+initializer funds the stream up front (`total = rate_per_sec ×
+duration_secs`, refused at construction if the product does not fit
+`u64`) and may cancel at any time: earned-so-far routes to the
+recipient, the unearned remainder returns to the initializer,
+terminally. An optional `cliff_secs` gates the first payout — before
+`start_ts + cliff_secs` the earned amount reports `0` (the cliff
+delays payout, it does not consume the stream: accrual runs from
+`start_ts`). The initializer may also `pause`/`resume`; paused
+intervals are tracked and permanently excluded from accrual.
+
+- Continuous release, not tranches: this is per-second accrual,
+  orthogonal to AV-13 vesting (one lump sum that unlocks whole at
+  expiry) and to AV-197 bidirectional channels (both parties co-sign
+  off-chain state — here release is unilateral, no signatures).
+- Idempotent withdrawals: a zero-earn withdraw is `Ok(0)`, not an
+  error; withdrawing the full total flips the stream to `Exhausted`
+  automatically. Any op on a `Cancelled`/`Exhausted` stream is
+  `StreamNotActive` (code 306).
+- Check order is authority-first: a non-recipient `stream_withdraw`
+  and a non-initializer `stream_cancel`/`pause`/`resume` are
+  `StreamUnauthorized` (code 305) before any state is examined.
+
+New error codes 304–308: `InvalidStream`, `StreamUnauthorized`,
+`StreamNotActive`, `StreamAlreadyPaused`, `StreamNotPaused`. Pure
+logic, standalone module like AV-192 — no vault layout change, no
+rent math changes in this item.
