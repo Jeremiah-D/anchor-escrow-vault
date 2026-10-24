@@ -6853,6 +6853,29 @@ intervals are tracked and permanently excluded from accrual.
   no-op. Emits the `stream_recipient_transferred` audit event
   (`PaymentStream::transfer_audit_json`, hand-written JSON, no new
   error codes — 304–308 unchanged).
+- Rate renegotiation (AV-204): `update_stream_rate(initializer,
+  recipient, new_rate, now)` reprices the stream mid-flight, but only
+  when *both* parties sign — either party absent, or a stranger in
+  either slot, is `StreamUnauthorized` (code 305). Only future accrual
+  changes: the amount earned under the old rate is checkpointed at
+  change time (chained across successive changes, so a second
+  renegotiation never reprices the first period) and the funded total
+  still caps everything — a rate increase reaches the cap sooner, it
+  never pays more than was funded. Zero and `u64`-overflowing
+  (`new_rate × duration_secs`) rates are `InvalidStream` (code 304);
+  changing to the current rate is an idempotent no-op; terminal
+  streams are `StreamNotActive` (code 306); a change while paused is
+  legal and applies from resume. The cliff interplay is deliberate:
+  the checkpoint stores the *ungated* accrued amount, so a pre-cliff
+  change does not erase pre-change accrual (it stays gated until the
+  cliff elapses). Emits the `stream_rate_updated` audit event
+  (`PaymentStream::rate_update_audit_json`, hand-written JSON, no new
+  error codes — 304–308 unchanged). Keeper scanning reads the stream
+  through `rate_per_sec()`, so it sees the new rate with no separate
+  integration: there is no stored/scanned stream state in `keeper.rs`
+  or `snapshot.rs` to pass through (both only mention streams in
+  unrelated prose), and the Anchor IDL carries no standalone-stream
+  instructions, so neither file changes in this item.
 
 New error codes 304–308: `InvalidStream`, `StreamUnauthorized`,
 `StreamNotActive`, `StreamAlreadyPaused`, `StreamNotPaused`. Pure

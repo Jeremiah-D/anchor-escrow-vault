@@ -21,13 +21,19 @@
 //! new recipient (`transfer_recipient`) — the payroll-to-new-wallet
 //! scenario: the stream survives, earned-but-unwithdrawn funds and the
 //! accrual schedule move with it, only the payee key changes.
-//! Orthogonal to AV-13 vesting (one lump sum that unlocks whole at
-//! expiry — the release is a single gate) and to AV-197 bidirectional
-//! channels (both parties co-sign off-chain state): here the release is
-//! *continuous* per-second and unilateral. Orthogonal to AV-190 rental
-//! escrow (day-granularity rent tranches): the stream accrues at
-//! second granularity and has no tranches. `Copy`, heap-free,
-//! `no_std`-friendly.
+//!
+//! AV-204: the rate itself may be renegotiated mid-flight with
+//! `update_stream_rate` — dual-signed by initializer *and* recipient,
+//! checkpointed so only *future* accrual changes: the amount already
+//! earned under the old rate is locked in at change time and never
+//! repriced, and the funded total (`total_funded`, set at creation)
+//! still caps everything. Orthogonal to AV-13 vesting (one lump sum
+//! that unlocks whole at expiry — the release is a single gate) and to
+//! AV-197 bidirectional channels (both parties co-sign off-chain
+//! state): here the release is *continuous* per-second and unilateral.
+//! Orthogonal to AV-190 rental escrow (day-granularity rent tranches):
+//! the stream accrues at second granularity and has no tranches.
+//! `Copy`, heap-free, `no_std`-friendly.
 
 use crate::EscrowError;
 
@@ -76,6 +82,15 @@ pub struct PaymentStream {
     paused_at: Option<u64>,
     /// Seconds spent paused across completed pause intervals.
     paused_total: u64,
+    /// AV-204 rate-change checkpoint: the earned amount locked in under
+    /// the previous rate(s) at the last rate change (ungated — the
+    /// cliff gates payout, not accrual, so a pre-cliff change must not
+    /// erase pre-change accrual).
+    checkpoint_earned: u64,
+    /// AV-204 rate-change checkpoint: `accruing_seconds` at the last
+    /// rate change. Post-change accrual is
+    /// `rate × (accruing_seconds(now) - checkpoint_seconds)`.
+    checkpoint_seconds: u64,
     /// Lifecycle state.
     state: StreamState,
 }
@@ -122,6 +137,8 @@ impl PaymentStream {
             withdrawn: 0,
             paused_at: None,
             paused_total: 0,
+            checkpoint_earned: 0,
+            checkpoint_seconds: 0,
             state: StreamState::Active,
         })
     }
@@ -154,19 +171,25 @@ impl PaymentStream {
         elapsed
     }
 
-    /// Amount earned as of `now`: `rate_per_sec × accruing_seconds`,
+    /// Amount earned as of `now`: the AV-204 checkpoint plus
+    /// `rate_per_sec × (accruing_seconds(now) - checkpoint_seconds)`,
     /// computed in `u128` (cannot overflow) and capped at
-    /// `total_funded`.
+    /// `total_funded`. With no rate change the checkpoint is `(0, 0)`
+    /// and this is exactly `rate × accruing_seconds`.
     ///
     /// Reports `0` before `start_ts + cliff_secs` — the cliff gates
     /// payout, it does not consume the stream: accrual itself runs
-    /// from `start_ts`.
+    /// from `start_ts`. (The checkpoint stores the *ungated* accrued
+    /// amount, so a rate change before the cliff elapses does not erase
+    /// the pre-change accrual — it simply stays gated until the cliff.)
     pub fn earned(&self, now: u64) -> u64 {
         if now < self.start_ts.saturating_add(self.cliff_secs) {
             return 0;
         }
-        let elapsed = self.accruing_seconds(now) as u128;
-        let earned = (self.rate_per_sec as u128).saturating_mul(elapsed);
+        let elapsed =
+            (self.accruing_seconds(now).saturating_sub(self.checkpoint_seconds)) as u128;
+        let earned = (self.checkpoint_earned as u128)
+            .saturating_add((self.rate_per_sec as u128).saturating_mul(elapsed));
         earned.min(self.total_funded as u128) as u64
     }
 
@@ -281,6 +304,78 @@ impl PaymentStream {
         s.push_str("\",\"new_recipient\":\"");
         s.push_str(&hex64(&new_recipient));
         s.push_str("\"}");
+        s
+    }
+
+    /// Renegotiates the rate mid-flight — dual-signed: *both* the
+    /// initializer and the recipient must present, so neither side can
+    /// reprice the stream alone. Either party absent, or a stranger in
+    /// either slot, is [`EscrowError::StreamUnauthorized`] (code 305).
+    ///
+    /// Only *future* accrual changes: the amount earned under the old
+    /// rate is checkpointed at `now` (ungated — see [`Self::earned`])
+    /// and never repriced, so `earned(now)` is identical immediately
+    /// before and after the change. `total_funded` (set at creation)
+    /// still caps everything: a rate increase cannot pay out more than
+    /// was funded, it only reaches the cap sooner.
+    ///
+    /// Check order is authority → state → config: a zero `new_rate`
+    /// is [`EscrowError::InvalidStream`] (code 304), as is a rate whose
+    /// `new_rate × duration_secs` product does not fit `u64` (the same
+    /// fail-closed bound [`Self::create_stream`] enforces). A change
+    /// to the current rate is an idempotent no-op (no checkpoint
+    /// churn). Allowed while paused — accrual is frozen then, so the
+    /// checkpoint is exact and the new rate applies from resume.
+    pub fn update_stream_rate(
+        &mut self,
+        initializer: [u8; 32],
+        recipient: [u8; 32],
+        new_rate: u64,
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // Authority first: dual signature — both parties must present.
+        if initializer != self.initializer || recipient != self.recipient {
+            return Err(EscrowError::StreamUnauthorized);
+        }
+        self.require_active()?;
+        if new_rate == 0 {
+            return Err(EscrowError::InvalidStream);
+        }
+        // Same u64-fit bound as create_stream, on the full duration.
+        if (new_rate as u128).saturating_mul(self.duration_secs as u128) > u64::MAX as u128 {
+            return Err(EscrowError::InvalidStream);
+        }
+        if new_rate == self.rate_per_sec {
+            return Ok(());
+        }
+        let acc = self.accruing_seconds(now);
+        // Chain from the previous checkpoint: only the seconds since
+        // the last change accrue at the old rate. (Using
+        // `old_rate × acc` here would reprice the pre-change seconds
+        // on every change after the first.)
+        let ungated = (self.checkpoint_earned as u128)
+            .saturating_add(
+                (self.rate_per_sec as u128)
+                    .saturating_mul(acc.saturating_sub(self.checkpoint_seconds) as u128),
+            )
+            .min(self.total_funded as u128) as u64;
+        self.checkpoint_earned = ungated;
+        self.checkpoint_seconds = acc;
+        self.rate_per_sec = new_rate;
+        Ok(())
+    }
+
+    /// Audit-event JSON for a rate change (hand-written, no serde —
+    /// same convention as [`Self::transfer_audit_json`]):
+    /// `{"event":"stream_rate_updated","old_rate":10,"new_rate":20,"at":25}`.
+    pub fn rate_update_audit_json(old_rate: u64, new_rate: u64, at: u64) -> String {
+        let mut s = String::from("{\"event\":\"stream_rate_updated\",\"old_rate\":");
+        s.push_str(&old_rate.to_string());
+        s.push_str(",\"new_rate\":");
+        s.push_str(&new_rate.to_string());
+        s.push_str(",\"at\":");
+        s.push_str(&at.to_string());
+        s.push('}');
         s
     }
 
