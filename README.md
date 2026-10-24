@@ -6999,3 +6999,40 @@ Layout: one appended vault tail u64 (`max_release_per_call`), so
 offsets are untouched. No new indexer event: the cap is a config
 value readable from the vault account, and cap changes are not
 settlements.
+
+## Delegation spend cap (AV-208)
+
+The AV-104 operator grant bounds *which* transitions an operator
+may run, but not *how much* they may move — a stolen hot wallet
+with RELEASE scope could drain the lockup one legal call at a
+time. `delegate_authority_with_spend_cap(caller, delegate, scopes,
+spend_cap)` adds a cumulative volume bound to the grant: every
+operator-settled gross release (`release` through `release_impl`,
+and the AV-108 table path `release_payout_split`) accumulates into
+the grant's `spent` counter, and a release that would push `spent`
+past the cap is refused with `SpendCapExceeded` (code 318) and
+consumes nothing. The cap binds gross amounts (the AV-205
+convention), sits after every other gate so refused releases never
+consume cap, and never auto-revokes the grant — a capped-out
+operator keeps their scope for non-release paths until a party
+revokes or overwrites. Party releases never count toward the cap;
+a zero cap is `InvalidDelegation` (`0` in storage always means
+"never capped", so a capped grant is never ambiguous with an
+AV-104 grant); re-granting the identical triple is a no-op that
+keeps the live `spent`, while overwriting with a new cap resets it;
+rotation clears the grant, cap and counter together. Paths an
+operator cannot drive (`release_split`, `release_milestone`,
+`claim`) need no accounting — their authority gates already refuse
+operators.
+
+Layout: the delegation region grows 37 → 53 bytes (u64 spend cap
++ u64 spent), so `ESCROW_BODY_LEN` grows 7731 → 7747,
+`VAULT_SPACE` 7739 → 7755 (rent-exempt 54_754_320 → 54_865_680
+lamports), and the no-quorum space 7249 → 7265; fields after the
+delegation region shift by 16 bytes, earlier offsets are
+untouched. Note the scope boundary: this item is the state machine
+(`escrow-state`) plus the regenerated IDL — the Anchor instruction
+that grants a capped delegation on-chain is follow-up Anchor work,
+not claimed here (the program's `escrow_error` mapping is already
+stale for several recent variants and is not repaired in this
+round).

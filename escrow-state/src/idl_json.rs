@@ -473,12 +473,15 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
             ("end_at", IdlType::U64),
             ("reserve_bps", IdlType::U16),
         ],
-        // Delegation { delegate: Pubkey, scopes: u32 } (AV-104): the
-        // operator grant — 36 bytes (the `Option` discriminant rides
-        // the vault field, not the named type).
+        // Delegation { delegate: Pubkey, scopes: u32, spend_cap: u64,
+        // spent: u64 } (AV-104 + AV-208): the operator grant — 52
+        // bytes (the `Option` discriminant rides the vault field,
+        // not the named type).
         "Delegation" => vec![
             ("delegate", IdlType::PublicKey),
             ("scopes", IdlType::U32),
+            ("spend_cap", IdlType::U64),
+            ("spent", IdlType::U64),
         ],
         // BasketLeg { mint: Pubkey, amount: u64, released: u64 }
         // (AV-95): one leg of a multi-mint basket — 48 bytes.
@@ -1164,10 +1167,11 @@ fn named_type_sizes_pin_constants() {
     // AV-97: start_at u64 + end_at u64 + reserve_bps u16.
     assert_eq!(size("DutchAuction"), DUTCH_AUCTION_LEN);
     assert_eq!(size("DutchAuction"), 18);
-    // AV-104: 32-byte operator key + u32 scope bitmap (the `Option`
-    // discriminant rides the vault field, not the named type).
+    // AV-104: 32-byte operator key + u32 scope bitmap + (AV-208)
+    // u64 spend cap + u64 spent counter (the `Option` discriminant
+    // rides the vault field, not the named type).
     assert_eq!(size("Delegation"), DELEGATION_LEN - 1);
-    assert_eq!(size("Delegation"), 36);
+    assert_eq!(size("Delegation"), 52);
     // AV-83: eight 32-byte program ids + count byte.
     assert_eq!(size("CpiAllowlist"), CPI_ALLOWLIST_LEN);
     // AV-84: 32-byte multisig program id + 32-byte authority PDA + u16
@@ -1314,13 +1318,14 @@ fn idl_errors_pin_enum() {
             // AV-194 with 282-285; AV-195 with 286-292; AV-196 with
             // 293-298; AV-197 with 299-303; AV-200 with 313; AV-201
             // with 314; AV-203 with 315; AV-205 with 316; AV-207 with
-            // 317 (never renumbered; each extension widens this bound).
-            (100..318).contains(&e.code()),
+            // 317; AV-208 with 318 (never renumbered; each extension
+            // widens this bound).
+            (100..319).contains(&e.code()),
             "error code out of pinned range: {name} = {}",
             e.code()
         );
     }
-    assert_eq!(errors.len(), 209, "error variant count drift"); // AV-195: +7 social-recovery errors; AV-196: +6 jury-sortition errors; AV-197: +5 payment-channel errors; AV-200: +1; AV-201: +1; AV-203: +1; AV-205: +1; AV-207: +1
+    assert_eq!(errors.len(), 210, "error variant count drift"); // AV-195: +7 social-recovery errors; AV-196: +6 jury-sortition errors; AV-197: +5 payment-channel errors; AV-200: +1; AV-201: +1; AV-203: +1; AV-205: +1; AV-207: +1; AV-208: +1
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);

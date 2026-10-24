@@ -1064,21 +1064,23 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     let appeal_bond_paid = c.u64_le()?;
     // AV-104: the delegated operator grant, always reserved like
     // `refund_to`: the `None` discriminant followed by the zeroed
-    // 36-byte grant region (32-byte operator key + u32 scope bitmap),
-    // appended last so every earlier offset above is unchanged. The
-    // bitmap is not validated here — an unknown bit is the grantor's
-    // problem, not a decode failure (mirroring the bitmask fields
-    // like `activation`); `Delegation::covers` rejects foreign bits
-    // at use time.
+    // 52-byte grant region (32-byte operator key + u32 scope bitmap
+    // + u64 spend cap + u64 spent, AV-208), appended last so every
+    // earlier offset above is unchanged. The bitmap is not validated
+    // here — an unknown bit is the grantor's problem, not a decode
+    // failure (mirroring the bitmask fields like `activation`);
+    // `Delegation::covers` rejects foreign bits at use time.
     let delegation = if c.option_present("delegation")? {
         let delegate = c.pubkey()?;
         let scopes = c.u32_le()?;
+        let spend_cap = c.u64_le()?;
+        let spent = c.u64_le()?;
         debug_assert_eq!(
-            32 + 4,
+            32 + 4 + 8 + 8,
             DELEGATION_LEN - 1,
             "delegation region drift vs DELEGATION_LEN"
         );
-        Some(Delegation::new(delegate, scopes))
+        Some(Delegation::new_full(delegate, scopes, spend_cap, spent))
     } else {
         c.skip(DELEGATION_LEN - 1)?;
         None
