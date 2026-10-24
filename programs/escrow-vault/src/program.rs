@@ -2292,6 +2292,33 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt into the delivery-confirmation gate (AV-203; mirrors
+    /// `Escrow::with_delivery_confirmation`). The initializer arms
+    /// the gate while the escrow is `Uninitialized` — the payout
+    /// rule is fixed before any funds move, like the other
+    /// `initialize_*` opt-ins. Once armed, `release`, `claim` and
+    /// `release_milestone` refuse to settle until the taker
+    /// confirms receipt via `confirm_delivery`
+    /// (`DeliveryNotConfirmed`, code 315, otherwise). The
+    /// unilateral exits (`cancel`, `cancel_expired`) and the
+    /// arbiter's `resolve` are deliberately not gated, so a taker
+    /// who refuses to confirm can never trap funds forever.
+    pub fn initialize_delivery_confirmation(
+        ctx: Context<InitializeDeliveryConfirmation>,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_delivery_confirmation()
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the two delivery
+        // tail bytes (zeroed when the gate is off), so the gate is
+        // written in place — no realloc needed in the real build.
+        // No indexer event: pre-fund configuration, like the other
+        // `initialize_*` opt-ins.
+        Ok(())
+    }
+
     /// Fix the funding amount window (AV-134; mirrors
     /// `Escrow::with_amount_bounds`). The initializer bounds every
     /// deposit: `fund` and each `fund_tranche` call reject amounts
@@ -3431,6 +3458,41 @@ pub mod escrow_vault {
             emit_transition(
             &ctx.accounts.vault,
             escrow_state::EscrowEventKind::MilestoneConfirmed,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
+    /// Confirm delivery (AV-203; mirrors `Escrow::confirm_delivery`).
+    /// Only the taker signs — the initializer cannot confirm their
+    /// own delivery (`Unauthorized` otherwise). `Funded` or
+    /// `Disputed` only; idempotent, so a repeat confirmation is a
+    /// no-op. Emits `DeliveryConfirmed` only on the first
+    /// confirmation (mirrors `IndexedEscrow::confirm_delivery` and
+    /// the `confirm_milestone` emission rule).
+    pub fn confirm_delivery(ctx: Context<ConfirmDelivery>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let confirmed_before = escrow.delivery_confirmed();
+        escrow
+            .confirm_delivery(ctx.accounts.taker.key().to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        if !confirmed_before && escrow.delivery_confirmed() {
+            let state = escrow.state() as u8;
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::DeliveryConfirmed,
             state,
             state,
             0,
@@ -8561,6 +8623,18 @@ pub struct InitializeDualControl<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-203: accounts for `initialize_delivery_confirmation` — the
+/// initializer arms the delivery-confirmation gate while the escrow
+/// is `Uninitialized`.
+#[derive(Accounts)]
+pub struct InitializeDeliveryConfirmation<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer arms the gate; the state machine
+    /// rejects re-configuration once the escrow is funded.
+    pub initializer: Signer<'info>,
+}
+
 /// AV-134: accounts for `initialize_amount_bounds` — the initializer
 /// fixes the funding amount window while the escrow is
 /// `Uninitialized`.
@@ -9509,6 +9583,17 @@ pub struct ConfirmMilestone<'info> {
     /// in the real build additionally asserts `authority.key() ==
     /// vault.initializer || authority.key() == vault.taker`.
     pub authority: Signer<'info>,
+}
+
+/// AV-203: accounts for `confirm_delivery` — only the taker signs;
+/// the state machine rejects the initializer (`Unauthorized`).
+#[derive(Accounts)]
+pub struct ConfirmDelivery<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the taker confirms delivery; a constraint in the real
+    /// build additionally asserts `taker.key() == vault.taker`.
+    pub taker: Signer<'info>,
 }
 
 #[derive(Accounts)]

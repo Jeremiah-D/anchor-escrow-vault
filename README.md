@@ -6858,3 +6858,32 @@ New error codes 304–308: `InvalidStream`, `StreamUnauthorized`,
 `StreamNotActive`, `StreamAlreadyPaused`, `StreamNotPaused`. Pure
 logic, standalone module like AV-192 — no vault layout change, no
 rent math changes in this item.
+
+## Delivery confirmation gate (AV-203)
+
+Opt-in taker-side receipt confirmation for payouts. The initializer
+opts in at construction with `with_delivery_confirmation`
+(`Uninitialized`-only; `InvalidStateTransition` afterwards), and the
+taker then calls `confirm_delivery()` once the goods or service have
+actually arrived. Until that confirmation lands, `release`,
+`release_milestone`, and `claim` are all refused with the new error
+`DeliveryNotConfirmed` (code 315) — the check sits last, just before
+fee charging, so a refused payout moves nothing and charges nothing.
+Check order on every gated path is authority → state → … →
+delivery-confirmation, and `confirm_delivery` itself is taker-only
+(`Unauthorized` otherwise) in `Funded` or `Disputed` state; repeating
+it is an idempotent no-op.
+
+Deliberately ungated, so a taker who refuses to confirm can never
+trap funds forever: initializer `cancel` / `cancel_expired` and
+arbiter `resolve` all still settle without any confirmation, and
+disputes stay arbitrable. Orthogonal to AV-130 (authority-side
+maker-checker dual control): AV-130 gates *who* may authorize a
+release, AV-203 gates *whether the taker has confirmed receipt*.
+
+The indexer emits `DeliveryConfirmed` exactly once, on the first
+transition (repeats emit nothing, failures emit nothing). Layout:
+two appended vault tail bytes (`delivery_confirmation`,
+`delivery_confirmed`), so `ESCROW_BODY_LEN` grows 7655 → 7657 and
+`VAULT_SPACE` 7663 → 7665 (rent-exempt 54_225_360 → 54_239_280
+lamports); earlier field offsets are untouched.

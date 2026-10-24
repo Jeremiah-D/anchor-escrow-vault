@@ -197,6 +197,8 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         | EscrowEventKind::Escalated
         | EscrowEventKind::MilestoneConfirmed
         | EscrowEventKind::MilestoneSkipped
+        // AV-203: a delivery confirmation carries no fee leg.
+        | EscrowEventKind::DeliveryConfirmed
         | EscrowEventKind::QuorumUpdated
         | EscrowEventKind::AttestorsUpdated
         // AV-154: a quorum key rotation moves no funds.
@@ -919,6 +921,8 @@ mod fee_history_tests {
                 | EscrowEventKind::DualControlCancelled
                 | EscrowEventKind::JudgmentCommitted
                 | EscrowEventKind::JudgmentRevealed
+                // AV-203: a delivery confirmation carries no fee leg.
+                | EscrowEventKind::DeliveryConfirmed
                 | EscrowEventKind::RentSwept => None,
             };
             assert_eq!(fee_kind(kind), want, "kind {kind:?}");

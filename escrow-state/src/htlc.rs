@@ -531,6 +531,6 @@ mod htlc_tests {
         // AV-188 pins its own codes in merkle_distributor::merkle_tests.
         // AV-189 pins its own codes in english_auction::english_auction_tests.
         // AV-190 pins its own codes in rental_escrow::rental_escrow_tests.
-        assert_eq!(EscrowError::all().len(), 206); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors
+        assert_eq!(EscrowError::all().len(), 207); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors
     }
 }

@@ -1249,6 +1249,18 @@
       "args": [
         {"name": "panel_size", "type": "u8"}
       ]
+    },
+    {
+      "name": "initialize_delivery_confirmation",
+      "discriminator": [225, 247, 213, 134, 192, 17, 42, 82],
+      "accounts": [],
+      "args": []
+    },
+    {
+      "name": "confirm_delivery",
+      "discriminator": [11, 109, 227, 53, 179, 190, 88, 155],
+      "accounts": [],
+      "args": []
     }
   ],
   "accounts": [
@@ -1388,7 +1400,9 @@
           {"name": "referral_bps", "type": "u16", "offset": 7343},
           {"name": "referral_paid", "type": "u64", "offset": 7345},
           {"name": "recovery", "type": {"option": {"defined": "SocialRecovery"}}, "offset": 7353},
-          {"name": "jury_panel_size", "type": "u8", "offset": 7662}
+          {"name": "jury_panel_size", "type": "u8", "offset": 7662},
+          {"name": "delivery_confirmation", "type": "bool", "offset": 7663},
+          {"name": "delivery_confirmed", "type": "bool", "offset": 7664}
         ]
       }
     }
@@ -1995,7 +2009,8 @@
     {"code": 302, "name": "StaleChannelNonce"},
     {"code": 303, "name": "ChannelBalanceMismatch"},
     {"code": 313, "name": "SealedBidPricingLocked"},
-    {"code": 314, "name": "EnglishAuctionBuyoutLocked"}
+    {"code": 314, "name": "EnglishAuctionBuyoutLocked"},
+    {"code": 315, "name": "DeliveryNotConfirmed"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

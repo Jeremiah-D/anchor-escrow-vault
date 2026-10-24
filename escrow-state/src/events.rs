@@ -1065,6 +1065,13 @@ pub enum EscrowEventKind {
     /// a rejected call changes nothing, so a failed call emits
     /// nothing.
     FeeWithdrawn,
+    /// AV-203: the taker confirmed delivery (see
+    /// [`Escrow::confirm_delivery`]). `from == to ==` the current
+    /// state — a confirmation, not a lifecycle move (like
+    /// [`EscrowEventKind::MilestoneConfirmed`]). Emitted only on
+    /// the first confirmation; repeat confirmations are idempotent
+    /// no-ops that emit nothing. The actor is the taker.
+    DeliveryConfirmed,
 }
 
 impl EscrowEventKind {
@@ -1280,6 +1287,9 @@ impl EscrowEventKind {
             // discriminants 0–84 stay stable for already-serialized
             // vaults.
             85 => Self::FeeWithdrawn,
+            // AV-203: appended after FeeWithdrawn so discriminants
+            // 0–85 stay stable for already-serialized vaults.
+            86 => Self::DeliveryConfirmed,
             _ => return None,
         })
     }
@@ -1403,6 +1413,7 @@ impl EscrowEventKind {
             Self::GovernanceExecuted => "governance_executed",
             Self::GovernanceCancelled => "governance_cancelled",
             Self::FeeWithdrawn => "fee_withdrawn",
+            Self::DeliveryConfirmed => "delivery_confirmed",
         }
     }
 
@@ -1530,6 +1541,7 @@ impl EscrowEventKind {
             "governance_executed" => Self::GovernanceExecuted,
             "governance_cancelled" => Self::GovernanceCancelled,
             "fee_withdrawn" => Self::FeeWithdrawn,
+            "delivery_confirmed" => Self::DeliveryConfirmed,
             _ => return None,
         })
     }
@@ -2976,6 +2988,14 @@ impl IndexedEscrow {
     /// emits no event.
     pub fn with_dual_control(mut self, checker: [u8; 32]) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_dual_control(checker)?;
+        Ok(self)
+    }
+
+    /// Opt into the delivery-confirmation gate (mirrors
+    /// [`Escrow::with_delivery_confirmation`], AV-203). Configuration:
+    /// emits no event.
+    pub fn with_delivery_confirmation(mut self) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_delivery_confirmation()?;
         Ok(self)
     }
 
@@ -5918,6 +5938,39 @@ impl IndexedEscrow {
             None,
             Some(authority),
         );
+        }
+        Ok(())
+    }
+
+    /// Confirm delivery (mirrors [`Escrow::confirm_delivery`], AV-203
+    /// — the taker confirms receipt). Emits
+    /// [`EscrowEventKind::DeliveryConfirmed`] only on the first
+    /// confirmation (`from == to ==` the current state, amounts
+    /// [`EventAmounts::none`], the actor is the taker); repeat
+    /// confirmations are idempotent no-ops that emit nothing
+    /// (mirroring `confirm_milestone`'s emission rule). Failed
+    /// confirmations emit nothing. `at` is the event timestamp.
+    pub fn confirm_delivery(
+        &mut self,
+        authority: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let confirmed_before = self.inner.delivery_confirmed();
+        self.inner.confirm_delivery(authority)?;
+        if !confirmed_before && self.inner.delivery_confirmed() {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::DeliveryConfirmed,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                Some(authority),
+            );
         }
         Ok(())
     }
@@ -9076,7 +9129,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9179,7 +9232,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9716,7 +9769,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9731,7 +9784,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9743,7 +9796,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9755,7 +9808,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9767,7 +9820,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9782,7 +9835,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9797,7 +9850,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9809,7 +9862,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9821,7 +9874,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9833,7 +9886,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9845,7 +9898,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9857,7 +9910,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9869,7 +9922,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9885,7 +9938,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9900,7 +9953,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9915,7 +9968,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9930,7 +9983,22 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
+    }
+
+    #[test]
+    fn delivery_confirmed_kind_round_trips() {
+        // AV-203: discriminant 86, appended after FeeWithdrawn —
+        // 0–85 stay stable for already-serialized histories.
+        let kind = EscrowEventKind::DeliveryConfirmed;
+        assert_eq!(kind.discriminant(), 86);
+        assert_eq!(EscrowEventKind::from_discriminant(86), Some(kind));
+        assert_eq!(kind.name(), "delivery_confirmed");
+        assert_eq!(
+            EscrowEventKind::from_name("delivery_confirmed"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
@@ -9962,7 +10030,7 @@ mod event_tests {
             EscrowEventKind::from_name("governance_cancelled"),
             Some(cancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(86), None);
+        assert_eq!(EscrowEventKind::from_discriminant(87), None);
     }
 
     #[test]
