@@ -884,6 +884,6 @@ mod sealed_bid_tests {
         // AV-192 appends 7 sealed-bid errors after AV-191's
         // InvalidReferral (271); AV-193 appends 3 oracle-adapter
         // errors after those.
-        assert_eq!(EscrowError::all().len(), 207); // AV-195: +7, AV-196: +6, AV-197: +5, AV-200: +1, AV-203: +1
+        assert_eq!(EscrowError::all().len(), 208); // AV-195: +7, AV-196: +6, AV-197: +5, AV-200: +1, AV-203: +1 AV-205: +1
     }
 }

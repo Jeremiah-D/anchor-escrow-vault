@@ -1678,6 +1678,8 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // AV-203: the delivery-confirmation gate + confirmation flag.
     let delivery_confirmation = c.u8()? != 0;
     let delivery_confirmed = c.u8()? != 0;
+    // AV-205: the per-call release cap (`0` = no cap).
+    let max_release_per_call = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -2010,6 +2012,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // the setup and the taker's confirmation recorded.
         delivery_confirmation,
         delivery_confirmed,
+        // AV-205: the per-call release cap — a decoded escrow
+        // carries the same cap the setup or the dual-signed
+        // adjustment recorded.
+        max_release_per_call,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

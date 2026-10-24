@@ -2319,6 +2319,31 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt into the per-call release cap (AV-205; mirrors
+    /// `Escrow::with_max_release_per_call`). The initializer arms
+    /// the cap while the escrow is `Uninitialized` — the payout
+    /// rule is fixed before any funds move, like the other
+    /// `initialize_*` opt-ins. A zero cap is `AmountMismatch`
+    /// (the opt-in must be positive; 0 in storage always means no
+    /// cap). Once armed, every taker payout call above the cap
+    /// refuses with `ReleaseExceedsCap` (code 316).
+    pub fn initialize_max_release_cap(
+        ctx: Context<InitializeMaxReleaseCap>,
+        cap: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_max_release_per_call(cap)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the 8 cap tail bytes
+        // (zeroed when no cap is configured), so the cap is
+        // written in place — no realloc needed in the real build.
+        // No indexer event: pre-fund configuration, like the other
+        // `initialize_*` opt-ins.
+        Ok(())
+    }
+
     /// Fix the funding amount window (AV-134; mirrors
     /// `Escrow::with_amount_bounds`). The initializer bounds every
     /// deposit: `fund` and each `fund_tranche` call reject amounts
@@ -3508,6 +3533,34 @@ pub mod escrow_vault {
         }
         Ok(())
     }
+    /// Adjust the per-call release cap (AV-205; mirrors
+    /// `Escrow::update_release_cap`). Both the initializer and the
+    /// taker sign — either party alone, or a stranger, is
+    /// `Unauthorized`. `Funded` or `Disputed` only; a zero cap is
+    /// `AmountMismatch` (a live cap can be raised or lowered by
+    /// dual signature but never removed). The new cap binds the
+    /// next payout call immediately, including a live dual-control
+    /// intent at confirm time. No indexer event: a config change,
+    /// not a settlement.
+    pub fn update_release_cap(
+        ctx: Context<UpdateReleaseCap>,
+        new_cap: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .update_release_cap(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_cap,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the 8 cap tail bytes,
+        // so the adjustment is written in place — no realloc
+        // needed in the real build.
+        Ok(())
+    }
+
 
     /// Release a milestone's tranche to the taker (AV-15; mirrors
     /// `Escrow::release_milestone`). Only the initializer signs; the
@@ -8635,6 +8688,18 @@ pub struct InitializeDeliveryConfirmation<'info> {
     pub initializer: Signer<'info>,
 }
 
+/// AV-205: accounts for `initialize_max_release_cap` — the
+/// initializer arms the per-call release cap while the escrow is
+/// `Uninitialized`.
+#[derive(Accounts)]
+pub struct InitializeMaxReleaseCap<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer arms the cap; the state machine
+    /// rejects re-configuration once the escrow is funded.
+    pub initializer: Signer<'info>,
+}
+
 /// AV-134: accounts for `initialize_amount_bounds` — the initializer
 /// fixes the funding amount window while the escrow is
 /// `Uninitialized`.
@@ -9593,6 +9658,19 @@ pub struct ConfirmDelivery<'info> {
     pub vault: Account<'info, Vault>,
     /// Only the taker confirms delivery; a constraint in the real
     /// build additionally asserts `taker.key() == vault.taker`.
+    pub taker: Signer<'info>,
+}
+
+/// AV-205: accounts for `update_release_cap` — both parties sign
+/// the cap adjustment on a live escrow; the state machine rejects
+/// either party alone (`Unauthorized`).
+#[derive(Accounts)]
+pub struct UpdateReleaseCap<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The initializer co-signs the adjustment.
+    pub initializer: Signer<'info>,
+    /// The taker co-signs the adjustment.
     pub taker: Signer<'info>,
 }
 

@@ -1261,6 +1261,22 @@
       "discriminator": [11, 109, 227, 53, 179, 190, 88, 155],
       "accounts": [],
       "args": []
+    },
+    {
+      "name": "initialize_max_release_cap",
+      "discriminator": [112, 5, 7, 39, 201, 4, 225, 231],
+      "accounts": [],
+      "args": [
+        {"name": "cap", "type": "u64"}
+      ]
+    },
+    {
+      "name": "update_release_cap",
+      "discriminator": [101, 182, 243, 184, 152, 64, 94, 158],
+      "accounts": [],
+      "args": [
+        {"name": "new_cap", "type": "u64"}
+      ]
     }
   ],
   "accounts": [
@@ -1402,7 +1418,8 @@
           {"name": "recovery", "type": {"option": {"defined": "SocialRecovery"}}, "offset": 7353},
           {"name": "jury_panel_size", "type": "u8", "offset": 7662},
           {"name": "delivery_confirmation", "type": "bool", "offset": 7663},
-          {"name": "delivery_confirmed", "type": "bool", "offset": 7664}
+          {"name": "delivery_confirmed", "type": "bool", "offset": 7664},
+          {"name": "max_release_per_call", "type": "u64", "offset": 7665}
         ]
       }
     }
@@ -2010,7 +2027,8 @@
     {"code": 303, "name": "ChannelBalanceMismatch"},
     {"code": 313, "name": "SealedBidPricingLocked"},
     {"code": 314, "name": "EnglishAuctionBuyoutLocked"},
-    {"code": 315, "name": "DeliveryNotConfirmed"}
+    {"code": 315, "name": "DeliveryNotConfirmed"},
+    {"code": 316, "name": "ReleaseExceedsCap"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

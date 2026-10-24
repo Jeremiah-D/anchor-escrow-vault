@@ -6910,3 +6910,48 @@ two appended vault tail bytes (`delivery_confirmation`,
 `delivery_confirmed`), so `ESCROW_BODY_LEN` grows 7655 → 7657 and
 `VAULT_SPACE` 7663 → 7665 (rent-exempt 54_225_360 → 54_239_280
 lamports); earlier field offsets are untouched.
+
+## Per-call release cap (AV-205)
+
+Opt-in ceiling on how much a single payout call may move. The
+initializer opts in at construction with `with_max_release_per_call`
+(`Uninitialized`-only; a zero cap is `AmountMismatch`, because `0`
+in storage always means "no cap"). While a non-zero cap is set, a
+single `release`, `release_milestone`, `claim`, `release_split`,
+or `release_payout_split` call whose gross amount exceeds the cap
+is refused with the new error `ReleaseExceedsCap` (code 316) — the
+check sits just before fee charging (second-to-last, right before
+the AV-203 delivery gate on the three gated paths), so a refused
+payout moves nothing and charges nothing.
+
+The cap is per call, not cumulative: a deal larger than the cap
+still settles in several capped calls, while a fat-fingered amount
+or a stolen key can never drain the lockup in one move. For
+`release_split` the cap binds the gross split total, so splitting
+a too-large call across recipients never evades it; for `claim`
+a pull larger than the cap refuses outright rather than paying a
+capped slice. The AV-108 table path is capped identically —
+otherwise the cap would be trivially bypassable through the
+declared table. Deliberately out of scope: `claim_share` (roster
+shares are pre-declared at setup), `release_period` (scheduled
+period amounts), and the arbiter's `resolve` (not an initializer
+payout) — the cap gates initializer/taker payout calls, not every
+fund movement.
+
+Combination with AV-130 dual control runs both ways: a
+`initiate_release` declaration above the cap never becomes a live
+intent (`ReleaseExceedsCap` at declaration), and `confirm_release`
+re-checks the live cap through `release_impl` at settlement, so a
+cap lowered after declaration still refuses the confirm while the
+intent stays live for a retry. The cap itself changes only by
+initializer+taker dual signature via `update_release_cap`
+(`Funded` or `Disputed`; either party alone is `Unauthorized`):
+it can be raised or lowered, but never removed — a live cap of
+`0` is rejected, so `0` in storage always means "never opted in".
+
+Layout: one appended vault tail u64 (`max_release_per_call`), so
+`ESCROW_BODY_LEN` grows 7657 → 7665 and `VAULT_SPACE` 7665 → 7673
+(rent-exempt 54_239_280 → 54_294_960 lamports); earlier field
+offsets are untouched. No new indexer event: the cap is a config
+value readable from the vault account, and cap changes are not
+settlements.
