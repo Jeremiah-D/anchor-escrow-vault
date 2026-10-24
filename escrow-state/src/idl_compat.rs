@@ -988,6 +988,7 @@ pub const BREAKING_CHANGE_ALLOWLIST: &[&str] = &[
     // never renumbered.
     "field_added:account Vault.milestone_due_dates",
     "field_added:account Vault.milestone_late_penalty_bps",
+    "field_added:account Vault.milestone_verifier",
     // AV-208: the delegation spend cap + spent counter — appended
     // to the Delegation named type, never renumbered.
     "field_added:type Delegation.spend_cap",
@@ -1475,7 +1476,7 @@ mod idl_compat_tests {
         // payment-channel errors; AV-200 adds 1 sealed-bid pricing
         // error; AV-201 adds 1 English-auction buyout error; AV-205
         // adds 1 per-call release cap error.
-        assert_eq!(spec.errors.len(), 214); // AV-209 adds 4 winner-payment errors.
+        assert_eq!(spec.errors.len(), 220); // AV-209 adds 4 winner-payment errors.
         // AV-178 adds the TieredQuorum + Tier named types; AV-195 adds
         // the SocialRecovery named type.
         assert_eq!(spec.types.len(), 36);

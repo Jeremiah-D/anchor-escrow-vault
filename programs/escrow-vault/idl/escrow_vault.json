@@ -1421,7 +1421,8 @@
           {"name": "delivery_confirmed", "type": "bool", "offset": 7680},
           {"name": "max_release_per_call", "type": "u64", "offset": 7681},
           {"name": "milestone_due_dates", "type": {"array": ["u64", 8]}, "offset": 7689},
-          {"name": "milestone_late_penalty_bps", "type": "u16", "offset": 7753}
+          {"name": "milestone_late_penalty_bps", "type": "u16", "offset": 7753},
+          {"name": "milestone_verifier", "type": "publicKey", "offset": 7755}
         ]
       }
     }
@@ -2038,7 +2039,13 @@
     {"code": 319, "name": "WinnerPaymentNotDue"},
     {"code": 320, "name": "WinnerPaymentNotCurrentWinner"},
     {"code": 321, "name": "WinnerPaymentWindowExpired"},
-    {"code": 322, "name": "WinnerPaymentInvalidWindow"}
+    {"code": 322, "name": "WinnerPaymentInvalidWindow"},
+    {"code": 323, "name": "InvalidMilestoneVerifier"},
+    {"code": 324, "name": "MilestoneVerifierRequired"},
+    {"code": 325, "name": "MilestoneVerifierNotBound"},
+    {"code": 326, "name": "MilestoneAttestationInvalid"},
+    {"code": 327, "name": "MilestoneAttestationExpired"},
+    {"code": 328, "name": "MilestoneAttestationReplay"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

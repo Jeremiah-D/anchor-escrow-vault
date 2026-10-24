@@ -2608,6 +2608,47 @@ the auction modules themselves (they price the asset and pick the
 winner; this module moves the deposits once the program reports the
 outcome). (Solana: auction wind-down.)
 
+## Milestone verifier attestation (AV-210)
+
+`release_milestone` used to trust only internal confirmation: both
+parties confirmed the milestone, so the initializer could release it.
+A milestone that represents third-party acceptance — a build
+delivered, an audit passed, a shipment inspected — needs an outside
+voice neither party can forge. `with_milestone_verifier`
+(`escrow-state/src/milestone_verifier.rs`) binds one verifier pubkey,
+`Uninitialized`-only, and once bound the plain `release_milestone`
+path refuses with `MilestoneVerifierRequired`: the gated path cannot
+be bypassed by simply not mentioning the verifier (the dual-control
+precedent). Releases then go through `release_milestone_verified`
+with one Ed25519 attestation over a domain-separated message binding
+the vault account key, the milestone index, the tranche hash
+(SHA-256 of vault, index and live plan amount, so the signature
+covers the deal terms, not just an ordinal) and the attestation's
+own expiry; a release at `now > expires_at` is
+`MilestoneAttestationExpired`, a binding or signature mismatch is
+`MilestoneAttestationInvalid`, and a replay for an already-released
+milestone is the explicit `MilestoneAttestationReplay` — replay
+protection is structural (releases are strictly in-order and each
+tranche settles at most once), so no nonce is needed. The verified
+path delegates to the same settlement code, so fee, cap, timelock,
+quorum and late-penalty gates all still run, and a failed
+attestation settles nothing and charges no fee.
+
+New error codes (never renumbered): `InvalidMilestoneVerifier`
+(323), `MilestoneVerifierRequired` (324),
+`MilestoneVerifierNotBound` (325), `MilestoneAttestationInvalid`
+(326), `MilestoneAttestationExpired` (327),
+`MilestoneAttestationReplay` (328). Vault layout: one 32-byte
+`milestone_verifier` field appended at the tail (`BODY` 7747→7779,
+`SPACE` 7755→7787, no-quorum 7265→7297, IDL regenerated).
+Orthogonal to AV-101 (keeper report signatures never gate a
+release) and AV-203 (the taker's own delivery confirmation, not a
+third party). Boundary: the Anchor instruction that accepts the
+attestation on chain (passing the vault account key and attestation
+bytes through to `release_milestone_verified`) is follow-up work —
+the pure-logic gate here is complete and tested, and no such
+instruction is claimed. (Solana: third-party milestone acceptance.)
+
 ## Winner payment window (AV-209)
 
 `SealedBidAuction::settle` only ranks — it names a winner and never

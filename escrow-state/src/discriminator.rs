@@ -1690,6 +1690,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         *due = c.u64_le()?;
     }
     let milestone_late_penalty_bps = c.u16_le()?;
+    // AV-210: the milestone verifier pubkey (zero = no gate).
+    let mut milestone_verifier = [0u8; 32];
+    for byte in milestone_verifier.iter_mut() {
+        *byte = c.u8()?;
+    }
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -2032,6 +2037,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // prices identically after a decode.
         milestone_due_dates,
         milestone_late_penalty_bps,
+        // AV-210: the milestone verifier pubkey — a decoded
+        // escrow carries the same gate the setup bound, so a
+        // verifier-bound escrow cannot lose its gate to a decode.
+        milestone_verifier,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
