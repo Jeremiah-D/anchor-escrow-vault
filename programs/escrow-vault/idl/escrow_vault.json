@@ -2034,7 +2034,11 @@
     {"code": 315, "name": "DeliveryNotConfirmed"},
     {"code": 316, "name": "ReleaseExceedsCap"},
     {"code": 317, "name": "InvalidVoteLock"},
-    {"code": 318, "name": "SpendCapExceeded"}
+    {"code": 318, "name": "SpendCapExceeded"},
+    {"code": 319, "name": "WinnerPaymentNotDue"},
+    {"code": 320, "name": "WinnerPaymentNotCurrentWinner"},
+    {"code": 321, "name": "WinnerPaymentWindowExpired"},
+    {"code": 322, "name": "WinnerPaymentInvalidWindow"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

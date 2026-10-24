@@ -2608,6 +2608,37 @@ the auction modules themselves (they price the asset and pick the
 winner; this module moves the deposits once the program reports the
 outcome). (Solana: auction wind-down.)
 
+## Winner payment window (AV-209)
+
+`SealedBidAuction::settle` only ranks — it names a winner and never
+asks whether that winner actually pays. `WinnerPaymentWindow`
+(`escrow-state/src/winner_payment.rs`) is the settlement
+follow-through: the current winner has `window_slots` slots to pay
+(`mark_paid` locks the sale); missing the window (`expire`) forfeits
+that winner and promotes the next validly revealed bidder in settle
+order (bid descending, ties to the earliest reveal slot — the same
+comparator settle uses, via `rank_revealed_bidders`), with a fresh
+window. Promotion walks the whole ranking; when every ranked bidder
+has defaulted the window is `Exhausted` — a no-sale the seller can act
+on, not a silent hang. A payment at or after the deadline is refused
+(the caller must `expire` first, so the successor, not a late payer,
+owns the sale), and a non-winner caller is refused before any window
+check. Funds never move here: `forfeit_deposits` maps each recorded
+defaulter onto AV-194's seller-authorized `BidDepositAuction::forfeit`
+after validating the whole book up front, so a bad book fails closed
+with zero partial confiscation; re-running after a successful
+forfeiture fails closed instead of double-counting.
+
+New error codes (never renumbered): `WinnerPaymentNotDue` (319),
+`WinnerPaymentNotCurrentWinner` (320), `WinnerPaymentWindowExpired`
+(321), `WinnerPaymentInvalidWindow` (322). Pure logic: no Vault
+layout change, no `VAULT_SPACE` bump. Orthogonal to AV-194 itself
+(which confiscates for unrevealed or no-sale bidders at settle time — a
+defaulting winner has revealed and won, so AV-194's settle path would
+refund, not forfeit, them) and to AV-189 English (open ascending bids:
+the winner is public and the next bid is known without a ranking
+walk). (Solana: auction settlement assurance.)
+
 ## Referrer revenue share (AV-191)
 
 Escrows can carry an optional referrer: `with_referrer(referrer, bps)`

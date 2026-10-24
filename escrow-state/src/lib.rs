@@ -633,6 +633,15 @@ pub use bid_deposit::{
     AuctionKind, BidDepositAuction, BidDepositSettlement, DepositReceipt, DepositState,
     MAX_BID_DEPOSITS,
 };
+// AV-209: winner payment window with ranked fallback — the settle
+// follow-through. Pure logic: no Vault layout change, no VAULT_SPACE
+// bump (the ranking/window decision lives off the Vault; funds move
+// only through the Anchor program and AV-194 deposit confiscation).
+mod winner_payment;
+pub use winner_payment::{
+    rank_revealed_bidders, RevealedBid, WinnerPaymentExpiry, WinnerPaymentReceipt,
+    WinnerPaymentState, WinnerPaymentWindow,
+};
 // AV-195: social recovery — the M-of-N guardian key-loss escape hatch
 // for the initializer. The policy (`SocialRecovery`) is configured
 // `Uninitialized`-only and persisted on the `Escrow` like the AV-14
@@ -4094,6 +4103,24 @@ pub enum EscrowError {
     /// — and a refused release consumes nothing. Never renumbered
     /// (see [`EscrowError::code`]).
     SpendCapExceeded,
+    /// AV-209: [`WinnerPaymentWindow::expire`](crate::WinnerPaymentWindow::expire)
+    /// before the current winner's payment deadline. Never renumbered
+    /// (see [`EscrowError::code`]).
+    WinnerPaymentNotDue,
+    /// AV-209: [`WinnerPaymentWindow::mark_paid`](crate::WinnerPaymentWindow::mark_paid)
+    /// by anyone other than the current winner. Never renumbered
+    /// (see [`EscrowError::code`]).
+    WinnerPaymentNotCurrentWinner,
+    /// AV-209: [`WinnerPaymentWindow::mark_paid`](crate::WinnerPaymentWindow::mark_paid)
+    /// at or after the current winner's payment deadline — the caller
+    /// must `expire` first so the successor, not a late payer, owns
+    /// the sale. Never renumbered (see [`EscrowError::code`]).
+    WinnerPaymentWindowExpired,
+    /// AV-209: [`WinnerPaymentWindow::new`](crate::WinnerPaymentWindow::new)
+    /// with a zero payment window, a zero bidder key, or a duplicate
+    /// bidder in the ranking. Never renumbered (see
+    /// [`EscrowError::code`]).
+    WinnerPaymentInvalidWindow,
 }
 
 impl EscrowError {
@@ -4453,6 +4480,10 @@ impl EscrowError {
             EscrowError::InvalidVoteLock => 317,
             // AV-208: appended, never renumbered.
             EscrowError::SpendCapExceeded => 318,
+            EscrowError::WinnerPaymentNotDue => 319,
+            EscrowError::WinnerPaymentNotCurrentWinner => 320,
+            EscrowError::WinnerPaymentWindowExpired => 321,
+            EscrowError::WinnerPaymentInvalidWindow => 322,
         }
     }
 
@@ -4790,6 +4821,14 @@ impl EscrowError {
             EscrowError::InvalidVoteLock,
             // AV-208: appended, never renumbered.
             EscrowError::SpendCapExceeded,
+            // AV-209: appended, never renumbered.
+            EscrowError::WinnerPaymentNotDue,
+            // AV-209: appended, never renumbered.
+            EscrowError::WinnerPaymentNotCurrentWinner,
+            // AV-209: appended, never renumbered.
+            EscrowError::WinnerPaymentWindowExpired,
+            // AV-209: appended, never renumbered.
+            EscrowError::WinnerPaymentInvalidWindow,
         ]
     }
 }
@@ -34114,6 +34153,30 @@ mod error_code_tests {
             318,
             "an operator release whose gross amount would push the live grant's cumulative spent volume past its spend cap — the grant survives, the refused release consumes nothing, and party releases never count toward the cap",
         ),
+        // AV-209: appended, never renumbered.
+        (
+            EscrowError::WinnerPaymentNotDue,
+            319,
+            "WinnerPaymentWindow::expire before the current winner's payment deadline (AV-209)",
+        ),
+        // AV-209: appended, never renumbered.
+        (
+            EscrowError::WinnerPaymentNotCurrentWinner,
+            320,
+            "WinnerPaymentWindow::mark_paid by anyone other than the current winner (AV-209)",
+        ),
+        // AV-209: appended, never renumbered.
+        (
+            EscrowError::WinnerPaymentWindowExpired,
+            321,
+            "WinnerPaymentWindow::mark_paid at or after the current winner's payment deadline — expire first so the successor owns the sale (AV-209)",
+        ),
+        // AV-209: appended, never renumbered.
+        (
+            EscrowError::WinnerPaymentInvalidWindow,
+            322,
+            "WinnerPaymentWindow::new with a zero payment window, a zero bidder key, or a duplicate bidder in the ranking (AV-209)",
+        ),
     ];
 
     #[test]
@@ -60077,7 +60140,7 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceStale));
         assert_eq!(EscrowError::OraclePriceUnreliable.code(), 281);
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceUnreliable));
-        assert_eq!(EscrowError::all().len(), 210); // AV-195: +7, AV-196: +6, AV-197: +5
+        assert_eq!(EscrowError::all().len(), 214); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4
     }
 
     #[test]
