@@ -561,7 +561,7 @@ pub use english_auction::{
 mod sealed_bid;
 pub use sealed_bid::{
     sealed_bid_commitment, SealedBidAuction, SealedBidCommitReceipt, SealedBidPhase,
-    SealedBidRevealReceipt, SealedBidSettlement, SealedBidState, MAX_SEALED_BIDS,
+    SealedBidPricing, SealedBidRevealReceipt, SealedBidSettlement, SealedBidState, MAX_SEALED_BIDS,
 };
 // AV-199: multi-unit uniform-price sealed-bid auction — the seller
 // auctions N homogeneous shares and every bidder bids a per-unit price
@@ -3979,6 +3979,12 @@ pub enum EscrowError {
     /// reveal from a bidder with no commitment on record. Never
     /// renumbered (see [`EscrowError::code`]).
     MultiUnitRevealMismatch,
+    /// AV-200: [`SealedBidAuction::with_vickrey`]
+    /// (crate::SealedBidAuction::with_vickrey) after the first
+    /// commitment has landed or on a terminal auction — the pricing
+    /// rule may not be rewritten once bidders have entered the game.
+    /// Never renumbered (see [`EscrowError::code`]).
+    SealedBidPricingLocked,
 }
 
 impl EscrowError {
@@ -4326,6 +4332,8 @@ impl EscrowError {
             EscrowError::MultiUnitDuplicateCommit => 311,
             // AV-199: appended, never renumbered.
             EscrowError::MultiUnitRevealMismatch => 312,
+            // AV-200: appended, never renumbered.
+            EscrowError::SealedBidPricingLocked => 313,
         }
     }
 
@@ -4651,6 +4659,8 @@ impl EscrowError {
             EscrowError::StaleChannelNonce,
             // AV-197: appended, never renumbered.
             EscrowError::ChannelBalanceMismatch,
+            // AV-200: appended, never renumbered.
+            EscrowError::SealedBidPricingLocked,
         ]
     }
 }
@@ -33347,6 +33357,12 @@ mod error_code_tests {
             303,
             "channel update whose balance_a + balance_b (u128 sum) does not equal the channel's total — no update may mint or burn lamports",
         ),
+        // AV-200: appended, never renumbered.
+        (
+            EscrowError::SealedBidPricingLocked,
+            313,
+            "with_vickrey after the first sealed-bid commitment landed or on a terminal auction — the pricing rule may not be rewritten once bidders have entered",
+        ),
     ];
 
     #[test]
@@ -59276,7 +59292,7 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceStale));
         assert_eq!(EscrowError::OraclePriceUnreliable.code(), 281);
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceUnreliable));
-        assert_eq!(EscrowError::all().len(), 204); // AV-195: +7, AV-196: +6, AV-197: +5
+        assert_eq!(EscrowError::all().len(), 205); // AV-195: +7, AV-196: +6, AV-197: +5
     }
 
     #[test]

@@ -2481,11 +2481,23 @@ last-second sniping on price.
 - **Cancel**: seller-only, before the first commitment and while the
   commit phase is still open; a lapsed or committed auction is settled,
   not cancelled.
+- **Vickrey (second-price) mode** (AV-200): `with_vickrey()` opts the
+  auction into second-price settlement — the highest validly revealed
+  bid still wins (ties to the earliest reveal), but the winner pays the
+  *second-highest* revealed bid, so revealing your true value is the
+  dominant strategy. With a single revealer the winner pays their own
+  bid; the price is clamped up to the minimum bid so the seller never
+  receives less than the public floor. The pricing rule is locked
+  before the first commitment lands (`SealedBidPricingLocked`, code
+  313) — rewriting the rules after bidders entered would be a
+  bait-and-switch. `Sold.winning_bid` is the price *paid*, and the
+  settlement audit JSON records `"pricing":"first_price|vickrey"`.
 
 New error codes (never renumbered): `InvalidSealedBid` (272),
 `SealedBidNotLive` (273), `SealedBidDuplicateCommit` (274),
 `SealedBidRevealMismatch` (275), `SealedBidSettleTooEarly` (276),
-`SealedBidNotCancellable` (277), `SealedBidBookFull` (278). Pure logic:
+`SealedBidNotCancellable` (277), `SealedBidBookFull` (278),
+`SealedBidPricingLocked` (313). Pure logic:
 no Vault layout change, no `VAULT_SPACE` bump. Orthogonal to AV-189
 English (ascending, open bids), AV-97 Dutch (descending price), AV-137
 (commit-reveal for arbitration votes — the preimage there binds a

@@ -1993,7 +1993,8 @@
     {"code": 300, "name": "InvalidChannelState"},
     {"code": 301, "name": "InvalidChannelSignature"},
     {"code": 302, "name": "StaleChannelNonce"},
-    {"code": 303, "name": "ChannelBalanceMismatch"}
+    {"code": 303, "name": "ChannelBalanceMismatch"},
+    {"code": 313, "name": "SealedBidPricingLocked"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

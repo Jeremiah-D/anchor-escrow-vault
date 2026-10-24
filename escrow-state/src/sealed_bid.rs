@@ -6,7 +6,9 @@
 //! they disclose `(bid, nonce)` and the commitment is verified. The
 //! highest *validly revealed* bid wins first-price — nobody learns a
 //! rival's bid until the reveal phase, so there is no bid shading or
-//! last-second sniping on price.
+//! last-second sniping on price. AV-200 adds an opt-in Vickrey
+//! (second-price) mode: the winner still pays the second-highest
+//! revealed bid, for the classic truthful-bidding incentive.
 //!
 //! Two classic sealed-bid rules are built in:
 //!
@@ -66,6 +68,30 @@ pub enum SealedBidPhase {
     Closed,
 }
 
+/// The pricing rule [`SealedBidAuction::settle`] applies once the
+/// reveal window closes.
+///
+/// [`SealedBidPricing::FirstPrice`] (the default) is the classic
+/// sealed-bid rule: the highest validly revealed bid wins and pays its
+/// own bid. [`SealedBidPricing::Vickrey`] is the second-price rule: the
+/// highest validly revealed bid still wins, but the winner pays the
+/// *second-highest* revealed bid — the classic truthful-bidding
+/// incentive (a bidder's best strategy is to reveal their true value,
+/// since the price they pay is set by someone else's bid).
+///
+/// The mode is fixed before the first commitment lands (see
+/// [`SealedBidAuction::with_vickrey`]) — changing the pricing rule
+/// after bidders have committed would rewrite the game they entered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SealedBidPricing {
+    /// Winner pays their own bid.
+    #[default]
+    FirstPrice,
+    /// Winner pays the second-highest revealed bid (their own bid when
+    /// alone), clamped up to the minimum bid.
+    Vickrey,
+}
+
 /// What [`SealedBidAuction::settle`] decided once the reveal window
 /// closed. The Anchor program maps `Sold` to "transfer the asset to the
 /// winner" and `NoBids` / `ReserveNotMet` to "return the asset to the
@@ -74,6 +100,10 @@ pub enum SealedBidPhase {
 pub enum SealedBidSettlement {
     /// A winner exists: `(winner, winning_bid)` — first-price, highest
     /// validly revealed bid; ties break to the earliest reveal.
+    /// Under [`SealedBidPricing::Vickrey`] `winning_bid` is the price
+    /// *paid*: the second-highest revealed bid (the winner's own bid
+    /// when they are the only revealer), clamped up to the minimum
+    /// bid — never below the seller's public floor.
     Sold {
         winner: [u8; 32],
         winning_bid: u64,
@@ -153,6 +183,9 @@ pub struct SealedBidAuction {
     commit_start_slot: u64,
     reveal_start_slot: u64,
     end_slot: u64,
+    /// The pricing rule `settle` applies — fixed before the first
+    /// commitment (see [`SealedBidAuction::with_vickrey`]).
+    pricing: SealedBidPricing,
     slots: [SealedBidSlot; MAX_SEALED_BIDS],
     commit_count: u32,
     reveal_count: u32,
@@ -186,11 +219,30 @@ impl SealedBidAuction {
             commit_start_slot,
             reveal_start_slot,
             end_slot,
+            pricing: SealedBidPricing::FirstPrice,
             slots: [SealedBidSlot::default(); MAX_SEALED_BIDS],
             commit_count: 0,
             reveal_count: 0,
             state: SealedBidState::Active,
         })
+    }
+
+    /// Opt in to Vickrey (second-price) settlement — the highest
+    /// validly revealed bid still wins, but the winner pays the
+    /// second-highest revealed bid.
+    ///
+    /// The mode is fixed before the game starts: refused with
+    /// [`EscrowError::SealedBidPricingLocked`] (code 313) once the
+    /// first commitment has landed or the auction is terminal —
+    /// bidders committed under first-price rules and the rule may not
+    /// be rewritten underneath them. Calling it twice is a harmless
+    /// no-op (the mode is already Vickrey).
+    pub fn with_vickrey(mut self) -> Result<Self, EscrowError> {
+        if self.state != SealedBidState::Active || self.commit_count > 0 {
+            return Err(EscrowError::SealedBidPricingLocked);
+        }
+        self.pricing = SealedBidPricing::Vickrey;
+        Ok(self)
     }
 
     /// The slot-derived phase: commitments land only in `Commit`,
@@ -293,12 +345,18 @@ impl SealedBidAuction {
     /// Settle the auction once the reveal window has closed
     /// (`current_slot >= end_slot`).
     ///
-    /// First-price: the highest validly revealed bid wins; ties break
-    /// to the earliest reveal slot (deterministic, no randomness
-    /// needed on-chain). Reveals below `min_bid` cannot win — when the
-    /// best valid bid is under the floor the outcome is
-    /// `ReserveNotMet`. Unrevealed commitments are simply dropped from
-    /// contention (AV-194 governs deposit confiscation for no-reveal).
+    /// First-price (the default): the highest validly revealed bid
+    /// wins and pays its own bid; ties break to the earliest reveal
+    /// slot (deterministic, no randomness needed on-chain). Vickrey
+    /// (see [`SealedBidAuction::with_vickrey`]): the highest validly
+    /// revealed bid still wins (same tie-break), but the winner pays
+    /// the *second-highest* revealed bid — with a single revealer the
+    /// winner pays their own bid, and the price is clamped up to
+    /// `min_bid` so the seller never receives less than the public
+    /// floor. Reveals below `min_bid` cannot win — when the best valid
+    /// bid is under the floor the outcome is `ReserveNotMet`.
+    /// Unrevealed commitments are simply dropped from contention
+    /// (AV-194 governs deposit confiscation for no-reveal).
     ///
     /// Refused with [`EscrowError::SealedBidSettleTooEarly`] (code 276)
     /// before `end_slot` and [`EscrowError::SealedBidNotLive`] (code
@@ -310,17 +368,30 @@ impl SealedBidAuction {
         if current_slot < self.end_slot {
             return Err(EscrowError::SealedBidSettleTooEarly);
         }
-        let mut best: Option<(u64, u64, [u8; 32])> = None; // (bid, reveal_slot, bidder)
+        // Rank reveals by (bid desc, reveal_slot asc): `first` is the
+        // winner candidate, `second` the Vickrey price source.
+        let mut first: Option<(u64, u64, [u8; 32])> = None;
+        let mut second: Option<u64> = None;
         for s in self.slots.iter().filter(|s| s.occupied && s.revealed) {
-            let better = match best {
+            let rank = (s.bid, s.reveal_slot);
+            let better_first = match first {
                 None => true,
-                Some((b, rs, _)) => s.bid > b || (s.bid == b && s.reveal_slot < rs),
+                Some((b, rs, _)) => rank_greater(rank, (b, rs)),
             };
-            if better {
-                best = Some((s.bid, s.reveal_slot, s.bidder));
+            if better_first {
+                second = first.map(|(b, _, _)| b);
+                first = Some((s.bid, s.reveal_slot, s.bidder));
+            } else {
+                let better_second = match second {
+                    None => true,
+                    Some(b) => rank_greater(rank, (b, u64::MAX)),
+                };
+                if better_second {
+                    second = Some(s.bid);
+                }
             }
         }
-        let settlement = match best {
+        let settlement = match first {
             None => {
                 self.state = SealedBidState::NoSale;
                 SealedBidSettlement::NoBids
@@ -334,13 +405,29 @@ impl SealedBidAuction {
             }
             Some((bid, _, bidder)) => {
                 self.state = SealedBidState::Settled;
+                let price = match self.pricing {
+                    SealedBidPricing::FirstPrice => bid,
+                    SealedBidPricing::Vickrey => {
+                        let p = second.unwrap_or(bid);
+                        if self.min_bid > 0 {
+                            p.max(self.min_bid)
+                        } else {
+                            p
+                        }
+                    }
+                };
                 SealedBidSettlement::Sold {
                     winner: bidder,
-                    winning_bid: bid,
+                    winning_bid: price,
                 }
             }
         };
         Ok(settlement)
+    }
+
+    /// The pricing rule this auction settles under.
+    pub fn pricing(&self) -> SealedBidPricing {
+        self.pricing
     }
 
     /// Cancel the auction. Seller-only
@@ -392,7 +479,10 @@ impl SealedBidAuction {
 
     /// Audit-event JSON for a settlement (hand-written):
     /// `{"event":"sealed_bid_settled","outcome":"sold|no_bids|
-    /// reserve_not_met","winner":"<64hex>","winning_bid":<u64>}`.
+    /// reserve_not_met","winner":"<64hex>","winning_bid":<u64>,
+    /// "pricing":"first_price|vickrey"}`. `winning_bid` is the price
+    /// *paid* — the winner's own bid under first-price, the
+    /// second-highest revealed bid under Vickrey.
     pub fn settle_audit_json(&self, settlement: SealedBidSettlement) -> String {
         let mut s = String::from("{\"event\":\"sealed_bid_settled\",\"outcome\":\"");
         let (winner, bid) = match settlement {
@@ -416,7 +506,12 @@ impl SealedBidAuction {
         s.push_str(&hex64(&winner));
         s.push_str("\",\"winning_bid\":");
         s.push_str(&bid.to_string());
-        s.push('}');
+        s.push_str(",\"pricing\":\"");
+        s.push_str(match self.pricing {
+            SealedBidPricing::FirstPrice => "first_price",
+            SealedBidPricing::Vickrey => "vickrey",
+        });
+        s.push_str("\"}");
         s
     }
 
@@ -452,8 +547,13 @@ impl SealedBidAuction {
     }
 }
 
-fn hex64(bytes: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
+/// Ranking order for reveals: higher bid first, ties to the earlier
+/// reveal slot. `rank_greater(a, b)` is `true` when `a` outranks `b`.
+fn rank_greater(a: (u64, u64), b: (u64, u64)) -> bool {
+    a.0 > b.0 || (a.0 == b.0 && a.1 < b.1)
+}
+
+fn hex64(bytes: &[u8; 32]) -> String {    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(64);
     for b in bytes.iter() {
         s.push(HEX[(b >> 4) as usize] as char);
@@ -768,6 +868,7 @@ mod sealed_bid_tests {
         assert_eq!(EscrowError::SealedBidSettleTooEarly.code(), 276);
         assert_eq!(EscrowError::SealedBidNotCancellable.code(), 277);
         assert_eq!(EscrowError::SealedBidBookFull.code(), 278);
+        assert_eq!(EscrowError::SealedBidPricingLocked.code(), 313);
         for e in [
             EscrowError::InvalidSealedBid,
             EscrowError::SealedBidNotLive,
@@ -776,12 +877,13 @@ mod sealed_bid_tests {
             EscrowError::SealedBidSettleTooEarly,
             EscrowError::SealedBidNotCancellable,
             EscrowError::SealedBidBookFull,
+            EscrowError::SealedBidPricingLocked,
         ] {
             assert!(EscrowError::all().contains(&e));
         }
         // AV-192 appends 7 sealed-bid errors after AV-191's
         // InvalidReferral (271); AV-193 appends 3 oracle-adapter
         // errors after those.
-        assert_eq!(EscrowError::all().len(), 204); // AV-195: +7, AV-196: +6, AV-197: +5
+        assert_eq!(EscrowError::all().len(), 205); // AV-195: +7, AV-196: +6, AV-197: +5, AV-200: +1
     }
 }

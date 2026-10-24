@@ -478,6 +478,6 @@ mod social_recovery_tests {
         // AV-195 appends 7 social-recovery errors after AV-194's
         // BidDepositBookFull (285); AV-196 appends 6 jury-sortition
         // errors after those.
-        assert_eq!(EscrowError::all().len(), 204); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors
+        assert_eq!(EscrowError::all().len(), 205); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors
     }
 }
