@@ -1019,6 +1019,25 @@ the state machine (`escrow-state`) — the Anchor instruction that
 attaches deadlines at vault creation and the on-chain routing of the
 penalty slice are follow-up Anchor work, not claimed here.
 
+**Vote-escrow locks (AV-207).** Time-weighted governance voting
+power, as a pure-logic sidecar (`escrow-state/src/vote_escrow.rs`,
+no vault layout change). `VoteEscrowLock::lock(amount, start,
+duration)` opens a lock whose voting power decays linearly:
+`power(now) = amount * remaining / duration`, computed in `u128`
+so even a `u64::MAX` lock stays exact, floored so a lock never
+reports more power than it holds. Power is full at `start` and zero
+at maturity. `extend_to(new_end)` only ever lengthens — a new end
+at or before the current end, or at or before `now`, is
+`InvalidVoteLock` (code 317), so a lock can never be shortened out
+of its commitment. `early_exit(now)` closes a live lock early and
+prices the exit as `(refund, penalty)` with `penalty = floor(amount
+* remaining / duration)`; a mature lock exits penalty-free, and a
+second exit is refused. The penalty is returned for the caller to
+route to the AV-106 insurance pool — the module moves no lamports,
+it only prices the exit. Orthogonal to AV-170 staking (yield, not
+votes) and AV-183 frozen snapshots (a snapshot reads weights at a
+slot; this lock generates a decaying weight over time).
+
 **Milestone tranche re-split (AV-70).** Before any settlement, the
 initializer and taker may jointly re-balance the tranche amounts via
 `adjust_milestone_amounts(initializer, taker, new_amounts)` — e.g.

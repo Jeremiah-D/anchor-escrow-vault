@@ -1313,14 +1313,14 @@ fn idl_errors_pin_enum() {
             // with 271; AV-192 with 272-278; AV-193 with 279-281;
             // AV-194 with 282-285; AV-195 with 286-292; AV-196 with
             // 293-298; AV-197 with 299-303; AV-200 with 313; AV-201
-            // with 314; AV-203 with 315; AV-205 with 316 (never renumbered; each
-            // extension widens this bound).
-            (100..317).contains(&e.code()),
+            // with 314; AV-203 with 315; AV-205 with 316; AV-207 with
+            // 317 (never renumbered; each extension widens this bound).
+            (100..318).contains(&e.code()),
             "error code out of pinned range: {name} = {}",
             e.code()
         );
     }
-    assert_eq!(errors.len(), 208, "error variant count drift"); // AV-195: +7 social-recovery errors; AV-196: +6 jury-sortition errors; AV-197: +5 payment-channel errors; AV-200: +1; AV-201: +1; AV-203: +1; AV-205: +1
+    assert_eq!(errors.len(), 209, "error variant count drift"); // AV-195: +7 social-recovery errors; AV-196: +6 jury-sortition errors; AV-197: +5 payment-channel errors; AV-200: +1; AV-201: +1; AV-203: +1; AV-205: +1; AV-207: +1
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);

@@ -637,6 +637,6 @@ mod jury_sortition_tests {
         // AV-196 appends 6 jury-sortition errors after AV-195's
         // RecoveryTimelockNotElapsed (292); AV-197 appends 5
         // payment-channel errors after AV-196's JuryArbiterConflict (298).
-        assert_eq!(EscrowError::all().len(), 208);
+        assert_eq!(EscrowError::all().len(), 209);
     }
 }

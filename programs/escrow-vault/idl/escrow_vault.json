@@ -2030,7 +2030,8 @@
     {"code": 313, "name": "SealedBidPricingLocked"},
     {"code": 314, "name": "EnglishAuctionBuyoutLocked"},
     {"code": 315, "name": "DeliveryNotConfirmed"},
-    {"code": 316, "name": "ReleaseExceedsCap"}
+    {"code": 316, "name": "ReleaseExceedsCap"},
+    {"code": 317, "name": "InvalidVoteLock"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

@@ -1471,7 +1471,7 @@ mod idl_compat_tests {
         // payment-channel errors; AV-200 adds 1 sealed-bid pricing
         // error; AV-201 adds 1 English-auction buyout error; AV-205
         // adds 1 per-call release cap error.
-        assert_eq!(spec.errors.len(), 208);
+        assert_eq!(spec.errors.len(), 209);
         // AV-178 adds the TieredQuorum + Tier named types; AV-195 adds
         // the SocialRecovery named type.
         assert_eq!(spec.types.len(), 36);

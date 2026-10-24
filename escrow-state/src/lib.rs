@@ -88,6 +88,11 @@ mod stake;
 pub use stake::{
     StakeDelegation, StakeError, StakeSettlement, StakeState, STAKE_BPS_DENOMINATOR,
 };
+// AV-207: vote-escrow locks — time-decaying governance voting power
+// (lock / extend-only / proportional-penalty early exit). Pure logic,
+// zero dependencies; a sidecar, not a vault field.
+mod vote_escrow;
+pub use vote_escrow::VoteEscrowLock;
 // AV-171: RPC commitment levels for off-chain reads — the
 // Processed/Confirmed/Finalized vocabulary, the risk-tiered read
 // table, the wait/retry gate with no silent downgrade, and
@@ -4076,6 +4081,12 @@ pub enum EscrowError {
     /// [`Escrow::update_release_cap`]. Never renumbered (see
     /// [`EscrowError::code`]).
     ReleaseExceedsCap,
+    /// AV-207: a malformed vote-escrow lock request — a
+    /// [`VoteEscrowLock`] opened with a zero amount or a zero
+    /// duration, extended to an end at or before the current end (or
+    /// at or before `now`), or exited / extended after it already
+    /// exited. Never renumbered (see [`EscrowError::code`]).
+    InvalidVoteLock,
 }
 
 impl EscrowError {
@@ -4431,6 +4442,8 @@ impl EscrowError {
             EscrowError::DeliveryNotConfirmed => 315,
             // AV-205: appended, never renumbered.
             EscrowError::ReleaseExceedsCap => 316,
+            // AV-207: appended, never renumbered.
+            EscrowError::InvalidVoteLock => 317,
         }
     }
 
@@ -4764,6 +4777,8 @@ impl EscrowError {
             EscrowError::DeliveryNotConfirmed,
             // AV-205: appended, never renumbered.
             EscrowError::ReleaseExceedsCap,
+            // AV-207: appended, never renumbered.
+            EscrowError::InvalidVoteLock,
         ]
     }
 }
@@ -33957,6 +33972,12 @@ mod error_code_tests {
             316,
             "a taker payout call (release / claim / release_milestone / release_split / release_payout_split) or a dual-control declaration whose gross amount exceeds the escrow's per-call release cap — the cap is per call, not cumulative, and a live cap lowered after declaration still refuses the confirm",
         ),
+        // AV-207: appended, never renumbered.
+        (
+            EscrowError::InvalidVoteLock,
+            317,
+            "a vote-escrow lock opened with a zero amount or zero duration, extended to an end at or before the current end (or at or before now), or exited / extended after it already exited",
+        ),
     ];
 
     #[test]
@@ -59916,7 +59937,7 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceStale));
         assert_eq!(EscrowError::OraclePriceUnreliable.code(), 281);
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceUnreliable));
-        assert_eq!(EscrowError::all().len(), 208); // AV-195: +7, AV-196: +6, AV-197: +5
+        assert_eq!(EscrowError::all().len(), 209); // AV-195: +7, AV-196: +6, AV-197: +5
     }
 
     #[test]
