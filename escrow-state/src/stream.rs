@@ -17,6 +17,10 @@
 //! paused intervals are tracked and excluded from accrual, so a paused
 //! second never earns.
 //!
+//! AV-202: the *current* recipient may transfer the whole stream to a
+//! new recipient (`transfer_recipient`) — the payroll-to-new-wallet
+//! scenario: the stream survives, earned-but-unwithdrawn funds and the
+//! accrual schedule move with it, only the payee key changes.
 //! Orthogonal to AV-13 vesting (one lump sum that unlocks whole at
 //! expiry — the release is a single gate) and to AV-197 bidirectional
 //! channels (both parties co-sign off-chain state): here the release is
@@ -217,6 +221,69 @@ impl PaymentStream {
         Ok((to_recipient, to_initializer))
     }
 
+    /// Transfers the stream's recipient to `new_recipient` — the
+    /// payroll-to-new-wallet scenario (lost recipient key, invoice
+    /// reassigned to a new contractor). Recipient-only: only the
+    /// *current* recipient may call; a stranger (including the
+    /// initializer) gets [`EscrowError::StreamUnauthorized`] (code
+    /// 305), checked before state so strangers learn nothing.
+    ///
+    /// The stream *survives*: `initializer`, `rate_per_sec`,
+    /// `start_ts`, `duration_secs`, `cliff_secs`, `total_funded`,
+    /// `withdrawn`, `paused_at`/`paused_total` and `state` are all
+    /// untouched — only the payee key changes. The new recipient
+    /// inherits the earned-but-unwithdrawn balance
+    /// (`earned(now) - withdrawn`) and keeps accruing at the same
+    /// rate; the old recipient's withdraws are history (`withdrawn`
+    /// stays — spent funds are not moved back).
+    ///
+    /// Orthogonal to [`PaymentStream::stream_cancel`] (terminal:
+    /// earned routes to the recipient, the unearned remainder to the
+    /// initializer): this is a *continuing* transfer, not a
+    /// termination.
+    ///
+    /// Check order is authority → state → config: a zero
+    /// `new_recipient` is [`EscrowError::InvalidStream`] (code 304).
+    /// Transferring to the current recipient is an idempotent no-op
+    /// (`Ok(())`, no state change).
+    ///
+    /// The program / indexer records the transfer with
+    /// [`PaymentStream::transfer_audit_json`].
+    pub fn transfer_recipient(
+        &mut self,
+        caller: [u8; 32],
+        new_recipient: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        if caller != self.recipient {
+            return Err(EscrowError::StreamUnauthorized);
+        }
+        self.require_active()?;
+        if new_recipient == [0u8; 32] {
+            return Err(EscrowError::InvalidStream);
+        }
+        if new_recipient == self.recipient {
+            return Ok(());
+        }
+        self.recipient = new_recipient;
+        Ok(())
+    }
+
+    /// Audit-event JSON for a recipient transfer (hand-written, no
+    /// serde — same convention as the auction modules):
+    /// `{"event":"stream_recipient_transferred","old_recipient":
+    /// "<64hex>","new_recipient":"<64hex>"}`. Standalone (no `&self`):
+    /// the old key is only known to the caller at call time — by the
+    /// time `transfer_recipient` returns, the stream already carries
+    /// the new recipient.
+    pub fn transfer_audit_json(old_recipient: [u8; 32], new_recipient: [u8; 32]) -> String {
+        let mut s = String::from("{\"event\":\"stream_recipient_transferred\",\"old_recipient\":\"");
+        s.push_str(&hex64(&old_recipient));
+        s.push_str("\",\"new_recipient\":\"");
+        s.push_str(&hex64(&new_recipient));
+        s.push_str("\"}");
+        s
+    }
+
     /// Freezes accrual at `now`. Initializer-only; `pause` on a
     /// paused stream is [`EscrowError::StreamAlreadyPaused`] (307),
     /// `pause` on a terminal stream is
@@ -305,4 +372,16 @@ impl PaymentStream {
     pub fn state(&self) -> StreamState {
         self.state
     }
+}
+
+/// 32-byte key to lowercase hex (64 chars) — private helper for the
+/// hand-written audit JSON above, same shape as the other modules.
+fn hex64(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }

@@ -6838,6 +6838,21 @@ intervals are tracked and permanently excluded from accrual.
 - Check order is authority-first: a non-recipient `stream_withdraw`
   and a non-initializer `stream_cancel`/`pause`/`resume` are
   `StreamUnauthorized` (code 305) before any state is examined.
+- Recipient transfer (AV-202): the *current* recipient may hand the
+  whole stream to a new recipient with `transfer_recipient(caller,
+  new_recipient)` — the payroll-to-new-wallet scenario (lost recipient
+  key, invoice reassigned to a new contractor). The initializer may
+  cancel but may *not* reassign. The stream survives: rate, schedule,
+  initializer, withdrawn total, paused intervals and state are
+  untouched; the new recipient inherits the earned-but-unwithdrawn
+  balance and keeps accruing, and the old key loses all rights (it is
+  a stranger afterwards). Orthogonal to `stream_cancel` (terminal) —
+  this is a *continuing* transfer, not a termination. Check order is
+  authority → state → config: a zero `new_recipient` is `InvalidStream`
+  (code 304); transferring to the current recipient is an idempotent
+  no-op. Emits the `stream_recipient_transferred` audit event
+  (`PaymentStream::transfer_audit_json`, hand-written JSON, no new
+  error codes — 304–308 unchanged).
 
 New error codes 304–308: `InvalidStream`, `StreamUnauthorized`,
 `StreamNotActive`, `StreamAlreadyPaused`, `StreamNotPaused`. Pure
