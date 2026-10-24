@@ -563,6 +563,19 @@ pub use sealed_bid::{
     sealed_bid_commitment, SealedBidAuction, SealedBidCommitReceipt, SealedBidPhase,
     SealedBidRevealReceipt, SealedBidSettlement, SealedBidState, MAX_SEALED_BIDS,
 };
+// AV-199: multi-unit uniform-price sealed-bid auction — the seller
+// auctions N homogeneous shares and every bidder bids a per-unit price
+// for one share. Commitments reuse the AV-192 `SHA-256(bid || nonce ||
+// bidder)` format; after the reveal phase every winner pays the same
+// marginal clearing price, bidders tied at the clearing price split
+// the remaining shares pro-rata, and undersubscribed shares return to
+// the seller. Orthogonal to AV-192 (single-item, first-price). Pure
+// logic: no Vault layout change, no VAULT_SPACE bump.
+mod multi_unit;
+pub use multi_unit::{
+    MultiUnitAllocation, MultiUnitAuction, MultiUnitCommitReceipt, MultiUnitPhase,
+    MultiUnitRevealReceipt, MultiUnitSettlement, MultiUnitState, MAX_MULTI_UNIT_BIDS,
+};
 // AV-193: Pyth / Switchboard oracle adapters — concrete `PriceFeed`
 // implementations for the AV-113 price gate. `PythPriceFeed` parses a
 // Pyth v2 price account's raw bytes (header validation, exponent
@@ -3942,6 +3955,30 @@ pub enum EscrowError {
     /// on a stream that is not paused. Never renumbered (see
     /// [`EscrowError::code`]).
     StreamNotPaused,
+    /// AV-199: [`MultiUnitAuction`](crate::MultiUnitAuction) creation
+    /// or operation with an invalid config — zero seller key, `units
+    /// == 0`, an empty commit or reveal window; or `commit_bid` with a
+    /// zero bidder key or zero commitment. Never renumbered (see
+    /// [`EscrowError::code`]).
+    InvalidMultiUnit,
+    /// AV-199: multi-unit commit/reveal outside its phase or on a
+    /// terminal auction; `settle` before `end_slot`; `cancel` after the
+    /// first commitment, on a terminal auction, or past the commit
+    /// phase; `commit_bid` when the book is full (the auction is not
+    /// live for new commitments). Never renumbered (see
+    /// [`EscrowError::code`]).
+    MultiUnitNotLive,
+    /// AV-199: [`MultiUnitAuction::commit_bid`]
+    /// (crate::MultiUnitAuction::commit_bid) from a bidder that
+    /// already committed — one commitment per bidder. Never
+    /// renumbered (see [`EscrowError::code`]).
+    MultiUnitDuplicateCommit,
+    /// AV-199: [`MultiUnitAuction::reveal_bid`]
+    /// (crate::MultiUnitAuction::reveal_bid) whose `SHA-256(bid ||
+    /// nonce || bidder)` does not equal the stored commitment — or a
+    /// reveal from a bidder with no commitment on record. Never
+    /// renumbered (see [`EscrowError::code`]).
+    MultiUnitRevealMismatch,
 }
 
 impl EscrowError {
@@ -4281,6 +4318,14 @@ impl EscrowError {
             EscrowError::StreamAlreadyPaused => 307,
             // AV-198: appended, never renumbered.
             EscrowError::StreamNotPaused => 308,
+            // AV-199: appended, never renumbered.
+            EscrowError::InvalidMultiUnit => 309,
+            // AV-199: appended, never renumbered.
+            EscrowError::MultiUnitNotLive => 310,
+            // AV-199: appended, never renumbered.
+            EscrowError::MultiUnitDuplicateCommit => 311,
+            // AV-199: appended, never renumbered.
+            EscrowError::MultiUnitRevealMismatch => 312,
         }
     }
 

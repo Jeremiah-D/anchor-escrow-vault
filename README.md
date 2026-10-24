@@ -2493,6 +2493,38 @@ judgment, here a bid), and AV-194 (opt-in bid deposits with no-reveal
 confiscation — this module tracks commitments, not funds). (Solana:
 auction primitives.)
 
+## Multi-unit uniform-price auction (AV-199)
+
+`escrow-state/src/multi_unit.rs` — the seller auctions N homogeneous
+shares and every bidder bids a per-unit price for exactly one share.
+Commitments reuse the AV-192 format `SHA-256(bid || nonce || bidder)`,
+so the commit/reveal machinery (phases, binding commitments,
+idempotent reveals) behaves exactly like the sealed-bid auction — the
+pricing rule is what changes.
+
+- **Uniform price**: every winner pays the same clearing price — the
+  marginal price. Valid revealed bids sort descending (ties to the
+  earliest reveal slot); the clearing price is the Nth bid when demand
+  covers supply, or the lowest winning bid when undersubscribed.
+- **Pro-rata at the margin**: bidders tied *at* the clearing price
+  split the remaining shares proportionally (`remaining / tied` as a
+  rational — shares are fungible, so fractions are fine). Bidders above
+  the clearing price take one full share each; bidders below it get
+  nothing. Undersubscribed: every valid bidder takes one full share
+  and the unsold shares return to the seller.
+- **Minimum bid**: the seller's public per-unit floor (`0` disables
+  it). Valid reveals below it are recorded but cannot win; with no
+  valid bid the outcome is `NoSale`. One commitment per bidder, max 64
+  commitments (a full book is not live for new commitments).
+
+New error codes (never renumbered): `InvalidMultiUnit` (309),
+`MultiUnitNotLive` (310), `MultiUnitDuplicateCommit` (311),
+`MultiUnitRevealMismatch` (312). Pure logic: no Vault layout change,
+no `VAULT_SPACE` bump. Orthogonal to AV-192 (single-item,
+first-price — one winner takes all) and to AV-194 (opt-in bid
+deposits — this module tracks commitments, not funds). (Solana:
+auction mechanism design.)
+
 ## Bid deposits (AV-194)
 
 Auctions can carry an opt-in flat bid deposit — English (AV-189),
