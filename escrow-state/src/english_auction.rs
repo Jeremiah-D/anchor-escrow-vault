@@ -11,6 +11,10 @@
 //! - **Reserve price**: the seller's hidden floor. If the highest bid
 //!   never reaches it, the sale fails and every bidder is refunded in
 //!   full — the seller never parts with the asset below the floor.
+//! - **Buy-it-now** (AV-201, opt-in): the seller may set a buyout
+//!   price; a live bid at or above it settles the auction immediately
+//!   at exactly that price, skipping the remaining window and any
+//!   anti-sniping extension.
 //!
 //! Orthogonal to AV-97 (Dutch auction, *descending* price — the price
 //! falls until someone takes it): here the price *rises* until nobody
@@ -87,6 +91,10 @@ pub struct BidReceipt {
     pub end_slot: u64,
     /// `true` when this bid triggered an anti-sniping extension.
     pub extended: bool,
+    /// `true` when this bid hit the buy-it-now price and settled the
+    /// auction immediately — `new_bid` is the buyout price (the winner
+    /// pays exactly that), and no anti-sniping extension fired.
+    pub buyout: bool,
 }
 
 /// An English auction: ascending bids, a minimum raise, anti-sniping
@@ -105,10 +113,18 @@ pub struct EnglishAuction {
     anti_snipe_window: u64,
     anti_snipe_extension: u64,
     max_extensions: u16,
+    /// The buy-it-now price (`0` = disabled). A live bid at or above
+    /// this price settles the auction immediately at exactly this
+    /// price (see [`EnglishAuction::with_buyout`]).
+    buyout_price: u64,
     highest_bid: u64,
     highest_bidder: [u8; 32],
     bid_count: u32,
     extension_count: u16,
+    /// The recorded buy-it-now sale `(winner, price)` — `Some` only
+    /// when the auction settled via [`EnglishAuction::place_bid`]'s
+    /// buyout path.
+    buyout_sale: Option<([u8; 32], u64)>,
     state: AuctionState,
 }
 
@@ -152,12 +168,57 @@ impl EnglishAuction {
             anti_snipe_window,
             anti_snipe_extension,
             max_extensions,
+            buyout_price: 0,
             highest_bid: 0,
             highest_bidder: [0u8; 32],
             bid_count: 0,
             extension_count: 0,
+            buyout_sale: None,
             state: AuctionState::Bidding,
         })
+    }
+
+    /// Set a buy-it-now price: a live bid at or above `buyout_price`
+    /// settles the auction immediately — the winner pays exactly
+    /// `buyout_price`, the remaining bidding window and any
+    /// anti-sniping extension are skipped.
+    ///
+    /// The price is fixed before the game starts: refused with
+    /// [`EscrowError::EnglishAuctionBuyoutLocked`] (code 314) once the
+    /// first bid has landed or the auction is terminal. Fail-closed
+    /// config checks ([`EscrowError::InvalidEnglishAuction`], code
+    /// 263): a price below `min_increment` could never trigger (the
+    /// minimum-raise gate would reject the bid first), and a price
+    /// below a nonzero `reserve_price` would sell under the seller's
+    /// floor. `buyout_price == 0` is a no-op (buy-it-now stays
+    /// disabled); calling twice replaces the price while no bid has
+    /// landed.
+    pub fn with_buyout(mut self, buyout_price: u64) -> Result<Self, EscrowError> {
+        if buyout_price == 0 {
+            return Ok(self);
+        }
+        if self.state != AuctionState::Bidding || self.bid_count > 0 {
+            return Err(EscrowError::EnglishAuctionBuyoutLocked);
+        }
+        if buyout_price < self.min_increment
+            || (self.reserve_price > 0 && buyout_price < self.reserve_price)
+        {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        self.buyout_price = buyout_price;
+        Ok(self)
+    }
+
+    /// The buy-it-now price (`0` = disabled).
+    pub fn buyout_price(&self) -> u64 {
+        self.buyout_price
+    }
+
+    /// The recorded buy-it-now sale `(winner, price)` — `Some` only
+    /// when the auction settled through the buyout path of
+    /// [`EnglishAuction::place_bid`].
+    pub fn buyout_sale(&self) -> Option<([u8; 32], u64)> {
+        self.buyout_sale
     }
 
     /// The seller key.
@@ -225,10 +286,21 @@ impl EnglishAuction {
     /// Place a bid.
     ///
     /// Check order: liveness → bidder key → minimum raise →
-    /// anti-sniping. The minimum legal bid is `highest_bid +
-    /// min_increment` — for the opening bid that is just
+    /// buy-it-now → anti-sniping. The minimum legal bid is
+    /// `highest_bid + min_increment` — for the opening bid that is just
     /// `min_increment`, so the increment doubles as the minimum
     /// opening bid.
+    ///
+    /// Buy-it-now: when a buyout price is set and a legal bid reaches
+    /// it, the auction settles immediately at exactly the buyout price
+    /// (the bid is capped — a bidder offering more still pays the
+    /// buyout price). The remaining bidding window and any
+    /// anti-sniping extension are skipped; the receipt carries
+    /// `buyout: true` and the outbid leader for the exact full refund
+    /// (the AV-194 deposit path reuses these fields unchanged). The
+    /// reserve price needs no separate check here — `with_buyout`
+    /// already refused a buyout below it, so a buyout sale always
+    /// satisfies the reserve.
     ///
     /// Anti-sniping: when a bid lands within `anti_snipe_window`
     /// slots of `end_slot` and the extension budget is not exhausted,
@@ -255,12 +327,30 @@ impl EnglishAuction {
         if amount < minimum {
             return Err(EscrowError::EnglishAuctionBidTooLow);
         }
+        let previous_bidder = self.highest_bidder;
+        let previous_bid = self.highest_bid;
+        if self.buyout_price > 0 && amount >= self.buyout_price {
+            self.highest_bid = self.buyout_price;
+            self.highest_bidder = bidder;
+            self.bid_count = self.bid_count.saturating_add(1);
+            self.state = AuctionState::Settled;
+            self.buyout_sale = Some((bidder, self.buyout_price));
+            return Ok(BidReceipt {
+                previous_bidder,
+                previous_bid,
+                new_bid: self.buyout_price,
+                end_slot: self.end_slot,
+                extended: false,
+                buyout: true,
+            });
+        }
         let receipt = BidReceipt {
             previous_bidder: self.highest_bidder,
             previous_bid: self.highest_bid,
             new_bid: amount,
             end_slot: self.end_slot,
             extended: false,
+            buyout: false,
         };
         self.highest_bid = amount;
         self.highest_bidder = bidder;
@@ -349,6 +439,32 @@ impl EnglishAuction {
         s.push_str(&self.end_slot.to_string());
         s.push_str(",\"extended\":");
         s.push_str(&extended.to_string());
+        s.push('}');
+        s
+    }
+
+    /// Audit-event JSON for a buy-it-now settlement (hand-written):
+    /// `{"event":"english_auction_buyout","bidder":"<64hex>",
+    /// "price":<u64>,"previous_bidder":"<64hex>","previous_bid":<u64>}`.
+    /// `price` is the buyout price the winner paid (the bid is capped —
+    /// offering more does not raise the price); `previous_bidder` /
+    /// `previous_bid` name the outbid leader for the exact full refund
+    /// (taken from the buyout [`BidReceipt`], since `place_bid`
+    /// already recorded the winner on the auction).
+    pub fn buyout_audit_json(
+        &self,
+        bidder: [u8; 32],
+        previous_bidder: [u8; 32],
+        previous_bid: u64,
+    ) -> String {
+        let mut s = String::from("{\"event\":\"english_auction_buyout\",\"bidder\":\"");
+        s.push_str(&hex64(&bidder));
+        s.push_str("\",\"price\":");
+        s.push_str(&self.buyout_price.to_string());
+        s.push_str(",\"previous_bidder\":\"");
+        s.push_str(&hex64(&previous_bidder));
+        s.push_str("\",\"previous_bid\":");
+        s.push_str(&previous_bid.to_string());
         s.push('}');
         s
     }
@@ -660,16 +776,18 @@ mod english_auction_tests {
         assert_eq!(EscrowError::EnglishAuctionNotLive.code(), 265);
         assert_eq!(EscrowError::EnglishAuctionSettleTooEarly.code(), 266);
         assert_eq!(EscrowError::EnglishAuctionNotCancellable.code(), 267);
+        assert_eq!(EscrowError::EnglishAuctionBuyoutLocked.code(), 314);
         for e in [
             EscrowError::InvalidEnglishAuction,
             EscrowError::EnglishAuctionBidTooLow,
             EscrowError::EnglishAuctionNotLive,
             EscrowError::EnglishAuctionSettleTooEarly,
             EscrowError::EnglishAuctionNotCancellable,
+            EscrowError::EnglishAuctionBuyoutLocked,
         ] {
             assert!(EscrowError::all().contains(&e));
         }
         // AV-190 appends 3 rental-escrow errors after these.
-        assert_eq!(EscrowError::all().len(), 205); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors, AV-200: +1
+        assert_eq!(EscrowError::all().len(), 206); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors, AV-200: +1, AV-201: +1
     }
 }

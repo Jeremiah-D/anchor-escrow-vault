@@ -6559,11 +6559,23 @@ whether the sale happens at all.
   outbid leader and their amount, so the program refunds the full
   previous bid atomically; `settle` is permissionless after the close
   and terminal. The seller may `cancel` only before the first bid.
+- **Buy-it-now** (AV-201): `with_buyout(price)` sets an opt-in buyout
+  price — any legal bid at or above it settles the auction immediately
+  at exactly that price (the bid is capped), skipping the remaining
+  window and any anti-sniping extension. The receipt reports
+  `buyout: true` with the outbid leader for the exact full refund (the
+  AV-194 deposit path reuses these fields unchanged). Fail-closed
+  config: a price below `min_increment` could never trigger, and a
+  price below a nonzero reserve would sell under the seller's floor —
+  both are refused; the price locks before the first bid
+  (`EnglishAuctionBuyoutLocked`, code 314). `buyout_audit_json`
+  records the winner, price, and refunded leader.
 
 New error codes (never renumbered): `InvalidEnglishAuction` (263),
 `EnglishAuctionBidTooLow` (264), `EnglishAuctionNotLive` (265),
 `EnglishAuctionSettleTooEarly` (266),
-`EnglishAuctionNotCancellable` (267). Pure logic: no Vault layout
+`EnglishAuctionNotCancellable` (267),
+`EnglishAuctionBuyoutLocked` (314). Pure logic: no Vault layout
 change, no `VAULT_SPACE` bump. Orthogonal to AV-97 (Dutch auction,
 descending price). (Solana: auction primitives.)
 

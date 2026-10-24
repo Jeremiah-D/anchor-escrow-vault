@@ -1458,8 +1458,8 @@ mod idl_compat_tests {
         // bid-deposit errors; AV-195 adds 7 social-recovery errors;
         // AV-196 adds 6 jury-sortition errors; AV-197 adds 5
         // payment-channel errors; AV-200 adds 1 sealed-bid pricing
-        // error.
-        assert_eq!(spec.errors.len(), 205);
+        // error; AV-201 adds 1 English-auction buyout error.
+        assert_eq!(spec.errors.len(), 206);
         // AV-178 adds the TieredQuorum + Tier named types; AV-195 adds
         // the SocialRecovery named type.
         assert_eq!(spec.types.len(), 36);

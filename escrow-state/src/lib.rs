@@ -3985,6 +3985,12 @@ pub enum EscrowError {
     /// rule may not be rewritten once bidders have entered the game.
     /// Never renumbered (see [`EscrowError::code`]).
     SealedBidPricingLocked,
+    /// AV-201: [`EnglishAuction::with_buyout`]
+    /// (crate::EnglishAuction::with_buyout) after the first bid has
+    /// landed or on a terminal auction — the buyout price may not be
+    /// set or changed once bidding has started. Never renumbered (see
+    /// [`EscrowError::code`]).
+    EnglishAuctionBuyoutLocked,
 }
 
 impl EscrowError {
@@ -4334,6 +4340,8 @@ impl EscrowError {
             EscrowError::MultiUnitRevealMismatch => 312,
             // AV-200: appended, never renumbered.
             EscrowError::SealedBidPricingLocked => 313,
+            // AV-201: appended, never renumbered.
+            EscrowError::EnglishAuctionBuyoutLocked => 314,
         }
     }
 
@@ -4661,6 +4669,8 @@ impl EscrowError {
             EscrowError::ChannelBalanceMismatch,
             // AV-200: appended, never renumbered.
             EscrowError::SealedBidPricingLocked,
+            // AV-201: appended, never renumbered.
+            EscrowError::EnglishAuctionBuyoutLocked,
         ]
     }
 }
@@ -33363,6 +33373,12 @@ mod error_code_tests {
             313,
             "with_vickrey after the first sealed-bid commitment landed or on a terminal auction — the pricing rule may not be rewritten once bidders have entered",
         ),
+        // AV-201: appended, never renumbered.
+        (
+            EscrowError::EnglishAuctionBuyoutLocked,
+            314,
+            "with_buyout after the first English-auction bid landed or on a terminal auction — the buyout price may not be set or changed once bidding has started",
+        ),
     ];
 
     #[test]
@@ -59292,7 +59308,7 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceStale));
         assert_eq!(EscrowError::OraclePriceUnreliable.code(), 281);
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceUnreliable));
-        assert_eq!(EscrowError::all().len(), 205); // AV-195: +7, AV-196: +6, AV-197: +5
+        assert_eq!(EscrowError::all().len(), 206); // AV-195: +7, AV-196: +6, AV-197: +5
     }
 
     #[test]
