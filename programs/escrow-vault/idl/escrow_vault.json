@@ -1422,7 +1422,8 @@
           {"name": "max_release_per_call", "type": "u64", "offset": 7681},
           {"name": "milestone_due_dates", "type": {"array": ["u64", 8]}, "offset": 7689},
           {"name": "milestone_late_penalty_bps", "type": "u16", "offset": 7753},
-          {"name": "milestone_verifier", "type": "publicKey", "offset": 7755}
+          {"name": "milestone_verifier", "type": "publicKey", "offset": 7755},
+          {"name": "credential_issuer", "type": "publicKey", "offset": 7787}
         ]
       }
     }
@@ -2049,7 +2050,13 @@
     {"code": 329, "name": "InspectionInvalidWindow"},
     {"code": 330, "name": "InspectionNotTaker"},
     {"code": 331, "name": "InspectionWindowExpired"},
-    {"code": 332, "name": "InspectionNotDue"}
+    {"code": 332, "name": "InspectionNotDue"},
+    {"code": 333, "name": "InvalidCredentialIssuer"},
+    {"code": 334, "name": "CredentialGateRequired"},
+    {"code": 335, "name": "CredentialGateNotBound"},
+    {"code": 336, "name": "CredentialInvalid"},
+    {"code": 337, "name": "CredentialExpired"},
+    {"code": 338, "name": "CredentialRevoked"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

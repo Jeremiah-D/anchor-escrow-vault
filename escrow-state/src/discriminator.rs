@@ -1695,6 +1695,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     for byte in milestone_verifier.iter_mut() {
         *byte = c.u8()?;
     }
+    // AV-212: the credential issuer pubkey (zero = no gate).
+    let mut credential_issuer = [0u8; 32];
+    for byte in credential_issuer.iter_mut() {
+        *byte = c.u8()?;
+    }
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -2041,6 +2046,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // escrow carries the same gate the setup bound, so a
         // verifier-bound escrow cannot lose its gate to a decode.
         milestone_verifier,
+        // AV-212: the credential issuer pubkey — a decoded
+        // escrow carries the same gate the setup bound, so a
+        // credential-gated escrow cannot lose its gate to a decode.
+        credential_issuer,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

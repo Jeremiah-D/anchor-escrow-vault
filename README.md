@@ -2680,6 +2680,49 @@ refund, not forfeit, them) and to AV-189 English (open ascending bids:
 the winner is public and the next bid is known without a ranking
 walk). (Solana: auction settlement assurance.)
 
+## Credential-gated release (AV-212)
+
+`release` used to trust only internal authority: the initializer
+(or their RELEASE-scoped operator) could release, with the payout
+destination pinned by the allowlist. A release that must only reach
+a compliance-cleared taker — a KYC'd counterparty, a licensed
+custodian, a sanctions-screened recipient — needs an outside voice
+neither party can forge. `with_credential_gate`
+(`escrow-state/src/credential_gate.rs`) binds one issuer pubkey,
+`Uninitialized`-only, and once bound the plain `release` path
+refuses with `CredentialGateRequired`: the gated path cannot be
+bypassed by simply not mentioning the credential (the dual-control
+precedent). Releases then go through `release_with_credential`
+with one Ed25519 credential over a domain-separated message
+binding the taker and the credential's own expiry, plus the
+issuer's revocation verdict passed in as a query callback — a
+credential never carries its own "not revoked" flag, since that
+would be a claim the holder asserts about themselves; a revoked
+credential is `CredentialRevoked` whatever its signature says.
+A release at `now > expires_at` is `CredentialExpired`, a taker
+mismatch or signature failure is `CredentialInvalid`, and the
+credentialed path on an unbound escrow is
+`CredentialGateNotBound`. The verified path delegates to the
+same settlement code, so fee, cap, timelock, quorum and
+payout-allowlist gates all still run, and a failed credential
+settles nothing and charges no fee. Replay needs no nonce: a full
+release is terminal, so a replayed credential can never settle a
+second release.
+
+New error codes (never renumbered): `InvalidCredentialIssuer`
+(333), `CredentialGateRequired` (334), `CredentialGateNotBound`
+(335), `CredentialInvalid` (336), `CredentialExpired` (337),
+`CredentialRevoked` (338); vault tail +32 bytes (BODY 7811,
+SPACE 7819, no-quorum 7329); IDL regenerated. Orthogonal to
+AV-210 (a third party attesting a delivery fact for one
+milestone, not a taker's qualification), AV-113/AV-128 (oracle
+price, not identity) and AV-104 (operation-right delegation,
+which still cannot release to an uncredentialed taker).
+Boundary: the Anchor instruction accepting the credential on
+chain (passing the revocation-registry verdict through) is
+follow-up work — no such instruction is claimed. (Solana:
+compliance-gated escrow.)
+
 ## Delivery inspection period (AV-211)
 
 `confirm_delivery` (AV-203) opens the payout paths immediately: a
