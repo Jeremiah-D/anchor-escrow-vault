@@ -2680,6 +2680,41 @@ refund, not forfeit, them) and to AV-189 English (open ascending bids:
 the winner is public and the next bid is known without a ranking
 walk). (Solana: auction settlement assurance.)
 
+## Denylist-gated release (AV-213)
+
+A release-time denylist for compliance lists that arrive after the
+escrow was initialized. `DenylistGate`
+(`escrow-state/src/denylist_gate.rs`) is a pure-logic sidecar the
+release caller consults before any other release gate: denied
+recipients plus denied settlement / intermediate mints, recipient
+first, then mint, both denying with `PayoutDenied` (the code AV-96
+already assigned to a denylist denial — no new error code, no IDL
+regeneration, no vault layout change).
+
+- The recipient leg overlaps AV-96 in effect but differs in source:
+  AV-96 is the escrow's own persisted, initializer-governed veto;
+  this gate is the caller's release-time list (a sanctions list
+  refreshed after initialization). `Escrow::check_denylist_gate`
+  checks the stored list first, then the supplied gate — never a
+  choice between them.
+- The mint leg is new: no mint denylist exists anywhere in the
+  crate (AV-157's mint allowlist is its mirror image, and AV-96
+  names recipients, never mints). `check_mints` denies a basket /
+  swap release as a whole when any leg mint is denied, so a denied
+  asset cannot be laundered through the clean legs.
+- Deny beats allow: a recipient on both the AV-49 allowlist and a
+  denylist is still denied, and a mint can be AV-157-allowlisted
+  and still denied here — the AV-96 precedence, extended to mints.
+  A denied mint is not `MintNotAllowlisted` (that code means "not
+  on the allowlist", a different gate with a different remedy);
+  callers that need the leg for an operator report read it from
+  `denied_target` before calling `check_release`.
+- Boundary: the gate is supplied per release, not stored on the
+  Vault, so there is no layout or rent change; the Anchor
+  instruction passing the program's release-time compliance list
+  through this gate before `release` is follow-up work — no such
+  instruction is claimed. (Solana: compliance-gated escrow.)
+
 ## Credential-gated release (AV-212)
 
 `release` used to trust only internal authority: the initializer

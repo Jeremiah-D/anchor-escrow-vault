@@ -331,6 +331,17 @@ pub use credential_gate::{
     ReleaseCredential, CREDENTIAL_GATE_DOMAIN, UNBOUND_CREDENTIAL_ISSUER,
 };
 
+// AV-213: release-time denylist gate — the caller-supplied denied
+// recipients and denied mints checked before every other release
+// gate. Pure logic: no Vault layout change, no VAULT_SPACE bump
+// (the gate is supplied per release, like AV-211's inspection
+// sidecar, not persisted on the Escrow).
+mod denylist_gate;
+pub use denylist_gate::{
+    DenylistGate, DeniedTarget, MAX_DENYLIST_GATE_MINTS,
+    MAX_DENYLIST_GATE_RECIPIENTS,
+};
+
 // ---------------------------------------------------------------------------
 // SHA-256 (hand-rolled, zero dependencies).
 // ---------------------------------------------------------------------------
@@ -19136,6 +19147,29 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// allowlisted destination does not trip `RecipientMismatch`.
     pub fn payout_recipient_allowed(&self, addr: [u8; 32]) -> bool {
         self.require_payout_recipient(addr).is_ok()
+    }
+
+    /// Pre-release denylist screen (AV-213): the escrow's own
+    /// persisted payout denylist (AV-96) first, then the
+    /// caller-supplied [`DenylistGate`] — stored veto, then
+    /// release-time veto, never a choice between them. Call this
+    /// before every other release gate: a denial here must fail
+    /// fast, before any fee, cap or timelock decision. This is a
+    /// pre-screen, not a second release path — `release` still
+    /// runs its own `require_payout_recipient` check, so a stored
+    /// denial is enforced twice, never zero times.
+    pub fn check_denylist_gate(
+        &self,
+        gate: &DenylistGate,
+        recipient: [u8; 32],
+        mint: Option<[u8; 32]>,
+    ) -> Result<(), EscrowError> {
+        if let Some(deny) = &self.payout_denylist {
+            if deny.contains(&recipient) {
+                return Err(EscrowError::PayoutDenied);
+            }
+        }
+        gate.check_release(&recipient, mint.as_ref())
     }
 
     /// Opt in to a payout destination denylist (AV-96 — Solana /
