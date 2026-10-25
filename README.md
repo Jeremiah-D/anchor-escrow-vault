@@ -2783,6 +2783,53 @@ Vault tail +258 bytes (BODY 7863 → 8121, SPACE 7871 → 8129,
 no-quorum 7381 → 7639); IDL regenerated. (Solana:
 cross-mint settlement risk control.)
 
+## Mutual cancel by dual-party agreement (AV-219)
+
+The unilateral exits leave one gap: a taker who wants out
+before expiry has no honest path — the initializer's `cancel`
+is not theirs to call, and `cancel_expired` is not yet
+eligible. `mutual_cancel` (`escrow-state/src/lib.rs`,
+backed by `escrow-state/src/mutual_cancel.rs`) closes it:
+a `Funded -> Cancelled` transition that requires both
+parties' signatures, carried as a `MutualCancelAgreement`
+whose sides are `Option` keys so absence is expressible. A
+missing party or a stranger key on either side is
+`Unauthorized`, checked before the state gate, so a stranger
+never learns whether an escrow is `Funded` from the error
+alone; a non-`Funded` state (including `Disputed`, which
+settles through `resolve`, not through an agreed exit) is
+`InvalidStateTransition`. One party alone is refused, not
+upgraded — the initializer signing alone is the unilateral
+cancel wearing a mutual-cancel name — and an AV-104
+CANCEL-scoped operator does not satisfy either side:
+termination by agreement is a personal act of both parties,
+while the delegated initializer who wants out unilaterally
+still has `cancel`.
+
+Settlement is the AV-148 bilateral unwind, same as `cancel`:
+the remainder returns leg by leg, the initializer's leg to
+the AV-23 refund policy destination (the whitelisted address
+when configured, otherwise the initializer — the call takes
+no `refund_to`, so no caller can redirect the refund by
+naming a destination), the taker's leg back to the taker,
+with no AV-24 penalty, since a cancel both parties signed
+is not griefing. On a plain single-funded escrow the taker's
+leg is zero, so the entire remainder returns to the
+initializer through the AV-23 destination.
+
+- Orthogonal to `cancel` (one signature, one party's
+  decision), to `cancel_expired` / `crank_expired`
+  (time-triggered — this item needs no expiry and refuses
+  nothing for being early), to AV-130 (maker-checker on the
+  release intent — this item terminates, it never pays the
+  taker), and to AV-52 (taker rotation — the rotated taker
+  is simply the taker whose agreement counts).
+
+No vault layout change (the agreement is a call-time fact,
+not stored state), no new error code, no IDL change, and
+no Anchor instruction is claimed for this path. (Solana:
+mutual termination.)
+
 ## Delivery-confirmation deadline (AV-216)
 
 AV-203 lets the taker confirm receipt but gives the

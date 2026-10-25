@@ -341,6 +341,18 @@ pub use settlement_allowlist::{
     MAX_SETTLEMENT_MINT_ALLOWLIST, SETTLEMENT_MINT_ALLOWLIST_LEN,
 };
 
+// AV-219: mutual cancel — the dual-party agreement shape and
+// gate for terminating a Funded escrow by agreement, plus the
+// `Escrow::mutual_cancel` transition. The agreement is a
+// call-time fact, not vault state, so the escrow owns no new
+// storage; this module owns only the agreement shape and its
+// gate. No new error code: `Unauthorized` for a missing or
+// stranger party, `InvalidStateTransition` outside `Funded`.
+mod mutual_cancel;
+pub use mutual_cancel::{
+    require_mutual_cancel_agreement, MutualCancelAgreement,
+};
+
 // AV-210: milestone release verifier attestation — the opt-in
 // third-party signature gate on `release_milestone`. The escrow
 // owns the storage (one verifier pubkey, appended to the vault
@@ -13627,6 +13639,87 @@ let fee = self.charge_protocol_fee(amount)?;
                 // AV-148: bilateral original-route return — each party
                 // from their own leg. Computed before the state
                 // transition lands; the legs sum to the remainder.
+                let (initializer_refund, taker_refund) = self.bilateral_legs();
+                self.state = EscrowState::Cancelled;
+                self.stamp_terminal(now);
+                Ok((initializer_refund, taker_refund))
+            }
+            _ => Err(EscrowError::InvalidStateTransition),
+        }
+    }
+
+    /// Cancel the escrow by mutual agreement and unwind the lockup
+    /// (`Funded -> Cancelled`, AV-219). Both parties must sign:
+    /// the initializer's and the taker's keys, carried as a
+    /// [`MutualCancelAgreement`] — a missing party (`None`) or a
+    /// stranger key on either side is [`EscrowError::Unauthorized`],
+    /// and the agreement gate runs before the state gate, so a
+    /// stranger never learns whether an escrow is `Funded` from
+    /// the error alone (the `cancel_expired` convention).
+    ///
+    /// Unlike [`Escrow::cancel`], this path takes no `refund_to`:
+    /// the refund destination is the AV-23 policy by construction
+    /// ([`Escrow::refund_recipient`] — the whitelisted address when
+    /// configured, otherwise the initializer), so a caller cannot
+    /// redirect the refund by naming a destination account; the
+    /// Anchor layer sends the initializer's leg there and the
+    /// taker's leg back to the taker. The settlement is the
+    /// AV-148 bilateral unwind, same as `cancel`: on a plain
+    /// single-funded escrow the taker's leg is zero, so the entire
+    /// remainder returns to the initializer through the AV-23
+    /// destination. No AV-24 penalty — the penalty prices a
+    /// taker-initiated *unilateral* expiry exit, and a cancel
+    /// both parties signed is not griefing.
+    ///
+    /// AV-104 delegation does not extend here: an operator key is
+    /// a stranger to the agreement gate even when it could call
+    /// `cancel` alone — termination by agreement is a personal
+    /// act of both parties. A delegated initializer who wants
+    /// out unilaterally still has `cancel`.
+    ///
+    /// Check order mirrors `cancel`: pause, then reentrancy,
+    /// then the agreement, then state, then the swap-link gate,
+    /// then the mint binding. `Disputed` escrows are refused
+    /// with `InvalidStateTransition` — a live dispute settles
+    /// through `resolve`, not through an agreed exit — as are
+    /// all other non-`Funded` states. Returns
+    /// `(initializer_refund, taker_refund)` like `cancel`, so
+    /// the caller can size the two refund transfers; the two
+    /// legs sum to the pre-cancel remainder by construction.
+    pub fn mutual_cancel(
+        &mut self,
+        agreement: MutualCancelAgreement,
+        mint: Option<[u8; 32]>,
+        now: u64,
+    ) -> Result<(u64, u64), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast,
+        // before the reentrancy guard and the agreement check.
+        self.require_not_paused()?;
+        // AV-36: reentrancy guard (see `require_not_reentrant`).
+        self.require_not_reentrant()?;
+        // AV-219: the dual-party agreement — authority before
+        // state, so a stranger learns nothing beyond `Unauthorized`.
+        require_mutual_cancel_agreement(&agreement, &self.initializer, &self.taker)?;
+        match self.state {
+            EscrowState::Funded => {
+                // AV-105: a live-linked escrow settles only through
+                // the pair path — refuse the single-side move
+                // (`SwapLinkActive`).
+                self.require_no_live_swap_link()?;
+                // AV-16: the refunded tokens must be the tokens
+                // this escrow locks (`MintMismatch` otherwise).
+                self.require_mint_match(mint)?;
+                // AV-107: void the outstanding yield claim — a
+                // cancelled deal unwinds to the pre-deal state, so
+                // no yield is owed on funds that never settled
+                // (same as `cancel`).
+                self.forfeit_accrued_interest();
+                // AV-148: bilateral original-route return. The
+                // initializer's leg is addressed to the AV-23
+                // refund policy destination by the caller (see
+                // `refund_recipient`); the taker's leg returns to
+                // the taker. Computed before the state transition
+                // lands; the legs sum to the remainder.
                 let (initializer_refund, taker_refund) = self.bilateral_legs();
                 self.state = EscrowState::Cancelled;
                 self.stamp_terminal(now);
