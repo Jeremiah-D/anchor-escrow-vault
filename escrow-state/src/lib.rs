@@ -23647,6 +23647,132 @@ let fee = self.charge_protocol_fee(net_tranche)?;
         }
         Ok(())
     }
+
+    /// Reallocate the milestone tranche amounts by dual-signed
+    /// governance (AV-224 — Solana milestone payments / payment
+    /// fintech): the initializer and the taker may jointly move
+    /// value between the still-unconfirmed tranches while the
+    /// plan's tranche count, total, and remainder stay exactly
+    /// fixed.
+    ///
+    /// The delta over [`Escrow::amend_milestones`] (AV-155) is the
+    /// zero rule: AV-155 rejects every zero amount (the
+    /// [`MilestonePlan::new`] invariant — a tranche that releases
+    /// nothing is a config error at construction), so a
+    /// deliverable can never be dropped out of the schedule
+    /// mid-flight. `reallocate_milestones` instead permits a
+    /// zero amount on an unconfirmed tranche: the tranche is
+    /// cleared, not deleted — the plan keeps its tranche count
+    /// and the in-order sequence still walks the zero slot
+    /// (confirm, then release a zero gross, or skip it), so no
+    /// later tranche is renumbered and no settlement order
+    /// changes. Only the still-unconfirmed tranches may move:
+    /// every confirmed or settled tranche keeps its exact amount
+    /// (a confirmed tranche was accepted at its declared amount,
+    /// a settled tranche already moved funds), exactly like
+    /// `amend_milestones`.
+    ///
+    /// Conservation is by construction, paralleling
+    /// [`Escrow::with_milestones`]: the new amounts must have
+    /// exactly the plan's tranche count and their exact `u128`
+    /// sum must equal the locked amount, so the free tranches
+    /// split exactly the remainder the locked tranches leave
+    /// behind — and because the settled amounts are locked, the
+    /// refundable remainder (`amount - released - skipped`) is
+    /// unchanged by a reallocation, unlike
+    /// [`Escrow::skip_milestone`] (AV-15), which reroutes a
+    /// tranche into the remainder. Orthogonal to skipping in the
+    /// other direction too: skipping reroutes without repricing;
+    /// reallocating reprices without rerouting.
+    ///
+    /// Later releases price from the live plan, so a reallocation
+    /// reprices the unsettled tranches' future payouts
+    /// automatically (fees are computed at release time from the
+    /// live plan via [`Escrow::protocol_fee_for`], still floored
+    /// by `fee_cap`); the already-released and already-skipped
+    /// counters are untouched, so nothing already claimed is
+    /// repriced retroactively. The rewrite is in place —
+    /// `VAULT_FIELDS` is untouched (the tranche table is already
+    /// reserved), so no account realloc and no rent change.
+    ///
+    /// Check order is deliberate — pause, then dual authority,
+    /// then state, then plan configuration, then the new amounts
+    /// — mirroring [`Escrow::amend_milestones`]:
+    /// 1. `Paused` while paused (AV-46) — reallocating is a config
+    ///    transition, not the pause key-loss escape hatch;
+    /// 2. both parties must sign: one party alone or a stranger
+    ///    pair is `Unauthorized` (independent `==` checks — the
+    ///    degenerate initializer == taker self-escrow authorizes
+    ///    with one key passed twice, like AV-12's activation);
+    /// 3. `Uninitialized` or `Funded` only: the terminal states
+    ///    have no live tranches left to reallocate, and
+    ///    `Disputed` is `InvalidStateTransition` (arbitration is
+    ///    in flight, and the tranches are part of what
+    ///    [`Escrow::resolve`] adjudicates);
+    /// 4. a milestone plan must be attached (`InvalidMilestones`
+    ///    otherwise — the plan-shape errors stay there);
+    /// 5. the new amounts must match the plan's tranche count,
+    ///    keep every confirmed/settled tranche's amount exactly,
+    ///    and sum to exactly the locked amount
+    ///    ([`EscrowError::InvalidMilestoneAmendment`] otherwise —
+    ///    the AV-155 amendment error, since this is the same
+    ///    governance family; a zero on an unconfirmed tranche is
+    ///    the one shape AV-155 would reject and this method
+    ///    accepts).
+    pub fn reallocate_milestones(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_amounts: &[u64],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the initializer and the
+        // taker must authorize the reallocation — one party alone
+        // cannot reshape the payment schedule, paralleling
+        // `amend_milestones`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let plan = self.milestones.ok_or(EscrowError::InvalidMilestones)?;
+        let count = plan.count as usize;
+        if new_amounts.len() != count {
+            return Err(EscrowError::InvalidMilestoneAmendment);
+        }
+        let mut total: u128 = 0;
+        for (i, &amount) in new_amounts.iter().enumerate() {
+            // Confirmed or settled tranches are locked: the dual
+            // confirmation accepted the declared amount, and a
+            // settled tranche already moved funds. Only the
+            // still-unconfirmed tranches may be repriced — and,
+            // unlike `amend_milestones`, they may be repriced to
+            // zero: a cleared tranche keeps its slot in the plan.
+            if self.milestone_confirmed(i) || self.milestone_settled(i) {
+                if amount != plan.amounts[i] {
+                    return Err(EscrowError::InvalidMilestoneAmendment);
+                }
+            }
+            total += amount as u128;
+        }
+        // The plan stays the complete release schedule: the exact
+        // u128 sum must equal the locked amount, so the free
+        // tranches split exactly the remainder the locked
+        // tranches leave behind — and the refundable remainder
+        // (amount - released - skipped) is unchanged, since the
+        // settled amounts above are locked.
+        if total != self.amount as u128 {
+            return Err(EscrowError::InvalidMilestoneAmendment);
+        }
+        let plan = self.milestones.as_mut().expect("plan checked above");
+        for (i, &amount) in new_amounts.iter().enumerate() {
+            plan.amounts[i] = amount;
+        }
+        Ok(())
+    }
     /// True when both parties confirmed milestone `index` for the release
     /// path (see [`Escrow::confirm_milestone`]). Out-of-range indices
     /// report `false`.
@@ -43733,7 +43859,11 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(86),
             Some(EscrowEventKind::DeliveryConfirmed)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(89), None);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(89),
+            Some(EscrowEventKind::MilestonesReallocated)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(90), None);
     }
 
     #[test]
@@ -58717,7 +58847,12 @@ mod event_history_tests {
             Some(EscrowEventKind::DeliveryConfirmed),
             "AV-203: appended after FeeWithdrawn"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(89), None);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(89),
+            Some(EscrowEventKind::MilestonesReallocated),
+            "AV-224: appended after ChainBroken"
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(90), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -58889,8 +59024,9 @@ mod event_history_tests {
         // (AV-158), 84 is `GovernanceCancelled` (AV-158), 85 is
         // `FeeWithdrawn` (AV-174), 86 is `DeliveryConfirmed`
         // (AV-203); 87 is `ChainLinked` and 88 is `ChainBroken`
-        // (AV-223); 89 is the first still-unknown byte.
-        for bad in [89u8, 90, 255] {
+        // (AV-223); 89 is `MilestonesReallocated` (AV-224) and
+        // 90 is the first still-unknown byte.
+        for bad in [90u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

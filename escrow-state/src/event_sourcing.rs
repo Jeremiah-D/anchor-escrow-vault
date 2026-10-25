@@ -154,6 +154,7 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         | EscrowEventKind::AttestorReplaced
         // AV-155: a milestone repricing moves no funds.
         | EscrowEventKind::MilestonesAmended
+        | EscrowEventKind::MilestonesReallocated
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -672,6 +673,10 @@ mod event_sourcing_tests {
             // the synth projection — `None` here, like the other
             // kind-specific extras.
             memo: None,
+            // AV-224: the before/after tranche tables are a
+            // live-emit extra, not part of the synth projection —
+            // `None` here, like the other kind-specific extras.
+            milestone_reallocation: None,
         }
     }
 
@@ -777,6 +782,7 @@ mod event_sourcing_tests {
                 | EscrowEventKind::AttestorReplaced
                 // AV-155: a milestone repricing moves no funds.
                 | EscrowEventKind::MilestonesAmended
+                | EscrowEventKind::MilestonesReallocated
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
