@@ -991,6 +991,10 @@ pub const BREAKING_CHANGE_ALLOWLIST: &[&str] = &[
     "field_added:account Vault.milestone_verifier",
     // AV-212: the credential issuer tail — appended, never renumbered.
     "field_added:account Vault.credential_issuer",
+    // AV-216: the delivery-deadline tail — appended, never renumbered.
+    "field_added:account Vault.delivery_deadline_at",
+    "field_added:account Vault.late_delivery_penalty_bps",
+    "field_added:account Vault.delivery_late",
     // AV-208: the delegation spend cap + spent counter — appended
     // to the Delegation named type, never renumbered.
     "field_added:type Delegation.spend_cap",

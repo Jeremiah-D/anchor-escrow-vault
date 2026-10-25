@@ -1424,7 +1424,10 @@
           {"name": "milestone_late_penalty_bps", "type": "u16", "offset": 7753},
           {"name": "milestone_verifier", "type": "publicKey", "offset": 7755},
           {"name": "credential_issuer", "type": "publicKey", "offset": 7787},
-          {"name": "delegation_expires_at", "type": {"option": "u64"}, "offset": 7819}
+          {"name": "delegation_expires_at", "type": {"option": "u64"}, "offset": 7819},
+          {"name": "delivery_deadline_at", "type": "u64", "offset": 7828},
+          {"name": "late_delivery_penalty_bps", "type": "u16", "offset": 7836},
+          {"name": "delivery_late", "type": "bool", "offset": 7838}
         ]
       }
     }

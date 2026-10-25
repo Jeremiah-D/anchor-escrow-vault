@@ -2680,6 +2680,62 @@ refund, not forfeit, them) and to AV-189 English (open ascending bids:
 the winner is public and the next bid is known without a ranking
 walk). (Solana: auction settlement assurance.)
 
+## Delivery-confirmation deadline (AV-216)
+
+AV-203 lets the taker confirm receipt but gives the
+confirmation no calendar: a confirmation a year late settles
+exactly like one made on time. This item prices lateness.
+`with_delivery_deadline` (`escrow-state/src/lib.rs`,
+`Uninitialized`-only) attaches one unix timestamp, and
+`with_late_delivery_penalty_bps` attaches a 0–10_000 bps rate;
+the timed `confirm_delivery_at` records `delivery_late` when
+the first confirmation lands strictly after the deadline
+(confirming exactly at the deadline is on time, the AV-206
+rule). A late-confirmed `release` / `release_milestone` then
+settles `released += gross - penalty`,
+`penalty_paid += penalty`, `taker_payout = net - fee +
+interest`, so `released + penalty_paid + remaining == amount`
+with the conservation formula untouched.
+
+- Lateness is recorded at confirmation time, never recomputed
+  at release time: a taker who confirmed on time but settles
+  late (the initializer's own delay) prices zero, by
+  construction. The timeless `confirm_delivery` records no
+  lateness — without a timestamp there is nothing to compare
+  against the deadline — and a second confirmation never
+  rewrites the first (first confirmation wins, in both
+  directions). The indexed wrapper routes through the timed
+  path with its event timestamp as the confirmation time.
+- Fees slice the net, caps bind the gross: the protocol fee,
+  the AV-191 referral share, and the AV-100 streaming fee all
+  cut value the taker actually receives, while the AV-205
+  per-call cap, the AV-208 operator spend cap, and the lockup
+  cap still check the gross — checking the net against the
+  pre-penalty cap would let a release settle gross value past
+  the lockup. On `release_milestone` the AV-216 penalty stacks
+  on the post-AV-206 net tranche (AV-206 first, then this one).
+- A rate without a deadline prices nothing, and a deadline
+  without a rate prices nothing — the two builders compose,
+  neither implies the other. The unilateral exits (`cancel`,
+  `cancel_expired`) and the arbiter's `resolve` are not gated
+  and not priced: a late confirmation prices payouts, never
+  traps funds (the AV-203 non-gating rule, extended to the
+  price). A zero deadline is `AmountMismatch` (0 in storage
+  always means "never attached", the AV-206 sentinel); a rate
+  above 10_000 bps is `InvalidPenalty` (the AV-206 validator).
+  No new error code.
+
+Vault tail +11 bytes (BODY 7820 → 7831, SPACE 7828 → 7839,
+no-quorum 7338 → 7349); IDL regenerated. Orthogonal to AV-206
+(per-tranche milestone due dates — this is the whole-deal
+delivery confirmation, and the two penalties stack), to AV-211
+(the post-confirmation inspection window — this deadline
+bounds the confirmation itself), and to AV-190 (rental
+use-right overdue rent — a different deal shape, a different
+clock). Boundary: the Anchor instruction accepting a deadline
+on chain is follow-up work — no such instruction is claimed.
+(Solana: delivery performance.)
+
 ## Time-bounded delegation (AV-215)
 
 An AV-104 operator grant may carry an opt-in expiry, set at

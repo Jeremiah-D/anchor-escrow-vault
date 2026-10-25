@@ -1710,6 +1710,12 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(8)?;
         None
     };
+    // AV-216: the delivery deadline (0 = no deadline attached),
+    // the late-delivery penalty rate, and the late flag — always
+    // present, in vault order after the delegation expiry.
+    let delivery_deadline_at = c.u64_le()?;
+    let late_delivery_penalty_bps = c.u16_le()?;
+    let delivery_late = c.u8()? != 0;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -2065,6 +2071,13 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // time-bounded operator cannot outlive its window to a
         // decode.
         delegation_expires_at,
+        // AV-216: the delivery deadline, late rate, and late flag
+        // — a decoded escrow carries the same deadline and
+        // lateness the setup recorded, so `release` /
+        // `release_milestone` price identically after a decode.
+        delivery_deadline_at,
+        late_delivery_penalty_bps,
+        delivery_late,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

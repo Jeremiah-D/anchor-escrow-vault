@@ -2999,6 +2999,22 @@ impl IndexedEscrow {
         Ok(self)
     }
 
+    /// Opt into the delivery-confirmation deadline (mirrors
+    /// [`Escrow::with_delivery_deadline`], AV-216). Configuration:
+    /// emits no event.
+    pub fn with_delivery_deadline(mut self, deadline_at: u64) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_delivery_deadline(deadline_at)?;
+        Ok(self)
+    }
+
+    /// Opt into the late-delivery penalty rate (mirrors
+    /// [`Escrow::with_late_delivery_penalty_bps`], AV-216).
+    /// Configuration: emits no event.
+    pub fn with_late_delivery_penalty_bps(mut self, bps: u16) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_late_delivery_penalty_bps(bps)?;
+        Ok(self)
+    }
+
     /// Declare a release for checker approval (mirrors
     /// [`Escrow::initiate_release`], AV-130 — the *maker* half of the
     /// maker-checker protocol). Emits
@@ -5949,14 +5965,18 @@ impl IndexedEscrow {
     /// [`EventAmounts::none`], the actor is the taker); repeat
     /// confirmations are idempotent no-ops that emit nothing
     /// (mirroring `confirm_milestone`'s emission rule). Failed
-    /// confirmations emit nothing. `at` is the event timestamp.
+    /// confirmations emit nothing. `at` is the event timestamp
+    /// and, via [`Escrow::confirm_delivery_at`] (AV-216), the
+    /// confirmation time the delivery deadline is measured
+    /// against — a post-deadline indexed confirmation records the
+    /// escrow late exactly like a direct timed confirmation.
     pub fn confirm_delivery(
         &mut self,
         authority: [u8; 32],
         at: u64,
     ) -> Result<(), EscrowError> {
         let confirmed_before = self.inner.delivery_confirmed();
-        self.inner.confirm_delivery(authority)?;
+        self.inner.confirm_delivery_at(authority, at)?;
         if !confirmed_before && self.inner.delivery_confirmed() {
             let state = self.inner.state();
             self.push_event(
