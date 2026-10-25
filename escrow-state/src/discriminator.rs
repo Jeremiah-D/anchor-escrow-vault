@@ -1741,6 +1741,9 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
             c.skip(SETTLEMENT_MINT_ALLOWLIST_LEN)?;
             None
         };
+    // AV-220: the partial-funding opt-in flag — always present,
+    // in vault order after the settlement-mint allowlist.
+    let partial_funding = c.u8()? != 0;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -2112,6 +2115,12 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // bound, so a settled release gates identically after a
         // decode.
         settlement_mint_allowlist,
+        // AV-220: the partial-funding flag — a decoded escrow
+        // carries the same deposit path the setup bound, so a
+        // partially-funded escrow keeps funding in installments
+        // after a decode instead of silently reverting to
+        // single-shot funding.
+        partial_funding,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
@@ -2289,6 +2298,23 @@ mod discriminator_tests {
         let decoded = decode_vault_account(&account_bytes(&e)).unwrap();
         assert_eq!(decoded, e);
         assert_eq!(decoded.evidence_hash(), Some([0xE0; 32]));
+    }
+
+    #[test]
+    fn decode_round_trips_partial_funding_flag() {
+        // AV-220: the opt-in flag and the partial deposit survive
+        // the round trip, so a decoded escrow keeps funding in
+        // installments instead of silently reverting to single-shot.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_partial_funding()
+            .unwrap();
+        e.fund_partial(ALICE, 400_000, EXPIRES_AT - 3_600).unwrap();
+        let decoded = decode_vault_account(&account_bytes(&e)).unwrap();
+        assert_eq!(decoded, e);
+        assert!(decoded.partial_funding());
+        assert_eq!(decoded.funded_total(), 400_000);
+        assert_eq!(decoded.state(), EscrowState::Uninitialized);
     }
 
     #[test]

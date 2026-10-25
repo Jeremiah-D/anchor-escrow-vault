@@ -1429,7 +1429,8 @@
           {"name": "late_delivery_penalty_bps", "type": "u16", "offset": 7836},
           {"name": "delivery_late", "type": "bool", "offset": 7838},
           {"name": "settlement_mint", "type": "publicKey", "offset": 7839},
-          {"name": "settlement_mint_allowlist", "type": {"option": {"defined": "SettlementMintAllowlist"}}, "offset": 7871}
+          {"name": "settlement_mint_allowlist", "type": {"option": {"defined": "SettlementMintAllowlist"}}, "offset": 7871},
+          {"name": "partial_funding", "type": "bool", "offset": 8129}
         ]
       }
     }
@@ -2084,7 +2085,8 @@
     {"code": 347, "name": "SettlementRateInvalid"},
     {"code": 348, "name": "SettlementRateExpired"},
     {"code": 349, "name": "InvalidSettlementMintAllowlist"},
-    {"code": 350, "name": "SettlementMintNotAllowlisted"}
+    {"code": 350, "name": "SettlementMintNotAllowlisted"},
+    {"code": 351, "name": "InvalidPartialFunding"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

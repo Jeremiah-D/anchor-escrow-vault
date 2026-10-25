@@ -2830,6 +2830,48 @@ not stored state), no new error code, no IDL change, and
 no Anchor instruction is claimed for this path. (Solana:
 mutual termination.)
 
+## Partial funding in installments (AV-220)
+
+The single-shot `fund` leaves one gap: an initializer who
+cannot post the whole deal size at once has no honest path —
+the AV-111 funding plan moves the escrow to `Funded` on the
+first tranche, so the taker can be paid from a half-funded
+vault before the rest arrives. `with_partial_funding`
+(`escrow-state/src/lib.rs`, backed by
+`escrow-state/src/partial_funding.rs`) closes it: the
+opt-in is `Uninitialized`-only, and installments posted
+through `fund_partial` accumulate in `funded_total` while
+the state stays `Uninitialized` until the installments sum
+to `amount` — only the last installment flips the escrow
+to `Funded` and anchors the funding clocks. The locked
+amount itself never moves, so milestones, vesting, and fees
+keep pricing off `amount`.
+
+- Accumulation runs in `u128`, so the sum can never wrap:
+  a zero deposit and any deposit that would push the total
+  past `amount` are clean `AmountMismatch` refusals, never
+  wraparounds. `fund` refuses a partial-funding escrow
+  with the new `InvalidPartialFunding` (code 351,
+  appended, never renumbered), and the AV-111 plan and
+  partial funding are mutually exclusive in either order —
+  the two deposit paths cannot both own one escrow.
+- While short of the total, `release` refuses (every payout
+  path's state gate already says no to a pre-`Funded`
+  escrow), and `cancel_expired` — once the AV-21 expiry
+  gate passes — refunds exactly the deposited total, never
+  the declared amount: funds that never arrived are never
+  refunded. A partial escrow with nothing deposited has
+  nothing to unwind and stays `InvalidStateTransition`.
+- Orthogonal to AV-11 (staged release — this item stages
+  the deposit, not the payout), to AV-95 (the multi-asset
+  basket — this item funds one asset in several calls), and
+  to AV-111 (the plan funds `Funded`-first; this item
+  funds `Funded`-last).
+
+Vault tail +1 byte (BODY 8121 → 8122, SPACE 8129 → 8130,
+no-quorum 7639 → 7640); IDL regenerated, including the new
+error code. (Solana: staged funding.)
+
 ## Delivery-confirmation deadline (AV-216)
 
 AV-203 lets the taker confirm receipt but gives the
