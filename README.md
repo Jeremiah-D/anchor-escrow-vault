@@ -2741,6 +2741,48 @@ rate path are follow-up work — no such paths are claimed, and
 no Anchor instruction for the settled path is claimed.
 (Solana: cross-mint settlement.)
 
+## Settlement-mint allowlist (AV-218)
+
+AV-217 settles in any attested mint; this item adds the
+initializer's own gate on top. `with_settlement_mint_allowlist`
+(`escrow-state/src/lib.rs`, `Uninitialized`-only) installs an
+opt-in list of at most 8 settlement mints
+(`escrow-state/src/settlement_allowlist.rs`); an empty slice
+means "allowlist off" (`None`, the AV-157 convention), and a
+non-empty list rejects a zero address, a duplicate, or more
+than 8 entries (`InvalidSettlementMintAllowlist`, 349).
+`release_with_settlement_rate` then checks the attestation's
+settlement mint against the list *before* rate verification or
+conversion pricing: a quote for a non-allowlisted mint is
+refused with `SettlementMintNotAllowlisted` (350) even when
+perfectly signed — and even when unsigned, since the policy
+check precedes signature verification. No allowlist configured
+means AV-217 semantics unchanged, and plain `release` never
+consults the list (no conversion, no settlement mint to gate).
+
+- The gate checks the attestation's mint, not the bound mint,
+  and that is sufficient rather than sloppy: verification
+  already requires the attestation's mint to equal the bound
+  mint, so a quote passing both checks is necessarily for an
+  allowlisted *and* bound mint. The builder deliberately does
+  not check the bound mint against the list — the release-time
+  gate is the single enforcement point, so a list excluding
+  the bound mint simply means no settled release can pass, a
+  policy the initializer chose and can read back, not a
+  config error.
+- Orthogonal to AV-217 (the conversion itself — this gates
+  which mints it may settle in, never repricing a leg), to
+  AV-16 (the funded-mint binding — this constrains the payout
+  denomination, and the AV-16 allowlist still does not apply
+  here), and to AV-49 (the payout-address allowlist — that
+  gates *where* the payout goes, this gates *what asset* it is
+  paid in; a settled release must pass both when both are
+  configured).
+
+Vault tail +258 bytes (BODY 7863 → 8121, SPACE 7871 → 8129,
+no-quorum 7381 → 7639); IDL regenerated. (Solana:
+cross-mint settlement risk control.)
+
 ## Delivery-confirmation deadline (AV-216)
 
 AV-203 lets the taker confirm receipt but gives the

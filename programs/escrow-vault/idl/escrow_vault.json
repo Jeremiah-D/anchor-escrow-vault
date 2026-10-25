@@ -1428,7 +1428,8 @@
           {"name": "delivery_deadline_at", "type": "u64", "offset": 7828},
           {"name": "late_delivery_penalty_bps", "type": "u16", "offset": 7836},
           {"name": "delivery_late", "type": "bool", "offset": 7838},
-          {"name": "settlement_mint", "type": "publicKey", "offset": 7839}
+          {"name": "settlement_mint", "type": "publicKey", "offset": 7839},
+          {"name": "settlement_mint_allowlist", "type": {"option": {"defined": "SettlementMintAllowlist"}}, "offset": 7871}
         ]
       }
     }
@@ -1501,6 +1502,16 @@
     },
     {
       "name": "MintAllowlist",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {"name": "mints", "type": {"array": ["publicKey", 8]}, "offset": 0},
+          {"name": "len", "type": "u8", "offset": 256}
+        ]
+      }
+    },
+    {
+      "name": "SettlementMintAllowlist",
       "type": {
         "kind": "struct",
         "fields": [
@@ -2071,7 +2082,9 @@
     {"code": 345, "name": "DelegationExpired"},
     {"code": 346, "name": "SettlementMintNotBound"},
     {"code": 347, "name": "SettlementRateInvalid"},
-    {"code": 348, "name": "SettlementRateExpired"}
+    {"code": 348, "name": "SettlementRateExpired"},
+    {"code": 349, "name": "InvalidSettlementMintAllowlist"},
+    {"code": 350, "name": "SettlementMintNotAllowlisted"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

@@ -1484,10 +1484,11 @@ mod idl_compat_tests {
         // payment-channel errors; AV-200 adds 1 sealed-bid pricing
         // error; AV-201 adds 1 English-auction buyout error; AV-205
         // adds 1 per-call release cap error.
-        assert_eq!(spec.errors.len(), 240); // AV-209 adds 4 winner-payment errors; AV-212 adds 6 credential-gate errors; AV-214 adds 6 option-escrow errors; AV-215 adds 1 delegation-expiry error; AV-217 adds 3 settlement-rate errors.
+        assert_eq!(spec.errors.len(), 242); // AV-209 adds 4 winner-payment errors; AV-212 adds 6 credential-gate errors; AV-214 adds 6 option-escrow errors; AV-215 adds 1 delegation-expiry error; AV-217 adds 3 settlement-rate errors; AV-218 adds 2 settlement-allowlist errors.
         // AV-178 adds the TieredQuorum + Tier named types; AV-195 adds
-        // the SocialRecovery named type.
-        assert_eq!(spec.types.len(), 36);
+        // the SocialRecovery named type; AV-218 adds the
+        // SettlementMintAllowlist named type.
+        assert_eq!(spec.types.len(), 37);
         let diff = diff_idl(&idl, &idl).unwrap();
         assert!(diff.changes.is_empty());
     }
