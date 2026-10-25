@@ -2056,7 +2056,13 @@
     {"code": 335, "name": "CredentialGateNotBound"},
     {"code": 336, "name": "CredentialInvalid"},
     {"code": 337, "name": "CredentialExpired"},
-    {"code": 338, "name": "CredentialRevoked"}
+    {"code": 338, "name": "CredentialRevoked"},
+    {"code": 339, "name": "InvalidOptionTerms"},
+    {"code": 340, "name": "OptionNotBuyer"},
+    {"code": 341, "name": "OptionExpired"},
+    {"code": 342, "name": "OptionNotExpired"},
+    {"code": 343, "name": "OptionAlreadySettled"},
+    {"code": 344, "name": "OptionStrikeMismatch"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

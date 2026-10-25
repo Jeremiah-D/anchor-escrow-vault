@@ -2680,6 +2680,53 @@ refund, not forfeit, them) and to AV-189 English (open ascending bids:
 the winner is public and the next bid is known without a ranking
 walk). (Solana: auction settlement assurance.)
 
+## Option escrow (AV-214)
+
+A fixed-strike, expiry-bound call option over a locked
+underlying amount. `OptionEscrow`
+(`escrow-state/src/option_escrow.rs`) is a pure-logic sidecar:
+the seller locks an underlying, the buyer pays a premium up
+front for the right — not the obligation — to buy that
+underlying at a fixed strike before an expiry timestamp.
+Exercise (buyer only, strictly before expiry, paying exactly
+the strike) sends the underlying to the buyer and the strike
+plus the premium to the seller; expiry (at or after expiry,
+unexercised) leaves the premium with the seller and returns
+the underlying to the seller — an unexercised option expiring
+worthless is a normal terminal outcome, not an error. The
+boundary is exact: at the expiry instant itself exercise is
+already closed and expiry already open, so no timestamp is
+both exercisable and expirable. Check order mirrors the HTLC
+claim (buyer, then state, then timelock, then payment), so a
+stranger learns nothing about the option's state from the
+error they get.
+
+- The premium is non-refundable in every outcome: it bought
+  the right, and the right was held. A wrong strike payment is
+  `OptionStrikeMismatch`, not `AmountMismatch` (that code means
+  "initialize with amount == 0"); a settled option reports
+  `OptionAlreadySettled` before any timestamp or payment
+  question is asked.
+- The module moves no funds itself: like the HTLC claim it
+  verifies the terms and returns the settlement legs for
+  transfer sizing, and the premium's custody before
+  construction is the caller's job.
+
+New error codes (never renumbered): `InvalidOptionTerms`
+(339), `OptionNotBuyer` (340), `OptionExpired` (341),
+`OptionNotExpired` (342), `OptionAlreadySettled` (343),
+`OptionStrikeMismatch` (344); no layout change, no
+`VAULT_SPACE` bump, no IDL regeneration. Orthogonal to
+AV-113 (a price gate that permits a release when a market
+condition holds — no holder choice, no strike), AV-97 (a
+Dutch auction that discovers a price — the strike here is
+fixed at construction, never bid) and AV-186 (an HTLC: a
+hashlock plus a timelock where the claim secret, not a
+payment, unlocks the funds). Boundary: the Anchor
+instruction that locks the underlying, collects the premium
+and settles these legs on chain is follow-up work — no such
+instruction is claimed. (Solana: option primitive.)
+
 ## Denylist-gated release (AV-213)
 
 A release-time denylist for compliance lists that arrive after the

@@ -1318,14 +1318,14 @@ fn idl_errors_pin_enum() {
             // AV-194 with 282-285; AV-195 with 286-292; AV-196 with
             // 293-298; AV-197 with 299-303; AV-200 with 313; AV-201
             // with 314; AV-203 with 315; AV-205 with 316; AV-207 with
-            // 317; AV-208 with 318; AV-209 with 319-322; AV-210 with 323-328; AV-211 with 329-332; AV-212 with 333-338 (never renumbered; each extension
+            // 317; AV-208 with 318; AV-209 with 319-322; AV-210 with 323-328; AV-211 with 329-332; AV-212 with 333-338; AV-214 with 339-344 (never renumbered; each extension
             // widens this bound).
-            (100..339).contains(&e.code()),
+            (100..345).contains(&e.code()),
             "error code out of pinned range: {name} = {}",
             e.code()
         );
     }
-    assert_eq!(errors.len(), 230, "error variant count drift"); // AV-195: +7 social-recovery errors; AV-196: +6 jury-sortition errors; AV-197: +5 payment-channel errors; AV-200: +1; AV-201: +1; AV-203: +1; AV-205: +1; AV-207: +1; AV-208: +1; AV-209: +4; AV-210: +6; AV-211: +4; AV-212: +6
+    assert_eq!(errors.len(), 236, "error variant count drift"); // AV-195: +7 social-recovery errors; AV-196: +6 jury-sortition errors; AV-197: +5 payment-channel errors; AV-200: +1; AV-201: +1; AV-203: +1; AV-205: +1; AV-207: +1; AV-208: +1; AV-209: +4; AV-210: +6; AV-211: +4; AV-212: +6; AV-214: +6
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);

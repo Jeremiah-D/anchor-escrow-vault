@@ -342,6 +342,18 @@ pub use denylist_gate::{
     MAX_DENYLIST_GATE_RECIPIENTS,
 };
 
+// AV-214: option escrow — a fixed-strike, expiry-bound call option
+// over a locked underlying amount: the buyer pays a premium up
+// front, exercises at the strike before expiry, or lets the option
+// lapse (premium to the seller, underlying back to the seller).
+// Pure logic: no Vault layout change, no VAULT_SPACE bump (the
+// option is a sidecar, like AV-213's gate, not persisted on the
+// Escrow).
+mod option_escrow;
+pub use option_escrow::{
+    OptionEscrow, OptionExercise, OptionExpiry, OptionState,
+};
+
 // ---------------------------------------------------------------------------
 // SHA-256 (hand-rolled, zero dependencies).
 // ---------------------------------------------------------------------------
@@ -4276,6 +4288,31 @@ pub enum EscrowError {
     /// the holder could set. Never renumbered (see
     /// [`EscrowError::code`]).
     CredentialRevoked,
+    /// AV-214: option-escrow terms misconfiguration — a zero party
+    /// key, seller == buyer, or a zero underlying / premium /
+    /// strike / expiry. Never renumbered (see
+    /// [`EscrowError::code`]).
+    InvalidOptionTerms,
+    /// AV-214: exercise attempted by anyone but the option's buyer.
+    /// Never renumbered (see [`EscrowError::code`]).
+    OptionNotBuyer,
+    /// AV-214: exercise at or after the option's expiry — the
+    /// window closed, only expiry settlement remains. Never
+    /// renumbered (see [`EscrowError::code`]).
+    OptionExpired,
+    /// AV-214: expiry settlement before the expiry timestamp — the
+    /// buyer's window is still open. Never renumbered (see
+    /// [`EscrowError::code`]).
+    OptionNotExpired,
+    /// AV-214: exercise or expiry on an option that already settled
+    /// (exercised or expired). Terminal states settle once. Never
+    /// renumbered (see [`EscrowError::code`]).
+    OptionAlreadySettled,
+    /// AV-214: exercise payment other than the fixed strike — the
+    /// strike never moves with the market, so any other payment is
+    /// a mispriced exercise, not a partial one. Never renumbered
+    /// (see [`EscrowError::code`]).
+    OptionStrikeMismatch,
 }
 
 impl EscrowError {
@@ -4658,6 +4695,13 @@ impl EscrowError {
             EscrowError::CredentialInvalid => 336,
             EscrowError::CredentialExpired => 337,
             EscrowError::CredentialRevoked => 338,
+            // AV-214: appended, never renumbered.
+            EscrowError::InvalidOptionTerms => 339,
+            EscrowError::OptionNotBuyer => 340,
+            EscrowError::OptionExpired => 341,
+            EscrowError::OptionNotExpired => 342,
+            EscrowError::OptionAlreadySettled => 343,
+            EscrowError::OptionStrikeMismatch => 344,
         }
     }
 
@@ -5022,6 +5066,13 @@ impl EscrowError {
             EscrowError::CredentialInvalid,
             EscrowError::CredentialExpired,
             EscrowError::CredentialRevoked,
+            // AV-214: appended, never renumbered.
+            EscrowError::InvalidOptionTerms,
+            EscrowError::OptionNotBuyer,
+            EscrowError::OptionExpired,
+            EscrowError::OptionNotExpired,
+            EscrowError::OptionAlreadySettled,
+            EscrowError::OptionStrikeMismatch,
         ]
     }
 }
@@ -34720,6 +34771,36 @@ mod error_code_tests {
             338,
             "credential reported revoked by the issuer's revocation query (AV-212)",
         ),
+        (
+            EscrowError::InvalidOptionTerms,
+            339,
+            "option with a zero party, seller == buyer, or a zero underlying / premium / strike / expiry (AV-214)",
+        ),
+        (
+            EscrowError::OptionNotBuyer,
+            340,
+            "exercise by anyone but the option's buyer (AV-214)",
+        ),
+        (
+            EscrowError::OptionExpired,
+            341,
+            "exercise at or after the option's expiry (AV-214)",
+        ),
+        (
+            EscrowError::OptionNotExpired,
+            342,
+            "expiry settlement before the option's expiry (AV-214)",
+        ),
+        (
+            EscrowError::OptionAlreadySettled,
+            343,
+            "exercise or expiry on an already-settled option (AV-214)",
+        ),
+        (
+            EscrowError::OptionStrikeMismatch,
+            344,
+            "exercise payment other than the fixed strike (AV-214)",
+        ),
     ];
 
     #[test]
@@ -60689,7 +60770,7 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceStale));
         assert_eq!(EscrowError::OraclePriceUnreliable.code(), 281);
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceUnreliable));
-        assert_eq!(EscrowError::all().len(), 230); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4
+        assert_eq!(EscrowError::all().len(), 236); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4; AV-214: +6
     }
 
     #[test]
