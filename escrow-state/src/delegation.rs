@@ -32,6 +32,21 @@
 //! come first: the initializer/taker themselves authorize before the
 //! delegation slot is even consulted, so an operator learns nothing
 //! the parties don't already know.
+//!
+//! AV-215: a grant may carry an opt-in expiry
+//! ([`Escrow::delegate_authority_with_expiry`](crate::Escrow::delegate_authority_with_expiry)).
+//! The expiry lives in its own tail field on the escrow, not in the
+//! grant region, so the AV-104 layout never moves; the gate checks
+//! it before scope, so a lapsed operator is refused with
+//! [`DelegationExpired`](crate::EscrowError::DelegationExpired) on
+//! every path, whatever scope was asked for. Expiry deactivates, it
+//! never clears: the grant and its spent counter survive the lapse,
+//! the owner may renew the window
+//! ([`Escrow::renew_delegation`](crate::Escrow::renew_delegation))
+//! — reactivating the same grant with its history intact — or
+//! revoke it, and every grant replacement, revocation or party
+//! rotation clears the window with the grant, so a stale expiry can
+//! never attach itself to a grant it was not set for.
 
 /// Scope bit: the operator may fund the escrow
 /// ([`Escrow::fund`](crate::Escrow::fund)).

@@ -1700,6 +1700,16 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     for byte in credential_issuer.iter_mut() {
         *byte = c.u8()?;
     }
+    // AV-215: the live operator grant's expiry timestamp — one
+    // discriminant byte plus the 8-byte timestamp (`None` = the
+    // AV-104 grant with no expiry). The reserved region is skipped
+    // when absent, like every other `Option` tail above.
+    let delegation_expires_at = if c.option_present("delegation_expires_at")? {
+        Some(c.u64_le()?)
+    } else {
+        c.skip(8)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -2050,6 +2060,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // escrow carries the same gate the setup bound, so a
         // credential-gated escrow cannot lose its gate to a decode.
         credential_issuer,
+        // AV-215: the delegation expiry — a decoded escrow carries
+        // the same window the grant was bound with, so a
+        // time-bounded operator cannot outlive its window to a
+        // decode.
+        delegation_expires_at,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

@@ -2680,6 +2680,45 @@ refund, not forfeit, them) and to AV-189 English (open ascending bids:
 the winner is public and the next bid is known without a ranking
 walk). (Solana: auction settlement assurance.)
 
+## Time-bounded delegation (AV-215)
+
+An AV-104 operator grant may carry an opt-in expiry, set at
+grant time. `delegate_authority_with_expiry`
+(`escrow-state/src/lib.rs`) bounds the grant to a window: while
+`now < expires_at` the operator acts exactly like an AV-104
+operator; once `now >= expires_at` every operator operation —
+fund, release and cancel alike — is refused with
+`DelegationExpired`, checked inside the authority gate before
+scope and before state, so a lapsed operator learns nothing
+beyond the refusal. The parties are never gated: expiry binds
+the operator alone.
+
+- Expiry deactivates, it never clears: the grant and its
+  `spent` counter survive the lapse, so `renew_delegation`
+  reactivates the same grant with its history intact (a lapsed
+  window is a pause, not a death), and revocation still works on
+  a lapsed grant. A capped-out history stays history whether or
+  not the window is still open.
+- No stale windows: a plain or capped re-grant, a revocation, or
+  a party rotation clears the expiry with the grant, so a fresh
+  grant is never silently time-bounded by its predecessor. The
+  expiry lives in its own appended tail field (9 bytes), not in
+  the AV-104 delegation region, so no earlier field offset
+  moves.
+- A `0` expiry is `InvalidDelegation`, not "no expiry": `0` in
+  storage always means "never expires", so a bounded grant is
+  never ambiguous with an AV-104 grant (the AV-208 zero-cap
+  convention).
+
+New error code (never renumbered): `DelegationExpired` (345);
+vault tail +9 bytes (BODY 7820, SPACE 7828, no-quorum 7338);
+IDL regenerated. Orthogonal to AV-104 (scope plus spend cap —
+this item is the time window) and to AV-208 (the cap binds
+volume, the window binds time; the two compose through the same
+grant slot). Boundary: the Anchor instruction accepting an
+expiry on chain is follow-up work — no such instruction is
+claimed. (Solana: delegation governance.)
+
 ## Option escrow (AV-214)
 
 A fixed-strike, expiry-bound call option over a locked
