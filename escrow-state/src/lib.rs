@@ -890,6 +890,12 @@ pub use keeper::{
 // sweepable vaults (see `scan_unclaimed_rent`).
 pub use keeper::{scan_unclaimed_rent, SweepableVault, UnclaimedRentReport};
 
+// AV-221: keeper expiry-cancel scan — read-only report of `Funded`
+// vaults past their expiry gate (AV-21 grace honored), with the
+// bilateral refund-leg preview (see `scan_expired_vaults`).
+// Report-only: execution still goes through `cancel_expired`.
+pub use keeper::{scan_expired_vaults, ExpiredVault, ExpiredVaultReport};
+
 // AV-174: protocol-fee collection keeper scan — dry-run listing of
 // vaults with withdrawable protocol fees (see `scan_fee_collection`).
 pub use keeper::{scan_fee_collection, CollectableFees, FeeCollectionReport};

@@ -2872,6 +2872,37 @@ Vault tail +1 byte (BODY 8121 → 8122, SPACE 8129 → 8130,
 no-quorum 7639 → 7640); IDL regenerated, including the new
 error code. (Solana: staged funding.)
 
+## Keeper expired-vault scan (AV-221)
+
+The AV-20 keeper scan already lists executable
+`cancel_expired` calls, but an operator who wants to know
+*which vaults are past their time and how much is at stake*
+has to read that action list sideways. `scan_expired_vaults`
+(`escrow-state/src/keeper.rs`, exported from
+`escrow-state/src/lib.rs`) is the report counterpart: it
+scans a watch list and returns an `ExpiredVaultReport` —
+every `Funded` vault whose AV-21 expiry gate has passed
+(`now >= expires_at + grace_period`, grace honored, so the
+chain would never reject the listing as `NotExpired`),
+with the overdue duration and the initializer/taker leg
+split of the refundable remainder.
+
+- Report only: the scan takes snapshots, mutates nothing,
+  and signs nothing — execution still goes through
+  `cancel_expired` / `crank_expired`, which keep enforcing
+  the pause, reentrancy, authority, mint, and refund
+  gates. A vault with nothing refundable is not a
+  candidate; a taker-initiated cancel's AV-24 penalty is
+  not pre-charged into the preview legs.
+- Orthogonal to AV-40 (which scans terminal states for
+  `close_vault`) and to AV-80 (which scans `Closed`
+  vaults holding only the rent-exempt minimum): this item
+  covers the live `Funded` vaults whose time has run out.
+
+No vault layout change, no new error code, no IDL change,
+and no Anchor instruction is claimed for this path.
+(Solana: keeper automation.)
+
 ## Delivery-confirmation deadline (AV-216)
 
 AV-203 lets the taker confirm receipt but gives the

@@ -2359,6 +2359,156 @@ pub fn scan_closeable(watched: &[WatchedEscrow]) -> CloseReport {    // AV-40: `
     }
 }
 
+/// One `Funded` vault that passed its expiry gate: the keeper's
+/// `cancel_expired` candidate, reported — not executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpiredVault {
+    /// Which escrow's vault this is: the caller-supplied identity
+    /// (the Anchor layer keys the vault PDA off it — the same
+    /// convention as [`WatchedEscrow::escrow_id`]).
+    pub escrow_id: [u8; 32],
+    /// The escrow's expiry timestamp.
+    pub expires_at: u64,
+    /// The AV-21 grace period the expiry gate honored, in seconds.
+    pub grace_period_secs: u64,
+    /// How long past the gate (`expires_at + grace_period`) the scan
+    /// ran: `now - (expires_at + grace_period)`, saturating — `0`
+    /// exactly at the gate, never negative.
+    pub overdue_secs: u64,
+    /// The initializer's leg of the refundable remainder, per
+    /// [`Escrow::bilateral_legs`]: the initializer-initiated split,
+    /// with no AV-24 penalty — a taker-initiated cancel slices the
+    /// penalty from the taker leg at execution time, so the preview
+    /// never pre-charges it.
+    pub initializer_refund: u64,
+    /// The taker's leg of the refundable remainder.
+    pub taker_refund: u64,
+}
+
+/// The expired-vault report: every watched vault ready for
+/// `cancel_expired`, in input order, with the fleet refundable total.
+/// Read-only by construction: the scan takes snapshots and returns
+/// a report — execution still goes through [`Escrow::cancel_expired`]
+/// / [`Escrow::crank_expired`], which enforce the pause, reentrancy,
+/// authority, mint, refund-destination, and expiry gates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredVaultReport {
+    /// How many escrows were scanned.
+    pub scanned: usize,
+    /// The scan clock.
+    pub now: u64,
+    /// The expired vaults, in input order.
+    pub vaults: Vec<ExpiredVault>,
+    /// Sum of the refundable remainders across the vaults
+    /// (saturating — a report total never wraps).
+    pub total_refundable: u64,
+}
+
+impl ExpiredVaultReport {
+    /// True when no expired vault was found.
+    pub fn is_empty(&self) -> bool {
+        self.vaults.is_empty()
+    }
+
+    /// Hand-serialized JSON (the crate is dependency-free).
+    /// Deterministic field order; keys are 64-char lowercase hex.
+    /// Vaults keep their input order.
+    ///
+    /// ```json
+    /// {"at":1750000000,"scanned":2,"total_refundable":1000000,"vaults":[
+    ///   {"escrow_id":"...","expires_at":1700000000,
+    ///    "grace_period_secs":0,"overdue_secs":50000000,
+    ///    "initializer_refund":1000000,"taker_refund":0}
+    /// ]}
+    /// ```
+    pub fn to_json(&self) -> String {
+        let mut s = String::with_capacity(64 + self.vaults.len() * 280);
+        s.push_str("{\"at\":");
+        s.push_str(&self.now.to_string());
+        s.push_str(",\"scanned\":");
+        s.push_str(&self.scanned.to_string());
+        s.push_str(",\"total_refundable\":");
+        s.push_str(&self.total_refundable.to_string());
+        s.push_str(",\"vaults\":[");
+        for (i, v) in self.vaults.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"escrow_id\":\"");
+            s.push_str(&hex32(&v.escrow_id));
+            s.push_str("\",\"expires_at\":");
+            s.push_str(&v.expires_at.to_string());
+            s.push_str(",\"grace_period_secs\":");
+            s.push_str(&v.grace_period_secs.to_string());
+            s.push_str(",\"overdue_secs\":");
+            s.push_str(&v.overdue_secs.to_string());
+            s.push_str(",\"initializer_refund\":");
+            s.push_str(&v.initializer_refund.to_string());
+            s.push_str(",\"taker_refund\":");
+            s.push_str(&v.taker_refund.to_string());
+            s.push('}');
+        }
+        s.push_str("]}");
+        s
+    }
+}
+
+/// Scan `watched` and report every vault ready for `cancel_expired`.
+/// Pure read over the snapshots: zero side effects, deterministic
+/// output in input order.
+///
+/// The gate mirrors AV-20's `cancel_expired` listing exactly — the
+/// escrow is `Funded`, the AV-21 expiry gate passes at the scan
+/// clock (`now >= expires_at + grace_period`, so keeper/cluster
+/// clock drift can never list a vault the chain would reject as
+/// `NotExpired`), and a nonzero remainder exists (a vault with
+/// nothing refundable is not a candidate). Anything else is
+/// skipped: `Uninitialized` / `Activated` vaults hold no funded
+/// lockup yet, terminal states have no expiry cancel left, and
+/// `Disputed` vaults settle through `resolve`, not through an
+/// expiry exit.
+///
+/// Orthogonal to AV-40 (which scans terminal states for
+/// `close_vault`) and to AV-80 (which scans `Closed` vaults
+/// holding exactly the rent-exempt minimum): this scan covers the
+/// live `Funded` vaults whose time has run out, and it reports
+/// rather than acts — the AV-20 scan still owns the executable
+/// call list, and `cancel_expired` still owns the execution.
+pub fn scan_expired_vaults(watched: &[WatchedEscrow], now: u64) -> ExpiredVaultReport {
+    let mut vaults = Vec::new();
+    let mut total_refundable = 0u64;
+    for w in watched {
+        let e = &w.escrow;
+        if e.state() != EscrowState::Funded {
+            continue;
+        }
+        if !e.is_expiry_eligible(now) {
+            continue;
+        }
+        let remaining = e.remaining_amount();
+        if remaining == 0 {
+            continue;
+        }
+        let (initializer_refund, taker_refund) = e.bilateral_legs();
+        vaults.push(ExpiredVault {
+            escrow_id: w.escrow_id,
+            expires_at: e.expires_at(),
+            grace_period_secs: e.grace_period(),
+            overdue_secs: now
+                .saturating_sub(e.expires_at().saturating_add(e.grace_period())),
+            initializer_refund,
+            taker_refund,
+        });
+        total_refundable = total_refundable.saturating_add(remaining);
+    }
+    ExpiredVaultReport {
+        scanned: watched.len(),
+        now,
+        vaults,
+        total_refundable,
+    }
+}
+
 /// One executable stale-vault close: everything the initializer needs
 /// to sign and submit `close_vault`, nothing more. The keeper never
 /// signs — this is the *to-be-signed* payload (see
@@ -2904,6 +3054,87 @@ mod keeper_tests {
         assert!(report.is_empty());
         assert_eq!(report.scanned, 0);
         assert_eq!(report.to_json(), r#"{"at":1750000000,"scanned":0,"total_estimated_cu":0,"jito_tip":null,"intent_releases":[],"pool_balance":0,"pool_inflow":0,"pool_outflow":0,"actions":[],"report_seq":null,"pending_auto_unpause":[],"funding_bounds":[]}"#);
+    }
+
+    // ---------- AV-221: keeper expiry-cancel scan ----------
+
+    #[test]
+    fn expired_vaults_lists_only_funded_expiry_eligible_vaults() {
+        let expired = funded(AMOUNT, MID - 1_000);
+        let unexpired = funded(AMOUNT, MID + 1_000);
+        let uninit = Escrow::initialize(ALICE, BOB, AMOUNT, MID - 1_000).unwrap();
+        // AV-21 grace: the gate is expires_at + grace, inclusive.
+        let mut graced = Escrow::initialize(ALICE, BOB, AMOUNT, MID - 1_000)
+            .unwrap()
+            .with_grace_period(2_000)
+            .unwrap();
+        graced.fund(ALICE, MID - 2_000).unwrap();
+        // Bilateral legs: the taker's counter-fund rides its own leg.
+        let mut bilateral = funded(AMOUNT, MID - 1_000);
+        bilateral.fund_taker(BOB, 200_000, MID - 500).unwrap();
+        let watched = [
+            watch(ID1, expired),
+            watch(ID2, unexpired),
+            watch(ID3, uninit),
+            watch([0x04; 32], graced),
+            watch([0x05; 32], bilateral),
+        ];
+        let report = scan_expired_vaults(&watched, MID);
+        assert_eq!(report.scanned, 5);
+        assert_eq!(report.vaults.len(), 2);
+        // Input order preserved; the graced vault is still inside its
+        // grace window at MID, so only the plain expired vault and
+        // the bilateral one list.
+        let first = &report.vaults[0];
+        assert_eq!(first.escrow_id, ID1);
+        assert_eq!(first.expires_at, MID - 1_000);
+        assert_eq!(first.grace_period_secs, 0);
+        assert_eq!(first.overdue_secs, 1_000);
+        assert_eq!((first.initializer_refund, first.taker_refund), (AMOUNT, 0));
+        let second = &report.vaults[1];
+        assert_eq!(second.escrow_id, [0x05; 32]);
+        assert_eq!(
+            (second.initializer_refund, second.taker_refund),
+            (AMOUNT, 200_000)
+        );
+        assert_eq!(report.total_refundable, AMOUNT + AMOUNT + 200_000);
+        // At the grace boundary the graced vault becomes eligible
+        // with zero overdue — the gate is inclusive, like
+        // `is_expiry_eligible`.
+        let boundary = scan_expired_vaults(&[watch(ID1, {
+            let mut g = Escrow::initialize(ALICE, BOB, AMOUNT, MID - 1_000)
+                .unwrap()
+                .with_grace_period(2_000)
+                .unwrap();
+            g.fund(ALICE, MID - 2_000).unwrap();
+            g
+        })], MID + 1_000);
+        assert_eq!(boundary.vaults.len(), 1);
+        assert_eq!(boundary.vaults[0].overdue_secs, 0);
+        assert_eq!(boundary.vaults[0].grace_period_secs, 2_000);
+    }
+
+    #[test]
+    fn expired_vaults_report_is_read_only_and_deterministic() {
+        let watched = [watch(ID1, funded(AMOUNT, MID - 1_000))];
+        let first = scan_expired_vaults(&watched, MID);
+        let second = scan_expired_vaults(&watched, MID);
+        assert_eq!(first.to_json(), second.to_json());
+        // The scan took snapshots: the watched escrow is untouched.
+        assert_eq!(watched[0].escrow.state(), EscrowState::Funded);
+        assert_eq!(watched[0].escrow.remaining_amount(), AMOUNT);
+        assert_eq!(
+            first.to_json(),
+            format!(
+                "{{\"at\":{},\"scanned\":1,\"total_refundable\":{},\"vaults\":[{{\"escrow_id\":\"{}\",\"expires_at\":{},\"grace_period_secs\":0,\"overdue_secs\":1000,\"initializer_refund\":{},\"taker_refund\":0}}]}}",
+                MID,
+                AMOUNT,
+                hex_of(0x01),
+                MID - 1_000,
+                AMOUNT
+            )
+        );
+        assert!(scan_expired_vaults(&[], MID).is_empty());
     }
 
     #[test]
