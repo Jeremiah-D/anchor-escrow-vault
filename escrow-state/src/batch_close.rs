@@ -200,6 +200,11 @@ pub struct VaultClosedItem {
     pub index: usize,
     pub from: EscrowState,
     pub rent_reclaimed: u64,
+    /// AV-222: who the reclaimed rent goes to — the escrow's
+    /// bound rent payer, or its initializer when none is bound
+    /// ([`crate::Escrow::rent_recipient`]). The batch never pays
+    /// the caller: the destination is the vault's own policy.
+    pub rent_recipient: [u8; 32],
     /// AV-92: the canonical vault PDA precomputed from the watch
     /// item's recorded seeds ([`CloseWatchItem::with_vault_seeds`]),
     /// or the recorded vault PDA for the indexed variant. `None`
@@ -299,6 +304,9 @@ impl CloseVaultsReport {
             s.push_str(&format!("{:?}", item.from).to_lowercase());
             s.push_str("\",\"rent_reclaimed\":");
             s.push_str(&item.rent_reclaimed.to_string());
+            s.push_str(",\"rent_recipient\":\"");
+            s.push_str(&hex32(&item.rent_recipient));
+            s.push('"');
             s.push('}');
         }
         s.push_str("],\"skipped\":[");
@@ -395,6 +403,7 @@ pub fn close_vaults(
                     index,
                     from,
                     rent_reclaimed: rent,
+                    rent_recipient: escrow.rent_recipient(),
                     vault_address,
                 });
             }
@@ -453,6 +462,9 @@ pub fn close_indexed_vaults(
             continue;
         }
         let from = inner.state();
+        // AV-222: the recipient is the vault's own policy, read
+        // before the close (close never changes the payer).
+        let rent_recipient = inner.rent_recipient();
         match escrow.close_vault(initializer, at) {
             Ok(rent) => {
                 report.total_rent_reclaimed = report
@@ -463,6 +475,7 @@ pub fn close_indexed_vaults(
                     index,
                     from,
                     rent_reclaimed: rent,
+                    rent_recipient,
                     vault_address,
                 });
             }
@@ -814,11 +827,35 @@ mod batch_close_tests {
         let json = report.to_json();
         let per_close = vault_close_rent_reclaimed();
         let expected = format!(
-            "{{\"scanned\":3,\"closed\":[{{\"index\":2,\"vault_address\":null,\"from\":\"released\",\"rent_reclaimed\":{per_close}}}],\"skipped\":[],\"failed\":[{{\"index\":0,\"vault_address\":null,\"error\":\"Unauthorized\",\"code\":{}}},{{\"index\":1,\"vault_address\":null,\"error\":\"InvalidStateTransition\",\"code\":{}}}],\"total_rent_reclaimed\":{per_close}}}",
+            "{{\"scanned\":3,\"closed\":[{{\"index\":2,\"vault_address\":null,\"from\":\"released\",\"rent_reclaimed\":{per_close},\"rent_recipient\":\"{}\"}}],\"skipped\":[],\"failed\":[{{\"index\":0,\"vault_address\":null,\"error\":\"Unauthorized\",\"code\":{}}},{{\"index\":1,\"vault_address\":null,\"error\":\"InvalidStateTransition\",\"code\":{}}}],\"total_rent_reclaimed\":{per_close}}}",
+            hex32(&ALICE),
             EscrowError::Unauthorized.code(),
             EscrowError::InvalidStateTransition.code(),
         );
         assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn close_report_pays_rent_to_bound_payer_not_initializer() {
+        // AV-222: a vault with a bound rent payer closes to the
+        // payer; a plain vault closes to the initializer. The
+        // close authority is the initializer in both cases.
+        let payer = [0xDD; 32];
+        let mut with_payer = Escrow::initialize(ALICE, BOB, 1_000_000, FUTURE)
+            .unwrap()
+            .with_rent_payer(payer)
+            .unwrap();
+        with_payer.fund(ALICE, NOW).unwrap();
+        with_payer.cancel(ALICE, None, ALICE, 0).unwrap();
+        let mut vaults = vec![
+            CloseWatchItem::new(with_payer),
+            CloseWatchItem::new(cancelled(2_000_000, FUTURE)),
+        ];
+        let report = close_vaults(&mut vaults, ALICE, BOB, &CloseVaultsFilter::any());
+        assert_eq!(report.closed.len(), 2);
+        assert_eq!(report.closed[0].rent_recipient, payer);
+        assert_eq!(report.closed[1].rent_recipient, ALICE);
+        assert_eq!(report.total_rent_reclaimed, 2 * vault_close_rent_reclaimed());
     }
 
     #[test]

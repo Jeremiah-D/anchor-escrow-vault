@@ -1744,6 +1744,15 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // AV-220: the partial-funding opt-in flag — always present,
     // in vault order after the settlement-mint allowlist.
     let partial_funding = c.u8()? != 0;
+    // AV-222: the rent payer — always present, in vault order
+    // after the partial-funding flag: the `Option` discriminant
+    // plus the payer key (zeroed when no payer is bound).
+    let rent_payer = if c.u8()? != 0 {
+        Some(c.pubkey()?)
+    } else {
+        c.skip(32)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -2121,6 +2130,12 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // after a decode instead of silently reverting to
         // single-shot funding.
         partial_funding,
+        // AV-222: the rent payer — a decoded escrow carries the
+        // same close-time destination the setup bound, so a
+        // close after a decode pays the payer, not the
+        // initializer, instead of silently reverting to the
+        // AV-34 default.
+        rent_payer,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
@@ -2315,6 +2330,20 @@ mod discriminator_tests {
         assert!(decoded.partial_funding());
         assert_eq!(decoded.funded_total(), 400_000);
         assert_eq!(decoded.state(), EscrowState::Uninitialized);
+    }
+
+    #[test]
+    fn decode_round_trips_rent_payer() {
+        // AV-222: the bound payer survives the round trip, so a
+        // close after a decode pays the payer, not the initializer.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_rent_payer([0xDD; 32])
+            .unwrap();
+        let decoded = decode_vault_account(&account_bytes(&e)).unwrap();
+        assert_eq!(decoded, e);
+        assert_eq!(decoded.rent_payer(), Some([0xDD; 32]));
+        assert_eq!(decoded.rent_recipient(), [0xDD; 32]);
     }
 
     #[test]

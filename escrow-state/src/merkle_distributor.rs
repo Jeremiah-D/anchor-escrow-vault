@@ -553,6 +553,6 @@ mod tests {
         }
         // AV-189 appends 5 English-auction errors after these; AV-190
         // appends 3 rental-escrow errors after those.
-        assert_eq!(EscrowError::all().len(), 243); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1
+        assert_eq!(EscrowError::all().len(), 244); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1
     }
 }

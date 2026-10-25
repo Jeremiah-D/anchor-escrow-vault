@@ -2903,6 +2903,47 @@ No vault layout change, no new error code, no IDL change,
 and no Anchor instruction is claimed for this path.
 (Solana: keeper automation.)
 
+## Rent payer (AV-222)
+
+`close_vault` always paid the rent-exempt deposit back to
+the initializer — the only destination the state machine
+knew. A vault whose rent was actually funded by someone
+else (a sponsor, a marketplace operator, a relayer that
+paid the account-creation rent on the initializer's
+behalf) had no way to say so: the sponsor's deposit
+silently became the initializer's on close.
+`with_rent_payer` (`escrow-state/src/lib.rs`, backed by
+`escrow-state/src/rent_payer.rs`) closes it: the opt-in
+is `Uninitialized`-only, so the close-time destination is
+fixed before any funds move and can never be re-pointed
+mid-life, and a zero payer is refused with the new
+`InvalidRentPayer` (code 352, appended, never
+renumbered) — a bound payer must be a real key, or the
+close would have nowhere to send the rent.
+
+- The close authority does not change: only the
+  initializer may call `close_vault` (AV-34), so naming a
+  payer never lets a stranger close the vault — it only
+  changes who the close pays. With no payer bound, the
+  destination stays the initializer, so every existing
+  vault closes exactly as before. The batch-close report
+  carries the destination per vault (`rent_recipient` on
+  each closed item), so a single-vault close and a batch
+  close can never disagree about who gets the rent.
+- Orthogonal to AV-34 (the close itself — this item
+  changes the close's recipient, never who may close or
+  which states are closeable), to AV-110 (anyone may top
+  up rent, but the top-up caller does not become the rent
+  payer — the payer is bound once, at setup, by the
+  initializer), and to AV-139 (the unclaimed-rent sweep
+  still pays its caller-specified treasury: the sweep is
+  the fallback for a close that never happened, and it
+  keeps its own destination).
+
+Vault tail +33 bytes (BODY 8122 → 8155, SPACE 8130 →
+8163, no-quorum 7640 → 7673); IDL regenerated, including
+the new field and error code. (Solana: rent economics.)
+
 ## Delivery-confirmation deadline (AV-216)
 
 AV-203 lets the taker confirm receipt but gives the
