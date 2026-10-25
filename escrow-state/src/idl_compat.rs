@@ -1001,6 +1001,7 @@ pub const BREAKING_CHANGE_ALLOWLIST: &[&str] = &[
     "field_added:account Vault.partial_funding",
     // AV-222: the rent payer — appended, never renumbered.
     "field_added:account Vault.rent_payer",
+    "field_added:account Vault.chain_link",
     // AV-208: the delegation spend cap + spent counter — appended
     // to the Delegation named type, never renumbered.
     "field_added:type Delegation.spend_cap",
@@ -1488,7 +1489,7 @@ mod idl_compat_tests {
         // payment-channel errors; AV-200 adds 1 sealed-bid pricing
         // error; AV-201 adds 1 English-auction buyout error; AV-205
         // adds 1 per-call release cap error.
-        assert_eq!(spec.errors.len(), 244); // AV-209 adds 4 winner-payment errors; AV-212 adds 6 credential-gate errors; AV-214 adds 6 option-escrow errors; AV-215 adds 1 delegation-expiry error; AV-217 adds 3 settlement-rate errors; AV-218 adds 2 settlement-allowlist errors; AV-220 adds 1 partial-funding error.
+        assert_eq!(spec.errors.len(), 246); // AV-209 adds 4 winner-payment errors; AV-212 adds 6 credential-gate errors; AV-214 adds 6 option-escrow errors; AV-215 adds 1 delegation-expiry error; AV-217 adds 3 settlement-rate errors; AV-218 adds 2 settlement-allowlist errors; AV-220 adds 1 partial-funding error.
         // AV-178 adds the TieredQuorum + Tier named types; AV-195 adds
         // the SocialRecovery named type; AV-218 adds the
         // SettlementMintAllowlist named type.

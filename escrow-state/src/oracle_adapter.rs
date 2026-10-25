@@ -671,6 +671,6 @@ mod oracle_adapter_tests {
         }
         // AV-193 appends 3 oracle-adapter errors after AV-192's
         // SealedBidBookFull (278).
-        assert_eq!(EscrowError::all().len(), 244); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1
+        assert_eq!(EscrowError::all().len(), 246); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1
     }
 }

@@ -563,6 +563,11 @@ pub struct EscrowSnapshot {
     /// not linked into a swap pair, so indexers see which two vaults
     /// settle as one.
     pub swap_link: Option<[u8; 32]>,
+    /// AV-223: the funding-chain downstream escrow id
+    /// ([`link_chain`](crate::link_chain)) — `None` when the escrow
+    /// is unchained, so indexers see which downstream vault this
+    /// upstream settlement funds.
+    pub chain_link: Option<[u8; 32]>,
     /// AV-106: whether the penalty insurance pool is opted in (see
     /// [`Escrow::with_insurance_pool`](crate::Escrow::with_insurance_pool)).
     pub insurance_pool: bool,
@@ -996,6 +1001,7 @@ impl Escrow {
             // AV-105: the swap counterparty id, so the export shows
             // the pair the escrow settles with.
             swap_link: self.swap_link(),
+            chain_link: self.chain_link(),
             // AV-106: the insurance-pool opt-in, the balance, the
             // pooled principal, the inflow/outflow lines and the
             // at-`now` payout eligibility ride the export — so an
@@ -1783,6 +1789,10 @@ impl EscrowSnapshot {
         // not linked into a swap pair.
         s.push_str(",\"swap_link\":");
         write_opt_hex(&mut s, self.swap_link);
+        // AV-223: the funding-chain downstream id — null when the
+        // escrow is unchained.
+        s.push_str(",\"chain_link\":");
+        write_opt_hex(&mut s, self.chain_link);
         // AV-106: the insurance-pool opt-in, balance, pooled
         // principal, inflow/outflow lines, cumulative payouts, and
         // payout eligibility.
@@ -1994,7 +2004,7 @@ mod snapshot_tests {
              \"slash_terms\":null,\"penalty_paid\":0,\"slash_eligible\":false,\
              \"appeal_window_secs\":0,\"appeal_deadline\":0,\"appeal_state\":\"none\",\"appeal_eligible\":false,\
              \"appeal_bond\":0,\"appeal_bond_paid\":0,\"appeal_expiry_eligible\":false,\
-             \"delegation\":null,\"swap_link\":null,\
+             \"delegation\":null,\"swap_link\":null,\"chain_link\":null,\
              \"insurance_pool\":false,\"pool_paid\":0,\"pool_slashed\":0,\
              \"pool_inflow\":0,\"pool_outflow\":0,\"pool_payout_paid\":0,\
              \"pool_payout_eligible\":false,\

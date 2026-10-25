@@ -1753,6 +1753,15 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(32)?;
         None
     };
+    // AV-223: the funding-chain downstream link — always present,
+    // in vault order after the rent payer: the `Option`
+    // discriminant plus the downstream id (zeroed when unlinked).
+    let chain_link = if c.u8()? != 0 {
+        Some(c.pubkey()?)
+    } else {
+        c.skip(32)?;
+        None
+    };
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -2136,6 +2145,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // initializer, instead of silently reverting to the
         // AV-34 default.
         rent_payer,
+        // AV-223: a decoded escrow carries the same chain link the
+        // setup bound, so a release after a decode still diverts
+        // to the downstream instead of silently settling to the
+        // taker.
+        chain_link,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
@@ -2344,6 +2358,23 @@ mod discriminator_tests {
         assert_eq!(decoded, e);
         assert_eq!(decoded.rent_payer(), Some([0xDD; 32]));
         assert_eq!(decoded.rent_recipient(), [0xDD; 32]);
+    }
+
+    #[test]
+    fn decode_round_trips_chain_link() {
+        // AV-223: the bound downstream id survives the round trip,
+        // so a release after a decode still diverts to the
+        // downstream instead of silently settling to the taker.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        crate::link_chain(&mut e, ALICE, [0xA1; 32], [0xB2; 32]).unwrap();
+        let decoded = decode_vault_account(&account_bytes(&e)).unwrap();
+        assert_eq!(decoded, e);
+        assert_eq!(decoded.chain_link(), Some([0xB2; 32]));
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            decode_vault_account(&account_bytes(&plain)).unwrap().chain_link(),
+            None
+        );
     }
 
     #[test]

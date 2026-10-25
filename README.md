@@ -2944,6 +2944,52 @@ Vault tail +33 bytes (BODY 8122 → 8155, SPACE 8130 →
 8163, no-quorum 7640 → 7673); IDL regenerated, including
 the new field and error code. (Solana: rent economics.)
 
+## Funding chain (AV-223)
+
+`link_swap` (AV-105) settles two vaults atomically, in
+both directions, at one moment — but a staged release
+has no shape: a milestone payout from vault A that is
+supposed to seed vault B (a supplier paid in tranches,
+each tranche funding the next leg) could only be moved
+by hand between the two releases, with nothing linking
+them. `link_chain` (`escrow-state/src/chain.rs`) closes
+it: the opt-in is `Uninitialized`-only, so the downstream
+vault is fixed before any funds move, and the link is
+one-way — A funds B, B carries no back-link. When A
+releases, an agreed amount is diverted to B first: B's
+`funded_amount` accumulates across installments, under-full
+stays pending-funding, and the installment that fills B
+flips it to Funded at that moment; whatever A releases
+beyond B's remaining need follows A's normal release
+path to the taker.
+
+- The diversion reuses the `fund` check order (pause,
+  reentrancy, amount) and B's partial-funding gate: a
+  downstream that does not accept installments refuses
+  the whole release atomically — A releases nothing,
+  rather than settling everything to the taker and
+  silently dropping the chain. A downstream that is
+  already Funded or terminal takes nothing, and the
+  excess follows A's normal path. A plain single-side
+  `release` on a live chain-linked A is refused with the
+  new `ChainLinkActive` (code 353, appended, never
+  renumbered), so the chain can never be bypassed by
+  releasing A outside it.
+- A terminal upstream breaks the chain instead of
+  funding it: cancel, expiry, deadman claim, and
+  dispute-final settlement all clear the link and audit
+  `chain_broken`, so a cancelled A never funds B.
+  Orthogonal to AV-105 (bilateral atomic swap vs.
+  one-way sequential funding) and to AV-220 (B's
+  installment accounting — the chain only deposits
+  into it, it does not change how B counts).
+
+Vault tail +33 bytes (BODY 8155 → 8188, SPACE 8163 →
+8196, no-quorum 7673 → 7706); IDL regenerated,
+including the new field and error codes 353
+`ChainLinkActive`, 354 `InvalidChainLink`.
+(Solana: payment settlement.)
+
 ## Delivery-confirmation deadline (AV-216)
 
 AV-203 lets the taker confirm receipt but gives the

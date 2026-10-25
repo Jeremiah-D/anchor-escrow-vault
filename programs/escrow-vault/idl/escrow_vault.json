@@ -1431,7 +1431,8 @@
           {"name": "settlement_mint", "type": "publicKey", "offset": 7839},
           {"name": "settlement_mint_allowlist", "type": {"option": {"defined": "SettlementMintAllowlist"}}, "offset": 7871},
           {"name": "partial_funding", "type": "bool", "offset": 8129},
-          {"name": "rent_payer", "type": {"option": "publicKey"}, "offset": 8130}
+          {"name": "rent_payer", "type": {"option": "publicKey"}, "offset": 8130},
+          {"name": "chain_link", "type": {"option": "publicKey"}, "offset": 8163}
         ]
       }
     }
@@ -2088,7 +2089,9 @@
     {"code": 349, "name": "InvalidSettlementMintAllowlist"},
     {"code": 350, "name": "SettlementMintNotAllowlisted"},
     {"code": 351, "name": "InvalidPartialFunding"},
-    {"code": 352, "name": "InvalidRentPayer"}
+    {"code": 352, "name": "InvalidRentPayer"},
+    {"code": 353, "name": "ChainLinkActive"},
+    {"code": 354, "name": "InvalidChainLink"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
