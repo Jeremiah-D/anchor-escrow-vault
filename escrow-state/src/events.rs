@@ -3015,6 +3015,14 @@ impl IndexedEscrow {
         Ok(self)
     }
 
+    /// Opt into the settlement mint (mirrors
+    /// [`Escrow::with_settlement_mint`], AV-217). Configuration:
+    /// emits no event.
+    pub fn with_settlement_mint(mut self, settle_mint: [u8; 32]) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_settlement_mint(settle_mint)?;
+        Ok(self)
+    }
+
     /// Declare a release for checker approval (mirrors
     /// [`Escrow::initiate_release`], AV-130 — the *maker* half of the
     /// maker-checker protocol). Emits

@@ -2680,6 +2680,67 @@ refund, not forfeit, them) and to AV-189 English (open ascending bids:
 the winner is public and the next bid is known without a ranking
 walk). (Solana: auction settlement assurance.)
 
+## Settlement-mint conversion (AV-217)
+
+An escrow locks one mint (AV-16) but may settle in another.
+`with_settlement_mint` (`escrow-state/src/lib.rs`,
+`Uninitialized`-only, non-zero key) binds the payout
+denomination, and `release_with_settlement_rate` settles the
+exact plain-`release` guard chain with the returned legs
+redenominated at a dual-signed rate. The rate quote
+(`escrow-state/src/settlement_mint.rs`) carries the settlement
+mint, a rational rate (`numerator` / `denominator`, settle
+units per funded unit), an expiry, and one Ed25519 signature
+from each party over the canonical message; the gate verifies
+expiry first, the mint binding second, a zero denominator
+third, and both signatures last (the AV-210 check order). The
+rate may be sourced from an AV-193 oracle feed quote off
+chain — the gate verifies the parties' signatures over that
+quote, so an oracle quote the parties never signed settles
+nothing.
+
+- Conversion is `floor(funded * numerator / denominator)` in
+  `u128`, floored per leg: the taker payout, the protocol fee
+  leg (the AV-191 referral share rides inside it), and the
+  late-delivery penalty leg (AV-216, zero when no late
+  confirmation was recorded) each convert independently. The
+  dust (under one settle unit per leg) stays with the vault;
+  the funded counters (`released`, `penalty_paid`) still move
+  in funded units, so funded-unit conservation remains the
+  audited identity and the settle-unit legs are transfer
+  sizings, not a second ledger.
+- Fail-closed, before any settlement runs: no settlement mint
+  bound (`SettlementMintNotBound`, 346), an expired quote
+  (`SettlementRateExpired`, 348 — exactly at `expires_at` is
+  still valid, the AV-206 convention), a quote for the wrong
+  mint, a zero denominator, or either signature failing
+  (`SettlementRateInvalid`, 347). A refused settled release
+  moves nothing and charges no fee. The quote is reusable
+  within its validity window (a rate quote, not a one-time
+  voucher) and is re-verified on every call.
+- Plain `release` is untouched: binding a settlement mint
+  changes nothing for the funded-unit path, and the settled
+  path runs the same guard chain — a dual-control escrow
+  still refuses the direct path, a credential-gated escrow
+  still requires its credential path, and a delivery-gated
+  escrow still requires its confirmation. The AV-16 mint
+  allowlist deliberately does not apply to the settlement mint
+  (it governs the funded mint); the dual-signed attestation is
+  the counterfeit protection for this mint.
+
+Vault tail +32 bytes (BODY 7831 → 7863, SPACE 7839 → 7871,
+no-quorum 7349 → 7381); IDL regenerated. Orthogonal to
+AV-113 / AV-193 (the price gate decides whether a payout may
+happen at all — this item decides what currency and amount it
+settles in), to AV-16 (the funded mint is not rebound, the
+payout is redenominated), and to AV-206 / AV-216 (lateness
+prices in funded units first; the settled path converts the
+priced legs, never reprices them). Boundary: a settled
+`release_milestone` variant and an on-chain oracle-verified
+rate path are follow-up work — no such paths are claimed, and
+no Anchor instruction for the settled path is claimed.
+(Solana: cross-mint settlement.)
+
 ## Delivery-confirmation deadline (AV-216)
 
 AV-203 lets the taker confirm receipt but gives the

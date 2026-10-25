@@ -551,6 +551,6 @@ mod rental_escrow_tests {
         ] {
             assert!(EscrowError::all().contains(&e));
         }
-        assert_eq!(EscrowError::all().len(), 237); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors; AV-209: +4; AV-214: +6; AV-215: +1
+        assert_eq!(EscrowError::all().len(), 240); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3
     }
 }

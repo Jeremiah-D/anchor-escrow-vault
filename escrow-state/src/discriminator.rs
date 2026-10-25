@@ -1716,6 +1716,13 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     let delivery_deadline_at = c.u64_le()?;
     let late_delivery_penalty_bps = c.u16_le()?;
     let delivery_late = c.u8()? != 0;
+    // AV-217: the settlement mint pubkey (zero = no settlement
+    // mint bound) — always present, in vault order after the
+    // delivery-deadline tail.
+    let mut settlement_mint = [0u8; 32];
+    for byte in settlement_mint.iter_mut() {
+        *byte = c.u8()?;
+    }
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -2078,6 +2085,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         delivery_deadline_at,
         late_delivery_penalty_bps,
         delivery_late,
+        // AV-217: the settlement mint — a decoded escrow carries
+        // the same denomination the setup bound, so a settled
+        // release prices identically after a decode.
+        settlement_mint,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.

@@ -1427,7 +1427,8 @@
           {"name": "delegation_expires_at", "type": {"option": "u64"}, "offset": 7819},
           {"name": "delivery_deadline_at", "type": "u64", "offset": 7828},
           {"name": "late_delivery_penalty_bps", "type": "u16", "offset": 7836},
-          {"name": "delivery_late", "type": "bool", "offset": 7838}
+          {"name": "delivery_late", "type": "bool", "offset": 7838},
+          {"name": "settlement_mint", "type": "publicKey", "offset": 7839}
         ]
       }
     }
@@ -2067,7 +2068,10 @@
     {"code": 342, "name": "OptionNotExpired"},
     {"code": 343, "name": "OptionAlreadySettled"},
     {"code": 344, "name": "OptionStrikeMismatch"},
-    {"code": 345, "name": "DelegationExpired"}
+    {"code": 345, "name": "DelegationExpired"},
+    {"code": 346, "name": "SettlementMintNotBound"},
+    {"code": 347, "name": "SettlementRateInvalid"},
+    {"code": 348, "name": "SettlementRateExpired"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
