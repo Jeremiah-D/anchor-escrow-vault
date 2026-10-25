@@ -93,6 +93,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `adjust_milestone_amounts(initializer, taker, new_amounts)` (AV-70) | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the tranche table) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition`; rejected once any tranche settled (`released > 0` or `skipped > 0`); new amounts must have the plan's tranche count, be all positive, and sum to exactly the locked amount; per-tranche confirmations survive (they accept the deliverable, not the amount); protocol fees charge on the new amounts at release time (still floored by `fee_cap`); emits `MilestonesAdjusted` only on an actual change |
 | `amend_milestones(initializer, taker, new_amounts)` (AV-155) | `Uninitialized`/`Funded` | — (no state change; rewrites the tranche table) | **both** parties must sign (dual-signature governance); terminal states and `Disputed` are `InvalidStateTransition`; confirmed or settled tranches keep their exact amounts (`InvalidMilestoneAmendment` on reprice); new amounts must have the plan's tranche count, be all positive, and sum to exactly the locked amount; unconfirmed tranches may be repriced mid-flight; in-place rewrite (no realloc); emits `MilestonesAmended` only on an actual change |
 | `reallocate_milestones(initializer, taker, new_amounts)` (AV-224) | `Uninitialized`/`Funded` | — (no state change; rewrites the tranche table) | **both** parties must sign (dual-signature governance); terminal states and `Disputed` are `InvalidStateTransition`; confirmed or settled tranches keep their exact amounts (`InvalidMilestoneAmendment` on reprice); new amounts must have the plan's tranche count and sum to exactly the locked amount; unlike `amend_milestones`, an unconfirmed tranche may be repriced to zero — cleared, not deleted (the plan keeps its tranche count and the in-order sequence still walks the zero slot); the refundable remainder is unchanged (repricing without rerouting, the mirror of `skip_milestone`'s rerouting without repricing); later releases price from the live plan, already-released/skipped amounts are untouched; in-place rewrite (no realloc); emits `MilestonesReallocated` (discriminant 89) only on an actual change, carrying the before/after tranche tables on the event |
+| `with_milestone_claim_deadline(tranche, deadline_secs)` (AV-225) | `Uninitialized` | — (no state change; attaches a per-tranche claim deadline) | opt-in, per-tranche, `Uninitialized`-only (after `with_milestones`; a plan is required, tranche in range, a zero deadline is `InvalidMilestones`); `deadline_secs` is an absolute unix timestamp in seconds, mirroring AV-206 `due_at`; claiming exactly at the deadline is on time, strictly after is expired; a vested (dual-confirmed, past the unlock gate, next in order) tranche claimed after its deadline is rejected with `MilestoneClaimExpired` (code 355) and the tranche amount automatically returns to remainder (`skipped += tranche`, same conservation backstop as `skip_milestone`) — the initializer reclaims it via the normal cancel path, nothing is forfeited; an unconfirmed tranche past its deadline still fails `MilestoneNotConfirmed` and nothing moves; claim semantics before the deadline unchanged; orthogonal to skip (an active action, this is time-expiry auto-return), to AV-51 vesting cliff (the cliff governs unlock time, this governs the claim window), and to AV-224 reallocation (amounts, not claim time); emits `MilestoneClaimExpired` (discriminant 90) carrying the tranche index and the returned amount |
 | `adjust_period_amounts(initializer, taker, new_amounts)` (AV-73) | `Uninitialized`/`Activated`/`Funded` | — (no state change; rewrites the per-period table) | **both** the initializer and the taker must sign (dual-signature governance — one party alone or a stranger pair is `Unauthorized`); terminal states and `Disputed` are `InvalidStateTransition`; released periods lock their recorded amounts (the re-split must reaffirm them — `InvalidSubscription` otherwise); new amounts must have the schedule's period count, be all positive, and sum to exactly the locked amount; protocol fees charge on the new amounts at release time (still floored by `fee_cap`); the keeper's `ReleasePeriod` action prices from the live table; emits `SubscriptionAmountsAdjusted` only on an actual change |
 | `migrate_schema()` (AV-75; AV-85: chain) | any | — (no state change; stamps the schema version) | initializer **only** (`Unauthorized` otherwise, checked before state validity); a paused escrow fails fast (`Paused`); the gate is a catch-up gate (AV-82: `schema_version < SCHEMA_VERSION` runs — an already-current vault refuses the second call and an unknown future version refuses loudly instead of skipping forward, `InvalidSchemaMigration`, code 140, either way); AV-85: the catch-up is now an explicit N → M step chain — each step re-validates the conservation invariants over the field set it carries (`released <= amount`, `released + skipped <= amount`, `fees_paid <= released`, milestone tranche sum `== amount`, plus `released + penalty_paid <= amount` from the 1 → 2 step on) and any failing step rolls the chain back to the pre-chain snapshot (zero partial migration) — a corrupt vault is refused, never migrated; emits one `SchemaMigrated` per applied step (from == to == the current state, each carrying its from → to versions), always on success; the read-only `migrate_dry_run` previews the step/field plan with zero write impact |
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
@@ -1019,6 +1020,34 @@ only ever hold late penalties. Note the scope boundary: this item is
 the state machine (`escrow-state`) — the Anchor instruction that
 attaches deadlines at vault creation and the on-chain routing of the
 penalty slice are follow-up Anchor work, not claimed here.
+
+**Milestone tranche claim deadline (AV-225).** A plan gives tranches no
+claim window: a vested tranche could sit unclaimed forever while the
+escrow stays `Funded`. `with_milestone_claim_deadline(tranche,
+deadline_secs)` (after `with_milestones`, `Uninitialized`-only, opt-in
+per tranche) attaches one absolute unix-timestamp deadline per tranche
+— `0` means no deadline, exactly as AV-206 due dates. A tranche that is
+vested but still unclaimed strictly after its deadline cannot be
+claimed: `release_milestone` rejects the claim with
+`MilestoneClaimExpired` (code 355) and the tranche amount automatically
+returns to remainder (the skip path's `skipped += tranche`, same
+conservation backstop), so the initializer reclaims it through the
+normal cancel path — nothing is forfeited. Claiming exactly at the
+deadline is on time; claim semantics before the deadline are unchanged.
+An unconfirmed tranche past its deadline still fails
+`MilestoneNotConfirmed` and nothing moves — expiry only fires on a
+vested tranche. The escrow stays `Funded`, later tranches continue, and
+all three release paths (`release_milestone`,
+`release_milestone_verified`, `release_milestone_slot_gated`) share the
+check. The `MilestoneClaimExpired` event (discriminant 90) carries the
+tranche index and the returned amount. Orthogonal to milestone skip (an
+active action, this is time-expiry auto-return), to AV-51 vesting cliff
+(the cliff governs unlock time, this governs the claim window), and to
+AV-224 reallocation (amounts, not claim time).
+
+Vault tail +64 bytes (BODY 8188 → 8252, SPACE 8196 → 8260, no-quorum
+7706 → 7770); IDL regenerated, including the new field and error code
+355 `MilestoneClaimExpired`. (Solana: payment settlement.)
 
 **Vote-escrow locks (AV-207).** Time-weighted governance voting
 power, as a pure-logic sidecar (`escrow-state/src/vote_escrow.rs`,

@@ -155,6 +155,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // AV-155: a milestone repricing moves no funds.
         | EscrowEventKind::MilestonesAmended
         | EscrowEventKind::MilestonesReallocated
+        // AV-225: an expired claim is a reclassification, not a
+        // settlement — the tranche stays in the lockup (it joins
+        // the refundable remainder, like `MilestoneSkipped`), so the
+        // fold books nothing now; the tranche is counted exactly
+        // once, inside the later cancel/resolve refund.
+        | EscrowEventKind::MilestoneClaimExpired
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -677,6 +683,10 @@ mod event_sourcing_tests {
             // live-emit extra, not part of the synth projection —
             // `None` here, like the other kind-specific extras.
             milestone_reallocation: None,
+            // AV-225: the expired tranche index is a live-emit
+            // extra, not part of the synth projection — `None`
+            // here, like the other kind-specific extras.
+            milestone_claim_expired: None,
         }
     }
 
@@ -783,6 +793,9 @@ mod event_sourcing_tests {
                 // AV-155: a milestone repricing moves no funds.
                 | EscrowEventKind::MilestonesAmended
                 | EscrowEventKind::MilestonesReallocated
+                // AV-225: an expired claim moves no funds (same
+                // reclassification rule as the production fold).
+                | EscrowEventKind::MilestoneClaimExpired
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

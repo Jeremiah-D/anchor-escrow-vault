@@ -254,6 +254,10 @@ pub fn csv_to_events(csv: &str) -> Result<Vec<EscrowEvent>, CsvError> {
             // carried by the CSV projection either — `None` on
             // import, like the other kind-specific extras.
             milestone_reallocation: None,
+            // AV-225: the expired tranche index is not carried by
+            // the CSV projection either — `None` on import, like
+            // the other kind-specific extras.
+            milestone_claim_expired: None,
         });
     }
     Ok(events)

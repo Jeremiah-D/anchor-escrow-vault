@@ -1432,7 +1432,8 @@
           {"name": "settlement_mint_allowlist", "type": {"option": {"defined": "SettlementMintAllowlist"}}, "offset": 7871},
           {"name": "partial_funding", "type": "bool", "offset": 8129},
           {"name": "rent_payer", "type": {"option": "publicKey"}, "offset": 8130},
-          {"name": "chain_link", "type": {"option": "publicKey"}, "offset": 8163}
+          {"name": "chain_link", "type": {"option": "publicKey"}, "offset": 8163},
+          {"name": "milestone_claim_deadlines", "type": {"array": ["u64", 8]}, "offset": 8196}
         ]
       }
     }
@@ -2091,7 +2092,8 @@
     {"code": 351, "name": "InvalidPartialFunding"},
     {"code": 352, "name": "InvalidRentPayer"},
     {"code": 353, "name": "ChainLinkActive"},
-    {"code": 354, "name": "InvalidChainLink"}
+    {"code": 354, "name": "InvalidChainLink"},
+    {"code": 355, "name": "MilestoneClaimExpired"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

@@ -209,6 +209,8 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // AV-155: a milestone repricing moves no funds.
         | EscrowEventKind::MilestonesAmended
         | EscrowEventKind::MilestonesReallocated
+        // AV-225: an expired claim carries no fee leg.
+        | EscrowEventKind::MilestoneClaimExpired
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -860,6 +862,8 @@ mod fee_history_tests {
                 // AV-155: a milestone repricing moves no funds.
                 | EscrowEventKind::MilestonesAmended
                 | EscrowEventKind::MilestonesReallocated
+                // AV-225: an expired claim carries no fee leg.
+                | EscrowEventKind::MilestoneClaimExpired
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

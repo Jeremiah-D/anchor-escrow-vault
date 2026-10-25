@@ -540,6 +540,6 @@ mod tests {
             assert!(EscrowError::all().contains(&e));
         }
         // Count covers the whole table; AV-190 bumps it to 171.
-        assert_eq!(EscrowError::all().len(), 246); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1
+        assert_eq!(EscrowError::all().len(), 247); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1
     }
 }

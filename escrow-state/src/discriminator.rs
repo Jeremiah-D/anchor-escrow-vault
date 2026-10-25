@@ -1762,6 +1762,13 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         c.skip(32)?;
         None
     };
+    // AV-225: per-tranche claim deadlines — always present, in
+    // vault order after the chain link: one u64 per tranche
+    // (zeroed when no deadline is attached for that tranche).
+    let mut milestone_claim_deadlines = [0u64; MAX_MILESTONES];
+    for slot in milestone_claim_deadlines.iter_mut() {
+        *slot = c.u64_le()?;
+    }
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -2150,6 +2157,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // to the downstream instead of silently settling to the
         // taker.
         chain_link,
+        // AV-225: a decoded escrow carries the same per-tranche
+        // claim deadlines the setup bound, so a claim after a
+        // decode still expires on the same calendar instead of
+        // silently settling a lapsed tranche.
+        milestone_claim_deadlines,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
@@ -2373,6 +2385,34 @@ mod discriminator_tests {
         let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
         assert_eq!(
             decode_vault_account(&account_bytes(&plain)).unwrap().chain_link(),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_round_trips_milestone_claim_deadlines() {
+        // AV-225: the per-tranche claim deadlines survive the round
+        // trip, so a claim after a decode still expires on the same
+        // calendar instead of silently settling a lapsed tranche.
+        let plan = crate::MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap()
+            .with_milestone_claim_deadline(1, 1_750_000_000)
+            .unwrap();
+        let decoded = decode_vault_account(&account_bytes(&e)).unwrap();
+        assert_eq!(decoded, e);
+        assert_eq!(decoded.milestone_claim_deadline_at(0), None);
+        assert_eq!(
+            decoded.milestone_claim_deadline_at(1),
+            Some(1_750_000_000)
+        );
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            decode_vault_account(&account_bytes(&plain))
+                .unwrap()
+                .milestone_claim_deadline_at(0),
             None
         );
     }
