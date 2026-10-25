@@ -2680,6 +2680,43 @@ refund, not forfeit, them) and to AV-189 English (open ascending bids:
 the winner is public and the next bid is known without a ranking
 walk). (Solana: auction settlement assurance.)
 
+## Delivery inspection period (AV-211)
+
+`confirm_delivery` (AV-203) opens the payout paths immediately: a
+taker who confirms and then discovers the delivery is defective has
+no on-escrow way to hold the release. `InspectionPeriod`
+(`escrow-state/src/inspection.rs`) is the post-confirmation
+inspection window anchored to the delivery confirmation itself
+(`confirmed_at` + `inspection_secs`, seconds): inside the window the
+taker — and only the taker — may `dispute` to freeze the release
+(a stranger is refused before any window check); at or after the
+deadline, `settle` releases automatically, so no second `release`
+call is needed and no party can stall a quiet deal by never calling
+again. Settling early is `InspectionNotDue` (the window runs its full
+course); disputing at or after the deadline is
+`InspectionWindowExpired` (the caller must `settle` instead); a
+disputed window never auto-releases — `settle` on it fails closed
+and the freeze stands until an arbiter resolves it (AV-14), with no
+un-dispute path. The deadline second belongs to the next phase (the
+AV-206 convention): a dispute exactly at `expires_at` is already
+late, a settle exactly at `expires_at` already releases.
+
+New error codes (never renumbered): `InspectionInvalidWindow`
+(329), `InspectionNotTaker` (330), `InspectionWindowExpired` (331),
+`InspectionNotDue` (332). Pure logic: no Vault layout change, no
+`VAULT_SPACE` bump (IDL regenerated for the 4 new errors only).
+Orthogonal to AV-112 (release-intent cooling: announced intent,
+either party may veto, plain `release` only, never an automatic
+release — this window is taker-only, anchored to delivery
+confirmation, and does auto-release on quiet expiry), to AV-14 (the
+dispute window anchored to escrow expiry, escalatable by either
+party), and to AV-210 (a third party's attestation, not the taker's
+own silence). Boundary: `settle` returns the release *decision*;
+the actual payout stays the Anchor program's job, and the Anchor
+instruction wiring the window to `confirm_delivery` is follow-up
+work — no such instruction is claimed. (Solana: delivery
+inspection.)
+
 ## Referrer revenue share (AV-191)
 
 Escrows can carry an optional referrer: `with_referrer(referrer, bps)`

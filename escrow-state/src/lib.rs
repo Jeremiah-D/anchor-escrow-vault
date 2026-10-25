@@ -655,6 +655,13 @@ pub use winner_payment::{
     rank_revealed_bidders, RevealedBid, WinnerPaymentExpiry, WinnerPaymentReceipt,
     WinnerPaymentState, WinnerPaymentWindow,
 };
+// AV-211: delivery inspection period — the taker's post-confirmation
+// inspection window with automatic release on quiet expiry. Pure
+// logic: no Vault layout change, no VAULT_SPACE bump (the window
+// decision lives off the Vault; funds move only through the Anchor
+// program, like AV-209's winner-payment window).
+mod inspection;
+pub use inspection::{InspectionPeriod, InspectionRelease, InspectionState};
 // AV-195: social recovery — the M-of-N guardian key-loss escape hatch
 // for the initializer. The policy (`SocialRecovery`) is configured
 // `Uninitialized`-only and persisted on the `Escrow` like the AV-14
@@ -4180,6 +4187,27 @@ pub enum EscrowError {
     /// one release, and that release already settled. Never
     /// renumbered (see [`EscrowError::code`]).
     MilestoneAttestationReplay,
+    /// AV-211: [`InspectionPeriod::new`](crate::InspectionPeriod::new)
+    /// with a zero taker key, a zero inspection window, or a
+    /// deadline that overflows `u64` — a window that could never be
+    /// inspected, or whose deadline cannot be represented, must not
+    /// be constructed. Never renumbered (see [`EscrowError::code`]).
+    InspectionInvalidWindow,
+    /// AV-211: [`InspectionPeriod::dispute`](crate::InspectionPeriod::dispute)
+    /// by anyone other than the window's taker — refused before any
+    /// window check, so a prober learns nothing about the window.
+    /// Never renumbered (see [`EscrowError::code`]).
+    InspectionNotTaker,
+    /// AV-211: [`InspectionPeriod::dispute`](crate::InspectionPeriod::dispute)
+    /// at or after the window's deadline — the window is over, so
+    /// the caller must `settle` instead of disputing a closed window.
+    /// Never renumbered (see [`EscrowError::code`]).
+    InspectionWindowExpired,
+    /// AV-211: [`InspectionPeriod::settle`](crate::InspectionPeriod::settle)
+    /// before the window's deadline — the window is the taker's, and
+    /// it runs its full course before any automatic release. Never
+    /// renumbered (see [`EscrowError::code`]).
+    InspectionNotDue,
 }
 
 impl EscrowError {
@@ -4550,6 +4578,11 @@ impl EscrowError {
             EscrowError::MilestoneAttestationInvalid => 326,
             EscrowError::MilestoneAttestationExpired => 327,
             EscrowError::MilestoneAttestationReplay => 328,
+            // AV-211: appended, never renumbered.
+            EscrowError::InspectionInvalidWindow => 329,
+            EscrowError::InspectionNotTaker => 330,
+            EscrowError::InspectionWindowExpired => 331,
+            EscrowError::InspectionNotDue => 332,
         }
     }
 
@@ -4902,6 +4935,11 @@ impl EscrowError {
             EscrowError::MilestoneAttestationInvalid,
             EscrowError::MilestoneAttestationExpired,
             EscrowError::MilestoneAttestationReplay,
+            // AV-211: appended, never renumbered.
+            EscrowError::InspectionInvalidWindow,
+            EscrowError::InspectionNotTaker,
+            EscrowError::InspectionWindowExpired,
+            EscrowError::InspectionNotDue,
         ]
     }
 }
@@ -34419,6 +34457,27 @@ mod error_code_tests {
             328,
             "a verifier attestation replayed for an already-released milestone (AV-210)",
         ),
+        // AV-211: appended, never renumbered.
+        (
+            EscrowError::InspectionInvalidWindow,
+            329,
+            "InspectionPeriod::new with a zero taker key, a zero inspection window, or an overflowing deadline (AV-211)",
+        ),
+        (
+            EscrowError::InspectionNotTaker,
+            330,
+            "InspectionPeriod::dispute by anyone other than the window's taker (AV-211)",
+        ),
+        (
+            EscrowError::InspectionWindowExpired,
+            331,
+            "InspectionPeriod::dispute at or after the window's deadline — settle instead (AV-211)",
+        ),
+        (
+            EscrowError::InspectionNotDue,
+            332,
+            "InspectionPeriod::settle before the window's deadline (AV-211)",
+        ),
     ];
 
     #[test]
@@ -60385,7 +60444,7 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceStale));
         assert_eq!(EscrowError::OraclePriceUnreliable.code(), 281);
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceUnreliable));
-        assert_eq!(EscrowError::all().len(), 220); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4
+        assert_eq!(EscrowError::all().len(), 224); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4
     }
 
     #[test]

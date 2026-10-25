@@ -2045,7 +2045,11 @@
     {"code": 325, "name": "MilestoneVerifierNotBound"},
     {"code": 326, "name": "MilestoneAttestationInvalid"},
     {"code": 327, "name": "MilestoneAttestationExpired"},
-    {"code": 328, "name": "MilestoneAttestationReplay"}
+    {"code": 328, "name": "MilestoneAttestationReplay"},
+    {"code": 329, "name": "InspectionInvalidWindow"},
+    {"code": 330, "name": "InspectionNotTaker"},
+    {"code": 331, "name": "InspectionWindowExpired"},
+    {"code": 332, "name": "InspectionNotDue"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
