@@ -16158,6 +16158,67 @@ let fee = self.charge_protocol_fee(claimable)?;
         self.appeal_ballot
     }
 
+    /// Revise the slash-appeal window after funding (AV-236 —
+    /// Solana dispute-appeal governance): both parties may
+    /// renegotiate how long the taker gets to appeal a future
+    /// slash, without redeploying or refunding the escrow.
+    ///
+    /// Why: the window set before funding may prove too short
+    /// (a taker travelling when a slash lands) or too long (a
+    /// legitimate slash stalled for a week). A dual-signed
+    /// revision lets the parties retune it to the dispute climate
+    /// they actually face.
+    ///
+    /// Governance: dual signature — both the initializer and the
+    /// taker must authorize, paralleling
+    /// [`Escrow::amend_arbiter_fee`]. `Funded`-only: the builder
+    /// [`Escrow::with_appeal_window`] owns the initial set, and a
+    /// settled or disputed escrow's window is fixed (a dispute in
+    /// flight must not move). A zero window is
+    /// [`EscrowError::InvalidAppealWindow`] (code 146 — a
+    /// zero-second window makes an appeal expire on arrival, the
+    /// same rejection as the builder). A paused escrow fails fast
+    /// ([`EscrowError::Paused`]).
+    ///
+    /// Scope: only slashes executed AFTER the amendment read the
+    /// new window. [`Escrow::slash`] stamps `appeal_deadline` from
+    /// the live field at slash time, so an already-stamped
+    /// deadline — a filed appeal under review, or a slash
+    /// awaiting filing — keeps its original window; the amendment
+    /// never shortens or extends a live appeal. Orthogonal to
+    /// [`Escrow::with_appeal_window`] (`Uninitialized`-only
+    /// initial configuration) and to AV-235's
+    /// [`Escrow::amend_arbiter_fee`] (that moves the arbiter fee;
+    /// this moves the appeal window — different field, different
+    /// governance consequence). Emits `AppealWindowAmended` on
+    /// the event layer.
+    pub fn amend_appeal_window(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        window_secs: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_arbiter_fee`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if window_secs == 0 {
+            return Err(EscrowError::InvalidAppealWindow);
+        }
+        // All checks pass before any write. No deadline is touched
+        // here: `slash` stamps `appeal_deadline` from this field at
+        // slash time, so only future slashes see the new window.
+        self.appeal_window_secs = window_secs;
+        Ok(())
+    }
+
     /// Opt in to an appeal bond (AV-103 — Solana dispute economics /
     /// anti-griefing): require the taker to lock `bond` lamports (or
     /// base-token units) when filing a slash appeal, via
@@ -45201,7 +45262,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -61141,7 +61202,7 @@ mod event_history_tests {
             Some(EscrowEventKind::ClaimantRosterAmended),
             "AV-227: appended after MilestoneTrancheAppended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -61323,9 +61384,10 @@ mod event_history_tests {
         // `MilestoneUnskipped` (AV-232), 97 is
         // `ProtocolFeeAmended` (AV-233), 98 is
         // `MilestoneVerifierRotated` (AV-234), 99 is
-        // `ArbiterFeeAmended` (AV-235) and 100 is the
+        // `ArbiterFeeAmended` (AV-235), 100 is
+        // `AppealWindowAmended` (AV-236) and 101 is the
         // first still-unknown byte.
-        for bad in [100u8, 255] {
+        for bad in [101u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -67385,6 +67447,95 @@ mod appeal_tests {
         assert!(e.is_appeal_eligible(DEADLINE + WINDOW), "window is inclusive");
         assert!(!e.is_appeal_eligible(DEADLINE + WINDOW + 1));
         assert_eq!(e.appeal_state(), AppealState::None);
+    }
+
+    // ----- AV-236: post-funding appeal-window amendment -----
+
+    #[test]
+    fn amend_appeal_window_revises_only_future_slashes() {
+        // A funded escrow whose slash has not happened yet: the
+        // amendment retunes the window, and the slash that follows
+        // stamps its deadline from the NEW window.
+        let mut e = windowed_uninitialized()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.amend_appeal_window(ALICE, BOB, 3600).unwrap();
+        assert_eq!(e.appeal_window_secs(), 3600);
+        assert_eq!(e.state(), EscrowState::Funded);
+        e.slash(ALICE, 200_000, None, DEADLINE).unwrap();
+        assert_eq!(e.appeal_deadline(), DEADLINE + 3600);
+        assert!(e.is_appeal_eligible(DEADLINE + 3600), "new window is inclusive");
+        assert!(!e.is_appeal_eligible(DEADLINE + 3600 + 1));
+    }
+
+    #[test]
+    fn amend_appeal_window_leaves_stamped_deadline_untouched() {
+        // The slash already happened under the 7-day window: the
+        // amendment moves the configured window but the stamped
+        // deadline — the live appeal's clock — does not move, so
+        // the taker can still file at the very end of the OLD
+        // window even though the new window is only one hour.
+        let mut e = windowed_slashed();
+        assert_eq!(e.appeal_deadline(), DEADLINE + WINDOW);
+        e.amend_appeal_window(ALICE, BOB, 3600).unwrap();
+        assert_eq!(e.appeal_window_secs(), 3600);
+        assert_eq!(e.appeal_deadline(), DEADLINE + WINDOW);
+        assert_eq!(e.file_appeal(BOB, DEADLINE + WINDOW).unwrap(), 0);
+        assert_eq!(e.appeal_state(), AppealState::Filed);
+    }
+
+    #[test]
+    fn amend_appeal_window_rejects_state_authority_zero_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial
+        // set.
+        let mut bare = windowed_uninitialized();
+        assert_eq!(
+            bare.amend_appeal_window(ALICE, BOB, 3600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.appeal_window_secs(), WINDOW);
+        // Dual signature: one party alone cannot shorten (or
+        // lengthen) the other's appeal time.
+        let mut e = windowed_uninitialized()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            e.amend_appeal_window(ALICE, ALICE, 3600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_appeal_window([0xCC; 32], BOB, 3600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.appeal_window_secs(), WINDOW);
+        // A zero window makes an appeal expire on arrival — the
+        // same rejection as the builder — and a failed amendment
+        // leaves the window untouched.
+        assert_eq!(
+            e.amend_appeal_window(ALICE, BOB, 0),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+        assert_eq!(EscrowError::InvalidAppealWindow.code(), 146);
+        assert_eq!(e.appeal_window_secs(), WINDOW);
+        // The pause guard fires before the authority and state
+        // gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_appeal_window(ALICE, BOB, 3600),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.appeal_window_secs(), WINDOW);
     }
 
     #[test]

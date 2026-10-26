@@ -183,6 +183,9 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // AV-235: a revised arbiter fee moves no funds — the new
         // fee prices only the later dispute settlements.
         | EscrowEventKind::ArbiterFeeAmended
+        // AV-236: a revised appeal window moves no funds — the new
+        // window stamps only the later slashes' appeal deadlines.
+        | EscrowEventKind::AppealWindowAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -851,6 +854,9 @@ mod event_sourcing_tests {
         | EscrowEventKind::MilestoneVerifierRotated
         // AV-235: a revised arbiter fee moves no funds.
         | EscrowEventKind::ArbiterFeeAmended
+        // AV-236: a revised appeal window moves no funds — the new
+        // window stamps only the later slashes' appeal deadlines.
+        | EscrowEventKind::AppealWindowAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

@@ -122,6 +122,12 @@
 //!   on every successful amendment (AV-235) — `from == to ==` the
 //!   current state, all amounts zero; the amended fee legs are read
 //!   from the vault. A failed amendment emits nothing.
+//! - `amend_appeal_window` emits [`EscrowEventKind::AppealWindowAmended`]
+//!   on every successful amendment (AV-236) — `from == to ==` the
+//!   current state, all amounts zero; the amended window is read
+//!   from the vault, and only slashes executed after the amendment
+//!   stamp their appeal deadline from it. A failed amendment emits
+//!   nothing.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -314,6 +320,7 @@
 //! | ProtocolFeeAmended (AV-233) | 0 | 0 | 0 | 0 — amending moves no funds; later payouts reprice from the vault |
 //! | MilestoneVerifierRotated (AV-234) | 0 | 0 | 0 | 0 — rotating moves no funds; later attestation checks read the new key from the vault |
 //! | ArbiterFeeAmended (AV-235) | 0 | 0 | 0 | 0 — amending moves no funds; later dispute settlements price from the vault |
+//! | AppealWindowAmended (AV-236) | 0 | 0 | 0 | 0 — amending moves no funds; later slashes stamp their appeal deadline from the vault |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1262,6 +1269,18 @@ pub enum EscrowEventKind {
     /// legs are read from the vault, so the event needs no extra
     /// field.
     ArbiterFeeAmended,
+    /// AV-236: the slash-appeal window was revised by dual-signed
+    /// governance
+    /// ([`Escrow::amend_appeal_window`](crate::Escrow::amend_appeal_window)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::ArbiterFeeAmended`]); all amounts are
+    /// zero — amending moves no funds (only slashes executed after
+    /// the amendment stamp their appeal deadline from the new
+    /// window; an already-stamped deadline is untouched). The
+    /// amended window is read from the vault, so the event needs
+    /// no extra field.
+    AppealWindowAmended,
 }
 
 impl EscrowEventKind {
@@ -1529,6 +1548,10 @@ impl EscrowEventKind {
             // discriminants 0–98 stay stable for already-serialized
             // histories.
             99 => Self::ArbiterFeeAmended,
+            // AV-236: appended after ArbiterFeeAmended so
+            // discriminants 0–99 stay stable for already-serialized
+            // histories.
+            100 => Self::AppealWindowAmended,
             _ => return None,
         })
     }
@@ -1698,6 +1721,10 @@ impl EscrowEventKind {
             // the name table stays stable for already-serialized
             // histories.
             Self::ArbiterFeeAmended => "arbiter_fee_amended",
+            // AV-236: appended after arbiter_fee_amended so
+            // the name table stays stable for already-serialized
+            // histories.
+            Self::AppealWindowAmended => "appeal_window_amended",
         }
     }
 
@@ -1871,6 +1898,10 @@ impl EscrowEventKind {
             // the name table stays stable for already-serialized
             // histories.
             "arbiter_fee_amended" => Self::ArbiterFeeAmended,
+            // AV-236: appended after arbiter_fee_amended so
+            // the name table stays stable for already-serialized
+            // histories.
+            "appeal_window_amended" => Self::AppealWindowAmended,
             _ => return None,
         })
     }
@@ -6456,6 +6487,40 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the slash-appeal window after funding (mirrors
+    /// [`Escrow::amend_appeal_window`]). Emits `AppealWindowAmended`
+    /// (`from == to ==` the current state — the window, not the
+    /// lifecycle state, is what changed; all amounts zero, since
+    /// amending moves no funds — only slashes executed after the
+    /// amendment stamp their appeal deadline from the new window).
+    /// The amended window is read from the vault, so the event
+    /// needs no extra field. A failed amendment emits nothing:
+    /// the core call returns before any event is pushed.
+    pub fn amend_appeal_window(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        window_secs: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner
+            .amend_appeal_window(initializer, taker, window_secs)?;
+        self.push_event(
+            EscrowEventKind::AppealWindowAmended,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// The live milestone tranche table as a fixed
     /// `MAX_MILESTONES` array (entries past the plan's count are
     /// zero): the shape the `MilestonesReallocated` event carries
@@ -9947,6 +10012,67 @@ mod event_tests {
     }
 
     #[test]
+    fn amend_appeal_window_emits_event_and_failed_amend_emits_nothing() {
+        // AV-236: a dual-signed revision emits AppealWindowAmended
+        // (discriminant 100, appended last) with zero amounts — a
+        // window revision, not a settlement — and the amended
+        // window is read from the vault. A refused revision emits
+        // nothing. Orthogonal to AV-235's ArbiterFeeAmended: a
+        // different field, a different governance consequence.
+        assert_eq!(EscrowEventKind::AppealWindowAmended.discriminant(), 100);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(100),
+            Some(EscrowEventKind::AppealWindowAmended)
+        );
+        assert_eq!(
+            EscrowEventKind::AppealWindowAmended.name(),
+            "appeal_window_amended"
+        );
+        assert_eq!(
+            EscrowEventKind::from_name("appeal_window_amended"),
+            Some(EscrowEventKind::AppealWindowAmended)
+        );
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_appeal_window(86_400)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        // A one-party revision fails and emits nothing: the last
+        // event is still Funded.
+        assert_eq!(
+            e.amend_appeal_window(ALICE, ALICE, 3600, T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(last(&e).kind, EscrowEventKind::Funded);
+        // A zero-window revision fails and emits nothing, with the
+        // window untouched.
+        assert_eq!(
+            e.amend_appeal_window(ALICE, BOB, 0, T0 + 2),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+        assert_eq!(last(&e).kind, EscrowEventKind::Funded);
+        assert_eq!(e.inner().appeal_window_secs(), 86_400);
+        e.amend_appeal_window(ALICE, BOB, 3600, T0 + 3).unwrap();
+        assert_event(
+            &last(&e),
+            EscrowEventKind::AppealWindowAmended,
+            2,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            0,
+            0,
+            0,
+            T0 + 3,
+        );
+        assert_eq!(e.inner().appeal_window_secs(), 3600);
+        let history = e.inner().event_history();
+        assert_eq!(
+            history.last().unwrap().kind,
+            EscrowEventKind::AppealWindowAmended
+        );
+    }
+
+    #[test]
     fn failed_reallocate_milestones_emits_nothing() {
         // Repricing a confirmed tranche is InvalidMilestoneAmendment
         // (the AV-155 amendment error): the failed governance call
@@ -10762,7 +10888,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -10865,7 +10991,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11402,7 +11528,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11417,7 +11543,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11429,7 +11555,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11441,7 +11567,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11453,7 +11579,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11468,7 +11594,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11483,7 +11609,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11495,7 +11621,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11507,7 +11633,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11519,7 +11645,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11531,7 +11657,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11543,7 +11669,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11555,7 +11681,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11571,7 +11697,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11586,7 +11712,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11601,7 +11727,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11616,7 +11742,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11631,7 +11757,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_reallocated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11647,7 +11773,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_claim_expired"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11663,7 +11789,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_tranche_appended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11679,7 +11805,7 @@ mod event_tests {
             EscrowEventKind::from_name("claimant_roster_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11694,7 +11820,7 @@ mod event_tests {
             EscrowEventKind::from_name("delivery_confirmed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
@@ -11726,7 +11852,7 @@ mod event_tests {
             EscrowEventKind::from_name("governance_cancelled"),
             Some(cancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
     }
 
     #[test]
