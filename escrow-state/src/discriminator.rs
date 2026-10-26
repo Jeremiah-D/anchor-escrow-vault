@@ -1769,6 +1769,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     for slot in milestone_claim_deadlines.iter_mut() {
         *slot = c.u64_le()?;
     }
+    // AV-228: the funding start window — always present, in vault
+    // order after the claim-deadline table: one u64 (zeroed when
+    // no window is attached).
+    let funding_start = c.u64_le()?;
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -2162,6 +2166,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // decode still expires on the same calendar instead of
         // silently settling a lapsed tranche.
         milestone_claim_deadlines,
+        // AV-228: a decoded escrow carries the same funding start
+        // window the setup bound, so funding after a decode is
+        // still refused before the window instead of silently
+        // accepting an early deposit.
+        funding_start,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
@@ -2414,6 +2423,32 @@ mod discriminator_tests {
                 .unwrap()
                 .milestone_claim_deadline_at(0),
             None
+        );
+    }
+
+    #[test]
+    fn decode_round_trips_funding_start() {
+        // AV-228: the funding start window survives the round trip,
+        // so funding after a decode is still refused before the
+        // window instead of silently accepting an early deposit.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_funding_start(1_700_000_000)
+            .unwrap();
+        let decoded = decode_vault_account(&account_bytes(&e)).unwrap();
+        assert_eq!(decoded, e);
+        assert_eq!(decoded.funding_start(), 1_700_000_000);
+        let mut early = decoded;
+        assert_eq!(
+            early.fund(ALICE, 1_699_999_999),
+            Err(crate::EscrowError::FundingNotStarted)
+        );
+        let plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            decode_vault_account(&account_bytes(&plain))
+                .unwrap()
+                .funding_start(),
+            0
         );
     }
 
