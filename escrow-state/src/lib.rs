@@ -18306,6 +18306,85 @@ let fee = self.charge_protocol_fee(claimable)?;
         self.fee_bps
     }
 
+    /// Revise the protocol fee rate and ceiling after funding
+    /// (AV-233 — Solana/DeFi fee governance / payment fintech):
+    /// the initializer and the taker may jointly renegotiate what
+    /// later taker payouts cost — a deal that grows may justify a
+    /// lower rate, a deal that shrinks a higher one — without
+    /// cancelling and re-locking.
+    ///
+    /// Check order mirrors [`Escrow::amend_milestone_due_dates`]:
+    /// pause, then dual-signature authority (both parties must
+    /// authorize — one party alone cannot raise the fee on the
+    /// other's payouts), then `Funded` state, then the rate's
+    /// shape. Validation completes before any write, so a failed
+    /// amendment leaves rate and cap untouched (fail-closed,
+    /// zero-write).
+    ///
+    /// Rate semantics (all failures are
+    /// [`EscrowError::InvalidProtocolFee`], the AV-17/AV-66 fee
+    /// error):
+    /// - `fee_bps <= 10_000` — a rate past 100% would take more
+    ///   than the payout;
+    /// - a configured tiered schedule ([`Escrow::with_fee_schedule`])
+    ///   rejects the amendment outright: the flat rate and the
+    ///   schedule are mutually exclusive (AV-66), and
+    ///   [`Escrow::protocol_fee_for`] prices from the schedule
+    ///   whenever one is configured — accepting a flat rate there
+    ///   would silently discard it. Amendment never replaces a
+    ///   schedule; the schedule stays fixed for the deal's life.
+    /// - `fee_cap` is set together with the rate (atomically — one
+    ///   call, one governance decision): `0` means uncapped, the
+    ///   same convention as [`Escrow::with_fee_cap`].
+    ///
+    /// Only later payouts reprice: [`Escrow::protocol_fee_for`]
+    /// reads the live fields, so every taker payout after the
+    /// amendment (`release`, `claim`, `release_milestone`, the
+    /// taker's `resolve` share, `release_period`) charges the new
+    /// rate floored by the new cap, while `fees_paid` — and every
+    /// fee already charged — is never repriced. Amendment does not
+    /// require a pre-existing fee: with both parties signing, a
+    /// first-time rate is a renegotiation, not a surprise cut.
+    /// Orthogonal to [`Escrow::with_protocol_fee`] /
+    /// [`Escrow::with_fee_schedule`] / [`Escrow::with_fee_cap`]
+    /// (all `Uninitialized`-only initial configuration — this is
+    /// the `Funded`-only revision path) and to AV-67's
+    /// [`Escrow::rotate_fee_recipient`] (that moves the fee's
+    /// *destination*; this moves the fee's *rate* — the recipient
+    /// is untouched here). Emits `ProtocolFeeAmended` on the event
+    /// layer.
+    pub fn amend_protocol_fee(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        fee_bps: u16,
+        fee_cap: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_milestone_due_dates`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // A tiered schedule owns the rate: a flat amendment here
+        // would be silently discarded by `protocol_fee_for`.
+        if self.fee_schedule.is_configured() {
+            return Err(EscrowError::InvalidProtocolFee);
+        }
+        if fee_bps > 10_000 {
+            return Err(EscrowError::InvalidProtocolFee);
+        }
+        // All checks pass before any write.
+        self.fee_bps = fee_bps;
+        self.fee_cap = fee_cap;
+        Ok(())
+    }
+
     /// Cumulative protocol fee charged across all payouts (AV-17).
     /// Always `<= released_amount()`: the fee is a routing slice of the
     /// gross payouts, and `payout + fee == gross` for every payout.
@@ -44970,7 +45049,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -48821,6 +48900,119 @@ mod vesting_tests {
             no_plan.unskip_milestone(ALICE, BOB, 0),
             Err(EscrowError::InvalidMilestones)
         );
+    }
+
+    // ----- AV-233: protocol-fee amendment -----
+
+    fn funded_fee_milestone_escrow() -> Escrow {
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap()
+            .with_protocol_fee(500)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    fn release_tranche(e: &mut Escrow, index: u8) -> (u64, u64) {
+        e.confirm_milestone(ALICE, index).unwrap();
+        e.confirm_milestone(BOB, index).unwrap();
+        e.release_milestone(ALICE, EXPIRES_AT - 1_800, index, None, BOB)
+            .unwrap()
+    }
+
+    #[test]
+    fn amend_protocol_fee_reprices_only_later_payouts() {
+        // Tranche 0 prices at the original 5%: 400,000 gross pays
+        // 20,000 fee. The amendment to 10% with a 15,000 cap then
+        // prices tranche 1 at min(60,000, 15,000) — and the fee
+        // already charged on tranche 0 is never repriced.
+        let mut e = funded_fee_milestone_escrow();
+        let (payout0, fee0) = release_tranche(&mut e, 0);
+        assert_eq!(payout0, 380_000);
+        assert_eq!(fee0, 20_000);
+        assert_eq!(e.fees_paid(), 20_000);
+        e.amend_protocol_fee(ALICE, BOB, 1_000, 15_000).unwrap();
+        assert_eq!(e.fee_bps(), 1_000);
+        assert_eq!(e.fee_cap(), 15_000);
+        // The amendment itself charged nothing.
+        assert_eq!(e.fees_paid(), 20_000);
+        assert_eq!(e.released_amount(), 400_000);
+        let (payout1, fee1) = release_tranche(&mut e, 1);
+        assert_eq!(fee1, 15_000);
+        assert_eq!(payout1, 585_000);
+        assert_eq!(e.fees_paid(), 35_000);
+        assert_eq!(e.released_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn amend_protocol_fee_allows_first_time_rate_and_uncapped_zero() {
+        // A fee-less escrow can adopt its first rate mid-deal when
+        // both parties sign — a renegotiation, not a surprise cut —
+        // and setting the rate back to 0 with a 0 cap restores the
+        // uncapped no-fee pricing.
+        let mut e = funded_milestone_escrow();
+        assert_eq!(e.fee_bps(), 0);
+        e.amend_protocol_fee(ALICE, BOB, 250, 0).unwrap();
+        assert_eq!(e.fee_bps(), 250);
+        assert_eq!(e.fee_cap(), 0);
+        assert_eq!(e.protocol_fee_for(400_000), 10_000);
+        e.amend_protocol_fee(ALICE, BOB, 0, 0).unwrap();
+        assert_eq!(e.protocol_fee_for(400_000), 0);
+    }
+
+    #[test]
+    fn amend_protocol_fee_rejects_bad_rates_schedules_and_authority_untouched() {
+        let mut e = funded_fee_milestone_escrow();
+        // One party alone cannot raise the fee on the other's
+        // payouts.
+        assert_eq!(
+            e.amend_protocol_fee(ALICE, MALLORY, 1_000, 0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_protocol_fee(MALLORY, BOB, 1_000, 0),
+            Err(EscrowError::Unauthorized)
+        );
+        // Past 100% is not a rate.
+        assert_eq!(
+            e.amend_protocol_fee(ALICE, BOB, 10_001, 0),
+            Err(EscrowError::InvalidProtocolFee)
+        );
+        // Every refusal leaves rate and cap untouched.
+        assert_eq!(e.fee_bps(), 500);
+        assert_eq!(e.fee_cap(), 0);
+        // A tiered schedule owns the rate: a flat amendment would
+        // be silently discarded by `protocol_fee_for`, so it fails.
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut scheduled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap()
+            .with_fee_schedule(&[(0, 500)])
+            .unwrap();
+        scheduled.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            scheduled.amend_protocol_fee(ALICE, BOB, 1_000, 0),
+            Err(EscrowError::InvalidProtocolFee)
+        );
+        assert_eq!(scheduled.fee_schedule().tier_count, 1);
+        assert_eq!(scheduled.fee_bps(), 0);
+        // Uninitialized: the builders own initial configuration.
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap()
+            .with_protocol_fee(500)
+            .unwrap();
+        assert_eq!(
+            bare.amend_protocol_fee(ALICE, BOB, 1_000, 0),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.fee_bps(), 500);
     }
 
     // ----- interaction with release / cancel / quorum -----
@@ -60797,7 +60989,7 @@ mod event_history_tests {
             Some(EscrowEventKind::ClaimantRosterAmended),
             "AV-227: appended after MilestoneTrancheAppended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -60976,9 +61168,10 @@ mod event_history_tests {
         // `MilestonePartiallyClaimed` (AV-229), 94 is
         // `VestingScheduleAmended` (AV-230), 95 is
         // `MilestoneDueDatesAmended` (AV-231), 96 is
-        // `MilestoneUnskipped` (AV-232) and 97 is the
+        // `MilestoneUnskipped` (AV-232), 97 is
+        // `ProtocolFeeAmended` (AV-233) and 98 is the
         // first still-unknown byte.
-        for bad in [97u8, 255] {
+        for bad in [98u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

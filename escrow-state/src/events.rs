@@ -300,6 +300,7 @@
 //! | VestingScheduleAmended (AV-230) | 0 | 0 | 0 | 0 — amending moves no funds; the amended schedule is read from the vault |
 //! | MilestoneDueDatesAmended (AV-231) | 0 | 0 | 0 | 0 — amending moves no funds; the amended table is read from the vault |
 //! | MilestoneUnskipped (AV-232) | 0 | 0 | 0 | 0 — unskipping moves no funds; the restored tranche is read from the vault |
+//! | ProtocolFeeAmended (AV-233) | 0 | 0 | 0 | 0 — amending moves no funds; later payouts reprice from the vault |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1216,6 +1217,17 @@ pub enum EscrowEventKind {
     /// materializes at a later cancel). The restored tranche is read
     /// from the vault, so the event needs no extra field.
     MilestoneUnskipped,
+    /// AV-233: the protocol fee rate and ceiling were revised by
+    /// dual-signed governance
+    /// ([`Escrow::amend_protocol_fee`](crate::Escrow::amend_protocol_fee)).
+    /// `from == to ==` the current state (a rate revision, not a
+    /// lifecycle move — like
+    /// [`EscrowEventKind::MilestoneUnskipped`]); all amounts are
+    /// zero — amending moves no funds (only later taker payouts
+    /// reprice against the new rate and cap). The amended rate and
+    /// cap are read from the vault, so the event needs no extra
+    /// field.
+    ProtocolFeeAmended,
 }
 
 impl EscrowEventKind {
@@ -1471,6 +1483,10 @@ impl EscrowEventKind {
             // discriminants 0–95 stay stable for already-serialized
             // histories.
             96 => Self::MilestoneUnskipped,
+            // AV-233: appended after MilestoneUnskipped so
+            // discriminants 0–96 stay stable for already-serialized
+            // histories.
+            97 => Self::ProtocolFeeAmended,
             _ => return None,
         })
     }
@@ -1628,6 +1644,10 @@ impl EscrowEventKind {
             // the name table stays stable for already-serialized
             // histories.
             Self::MilestoneUnskipped => "milestone_unskipped",
+            // AV-233: appended after milestone_unskipped so
+            // the name table stays stable for already-serialized
+            // histories.
+            Self::ProtocolFeeAmended => "protocol_fee_amended",
         }
     }
 
@@ -1789,6 +1809,10 @@ impl EscrowEventKind {
             // the name table stays stable for already-serialized
             // histories.
             "milestone_unskipped" => Self::MilestoneUnskipped,
+            // AV-233: appended after milestone_unskipped so
+            // the name table stays stable for already-serialized
+            // histories.
+            "protocol_fee_amended" => Self::ProtocolFeeAmended,
             _ => return None,
         })
     }
@@ -6259,6 +6283,40 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the protocol fee rate and ceiling after funding
+    /// (mirrors [`Escrow::amend_protocol_fee`]). Emits
+    /// `ProtocolFeeAmended` (`from == to ==` the current state —
+    /// the rate, not the lifecycle state, is what changed; all
+    /// amounts zero, since amending moves no funds — only later
+    /// payouts reprice). The amended rate and cap are read from
+    /// the vault, so the event needs no extra field. A failed
+    /// amendment emits nothing: the core call returns before any
+    /// event is pushed.
+    pub fn amend_protocol_fee(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        fee_bps: u16,
+        fee_cap: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner.amend_protocol_fee(initializer, taker, fee_bps, fee_cap)?;
+        self.push_event(
+            EscrowEventKind::ProtocolFeeAmended,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// The live milestone tranche table as a fixed
     /// `MAX_MILESTONES` array (entries past the plan's count are
     /// zero): the shape the `MilestonesReallocated` event carries
@@ -9573,6 +9631,59 @@ mod event_tests {
     }
 
     #[test]
+    fn amend_protocol_fee_emits_event_and_failed_amend_emits_nothing() {
+        // AV-233: a dual-signed revision emits ProtocolFeeAmended
+        // (discriminant 97, appended last) with zero amounts — a
+        // rate revision, not a settlement — and the amended rate
+        // and cap are read from the vault. A refused revision
+        // emits nothing.
+        assert_eq!(EscrowEventKind::ProtocolFeeAmended.discriminant(), 97);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(97),
+            Some(EscrowEventKind::ProtocolFeeAmended)
+        );
+        assert_eq!(
+            EscrowEventKind::ProtocolFeeAmended.name(),
+            "protocol_fee_amended"
+        );
+        assert_eq!(
+            EscrowEventKind::from_name("protocol_fee_amended"),
+            Some(EscrowEventKind::ProtocolFeeAmended)
+        );
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_protocol_fee(500)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        // A one-party revision fails and emits nothing: the last
+        // event is still Funded.
+        assert_eq!(
+            e.amend_protocol_fee(ALICE, ALICE, 1_000, 0, T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(last(&e).kind, EscrowEventKind::Funded);
+        e.amend_protocol_fee(ALICE, BOB, 1_000, 15_000, T0 + 3).unwrap();
+        assert_event(
+            &last(&e),
+            EscrowEventKind::ProtocolFeeAmended,
+            2,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            0,
+            0,
+            0,
+            T0 + 3,
+        );
+        assert_eq!(e.inner().fee_bps(), 1_000);
+        assert_eq!(e.inner().fee_cap(), 15_000);
+        let history = e.inner().event_history();
+        assert_eq!(
+            history.last().unwrap().kind,
+            EscrowEventKind::ProtocolFeeAmended
+        );
+    }
+
+    #[test]
     fn failed_reallocate_milestones_emits_nothing() {
         // Repricing a confirmed tranche is InvalidMilestoneAmendment
         // (the AV-155 amendment error): the failed governance call
@@ -10388,7 +10499,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -10491,7 +10602,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11028,7 +11139,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11043,7 +11154,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11055,7 +11166,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11067,7 +11178,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11079,7 +11190,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11094,7 +11205,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11109,7 +11220,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11121,7 +11232,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11133,7 +11244,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11145,7 +11256,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11157,7 +11268,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11169,7 +11280,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11181,7 +11292,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11197,7 +11308,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11212,7 +11323,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11227,7 +11338,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11242,7 +11353,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11257,7 +11368,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_reallocated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11273,7 +11384,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_claim_expired"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11289,7 +11400,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_tranche_appended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11305,7 +11416,7 @@ mod event_tests {
             EscrowEventKind::from_name("claimant_roster_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11320,7 +11431,7 @@ mod event_tests {
             EscrowEventKind::from_name("delivery_confirmed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]
@@ -11352,7 +11463,7 @@ mod event_tests {
             EscrowEventKind::from_name("governance_cancelled"),
             Some(cancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
+        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
     }
 
     #[test]

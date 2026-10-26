@@ -174,6 +174,9 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // AV-231: a revised deadline table moves no funds — the new
         // dates price late penalties only at the later releases.
         | EscrowEventKind::MilestoneDueDatesAmended
+        // AV-233: a revised fee rate moves no funds — the new
+        // rate prices only the later taker payouts.
+        | EscrowEventKind::ProtocolFeeAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -836,6 +839,8 @@ mod event_sourcing_tests {
         // AV-231: a revised deadline table moves no funds — the new
         // dates price late penalties only at the later releases.
         | EscrowEventKind::MilestoneDueDatesAmended
+        // AV-233: a revised fee rate moves no funds.
+        | EscrowEventKind::ProtocolFeeAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
