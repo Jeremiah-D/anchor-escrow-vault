@@ -20720,6 +20720,87 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(self)
     }
 
+    /// Revise the dispute-evidence disclosure deadline after
+    /// funding (AV-241 — Solana arbitration discipline / payment
+    /// fintech): both parties may renegotiate how long the
+    /// escalating party gets — measured from `disputed_at` — to
+    /// disclose the dispute evidence, without redeploying or
+    /// refunding the escrow.
+    ///
+    /// Why: the deadline set before funding assumes a dispute
+    /// pace the parties may no longer face — a complex claim can
+    /// need a longer disclosure window than the optimistic one
+    /// negotiated at setup, or a fast-moving dispute can make a
+    /// long window an invitation to stall. A dual-signed revision
+    /// lets the parties retune the bar to the dispute climate
+    /// they actually face.
+    ///
+    /// Governance: dual signature — both the initializer and the
+    /// taker must authorize, paralleling
+    /// [`Escrow::amend_grace_period`]. `Funded`-only: the builder
+    /// [`Escrow::with_evidence_deadline`] owns the initial set. A
+    /// paused escrow fails fast ([`EscrowError::Paused`]).
+    ///
+    /// Rejections, reusing the builder's checks in the builder's
+    /// order: no arbitration mechanism configured (neither a
+    /// single arbiter nor a panel) is
+    /// [`EscrowError::InvalidArbiter`] — the deadline disciplines
+    /// *arbitration* evidence, so a no-arbiter escrow has nothing
+    /// to discipline; a zero `deadline_secs` is
+    /// [`EscrowError::InvalidEvidenceDeadline`] (code 138 — a
+    /// deadline of zero seconds would lapse the moment the
+    /// dispute starts). All checks run before any write, so a
+    /// failed amendment leaves the configured deadline untouched.
+    ///
+    /// Scope: only the config field changes, and the deadline is
+    /// read live: [`Escrow::evidence_due_at`] computes
+    /// `disputed_at + evidence_deadline_secs` at call time. An
+    /// in-progress dispute can never be amended, because
+    /// [`Escrow::escalate`] moves the state `Funded` -> `Disputed`
+    /// — a distinct [`EscrowState`] — and this method is
+    /// `Funded`-only, so the amendment is rejected with
+    /// `InvalidStateTransition` and the live dispute's computed
+    /// deadline is untouched. Conversely a dispute escalated
+    /// after the amendment measures its deadline from the new
+    /// value, because `escalate` stamps a fresh `disputed_at`
+    /// and `evidence_due_at` adds the live field. There is no
+    /// stamped per-dispute deadline field to preserve, and none
+    /// is added. Orthogonal to
+    /// [`Escrow::with_evidence_deadline`] (`Uninitialized`-only
+    /// initial configuration) and to AV-240's
+    /// [`Escrow::amend_grace_period`] (a different field, a
+    /// different governance consequence). Emits
+    /// `EvidenceDeadlineAmended` on the event layer.
+    pub fn amend_evidence_deadline(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        deadline_secs: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_grace_period`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Builder-order value checks, all before any write: the
+        // arbitration-mechanism pre-check first (mirroring
+        // `with_evidence_deadline`), then the zero rejection.
+        if self.arbiter.is_none() && self.arbiter_panel.is_none() {
+            return Err(EscrowError::InvalidArbiter);
+        }
+        if deadline_secs == 0 {
+            return Err(EscrowError::InvalidEvidenceDeadline);
+        }
+        self.evidence_deadline_secs = deadline_secs;
+        Ok(())
+    }
+
     /// The dispute-evidence disclosure deadline in seconds (AV-68), or
     /// `0` when no deadline was configured (backward compatible). Set
     /// once via [`Escrow::with_evidence_deadline`].
@@ -45636,7 +45717,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
+        assert_eq!(EscrowEventKind::from_discriminant(105), None); // AV-241: 104 is EvidenceDeadlineAmended
     }
 
     #[test]
@@ -54391,6 +54472,115 @@ mod evidence_deadline_tests {
         assert_eq!(bytes[3301], 0, "escalated_by: None discriminant");
         assert_eq!(&bytes[2901..2933], &[0u8; 32], "escalated_by zeroed");
     }
+
+    // ----- AV-241: post-funding evidence-deadline amendment -----
+
+    #[test]
+    fn amend_evidence_deadline_retunes_only_future_disputes() {
+        // A funded escrow: the amendment retunes the deadline,
+        // and the dispute escalated AFTER it measures its due date
+        // from the NEW value — disputed_at + 7_200, not the old
+        // 3_600.
+        let mut e = arbitrated();
+        e.fund(ALICE, T0).unwrap();
+        e.amend_evidence_deadline(ALICE, BOB, 7_200).unwrap();
+        assert_eq!(e.evidence_deadline_secs(), 7_200);
+        assert_eq!(e.state(), EscrowState::Funded);
+        let disputed_at = T0 + 100;
+        e.escalate(BOB, disputed_at, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(e.evidence_due_at(), Some(disputed_at + 7_200));
+    }
+
+    #[test]
+    fn amend_evidence_deadline_cannot_move_a_live_dispute() {
+        // The dispute is already in flight: its state is Disputed,
+        // not Funded, so the amendment is rejected — and the live
+        // dispute's computed deadline (disputed_at + the ORIGINAL
+        // 3_600) is untouched. This is the AV-241 critical
+        // semantic: `evidence_due_at` is computed live from
+        // `disputed_at + evidence_deadline_secs`, and no path
+        // lets a live dispute coexist with Funded state
+        // (`escalate` is the only writer of Disputed /
+        // disputed_at / escalated_by, and Disputed exits only to
+        // Settled via `resolve` — never back to Funded).
+        let (mut e, disputed_at) = disputed_by(BOB);
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(e.evidence_due_at(), Some(disputed_at + DEADLINE));
+        assert_eq!(
+            e.amend_evidence_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.evidence_deadline_secs(), DEADLINE, "rejected amend writes nothing");
+        assert_eq!(e.disputed_at(), disputed_at);
+        assert_eq!(
+            e.evidence_due_at(),
+            Some(disputed_at + DEADLINE),
+            "live dispute's due date is untouched"
+        );
+    }
+
+    #[test]
+    fn amend_evidence_deadline_rejects_state_authority_arbiter_zero_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial
+        // set.
+        let mut bare = arbitrated();
+        assert_eq!(
+            bare.amend_evidence_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.evidence_deadline_secs(), DEADLINE);
+        // Dual signature: one party alone cannot move the other's
+        // disclosure bar.
+        let mut e = arbitrated();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            e.amend_evidence_deadline(ALICE, ALICE, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_evidence_deadline([0xCC; 32], BOB, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.evidence_deadline_secs(), DEADLINE);
+        // No arbitration mechanism: the deadline disciplines
+        // arbitration evidence, so a plain escrow has nothing to
+        // discipline — same rejection as the builder.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            plain.amend_evidence_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidArbiter)
+        );
+        assert_eq!(EscrowError::InvalidArbiter.code(), 108);
+        assert_eq!(plain.evidence_deadline_secs(), 0);
+        // A zero deadline lapses the moment the dispute starts —
+        // same rejection as the builder, with zero write.
+        assert_eq!(
+            e.amend_evidence_deadline(ALICE, BOB, 0),
+            Err(EscrowError::InvalidEvidenceDeadline)
+        );
+        assert_eq!(EscrowError::InvalidEvidenceDeadline.code(), 138);
+        assert_eq!(e.evidence_deadline_secs(), DEADLINE);
+        // The pause guard fires before the authority and state
+        // gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_evidence_deadline(DEADLINE)
+            .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_evidence_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.evidence_deadline_secs(), DEADLINE);
+    }
 }
 
 #[cfg(test)]
@@ -61576,7 +61766,7 @@ mod event_history_tests {
             Some(EscrowEventKind::ClaimantRosterAmended),
             "AV-227: appended after MilestoneTrancheAppended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
+        assert_eq!(EscrowEventKind::from_discriminant(105), None); // AV-241: 104 is EvidenceDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -61762,9 +61952,10 @@ mod event_history_tests {
         // `AppealWindowAmended` (AV-236), 101 is
         // `SlashLadderAmended` (AV-237), 102 is
         // `AppealBondAmended` (AV-238), 103 is
-        // `GracePeriodAmended` (AV-240) and 104 is the
+        // `GracePeriodAmended` (AV-240), 104 is
+        // `EvidenceDeadlineAmended` (AV-241) and 105 is the
         // first still-unknown byte.
-        for bad in [104u8, 255] {
+        for bad in [105u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

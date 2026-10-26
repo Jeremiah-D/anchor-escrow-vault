@@ -195,6 +195,10 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // AV-240: a revised grace period moves no funds — the new
         // grace gates only the later expiry determinations.
         | EscrowEventKind::GracePeriodAmended
+        // AV-241: a revised evidence deadline moves no funds —
+        // the new deadline gates only the later disputes'
+        // disclosure windows.
+        | EscrowEventKind::EvidenceDeadlineAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -872,6 +876,8 @@ mod event_sourcing_tests {
         | EscrowEventKind::AppealBondAmended
         // AV-240: a revised grace period moves no funds.
         | EscrowEventKind::GracePeriodAmended
+        // AV-241: a revised evidence deadline moves no funds.
+        | EscrowEventKind::EvidenceDeadlineAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
