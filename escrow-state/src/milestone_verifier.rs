@@ -493,4 +493,116 @@ mod tests {
         let (payout, _) = e.release_milestone(ALICE, NOW, 0, None, BOB).unwrap();
         assert_eq!(payout, 400_000);
     }
+
+    // ----- AV-234: post-funding milestone verifier rotation -----
+
+    fn new_verifier_key() -> SigningKey {
+        SigningKey::from_seed([0x78; 32])
+    }
+
+    #[test]
+    fn rotate_milestone_verifier_happy_path_and_chained_rotation() {
+        let mut e = verified_escrow();
+        let old = verifier_key().public_key();
+        assert_eq!(e.milestone_verifier(), old);
+        let new = new_verifier_key().public_key();
+        e.rotate_milestone_verifier(ALICE, BOB, new).unwrap();
+        assert_eq!(e.milestone_verifier(), new);
+        assert_eq!(e.state(), EscrowState::Funded);
+        // Rotation is repeatable: the new key consents, via the
+        // parties, to its own replacement by a third key.
+        let third = SigningKey::from_seed([0x79; 32]).public_key();
+        e.rotate_milestone_verifier(ALICE, BOB, third).unwrap();
+        assert_eq!(e.milestone_verifier(), third);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn rotate_milestone_verifier_rejects_state_authority_and_shape_untouched() {
+        let old = verifier_key().public_key();
+        let new = new_verifier_key().public_key();
+        // Funded-only: the Uninitialized builder owns the initial
+        // set, and a funded escrow's rotation must wait for funding.
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap()
+            .with_milestone_verifier(old)
+            .unwrap();
+        assert_eq!(
+            bare.rotate_milestone_verifier(ALICE, BOB, new),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.milestone_verifier(), old);
+        // Dual signature: one party alone cannot swap the
+        // gatekeeper on the other's milestones.
+        let mut e = verified_escrow();
+        assert_eq!(
+            e.rotate_milestone_verifier(ALICE, ALICE, new),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.rotate_milestone_verifier([0xCC; 32], BOB, new),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.milestone_verifier(), old);
+        // Zero address: zero is the unbound sentinel, so rotating
+        // to it would be a gate that never opens.
+        assert_eq!(
+            e.rotate_milestone_verifier(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::InvalidMilestoneVerifier)
+        );
+        assert_eq!(e.milestone_verifier(), old);
+        // Same verifier: a no-change rotation is rejected, not
+        // silently accepted — a typo'd key must not read as
+        // governance.
+        assert_eq!(
+            e.rotate_milestone_verifier(ALICE, BOB, old),
+            Err(EscrowError::InvalidMilestoneVerifier)
+        );
+        assert_eq!(e.milestone_verifier(), old);
+        // Unbound: rotation never creates the gate — the initial
+        // set belongs to `with_milestone_verifier` pre-funding.
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut unbound = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        unbound.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            unbound.rotate_milestone_verifier(ALICE, BOB, new),
+            Err(EscrowError::InvalidMilestoneVerifier)
+        );
+        assert_eq!(unbound.milestone_verifier(), [0u8; 32]);
+    }
+
+    #[test]
+    fn rotate_milestone_verifier_invalidates_old_attestations_accepts_new() {
+        let old_key = verifier_key();
+        let new_key = new_verifier_key();
+        let mut e = verified_escrow();
+        let hash = milestone_tranche_hash(VAULT, 0, 400_000);
+        // An attestation minted by the old verifier, unused at
+        // rotation time, stops verifying the moment the key
+        // changes — no stored attestation state to rewrite, the
+        // gate reads the live key.
+        let old_attestation =
+            sign_milestone_attestation(&old_key, VAULT, 0, hash, EXPIRES_AT);
+        e.rotate_milestone_verifier(ALICE, BOB, new_key.public_key())
+            .unwrap();
+        assert_eq!(
+            e.release_milestone_verified(ALICE, NOW, 0, None, BOB, VAULT, &old_attestation),
+            Err(EscrowError::MilestoneAttestationInvalid)
+        );
+        assert_eq!(e.released_amount(), 0, "a refused release moves nothing");
+        // The new verifier's attestation for the same terms settles.
+        let new_attestation =
+            sign_milestone_attestation(&new_key, VAULT, 0, hash, EXPIRES_AT);
+        let (payout, fee) = e
+            .release_milestone_verified(ALICE, NOW, 0, None, BOB, VAULT, &new_attestation)
+            .unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.released_amount(), 400_000);
+    }
 }

@@ -13265,6 +13265,85 @@ let fee = self.charge_protocol_fee(net_amount)?;
         Ok(self)
     }
 
+    /// Rotate the milestone verifier after funding (AV-234 —
+    /// Solana / milestone fulfillment): the post-funding
+    /// counterpart of [`Escrow::with_milestone_verifier`], which
+    /// stays `Uninitialized`-only — this is the revision path,
+    /// not a second initial set. When the verifier's key is
+    /// compromised, lost, or handed to a new auditor, the gate
+    /// can follow without cancelling and re-locking the escrow
+    /// (which would strand milestone progress and confirmed
+    /// tranches).
+    ///
+    /// Check order mirrors [`Escrow::amend_protocol_fee`]:
+    /// pause, then dual-signature authority (the *current*
+    /// initializer AND the *current* taker must both authorize —
+    /// one party alone cannot swap the gatekeeper on the other's
+    /// milestones), then `Funded` state, then the verifier's
+    /// shape. Validation completes before any write, so a failed
+    /// rotation leaves the stored verifier untouched (fail-closed,
+    /// zero-write). All verifier-shape failures are
+    /// [`EscrowError::InvalidMilestoneVerifier`] (code 323, the
+    /// AV-210 verifier error):
+    /// - an unbound escrow has nothing to rotate — rotation never
+    ///   creates the gate (use `with_milestone_verifier` before
+    ///   funding for the initial set);
+    /// - the zero key is rejected — zero is the unbound sentinel,
+    ///   so rotating to it would be a gate that never opens;
+    /// - rotating to the current verifier is rejected — a
+    ///   no-change rotation is not governance, and silently
+    ///   succeeding would let a caller mistake a typo'd key for a
+    ///   real rotation (unlike [`Escrow::rotate_arbiter`]'s
+    ///   idempotent no-op, which predates this stricter rule).
+    ///
+    /// Rotation semantics: the gate verifies attestations
+    /// against the *stored* key ([`verify_milestone_attestation`]
+    /// takes the escrow's live `milestone_verifier`), and
+    /// attestations carry no stored state — so the moment the
+    /// key changes, attestations signed by the old verifier stop
+    /// verifying (unused old attestations become invalid with no
+    /// extra writes) and attestations signed by the new verifier
+    /// verify. Already-settled tranches are untouched: a release
+    /// already made is final, and the released bit — not the
+    /// attestation — is what prevents a replay.
+    /// Orthogonal to [`Escrow::rotate_arbiter`] /
+    /// [`Escrow::rotate_taker`] (different roles: the arbiter
+    /// settles disputes, the taker receives payouts, the verifier
+    /// attests delivery facts — rotating one never moves the
+    /// others). Emits `MilestoneVerifierRotated` on the event
+    /// layer.
+    pub fn rotate_milestone_verifier(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_verifier: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the *current*
+        // initializer and the *current* taker must authorize.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Nothing bound: rotation never creates the gate.
+        if self.milestone_verifier == [0u8; 32] {
+            return Err(EscrowError::InvalidMilestoneVerifier);
+        }
+        if new_verifier == [0u8; 32] {
+            return Err(EscrowError::InvalidMilestoneVerifier);
+        }
+        if new_verifier == self.milestone_verifier {
+            return Err(EscrowError::InvalidMilestoneVerifier);
+        }
+        // All checks pass before any write.
+        self.milestone_verifier = new_verifier;
+        Ok(())
+    }
+
     /// The credential issuer pubkey bound via
     /// [`Escrow::with_credential_gate`]; the zero key when no
     /// credential gate is configured.
@@ -45049,7 +45128,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -60989,7 +61068,7 @@ mod event_history_tests {
             Some(EscrowEventKind::ClaimantRosterAmended),
             "AV-227: appended after MilestoneTrancheAppended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -61169,9 +61248,10 @@ mod event_history_tests {
         // `VestingScheduleAmended` (AV-230), 95 is
         // `MilestoneDueDatesAmended` (AV-231), 96 is
         // `MilestoneUnskipped` (AV-232), 97 is
-        // `ProtocolFeeAmended` (AV-233) and 98 is the
+        // `ProtocolFeeAmended` (AV-233), 98 is
+        // `MilestoneVerifierRotated` (AV-234) and 99 is the
         // first still-unknown byte.
-        for bad in [98u8, 255] {
+        for bad in [99u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

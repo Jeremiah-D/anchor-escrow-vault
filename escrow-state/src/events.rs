@@ -111,6 +111,13 @@
 //!   current state, all amounts zero; a no-op rotation emits nothing.
 //!   A rotation with no fee recipient configured is rejected, so the
 //!   event can never fire on a recipient-less escrow.
+//! - `rotate_milestone_verifier` emits
+//!   [`EscrowEventKind::MilestoneVerifierRotated`] on every successful
+//!   rotation (AV-234) — `from == to ==` the current state, all amounts
+//!   zero; there is no silent case, because the core call rejects a
+//!   same-verifier rotation outright instead of no-op succeeding like
+//!   `rotate_arbiter`. A rotation with no verifier configured is
+//!   rejected, so the event can never fire on a verifier-less escrow.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -301,6 +308,7 @@
 //! | MilestoneDueDatesAmended (AV-231) | 0 | 0 | 0 | 0 — amending moves no funds; the amended table is read from the vault |
 //! | MilestoneUnskipped (AV-232) | 0 | 0 | 0 | 0 — unskipping moves no funds; the restored tranche is read from the vault |
 //! | ProtocolFeeAmended (AV-233) | 0 | 0 | 0 | 0 — amending moves no funds; later payouts reprice from the vault |
+//! | MilestoneVerifierRotated (AV-234) | 0 | 0 | 0 | 0 — rotating moves no funds; later attestation checks read the new key from the vault |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1228,6 +1236,16 @@ pub enum EscrowEventKind {
     /// cap are read from the vault, so the event needs no extra
     /// field.
     ProtocolFeeAmended,
+    /// AV-234: the milestone verifier was rotated by dual-signed
+    /// governance
+    /// ([`Escrow::rotate_milestone_verifier`](crate::Escrow::rotate_milestone_verifier)).
+    /// `from == to ==` the current state (a gatekeeper revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::ProtocolFeeAmended`]); all amounts are
+    /// zero — rotating moves no funds (only later attestation
+    /// checks read the new key). The new verifier is read from
+    /// the vault, so the event needs no extra field.
+    MilestoneVerifierRotated,
 }
 
 impl EscrowEventKind {
@@ -1487,6 +1505,10 @@ impl EscrowEventKind {
             // discriminants 0–96 stay stable for already-serialized
             // histories.
             97 => Self::ProtocolFeeAmended,
+            // AV-234: appended after ProtocolFeeAmended so
+            // discriminants 0–97 stay stable for already-serialized
+            // histories.
+            98 => Self::MilestoneVerifierRotated,
             _ => return None,
         })
     }
@@ -1648,6 +1670,10 @@ impl EscrowEventKind {
             // the name table stays stable for already-serialized
             // histories.
             Self::ProtocolFeeAmended => "protocol_fee_amended",
+            // AV-234: appended after protocol_fee_amended so
+            // the name table stays stable for already-serialized
+            // histories.
+            Self::MilestoneVerifierRotated => "milestone_verifier_rotated",
         }
     }
 
@@ -1813,6 +1839,10 @@ impl EscrowEventKind {
             // the name table stays stable for already-serialized
             // histories.
             "protocol_fee_amended" => Self::ProtocolFeeAmended,
+            // AV-234: appended after protocol_fee_amended so
+            // the name table stays stable for already-serialized
+            // histories.
+            "milestone_verifier_rotated" => Self::MilestoneVerifierRotated,
             _ => return None,
         })
     }
@@ -2971,6 +3001,14 @@ impl IndexedEscrow {
     /// [`Escrow::with_milestones`]). Configuration: emits no event.
     pub fn with_milestones(mut self, plan: MilestonePlan) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_milestones(plan)?;
+        Ok(self)
+    }
+
+    /// Bind the milestone verifier gate (mirrors
+    /// [`Escrow::with_milestone_verifier`], AV-210).
+    /// Configuration: emits no event.
+    pub fn with_milestone_verifier(mut self, verifier: [u8; 32]) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_milestone_verifier(verifier)?;
         Ok(self)
     }
 
@@ -6304,6 +6342,44 @@ impl IndexedEscrow {
         self.inner.amend_protocol_fee(initializer, taker, fee_bps, fee_cap)?;
         self.push_event(
             EscrowEventKind::ProtocolFeeAmended,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
+    /// Rotate the milestone verifier after funding (mirrors
+    /// [`Escrow::rotate_milestone_verifier`]). Emits
+    /// `MilestoneVerifierRotated` (`from == to ==` the current
+    /// state — the gatekeeper, not the lifecycle state, is what
+    /// changed; all amounts zero, since rotating moves no funds
+    /// — only later attestation checks read the new key). The
+    /// new verifier is read from the vault, so the event needs
+    /// no extra field. A failed rotation emits nothing: the core
+    /// call returns before any event is pushed — and unlike
+    /// [`IndexedEscrow::rotate_arbiter`]'s no-op silence, there
+    /// is no silent case here: the core call rejects a
+    /// same-verifier rotation outright, so every success is a
+    /// real change and every success emits.
+    pub fn rotate_milestone_verifier(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_verifier: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner
+            .rotate_milestone_verifier(initializer, taker, new_verifier)?;
+        self.push_event(
+            EscrowEventKind::MilestoneVerifierRotated,
             from,
             self.inner.state(),
             EventAmounts::none(),
@@ -9684,6 +9760,67 @@ mod event_tests {
     }
 
     #[test]
+    fn rotate_milestone_verifier_emits_event_and_failed_rotate_emits_nothing() {
+        // AV-234: a dual-signed rotation emits
+        // MilestoneVerifierRotated (discriminant 98, appended last)
+        // with zero amounts — a gatekeeper revision, not a
+        // settlement — and the new verifier is read from the
+        // vault. A refused rotation emits nothing. Unlike
+        // `rotate_arbiter`, there is no silent same-key case: the
+        // core call rejects it, so a same-key attempt fails here
+        // too and emits nothing.
+        assert_eq!(EscrowEventKind::MilestoneVerifierRotated.discriminant(), 98);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(98),
+            Some(EscrowEventKind::MilestoneVerifierRotated)
+        );
+        assert_eq!(
+            EscrowEventKind::MilestoneVerifierRotated.name(),
+            "milestone_verifier_rotated"
+        );
+        assert_eq!(
+            EscrowEventKind::from_name("milestone_verifier_rotated"),
+            Some(EscrowEventKind::MilestoneVerifierRotated)
+        );
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_milestone_verifier([0x77; 32])
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        // A one-party rotation fails and emits nothing: the last
+        // event is still Funded.
+        assert_eq!(
+            e.rotate_milestone_verifier(ALICE, ALICE, [0x78; 32], T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(last(&e).kind, EscrowEventKind::Funded);
+        // A same-key rotation fails and emits nothing either.
+        assert_eq!(
+            e.rotate_milestone_verifier(ALICE, BOB, [0x77; 32], T0 + 2),
+            Err(EscrowError::InvalidMilestoneVerifier)
+        );
+        assert_eq!(last(&e).kind, EscrowEventKind::Funded);
+        e.rotate_milestone_verifier(ALICE, BOB, [0x78; 32], T0 + 3).unwrap();
+        assert_event(
+            &last(&e),
+            EscrowEventKind::MilestoneVerifierRotated,
+            2,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            0,
+            0,
+            0,
+            T0 + 3,
+        );
+        assert_eq!(e.inner().milestone_verifier(), [0x78; 32]);
+        let history = e.inner().event_history();
+        assert_eq!(
+            history.last().unwrap().kind,
+            EscrowEventKind::MilestoneVerifierRotated
+        );
+    }
+
+    #[test]
     fn failed_reallocate_milestones_emits_nothing() {
         // Repricing a confirmed tranche is InvalidMilestoneAmendment
         // (the AV-155 amendment error): the failed governance call
@@ -10499,7 +10636,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -10602,7 +10739,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11139,7 +11276,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11154,7 +11291,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11166,7 +11303,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11178,7 +11315,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11190,7 +11327,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11205,7 +11342,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11220,7 +11357,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11232,7 +11369,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11244,7 +11381,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11256,7 +11393,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11268,7 +11405,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11280,7 +11417,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11292,7 +11429,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11308,7 +11445,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11323,7 +11460,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11338,7 +11475,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11353,7 +11490,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11368,7 +11505,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_reallocated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11384,7 +11521,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_claim_expired"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11400,7 +11537,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_tranche_appended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11416,7 +11553,7 @@ mod event_tests {
             EscrowEventKind::from_name("claimant_roster_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11431,7 +11568,7 @@ mod event_tests {
             EscrowEventKind::from_name("delivery_confirmed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
@@ -11463,7 +11600,7 @@ mod event_tests {
             EscrowEventKind::from_name("governance_cancelled"),
             Some(cancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(98), None); // AV-233: 97 is ProtocolFeeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
     }
 
     #[test]
