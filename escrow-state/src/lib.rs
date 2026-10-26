@@ -23914,6 +23914,127 @@ let fee = self.charge_protocol_fee(net_tranche)?;
         }
         Ok(())
     }
+
+    /// Append a milestone tranche to the end of the plan by dual-signed
+    /// governance (AV-226 — Solana milestone payments / payment
+    /// fintech): the initializer and the taker may jointly schedule
+    /// one more deliverable after the plan is live, without touching
+    /// any existing tranche.
+    ///
+    /// The new tranche is carved from the refundable remainder — the
+    /// skipped amount ([`Escrow::skipped_amount`]): tranches returned
+    /// by [`Escrow::skip_milestone`] or by an AV-225 claim expiry.
+    /// That is the only pool an append may draw on, because the plan
+    /// is otherwise the *complete* release schedule: its tranches
+    /// already sum to the locked amount, so inventing a tranche from
+    /// nothing would over-cover the lockup. Carving from the skipped
+    /// pool keeps conservation exact — the locked amount is
+    /// unchanged, the skipped remainder decreases by exactly the new
+    /// tranche amount, and `released + skipped + unsettled` still
+    /// equals the locked amount (the appended tranche joins the
+    /// unsettled side as the skipped side shrinks by the same
+    /// amount). A Funded escrow with no skipped remainder cannot
+    /// append at all ([`EscrowError::InvalidMilestoneAmendment`]):
+    /// there is nothing to carve from, and the caller must skip (or
+    /// let expire) a tranche first.
+    ///
+    /// The append is at the end only: the new tranche takes the next
+    /// free index, every existing tranche keeps its position and its
+    /// exact amount, and the in-order sequence walks the appended
+    /// tranche last — after every previously scheduled tranche.
+    /// Already confirmed or settled tranches are untouched (their
+    /// flags and amounts are never rewritten; a skipped tranche
+    /// stays skipped — the append schedules a *new* deliverable, it
+    /// never resurrects the skipped slot). The appended tranche
+    /// starts unconfirmed and unsettled, with no AV-206 due date and
+    /// no AV-225 claim deadline (both tables hold `0` — unattached —
+    /// at the fresh index, and the AV-225 builder is
+    /// `Uninitialized`-only, so no deadline can be attached to it
+    /// later either; it claims under the pre-AV-225 semantics).
+    /// Later releases price from the live plan, so the appended
+    /// tranche settles like any other tranche once dual-confirmed
+    /// in order (fees computed at release time from the live plan).
+    /// If every other tranche settles and part of the skipped pool
+    /// is still unspent, the escrow stays `Funded` — the leftover
+    /// skipped remainder is still the initializer's refund via the
+    /// normal cancel path, exactly like a skipped tranche.
+    ///
+    /// The rewrite is in place — `VAULT_FIELDS` is untouched (the
+    /// tranche table is already reserved to [`MAX_MILESTONES`], the
+    /// count byte and the skipped counter already exist), so no
+    /// account realloc and no rent change, paralleling
+    /// [`Escrow::reallocate_milestones`].
+    ///
+    /// Orthogonal to [`Escrow::reallocate_milestones`] (AV-224):
+    /// reallocation changes existing tranche amounts and never the
+    /// tranche count; this changes only the count and never an
+    /// existing amount. Orthogonal to
+    /// [`Escrow::with_milestone_claim_deadline`] (AV-225): deadlines
+    /// are per-tranche independent config, and the appended tranche
+    /// simply has none.
+    ///
+    /// Check order is deliberate — pause, then dual authority, then
+    /// state, then plan configuration, then the new tranche —
+    /// mirroring [`Escrow::reallocate_milestones`]:
+    /// 1. `Paused` while paused (AV-46) — appending is a config
+    ///    transition, not the pause key-loss escape hatch;
+    /// 2. both parties must sign: one party alone or a stranger
+    ///    pair is `Unauthorized` (independent `==` checks — the
+    ///    degenerate initializer == taker self-escrow authorizes
+    ///    with one key passed twice, like AV-12's activation);
+    /// 3. `Funded` only: `Uninitialized` has no live schedule to
+    ///    extend (the plan is built with
+    ///    [`Escrow::with_milestones`] there), and the terminal
+    ///    states and `Disputed` have no live tranches to append to
+    ///    (`InvalidStateTransition`);
+    /// 4. a milestone plan must be attached (`InvalidMilestones`
+    ///    otherwise — the plan-shape errors stay there);
+    /// 5. the plan must have a free slot (`InvalidMilestoneAmendment`
+    ///    at [`MAX_MILESTONES`]), the new amount must be positive
+    ///    (a tranche that releases nothing is a config error, like
+    ///    [`MilestonePlan::new`]), and it must not exceed the
+    ///    skipped remainder (`InvalidMilestoneAmendment` — the
+    ///    AV-155 amendment error, since this is the same
+    ///    governance family).
+    pub fn append_milestone_tranche(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        amount: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the initializer and the
+        // taker must authorize the append — one party alone cannot
+        // extend the payment schedule, paralleling
+        // `reallocate_milestones`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let plan = self.milestones.ok_or(EscrowError::InvalidMilestones)?;
+        let count = plan.count as usize;
+        if count >= MAX_MILESTONES {
+            return Err(EscrowError::InvalidMilestoneAmendment);
+        }
+        if amount == 0 {
+            return Err(EscrowError::InvalidMilestoneAmendment);
+        }
+        // Carved from the refundable remainder only: the skipped
+        // pool is the one source that does not over-cover the
+        // lockup, and it shrinks by exactly the appended amount.
+        if amount > self.skipped {
+            return Err(EscrowError::InvalidMilestoneAmendment);
+        }
+        let plan = self.milestones.as_mut().expect("plan checked above");
+        plan.amounts[count] = amount;
+        plan.count += 1;
+        self.skipped -= amount;
+        Ok(())
+    }
     /// True when both parties confirmed milestone `index` for the release
     /// path (see [`Escrow::confirm_milestone`]). Out-of-range indices
     /// report `false`.
@@ -44044,7 +44165,12 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(90),
             Some(EscrowEventKind::MilestoneClaimExpired)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(91), None);
+        // AV-226: MilestoneTrancheAppended takes discriminant 91.
+        assert_eq!(
+            EscrowEventKind::from_discriminant(91),
+            Some(EscrowEventKind::MilestoneTrancheAppended)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(92), None);
     }
 
     #[test]
@@ -48650,6 +48776,126 @@ mod milestone_tests {
     fn milestone_claim_deadline_error_code_is_pinned() {
         assert_eq!(EscrowError::MilestoneClaimExpired.code(), 355);
         assert!(EscrowError::all().contains(&EscrowError::MilestoneClaimExpired));
+    }
+
+    // ----- AV-226: milestone tranche append -----
+
+    #[test]
+    fn append_milestone_tranche_carves_from_skipped_remainder() {
+        // AV-226: the appended tranche is carved from the skipped
+        // remainder, not invented — the locked amount is unchanged,
+        // the skipped pool shrinks by exactly the appended amount,
+        // existing tranches keep position and amount, and the
+        // appended tranche settles last, in order, at its own amount.
+        let mut e = milestone_escrow();
+        e.skip_milestone(ALICE, 0).unwrap();
+        e.skip_milestone(BOB, 0).unwrap();
+        assert_eq!(e.skipped_amount(), 400_000);
+        // Tranche 1 is dual-confirmed before the append: the append
+        // must not disturb a confirmed tranche.
+        confirm_both(&mut e, 1);
+        e.append_milestone_tranche(ALICE, BOB, 150_000).unwrap();
+        let plan = e.milestone_plan().unwrap();
+        assert_eq!(plan.count(), 3);
+        assert_eq!(plan.amount_at(0), Some(400_000));
+        assert_eq!(plan.amount_at(1), Some(600_000));
+        assert_eq!(plan.amount_at(2), Some(150_000));
+        assert_eq!(e.amount(), 1_000_000, "locked total unchanged");
+        assert_eq!(e.skipped_amount(), 250_000, "remainder shrank by exactly 150_000");
+        assert!(e.milestone_settled(0), "skipped tranche stays settled");
+        assert!(e.milestone_confirmed(1), "confirmed tranche stays confirmed");
+        assert!(!e.milestone_confirmed(2), "appended tranche starts unconfirmed");
+        assert_eq!(e.next_milestone(), Some(1), "in-order walk reaches old tranches first");
+        // Conservation: released + skipped + unsettled == locked.
+        assert_eq!(e.released_amount() + e.skipped_amount() + 600_000 + 150_000, 1_000_000);
+        // The old tranche settles at its amount, then the appended
+        // tranche settles last at its own amount.
+        let (t1, _) = e.release_milestone(ALICE, 1_750_000_000, 1, None, BOB).unwrap();
+        assert_eq!(t1, 600_000);
+        confirm_both(&mut e, 2);
+        let (t2, _) = e.release_milestone(ALICE, 1_750_000_000, 2, None, BOB).unwrap();
+        assert_eq!(t2, 150_000);
+        assert_eq!(e.released_amount(), 750_000);
+        assert_eq!(e.skipped_amount(), 250_000);
+        assert_eq!(e.state(), EscrowState::Funded, "leftover skipped remainder stays refundable");
+        assert_eq!(e.next_milestone(), None);
+    }
+
+    #[test]
+    fn append_milestone_tranche_refusals() {
+        // No skipped remainder: there is nothing to carve from.
+        let mut e = milestone_escrow();
+        assert_eq!(
+            e.append_milestone_tranche(ALICE, BOB, 100_000),
+            Err(EscrowError::InvalidMilestoneAmendment)
+        );
+        assert_eq!(e.milestone_plan().unwrap().count(), 2);
+        // No plan at all: a plan-shape error, not an amendment error.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        bare.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            bare.append_milestone_tranche(ALICE, BOB, 100_000),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // Funded-only: Uninitialized cannot append (the plan is built
+        // with with_milestones there).
+        let mut uninit = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap();
+        assert_eq!(
+            uninit.append_milestone_tranche(ALICE, BOB, 100_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Dual signature: one party alone or a stranger pair fails.
+        let mut e = milestone_escrow();
+        e.skip_milestone(ALICE, 0).unwrap();
+        e.skip_milestone(BOB, 0).unwrap();
+        assert_eq!(
+            e.append_milestone_tranche(ALICE, MALLORY, 100_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.append_milestone_tranche(MALLORY, BOB, 100_000),
+            Err(EscrowError::Unauthorized)
+        );
+        // Zero amount and over-remainder amount are amendment errors,
+        // and neither moves the plan or the remainder.
+        assert_eq!(
+            e.append_milestone_tranche(ALICE, BOB, 0),
+            Err(EscrowError::InvalidMilestoneAmendment)
+        );
+        assert_eq!(
+            e.append_milestone_tranche(ALICE, BOB, 400_001),
+            Err(EscrowError::InvalidMilestoneAmendment)
+        );
+        assert_eq!(e.milestone_plan().unwrap().count(), 2);
+        assert_eq!(e.skipped_amount(), 400_000);
+        // Exactly the whole remainder appends fine (boundary).
+        e.append_milestone_tranche(ALICE, BOB, 400_000).unwrap();
+        assert_eq!(e.milestone_plan().unwrap().count(), 3);
+        assert_eq!(e.skipped_amount(), 0);
+    }
+
+    #[test]
+    fn append_milestone_tranche_refuses_at_max_milestones() {
+        // Eight tranches already: no free slot, even with remainder
+        // available from a skipped tranche.
+        let plan = MilestonePlan::new(&[125_000; 8]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.skip_milestone(ALICE, 0).unwrap();
+        e.skip_milestone(BOB, 0).unwrap();
+        assert_eq!(e.skipped_amount(), 125_000);
+        assert_eq!(
+            e.append_milestone_tranche(ALICE, BOB, 100_000),
+            Err(EscrowError::InvalidMilestoneAmendment)
+        );
+        assert_eq!(e.milestone_plan().unwrap().count(), 8);
+        assert_eq!(e.skipped_amount(), 125_000);
     }
 
     #[test]
@@ -59167,7 +59413,12 @@ mod event_history_tests {
             Some(EscrowEventKind::MilestoneClaimExpired),
             "AV-225: appended after MilestonesReallocated"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(91), None);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(91),
+            Some(EscrowEventKind::MilestoneTrancheAppended),
+            "AV-226: appended after MilestoneClaimExpired"
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(92), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -59340,9 +59591,10 @@ mod event_history_tests {
         // `FeeWithdrawn` (AV-174), 86 is `DeliveryConfirmed`
         // (AV-203); 87 is `ChainLinked` and 88 is `ChainBroken`
         // (AV-223); 89 is `MilestonesReallocated` (AV-224), 90 is
-        // `MilestoneClaimExpired` (AV-225) and 91 is the first
+        // `MilestoneClaimExpired` (AV-225), 91 is
+        // `MilestoneTrancheAppended` (AV-226) and 92 is the first
         // still-unknown byte.
-        for bad in [91u8, 255] {
+        for bad in [92u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

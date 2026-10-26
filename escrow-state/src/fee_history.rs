@@ -211,6 +211,8 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         | EscrowEventKind::MilestonesReallocated
         // AV-225: an expired claim carries no fee leg.
         | EscrowEventKind::MilestoneClaimExpired
+        // AV-226: an appended tranche carries no fee leg.
+        | EscrowEventKind::MilestoneTrancheAppended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -864,6 +866,8 @@ mod fee_history_tests {
                 | EscrowEventKind::MilestonesReallocated
                 // AV-225: an expired claim carries no fee leg.
                 | EscrowEventKind::MilestoneClaimExpired
+        // AV-226: an appended tranche carries no fee leg.
+        | EscrowEventKind::MilestoneTrancheAppended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
