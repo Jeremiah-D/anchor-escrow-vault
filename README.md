@@ -201,6 +201,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `resume_vesting()` (AV-150) | `Funded` | `Funded` (unchanged — a schedule-config flip, not a lifecycle move) | initializer only (`Unauthorized` otherwise); `now` <- clock sysvar (never a param); full check sequence — auto-unpause (AV-133) → pause (`Paused`) → authority → state (`InvalidStateTransition` unless `Funded`) → paused (live schedule is `VestingNotPaused`, code 214) → clock sane (`now < paused_at` is `InvalidVesting`); shifts the schedule's start/end/cliff_at forward by `now - paused_at` so the taker loses no unlock time (unlock duration unchanged), then clears the marker; emits `VestingResumed` (discriminant 79) |
 | `initialize_amount_bounds(min_amount, max_amount)` (AV-134) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; opt-in deposit guardrails — `min_amount > max_amount` is `InvalidAmountBounds`, code 196); once attached, `fund` and each `fund_tranche` deposit must sit inside the window (`AmountOutOfBounds`, code 197, otherwise); with no bounds configured both deposit paths keep their existing semantics |
 | `initialize_arbiter_fee(flat_lamports, fee_bps)` (AV-135) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; opt-in arbiter compensation — `fee_bps > 10_000` is `InvalidArbiterFee`, code 198); once attached, every dispute settlement (`resolve`, the panel settling vote, the AV-55 default judgment) deducts the fee from the taker's adjudicated share and routes it to the arbiter (deduction order: AV-17 protocol fee, AV-100 streaming fee, then the arbiter fee); with no fee configured the settlement paths keep their existing semantics |
+| `amend_arbiter_fee(initializer, taker, flat_lamports, fee_bps)` (AV-235) | `Funded` | — (no state change; rewrites the arbiter fee legs) | **both** parties must sign (dual-signature governance — one party alone cannot raise the fee on the other's adjudicated share); `Uninitialized`, terminal states and `Disputed` are `InvalidStateTransition`; `fee_bps > 10_000` is `InvalidArbiterFee` (code 198); both legs are set atomically in one call and a failed amendment leaves both untouched (the valid flat leg in a bad-bps call does not move); the zero convention matches the builder (a `0` leg clears that leg, `(0, 0)` disables the fee); only disputes arising after the amendment price at the new rate (`arbiter_fee_for` reads the live fields) while already-settled disputes keep the fee deducted at their own settlement (`resolve` is terminal, so no settled dispute is repriced) and the amendment itself charges nothing; orthogonal to AV-233's protocol-fee amendment (different field, different rate, different deduction order); emits `ArbiterFeeAmended` (discriminant 99), all amounts zero |
 | `with_release_cooling(cooling_secs)` (AV-112) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; builder-style like the other `with_*` opt-ins); `cooling_secs = 0` means unconfigured — `release` is ungated, exactly like AV-21's grace-period convention |
 | `announce_release(authority, now)` (AV-112) | `Funded` | `Funded` | initializer or taker (either party, no delegation); full check sequence — pause → authority → state; stamps `release_intent_at = now` (re-announce overwrites — idempotent); touches the AV-109 deadman clock (party liveness); emits `ReleaseIntentAnnounced` |
 | `veto_release(caller, now)` (AV-112) | any non-`Closed` | unchanged | initializer or taker (either party); full check sequence — pause → authority → state; clears `release_intent_at`; no intent is a no-op success; touches the deadman clock; emits `ReleaseIntentVetoed` |
@@ -6872,6 +6873,28 @@ The fee rides the settlement events (`Resolved`, `DefaultJudgment`,
 (`arbiter_fee` on the `Resolve` / `PanelJudgment` actions), and the
 state snapshot — so indexers and arbiter bots see the arbitration
 economics before and after the ruling.
+
+**Arbiter fee amendment (AV-235).** A fee fixed at funding cannot
+follow arbitration economics that change mid-deal — the dispute
+grows more complex than the original flat leg priced, or the parties
+agree the arbiter should cost less. `amend_arbiter_fee(initializer,
+taker, flat_lamports, fee_bps)` (`Funded`-only, dual-signed) is the
+post-funding revision path; `with_arbiter_fee` stays
+`Uninitialized`-only as the initial set. Both legs are set
+atomically in one call (no call moves the flat leg without the bps
+leg), the zero convention matches the builder (a `0` leg clears that
+leg, so `(0, 0)` disables the fee), and `fee_bps > 10_000` is
+`InvalidArbiterFee` (198) — every failure leaves both legs untouched.
+Only disputes arising after the amendment price at the new rate,
+because `arbiter_fee_for` reads the live fields, while a dispute
+already settled keeps the fee deducted at its own settlement
+(`resolve` is terminal, so no settled dispute can ever be repriced)
+and the amendment itself charges nothing. Orthogonal to AV-233's
+protocol-fee amendment (that moves the fee on taker payouts; this
+moves the fee on adjudicated shares — different field, different
+rate, different deduction order). The `ArbiterFeeAmended` event
+(discriminant 99) carries no amounts; the amended legs are read from
+the vault. (Solana: dispute fee governance.)
 
 Layout growth: the vault body grows from 5533 to 5545 bytes (+12: the
 9-byte flat slice + the 3-byte bps rate), `VAULT_SPACE_NO_QUORUM` from

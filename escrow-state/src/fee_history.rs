@@ -229,6 +229,8 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         | EscrowEventKind::ProtocolFeeAmended
         // AV-234: a rotated verifier carries no fee leg.
         | EscrowEventKind::MilestoneVerifierRotated
+        // AV-235: a revised arbiter fee carries no fee leg itself.
+        | EscrowEventKind::ArbiterFeeAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -900,6 +902,8 @@ mod fee_history_tests {
         | EscrowEventKind::ProtocolFeeAmended
         // AV-234: a rotated verifier carries no fee leg.
         | EscrowEventKind::MilestoneVerifierRotated
+        // AV-235: a revised arbiter fee carries no fee leg itself.
+        | EscrowEventKind::ArbiterFeeAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

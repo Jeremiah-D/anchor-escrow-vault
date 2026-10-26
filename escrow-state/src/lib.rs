@@ -9809,6 +9809,79 @@ impl Escrow {
         Ok(self)
     }
 
+    /// Revise the arbiter adjudication fee after funding (AV-235 —
+    /// Solana / dispute fee governance / payment fintech): the
+    /// post-funding counterpart of [`Escrow::with_arbiter_fee`],
+    /// which stays `Uninitialized`-only — this is the revision
+    /// path, not a second initial set. When the arbitration
+    /// economics change mid-deal — the dispute grows more complex
+    /// than the original flat leg priced, or the parties agree the
+    /// arbiter should cost less — the fee can follow without
+    /// cancelling and re-locking the escrow.
+    ///
+    /// Check order mirrors [`Escrow::amend_protocol_fee`]:
+    /// pause, then dual-signature authority (both parties must
+    /// authorize — one party alone cannot raise the fee on the
+    /// other's adjudicated share), then `Funded` state, then the
+    /// rate's shape. Validation completes before any write, so a
+    /// failed amendment leaves both legs untouched (fail-closed,
+    /// zero-write). The two legs are set ATOMICALLY in one call:
+    /// there is no call that moves the flat leg without the bps
+    /// leg, so a failed or partial update can never leave the fee
+    /// half old, half new. The zero convention matches
+    /// [`Escrow::with_arbiter_fee`]: a `0` leg clears that leg
+    /// (`None`), so `(0, 0)` disables the fee outright.
+    ///
+    /// Rate semantics: `fee_bps <= 10_000` — a rate past 100%
+    /// would take more than the adjudicated share — enforced as
+    /// [`EscrowError::InvalidArbiterFee`] (code 198, the AV-135
+    /// arbiter-fee error). The flat leg has no cap of its own:
+    /// [`Escrow::arbiter_fee_for`] already caps the total at the
+    /// adjudicated share, so a large flat leg can never overdraw
+    /// the payout.
+    ///
+    /// Only disputes arising AFTER the amendment price at the new
+    /// rate: [`Escrow::arbiter_fee_for`] reads the live fields, so
+    /// every `resolve` (and panel settlement) after the amendment
+    /// deducts the new fee from the taker's adjudicated share,
+    /// while a dispute already settled keeps the fee deducted at
+    /// its own settlement — `resolve` is terminal (`Settled`), so
+    /// no settled dispute can ever be repriced, and the amendment
+    /// itself charges nothing. Orthogonal to
+    /// [`Escrow::with_arbiter_fee`] (`Uninitialized`-only initial
+    /// configuration) and to AV-233's
+    /// [`Escrow::amend_protocol_fee`] (that moves the PROTOCOL
+    /// fee on taker payouts; this moves the ARBITER fee on
+    /// adjudicated shares — different field, different rate,
+    /// different deduction order). Emits `ArbiterFeeAmended` on
+    /// the event layer.
+    pub fn amend_arbiter_fee(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        flat_lamports: u64,
+        fee_bps: u16,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_protocol_fee`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if fee_bps > 10_000 {
+            return Err(EscrowError::InvalidArbiterFee);
+        }
+        // All checks pass before any write: both legs move together.
+        self.arbiter_fee_flat = (flat_lamports > 0).then_some(flat_lamports);
+        self.arbiter_fee_bps = (fee_bps > 0).then_some(fee_bps);
+        Ok(())
+    }
+
     /// The arbiter fee's fixed lamport slice configured via
     /// [`Escrow::with_arbiter_fee`]; `None` when the flat leg is not
     /// configured (backward compatible).
@@ -45128,7 +45201,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
+        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
     }
 
     #[test]
@@ -61068,7 +61141,7 @@ mod event_history_tests {
             Some(EscrowEventKind::ClaimantRosterAmended),
             "AV-227: appended after MilestoneTrancheAppended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(99), None); // AV-234: 98 is MilestoneVerifierRotated
+        assert_eq!(EscrowEventKind::from_discriminant(100), None); // AV-235: 99 is ArbiterFeeAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -61249,9 +61322,10 @@ mod event_history_tests {
         // `MilestoneDueDatesAmended` (AV-231), 96 is
         // `MilestoneUnskipped` (AV-232), 97 is
         // `ProtocolFeeAmended` (AV-233), 98 is
-        // `MilestoneVerifierRotated` (AV-234) and 99 is the
+        // `MilestoneVerifierRotated` (AV-234), 99 is
+        // `ArbiterFeeAmended` (AV-235) and 100 is the
         // first still-unknown byte.
-        for bad in [99u8, 255] {
+        for bad in [100u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -71008,6 +71082,127 @@ mod arbiter_fee_tests {
             e.with_arbiter_fee(1, 1),
             Err(EscrowError::InvalidStateTransition)
         );
+    }
+
+    // ----- AV-235: post-funding arbiter fee amendment -----
+
+    fn funded_with_fee(flat: u64, bps: u16) -> Escrow {
+        let mut e = uninitialized()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbiter_fee(flat, bps)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_arbiter_fee_happy_path_reprices_live_and_clears_on_zero() {
+        let mut e = funded_with_fee(5_000, 250);
+        assert_eq!(e.arbiter_fee_flat(), Some(5_000));
+        assert_eq!(e.arbiter_fee_bps(), Some(250));
+        assert_eq!(e.arbiter_fee_for(1_000_000), 30_000);
+        // Both legs move in one call: flat 1,000 + 1% of the share.
+        e.amend_arbiter_fee(ALICE, BOB, 1_000, 100).unwrap();
+        assert_eq!(e.arbiter_fee_flat(), Some(1_000));
+        assert_eq!(e.arbiter_fee_bps(), Some(100));
+        assert_eq!(e.arbiter_fee_for(1_000_000), 11_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+        // (0, 0) disables the fee outright, the same convention
+        // as `with_arbiter_fee`.
+        e.amend_arbiter_fee(ALICE, BOB, 0, 0).unwrap();
+        assert_eq!(e.arbiter_fee_flat(), None);
+        assert_eq!(e.arbiter_fee_bps(), None);
+        assert_eq!(e.arbiter_fee_for(1_000_000), 0);
+        // A first-time fee on a fee-less escrow is a renegotiation,
+        // not a surprise cut — both parties signed.
+        let mut bare = funded_with_fee(0, 0);
+        bare.amend_arbiter_fee(ALICE, BOB, 2_000, 50).unwrap();
+        assert_eq!(bare.arbiter_fee_for(1_000_000), 7_000);
+    }
+
+    #[test]
+    fn amend_arbiter_fee_rejects_state_authority_and_bad_bps_atomically() {
+        // Funded-only: the Uninitialized builder owns the initial
+        // set, and a disputed or settled escrow's fee is fixed —
+        // arbitration in flight (or already priced) must not move.
+        let mut bare = uninitialized()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbiter_fee(5_000, 250)
+            .unwrap();
+        assert_eq!(
+            bare.amend_arbiter_fee(ALICE, BOB, 1_000, 100),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.arbiter_fee_flat(), Some(5_000));
+        assert_eq!(bare.arbiter_fee_bps(), Some(250));
+        let mut disputed = disputed_with_fee(5_000, 250);
+        assert_eq!(
+            disputed.amend_arbiter_fee(ALICE, BOB, 1_000, 100),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(disputed.arbiter_fee_flat(), Some(5_000));
+        assert_eq!(disputed.arbiter_fee_bps(), Some(250));
+        // Dual signature: one party alone cannot raise the fee on
+        // the other's adjudicated share.
+        let mut e = funded_with_fee(5_000, 250);
+        assert_eq!(
+            e.amend_arbiter_fee(ALICE, ALICE, 1_000, 100),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_arbiter_fee([0xCC; 32], BOB, 1_000, 100),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.arbiter_fee_flat(), Some(5_000));
+        assert_eq!(e.arbiter_fee_bps(), Some(250));
+        // Past 100% is not a rate — and atomicity means the valid
+        // flat leg in the same call does NOT move either: a failed
+        // amendment leaves both legs untouched, never half old,
+        // half new.
+        assert_eq!(
+            e.amend_arbiter_fee(ALICE, BOB, 9_999, 10_001),
+            Err(EscrowError::InvalidArbiterFee)
+        );
+        assert_eq!(e.arbiter_fee_flat(), Some(5_000));
+        assert_eq!(e.arbiter_fee_bps(), Some(250));
+        // The boundary itself is a rate: exactly 100% is accepted.
+        e.amend_arbiter_fee(ALICE, BOB, 0, 10_000).unwrap();
+        assert_eq!(e.arbiter_fee_flat(), None);
+        assert_eq!(e.arbiter_fee_bps(), Some(10_000));
+        assert_eq!(e.arbiter_fee_for(1_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn amend_arbiter_fee_prices_only_later_disputes() {
+        // A dispute settled BEFORE any amendment keeps the fee
+        // deducted at its own settlement: flat 5,000 + 2.5% of the
+        // full 1,000,000 share = 30,000, so the taker nets 970,000
+        // and the protocol/streaming fee legs are zero.
+        let mut settled = disputed_with_fee(5_000, 250);
+        let (payout, fee, refund) =
+            settled.resolve(ARBITER, 1_000_000, EXPIRES_AT - 1, None, None, BOB).unwrap();
+        assert_eq!((payout, fee, refund), (970_000, 0, 0));
+        assert_eq!(settled.state(), EscrowState::Settled);
+        // A settled dispute can never be repriced: the amendment
+        // path is Funded-only, so the 30,000 already deducted stays.
+        assert_eq!(
+            settled.amend_arbiter_fee(ALICE, BOB, 1_000, 100),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // A dispute arising AFTER the amendment prices at the new
+        // rate: flat 1,000 + 1% = 11,000, so the taker nets 989,000.
+        // The amendment itself charged nothing — the funded total
+        // and the disputed pool are untouched by the governance.
+        let mut later = funded_with_fee(5_000, 250);
+        later.amend_arbiter_fee(ALICE, BOB, 1_000, 100).unwrap();
+        later
+            .escalate(ALICE, EXPIRES_AT - 1, later.remaining_amount(), None, None, 0)
+            .unwrap();
+        let (payout, fee, refund) =
+            later.resolve(ARBITER, 1_000_000, EXPIRES_AT - 1, None, None, BOB).unwrap();
+        assert_eq!((payout, fee, refund), (989_000, 0, 0));
     }
 
     #[test]

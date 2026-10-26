@@ -180,6 +180,9 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // AV-234: a rotated verifier moves no funds — the new
         // key gates only the later attestation checks.
         | EscrowEventKind::MilestoneVerifierRotated
+        // AV-235: a revised arbiter fee moves no funds — the new
+        // fee prices only the later dispute settlements.
+        | EscrowEventKind::ArbiterFeeAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -846,6 +849,8 @@ mod event_sourcing_tests {
         | EscrowEventKind::ProtocolFeeAmended
         // AV-234: a rotated verifier moves no funds.
         | EscrowEventKind::MilestoneVerifierRotated
+        // AV-235: a revised arbiter fee moves no funds.
+        | EscrowEventKind::ArbiterFeeAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
