@@ -48,6 +48,12 @@
 //!   governance: `from == to == Funded`, all amounts zero —
 //!   appending moves no funds, the appended tranche is read from the
 //!   vault's plan tail, and the event is the ordering signal.
+//! - `amend_claimant_roster` emits
+//!   [`EscrowEventKind::ClaimantRosterAmended`] (AV-227) when the
+//!   claimant roster is revised by initializer-only governance:
+//!   `from == to == Funded`, all amounts zero — amending moves no
+//!   funds, the amended roster is read from the vault, and the
+//!   event is the ordering signal.
 //! - A keeper milestone bundle
 //!   ([`crate::keeper::execute_milestone_bundle`], AV-76) emits one
 //!   [`EscrowEventKind::MilestoneReleased`] per executed tranche and,
@@ -263,7 +269,7 @@
 //!
 //! | kind | `payout` | `fee` | `refund` | `penalty` |
 //! |------|----------|-------|----------|-----------|
-//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), PartiallyCancelled, ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-73), SchemaMigrated (AV-75), TemplateApplied (AV-77), VestingPaused (AV-150), VestingResumed (AV-150), AttestorReplaced (AV-154), MilestonesAmended (AV-155), MilestonesReallocated (AV-224), MilestoneTrancheAppended (AV-226), GovernanceProposed (AV-158), GovernanceExecuted (AV-158), GovernanceCancelled (AV-158), FeeWithdrawn (AV-174) | 0 | 0 | 0 | 0 |
+//! | Initialized, Activated, Funded, Escalated, Attested, MilestoneConfirmed, QuorumUpdated, AttestorsUpdated, EmergencyUnlock (AV-41), ReentryRejected (AV-36), PauseAuthorityRotated (AV-47), TakerRotated (AV-52), InitializerRotated (AV-58), ExpiryExtended (AV-59), PartiallyCancelled, ArbiterRotated (AV-62), FeeRecipientRotated (AV-67), EvidenceSubmitted (AV-68), PanelThresholdChanged (AV-69), MilestonesAdjusted (AV-73), SchemaMigrated (AV-75), TemplateApplied (AV-77), VestingPaused (AV-150), VestingResumed (AV-150), AttestorReplaced (AV-154), MilestonesAmended (AV-155), MilestonesReallocated (AV-224), MilestoneTrancheAppended (AV-226), ClaimantRosterAmended (AV-227), GovernanceProposed (AV-158), GovernanceExecuted (AV-158), GovernanceCancelled (AV-158), FeeWithdrawn (AV-174) | 0 | 0 | 0 | 0 |
 //! | Released, Claimed, ShareClaimed (AV-149), MilestoneReleased, SubscriptionPeriodReleased (AV-56) | gross taker amount (net payout + fee) | protocol fee (AV-17) | 0 | 0 |
 //! | ReleasedSplit (AV-93) | gross taker amount (Σ net legs + fee) | protocol fee (AV-17, charged on the gross before the split) | 0 | 0 — the per-recipient `(recipient, net_share)` legs ride the event's `release_split` field |
 //! | BasketReleased (AV-95b) | the leg's gross remainder (taker payout + fee) | protocol fee (AV-17, charged on the leg's remainder) | 0 | 0 |
@@ -289,6 +295,7 @@
 //! | MilestoneSkipped | 0 | 0 | skipped tranche (the initializer's refund) | 0 |
 //! | MilestoneClaimExpired (AV-225) | 0 | 0 | expired tranche (the initializer's refund) | 0 — the expired tranche index rides the event's `milestone_claim_expired` field |
 //! | MilestoneTrancheAppended (AV-226) | 0 | 0 | 0 | 0 — appending moves no funds; the appended tranche is read from the vault's plan tail |
+//! | ClaimantRosterAmended (AV-227) | 0 | 0 | 0 | 0 — amending moves no funds; the amended roster is read from the vault |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1151,6 +1158,15 @@ pub enum EscrowEventKind {
     /// appended tranche is read from the vault — the plan's last
     /// tranche after the append — the event is the ordering signal.
     MilestoneTrancheAppended,
+    /// AV-227: the claimant roster was amended by initializer-only
+    /// governance
+    /// ([`Escrow::amend_claimant_roster`](crate::Escrow::amend_claimant_roster)).
+    /// `from == to ==` the current state (a config change, not a
+    /// lifecycle move — like [`EscrowEventKind::MilestonesAmended`]);
+    /// all amounts are zero — amending moves no funds (the later
+    /// `claim_share` pulls carry the new shares). The amended roster
+    /// is read from the vault — the event is the ordering signal.
+    ClaimantRosterAmended,
 }
 
 impl EscrowEventKind {
@@ -1386,6 +1402,10 @@ impl EscrowEventKind {
             // discriminants 0–90 stay stable for already-serialized
             // histories.
             91 => Self::MilestoneTrancheAppended,
+            // AV-227: appended after MilestoneTrancheAppended so
+            // discriminants 0–91 stay stable for already-serialized
+            // histories.
+            92 => Self::ClaimantRosterAmended,
             _ => return None,
         })
     }
@@ -1523,6 +1543,10 @@ impl EscrowEventKind {
             // name table stays stable for already-serialized
             // histories.
             Self::MilestoneTrancheAppended => "milestone_tranche_appended",
+            // AV-227: appended after milestone_tranche_appended so
+            // the name table stays stable for already-serialized
+            // histories.
+            Self::ClaimantRosterAmended => "claimant_roster_amended",
         }
     }
 
@@ -1664,6 +1688,10 @@ impl EscrowEventKind {
             // name table stays stable for already-serialized
             // histories.
             "milestone_tranche_appended" => Self::MilestoneTrancheAppended,
+            // AV-227: appended after milestone_tranche_appended so
+            // the name table stays stable for already-serialized
+            // histories.
+            "claimant_roster_amended" => Self::ClaimantRosterAmended,
             _ => return None,
         })
     }
@@ -2822,6 +2850,17 @@ impl IndexedEscrow {
     /// [`Escrow::with_milestones`]). Configuration: emits no event.
     pub fn with_milestones(mut self, plan: MilestonePlan) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_milestones(plan)?;
+        Ok(self)
+    }
+
+    /// Opt in to multi-taker share claiming (mirrors
+    /// [`Escrow::with_claimants`](crate::Escrow::with_claimants),
+    /// AV-149). Configuration: emits no event.
+    pub fn with_claimants(
+        mut self,
+        shares: &[([u8; 32], u16)],
+    ) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_claimants(shares)?;
         Ok(self)
     }
 
@@ -6013,6 +6052,38 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the claimant roster after funding (mirrors
+    /// [`Escrow::amend_claimant_roster`]). Emits
+    /// `ClaimantRosterAmended` (`from == to ==` the current state —
+    /// the roster, not the lifecycle state, is what changed; all
+    /// amounts zero, since amending moves no funds). The amended
+    /// roster is read from the vault, so the event needs no extra
+    /// field. A failed amendment emits nothing: the core call
+    /// returns before any event is pushed. `at` is the
+    /// caller-supplied timestamp (on-chain: the clock sysvar).
+    pub fn amend_claimant_roster(
+        &mut self,
+        initializer: [u8; 32],
+        new_legs: &[([u8; 32], u16)],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner.amend_claimant_roster(initializer, new_legs)?;
+        self.push_event(
+            EscrowEventKind::ClaimantRosterAmended,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// The live milestone tranche table as a fixed
     /// `MAX_MILESTONES` array (entries past the plan's count are
     /// zero): the shape the `MilestonesReallocated` event carries
@@ -9006,6 +9077,47 @@ mod event_tests {
     }
 
     #[test]
+    fn amend_claimant_roster_emits_event_with_new_shares() {
+        // AV-227: amending emits ClaimantRosterAmended with
+        // from == to == Funded and zero amounts — amending moves
+        // no funds — and the amended roster reads back from the
+        // vault. A failed amendment emits nothing.
+        const C1: [u8; 32] = [0xC1; 32];
+        const C2: [u8; 32] = [0xC2; 32];
+        const C3: [u8; 32] = [0xC3; 32];
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_claimants(&[(C1, 5000), (C2, 5000)])
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        assert_eq!(
+            e.amend_claimant_roster(ALICE, &[(C1, 0)], T0 + 2),
+            Err(EscrowError::InvalidClaimantShares),
+            "zero-weight amendment must fail before any event"
+        );
+        e.amend_claimant_roster(ALICE, &[(C1, 1), (C3, 3)], T0 + 2).unwrap();
+        assert_event(
+            &last(&e),
+            EscrowEventKind::ClaimantRosterAmended,
+            2,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            0,
+            0,
+            0,
+            T0 + 2,
+        );
+        let r = e.inner().claimants().unwrap();
+        assert_eq!(r.claimant_count, 2);
+        assert_eq!(r.find(C1), Some(0));
+        assert_eq!(r.share_bps[0], 2500);
+        assert_eq!(r.find(C3), Some(1));
+        assert_eq!(r.share_bps[1], 7500);
+        assert_eq!(r.find(C2), None, "omitted leg is removed");
+        assert_eq!(r.unclaimed_bps(), 10_000);
+    }
+
+    #[test]
     fn builders_emit_nothing() {
         let e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
             .unwrap()
@@ -9712,7 +9824,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -9815,7 +9927,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10352,7 +10464,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10367,7 +10479,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10379,7 +10491,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10391,7 +10503,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10403,7 +10515,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10418,7 +10530,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10433,7 +10545,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10445,7 +10557,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10457,7 +10569,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10469,7 +10581,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10481,7 +10593,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10493,7 +10605,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10505,7 +10617,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10521,7 +10633,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10536,7 +10648,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10551,7 +10663,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10566,7 +10678,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10581,7 +10693,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_reallocated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10597,7 +10709,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_claim_expired"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10613,7 +10725,23 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_tranche_appended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None);
+        assert_eq!(EscrowEventKind::from_discriminant(93), None);
+    }
+
+    #[test]
+    fn claimant_roster_amended_kind_round_trips() {
+        // AV-227: discriminant 92, appended after
+        // MilestoneTrancheAppended — 0–91 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::ClaimantRosterAmended;
+        assert_eq!(kind.discriminant(), 92);
+        assert_eq!(EscrowEventKind::from_discriminant(92), Some(kind));
+        assert_eq!(kind.name(), "claimant_roster_amended");
+        assert_eq!(
+            EscrowEventKind::from_name("claimant_roster_amended"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(93), None);
     }
 
     #[test]
@@ -10628,7 +10756,7 @@ mod event_tests {
             EscrowEventKind::from_name("delivery_confirmed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]
@@ -10660,7 +10788,7 @@ mod event_tests {
             EscrowEventKind::from_name("governance_cancelled"),
             Some(cancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None); // AV-226: 91 is MilestoneTrancheAppended
+        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
     }
 
     #[test]

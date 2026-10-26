@@ -165,6 +165,9 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // is carved from the skipped remainder, not paid out now;
         // the later tranche release carries the amount with its fee.
         | EscrowEventKind::MilestoneTrancheAppended
+        // AV-227: amending the roster moves no funds — the new
+        // shares price only at the later claim_share pulls.
+        | EscrowEventKind::ClaimantRosterAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -804,6 +807,9 @@ mod event_sourcing_tests {
         // is carved from the skipped remainder, not paid out now;
         // the later tranche release carries the amount with its fee.
         | EscrowEventKind::MilestoneTrancheAppended
+        // AV-227: amending the roster moves no funds — the new
+        // shares price only at the later claim_share pulls.
+        | EscrowEventKind::ClaimantRosterAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

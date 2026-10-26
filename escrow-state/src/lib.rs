@@ -17119,6 +17119,197 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(self)
     }
 
+    /// Revise the claimant roster after funding (AV-227 — Solana /
+    /// payment fintech: a payroll run or revenue split whose
+    /// beneficiaries change mid-deal — a contributor leaves, a new
+    /// one joins, weights shift — without unwinding the escrow).
+    ///
+    /// Only the still-unclaimed legs may change. Every claimed leg
+    /// keeps its address, its share, and its claimed bit exactly:
+    /// a claimed leg already pulled its payout, so repricing it
+    /// would rewrite a settled deal (and the claimed bitmask is the
+    /// replay guard — moving a claimed leg would let it pull
+    /// twice). The caller supplies the *new unclaimed legs* as
+    /// `(claimant, weight)` pairs — weights, not basis points:
+    /// claimed legs are implicitly preserved (they are not passed
+    /// in at all), an unclaimed leg is removed by omitting it, and
+    /// an unclaimed leg is added by including a new address.
+    ///
+    /// After the change the shares re-normalize to exactly
+    /// [`CLAIMANT_SHARE_TOTAL_BPS`]: the claimed legs pin their
+    /// slice, and the unclaimed pool — `10_000` minus the claimed
+    /// shares — is re-cut across the new unclaimed legs in
+    /// proportion to their weights (largest-remainder apportionment,
+    /// ties broken by input order, so the Σ is exactly `10_000`
+    /// with no dust left over). [`Escrow::claim_share`] prices
+    /// each later pull against the unclaimed Σ, so the amended
+    /// legs still settle pro rata and the Σ of all gross pulls
+    /// (claimed legs at their old shares, new legs at their
+    /// normalized shares) is exactly the locked amount.
+    ///
+    /// The new roster is written claimed-legs-first (in original
+    /// order), then the new unclaimed legs (in input order), with
+    /// the claimed bits set on exactly the claimed prefix — the
+    /// bitmask stays positional, so a kept unclaimed leg moving
+    /// slots is harmless (its bit was `0` and stays `0`). The
+    /// rewrite is in place — the roster region is already reserved
+    /// ([`CLAIMANT_ROSTER_LEN`] bytes) — so no account realloc
+    /// and no rent change.
+    ///
+    /// Orthogonal to [`Escrow::with_claimants`] (AV-149): that
+    /// builder creates the roster `Uninitialized`-only; this
+    /// revises it `Funded`-only and never creates one (a
+    /// roster-less escrow is `InvalidClaimantShares` here, not an
+    /// invitation to attach a roster mid-flight). Orthogonal to
+    /// [`Escrow::release_payout_split`]: that settles the AV-108
+    /// push table in one call; this rewrites the AV-149 pull
+    /// table, whose legs still settle one by one via
+    /// [`Escrow::claim_share`].
+    ///
+    /// Check order is deliberate — pause, then authority, then
+    /// state, then roster configuration, then the new table —
+    /// mirroring [`Escrow::reallocate_milestones`]:
+    /// 1. `Paused` while paused (AV-46) — amending is a config
+    ///    transition, not the pause key-loss escape hatch;
+    /// 2. initializer-only: anyone else is `Unauthorized`
+    ///    (delegation does not extend — the roster is the
+    ///    initializer's declared distribution, and only the
+    ///    initializer may rewrite it);
+    /// 3. `Funded` only: `Uninitialized` rosters are built with
+    ///    [`Escrow::with_claimants`], and the terminal states and
+    ///    `Disputed` have no live legs to amend
+    ///    (`InvalidStateTransition`);
+    /// 4. a roster must be configured (`InvalidClaimantShares`
+    ///    otherwise — the roster-shape errors stay there);
+    /// 5. the new table must be non-empty, fit
+    ///    [`MAX_CLAIMANTS`] together with the claimed legs, and
+    ///    contain no zero address, no zero weight, no duplicate
+    ///    address, and no already-claimed address (re-adding a
+    ///    claimed leg as unclaimed would un-pull it); the
+    ///    unclaimed pool must be non-zero (a fully-claimed roster
+    ///    has nothing left to re-cut); and every normalized share
+    ///    must be at least 1 bp (a weight too small to earn a whole
+    ///    basis point is a shape error, like
+    ///    [`ClaimantRoster::new`]'s zero-share rule) — all
+    ///    [`EscrowError::InvalidClaimantShares`] (code 211).
+    ///    Validation completes before any write, so a failed
+    ///    amendment leaves the roster untouched.
+    pub fn amend_claimant_roster(
+        &mut self,
+        initializer: [u8; 32],
+        new_legs: &[([u8; 32], u16)],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Initializer-only governance: the roster is the
+        // initializer's declared distribution.
+        if initializer != self.initializer {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let roster = self
+            .claimants
+            .ok_or(EscrowError::InvalidClaimantShares)?;
+        if new_legs.is_empty() {
+            return Err(EscrowError::InvalidClaimantShares);
+        }
+        // Claimed legs are preserved verbatim: address, share, and
+        // (below) claimed bit. Collect them first so the new table
+        // is built claimed-legs-first.
+        let mut kept: [([u8; 32], u16); MAX_CLAIMANTS] = [([0u8; 32], 0); MAX_CLAIMANTS];
+        let mut kept_count = 0usize;
+        let mut claimed_bps: u32 = 0;
+        for i in 0..roster.claimant_count as usize {
+            if roster.is_claimed(i) {
+                kept[kept_count] = (roster.claimants[i], roster.share_bps[i]);
+                kept_count += 1;
+                claimed_bps += roster.share_bps[i] as u32;
+            }
+        }
+        // The unclaimed pool is what the new legs re-cut. A
+        // fully-claimed roster has no pool left to re-cut.
+        let pool = CLAIMANT_SHARE_TOTAL_BPS - claimed_bps;
+        if pool == 0 {
+            return Err(EscrowError::InvalidClaimantShares);
+        }
+        if kept_count + new_legs.len() > MAX_CLAIMANTS {
+            return Err(EscrowError::InvalidClaimantShares);
+        }
+        // Validate the whole new table before touching the roster.
+        let mut total_weight: u32 = 0;
+        for (i, (claimant, weight)) in new_legs.iter().enumerate() {
+            if *claimant == [0u8; 32] || *weight == 0 {
+                return Err(EscrowError::InvalidClaimantShares);
+            }
+            for (other, _) in &new_legs[..i] {
+                if other == claimant {
+                    return Err(EscrowError::InvalidClaimantShares);
+                }
+            }
+            // A claimed address cannot re-enter as unclaimed: that
+            // would un-pull a settled leg.
+            for (kept_claimant, _) in &kept[..kept_count] {
+                if kept_claimant == claimant {
+                    return Err(EscrowError::InvalidClaimantShares);
+                }
+            }
+            total_weight += *weight as u32;
+        }
+        // Largest-remainder apportionment of the pool by weight:
+        // floor each leg, then hand the leftover dust (always fewer
+        // than one unit per leg) to the largest fractional
+        // remainders, earliest input first on ties — so the
+        // normalized Σ is exactly the pool, hence exactly 10_000
+        // with the claimed legs.
+        let mut new_bps = [0u16; MAX_CLAIMANTS];
+        let mut remainders = [0u32; MAX_CLAIMANTS];
+        let mut assigned: u32 = 0;
+        for (j, (_, weight)) in new_legs.iter().enumerate() {
+            let raw = *weight as u32 * pool;
+            new_bps[j] = (raw / total_weight) as u16;
+            remainders[j] = raw % total_weight;
+            assigned += new_bps[j] as u32;
+        }
+        let mut dust = pool - assigned;
+        while dust > 0 {
+            let mut best: Option<usize> = None;
+            for j in 0..new_legs.len() {
+                match best {
+                    None => best = Some(j),
+                    Some(b) if remainders[j] > remainders[b] => best = Some(j),
+                    _ => {}
+                }
+            }
+            let j = best.expect("new_legs is non-empty");
+            new_bps[j] += 1;
+            remainders[j] = 0;
+            dust -= 1;
+        }
+        for j in 0..new_legs.len() {
+            if new_bps[j] == 0 {
+                return Err(EscrowError::InvalidClaimantShares);
+            }
+        }
+        // All validation passed: write the new roster.
+        let mut next = ClaimantRoster::default();
+        for (k, (claimant, bps)) in kept[..kept_count].iter().enumerate() {
+            next.claimants[k] = *claimant;
+            next.share_bps[k] = *bps;
+            next.claimed |= 1u8 << k;
+        }
+        for (j, (claimant, _)) in new_legs.iter().enumerate() {
+            let slot = kept_count + j;
+            next.claimants[slot] = *claimant;
+            next.share_bps[slot] = new_bps[j];
+        }
+        next.claimant_count = (kept_count + new_legs.len()) as u8;
+        self.claimants = Some(next);
+        Ok(())
+    }
+
     /// The multi-taker claimant roster attached via
     /// [`Escrow::with_claimants`] (AV-149). `None` on a plain
     /// bilateral escrow.
@@ -44170,7 +44361,12 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(91),
             Some(EscrowEventKind::MilestoneTrancheAppended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None);
+        // AV-227: ClaimantRosterAmended takes discriminant 92.
+        assert_eq!(
+            EscrowEventKind::from_discriminant(92),
+            Some(EscrowEventKind::ClaimantRosterAmended)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(93), None);
     }
 
     #[test]
@@ -59418,7 +59614,12 @@ mod event_history_tests {
             Some(EscrowEventKind::MilestoneTrancheAppended),
             "AV-226: appended after MilestoneClaimExpired"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(92), None);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(92),
+            Some(EscrowEventKind::ClaimantRosterAmended),
+            "AV-227: appended after MilestoneTrancheAppended"
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(93), None);
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -59592,9 +59793,10 @@ mod event_history_tests {
         // (AV-203); 87 is `ChainLinked` and 88 is `ChainBroken`
         // (AV-223); 89 is `MilestonesReallocated` (AV-224), 90 is
         // `MilestoneClaimExpired` (AV-225), 91 is
-        // `MilestoneTrancheAppended` (AV-226) and 92 is the first
+        // `MilestoneTrancheAppended` (AV-226), 92 is
+        // `ClaimantRosterAmended` (AV-227) and 93 is the first
         // still-unknown byte.
-        for bad in [92u8, 255] {
+        for bad in [93u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -70131,6 +70333,133 @@ mod av149_tests {
             Err(EscrowError::InvalidMilestones)
         );
         assert_eq!(e.claimants().unwrap().claimed, 0);
+    }
+
+    // ----- AV-227: claimant roster amendment -----
+
+    #[test]
+    fn amend_claimant_roster_locks_claimed_legs_and_renormalizes() {
+        // AV-227: C1 pulls first (5000 bps → 500_000), then the
+        // initializer re-cuts only the unclaimed pool: C2 keeps a
+        // leg at weight 1, C3 joins at weight 3. The claimed leg
+        // keeps its share and its claimed bit; the new legs split
+        // the 5000-bps pool 1250/3750, so the Σ is exactly 10_000.
+        let mut e = rostered_funded(&[(C1, 5000), (C2, 5000)]);
+        let (payout, _) = e.claim_share(C1, C1, T0 + 1).unwrap();
+        assert_eq!(payout, 500_000);
+        e.amend_claimant_roster(ALICE, &[(C2, 1), (C3, 3)]).unwrap();
+        let r = e.claimants().unwrap();
+        assert_eq!(r.claimant_count, 3);
+        assert_eq!(r.find(C1), Some(0), "claimed legs stay first");
+        assert_eq!(r.share_bps[0], 5000, "claimed share locked");
+        assert!(r.is_claimed(0), "claimed bit locked");
+        assert_eq!(r.find(C2), Some(1));
+        assert_eq!(r.share_bps[1], 1250);
+        assert!(!r.is_claimed(1));
+        assert_eq!(r.find(C3), Some(2));
+        assert_eq!(r.share_bps[2], 3750);
+        assert!(!r.is_claimed(2));
+        assert_eq!(r.unclaimed_bps(), 5000);
+        // The claimed leg cannot pull twice, and the new legs still
+        // settle pro rata to exactly the locked amount.
+        assert_eq!(
+            e.claim_share(C1, C1, T0 + 2),
+            Err(EscrowError::ClaimantAlreadyClaimed)
+        );
+        let (p2, _) = e.claim_share(C2, C2, T0 + 3).unwrap();
+        assert_eq!(p2, 125_000);
+        let (p3, _) = e.claim_share(C3, C3, T0 + 4).unwrap();
+        assert_eq!(p3, 375_000, "last leg takes the whole remainder");
+        assert_eq!(payout + p2 + p3, 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_claimant_roster_renormalizes_with_dust_and_removes_legs() {
+        // AV-227: no claims yet, so the whole 10_000-bps pool is
+        // re-cut. Equal weights over 3 legs floor to 3333 each and
+        // the 1-bp dust goes to the first leg (largest-remainder
+        // tie-break by input order).
+        let mut e = rostered_funded(&[(C1, 5000), (C2, 5000)]);
+        e.amend_claimant_roster(ALICE, &[(C1, 1), (C2, 1), (C3, 1)]).unwrap();
+        let r = e.claimants().unwrap();
+        assert_eq!(r.claimant_count, 3);
+        assert_eq!((r.share_bps[0], r.share_bps[1], r.share_bps[2]), (3334, 3333, 3333));
+        assert_eq!(r.unclaimed_bps(), 10_000);
+        // Omitting a leg removes it: only C3 survives, at 10_000.
+        e.amend_claimant_roster(ALICE, &[(C3, 1)]).unwrap();
+        let r = e.claimants().unwrap();
+        assert_eq!(r.claimant_count, 1);
+        assert_eq!(r.find(C1), None);
+        assert_eq!(r.find(C2), None);
+        assert_eq!(r.find(C3), Some(0));
+        assert_eq!(r.share_bps[0], 10_000);
+    }
+
+    #[test]
+    fn amend_claimant_roster_refusals() {
+        // Roster-less escrow: amendment never creates a roster.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            plain.amend_claimant_roster(ALICE, &[(C1, 1)]),
+            Err(EscrowError::InvalidClaimantShares)
+        );
+        // Uninitialized: rosters are built with with_claimants.
+        let mut uninit = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_claimants(&[(C1, 5000), (C2, 5000)])
+            .unwrap();
+        assert_eq!(
+            uninit.amend_claimant_roster(ALICE, &[(C1, 1)]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Initializer-only.
+        let mut e = rostered_funded(&[(C1, 5000), (C2, 5000)]);
+        for bad in [BOB, MALLORY] {
+            assert_eq!(
+                e.amend_claimant_roster(bad, &[(C1, 1)]),
+                Err(EscrowError::Unauthorized)
+            );
+        }
+        // Empty table, zero address, zero weight, duplicate leg.
+        for bad_table in [
+            Vec::new(),
+            vec![([0u8; 32], 1)],
+            vec![(C1, 0)],
+            vec![(C1, 1), (C1, 1)],
+        ] {
+            assert_eq!(
+                e.amend_claimant_roster(ALICE, &bad_table),
+                Err(EscrowError::InvalidClaimantShares),
+                "table {bad_table:?}"
+            );
+        }
+        // The roster is untouched by every failed amendment above.
+        let r = e.claimants().unwrap();
+        assert_eq!(r.claimant_count, 2);
+        assert_eq!((r.share_bps[0], r.share_bps[1]), (5000, 5000));
+        assert_eq!(r.claimed, 0);
+        // A claimed address cannot re-enter as unclaimed.
+        let _ = e.claim_share(C1, C1, T0 + 1).unwrap();
+        assert_eq!(
+            e.amend_claimant_roster(ALICE, &[(C1, 1), (C2, 1)]),
+            Err(EscrowError::InvalidClaimantShares)
+        );
+        // Claimed leg + 8 new legs exceeds MAX_CLAIMANTS.
+        let many: Vec<([u8; 32], u16)> =
+            (0..8).map(|i| ([0xD0 + i as u8; 32], 1)).collect();
+        assert_eq!(
+            e.amend_claimant_roster(ALICE, &many),
+            Err(EscrowError::InvalidClaimantShares)
+        );
+        // Still untouched after the claimed-address and over-cap
+        // refusals: the claimed leg kept its share and bit.
+        let r = e.claimants().unwrap();
+        assert_eq!(r.claimant_count, 2);
+        assert_eq!(r.share_bps[0], 5000);
+        assert!(r.is_claimed(0));
+        assert!(!r.is_claimed(1));
     }
 
     #[test]
