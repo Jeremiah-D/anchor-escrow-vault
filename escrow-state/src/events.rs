@@ -299,6 +299,7 @@
 //! | MilestonePartiallyClaimed (AV-229) | gross slice (net payout + fee, net of penalties priced on this call) | protocol fee | 0 | 0 |
 //! | VestingScheduleAmended (AV-230) | 0 | 0 | 0 | 0 — amending moves no funds; the amended schedule is read from the vault |
 //! | MilestoneDueDatesAmended (AV-231) | 0 | 0 | 0 | 0 — amending moves no funds; the amended table is read from the vault |
+//! | MilestoneUnskipped (AV-232) | 0 | 0 | 0 | 0 — unskipping moves no funds; the restored tranche is read from the vault |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1204,6 +1205,17 @@ pub enum EscrowEventKind {
     /// new dates). The amended table is read from the vault, so
     /// the event needs no extra field.
     MilestoneDueDatesAmended,
+    /// AV-232: a skipped milestone tranche was restored to the
+    /// claimable schedule by dual-signed governance
+    /// ([`Escrow::unskip_milestone`](crate::Escrow::unskip_milestone)).
+    /// `from == to ==` the current state (a schedule restoration,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::MilestoneDueDatesAmended`]); all amounts
+    /// are zero — unskipping moves no funds (the tranche returns to
+    /// the claimable schedule; the refund it had joined only
+    /// materializes at a later cancel). The restored tranche is read
+    /// from the vault, so the event needs no extra field.
+    MilestoneUnskipped,
 }
 
 impl EscrowEventKind {
@@ -1455,6 +1467,10 @@ impl EscrowEventKind {
             // discriminants 0–94 stay stable for already-serialized
             // histories.
             95 => Self::MilestoneDueDatesAmended,
+            // AV-232: appended after MilestoneDueDatesAmended so
+            // discriminants 0–95 stay stable for already-serialized
+            // histories.
+            96 => Self::MilestoneUnskipped,
             _ => return None,
         })
     }
@@ -1608,6 +1624,10 @@ impl EscrowEventKind {
             // the name table stays stable for already-serialized
             // histories.
             Self::MilestoneDueDatesAmended => "milestone_due_dates_amended",
+            // AV-232: appended after milestone_due_dates_amended so
+            // the name table stays stable for already-serialized
+            // histories.
+            Self::MilestoneUnskipped => "milestone_unskipped",
         }
     }
 
@@ -1765,6 +1785,10 @@ impl EscrowEventKind {
             // the name table stays stable for already-serialized
             // histories.
             "milestone_due_dates_amended" => Self::MilestoneDueDatesAmended,
+            // AV-232: appended after milestone_due_dates_amended so
+            // the name table stays stable for already-serialized
+            // histories.
+            "milestone_unskipped" => Self::MilestoneUnskipped,
             _ => return None,
         })
     }
@@ -6883,6 +6907,37 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Restore a skipped milestone to the claimable schedule
+    /// (mirrors [`Escrow::unskip_milestone`]). Emits
+    /// `MilestoneUnskipped` (`from == to ==` the current state —
+    /// the schedule, not the lifecycle state, is what changed;
+    /// all amounts zero, since unskipping moves no funds). A
+    /// failed restoration emits nothing: the core call returns
+    /// before any event is pushed.
+    pub fn unskip_milestone(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        index: u8,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner.unskip_milestone(initializer, taker, index)?;
+        self.push_event(
+            EscrowEventKind::MilestoneUnskipped,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// Close the vault account and reclaim the rent-exempt deposit
     /// (mirrors [`Escrow::close_vault`]). Only the initializer may call
     /// this (`Unauthorized` otherwise, checked before state validity —
@@ -9460,6 +9515,64 @@ mod event_tests {
     }
 
     #[test]
+    fn unskip_milestone_emits_event_and_failed_unskip_emits_nothing() {
+        // AV-232: a dual-signed restoration emits MilestoneUnskipped
+        // (discriminant 96, appended last) with zero amounts — a
+        // schedule restoration, not a settlement — and the restored
+        // tranche is read from the vault. A refused restoration
+        // emits nothing.
+        assert_eq!(EscrowEventKind::MilestoneUnskipped.discriminant(), 96);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(96),
+            Some(EscrowEventKind::MilestoneUnskipped)
+        );
+        assert_eq!(
+            EscrowEventKind::MilestoneUnskipped.name(),
+            "milestone_unskipped"
+        );
+        assert_eq!(
+            EscrowEventKind::from_name("milestone_unskipped"),
+            Some(EscrowEventKind::MilestoneUnskipped)
+        );
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.skip_milestone(ALICE, 0, T0 + 2).unwrap();
+        e.skip_milestone(BOB, 0, T0 + 3).unwrap();
+        assert_eq!(last(&e).kind, EscrowEventKind::MilestoneSkipped);
+        assert_eq!(e.inner().skipped_amount(), 400_000);
+        // A one-party restoration fails and emits nothing: the last
+        // event is still MilestoneSkipped.
+        assert_eq!(
+            e.unskip_milestone(ALICE, ALICE, 0, T0 + 4),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(last(&e).kind, EscrowEventKind::MilestoneSkipped);
+        e.unskip_milestone(ALICE, BOB, 0, T0 + 5).unwrap();
+        assert_event(
+            &last(&e),
+            EscrowEventKind::MilestoneUnskipped,
+            3,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            0,
+            0,
+            0,
+            T0 + 5,
+        );
+        assert_eq!(e.inner().skipped_amount(), 0);
+        assert!(!e.inner().milestone_settled(0));
+        let history = e.inner().event_history();
+        assert_eq!(
+            history.last().unwrap().kind,
+            EscrowEventKind::MilestoneUnskipped
+        );
+    }
+
+    #[test]
     fn failed_reallocate_milestones_emits_nothing() {
         // Repricing a confirmed tranche is InvalidMilestoneAmendment
         // (the AV-155 amendment error): the failed governance call
@@ -10275,7 +10388,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -10378,7 +10491,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -10915,7 +11028,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -10930,7 +11043,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -10942,7 +11055,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -10954,7 +11067,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -10966,7 +11079,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -10981,7 +11094,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -10996,7 +11109,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11008,7 +11121,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11020,7 +11133,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11032,7 +11145,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11044,7 +11157,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11056,7 +11169,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11068,7 +11181,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11084,7 +11197,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11099,7 +11212,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11114,7 +11227,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11129,7 +11242,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11144,7 +11257,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_reallocated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11160,7 +11273,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_claim_expired"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11176,7 +11289,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_tranche_appended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11192,7 +11305,7 @@ mod event_tests {
             EscrowEventKind::from_name("claimant_roster_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11207,7 +11320,7 @@ mod event_tests {
             EscrowEventKind::from_name("delivery_confirmed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -11239,7 +11352,7 @@ mod event_tests {
             EscrowEventKind::from_name("governance_cancelled"),
             Some(cancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]

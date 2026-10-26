@@ -200,6 +200,8 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         | EscrowEventKind::Escalated
         | EscrowEventKind::MilestoneConfirmed
         | EscrowEventKind::MilestoneSkipped
+        // AV-232: restoring a skipped tranche carries no fee leg.
+        | EscrowEventKind::MilestoneUnskipped
         // AV-203: a delivery confirmation carries no fee leg.
         | EscrowEventKind::DeliveryConfirmed
         // AV-223: chain link / break carry no fee leg.
@@ -870,6 +872,8 @@ mod fee_history_tests {
                 | EscrowEventKind::Escalated
                 | EscrowEventKind::MilestoneConfirmed
                 | EscrowEventKind::MilestoneSkipped
+                // AV-232: restoring a skipped tranche carries no fee leg.
+                | EscrowEventKind::MilestoneUnskipped
                 | EscrowEventKind::QuorumUpdated
                 | EscrowEventKind::AttestorsUpdated
                 // AV-154: a quorum key rotation moves no funds.

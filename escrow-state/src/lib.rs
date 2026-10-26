@@ -24158,6 +24158,108 @@ let fee = self.charge_protocol_fee(net_tranche)?;
         Ok(())
     }
 
+    /// Restore a skipped milestone to the claimable schedule by mutual
+    /// agreement (AV-232 — Solana milestone payments / payment
+    /// fintech): the inverse of [`Escrow::skip_milestone`]. A skipped
+    /// tranche is refundable, not gone — if both parties change their
+    /// minds before anything else settles, the tranche can come back
+    /// and be released like any other unsettled tranche, instead of
+    /// forcing the deal to cancel and re-lock.
+    ///
+    /// Check order mirrors [`Escrow::skip_milestone`] and
+    /// [`Escrow::amend_milestone_due_dates`]: pause, then
+    /// dual-signature authority (both parties must authorize — one
+    /// party alone cannot resurrect a tranche the other agreed to
+    /// refund), then `Funded` state, then plan configuration, then
+    /// the tranche's restoration eligibility. Validation completes
+    /// before any write, so a failed restoration leaves the flags
+    /// and the skipped pool untouched (fail-closed, zero-write).
+    ///
+    /// Restoration eligibility (all three must hold, otherwise
+    /// `InvalidStateTransition`):
+    /// - the tranche is currently skipped (its `SKIPPED_BIT` is set)
+    ///   — a released tranche is paid out and can never come back,
+    ///   and a never-skipped tranche has nothing to restore;
+    /// - every earlier tranche is settled (released or skipped) —
+    ///   so the restored tranche becomes the earliest unsettled
+    ///   tranche, i.e. `next_milestone_index()`, and in-order
+    ///   settlement is preserved rather than rewound;
+    /// - no later tranche is settled (released or skipped) — a skip
+    ///   followed by a later settlement is final: restoring the
+    ///   earlier tranche underneath an already-settled later one
+    ///   would reorder the settlement sequence. Restoration is
+    ///   therefore last-settled-first-restored: with tranches 0 and
+    ///   1 both skipped, tranche 1 restores first, then tranche 0.
+    ///
+    /// On success the `SKIPPED_BIT` and both skip-approval bits are
+    /// cleared and the tranche amount leaves the skipped pool
+    /// (`skipped -= plan.amounts[i]`, checked) — the released +
+    /// skipped `<= amount` accounting invariant is preserved in
+    /// both directions. Per-tranche confirmations survive (they
+    /// record acceptance of the *deliverable*, not the settlement —
+    /// the same rationale as AV-70's re-split): a tranche both
+    /// parties already confirmed can be released immediately after
+    /// restoration. Orthogonal to [`Escrow::skip_milestone`] (that
+    /// call skips an unsettled tranche into the refundable pool;
+    /// this call restores a skipped tranche out of it) and to
+    /// AV-226's tranche append (that carves a *new* tranche from the
+    /// skipped remainder; this restores an *existing* skipped one).
+    /// Emits `MilestoneUnskipped` on the event layer.
+    pub fn unskip_milestone(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        index: u8,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the restoration, paralleling `skip_milestone`'s dual
+        // approval and `amend_milestone_due_dates`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let plan = self.milestones.ok_or(EscrowError::InvalidMilestones)?;
+        let i = index as usize;
+        if i >= plan.count as usize {
+            return Err(EscrowError::InvalidMilestones);
+        }
+        // The tranche must currently be skipped — released and
+        // never-skipped tranches have nothing to restore.
+        if self.milestone_flags & Self::milestone_bit(i, MILESTONE_SKIPPED_BIT) == 0 {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        // Every earlier tranche settled, so the restored tranche
+        // becomes the earliest unsettled one.
+        for j in 0..i {
+            if !self.milestone_settled(j) {
+                return Err(EscrowError::InvalidStateTransition);
+            }
+        }
+        // No later tranche settled: a skip followed by a later
+        // settlement is final.
+        for j in (i + 1)..plan.count as usize {
+            if self.milestone_settled(j) {
+                return Err(EscrowError::InvalidStateTransition);
+            }
+        }
+        // All checks pass before any write: validate the pool
+        // arithmetic first, then mutate flags and pool together.
+        let restored = self
+            .skipped
+            .checked_sub(plan.amounts[i])
+            .ok_or(EscrowError::ReleaseExceedsLocked)?;
+        self.skipped = restored;
+        self.milestone_flags &= !(Self::milestone_bit(i, MILESTONE_SKIPPED_BIT)
+            | Self::milestone_bit(i, MILESTONE_SKIP_INIT_BIT)
+            | Self::milestone_bit(i, MILESTONE_SKIP_TAKER_BIT));
+        Ok(())
+    }
+
     /// Bit position of milestone `index`'s `offset` bit inside
     /// `milestone_flags`. Callers guarantee `index < MAX_MILESTONES`
     /// (plan counts are capped there), so the shift cannot overflow.
@@ -44868,7 +44970,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
     }
 
     #[test]
@@ -48574,6 +48676,149 @@ mod vesting_tests {
         no_plan.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         assert_eq!(
             no_plan.amend_milestone_due_dates(ALICE, BOB, &table, 1_740_000_000),
+            Err(EscrowError::InvalidMilestones)
+        );
+    }
+
+    // ----- AV-232: milestone unskip -----
+
+    fn funded_milestone_escrow() -> Escrow {
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    fn skip_tranche(e: &mut Escrow, index: u8) {
+        e.skip_milestone(ALICE, index).unwrap();
+        e.skip_milestone(BOB, index).unwrap();
+        assert!(e.milestone_settled(index as usize));
+    }
+
+    #[test]
+    fn unskip_milestone_restores_skipped_tranche_to_claimable() {
+        // Skip tranche 0 (dual-approved), then restore it: the
+        // skipped pool drains, the tranche unsettles, and the
+        // ordinary release path settles it in full.
+        let mut e = funded_milestone_escrow();
+        skip_tranche(&mut e, 0);
+        assert_eq!(e.skipped_amount(), 400_000);
+        e.unskip_milestone(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.skipped_amount(), 0);
+        assert!(!e.milestone_settled(0));
+        // The restored tranche releases like any unsettled one.
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        let (payout, fee) = e.release_milestone(ALICE, EXPIRES_AT - 1_800, 0, None, BOB).unwrap();
+        assert_eq!(payout, 400_000);
+        assert_eq!(fee, 0);
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.skipped_amount(), 0);
+    }
+
+    #[test]
+    fn unskip_milestone_restores_in_reverse_settlement_order() {
+        // Both tranches skipped: the earlier one cannot restore
+        // underneath the later settled one — restoration is
+        // last-settled-first-restored. Once tranche 1 is back,
+        // tranche 0 restores too.
+        let mut e = funded_milestone_escrow();
+        skip_tranche(&mut e, 0);
+        skip_tranche(&mut e, 1);
+        assert_eq!(e.skipped_amount(), 1_000_000);
+        assert_eq!(
+            e.unskip_milestone(ALICE, BOB, 0),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // The refusal wrote nothing.
+        assert_eq!(e.skipped_amount(), 1_000_000);
+        assert!(e.milestone_settled(0));
+        assert!(e.milestone_settled(1));
+        e.unskip_milestone(ALICE, BOB, 1).unwrap();
+        assert_eq!(e.skipped_amount(), 400_000);
+        assert!(!e.milestone_settled(1));
+        e.unskip_milestone(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.skipped_amount(), 0);
+        assert!(!e.milestone_settled(0));
+    }
+
+    #[test]
+    fn unskip_milestone_rejects_released_never_skipped_and_later_settled() {
+        // Released tranches never come back.
+        let mut released = funded_milestone_escrow();
+        released.confirm_milestone(ALICE, 0).unwrap();
+        released.confirm_milestone(BOB, 0).unwrap();
+        released
+            .release_milestone(ALICE, EXPIRES_AT - 1_800, 0, None, BOB)
+            .unwrap();
+        assert_eq!(
+            released.unskip_milestone(ALICE, BOB, 0),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(released.released_amount(), 400_000);
+        // A never-skipped tranche has nothing to restore.
+        let mut plain = funded_milestone_escrow();
+        assert_eq!(
+            plain.unskip_milestone(ALICE, BOB, 0),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(plain.skipped_amount(), 0);
+        // A skip followed by a later settlement is final: skip 0,
+        // release 1, then tranche 0 stays skipped whatever the
+        // parties agree.
+        let mut settled_later = funded_milestone_escrow();
+        skip_tranche(&mut settled_later, 0);
+        settled_later.confirm_milestone(ALICE, 1).unwrap();
+        settled_later.confirm_milestone(BOB, 1).unwrap();
+        settled_later
+            .release_milestone(ALICE, EXPIRES_AT - 1_800, 1, None, BOB)
+            .unwrap();
+        assert_eq!(
+            settled_later.unskip_milestone(ALICE, BOB, 0),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(settled_later.skipped_amount(), 400_000);
+        assert_eq!(settled_later.released_amount(), 600_000);
+    }
+
+    #[test]
+    fn unskip_milestone_requires_dual_signature_funded_and_plan() {
+        let mut e = funded_milestone_escrow();
+        skip_tranche(&mut e, 0);
+        assert_eq!(
+            e.unskip_milestone(ALICE, MALLORY, 0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.unskip_milestone(MALLORY, BOB, 0),
+            Err(EscrowError::Unauthorized)
+        );
+        // Still skipped after the refused calls.
+        assert_eq!(e.skipped_amount(), 400_000);
+        assert!(e.milestone_settled(0));
+        // Out-of-range index.
+        assert_eq!(
+            e.unskip_milestone(ALICE, BOB, 2),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // Uninitialized: no live tranche to restore.
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        assert_eq!(
+            bare.unskip_milestone(ALICE, BOB, 0),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Funded but plan-less: nothing to restore.
+        let mut no_plan = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        no_plan.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            no_plan.unskip_milestone(ALICE, BOB, 0),
             Err(EscrowError::InvalidMilestones)
         );
     }
@@ -60552,7 +60797,7 @@ mod event_history_tests {
             Some(EscrowEventKind::ClaimantRosterAmended),
             "AV-227: appended after MilestoneTrancheAppended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(97), None); // AV-232: 96 is MilestoneUnskipped
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -60730,9 +60975,10 @@ mod event_history_tests {
         // `ClaimantRosterAmended` (AV-227), 93 is
         // `MilestonePartiallyClaimed` (AV-229), 94 is
         // `VestingScheduleAmended` (AV-230), 95 is
-        // `MilestoneDueDatesAmended` (AV-231) and 96 is the
+        // `MilestoneDueDatesAmended` (AV-231), 96 is
+        // `MilestoneUnskipped` (AV-232) and 97 is the
         // first still-unknown byte.
-        for bad in [96u8, 255] {
+        for bad in [97u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

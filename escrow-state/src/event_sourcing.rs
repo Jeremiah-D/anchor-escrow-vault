@@ -237,6 +237,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // it), so the fold books nothing now; the tranche is counted
         // exactly once, inside the later cancel/resolve refund.
         | EscrowEventKind::MilestoneSkipped
+        // AV-232: restoring a skipped tranche moves no funds
+        // either — the symmetric no-op of MilestoneSkipped: the
+        // tranche returns to the claimable schedule inside the
+        // lockup, and is counted exactly once, inside the later
+        // release or cancel.
+        | EscrowEventKind::MilestoneUnskipped
         // AV-82: the slash moves funds to the penalty account, tracked
         // by the state machine's dedicated `penalty_paid` counter —
         // never mixed into `released`. The triple has no penalty leg,
@@ -800,6 +806,8 @@ mod event_sourcing_tests {
                 | EscrowEventKind::Escalated
                 | EscrowEventKind::MilestoneConfirmed
                 | EscrowEventKind::MilestoneSkipped
+                // AV-232: restoring a skipped tranche moves no funds.
+                | EscrowEventKind::MilestoneUnskipped
                 // AV-203: a delivery confirmation moves no funds.
                 | EscrowEventKind::DeliveryConfirmed
                 // AV-223: chain link / break move no funds.
