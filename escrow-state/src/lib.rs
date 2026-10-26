@@ -17543,6 +17543,110 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Revise the milestone deadline table after funding (AV-231
+    /// — Solana milestone payments / payment fintech): the
+    /// initializer and the taker may jointly move the per-tranche
+    /// `due_at` deadlines of a live escrow (a deliverable slips,
+    /// the calendar follows — without reopening the amounts, which
+    /// stay owned by AV-70 / AV-155 / AV-224).
+    ///
+    /// Check order mirrors [`Escrow::amend_vesting_schedule`]:
+    /// pause, then dual-signature authority (both parties must
+    /// authorize — one party alone cannot rewrite the settlement
+    /// calendar), then `Funded` state, then an attached plan with
+    /// an attached deadline table (a table-less escrow has nothing
+    /// to amend — amendment never creates a table mid-flight;
+    /// [`Escrow::with_milestone_due_dates`] stays
+    /// `Uninitialized`-only), then the new table's shape.
+    /// Validation completes before any write, so a failed
+    /// amendment leaves the table untouched.
+    ///
+    /// Table semantics (fail-closed, all shape failures are
+    /// [`EscrowError::InvalidMilestones`], the AV-206 table error):
+    /// - the submitted table's length must equal the plan's tranche
+    ///   count — a shorter table would leave tranches deadline-free
+    ///   by accident, a longer one would invent deadlines;
+    /// - only unsettled tranches move: a released or skipped
+    ///   tranche's `due_at` is retained verbatim, whatever the
+    ///   caller submitted for that slot (history is not rewritten
+    ///   — a settled tranche's deadline already priced its late
+    ///   penalty, if any, at release time);
+    /// - every submitted due for an unsettled tranche must be
+    ///   non-zero and no earlier than `now` — moving a deadline
+    ///   into the past would make the tranche instantly late and
+    ///   ambush it with an AV-206 penalty on the next release;
+    /// - the *final* table (retained settled dues plus new unsettled
+    ///   dues) must be strictly increasing, so a moved deadline can
+    ///   never overtake its predecessor's retained due or leapfrog
+    ///   a later tranche.
+    ///
+    /// Orthogonal to [`Escrow::with_milestone_due_dates`] (AV-206):
+    /// that builder creates the table `Uninitialized`-only; this
+    /// revises it `Funded`-only and never creates one. Orthogonal
+    /// to AV-206's penalty pricing (the rate is untouched — only
+    /// the dates it prices against move) and to AV-225's per-tranche
+    /// claim deadlines (an independent time gate, untouched here).
+    /// Emits `MilestoneDueDatesAmended` on the event layer.
+    pub fn amend_milestone_due_dates(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        due_at: &[u64],
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision — one party alone cannot rewrite the
+        // settlement calendar, paralleling `amend_vesting_schedule`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let plan = self.milestones.ok_or(EscrowError::InvalidMilestones)?;
+        let count = plan.count as usize;
+        if due_at.len() != count {
+            return Err(EscrowError::InvalidMilestones);
+        }
+        // Amendment never creates a table mid-flight: every tranche
+        // must already carry a deadline (a stored 0 means "never
+        // attached" — the AV-206 builder rejects 0 as a deadline).
+        for i in 0..count {
+            if self.milestone_due_dates[i] == 0 {
+                return Err(EscrowError::InvalidMilestones);
+            }
+        }
+        // Build the final table first; validation completes before
+        // any write, so a failed amendment leaves the table
+        // untouched.
+        let mut amended = [0u64; MAX_MILESTONES];
+        for i in 0..count {
+            if self.milestone_settled(i) {
+                // Settled tranches keep their deadline verbatim,
+                // whatever the caller submitted for that slot.
+                amended[i] = self.milestone_due_dates[i];
+            } else {
+                let due = due_at[i];
+                if due == 0 || due < now {
+                    return Err(EscrowError::InvalidMilestones);
+                }
+                amended[i] = due;
+            }
+        }
+        for window in amended[..count].windows(2) {
+            if window[1] <= window[0] {
+                return Err(EscrowError::InvalidMilestones);
+            }
+        }
+        for i in 0..count {
+            self.milestone_due_dates[i] = amended[i];
+        }
+        Ok(())
+    }
+
     /// The multi-taker claimant roster attached via
     /// [`Escrow::with_claimants`] (AV-149). `None` on a plain
     /// bilateral escrow.
@@ -44764,7 +44868,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(95), None); // AV-230: 94 is VestingScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
     }
 
     #[test]
@@ -48347,6 +48451,131 @@ mod vesting_tests {
         );
         let (payout, _) = e.claim(BOB, (START + END) / 2, None, BOB).unwrap();
         assert_eq!(payout, 500_000, "at the midpoint the linear curve applies");
+    }
+
+    // ----- AV-231: milestone due-date amendment -----
+
+    fn funded_milestone_due_escrow() -> Escrow {
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap()
+            .with_milestone_due_dates(&[1_750_000_000, 1_760_000_000])
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_milestone_due_dates_moves_only_unsettled_tranches() {
+        // Release tranche 0 (dual-confirmed), then move the table:
+        // the settled tranche keeps its original due whatever the
+        // caller submits for that slot, the open tranche moves.
+        let mut e = funded_milestone_due_escrow();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        e.release_milestone(ALICE, 1_740_000_000, 0, None, BOB).unwrap();
+        assert!(e.milestone_settled(0));
+        e.amend_milestone_due_dates(ALICE, BOB, &[1_700_000_000, 1_770_000_000], 1_740_000_000)
+            .unwrap();
+        assert_eq!(e.milestone_due_at(0), Some(1_750_000_000));
+        assert_eq!(e.milestone_due_at(1), Some(1_770_000_000));
+        // The moved deadline prices the later release: releasing
+        // tranche 1 before its new due is on time (no penalty
+        // configured here, but the due itself is what moved).
+        e.confirm_milestone(ALICE, 1).unwrap();
+        e.confirm_milestone(BOB, 1).unwrap();
+        e.release_milestone(ALICE, 1_765_000_000, 1, None, BOB).unwrap();
+        assert_eq!(e.released_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn amend_milestone_due_dates_rejects_bad_tables_untouched() {
+        let mut e = funded_milestone_due_escrow();
+        let now = 1_740_000_000;
+        // Length mismatch.
+        assert_eq!(
+            e.amend_milestone_due_dates(ALICE, BOB, &[1_750_000_000], now),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // A new due in the past would ambush the tranche with an
+        // instant-late penalty on the next release.
+        assert_eq!(
+            e.amend_milestone_due_dates(ALICE, BOB, &[1_730_000_000, 1_760_000_000], now),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // Non-increasing final table.
+        assert_eq!(
+            e.amend_milestone_due_dates(ALICE, BOB, &[1_760_000_000, 1_750_000_000], now),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // A moved due that would overtake nothing but still breaks
+        // monotonicity against the *retained* settled due is caught
+        // by the final-table check: release tranche 0, then try to
+        // move tranche 1 below tranche 0's retained due.
+        let mut settled = funded_milestone_due_escrow();
+        settled.confirm_milestone(ALICE, 0).unwrap();
+        settled.confirm_milestone(BOB, 0).unwrap();
+        settled.release_milestone(ALICE, 1_740_000_000, 0, None, BOB).unwrap();
+        assert_eq!(
+            settled.amend_milestone_due_dates(
+                ALICE,
+                BOB,
+                &[1_700_000_000, 1_745_000_000],
+                1_740_000_000
+            ),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // Every failure leaves the table untouched.
+        assert_eq!(e.milestone_due_at(0), Some(1_750_000_000));
+        assert_eq!(e.milestone_due_at(1), Some(1_760_000_000));
+        assert_eq!(settled.milestone_due_at(0), Some(1_750_000_000));
+        assert_eq!(settled.milestone_due_at(1), Some(1_760_000_000));
+    }
+
+    #[test]
+    fn amend_milestone_due_dates_requires_dual_signature_funded_and_table() {
+        let mut e = funded_milestone_due_escrow();
+        let table = [1_750_000_000, 1_770_000_000];
+        assert_eq!(
+            e.amend_milestone_due_dates(ALICE, MALLORY, &table, 1_740_000_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_milestone_due_dates(MALLORY, BOB, &table, 1_740_000_000),
+            Err(EscrowError::Unauthorized)
+        );
+        // Uninitialized: the builder owns table creation.
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap()
+            .with_milestone_due_dates(&[1_750_000_000, 1_760_000_000])
+            .unwrap();
+        assert_eq!(
+            bare.amend_milestone_due_dates(ALICE, BOB, &table, 1_740_000_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Funded but table-less: amendment never creates one.
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap();
+        plain.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            plain.amend_milestone_due_dates(ALICE, BOB, &table, 1_740_000_000),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // Funded but plan-less: nothing to amend.
+        let mut no_plan = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        no_plan.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            no_plan.amend_milestone_due_dates(ALICE, BOB, &table, 1_740_000_000),
+            Err(EscrowError::InvalidMilestones)
+        );
     }
 
     // ----- interaction with release / cancel / quorum -----
@@ -60323,7 +60552,7 @@ mod event_history_tests {
             Some(EscrowEventKind::ClaimantRosterAmended),
             "AV-227: appended after MilestoneTrancheAppended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(95), None); // AV-230: 94 is VestingScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(96), None); // AV-231: 95 is MilestoneDueDatesAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -60500,9 +60729,10 @@ mod event_history_tests {
         // `MilestoneTrancheAppended` (AV-226), 92 is
         // `ClaimantRosterAmended` (AV-227), 93 is
         // `MilestonePartiallyClaimed` (AV-229), 94 is
-        // `VestingScheduleAmended` (AV-230) and 95 is the
+        // `VestingScheduleAmended` (AV-230), 95 is
+        // `MilestoneDueDatesAmended` (AV-231) and 96 is the
         // first still-unknown byte.
-        for bad in [95u8, 255] {
+        for bad in [96u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
