@@ -167,6 +167,9 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // AV-130: a checker-approved release fees like Released.
         | EscrowEventKind::DualControlConfirmed
         | EscrowEventKind::MilestoneReleased
+        // AV-229: a partial slice fees like a full tranche
+        // release — the slice's fee leg is a release fee.
+        | EscrowEventKind::MilestonePartiallyClaimed
         | EscrowEventKind::SubscriptionPeriodReleased
         // AV-95b: the per-leg taker payout fees like Released.
         // AV-140: the netting offset fees like Released (the fee leg
@@ -841,6 +844,9 @@ mod fee_history_tests {
                 | EscrowEventKind::ReleaseViaIntent
                 | EscrowEventKind::DualControlConfirmed
                 | EscrowEventKind::MilestoneReleased
+                // AV-229: a partial slice fees like a full
+                // tranche release.
+                | EscrowEventKind::MilestonePartiallyClaimed
                 | EscrowEventKind::SubscriptionPeriodReleased
                 | EscrowEventKind::BasketReleased
                 | EscrowEventKind::EscrowsNetted => Some(FeeType::Release),

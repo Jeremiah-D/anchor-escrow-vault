@@ -292,6 +292,9 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // plain kind.
         | EscrowEventKind::ShareClaimed
         | EscrowEventKind::MilestoneReleased
+        // AV-229: a partial slice books like the full tranche
+        // release — the slice's gross is released value.
+        | EscrowEventKind::MilestonePartiallyClaimed
         | EscrowEventKind::SubscriptionPeriodReleased
         // AV-95b: one basket leg paid out to the taker — the per-leg
         // `Released`; the leg's gross books as `released`, like the
@@ -752,6 +755,9 @@ mod event_sourcing_tests {
                 // AV-149: the per-leg taker payout books like Released.
                 | EscrowEventKind::ShareClaimed
                 | EscrowEventKind::MilestoneReleased
+                // AV-229: a partial slice books like the full
+                // tranche release.
+                | EscrowEventKind::MilestonePartiallyClaimed
                 | EscrowEventKind::SubscriptionPeriodReleased
                 // AV-95b: the per-leg taker payout books like Released.
                 // AV-140: the larger leg's netting offset books like

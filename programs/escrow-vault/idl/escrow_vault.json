@@ -1434,7 +1434,8 @@
           {"name": "rent_payer", "type": {"option": "publicKey"}, "offset": 8130},
           {"name": "chain_link", "type": {"option": "publicKey"}, "offset": 8163},
           {"name": "milestone_claim_deadlines", "type": {"array": ["u64", 8]}, "offset": 8196},
-          {"name": "funding_start", "type": "u64", "offset": 8260}
+          {"name": "funding_start", "type": "u64", "offset": 8260},
+          {"name": "milestone_partial_claimed", "type": {"array": ["u64", 8]}, "offset": 8268}
         ]
       }
     }

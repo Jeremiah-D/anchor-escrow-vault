@@ -1008,6 +1008,9 @@ pub const BREAKING_CHANGE_ALLOWLIST: &[&str] = &[
     // AV-228: the funding start window tail — appended, never
     // renumbered.
     "field_added:account Vault.funding_start",
+    // AV-229: the per-tranche partial-claim ledger tail —
+    // appended, never renumbered.
+    "field_added:account Vault.milestone_partial_claimed",
     // AV-208: the delegation spend cap + spent counter — appended
     // to the Delegation named type, never renumbered.
     "field_added:type Delegation.spend_cap",

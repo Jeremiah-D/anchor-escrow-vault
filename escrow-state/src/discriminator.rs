@@ -1773,6 +1773,14 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // order after the claim-deadline table: one u64 (zeroed when
     // no window is attached).
     let funding_start = c.u64_le()?;
+    // AV-229: per-tranche partial-claim ledger — always present,
+    // in vault order after the funding window: one u64 per
+    // tranche (zeroed when nothing of that tranche has been
+    // partially claimed).
+    let mut milestone_partial_claimed = [0u64; MAX_MILESTONES];
+    for slot in milestone_partial_claimed.iter_mut() {
+        *slot = c.u64_le()?;
+    }
 
     debug_assert_eq!(
         c.pos, ESCROW_BODY_LEN,
@@ -2171,6 +2179,11 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
         // still refused before the window instead of silently
         // accepting an early deposit.
         funding_start,
+        // AV-229: a decoded escrow carries the same partial-claim
+        // ledger the live one had, so a claim after a decode
+        // still settles only the tranche's true remainder
+        // instead of double-paying an already-claimed slice.
+        milestone_partial_claimed,
         // AV-36: the reentrancy lock is runtime-only — decoded escrows
         // always start unlocked; the lock can only be armed inside
         // `release_via_cpi`'s executor window on a live `&mut Escrow`.
@@ -2424,6 +2437,35 @@ mod discriminator_tests {
                 .milestone_claim_deadline_at(0),
             None
         );
+    }
+
+    #[test]
+    fn decode_round_trips_partial_claim_ledger() {
+        // AV-229: the per-tranche partial-claim ledger survives
+        // the round trip, so a claim after a decode settles only
+        // the tranche's true remainder instead of double-paying
+        // an already-claimed slice.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.confirm_milestone(ALICE, 0).unwrap();
+        e.confirm_milestone(BOB, 0).unwrap();
+        e.release_milestone_partial(ALICE, 1_750_000_000, 0, 150_000, None, BOB)
+            .unwrap();
+        let decoded = decode_vault_account(&account_bytes(&e)).unwrap();
+        assert_eq!(decoded, e);
+        assert_eq!(decoded.milestone_partial_claimed_at(0), Some(150_000));
+        assert_eq!(decoded.milestone_partial_remaining_at(0), Some(250_000));
+        // The decoded escrow settles exactly the remainder — the
+        // ledger, not just the released counter, survived.
+        let mut live = decoded;
+        let (payout, _) = live
+            .release_milestone(ALICE, 1_750_000_000, 0, None, BOB)
+            .unwrap();
+        assert_eq!(payout, 250_000);
+        assert_eq!(live.milestone_partial_claimed_at(0), Some(400_000));
     }
 
     #[test]

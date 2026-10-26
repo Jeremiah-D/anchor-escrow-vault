@@ -296,6 +296,7 @@
 //! | MilestoneClaimExpired (AV-225) | 0 | 0 | expired tranche (the initializer's refund) | 0 — the expired tranche index rides the event's `milestone_claim_expired` field |
 //! | MilestoneTrancheAppended (AV-226) | 0 | 0 | 0 | 0 — appending moves no funds; the appended tranche is read from the vault's plan tail |
 //! | ClaimantRosterAmended (AV-227) | 0 | 0 | 0 | 0 — amending moves no funds; the amended roster is read from the vault |
+//! | MilestonePartiallyClaimed (AV-229) | gross slice (net payout + fee, net of penalties priced on this call) | protocol fee | 0 | 0 |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1167,6 +1168,20 @@ pub enum EscrowEventKind {
     /// `claim_share` pulls carry the new shares). The amended roster
     /// is read from the vault — the event is the ordering signal.
     ClaimantRosterAmended,
+    /// AV-229: a slice of a milestone tranche was claimed through
+    /// [`Escrow::release_milestone_partial`](crate::Escrow::release_milestone_partial).
+    /// `from` is the pre-claim state, `to` the post-claim state
+    /// (the final slice carries `to == Released`, like
+    /// [`EscrowEventKind::MilestoneReleased`]); `amounts.payout`
+    /// carries the slice's gross (net payout + fee, net of the
+    /// AV-206 / AV-216 penalties priced on this call) and
+    /// `amounts.fee` the protocol fee, like `MilestoneReleased`
+    /// — a partial claim moves funds, so it is a payout event,
+    /// not a config event. The tranche index is not carried: the
+    /// event stream is in-order, and the tranche is always the
+    /// first unsettled one at emit time (the same convention as
+    /// `MilestoneReleased`).
+    MilestonePartiallyClaimed,
 }
 
 impl EscrowEventKind {
@@ -1406,6 +1421,10 @@ impl EscrowEventKind {
             // discriminants 0–91 stay stable for already-serialized
             // histories.
             92 => Self::ClaimantRosterAmended,
+            // AV-229: appended after ClaimantRosterAmended so
+            // discriminants 0–92 stay stable for already-serialized
+            // histories.
+            93 => Self::MilestonePartiallyClaimed,
             _ => return None,
         })
     }
@@ -1547,6 +1566,10 @@ impl EscrowEventKind {
             // the name table stays stable for already-serialized
             // histories.
             Self::ClaimantRosterAmended => "claimant_roster_amended",
+            // AV-229: appended after claimant_roster_amended so the
+            // name table stays stable for already-serialized
+            // histories.
+            Self::MilestonePartiallyClaimed => "milestone_partially_claimed",
         }
     }
 
@@ -1692,6 +1715,10 @@ impl EscrowEventKind {
             // the name table stays stable for already-serialized
             // histories.
             "claimant_roster_amended" => Self::ClaimantRosterAmended,
+            // AV-229: appended after claimant_roster_amended so the
+            // name table stays stable for already-serialized
+            // histories.
+            "milestone_partially_claimed" => Self::MilestonePartiallyClaimed,
             _ => return None,
         })
     }
@@ -6437,6 +6464,95 @@ impl IndexedEscrow {
         Ok((payout, fee))
     }
 
+    /// Release part of a milestone's tranche to the taker (mirrors
+    /// [`Escrow::release_milestone_partial`]). Emits
+    /// `MilestonePartiallyClaimed` with the slice's gross in
+    /// `amounts.payout` (net payout + fee); the final slice carries
+    /// `to == Released`, like `MilestoneReleased`. Returns
+    /// `(taker_payout, fee)` like the inner method. `at` is both
+    /// the event timestamp and the state machine's `now` (AV-27
+    /// timelock gate). AV-225: a slice claimed past the tranche's
+    /// deadline emits `MilestoneClaimExpired` instead (`from == to
+    /// ==` the current state, `amounts.refund` the tranche's
+    /// unclaimed remainder — the already-claimed slices stay
+    /// paid — the tranche index on the event) and still returns
+    /// the inner `MilestoneClaimExpired` error, mirroring
+    /// [`IndexedEscrow::release_milestone`].
+    pub fn release_milestone_partial(
+        &mut self,
+        authority: [u8; 32],
+        index: u8,
+        amount: u64,
+        mint: Option<[u8; 32]>,
+        payout_to: [u8; 32],
+        at: u64,
+    ) -> Result<(u64, u64), EscrowError> {
+        let from = self.inner.state();
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
+        // The unclaimed remainder is fixed by the plan and the
+        // ledger; read it before the call so the expiry path can
+        // audit it. A successful slice implies a configured plan
+        // and an in-range index, so the fallback is unreachable
+        // on the event path.
+        let remaining = self
+            .inner
+            .milestone_partial_remaining_at(index as usize)
+            .unwrap_or(0);
+        let result = self
+            .inner
+            .release_milestone_partial(authority, at, index, amount, mint, payout_to);
+        let (payout, fee) = match result {
+            Ok(v) => v,
+            Err(EscrowError::MilestoneClaimExpired) => {
+                // AV-225 / AV-229: the inner call already returned
+                // the remainder to refund (skipped bit + `skipped`
+                // counter), so this is a real state move, not a
+                // plain refusal — the auto-recovery stays consumed
+                // like on success, and the expiry is audited
+                // before the error is reported.
+                self.emit_auto_unpause(pause_state, at, auto_unpaused);
+                let state = self.inner.state();
+                self.push_event(
+                    EscrowEventKind::MilestoneClaimExpired,
+                    state,
+                    state,
+                    EventAmounts::refund(remaining),
+                    at,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(authority),
+                );
+                if let Some(last) = self.events.last_mut() {
+                    last.milestone_claim_expired = Some(index);
+                }
+                return self.map_reentrant(Err(EscrowError::MilestoneClaimExpired), at);
+            }
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
+        // `payout + fee` is the slice's gross (`<= tranche`); no
+        // overflow possible.
+        self.push_event(
+            EscrowEventKind::MilestonePartiallyClaimed,
+            from,
+            self.inner.state(),
+            EventAmounts::payout(payout + fee, fee),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(authority),
+        );
+        Ok((payout, fee))
+    }
+
     /// Emit [`EscrowEventKind::BundlePartiallyExecuted`] for a keeper
     /// milestone bundle that released a proper subset of the configured
     /// tranches (AV-76 — see
@@ -9009,6 +9125,111 @@ mod event_tests {
     }
 
     #[test]
+    fn partial_claim_emits_event_per_slice_and_settles_on_final_slice() {
+        // AV-229: each slice emits MilestonePartiallyClaimed
+        // (discriminant 93, appended last) with the slice's gross
+        // in payout; the tranche settles only on the final slice,
+        // and the event stream stays in Funded until the whole
+        // lockup settles.
+        assert_eq!(EscrowEventKind::MilestonePartiallyClaimed.discriminant(), 93);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(93),
+            Some(EscrowEventKind::MilestonePartiallyClaimed)
+        );
+        assert_eq!(
+            EscrowEventKind::MilestonePartiallyClaimed.name(),
+            "milestone_partially_claimed"
+        );
+        assert_eq!(
+            EscrowEventKind::from_name("milestone_partially_claimed"),
+            Some(EscrowEventKind::MilestonePartiallyClaimed)
+        );
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.confirm_milestone(ALICE, 0, T0 + 2).unwrap();
+        e.confirm_milestone(BOB, 0, T0 + 3).unwrap();
+        let (payout, fee) = e
+            .release_milestone_partial(ALICE, 0, 150_000, None, BOB, T0 + 4)
+            .unwrap();
+        assert_eq!((payout, fee), (150_000, 0));
+        assert_event(
+            &last(&e),
+            EscrowEventKind::MilestonePartiallyClaimed,
+            3,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            150_000,
+            0,
+            0,
+            T0 + 4,
+        );
+        assert_eq!(e.inner().milestone_partial_claimed_at(0), Some(150_000));
+        let (payout, _) = e
+            .release_milestone_partial(ALICE, 0, 250_000, None, BOB, T0 + 5)
+            .unwrap();
+        assert_eq!(payout, 250_000);
+        assert_event(
+            &last(&e),
+            EscrowEventKind::MilestonePartiallyClaimed,
+            4,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            250_000,
+            0,
+            0,
+            T0 + 5,
+        );
+        assert!(e.inner().milestone_settled(0));
+        assert_eq!(e.inner().next_milestone(), Some(1));
+        let history = e.inner().event_history();
+        assert_eq!(
+            history.last().unwrap().kind,
+            EscrowEventKind::MilestonePartiallyClaimed
+        );
+    }
+
+    #[test]
+    fn partial_claim_past_deadline_emits_expiry_with_remainder() {
+        // AV-229 / AV-225: a slice past the deadline is rejected
+        // and audited like a full expired claim — except the
+        // refund leg carries only the unclaimed remainder, since
+        // the earlier slice already settled.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap()
+            .with_milestone_claim_deadline(0, T0 + 6)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        e.confirm_milestone(ALICE, 0, T0 + 2).unwrap();
+        e.confirm_milestone(BOB, 0, T0 + 3).unwrap();
+        e.release_milestone_partial(ALICE, 0, 100_000, None, BOB, T0 + 4)
+            .unwrap();
+        assert_eq!(
+            e.release_milestone_partial(ALICE, 0, 50_000, None, BOB, T0 + 7),
+            Err(EscrowError::MilestoneClaimExpired)
+        );
+        assert_event(
+            &last(&e),
+            EscrowEventKind::MilestoneClaimExpired,
+            4,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            0,
+            0,
+            300_000,
+            T0 + 7,
+        );
+        assert_eq!(last(&e).milestone_claim_expired, Some(0));
+        assert_eq!(e.inner().released_amount(), 100_000);
+        assert_eq!(e.inner().skipped_amount(), 300_000);
+        assert_eq!(e.inner().next_milestone(), Some(1));
+    }
+
+    #[test]
     fn failed_reallocate_milestones_emits_nothing() {
         // Repricing a confirmed tranche is InvalidMilestoneAmendment
         // (the AV-155 amendment error): the failed governance call
@@ -9824,7 +10045,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -9927,7 +10148,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10464,7 +10685,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10479,7 +10700,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10491,7 +10712,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10503,7 +10724,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10515,7 +10736,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10530,7 +10751,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10545,7 +10766,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10557,7 +10778,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10569,7 +10790,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10581,7 +10802,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10593,7 +10814,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10605,7 +10826,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10617,7 +10838,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10633,7 +10854,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10648,7 +10869,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10663,7 +10884,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10678,7 +10899,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10693,7 +10914,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_reallocated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10709,7 +10930,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_claim_expired"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10725,7 +10946,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_tranche_appended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(93), None);
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10741,7 +10962,7 @@ mod event_tests {
             EscrowEventKind::from_name("claimant_roster_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(93), None);
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10756,7 +10977,7 @@ mod event_tests {
             EscrowEventKind::from_name("delivery_confirmed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
@@ -10788,7 +11009,7 @@ mod event_tests {
             EscrowEventKind::from_name("governance_cancelled"),
             Some(cancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(93), None); // AV-227: 92 is ClaimantRosterAmended
+        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
     }
 
     #[test]
