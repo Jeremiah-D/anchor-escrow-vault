@@ -134,6 +134,11 @@
 //!   from the vault, and only slashes executed after the amendment
 //!   price from its future rungs. A failed amendment emits
 //!   nothing.
+//! - `amend_appeal_bond` emits [`EscrowEventKind::AppealBondAmended`]
+//!   on every successful amendment (AV-238) — `from == to ==` the
+//!   current state, all amounts zero; the amended bond is read
+//!   from the vault, and only appeals filed after the amendment
+//!   lock the new bond. A failed amendment emits nothing.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -328,6 +333,7 @@
 //! | ArbiterFeeAmended (AV-235) | 0 | 0 | 0 | 0 — amending moves no funds; later dispute settlements price from the vault |
 //! | AppealWindowAmended (AV-236) | 0 | 0 | 0 | 0 — amending moves no funds; later slashes stamp their appeal deadline from the vault |
 //! | SlashLadderAmended (AV-237) | 0 | 0 | 0 | 0 — amending moves no funds; later slashes price from the amended future rungs |
+//! | AppealBondAmended (AV-238) | 0 | 0 | 0 | 0 — amending moves no funds; later appeals lock the amended bond |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1300,6 +1306,17 @@ pub enum EscrowEventKind {
     /// are untouched). The amended ladder is read from the vault,
     /// so the event needs no extra field.
     SlashLadderAmended,
+    /// AV-238: the slash-appeal bond was revised by dual-signed
+    /// governance
+    /// ([`Escrow::amend_appeal_bond`](crate::Escrow::amend_appeal_bond)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::SlashLadderAmended`]); all amounts are
+    /// zero — amending moves no funds (only appeals filed after
+    /// the amendment lock the new bond; an already-locked bond
+    /// is untouched). The amended bond is read from the vault,
+    /// so the event needs no extra field.
+    AppealBondAmended,
 }
 
 impl EscrowEventKind {
@@ -1575,6 +1592,10 @@ impl EscrowEventKind {
             // discriminants 0–100 stay stable for already-serialized
             // histories.
             101 => Self::SlashLadderAmended,
+            // AV-238: appended after SlashLadderAmended so
+            // discriminants 0–101 stay stable for already-serialized
+            // histories.
+            102 => Self::AppealBondAmended,
             _ => return None,
         })
     }
@@ -1752,6 +1773,7 @@ impl EscrowEventKind {
             // the name table stays stable for already-serialized
             // histories.
             Self::SlashLadderAmended => "slash_ladder_amended",
+            Self::AppealBondAmended => "appeal_bond_amended",
         }
     }
 
@@ -1933,6 +1955,7 @@ impl EscrowEventKind {
             // the name table stays stable for already-serialized
             // histories.
             "slash_ladder_amended" => Self::SlashLadderAmended,
+            "appeal_bond_amended" => Self::AppealBondAmended,
             _ => return None,
         })
     }
@@ -6589,6 +6612,40 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the slash-appeal bond after funding (mirrors
+    /// [`Escrow::amend_appeal_bond`]). Emits `AppealBondAmended`
+    /// (`from == to ==` the current state — the bond, not the
+    /// lifecycle state, is what changed; all amounts zero, since
+    /// amending moves no funds — only appeals filed after the
+    /// amendment lock the new bond). The amended bond is read
+    /// from the vault, so the event needs no extra field. A
+    /// failed amendment emits nothing: the core call returns
+    /// before any event is pushed.
+    pub fn amend_appeal_bond(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        bond: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner.amend_appeal_bond(initializer, taker, bond)?;
+        self.push_event(
+            EscrowEventKind::AppealBondAmended,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
+
     /// The live milestone tranche table as a fixed
     /// `MAX_MILESTONES` array (entries past the plan's count are
     /// zero): the shape the `MilestonesReallocated` event carries
@@ -10210,6 +10267,70 @@ mod event_tests {
     }
 
     #[test]
+    fn amend_appeal_bond_emits_event_and_failed_amend_emits_nothing() {
+        // AV-238: a dual-signed revision emits AppealBondAmended
+        // (discriminant 102, appended last) with zero amounts — a
+        // bond revision, not a settlement — and the amended bond
+        // is read from the vault. A refused revision emits
+        // nothing. Orthogonal to AV-237's SlashLadderAmended and
+        // AV-236's AppealWindowAmended: a different field, a
+        // different governance consequence.
+        assert_eq!(EscrowEventKind::AppealBondAmended.discriminant(), 102);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(102),
+            Some(EscrowEventKind::AppealBondAmended)
+        );
+        assert_eq!(
+            EscrowEventKind::AppealBondAmended.name(),
+            "appeal_bond_amended"
+        );
+        assert_eq!(
+            EscrowEventKind::from_name("appeal_bond_amended"),
+            Some(EscrowEventKind::AppealBondAmended)
+        );
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_appeal_window(86_400)
+            .unwrap()
+            .with_appeal_bond(50_000)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        // A one-party revision fails and emits nothing: the last
+        // event is still Funded.
+        assert_eq!(
+            e.amend_appeal_bond(ALICE, ALICE, 80_000, T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(last(&e).kind, EscrowEventKind::Funded);
+        // A zero-bond revision fails and emits nothing, with the
+        // bond untouched.
+        assert_eq!(
+            e.amend_appeal_bond(ALICE, BOB, 0, T0 + 2),
+            Err(EscrowError::InvalidAppealBond)
+        );
+        assert_eq!(last(&e).kind, EscrowEventKind::Funded);
+        assert_eq!(e.inner().appeal_bond(), 50_000);
+        e.amend_appeal_bond(ALICE, BOB, 80_000, T0 + 3).unwrap();
+        assert_event(
+            &last(&e),
+            EscrowEventKind::AppealBondAmended,
+            2,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            0,
+            0,
+            0,
+            T0 + 3,
+        );
+        assert_eq!(e.inner().appeal_bond(), 80_000);
+        let history = e.inner().event_history();
+        assert_eq!(
+            history.last().unwrap().kind,
+            EscrowEventKind::AppealBondAmended
+        );
+    }
+
+    #[test]
     fn failed_reallocate_milestones_emits_nothing() {
         // Repricing a confirmed tranche is InvalidMilestoneAmendment
         // (the AV-155 amendment error): the failed governance call
@@ -11025,7 +11146,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11128,7 +11249,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11665,7 +11786,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11680,7 +11801,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11692,7 +11813,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11704,7 +11825,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11716,7 +11837,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11731,7 +11852,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11746,7 +11867,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11758,7 +11879,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11770,7 +11891,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11782,7 +11903,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11794,7 +11915,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11806,7 +11927,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11818,7 +11939,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11834,7 +11955,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11849,7 +11970,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11864,7 +11985,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11879,7 +12000,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11894,7 +12015,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_reallocated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11910,7 +12031,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_claim_expired"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11926,7 +12047,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_tranche_appended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11942,7 +12063,7 @@ mod event_tests {
             EscrowEventKind::from_name("claimant_roster_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11957,7 +12078,7 @@ mod event_tests {
             EscrowEventKind::from_name("delivery_confirmed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -11989,7 +12110,7 @@ mod event_tests {
             EscrowEventKind::from_name("governance_cancelled"),
             Some(cancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]

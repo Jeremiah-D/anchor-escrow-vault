@@ -16397,6 +16397,68 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(self)
     }
 
+    /// Revise the slash-appeal bond after funding (AV-238 —
+    /// Solana dispute-appeal governance): both parties may
+    /// renegotiate what the taker must lock when filing a future
+    /// slash appeal, without redeploying or refunding the escrow.
+    ///
+    /// Why: the bond set before funding may prove too low to
+    /// deter a frivolous appeal once a real slash lands, or so
+    /// high it prices a legitimate appeal out of reach. A
+    /// dual-signed revision lets the parties retune the stake to
+    /// the dispute climate they actually face.
+    ///
+    /// Governance: dual signature — both the initializer and the
+    /// taker must authorize, paralleling
+    /// [`Escrow::amend_appeal_window`]. `Funded`-only: the builder
+    /// [`Escrow::with_appeal_bond`] owns the initial set, and a
+    /// settled or disputed escrow's bond is fixed (a dispute in
+    /// flight must not move). A zero bond is
+    /// [`EscrowError::InvalidAppealBond`] (code 158 — the same
+    /// rejection as the builder: a zero bond is a no-op, and the
+    /// no-bond default already covers free filing). A paused
+    /// escrow fails fast ([`EscrowError::Paused`]).
+    ///
+    /// Scope: only appeals filed AFTER the amendment lock the
+    /// new bond. [`Escrow::file_appeal`] copies the live
+    /// `appeal_bond` field into `appeal_bond_paid` at filing
+    /// time, so an already-locked bond — a filed appeal under
+    /// review — keeps its original amount; the amendment never
+    /// tops up or refunds a live appeal. Orthogonal to
+    /// [`Escrow::with_appeal_bond`] (`Uninitialized`-only
+    /// initial configuration) and to AV-236's
+    /// [`Escrow::amend_appeal_window`] (that moves the appeal
+    /// window; this moves the bond — different field, different
+    /// governance consequence). Emits `AppealBondAmended` on
+    /// the event layer.
+    pub fn amend_appeal_bond(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        bond: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_appeal_window`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if bond == 0 {
+            return Err(EscrowError::InvalidAppealBond);
+        }
+        // All checks pass before any write. `appeal_bond_paid`
+        // is deliberately not touched here: it already holds the
+        // live appeal's locked bond (if any), and only the next
+        // filing reads the new configured bond.
+        self.appeal_bond = bond;
+        Ok(())
+    }
+
     /// The opt-in appeal bond configured via
     /// [`Escrow::with_appeal_bond`] (AV-103), or `0` when no bond was
     /// configured (filing stays free — backward compatible).
@@ -45399,7 +45461,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
     }
 
     #[test]
@@ -61339,7 +61401,7 @@ mod event_history_tests {
             Some(EscrowEventKind::ClaimantRosterAmended),
             "AV-227: appended after MilestoneTrancheAppended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
+        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -61523,9 +61585,10 @@ mod event_history_tests {
         // `MilestoneVerifierRotated` (AV-234), 99 is
         // `ArbiterFeeAmended` (AV-235), 100 is
         // `AppealWindowAmended` (AV-236), 101 is
-        // `SlashLadderAmended` (AV-237) and 102 is the
+        // `SlashLadderAmended` (AV-237), 102 is
+        // `AppealBondAmended` (AV-238) and 103 is the
         // first still-unknown byte.
-        for bad in [102u8, 255] {
+        for bad in [103u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -68701,6 +68764,104 @@ mod appeal_bond_tests {
         let resolved = e.events().last().unwrap();
         assert_eq!(resolved.amounts.penalty, BOND, "forfeiture rides penalty");
         assert_eq!(resolved.amounts.payout, 0);
+    }
+
+    // ----- AV-238: post-funding appeal-bond amendment -----
+
+    #[test]
+    fn amend_appeal_bond_retunes_only_future_filings() {
+        // A funded escrow whose slash has not happened yet: the
+        // amendment retunes the bond, and the appeal filed after
+        // it locks the NEW bond.
+        let mut e = bonded_uninitialized()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.amend_appeal_bond(ALICE, BOB, 80_000).unwrap();
+        assert_eq!(e.appeal_bond(), 80_000);
+        assert_eq!(e.appeal_bond_paid(), 0, "nothing locked before filing");
+        assert_eq!(e.state(), EscrowState::Funded);
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        let locked = e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        assert_eq!(locked, 80_000, "filing locks the amended bond");
+        assert_eq!(e.appeal_bond_paid(), 80_000);
+        assert_eq!(e.appeal_state(), AppealState::Filed);
+    }
+
+    #[test]
+    fn amend_appeal_bond_leaves_in_flight_bond_untouched() {
+        // The appeal is already filed under the 50_000 bond: the
+        // amendment moves the configured bond but the locked
+        // bond — the live appeal's stake — does not move, so
+        // overturn still refunds exactly the ORIGINAL bond.
+        let mut e = bonded_slashed();
+        let locked = e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        assert_eq!(locked, BOND);
+        e.amend_appeal_bond(ALICE, BOB, 80_000).unwrap();
+        assert_eq!(e.appeal_bond(), 80_000);
+        assert_eq!(e.appeal_bond_paid(), BOND, "live bond untouched");
+        assert_eq!(e.appeal_state(), AppealState::Filed);
+        e.review_appeal(M1, false).unwrap();
+        let (outcome, penalty_refunded, bond_moved) =
+            e.review_appeal(M2, false).unwrap().unwrap();
+        assert_eq!(outcome, AppealOutcome::Overturned);
+        assert_eq!(penalty_refunded, SLASHED);
+        assert_eq!(bond_moved, BOND, "refund is the original bond");
+        assert_eq!(e.appeal_bond_paid(), 0, "counter zeroes on refund");
+    }
+
+    #[test]
+    fn amend_appeal_bond_rejects_state_authority_zero_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial
+        // set.
+        let mut bare = bonded_uninitialized();
+        assert_eq!(
+            bare.amend_appeal_bond(ALICE, BOB, 80_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.appeal_bond(), BOND);
+        // Dual signature: one party alone cannot raise (or lower)
+        // the other's appeal stake.
+        let mut e = bonded_uninitialized()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            e.amend_appeal_bond(ALICE, ALICE, 80_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_appeal_bond([0xCC; 32], BOB, 80_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.appeal_bond(), BOND);
+        // A zero bond is the builder's rejection, and a failed
+        // amendment leaves the bond untouched.
+        assert_eq!(
+            e.amend_appeal_bond(ALICE, BOB, 0),
+            Err(EscrowError::InvalidAppealBond)
+        );
+        assert_eq!(EscrowError::InvalidAppealBond.code(), 158);
+        assert_eq!(e.appeal_bond(), BOND);
+        // The pause guard fires before the authority and state
+        // gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap()
+            .with_appeal_bond(BOND)
+            .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_appeal_bond(ALICE, BOB, 80_000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.appeal_bond(), BOND);
     }
 }
 

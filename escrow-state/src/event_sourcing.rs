@@ -189,6 +189,9 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // AV-237: a revised slash ladder moves no funds — the new
         // rungs price only the later slashes.
         | EscrowEventKind::SlashLadderAmended
+        // AV-238: a revised appeal bond moves no funds — the new
+        // bond is locked only by the later appeal filings.
+        | EscrowEventKind::AppealBondAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -862,6 +865,8 @@ mod event_sourcing_tests {
         | EscrowEventKind::AppealWindowAmended
         // AV-237: a revised slash ladder moves no funds.
         | EscrowEventKind::SlashLadderAmended
+        // AV-238: a revised appeal bond moves no funds.
+        | EscrowEventKind::AppealBondAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
