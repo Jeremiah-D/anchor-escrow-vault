@@ -139,6 +139,12 @@
 //!   current state, all amounts zero; the amended bond is read
 //!   from the vault, and only appeals filed after the amendment
 //!   lock the new bond. A failed amendment emits nothing.
+//! - `amend_grace_period` emits [`EscrowEventKind::GracePeriodAmended`]
+//!   on every successful amendment (AV-240) — `from == to ==` the
+//!   current state, all amounts zero; the amended grace period is
+//!   read from the vault, and only expiry determinations after the
+//!   amendment follow the new value. A failed amendment emits
+//!   nothing.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -334,6 +340,7 @@
 //! | AppealWindowAmended (AV-236) | 0 | 0 | 0 | 0 — amending moves no funds; later slashes stamp their appeal deadline from the vault |
 //! | SlashLadderAmended (AV-237) | 0 | 0 | 0 | 0 — amending moves no funds; later slashes price from the amended future rungs |
 //! | AppealBondAmended (AV-238) | 0 | 0 | 0 | 0 — amending moves no funds; later appeals lock the amended bond |
+//! | GracePeriodAmended (AV-240) | 0 | 0 | 0 | 0 — amending moves no funds; later expiry determinations follow the amended grace |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1317,6 +1324,17 @@ pub enum EscrowEventKind {
     /// is untouched). The amended bond is read from the vault,
     /// so the event needs no extra field.
     AppealBondAmended,
+    /// AV-240: the expiry grace period was revised by dual-signed
+    /// governance
+    /// ([`Escrow::amend_grace_period`](crate::Escrow::amend_grace_period)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::AppealBondAmended`]); all amounts are
+    /// zero — amending moves no funds (only expiry determinations
+    /// after the amendment follow the new grace; an already-executed
+    /// determination is history). The amended grace period is read
+    /// from the vault, so the event needs no extra field.
+    GracePeriodAmended,
 }
 
 impl EscrowEventKind {
@@ -1596,6 +1614,10 @@ impl EscrowEventKind {
             // discriminants 0–101 stay stable for already-serialized
             // histories.
             102 => Self::AppealBondAmended,
+            // AV-240: appended after AppealBondAmended so
+            // discriminants 0–102 stay stable for already-serialized
+            // histories.
+            103 => Self::GracePeriodAmended,
             _ => return None,
         })
     }
@@ -1774,6 +1796,7 @@ impl EscrowEventKind {
             // histories.
             Self::SlashLadderAmended => "slash_ladder_amended",
             Self::AppealBondAmended => "appeal_bond_amended",
+            Self::GracePeriodAmended => "grace_period_amended",
         }
     }
 
@@ -1956,6 +1979,7 @@ impl EscrowEventKind {
             // histories.
             "slash_ladder_amended" => Self::SlashLadderAmended,
             "appeal_bond_amended" => Self::AppealBondAmended,
+            "grace_period_amended" => Self::GracePeriodAmended,
             _ => return None,
         })
     }
@@ -6645,6 +6669,40 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the expiry grace period after funding (mirrors
+    /// [`Escrow::amend_grace_period`]). Emits `GracePeriodAmended`
+    /// (`from == to ==` the current state — the grace period, not
+    /// the lifecycle state, is what changed; all amounts zero,
+    /// since amending moves no funds — only expiry determinations
+    /// after the amendment follow the new grace). The amended
+    /// grace period is read from the vault, so the event needs no
+    /// extra field. A failed amendment emits nothing: the core
+    /// call returns before any event is pushed.
+    pub fn amend_grace_period(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        grace_secs: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner
+            .amend_grace_period(initializer, taker, grace_secs)?;
+        self.push_event(
+            EscrowEventKind::GracePeriodAmended,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
 
     /// The live milestone tranche table as a fixed
     /// `MAX_MILESTONES` array (entries past the plan's count are
@@ -10331,6 +10389,63 @@ mod event_tests {
     }
 
     #[test]
+    fn amend_grace_period_emits_event_and_failed_amend_emits_nothing() {
+        // AV-240: a dual-signed revision emits GracePeriodAmended
+        // (discriminant 103, appended last) with zero amounts — a
+        // grace revision, not a settlement — and the amended grace
+        // is read from the vault. A refused revision emits
+        // nothing. Orthogonal to AV-238's AppealBondAmended: a
+        // different field, a different governance consequence.
+        assert_eq!(EscrowEventKind::GracePeriodAmended.discriminant(), 103);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(103),
+            Some(EscrowEventKind::GracePeriodAmended)
+        );
+        assert_eq!(
+            EscrowEventKind::GracePeriodAmended.name(),
+            "grace_period_amended"
+        );
+        assert_eq!(
+            EscrowEventKind::from_name("grace_period_amended"),
+            Some(EscrowEventKind::GracePeriodAmended)
+        );
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_grace_period(300)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        // A one-party revision fails and emits nothing: the last
+        // event is still Funded.
+        assert_eq!(
+            e.amend_grace_period(ALICE, ALICE, 600, T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(last(&e).kind, EscrowEventKind::Funded);
+        // The new expiry gate (EXPIRES_AT + 600) follows the
+        // amended grace, not the old 300.
+        e.amend_grace_period(ALICE, BOB, 600, T0 + 3).unwrap();
+        assert_event(
+            &last(&e),
+            EscrowEventKind::GracePeriodAmended,
+            2,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            0,
+            0,
+            0,
+            T0 + 3,
+        );
+        assert_eq!(e.inner().grace_period(), 600);
+        assert!(!e.inner().is_expiry_eligible(EXPIRES_AT + 300));
+        assert!(e.inner().is_expiry_eligible(EXPIRES_AT + 600));
+        let history = e.inner().event_history();
+        assert_eq!(
+            history.last().unwrap().kind,
+            EscrowEventKind::GracePeriodAmended
+        );
+    }
+
+    #[test]
     fn failed_reallocate_milestones_emits_nothing() {
         // Repricing a confirmed tranche is InvalidMilestoneAmendment
         // (the AV-155 amendment error): the failed governance call
@@ -11146,7 +11261,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11249,7 +11364,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11786,7 +11901,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11801,7 +11916,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11813,7 +11928,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11825,7 +11940,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11837,7 +11952,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11852,7 +11967,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11867,7 +11982,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11879,7 +11994,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11891,7 +12006,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11903,7 +12018,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11915,7 +12030,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11927,7 +12042,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11939,7 +12054,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11955,7 +12070,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11970,7 +12085,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -11985,7 +12100,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -12000,7 +12115,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -12015,7 +12130,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_reallocated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -12031,7 +12146,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_claim_expired"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -12047,7 +12162,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_tranche_appended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -12063,7 +12178,7 @@ mod event_tests {
             EscrowEventKind::from_name("claimant_roster_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -12078,7 +12193,7 @@ mod event_tests {
             EscrowEventKind::from_name("delivery_confirmed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -12110,7 +12225,7 @@ mod event_tests {
             EscrowEventKind::from_name("governance_cancelled"),
             Some(cancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]

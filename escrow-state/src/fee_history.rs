@@ -237,6 +237,8 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         | EscrowEventKind::SlashLadderAmended
         // AV-238: a revised appeal bond carries no fee leg itself.
         | EscrowEventKind::AppealBondAmended
+        // AV-240: a revised grace period carries no fee leg itself.
+        | EscrowEventKind::GracePeriodAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -916,6 +918,8 @@ mod fee_history_tests {
         | EscrowEventKind::SlashLadderAmended
         // AV-238: a revised appeal bond carries no fee leg itself.
         | EscrowEventKind::AppealBondAmended
+        // AV-240: a revised grace period carries no fee leg itself.
+        | EscrowEventKind::GracePeriodAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

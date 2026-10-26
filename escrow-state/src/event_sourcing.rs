@@ -192,6 +192,9 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // AV-238: a revised appeal bond moves no funds — the new
         // bond is locked only by the later appeal filings.
         | EscrowEventKind::AppealBondAmended
+        // AV-240: a revised grace period moves no funds — the new
+        // grace gates only the later expiry determinations.
+        | EscrowEventKind::GracePeriodAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -867,6 +870,8 @@ mod event_sourcing_tests {
         | EscrowEventKind::SlashLadderAmended
         // AV-238: a revised appeal bond moves no funds.
         | EscrowEventKind::AppealBondAmended
+        // AV-240: a revised grace period moves no funds.
+        | EscrowEventKind::GracePeriodAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

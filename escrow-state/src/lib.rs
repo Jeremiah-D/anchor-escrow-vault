@@ -16459,6 +16459,76 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Revise the expiry grace period after funding (AV-240 —
+    /// Solana operations / backend engineering): both parties may
+    /// renegotiate how long past `expires_at` the escrow waits
+    /// before it becomes expiry-eligible, without redeploying or
+    /// refunding the escrow.
+    ///
+    /// Why: the grace period set before funding covers keeper /
+    /// cluster clock skew at setup time, but the skew the parties
+    /// actually face can grow (a slower keeper, a busier cluster)
+    /// or shrink (a tighter keeper loop). A dual-signed revision
+    /// lets the parties retune the buffer to the drift they
+    /// actually observe, instead of cancelling and re-creating
+    /// the escrow — which would strand its votes, attestations
+    /// and milestone progress.
+    ///
+    /// Governance: dual signature — both the initializer and the
+    /// taker must authorize, paralleling
+    /// [`Escrow::amend_appeal_bond`]. `Funded`-only: the builder
+    /// [`Escrow::with_grace_period`] owns the initial set, and a
+    /// settled or disputed escrow's expiry gate is fixed. A paused
+    /// escrow fails fast ([`EscrowError::Paused`]).
+    ///
+    /// Rejection: `expires_at.checked_add(grace_secs)` overflowing
+    /// `u64` is [`EscrowError::InvalidGracePeriod`] (code 115 —
+    /// the same rejection as the builder, which is why a grace
+    /// period can never be combined with the no-timeout
+    /// convention). There is deliberately no zero rejection: `0`
+    /// is the builder's valid default and means "no grace period"
+    /// here too — amending to `0` removes the grace. All checks
+    /// run before any write, so a failed amendment leaves the
+    /// configured grace untouched.
+    ///
+    /// Scope: only the config field changes. Expiry eligibility
+    /// reads the live field ([`Escrow::is_expiry_eligible`] and
+    /// [`Escrow::cancel_expired`] both evaluate
+    /// `expires_at + grace_period` at call time), so future
+    /// determinations follow the new value; determinations
+    /// already executed are history and are never rewritten.
+    /// Orthogonal to [`Escrow::with_grace_period`]
+    /// (`Uninitialized`-only initial configuration) and to
+    /// AV-238's [`Escrow::amend_appeal_bond`] (a different field,
+    /// a different governance consequence). Emits
+    /// `GracePeriodAmended` on the event layer.
+    pub fn amend_grace_period(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        grace_secs: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_appeal_bond`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // All checks pass before any write. The overflow check
+        // mirrors `with_grace_period` exactly: the new expiry gate
+        // (`expires_at + grace_secs`) must fit in u64.
+        self.expires_at
+            .checked_add(grace_secs)
+            .ok_or(EscrowError::InvalidGracePeriod)?;
+        self.grace_period = grace_secs;
+        Ok(())
+    }
+
     /// The opt-in appeal bond configured via
     /// [`Escrow::with_appeal_bond`] (AV-103), or `0` when no bond was
     /// configured (filing stays free — backward compatible).
@@ -27396,6 +27466,111 @@ mod tests {
         let (refund, _, _, _) = e.crank_expired(MALLORY, EXPIRES_AT + 300, None).unwrap();
         assert_eq!(refund, 1_000_000);
         assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    // ----- AV-240: post-funding grace-period amendment -----
+
+    #[test]
+    fn amend_grace_period_retunes_the_live_expiry_gate() {
+        // A funded escrow with a 300-second grace: the amendment
+        // retunes the gate, and the expiry determination follows
+        // the NEW value — at EXPIRES_AT + 300 the escrow is no
+        // longer eligible, and only at EXPIRES_AT + 600 does the
+        // crank succeed.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_grace_period(300)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert!(e.is_expiry_eligible(EXPIRES_AT + 300));
+        e.amend_grace_period(ALICE, BOB, 600).unwrap();
+        assert_eq!(e.grace_period(), 600);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert!(!e.is_expiry_eligible(EXPIRES_AT + 300));
+        assert!(!e.is_expiry_eligible(EXPIRES_AT + 599));
+        assert!(e.is_expiry_eligible(EXPIRES_AT + 600));
+        assert_eq!(
+            e.crank_expired(MALLORY, EXPIRES_AT + 300, None),
+            Err(EscrowError::NotExpired)
+        );
+        let (refund, _, _, _) = e.crank_expired(MALLORY, EXPIRES_AT + 600, None).unwrap();
+        assert_eq!(refund, 1_000_000);
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn amend_grace_period_to_zero_removes_the_grace() {
+        // Zero is the builder's valid default, not a rejection:
+        // amending to 0 removes the grace, so expiry eligibility
+        // falls back to `expires_at` itself.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_grace_period(300)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.amend_grace_period(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.grace_period(), 0);
+        assert!(!e.is_expiry_eligible(EXPIRES_AT - 1));
+        assert!(e.is_expiry_eligible(EXPIRES_AT));
+    }
+
+    #[test]
+    fn amend_grace_period_rejects_state_authority_overflow_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial
+        // set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_grace_period(300)
+            .unwrap();
+        assert_eq!(
+            bare.amend_grace_period(ALICE, BOB, 600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.grace_period(), 300);
+        // Dual signature: one party alone cannot move the other's
+        // expiry buffer.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_grace_period(300)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            e.amend_grace_period(ALICE, ALICE, 600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_grace_period([0xCC; 32], BOB, 600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.grace_period(), 300);
+        // Overflow: expires_at (u64::MAX - 1) + 2 does not fit, so
+        // the amendment is rejected with zero write — and the
+        // boundary value that does fit is accepted.
+        let mut edge = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX - 1).unwrap();
+        edge.fund(ALICE, 1_000_000).unwrap();
+        assert_eq!(
+            edge.amend_grace_period(ALICE, BOB, 2),
+            Err(EscrowError::InvalidGracePeriod)
+        );
+        assert_eq!(EscrowError::InvalidGracePeriod.code(), 115);
+        assert_eq!(edge.grace_period(), 0, "failed amendment writes nothing");
+        edge.amend_grace_period(ALICE, BOB, 1).unwrap();
+        assert_eq!(edge.grace_period(), 1);
+        // The pause guard fires before the authority and state
+        // gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_grace_period(300)
+            .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_grace_period(ALICE, BOB, 600),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.grace_period(), 300);
     }
 
     #[test]
@@ -45461,7 +45636,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
     }
 
     #[test]
@@ -61401,7 +61576,7 @@ mod event_history_tests {
             Some(EscrowEventKind::ClaimantRosterAmended),
             "AV-227: appended after MilestoneTrancheAppended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(103), None); // AV-238: 102 is AppealBondAmended
+        assert_eq!(EscrowEventKind::from_discriminant(104), None); // AV-240: 103 is GracePeriodAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -61586,9 +61761,10 @@ mod event_history_tests {
         // `ArbiterFeeAmended` (AV-235), 100 is
         // `AppealWindowAmended` (AV-236), 101 is
         // `SlashLadderAmended` (AV-237), 102 is
-        // `AppealBondAmended` (AV-238) and 103 is the
+        // `AppealBondAmended` (AV-238), 103 is
+        // `GracePeriodAmended` (AV-240) and 104 is the
         // first still-unknown byte.
-        for bad in [103u8, 255] {
+        for bad in [104u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
