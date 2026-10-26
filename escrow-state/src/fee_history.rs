@@ -218,6 +218,8 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         | EscrowEventKind::MilestoneTrancheAppended
         // AV-227: an amended roster carries no fee leg.
         | EscrowEventKind::ClaimantRosterAmended
+        // AV-230: a revised schedule carries no fee leg.
+        | EscrowEventKind::VestingScheduleAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -878,6 +880,8 @@ mod fee_history_tests {
         | EscrowEventKind::MilestoneTrancheAppended
         // AV-227: an amended roster carries no fee leg.
         | EscrowEventKind::ClaimantRosterAmended
+        // AV-230: a revised schedule carries no fee leg.
+        | EscrowEventKind::VestingScheduleAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

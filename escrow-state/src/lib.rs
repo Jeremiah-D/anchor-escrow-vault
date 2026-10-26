@@ -17449,6 +17449,100 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Revise the linear vesting schedule after funding (AV-230 —
+    /// Solana / payment fintech: a token unlock or salary stream
+    /// whose timeline changes mid-deal — a cliff moves, the
+    /// unlock window stretches — without unwinding the escrow).
+    ///
+    /// Only the still-unvested part may be reshaped. The claimed
+    /// part is locked: the new schedule's vested amount at `now`
+    /// must be at least the amount already claimed
+    /// ([`EscrowError::InvalidVesting`] otherwise, fail-closed) —
+    /// a revision that vested less than already paid out would
+    /// rewrite a settled deal backwards (the books would show
+    /// paid > vested, and the taker's earned-but-unclaimed
+    /// balance would shrink retroactively). The claimed floor is
+    /// `released`: [`Escrow::claim`] accumulates its gross pull
+    /// there, so on a pure vesting escrow it is exactly the
+    /// claimed amount; on an escrow that also paid out through
+    /// `release` it is conservative (never looser than the
+    /// pure-vesting case). Penalty and slash accounting stays
+    /// separate — `claim`'s claimable formula subtracts those
+    /// counters and saturates at zero, so they can never make a
+    /// post-amendment claim negative.
+    ///
+    /// The new schedule must already be a valid
+    /// [`VestingSchedule`] — that type can only be built through
+    /// `new` / `new_with_cliff`, which reject `start >= end` and
+    /// `cliff_at > end` with `InvalidVesting`, so the
+    /// "existing validation" requirement is discharged by
+    /// construction, not re-litigated here. The amendment
+    /// replaces the schedule only: an attached AV-90 unlock curve
+    /// keeps pricing against the new window (the curve's tier
+    /// window is the schedule's window — callers re-check curve
+    /// fit after amending, exactly as `with_vesting_curve`
+    /// requires at attach time), and a vesting pause (AV-150)
+    /// keeps applying to the amended schedule (a later
+    /// `resume_vesting` shifts the new window, not the old one).
+    ///
+    /// Check order mirrors [`Escrow::append_milestone_tranche`]:
+    /// pause, then dual-signature authority (both parties must
+    /// authorize — one party alone cannot rewrite the unlock
+    /// timeline), then `Funded` state, then an existing schedule
+    /// (a schedule-less escrow has nothing to amend —
+    /// `InvalidVesting`, not an invitation to attach one
+    /// mid-flight; `with_vesting` stays `Uninitialized`-only),
+    /// then the anti-clawback floor. Validation completes
+    /// before any write, so a failed amendment leaves the
+    /// schedule untouched.
+    ///
+    /// Orthogonal to [`Escrow::with_vesting`] (AV-13): that
+    /// builder creates the schedule `Uninitialized`-only; this
+    /// revises it `Funded`-only and never creates one.
+    /// Orthogonal to [`Escrow::with_vesting_curve`] (AV-90):
+    /// that sets the non-linear unlock *shape*; this changes
+    /// the linear *table* (start / end / cliff) the shape prices
+    /// over.
+    pub fn amend_vesting_schedule(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        schedule: VestingSchedule,
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision — one party alone cannot rewrite the
+        // unlock timeline, paralleling `append_milestone_tranche`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // A schedule must already be configured: amendment never
+        // creates one mid-flight.
+        if self.vesting.is_none() {
+            return Err(EscrowError::InvalidVesting);
+        }
+        // Anti-clawback floor: the new schedule must vest at
+        // least what the taker already claimed, priced exactly
+        // the way `claim` prices — through the attached curve
+        // when one is configured, linearly otherwise (the
+        // AV-51 cliff gates inside both pricings).
+        let new_vested = match self.vesting_curve {
+            Some(curve) => curve.vested_amount(&schedule, self.amount, now),
+            None => schedule.vested_amount(self.amount, now),
+        };
+        if new_vested < self.released {
+            return Err(EscrowError::InvalidVesting);
+        }
+        self.vesting = Some(schedule);
+        Ok(())
+    }
+
     /// The multi-taker claimant roster attached via
     /// [`Escrow::with_claimants`] (AV-149). `None` on a plain
     /// bilateral escrow.
@@ -44670,7 +44764,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
+        assert_eq!(EscrowEventKind::from_discriminant(95), None); // AV-230: 94 is VestingScheduleAmended
     }
 
     #[test]
@@ -48162,6 +48256,97 @@ mod vesting_tests {
             Err(EscrowError::InvalidStateTransition),
             "the unlock curve is fixed before funds move, like with_quorum"
         );
+    }
+
+    // ----- AV-230: vesting schedule amendment -----
+
+    #[test]
+    fn amend_vesting_schedule_reshapes_only_the_unvested_part() {
+        // Claim a quarter, then stretch the window backwards and
+        // forwards: the new schedule still vests at least the
+        // claimed quarter at amendment time, and later claims
+        // price against the new table, not the old one.
+        let mut e = funded_vesting_escrow();
+        let quarter = START + (END - START) / 4;
+        let (payout, _) = e.claim(BOB, quarter, None, BOB).unwrap();
+        assert_eq!(payout, 250_000);
+        let stretched = VestingSchedule::new(START - 25_000_000, END + 25_000_000).unwrap();
+        e.amend_vesting_schedule(ALICE, BOB, stretched, quarter).unwrap();
+        assert_eq!(e.vesting_schedule(), Some(stretched));
+        // At the old end the new table has vested 833_333, so the
+        // next pull is 833_333 - 250_000, not the old 750_000.
+        let (payout, _) = e.claim(BOB, END, None, BOB).unwrap();
+        assert_eq!(payout, 583_333);
+        assert_eq!(e.released_amount(), 833_333);
+    }
+
+    #[test]
+    fn amend_vesting_schedule_rejects_clawback_below_claimed() {
+        // Half claimed at the midpoint; a stretched window that
+        // would vest only a quarter at that moment rewrites the
+        // settled half backwards — refused, schedule untouched.
+        let mut e = funded_vesting_escrow();
+        let midpoint = (START + END) / 2;
+        e.claim(BOB, midpoint, None, BOB).unwrap();
+        assert_eq!(e.released_amount(), 500_000);
+        let stretched = VestingSchedule::new(START, END + 100_000_000).unwrap();
+        assert_eq!(
+            e.amend_vesting_schedule(ALICE, BOB, stretched, midpoint),
+            Err(EscrowError::InvalidVesting)
+        );
+        assert_eq!(
+            e.vesting_schedule(),
+            Some(VestingSchedule::new(START, END).unwrap()),
+            "a failed amendment leaves the schedule untouched"
+        );
+        assert_eq!(e.released_amount(), 500_000);
+    }
+
+    #[test]
+    fn amend_vesting_schedule_requires_dual_signature_and_funded_state() {
+        // One party alone cannot rewrite the unlock timeline, and
+        // a stranger pair cannot either.
+        let mut e = funded_vesting_escrow();
+        let stretched = VestingSchedule::new(START, END + 50_000_000).unwrap();
+        assert_eq!(
+            e.amend_vesting_schedule(ALICE, MALLORY, stretched, START),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_vesting_schedule(MALLORY, BOB, stretched, START),
+            Err(EscrowError::Unauthorized)
+        );
+        // Uninitialized: the builder owns schedule creation.
+        let mut bare = vesting_escrow();
+        assert_eq!(
+            bare.amend_vesting_schedule(ALICE, BOB, stretched, START),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Funded but schedule-less: amendment never creates one.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            plain.amend_vesting_schedule(ALICE, BOB, stretched, START),
+            Err(EscrowError::InvalidVesting)
+        );
+    }
+
+    #[test]
+    fn amend_vesting_schedule_with_cliff_gates_later_claims() {
+        // A no-claim amendment that adds a cliff: before the
+        // cliff nothing vests (the new table's gate, not the old
+        // one's), at and after it the linear curve applies.
+        let mut e = funded_vesting_escrow();
+        let cliffed = VestingSchedule::new_with_cliff(START, END, START + 10_000_000).unwrap();
+        e.amend_vesting_schedule(ALICE, BOB, cliffed, START + 5_000_000)
+            .unwrap();
+        assert_eq!(
+            e.claim(BOB, START + 5_000_000, None, BOB),
+            Err(EscrowError::AmountMismatch),
+            "pre-cliff claim finds nothing vested under the new table"
+        );
+        let (payout, _) = e.claim(BOB, (START + END) / 2, None, BOB).unwrap();
+        assert_eq!(payout, 500_000, "at the midpoint the linear curve applies");
     }
 
     // ----- interaction with release / cancel / quorum -----
@@ -60138,7 +60323,7 @@ mod event_history_tests {
             Some(EscrowEventKind::ClaimantRosterAmended),
             "AV-227: appended after MilestoneTrancheAppended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(94), None); // AV-229: 93 is MilestonePartiallyClaimed
+        assert_eq!(EscrowEventKind::from_discriminant(95), None); // AV-230: 94 is VestingScheduleAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -60314,9 +60499,10 @@ mod event_history_tests {
         // `MilestoneClaimExpired` (AV-225), 91 is
         // `MilestoneTrancheAppended` (AV-226), 92 is
         // `ClaimantRosterAmended` (AV-227), 93 is
-        // `MilestonePartiallyClaimed` (AV-229) and 94 is the
+        // `MilestonePartiallyClaimed` (AV-229), 94 is
+        // `VestingScheduleAmended` (AV-230) and 95 is the
         // first still-unknown byte.
-        for bad in [94u8, 255] {
+        for bad in [95u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

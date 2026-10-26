@@ -168,6 +168,9 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // AV-227: amending the roster moves no funds — the new
         // shares price only at the later claim_share pulls.
         | EscrowEventKind::ClaimantRosterAmended
+        // AV-230: revising the schedule moves no funds — the new
+        // table prices only at the later claim pulls.
+        | EscrowEventKind::VestingScheduleAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -816,6 +819,9 @@ mod event_sourcing_tests {
         // AV-227: amending the roster moves no funds — the new
         // shares price only at the later claim_share pulls.
         | EscrowEventKind::ClaimantRosterAmended
+        // AV-230: revising the schedule moves no funds — the new
+        // table prices only at the later claim pulls.
+        | EscrowEventKind::VestingScheduleAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
