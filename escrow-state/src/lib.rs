@@ -15773,6 +15773,143 @@ let fee = self.charge_protocol_fee(claimable)?;
         self.slash_ladder_index
     }
 
+    /// Revise the tiered default-penalty (slash) ladder after funding
+    /// (AV-237 — Solana payment risk / escalating taker-default
+    /// governance): both parties may retune the penalty schedule
+    /// for the defaults still ahead, without redeploying or
+    /// refunding the escrow.
+    ///
+    /// Why: the ladder set before funding may prove miscalibrated
+    /// once performance is underway — an early rung too lenient to
+    /// deter a second miss, or a top rung so harsh it makes late
+    /// performance pointless. A dual-signed revision lets the
+    /// parties reprice the future tiers to the default pattern
+    /// they actually face.
+    ///
+    /// Governance: dual signature — both the initializer and the
+    /// taker must authorize, paralleling
+    /// [`Escrow::amend_appeal_window`]. `Funded`-only: the builder
+    /// [`Escrow::with_slash_ladder`] owns the initial set, and an
+    /// escrow with no ladder has nothing to revise
+    /// ([`EscrowError::InvalidSlashLadder`] — the ladder's own
+    /// config error). A paused escrow fails fast
+    /// ([`EscrowError::Paused`]).
+    ///
+    /// Consumed-prefix immutability (fail-closed): the cursor
+    /// ([`Escrow::slash_ladder_index`]) is the index of the rung
+    /// the next [`Escrow::slash`] draws on, so rungs
+    /// `0..consumed` are history and rungs `consumed..` govern the
+    /// future. The first `consumed` rungs of `new_rungs` must equal
+    /// the old ladder rung-by-rung (deadline and bps); the new
+    /// table must hold at least `consumed` rungs (and at most
+    /// [`MAX_SLASH_LADDER_RUNGS`], like the builder — the fixed
+    /// slots bound the table); and the new table as a whole must
+    /// stay strictly ascending in deadline and bps, each bps at
+    /// most 10_000. Every violation is
+    /// [`EscrowError::InvalidSlashLadder`] and the escrow is
+    /// untouched. The rung at the cursor is amendable — it was
+    /// already consumed once only when the ladder is exhausted
+    /// (cursor saturated at the top rung), and even then its past
+    /// effect already sits in `penalty_paid`; what the amendment
+    /// retunes is the cap on the *next* slash, which is exactly
+    /// the future tier. A corrupt cursor past the old rung count
+    /// saturates to the old count (the crate's
+    /// `active_ladder_rung` precedent) rather than indexing out
+    /// of bounds.
+    ///
+    /// Future rungs only: every rung at or past the cursor must
+    /// carry a deadline no earlier than `now` — a rung cannot be
+    /// backdated into eligibility (the next slash would fire
+    /// immediately on a deadline already passed). Consumed rungs
+    /// keep their original deadlines, past or not — history is
+    /// never rewritten.
+    ///
+    /// Scope: the penalty account, the consumed rungs' slash effect
+    /// (`penalty_paid`), and the consumption cursor are untouched
+    /// by the amendment — only the future tiers move, so a slash
+    /// after the amendment prices from the new rung at the same
+    /// cursor. Orthogonal to [`Escrow::with_slash_ladder`]
+    /// (`Uninitialized`-only initial configuration) and to AV-126
+    /// (ladder consumption / cursor semantics — unchanged here).
+    /// Emits `SlashLadderAmended` on the event layer.
+    pub fn amend_slash_ladder(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_rungs: &[(u64, u16)],
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_appeal_window`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let old = match self.slash_ladder {
+            Some(ladder) => ladder,
+            None => return Err(EscrowError::InvalidSlashLadder),
+        };
+        // The cursor is the next rung's index; saturate a corrupt
+        // cursor at the old rung count rather than indexing out
+        // of bounds (mirrors `active_ladder_rung`).
+        let consumed = (self.slash_ladder_index as usize).min(old.rung_count as usize);
+        if new_rungs.is_empty()
+            || new_rungs.len() > MAX_SLASH_LADDER_RUNGS
+            || new_rungs.len() < consumed
+        {
+            return Err(EscrowError::InvalidSlashLadder);
+        }
+        // Consumed-prefix immutability: history rung-by-rung.
+        for i in 0..consumed {
+            if new_rungs[i] != (old.rungs[i].deadline, old.rungs[i].bps) {
+                return Err(EscrowError::InvalidSlashLadder);
+            }
+        }
+        // The whole new table must stay a valid escalation
+        // schedule — strictly ascending deadlines and bps, each
+        // bps within 0–10_000 — and every future rung's deadline
+        // must not predate `now` (no backdating into eligibility).
+        // The consumed prefix already satisfied the schedule
+        // shape at construction, so this check binds the future
+        // rungs (and the seam between history and future).
+        let mut prev_deadline: u64 = 0;
+        let mut prev_bps: u16 = 0;
+        for (i, &(deadline, bps)) in new_rungs.iter().enumerate() {
+            if i > 0 && (deadline <= prev_deadline || bps <= prev_bps) {
+                return Err(EscrowError::InvalidSlashLadder);
+            }
+            if bps > 10_000 {
+                return Err(EscrowError::InvalidSlashLadder);
+            }
+            if i >= consumed && deadline < now {
+                return Err(EscrowError::InvalidSlashLadder);
+            }
+            prev_deadline = deadline;
+            prev_bps = bps;
+        }
+        // All checks pass before any write. The penalty account
+        // and the cursor are deliberately not touched here: only
+        // the future tiers move.
+        let mut table = [SlashRung {
+            deadline: 0,
+            bps: 0,
+        }; MAX_SLASH_LADDER_RUNGS];
+        for (i, &(deadline, bps)) in new_rungs.iter().enumerate() {
+            table[i] = SlashRung { deadline, bps };
+        }
+        self.slash_ladder = Some(SlashLadder {
+            penalty_account: old.penalty_account,
+            rungs: table,
+            rung_count: new_rungs.len() as u8,
+        });
+        Ok(())
+    }
+
     /// Cumulative amount slashed to the penalty account (AV-82):
     /// `0` when never slashed. Kept separate from `released` — the
     /// audit trail distinguishes a default penalty from a taker
@@ -45262,7 +45399,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
     }
 
     #[test]
@@ -61202,7 +61339,7 @@ mod event_history_tests {
             Some(EscrowEventKind::ClaimantRosterAmended),
             "AV-227: appended after MilestoneTrancheAppended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(101), None); // AV-236: 100 is AppealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(102), None); // AV-237: 101 is SlashLadderAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -61385,9 +61522,10 @@ mod event_history_tests {
         // `ProtocolFeeAmended` (AV-233), 98 is
         // `MilestoneVerifierRotated` (AV-234), 99 is
         // `ArbiterFeeAmended` (AV-235), 100 is
-        // `AppealWindowAmended` (AV-236) and 101 is the
+        // `AppealWindowAmended` (AV-236), 101 is
+        // `SlashLadderAmended` (AV-237) and 102 is the
         // first still-unknown byte.
-        for bad in [101u8, 255] {
+        for bad in [102u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -67256,6 +67394,268 @@ mod slash_ladder_tests {
         let last = e.events().last().unwrap();
         assert_eq!(last.kind, EscrowEventKind::Slashed);
         assert_eq!(last.slash_ladder_index, None);
+    }
+
+    // ----- AV-237: post-funding slash-ladder amendment -----
+
+    #[test]
+    fn amend_slash_ladder_retunes_future_rungs_before_any_slash() {
+        // Nothing consumed yet: the whole table is future, so all
+        // three rungs move — and the next slash prices from the
+        // NEW rung 0 at the same cursor.
+        let mut e = ladder_escrow();
+        e.amend_slash_ladder(
+            ALICE,
+            BOB,
+            &[(T0, 200), (T0 + DAY, 600), (T0 + 2 * DAY, 1_200)],
+            T0 - 1,
+        )
+        .unwrap();
+        let ladder = e.slash_ladder().unwrap();
+        assert_eq!(ladder.penalty_account, PENALTY);
+        assert_eq!(ladder.rung_count, 3);
+        assert_eq!(ladder.rungs[0], SlashRung { deadline: T0, bps: 200 });
+        assert_eq!(ladder.rungs[1], SlashRung { deadline: T0 + DAY, bps: 600 });
+        assert_eq!(ladder.rungs[2], SlashRung { deadline: T0 + 2 * DAY, bps: 1_200 });
+        assert_eq!(e.slash_ladder_index(), 0);
+        assert_eq!(e.penalty_paid(), 0);
+        // New rung 0 caps at 2% of 1_000_000 = 20_000.
+        let s = e.slash(ALICE, 20_000, None, T0).unwrap();
+        assert_eq!(s, 20_000);
+        assert_eq!(e.slash_ladder_index(), 1);
+    }
+
+    #[test]
+    fn amend_slash_ladder_keeps_consumed_prefix_cursor_and_effect() {
+        // Rung 0 consumed: its 10_000 penalty is history. The
+        // amendment retunes rungs 1–2 only; the cursor, the
+        // penalty already paid, and the penalty account do not
+        // move — and the next slash prices from the NEW rung 1
+        // at the SAME cursor.
+        let mut e = ladder_escrow();
+        e.slash(ALICE, 10_000, None, T0).unwrap();
+        assert_eq!(e.slash_ladder_index(), 1);
+        e.amend_slash_ladder(
+            ALICE,
+            BOB,
+            &[(T0, 100), (T0 + DAY, 600), (T0 + 2 * DAY, 1_500)],
+            T0 + DAY,
+        )
+        .unwrap();
+        let ladder = e.slash_ladder().unwrap();
+        assert_eq!(ladder.penalty_account, PENALTY);
+        assert_eq!(ladder.rungs[0], SlashRung { deadline: T0, bps: 100 });
+        assert_eq!(ladder.rungs[1], SlashRung { deadline: T0 + DAY, bps: 600 });
+        assert_eq!(ladder.rungs[2], SlashRung { deadline: T0 + 2 * DAY, bps: 1_500 });
+        assert_eq!(e.slash_ladder_index(), 1);
+        assert_eq!(e.penalty_paid(), 10_000);
+        // New rung 1 caps at 6% of the 990_000 remainder = 59_400.
+        let s = e.slash(ALICE, 59_400, None, T0 + DAY).unwrap();
+        assert_eq!(s, 59_400);
+        assert_eq!(e.slash_ladder_index(), 2);
+        assert_eq!(e.penalty_paid(), 10_000 + 59_400);
+        // The amended ladder can also shrink the tail: dropping
+        // the top rung is fine while the consumed prefix survives.
+        e.amend_slash_ladder(ALICE, BOB, &[(T0, 100), (T0 + DAY, 600)], T0 + DAY)
+            .unwrap();
+        assert_eq!(e.slash_ladder().unwrap().rung_count, 2);
+        assert_eq!(e.slash_ladder_index(), 2);
+    }
+
+    #[test]
+    fn amend_slash_ladder_rejects_consumed_prefix_mutation() {
+        let mut e = ladder_escrow();
+        e.slash(ALICE, 10_000, None, T0).unwrap();
+        let before = e.slash_ladder().unwrap();
+        // Mutating the consumed rung's bps.
+        let err = e
+            .amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[(T0, 101), (T0 + DAY, 500), (T0 + 2 * DAY, 1_000)],
+                T0 + DAY,
+            )
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidSlashLadder);
+        // Mutating the consumed rung's deadline.
+        let err = e
+            .amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[(T0 + 1, 100), (T0 + DAY, 500), (T0 + 2 * DAY, 1_000)],
+                T0 + DAY,
+            )
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidSlashLadder);
+        // Both refusals leave the ladder, cursor, and penalty
+        // untouched.
+        assert_eq!(e.slash_ladder().unwrap(), before);
+        assert_eq!(e.slash_ladder_index(), 1);
+        assert_eq!(e.penalty_paid(), 10_000);
+    }
+
+    #[test]
+    fn amend_slash_ladder_rejects_too_short_and_malformed_tables() {
+        // Two rungs consumed: a one-rung table would drop history.
+        let mut e = ladder_escrow();
+        e.slash(ALICE, 10_000, None, T0).unwrap();
+        e.slash(ALICE, 49_500, None, T0 + DAY).unwrap();
+        assert_eq!(e.slash_ladder_index(), 2);
+        let before = e.slash_ladder().unwrap();
+        let err = e
+            .amend_slash_ladder(ALICE, BOB, &[(T0, 100)], T0 + DAY)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidSlashLadder);
+        // An empty table is not a ladder at all.
+        let err = e.amend_slash_ladder(ALICE, BOB, &[], T0 + DAY).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidSlashLadder);
+        // More rungs than the fixed slots hold.
+        let err = e
+            .amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[
+                    (T0, 100),
+                    (T0 + DAY, 500),
+                    (T0 + 2 * DAY, 1_000),
+                    (T0 + 3 * DAY, 1_500),
+                    (T0 + 4 * DAY, 2_000),
+                    (T0 + 5 * DAY, 2_500),
+                    (T0 + 6 * DAY, 3_000),
+                    (T0 + 7 * DAY, 3_500),
+                    (T0 + 8 * DAY, 4_000),
+                ],
+                T0 + DAY,
+            )
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidSlashLadder);
+        assert_eq!(e.slash_ladder().unwrap(), before);
+        assert_eq!(e.slash_ladder_index(), 2);
+    }
+
+    #[test]
+    fn amend_slash_ladder_rejects_non_increasing_and_overfull_rungs() {
+        let mut e = ladder_escrow();
+        let before = e.slash_ladder().unwrap();
+        // Equal deadlines in the future rungs.
+        let err = e
+            .amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[(T0, 100), (T0 + DAY, 500), (T0 + DAY, 600)],
+                T0 - 1,
+            )
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidSlashLadder);
+        // Equal bps in the future rungs.
+        let err = e
+            .amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[(T0, 100), (T0 + DAY, 500), (T0 + 2 * DAY, 500)],
+                T0 - 1,
+            )
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidSlashLadder);
+        // A rung above 100%.
+        let err = e
+            .amend_slash_ladder(ALICE, BOB, &[(T0, 100), (T0 + DAY, 10_001)], T0 - 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidSlashLadder);
+        // A future rung retreating below the consumed rung's bps
+        // breaks the escalation at the history/future seam.
+        let mut e2 = ladder_escrow();
+        e2.slash(ALICE, 10_000, None, T0).unwrap();
+        let err = e2
+            .amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[(T0, 100), (T0 + DAY, 50), (T0 + 2 * DAY, 1_000)],
+                T0 + DAY,
+            )
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidSlashLadder);
+        assert_eq!(e.slash_ladder().unwrap(), before);
+        assert_eq!(e.slash_ladder_index(), 0);
+    }
+
+    #[test]
+    fn amend_slash_ladder_rejects_backdated_future_rungs() {
+        // A future rung dated before `now` would make the next
+        // slash fire immediately — backdating is refused, while
+        // the consumed rung's past deadline is fine (it is
+        // history, and the amendment above already proved it).
+        let mut e = ladder_escrow();
+        let err = e
+            .amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[(T0 - 1, 100), (T0 + DAY, 500)],
+                T0,
+            )
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidSlashLadder);
+        // A deadline exactly at `now` is not earlier than now.
+        e.amend_slash_ladder(ALICE, BOB, &[(T0, 100), (T0 + DAY, 500)], T0)
+            .unwrap();
+        let amended = e.slash_ladder().unwrap();
+        assert_eq!(amended.rung_count, 2);
+        assert_eq!(amended.rungs[0], SlashRung { deadline: T0, bps: 100 });
+        assert_eq!(amended.rungs[1], SlashRung { deadline: T0 + DAY, bps: 500 });
+    }
+
+    #[test]
+    fn amend_slash_ladder_rejects_state_authority_ladder_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial
+        // set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_ladder(PENALTY, &[(T0, 100), (T0 + DAY, 500)])
+            .unwrap();
+        let before = bare.slash_ladder().unwrap();
+        assert_eq!(
+            bare.amend_slash_ladder(ALICE, BOB, &[(T0, 200), (T0 + DAY, 600)], T0 - 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.slash_ladder().unwrap(), before);
+        // No ladder, nothing to revise — a single-level escrow is
+        // not a ladder escrow.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, T0)
+            .unwrap();
+        plain.fund(ALICE, T0 - 1).unwrap();
+        assert_eq!(
+            plain.amend_slash_ladder(ALICE, BOB, &[(T0, 100)], T0 - 1),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        // Dual signature: one party alone cannot reprice the
+        // other's default penalty.
+        let mut e = ladder_escrow();
+        assert_eq!(
+            e.amend_slash_ladder(ALICE, ALICE, &[(T0, 200)], T0 - 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_slash_ladder([0xCC; 32], BOB, &[(T0, 200)], T0 - 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.slash_ladder().unwrap().rungs[0].bps, 100);
+        // The pause guard fires before the authority and state
+        // gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_slash_ladder(PENALTY, &[(T0, 100), (T0 + DAY, 500)])
+            .unwrap();
+        paused.fund(ALICE, T0 - 1).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_slash_ladder(ALICE, BOB, &[(T0, 200), (T0 + DAY, 600)], T0 - 1),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.slash_ladder().unwrap().rungs[0].bps, 100);
     }
 
     #[test]

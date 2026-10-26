@@ -233,6 +233,8 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         | EscrowEventKind::ArbiterFeeAmended
         // AV-236: a revised appeal window carries no fee leg itself.
         | EscrowEventKind::AppealWindowAmended
+        // AV-237: a revised slash ladder carries no fee leg itself.
+        | EscrowEventKind::SlashLadderAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -908,6 +910,8 @@ mod fee_history_tests {
         | EscrowEventKind::ArbiterFeeAmended
         // AV-236: a revised appeal window carries no fee leg itself.
         | EscrowEventKind::AppealWindowAmended
+        // AV-237: a revised slash ladder carries no fee leg itself.
+        | EscrowEventKind::SlashLadderAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

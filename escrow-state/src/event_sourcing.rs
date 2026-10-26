@@ -186,6 +186,9 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // AV-236: a revised appeal window moves no funds — the new
         // window stamps only the later slashes' appeal deadlines.
         | EscrowEventKind::AppealWindowAmended
+        // AV-237: a revised slash ladder moves no funds — the new
+        // rungs price only the later slashes.
+        | EscrowEventKind::SlashLadderAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -857,6 +860,8 @@ mod event_sourcing_tests {
         // AV-236: a revised appeal window moves no funds — the new
         // window stamps only the later slashes' appeal deadlines.
         | EscrowEventKind::AppealWindowAmended
+        // AV-237: a revised slash ladder moves no funds.
+        | EscrowEventKind::SlashLadderAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
