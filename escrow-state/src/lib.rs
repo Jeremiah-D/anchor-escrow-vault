@@ -19497,6 +19497,99 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Revise the tiered protocol-fee schedule after funding (AV-253 — Solana/DeFi
+    /// fee governance / payment fintech): the initializer and the taker may
+    /// jointly renegotiate what later taker payouts cost by amount tier — a
+    /// deal that grows may justify a lower top-tier rate, a deal that shrinks
+    /// a higher one — without cancelling and re-locking.
+    ///
+    /// Check order mirrors [`Escrow::amend_protocol_fee`]: pause first
+    /// ([`EscrowError::Paused`]), dual signature next
+    /// ([`EscrowError::Unauthorized`]), `Funded`-only
+    /// ([`EscrowError::InvalidStateTransition`]), then the schedule
+    /// validation, all before any write.
+    ///
+    /// Validation ([`EscrowError::InvalidProtocolFee`] — no new code, the
+    /// schedule is a fee-rate configuration, exactly as
+    /// [`Escrow::with_fee_schedule`] validates it): at least one tier and at
+    /// most [`MAX_FEE_TIERS`] (8); every `bps <= 10_000`; the `min_amount`
+    /// floors strictly ascending (the tier lookup scans them in slot order).
+    /// A flat rate and a schedule are mutually exclusive — fail-fast, never
+    /// silent last-wins: amending a schedule onto an escrow whose flat
+    /// `fee_bps` is nonzero is `InvalidProtocolFee`, paralleling
+    /// [`Escrow::amend_protocol_fee`]'s refusal the other way (a configured
+    /// schedule owns the rate, so a flat amendment there is likewise
+    /// refused) and [`Escrow::with_fee_schedule`]'s builder refusal. An
+    /// escrow with no schedule and a zero flat rate simply gains its first
+    /// schedule on amendment.
+    ///
+    /// Scope: only `fee_schedule` changes — `fee_bps` and `fee_cap` are
+    /// untouched (the cap still floors the new schedule's bps fee at
+    /// fee-computation time, exactly as before), and `fees_paid` /
+    /// `fees_withdrawn` are untouched (fees already charged or withdrawn
+    /// are never restated; there are no refunds). The 81-byte schedule
+    /// region is always resident, so the revision rewrites it in place —
+    /// the new tier count and tiers replace the old ones outright, with
+    /// the tail slots zeroed — and no reallocation ever occurs. Later
+    /// taker payouts price live through [`Escrow::protocol_fee_for`], which
+    /// reads the schedule's highest tier whose `min_amount <= amount`, so
+    /// a payout that straddled tiers reprices at the new tier the moment
+    /// the amendment lands. Orthogonal to [`Escrow::with_fee_schedule`]
+    /// (`Uninitialized`-only initial configuration) and to AV-233's
+    /// [`Escrow::amend_protocol_fee`] (that revises the flat rate, this
+    /// revises the tier schedule — the two rates are mutually exclusive,
+    /// so the items never overlap on one escrow). Emits `FeeScheduleAmended`
+    /// on the event layer.
+    pub fn amend_fee_schedule(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        tiers: &[(u64, u16)],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_protocol_fee`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // A flat rate owns the fee: a schedule here would be silently
+        // discarded by `protocol_fee_for` — fail-fast, never last-wins.
+        if self.fee_bps != 0 {
+            return Err(EscrowError::InvalidProtocolFee);
+        }
+        // The builder's tier validation, unchanged.
+        if tiers.is_empty() || tiers.len() > MAX_FEE_TIERS {
+            return Err(EscrowError::InvalidProtocolFee);
+        }
+        let mut schedule = FeeSchedule::default();
+        let mut prev_floor: Option<u64> = None;
+        for (i, (min_amount, bps)) in tiers.iter().enumerate() {
+            if *bps > 10_000 {
+                return Err(EscrowError::InvalidProtocolFee);
+            }
+            if let Some(prev) = prev_floor {
+                if *min_amount <= prev {
+                    return Err(EscrowError::InvalidProtocolFee);
+                }
+            }
+            prev_floor = Some(*min_amount);
+            schedule.tiers[i] = FeeTier {
+                min_amount: *min_amount,
+                bps: *bps,
+            };
+        }
+        schedule.tier_count = tiers.len() as u8;
+        // All checks pass before any write: the resident schedule region
+        // is rewritten in place.
+        self.fee_schedule = schedule;
+        Ok(())
+    }
+
     /// Cumulative protocol fee charged across all payouts (AV-17).
     /// Always `<= released_amount()`: the fee is a routing slice of the
     /// gross payouts, and `payout + fee == gross` for every payout.
@@ -46501,7 +46594,11 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(115),
             Some(EscrowEventKind::RentSweepGraceAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(
+            EscrowEventKind::from_discriminant(116),
+            Some(EscrowEventKind::FeeScheduleAmended)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -62744,7 +62841,12 @@ mod event_history_tests {
             Some(EscrowEventKind::RentSweepGraceAmended),
             "AV-252: appended after SlotTimelockAmended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(
+            EscrowEventKind::from_discriminant(116),
+            Some(EscrowEventKind::FeeScheduleAmended),
+            "AV-253: appended after RentSweepGraceAmended"
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -62942,9 +63044,10 @@ mod event_history_tests {
         // `TimelockAmended` (AV-249), 113 is
         // `RelativeTimelockAmended` (AV-250), 114 is
         // `SlotTimelockAmended` (AV-251), 115 is
-        // `RentSweepGraceAmended` (AV-252) and 116 is the
+        // `RentSweepGraceAmended` (AV-252), 116 is
+        // `FeeScheduleAmended` (AV-253) and 117 is the
         // first still-unknown byte.
-        for bad in [116u8, 255] {
+        for bad in [117u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -76567,6 +76670,190 @@ mod rent_sweep_grace_amend_tests {
         assert_eq!(e.event_count(), before + 1);
         let ev = e.events().last().copied().expect("event pushed");
         assert_eq!(ev.kind, EscrowEventKind::RentSweepGraceAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+    }
+}
+
+#[cfg(test)]
+mod fee_schedule_amend_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const NOW: u64 = 1_700_000_000;
+
+    fn funded() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000).unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_fee_schedule_installs_first_schedule_and_reprices_live() {
+        // An escrow with no schedule and a zero flat rate gains its
+        // first schedule on amendment, and later payouts price live
+        // from it: the highest tier whose floor the amount reaches.
+        let mut e = funded();
+        assert_eq!(e.fee_schedule().tier_count, 0);
+        assert_eq!(e.protocol_fee_for(600_000), 0);
+        e.amend_fee_schedule(ALICE, BOB, &[(0, 1000), (500_000, 500)])
+            .unwrap();
+        assert_eq!(e.fee_schedule().tier_count, 2);
+        assert_eq!(e.fee_schedule().tiers[0], FeeTier { min_amount: 0, bps: 1000 });
+        assert_eq!(e.fee_schedule().tiers[1], FeeTier { min_amount: 500_000, bps: 500 });
+        assert_eq!(e.protocol_fee_for(400_000), 40_000);
+        assert_eq!(e.protocol_fee_for(600_000), 30_000);
+        assert_eq!(e.fee_bps(), 0, "the flat rate stays zero");
+    }
+
+    #[test]
+    fn amend_fee_schedule_replaces_schedule_in_place_and_drops_old_tiers() {
+        // Replacing a schedule rewrites the resident region outright:
+        // the old tiers are gone, the tail slots are zeroed, and the
+        // new tiers price from the amendment on.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000)
+            .unwrap()
+            .with_fee_schedule(&[(0, 1000)])
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.protocol_fee_for(200_000), 20_000);
+        e.amend_fee_schedule(ALICE, BOB, &[(0, 200), (100_000, 100)])
+            .unwrap();
+        assert_eq!(e.fee_schedule().tier_count, 2);
+        assert_eq!(e.fee_schedule().tiers[2], FeeTier { min_amount: 0, bps: 0 });
+        assert_eq!(e.protocol_fee_for(50_000), 1_000);
+        assert_eq!(e.protocol_fee_for(200_000), 2_000);
+    }
+
+    #[test]
+    fn amend_fee_schedule_later_release_charges_new_schedule_and_keeps_old_fees() {
+        // Fees already charged are never restated: a pre-amendment
+        // payout keeps its (zero) fee, and the post-amendment payout
+        // charges the new schedule.
+        let mut e = funded();
+        let (payout, fee) = e.release(ALICE, NOW, 400_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.fees_paid(), 0);
+        e.amend_fee_schedule(ALICE, BOB, &[(0, 1000), (500_000, 500)])
+            .unwrap();
+        let (payout, fee) = e.release(ALICE, NOW, 600_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (570_000, 30_000));
+        assert_eq!(e.fees_paid(), 30_000);
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_fee_schedule_rejects_invalid_tiers_and_leaves_schedule_untouched() {
+        // Every builder rejection is fail-closed: the old schedule
+        // survives each failed amendment verbatim.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000)
+            .unwrap()
+            .with_fee_schedule(&[(0, 1000)])
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        let bad: Vec<Vec<(u64, u16)>> = vec![
+            vec![],
+            (0..9).map(|i| (i * 1000, 100)).collect(),
+            vec![(0, 10_001)],
+            vec![(0, 1000), (0, 500)],
+            vec![(500_000, 500), (0, 1000)],
+        ];
+        for tiers in &bad {
+            assert_eq!(
+                e.amend_fee_schedule(ALICE, BOB, tiers),
+                Err(EscrowError::InvalidProtocolFee),
+                "tiers {tiers:?} must fail"
+            );
+            assert_eq!(e.fee_schedule().tier_count, 1);
+            assert_eq!(e.fee_schedule().tiers[0], FeeTier { min_amount: 0, bps: 1000 });
+            assert_eq!(e.protocol_fee_for(200_000), 20_000);
+        }
+    }
+
+    #[test]
+    fn amend_fee_schedule_refuses_flat_rate_and_keeps_flat_pricing() {
+        // Mutual exclusion, fail-fast not last-wins: a nonzero flat
+        // rate refuses the schedule, and flat pricing survives.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000)
+            .unwrap()
+            .with_protocol_fee(500)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            e.amend_fee_schedule(ALICE, BOB, &[(0, 1000)]),
+            Err(EscrowError::InvalidProtocolFee)
+        );
+        assert_eq!(e.fee_bps(), 500);
+        assert_eq!(e.fee_schedule().tier_count, 0);
+        assert_eq!(e.protocol_fee_for(100_000), 5_000);
+    }
+
+    #[test]
+    fn amend_fee_schedule_keeps_cap_and_rejects_state_authority_and_paused() {
+        // The cap is untouched by the revision and still floors the
+        // new schedule's bps fee at computation time.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000)
+            .unwrap()
+            .with_fee_cap(5000)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        e.amend_fee_schedule(ALICE, BOB, &[(0, 1000), (500_000, 500)])
+            .unwrap();
+        assert_eq!(e.fee_cap(), 5000);
+        assert_eq!(e.protocol_fee_for(600_000), 5000);
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000)
+            .unwrap()
+            .with_fee_schedule(&[(0, 1000)])
+            .unwrap();
+        assert_eq!(
+            bare.amend_fee_schedule(ALICE, BOB, &[(0, 500)]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.fee_schedule().tiers[0].bps, 1000);
+        // Dual signature: one party alone cannot reprice the other's fee.
+        let mut f = funded();
+        assert_eq!(
+            f.amend_fee_schedule(ALICE, ALICE, &[(0, 1000)]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            f.amend_fee_schedule([0xCC; 32], BOB, &[(0, 1000)]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(f.fee_schedule().tier_count, 0);
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap();
+        paused.fund(ALICE, NOW).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_fee_schedule(ALICE, BOB, &[(0, 1000)]),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.fee_schedule().tier_count, 0);
+    }
+
+    #[test]
+    fn amend_fee_schedule_indexed_emits_event_and_failed_emits_nothing() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000, [0x1D; 32], NOW)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_fee_schedule(ALICE, BOB, &[], NOW),
+            Err(EscrowError::InvalidProtocolFee)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_fee_schedule(ALICE, BOB, &[(0, 1000)], NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::FeeScheduleAmended);
         assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
         assert_eq!(ev.amounts.payout, 0);
         assert_eq!(ev.amounts.fee, 0);

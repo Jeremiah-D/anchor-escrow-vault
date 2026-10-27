@@ -289,6 +289,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // against the unchanged terminal timestamp; a sweep
         // already performed is never undone.
         | EscrowEventKind::RentSweepGraceAmended
+        // AV-253: a revised fee schedule moves no
+        // funds — later payouts reprice live from the amended
+        // schedule; fees already charged or withdrawn are never
+        // restated.
+        | EscrowEventKind::FeeScheduleAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1020,6 +1025,11 @@ mod fee_history_tests {
         // against the unchanged terminal timestamp; a sweep
         // already performed is never undone.
         | EscrowEventKind::RentSweepGraceAmended
+        // AV-253: a revised fee schedule moves no
+        // funds — later payouts reprice live from the amended
+        // schedule; fees already charged or withdrawn are never
+        // restated.
+        | EscrowEventKind::FeeScheduleAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

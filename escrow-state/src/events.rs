@@ -231,6 +231,13 @@
 //!   vault, and the sweep gate re-reads it live against the
 //!   unchanged `terminal_at` stamp, while a sweep already
 //!   performed is never undone. A failed amendment emits nothing.
+//! - `amend_fee_schedule` emits
+//!   [`EscrowEventKind::FeeScheduleAmended`] on every
+//!   successful amendment (AV-253) — `from == to ==` the current
+//!   state, all amounts zero; the amended schedule is read from
+//!   the vault, and later payouts reprice live from it, while
+//!   fees already charged or withdrawn are never restated.
+//!   A failed amendment emits nothing.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -439,6 +446,7 @@
 //! | RelativeTimelockAmended (AV-250) | 0 | 0 | 0 | 0 — amending moves no funds; the payout gates re-read the live window against the unchanged funding anchor, while already-released amounts are never restated |
 //! | SlotTimelockAmended (AV-251) | 0 | 0 | 0 | 0 — amending moves no funds; the slot gates re-read the live window against the unchanged funding slot, while already-released amounts are never restated |
 //! | RentSweepGraceAmended (AV-252) | 0 | 0 | 0 | 0 — amending moves no funds; the sweep gate re-reads the live grace against the unchanged terminal timestamp, while a sweep already performed is never undone |
+//! | FeeScheduleAmended (AV-253) | 0 | 0 | 0 | 0 — amending moves no funds; later payouts reprice live from the amended schedule, while fees already charged or withdrawn are never restated |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1595,6 +1603,18 @@ pub enum EscrowEventKind {
     /// already performed is never undone). The amended grace is
     /// read from the vault, so the event needs no extra field.
     RentSweepGraceAmended,
+    /// AV-253: the tiered protocol-fee schedule was revised by
+    /// dual-signed governance
+    /// ([`Escrow::amend_fee_schedule`](crate::Escrow::amend_fee_schedule)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::ProtocolFeeAmended`]); all amounts are
+    /// zero — amending moves no funds (later taker payouts reprice
+    /// live from the amended schedule, the flat rate and the cap
+    /// are untouched, and fees already charged or withdrawn are
+    /// never restated). The amended schedule is read from the
+    /// vault, so the event needs no extra field.
+    FeeScheduleAmended,
 }
 
 impl EscrowEventKind {
@@ -1926,6 +1946,10 @@ impl EscrowEventKind {
             // discriminants 0–114 stay stable for already-serialized
             // histories.
             115 => Self::RentSweepGraceAmended,
+            // AV-253: appended after RentSweepGraceAmended so
+            // discriminants 0–115 stay stable for already-serialized
+            // histories.
+            116 => Self::FeeScheduleAmended,
             _ => return None,
         })
     }
@@ -2117,6 +2141,7 @@ impl EscrowEventKind {
             Self::RelativeTimelockAmended => "relative_timelock_amended",
             Self::SlotTimelockAmended => "slot_timelock_amended",
             Self::RentSweepGraceAmended => "rent_sweep_grace_amended",
+            Self::FeeScheduleAmended => "fee_schedule_amended",
         }
     }
 
@@ -2312,6 +2337,7 @@ impl EscrowEventKind {
             "relative_timelock_amended" => Self::RelativeTimelockAmended,
             "slot_timelock_amended" => Self::SlotTimelockAmended,
             "rent_sweep_grace_amended" => Self::RentSweepGraceAmended,
+            "fee_schedule_amended" => Self::FeeScheduleAmended,
             _ => return None,
         })
     }
@@ -7458,6 +7484,40 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the tiered protocol-fee schedule after funding (mirrors
+    /// [`Escrow::amend_fee_schedule`]). Emits
+    /// `FeeScheduleAmended` (`from == to ==` the current state
+    /// — the schedule, not the lifecycle state, is what changed; all
+    /// amounts zero, since amending moves no funds — later payouts
+    /// reprice live from the amended schedule, while fees already
+    /// charged or withdrawn are never restated). The amended
+    /// schedule is read from the vault, so the event needs no extra
+    /// field. A failed amendment emits nothing: the core call returns
+    /// before any event is pushed.
+    pub fn amend_fee_schedule(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        tiers: &[(u64, u16)],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner.amend_fee_schedule(initializer, taker, tiers)?;
+        self.push_event(
+            EscrowEventKind::FeeScheduleAmended,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// The live milestone tranche table as a fixed
     /// `MAX_MILESTONES` array (entries past the plan's count are
     /// zero): the shape the `MilestonesReallocated` event carries
@@ -12083,7 +12143,8 @@ mod event_tests {
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12187,7 +12248,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12725,7 +12787,8 @@ mod event_tests {
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12741,7 +12804,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12754,7 +12818,8 @@ mod event_tests {
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12767,7 +12832,8 @@ mod event_tests {
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12780,7 +12846,8 @@ mod event_tests {
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12796,7 +12863,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12812,7 +12880,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12825,7 +12894,8 @@ mod event_tests {
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12838,7 +12908,8 @@ mod event_tests {
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12851,7 +12922,8 @@ mod event_tests {
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12864,7 +12936,8 @@ mod event_tests {
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12877,7 +12950,8 @@ mod event_tests {
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12890,7 +12964,8 @@ mod event_tests {
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12907,7 +12982,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12923,7 +12999,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12939,7 +13016,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12955,7 +13033,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12971,7 +13050,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -12988,7 +13068,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -13005,7 +13086,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -13022,7 +13104,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -13038,7 +13121,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]
@@ -13071,7 +13155,8 @@ mod event_tests {
             Some(cancelled)
         );
         assert_eq!(EscrowEventKind::from_discriminant(115), Some(EscrowEventKind::RentSweepGraceAmended)); // AV-252: 115 is RentSweepGraceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(116), Some(EscrowEventKind::FeeScheduleAmended)); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
     }
 
     #[test]

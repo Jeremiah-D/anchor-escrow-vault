@@ -247,6 +247,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // against the unchanged terminal timestamp; a sweep
         // already performed is never undone.
         | EscrowEventKind::RentSweepGraceAmended
+        // AV-253: a revised fee schedule moves no
+        // funds — later payouts reprice live from the amended
+        // schedule; fees already charged or withdrawn are never
+        // restated.
+        | EscrowEventKind::FeeScheduleAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -974,6 +979,11 @@ mod event_sourcing_tests {
         // against the unchanged terminal timestamp; a sweep
         // already performed is never undone.
         | EscrowEventKind::RentSweepGraceAmended
+        // AV-253: a revised fee schedule moves no
+        // funds — later payouts reprice live from the amended
+        // schedule; fees already charged or withdrawn are never
+        // restated.
+        | EscrowEventKind::FeeScheduleAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
