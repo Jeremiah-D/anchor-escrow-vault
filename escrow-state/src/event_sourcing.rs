@@ -207,6 +207,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // the next claim's eligibility is recomputed from the
         // amended cooldown.
         | EscrowEventKind::ClaimCooldownAmended
+        // AV-244: a revised delivery deadline moves no funds —
+        // confirmations after the amendment are judged against
+        // the new deadline; an already-confirmed delivery keeps
+        // its first-won stamp.
+        | EscrowEventKind::DeliveryDeadlineAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -894,6 +899,11 @@ mod event_sourcing_tests {
         // the next claim's eligibility is recomputed from the
         // amended cooldown.
         | EscrowEventKind::ClaimCooldownAmended
+        // AV-244: a revised delivery deadline moves no funds —
+        // confirmations after the amendment are judged against
+        // the new deadline; an already-confirmed delivery keeps
+        // its first-won stamp.
+        | EscrowEventKind::DeliveryDeadlineAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

@@ -12583,6 +12583,71 @@ let fee = self.charge_protocol_fee(net_amount)?;
         self.delivery_late
     }
 
+    /// Revise the delivery-confirmation deadline after funding (AV-244):
+    /// both parties may renegotiate the timestamp by which the taker
+    /// must confirm receipt, without redeploying or refunding the
+    /// escrow.
+    ///
+    /// Why: the deadline set before funding assumes a delivery pace
+    /// the parties may no longer face — a slipped schedule can make
+    /// the original date impossibly tight, or a fast delivery can
+    /// make it meaninglessly loose. A dual-signed revision lets the
+    /// parties retune the confirmation bar to the delivery they
+    /// actually face.
+    ///
+    /// Governance: dual signature — both the initializer and the
+    /// taker must authorize, paralleling
+    /// [`Escrow::amend_claim_cooldown`]. `Funded`-only: the builder
+    /// [`Escrow::with_delivery_deadline`] owns the initial set. A paused
+    /// escrow fails fast ([`EscrowError::Paused`]).
+    ///
+    /// Rejections, reusing the builder's check: a zero `deadline_at`
+    /// is [`EscrowError::AmountMismatch`] — storage uses `0` for "no
+    /// deadline attached" (the AV-206 sentinel), so a revision to `0`
+    /// cannot cancel a deadline; there is no cancel-deadline path
+    /// in this item. All checks run before any write, so a failed
+    /// amendment leaves the configured deadline untouched.
+    ///
+    /// Scope: only `delivery_deadline_at` changes —
+    /// `late_delivery_penalty_bps` and `delivery_late` are untouched.
+    /// The deadline is read live: [`Escrow::confirm_delivery_at`]
+    /// reads `delivery_deadline_at()` at call time, so a confirmation
+    /// after the amendment is judged against the new deadline, while
+    /// an escrow with no deadline gains one on first amendment. A
+    /// delivery already confirmed keeps its stamp: confirmation is
+    /// first-wins, so an on-time confirmation can never be rewritten
+    /// late, and a late one can never be washed clean by moving the
+    /// deadline. Orthogonal to [`Escrow::with_delivery_deadline`]
+    /// (`Uninitialized`-only initial configuration), to AV-245's
+    /// penalty-rate amendment (a different field, a different
+    /// governance consequence), and to AV-211's post-confirmation
+    /// inspection window (the window runs from the confirmation,
+    /// this deadline bounds the confirmation itself). Emits
+    /// `DeliveryDeadlineAmended` on the event layer.
+    pub fn amend_delivery_deadline(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        deadline_at: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_claim_cooldown`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Builder-order value check, before any write: zero is the
+        // "no deadline" sentinel, not a deadline.
+        validate_delivery_deadline(deadline_at)?;
+        self.delivery_deadline_at = deadline_at;
+        Ok(())
+    }
+
     /// The taker confirms receipt with a timestamp (AV-216): the
     /// timed twin of [`Escrow::confirm_delivery`] — same
     /// authority (taker-only), same state window (`Funded` or
@@ -45867,7 +45932,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
+        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
     }
 
     #[test]
@@ -62065,7 +62130,12 @@ mod event_history_tests {
             Some(EscrowEventKind::ClaimCooldownAmended),
             "AV-243: appended after ArbitrationDeadlineAmended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
+        assert_eq!(
+            EscrowEventKind::from_discriminant(107),
+            Some(EscrowEventKind::DeliveryDeadlineAmended),
+            "AV-244: appended after ClaimCooldownAmended"
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -62254,9 +62324,10 @@ mod event_history_tests {
         // `GracePeriodAmended` (AV-240), 104 is
         // `EvidenceDeadlineAmended` (AV-241), 105 is
         // `ArbitrationDeadlineAmended` (AV-242), 106 is
-        // `ClaimCooldownAmended` (AV-243) and 107 is the
+        // `ClaimCooldownAmended` (AV-243), 107 is
+        // `DeliveryDeadlineAmended` (AV-244) and 108 is the
         // first still-unknown byte.
-        for bad in [107u8, 255] {
+        for bad in [108u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -74471,5 +74542,132 @@ mod recovery_tests {
         assert_eq!(EscrowError::RecoveryNoPendingRequest.code(), 290);
         assert_eq!(EscrowError::RecoveryThresholdNotReached.code(), 291);
         assert_eq!(EscrowError::RecoveryTimelockNotElapsed.code(), 292);
+    }
+}
+
+// ---------- AV-244: post-funding delivery-deadline amendment ----------
+
+#[cfg(test)]
+mod delivery_deadline_amend_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+
+    fn deadline_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_delivery_deadline(T0 + 1000)
+            .unwrap()
+            .with_late_delivery_penalty_bps(1000)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_delivery_deadline_moves_the_live_judgment() {
+        // Funded with deadline T0+1000: confirming at T0+500 is on
+        // time under the old deadline. Pulling the deadline in to
+        // T0+100 makes that same confirmation late — the judgment
+        // reads the amended value live — while the penalty rate is
+        // untouched and the state stays Funded.
+        let mut e = deadline_escrow();
+        e.amend_delivery_deadline(ALICE, BOB, T0 + 100).unwrap();
+        assert_eq!(e.delivery_deadline_at(), Some(T0 + 100));
+        assert_eq!(e.late_delivery_penalty_bps(), 1000);
+        assert_eq!(e.state(), EscrowState::Funded);
+        e.confirm_delivery_at(BOB, T0 + 500).unwrap();
+        assert!(e.delivery_confirmed());
+        assert!(e.delivery_late());
+    }
+
+    #[test]
+    fn amend_delivery_deadline_gives_an_unconfigured_escrow_a_deadline() {
+        // No configuration precondition beyond a valid deadline: a
+        // funded escrow with no deadline gains one, and the first
+        // confirmation after the amendment is judged against it.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(e.delivery_deadline_at(), None);
+        e.amend_delivery_deadline(ALICE, BOB, T0 + 1000).unwrap();
+        assert_eq!(e.delivery_deadline_at(), Some(T0 + 1000));
+        e.confirm_delivery_at(BOB, T0 + 500).unwrap();
+        assert!(!e.delivery_late());
+    }
+
+    #[test]
+    fn amend_delivery_deadline_rejects_zero_and_leaves_the_deadline_untouched() {
+        // Zero is the "no deadline" sentinel, not a deadline: the
+        // builder's rejection, and a failed amendment writes nothing.
+        let mut e = deadline_escrow();
+        assert_eq!(
+            e.amend_delivery_deadline(ALICE, BOB, 0),
+            Err(EscrowError::AmountMismatch)
+        );
+        assert_eq!(e.delivery_deadline_at(), Some(T0 + 1000));
+    }
+
+    #[test]
+    fn amend_delivery_deadline_keeps_an_already_confirmed_stamp() {
+        // First confirmation wins: an on-time confirmation stays
+        // on time even after the deadline is pulled in before its
+        // confirmation time, and a late confirmation stays late even
+        // after the deadline is pushed out past its confirmation time.
+        let mut on_time = deadline_escrow();
+        on_time.confirm_delivery_at(BOB, T0 + 500).unwrap();
+        assert!(!on_time.delivery_late());
+        on_time.amend_delivery_deadline(ALICE, BOB, T0 + 100).unwrap();
+        assert!(!on_time.delivery_late());
+        assert!(on_time.delivery_confirmed());
+
+        let mut late = deadline_escrow();
+        late.confirm_delivery_at(BOB, T0 + 1500).unwrap();
+        assert!(late.delivery_late());
+        late.amend_delivery_deadline(ALICE, BOB, T0 + 2000).unwrap();
+        assert!(late.delivery_late());
+        assert!(late.delivery_confirmed());
+    }
+
+    #[test]
+    fn amend_delivery_deadline_rejects_state_authority_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_delivery_deadline(T0 + 1000)
+            .unwrap();
+        assert_eq!(
+            bare.amend_delivery_deadline(ALICE, BOB, T0 + 2000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.delivery_deadline_at(), Some(T0 + 1000));
+        // Dual signature: one party alone cannot move the other's
+        // confirmation bar.
+        let mut e = deadline_escrow();
+        assert_eq!(
+            e.amend_delivery_deadline(ALICE, ALICE, T0 + 2000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_delivery_deadline([0xCC; 32], BOB, T0 + 2000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.delivery_deadline_at(), Some(T0 + 1000));
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_delivery_deadline(T0 + 1000)
+            .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_delivery_deadline(ALICE, BOB, T0 + 2000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.delivery_deadline_at(), Some(T0 + 1000));
     }
 }

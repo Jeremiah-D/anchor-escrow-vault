@@ -249,6 +249,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // the next claim's eligibility is recomputed from the
         // amended cooldown.
         | EscrowEventKind::ClaimCooldownAmended
+        // AV-244: a revised delivery deadline moves no funds —
+        // confirmations after the amendment are judged against
+        // the new deadline; an already-confirmed delivery keeps
+        // its first-won stamp.
+        | EscrowEventKind::DeliveryDeadlineAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -940,6 +945,11 @@ mod fee_history_tests {
         // the next claim's eligibility is recomputed from the
         // amended cooldown.
         | EscrowEventKind::ClaimCooldownAmended
+        // AV-244: a revised delivery deadline moves no funds —
+        // confirmations after the amendment are judged against
+        // the new deadline; an already-confirmed delivery keeps
+        // its first-won stamp.
+        | EscrowEventKind::DeliveryDeadlineAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
