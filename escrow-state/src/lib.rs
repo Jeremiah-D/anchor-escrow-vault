@@ -13155,6 +13155,64 @@ let fee = self.charge_protocol_fee(net_amount)?;
         Ok(())
     }
 
+    /// Revise the unclaimed-rent sweep grace period after funding (AV-252): both
+    /// parties may renegotiate how long a terminal vault's rent may sit
+    /// unclaimed before [`Escrow::sweep_unclaimed_rent`] becomes callable,
+    /// without redeploying or refunding the escrow.
+    ///
+    /// Why: the grace set before funding assumes a settlement pace the parties
+    /// may no longer face — a slow claim can make a short grace sweep rent the
+    /// initializer still intends to reclaim, or a fast one can make a long
+    /// grace trap rent for a month. A dual-signed revision lets the parties
+    /// move the sweep horizon while the deal is still live.
+    ///
+    /// Governance: dual signature — both the initializer and the taker must
+    /// authorize, paralleling [`Escrow::amend_slot_timelock`]. `Funded`-only:
+    /// the builder [`Escrow::with_rent_sweep_grace_secs`] owns the initial set.
+    /// A paused escrow fails fast ([`EscrowError::Paused`]). Any `u64` is a
+    /// legal value, and `0` is legal: it restores the 30-day default, exactly
+    /// the builder's `0` semantics (see
+    /// [`Escrow::effective_rent_sweep_grace_secs`]), rather than meaning
+    /// "sweep immediately". All checks run before any write, so a failed
+    /// amendment leaves the grace untouched.
+    ///
+    /// Scope: only `rent_sweep_grace_secs` changes — `terminal_at` is never
+    /// restated (it is stamped only when the escrow enters a closeable
+    /// terminal state), and no already-swept or already-closed state is
+    /// touched: a terminal or `Closed` vault fails with
+    /// [`EscrowError::InvalidStateTransition`], so a sweep already performed
+    /// is never undone and its grace stays as it was. The sweep gate reads
+    /// the grace live ([`Escrow::is_rent_sweep_eligible`] consults
+    /// [`Escrow::effective_rent_sweep_grace_secs`] at sweep time, and the
+    /// keeper scan reads the same live value), so lengthening the grace
+    /// pushes a sweep out, shortening it pulls a sweep in, and clearing to
+    /// `0` restores the 30-day horizon — the terminal timestamp itself
+    /// never moves. Orthogonal to [`Escrow::with_rent_sweep_grace_secs`]
+    /// (`Uninitialized`-only initial configuration), to AV-139's sweep
+    /// mechanism itself (this item is the post-funding revision), and to
+    /// AV-249/AV-250/AV-251's timelock revisions (different gates). Emits
+    /// `RentSweepGraceAmended` on the event layer.
+    pub fn amend_rent_sweep_grace(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        grace_secs: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_slot_timelock`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        self.rent_sweep_grace_secs = grace_secs;
+        Ok(())
+    }
+
     /// The taker confirms receipt with a timestamp (AV-216): the
     /// timed twin of [`Escrow::confirm_delivery`] — same
     /// authority (taker-only), same state window (`Funded` or
@@ -46439,7 +46497,11 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(115), None); // AV-251: 114 is SlotTimelockAmended
+        assert_eq!(
+            EscrowEventKind::from_discriminant(115),
+            Some(EscrowEventKind::RentSweepGraceAmended)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
     }
 
     #[test]
@@ -62677,7 +62739,12 @@ mod event_history_tests {
             Some(EscrowEventKind::SlotTimelockAmended),
             "AV-251: appended after RelativeTimelockAmended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(115), None); // AV-251: 114 is SlotTimelockAmended
+        assert_eq!(
+            EscrowEventKind::from_discriminant(115),
+            Some(EscrowEventKind::RentSweepGraceAmended),
+            "AV-252: appended after SlotTimelockAmended"
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(116), None); // AV-252: 115 is RentSweepGraceAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -62874,9 +62941,10 @@ mod event_history_tests {
         // `MaxExtensionAmended` (AV-248), 112 is
         // `TimelockAmended` (AV-249), 113 is
         // `RelativeTimelockAmended` (AV-250), 114 is
-        // `SlotTimelockAmended` (AV-251) and 115 is the
+        // `SlotTimelockAmended` (AV-251), 115 is
+        // `RentSweepGraceAmended` (AV-252) and 116 is the
         // first still-unknown byte.
-        for bad in [115u8, 255] {
+        for bad in [116u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -76340,5 +76408,167 @@ mod slot_timelock_amend_tests {
             Err(EscrowError::Paused)
         );
         assert_eq!(paused.slot_timelock_slots(), SLOT_LOCK);
+    }
+}
+
+#[cfg(test)]
+mod rent_sweep_grace_amend_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const NOW: u64 = 1_700_000_000;
+    const GRACE: u64 = 30 * 24 * 3600;
+
+    fn funded_with_grace(grace_secs: u64) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000)
+            .unwrap()
+            .with_rent_sweep_grace_secs(grace_secs)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_lengthens_and_pushes_sweep_out() {
+        // Lengthening the grace pushes a sweep out: a sweep at the old
+        // horizon is refused once the grace moves, and succeeds at
+        // the new horizon with the terminal timestamp untouched.
+        let mut e = funded_with_grace(3600);
+        e.amend_rent_sweep_grace(ALICE, BOB, 7200).unwrap();
+        assert_eq!(e.rent_sweep_grace_secs(), 7200);
+        assert_eq!(e.effective_rent_sweep_grace_secs(), 7200);
+        assert_eq!(e.terminal_at(), 0, "amending stamps nothing");
+        e.cancel(ALICE, None, ALICE, NOW).unwrap();
+        assert_eq!(e.terminal_at(), NOW);
+        assert!(!e.is_rent_sweep_eligible(NOW + 3600));
+        assert_eq!(
+            e.sweep_unclaimed_rent([0x09; 32], NOW + 3600),
+            Err(EscrowError::SweepGraceNotElapsed)
+        );
+        assert!(e.is_rent_sweep_eligible(NOW + 7200));
+        assert_eq!(
+            e.sweep_unclaimed_rent([0x09; 32], NOW + 7200).unwrap(),
+            vault_close_rent_reclaimed()
+        );
+        assert_eq!(e.state(), EscrowState::Closed);
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_shortens_and_pulls_sweep_in() {
+        // Shortening the grace pulls a sweep in: a sweep at the new
+        // horizon settles even though the 30-day default would
+        // still bind.
+        let mut e = funded_with_grace(0);
+        assert_eq!(e.effective_rent_sweep_grace_secs(), GRACE);
+        e.amend_rent_sweep_grace(ALICE, BOB, 3600).unwrap();
+        e.cancel(ALICE, None, ALICE, NOW).unwrap();
+        assert_eq!(
+            e.sweep_unclaimed_rent([0x09; 32], NOW + 3600).unwrap(),
+            vault_close_rent_reclaimed()
+        );
+        assert_eq!(e.state(), EscrowState::Closed);
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_to_zero_restores_default() {
+        // Zero is the builder's default sentinel, not "sweep now":
+        // clearing a custom grace restores the 30-day horizon.
+        let mut e = funded_with_grace(3600);
+        e.amend_rent_sweep_grace(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.rent_sweep_grace_secs(), 0);
+        assert_eq!(e.effective_rent_sweep_grace_secs(), GRACE);
+        assert_eq!(e.effective_rent_sweep_grace_secs(), DEFAULT_RENT_SWEEP_GRACE_SECS);
+        e.cancel(ALICE, None, ALICE, NOW).unwrap();
+        assert!(!e.is_rent_sweep_eligible(NOW + 3600));
+        assert_eq!(
+            e.sweep_unclaimed_rent([0x09; 32], NOW + 3600),
+            Err(EscrowError::SweepGraceNotElapsed)
+        );
+        assert!(e.is_rent_sweep_eligible(NOW + GRACE));
+        e.sweep_unclaimed_rent([0x09; 32], NOW + GRACE).unwrap();
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_rejects_state_authority_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000)
+            .unwrap()
+            .with_rent_sweep_grace_secs(3600)
+            .unwrap();
+        assert_eq!(
+            bare.amend_rent_sweep_grace(ALICE, BOB, 7200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.rent_sweep_grace_secs(), 3600);
+        // Dual signature: one party alone cannot move the other's grace.
+        let mut e = funded_with_grace(3600);
+        assert_eq!(
+            e.amend_rent_sweep_grace(ALICE, ALICE, 7200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_rent_sweep_grace([0xCC; 32], BOB, 7200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.rent_sweep_grace_secs(), 3600);
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_rent_sweep_grace_secs(3600)
+            .unwrap();
+        paused.fund(ALICE, NOW).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_rent_sweep_grace(ALICE, BOB, 7200),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.rent_sweep_grace_secs(), 3600);
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_on_terminal_and_closed_vaults_changes_nothing() {
+        // A terminal vault cannot be amended, and a closed vault
+        // cannot be reopened by amending: the sweep already
+        // performed stays performed, the grace stays as it was.
+        let mut e = funded_with_grace(3600);
+        e.cancel(ALICE, None, ALICE, NOW).unwrap();
+        assert_eq!(e.terminal_at(), NOW);
+        assert_eq!(
+            e.amend_rent_sweep_grace(ALICE, BOB, 7200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.rent_sweep_grace_secs(), 3600);
+        assert_eq!(e.terminal_at(), NOW);
+        e.sweep_unclaimed_rent([0x09; 32], NOW + 3600).unwrap();
+        assert_eq!(e.state(), EscrowState::Closed);
+        assert_eq!(
+            e.amend_rent_sweep_grace(ALICE, BOB, 7200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.rent_sweep_grace_secs(), 3600);
+        assert_eq!(e.state(), EscrowState::Closed);
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_indexed_emits_event_and_failed_emits_nothing() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000, [0x1D; 32], NOW)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_rent_sweep_grace(ALICE, ALICE, 7200, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_rent_sweep_grace(ALICE, BOB, 7200, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::RentSweepGraceAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
     }
 }

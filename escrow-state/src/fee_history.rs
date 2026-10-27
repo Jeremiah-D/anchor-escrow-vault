@@ -284,6 +284,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // against the unchanged funding slot; already-released
         // amounts are never restated.
         | EscrowEventKind::SlotTimelockAmended
+        // AV-252: a revised rent sweep grace moves no
+        // funds — the sweep gate re-reads the live grace
+        // against the unchanged terminal timestamp; a sweep
+        // already performed is never undone.
+        | EscrowEventKind::RentSweepGraceAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1010,6 +1015,11 @@ mod fee_history_tests {
         // against the unchanged funding slot; already-released
         // amounts are never restated.
         | EscrowEventKind::SlotTimelockAmended
+        // AV-252: a revised rent sweep grace moves no
+        // funds — the sweep gate re-reads the live grace
+        // against the unchanged terminal timestamp; a sweep
+        // already performed is never undone.
+        | EscrowEventKind::RentSweepGraceAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
