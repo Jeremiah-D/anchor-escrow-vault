@@ -12712,6 +12712,71 @@ let fee = self.charge_protocol_fee(net_amount)?;
         Ok(())
     }
 
+    /// Revise the release cooling window after funding (AV-246):
+    /// both parties may renegotiate how long an announced release
+    /// intent must age before [`Escrow::release`] may settle,
+    /// without redeploying or refunding the escrow.
+    ///
+    /// Why: the window set before funding assumes a veto urgency
+    /// the parties may no longer share — a fast-moving deal can
+    /// make a long cooling window an invitation to stall, or a
+    /// contested one can make a short window no veto at all. A
+    /// dual-signed revision lets the parties retune the veto
+    /// delay to the contention they actually face.
+    ///
+    /// Governance: dual signature — both the initializer and the
+    /// taker must authorize, paralleling
+    /// [`Escrow::amend_late_delivery_penalty_bps`]. `Funded`-only:
+    /// the builder [`Escrow::with_release_cooling`] owns the
+    /// initial set. A paused escrow fails fast
+    /// ([`EscrowError::Paused`]).
+    ///
+    /// Rejections: none on value — any `u64` is a legal window
+    /// (the builder's rule: the gate adds with `saturating_add`,
+    /// so no configuration can overflow), and `0` is a legal
+    /// value meaning "cooling off" (the builder's zero semantics,
+    /// same as [`Escrow::with_release_cooling`]). All checks run
+    /// before any write, so a failed amendment leaves the
+    /// configured window untouched.
+    ///
+    /// Scope: only `release_cooling_secs` changes —
+    /// `release_intent_at` is untouched, so a live announced
+    /// intent is re-measured against the new window:
+    /// [`Escrow::is_release_cooling_eligible`] reads the live
+    /// field, so lengthening the window pushes an announced but
+    /// not-yet-elapsed intent out, shortening it pulls it in,
+    /// and amending to `0` opens release immediately. A vetoed
+    /// intent stays vetoed — veto clears the intent, and this
+    /// amendment writes the window only, so it cannot resurrect
+    /// an intent. Amounts are untouched. Orthogonal to
+    /// [`Escrow::with_release_cooling`] (`Uninitialized`-only
+    /// initial configuration), to AV-112's announce/veto (the
+    /// intent lifecycle — this item is the window length), and
+    /// to AV-244's delivery deadline (a different gate). Emits
+    /// `ReleaseCoolingAmended` on the event layer.
+    pub fn amend_release_cooling(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        cooling_secs: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_late_delivery_penalty_bps`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // No value rejection: any u64 is a legal window, and 0
+        // is the builder's legal "cooling off" sentinel.
+        self.release_cooling_secs = cooling_secs;
+        Ok(())
+    }
+
     /// The taker confirms receipt with a timestamp (AV-216): the
     /// timed twin of [`Escrow::confirm_delivery`] — same
     /// authority (taker-only), same state window (`Funded` or
@@ -45996,7 +46061,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(110), None); // AV-246: 109 is ReleaseCoolingAmended
     }
 
     #[test]
@@ -62204,7 +62269,12 @@ mod event_history_tests {
             Some(EscrowEventKind::LateDeliveryPenaltyAmended),
             "AV-245: appended after DeliveryDeadlineAmended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
+        assert_eq!(
+            EscrowEventKind::from_discriminant(109),
+            Some(EscrowEventKind::ReleaseCoolingAmended),
+            "AV-246: appended after LateDeliveryPenaltyAmended"
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(110), None); // AV-246: 109 is ReleaseCoolingAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -62395,9 +62465,10 @@ mod event_history_tests {
         // `ArbitrationDeadlineAmended` (AV-242), 106 is
         // `ClaimCooldownAmended` (AV-243), 107 is
         // `DeliveryDeadlineAmended` (AV-244), 108 is
-        // `LateDeliveryPenaltyAmended` (AV-245) and 109 is the
+        // `LateDeliveryPenaltyAmended` (AV-245), 109 is
+        // `ReleaseCoolingAmended` (AV-246) and 110 is the
         // first still-unknown byte.
-        for bad in [109u8, 255] {
+        for bad in [110u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -74868,5 +74939,135 @@ mod late_delivery_penalty_amend_tests {
             Err(EscrowError::Paused)
         );
         assert_eq!(paused.late_delivery_penalty_bps(), 1000);
+    }
+}
+
+// ---------- AV-246: post-funding release-cooling amendment ----------
+
+#[cfg(test)]
+mod release_cooling_amend_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+
+    fn cooling_escrow(cooling: u64) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_release_cooling(cooling)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    fn announced(cooling: u64) -> Escrow {
+        let mut e = cooling_escrow(cooling);
+        e.announce_release(ALICE, T0).unwrap();
+        assert_eq!(e.release_intent_at(), Some(T0));
+        e
+    }
+
+    #[test]
+    fn amend_release_cooling_lengthens_a_live_intent_window() {
+        // Announced under a 60s window, eligible at T0+60 — then
+        // the parties lengthen to 600s: the same intent is
+        // re-measured live, so release at T0+60 is refused and
+        // release at T0+600 settles. The intent timestamp itself
+        // never moves.
+        let mut e = announced(60);
+        assert!(e.is_release_cooling_eligible(T0 + 60));
+        e.amend_release_cooling(ALICE, BOB, 600).unwrap();
+        assert_eq!(e.release_cooling_secs(), 600);
+        assert_eq!(e.release_intent_at(), Some(T0));
+        assert!(!e.is_release_cooling_eligible(T0 + 60));
+        assert_eq!(
+            e.release(ALICE, T0 + 60, 100_000, None, BOB),
+            Err(EscrowError::ReleaseCoolingNotElapsed)
+        );
+        assert!(e.is_release_cooling_eligible(T0 + 600));
+        let (payout, fee) = e.release(ALICE, T0 + 600, 100_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (100_000, 0));
+        assert_eq!(e.released_amount(), 100_000);
+    }
+
+    #[test]
+    fn amend_release_cooling_to_zero_opens_release_immediately() {
+        // Zero is the builder's "cooling off" value: an intent
+        // announced under a 3600s window becomes eligible at once.
+        let mut e = announced(3600);
+        assert!(!e.is_release_cooling_eligible(T0 + 60));
+        e.amend_release_cooling(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.release_cooling_secs(), 0);
+        assert!(e.is_release_cooling_eligible(T0));
+        let (payout, fee) = e.release(ALICE, T0 + 1, 100_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (100_000, 0));
+    }
+
+    #[test]
+    fn amend_release_cooling_gives_an_unconfigured_escrow_a_window() {
+        // No configuration precondition: announcing with no
+        // cooling still records the intent (harmless bookkeeping
+        // under AV-112), and the first amendment turns it into a
+        // live window measured from the original announcement.
+        let mut e = announced(0);
+        assert!(e.is_release_cooling_eligible(T0));
+        e.amend_release_cooling(ALICE, BOB, 600).unwrap();
+        assert!(!e.is_release_cooling_eligible(T0 + 60));
+        assert!(e.is_release_cooling_eligible(T0 + 600));
+        assert_eq!(e.release_intent_at(), Some(T0));
+    }
+
+    #[test]
+    fn amend_release_cooling_cannot_resurrect_a_vetoed_intent() {
+        // Veto clears the intent; amending the window writes the
+        // window only, so the escrow stays cooling-gated until a
+        // fresh announcement restarts the window.
+        let mut e = announced(60);
+        e.veto_release(BOB, T0 + 10).unwrap();
+        assert_eq!(e.release_intent_at(), None);
+        e.amend_release_cooling(ALICE, BOB, 600).unwrap();
+        assert_eq!(e.release_intent_at(), None);
+        assert!(!e.is_release_cooling_eligible(T0 + 600));
+    }
+
+    #[test]
+    fn amend_release_cooling_rejects_state_authority_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_release_cooling(60)
+            .unwrap();
+        assert_eq!(
+            bare.amend_release_cooling(ALICE, BOB, 600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.release_cooling_secs(), 60);
+        // Dual signature: one party alone cannot move the other's veto window.
+        let mut e = cooling_escrow(60);
+        assert_eq!(
+            e.amend_release_cooling(ALICE, ALICE, 600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_release_cooling([0xCC; 32], BOB, 600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.release_cooling_secs(), 60);
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_release_cooling(60)
+            .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_release_cooling(ALICE, BOB, 600),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.release_cooling_secs(), 60);
     }
 }

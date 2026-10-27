@@ -216,6 +216,10 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // funds — a late-stamped but unreleased delivery reprices
         // at the new rate; already-released amounts are untouched.
         | EscrowEventKind::LateDeliveryPenaltyAmended
+        // AV-246: a revised release cooling window moves no
+        // funds — a live announced intent is re-measured against
+        // the new window; a vetoed intent stays vetoed.
+        | EscrowEventKind::ReleaseCoolingAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -912,6 +916,10 @@ mod event_sourcing_tests {
         // funds — a late-stamped but unreleased delivery reprices
         // at the new rate; already-released amounts are untouched.
         | EscrowEventKind::LateDeliveryPenaltyAmended
+        // AV-246: a revised release cooling window moves no
+        // funds — a live announced intent is re-measured against
+        // the new window; a vetoed intent stays vetoed.
+        | EscrowEventKind::ReleaseCoolingAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
