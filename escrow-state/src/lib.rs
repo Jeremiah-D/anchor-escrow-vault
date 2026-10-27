@@ -12777,6 +12777,90 @@ let fee = self.charge_protocol_fee(net_amount)?;
         Ok(())
     }
 
+    /// Revise one milestone tranche's claim deadline after funding
+    /// (AV-247): both parties may renegotiate the timestamp by
+    /// which a tranche must be claimed, without redeploying or
+    /// refunding the escrow.
+    ///
+    /// Why: the window set before funding assumes a claim pace
+    /// the parties may no longer face — a slipped confirmation
+    /// can make the original deadline impossibly tight, or a
+    /// fast-settling tranche can make it meaninglessly loose. A
+    /// dual-signed revision lets the parties retune one
+    /// tranche's claim window without touching the others.
+    ///
+    /// Governance: dual signature — both the initializer and the
+    /// taker must authorize, paralleling
+    /// [`Escrow::amend_release_cooling`]. `Funded`-only: the
+    /// builder [`Escrow::with_milestone_claim_deadline`] owns the
+    /// initial set. A paused escrow fails fast
+    /// ([`EscrowError::Paused`]).
+    ///
+    /// Rejections, reusing the builder's plan-shape errors: no
+    /// milestone plan attached, or a tranche at or past the
+    /// plan's count, is [`EscrowError::InvalidMilestones`]
+    /// (the builder's rejection — an out-of-range tranche has no
+    /// deadline slot to write). Unlike the builder, `0` is a
+    /// legal value here: it clears the tranche's deadline (the
+    /// stored `0` reads back as "never attached", the
+    /// [`Escrow::milestone_claim_deadline_at`] sentinel), so the
+    /// parties can cancel a claim window they no longer want.
+    /// All checks run before any write, so a failed amendment
+    /// leaves every tranche's deadline untouched.
+    ///
+    /// Scope: only `milestone_claim_deadlines[tranche]` changes —
+    /// the plan amounts, the due dates, the other tranches'
+    /// deadlines, and the settled amounts are untouched. The
+    /// claim gate reads the deadline live:
+    /// [`Escrow::release_milestone`] (and the partial-claim path)
+    /// consult [`Escrow::milestone_claim_deadline_at`] at claim
+    /// time, so extending a deadline rescues a tranche that
+    /// would have expired under the old window, shortening one
+    /// expires it sooner, and clearing one removes the gate
+    /// entirely — while a tranche already claimed or already
+    /// skipped is unaffected in amount (its settlement already
+    /// happened; rewriting its deadline changes nothing it can
+    /// still claim). An unconfirmed tranche still needs its
+    /// confirmations first: the confirmation gate runs before
+    /// the deadline gate, so amending an unconfirmed tranche's
+    /// deadline never waives confirmation. Orthogonal to
+    /// [`Escrow::with_milestone_claim_deadline`]
+    /// (`Uninitialized`-only initial configuration), to
+    /// [`Escrow::amend_milestone_due_dates`] (the due dates, not
+    /// the claim deadlines), and to AV-225's claim-deadline
+    /// mechanism itself (this item is the post-funding revision).
+    /// Emits `MilestoneClaimDeadlineAmended` on the event layer.
+    pub fn amend_milestone_claim_deadline(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        tranche: u8,
+        deadline_secs: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_release_cooling`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Plan-shape checks, before any write — the builder's
+        // errors, in the builder's order.
+        let plan = self.milestones.ok_or(EscrowError::InvalidMilestones)?;
+        let i = tranche as usize;
+        if i >= plan.count as usize {
+            return Err(EscrowError::InvalidMilestones);
+        }
+        // 0 clears the deadline (the "never attached" sentinel);
+        // any nonzero value is the new absolute deadline.
+        self.milestone_claim_deadlines[i] = deadline_secs;
+        Ok(())
+    }
+
     /// The taker confirms receipt with a timestamp (AV-216): the
     /// timed twin of [`Escrow::confirm_delivery`] — same
     /// authority (taker-only), same state window (`Funded` or
@@ -46061,7 +46145,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(110), None); // AV-246: 109 is ReleaseCoolingAmended
+        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
     }
 
     #[test]
@@ -62274,7 +62358,12 @@ mod event_history_tests {
             Some(EscrowEventKind::ReleaseCoolingAmended),
             "AV-246: appended after LateDeliveryPenaltyAmended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(110), None); // AV-246: 109 is ReleaseCoolingAmended
+        assert_eq!(
+            EscrowEventKind::from_discriminant(110),
+            Some(EscrowEventKind::MilestoneClaimDeadlineAmended),
+            "AV-247: appended after ReleaseCoolingAmended"
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -62466,9 +62555,10 @@ mod event_history_tests {
         // `ClaimCooldownAmended` (AV-243), 107 is
         // `DeliveryDeadlineAmended` (AV-244), 108 is
         // `LateDeliveryPenaltyAmended` (AV-245), 109 is
-        // `ReleaseCoolingAmended` (AV-246) and 110 is the
+        // `ReleaseCoolingAmended` (AV-246), 110 is
+        // `MilestoneClaimDeadlineAmended` (AV-247) and 111 is the
         // first still-unknown byte.
-        for bad in [110u8, 255] {
+        for bad in [111u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -75069,5 +75159,197 @@ mod release_cooling_amend_tests {
             Err(EscrowError::Paused)
         );
         assert_eq!(paused.release_cooling_secs(), 60);
+    }
+}
+
+// ---------- AV-247: post-funding milestone claim-deadline amendment ----------
+
+#[cfg(test)]
+mod milestone_claim_deadline_amend_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const DEADLINE: u64 = 1_750_000_000;
+
+    fn plan_2() -> MilestonePlan {
+        MilestonePlan::new(&[400_000, 600_000]).unwrap()
+    }
+
+    fn deadline_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap()
+            .with_milestone_claim_deadline(0, DEADLINE)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    fn confirm_both(e: &mut Escrow, index: u8) {
+        e.confirm_milestone(ALICE, index).unwrap();
+        e.confirm_milestone(BOB, index).unwrap();
+        assert!(e.milestone_confirmed(index as usize));
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_extends_a_live_window() {
+        // Vested under the old deadline, the tranche would expire
+        // at DEADLINE+1 — extending to DEADLINE+1000 rescues it:
+        // a claim at DEADLINE+500 settles in full.
+        let mut e = deadline_escrow();
+        confirm_both(&mut e, 0);
+        e.amend_milestone_claim_deadline(ALICE, BOB, 0, DEADLINE + 1000)
+            .unwrap();
+        assert_eq!(e.milestone_claim_deadline_at(0), Some(DEADLINE + 1000));
+        assert_eq!(e.milestone_claim_deadline_at(1), None);
+        let (payout, fee) = e
+            .release_milestone(ALICE, DEADLINE + 500, 0, None, BOB)
+            .unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.released_amount(), 400_000);
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_shortens_a_live_window() {
+        // Shortening to DEADLINE-1000 expires the tranche early:
+        // a claim at DEADLINE+1 is rejected AND the amount
+        // returns to the refundable remainder, exactly like an
+        // expiry under the builder-set deadline.
+        let mut e = deadline_escrow();
+        confirm_both(&mut e, 0);
+        e.amend_milestone_claim_deadline(ALICE, BOB, 0, DEADLINE - 1000)
+            .unwrap();
+        assert_eq!(
+            e.release_milestone(ALICE, DEADLINE + 1, 0, None, BOB),
+            Err(EscrowError::MilestoneClaimExpired)
+        );
+        assert_eq!(e.skipped_amount(), 400_000);
+        assert_eq!(e.released_amount(), 0);
+        assert!(e.milestone_settled(0));
+        assert_eq!(e.next_milestone(), Some(1));
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_to_zero_cancels_the_window() {
+        // Zero clears the deadline (the "never attached"
+        // sentinel): a claim long past the old deadline settles
+        // as if no deadline had ever been attached.
+        let mut e = deadline_escrow();
+        confirm_both(&mut e, 0);
+        e.amend_milestone_claim_deadline(ALICE, BOB, 0, 0).unwrap();
+        assert_eq!(e.milestone_claim_deadline_at(0), None);
+        let (payout, fee) = e
+            .release_milestone(ALICE, DEADLINE + 1, 0, None, BOB)
+            .unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_never_waives_confirmation() {
+        // The confirmation gate runs before the deadline gate:
+        // amending an unconfirmed tranche's deadline leaves the
+        // claim refused as unconfirmed, not expired or settled.
+        let mut e = deadline_escrow();
+        e.amend_milestone_claim_deadline(ALICE, BOB, 0, DEADLINE + 1000)
+            .unwrap();
+        assert_eq!(e.milestone_claim_deadline_at(0), Some(DEADLINE + 1000));
+        assert_eq!(
+            e.release_milestone(ALICE, DEADLINE + 500, 0, None, BOB),
+            Err(EscrowError::MilestoneNotConfirmed)
+        );
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_leaves_settled_amounts_untouched() {
+        // A settled tranche keeps its settlement: amending its
+        // deadline after the claim changes no amount.
+        let mut e = deadline_escrow();
+        confirm_both(&mut e, 0);
+        let (payout, _) = e
+            .release_milestone(ALICE, DEADLINE, 0, None, BOB)
+            .unwrap();
+        assert_eq!(payout, 400_000);
+        e.amend_milestone_claim_deadline(ALICE, BOB, 0, DEADLINE + 1000)
+            .unwrap();
+        assert_eq!(e.released_amount(), 400_000);
+        assert!(e.milestone_settled(0));
+        // A skipped tranche likewise keeps its reroute: expiring
+        // tranche 1 under its own deadline, then amending it,
+        // moves nothing back.
+        let mut e2 = deadline_escrow();
+        e2.amend_milestone_claim_deadline(ALICE, BOB, 1, DEADLINE)
+            .unwrap();
+        confirm_both(&mut e2, 0);
+        e2.release_milestone(ALICE, DEADLINE, 0, None, BOB).unwrap();
+        confirm_both(&mut e2, 1);
+        assert_eq!(
+            e2.release_milestone(ALICE, DEADLINE + 1, 1, None, BOB),
+            Err(EscrowError::MilestoneClaimExpired)
+        );
+        assert_eq!(e2.skipped_amount(), 600_000);
+        e2.amend_milestone_claim_deadline(ALICE, BOB, 1, DEADLINE + 1000)
+            .unwrap();
+        assert_eq!(e2.skipped_amount(), 600_000);
+        assert_eq!(e2.released_amount(), 400_000);
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_rejects_shape_state_authority_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap()
+            .with_milestone_claim_deadline(0, DEADLINE)
+            .unwrap();
+        assert_eq!(
+            bare.amend_milestone_claim_deadline(ALICE, BOB, 0, DEADLINE + 1000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.milestone_claim_deadline_at(0), Some(DEADLINE));
+        // No plan attached, or a tranche past the plan's count,
+        // is a plan-shape error — and a failed amendment writes nothing.
+        let mut no_plan = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        no_plan.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            no_plan.amend_milestone_claim_deadline(ALICE, BOB, 0, DEADLINE),
+            Err(EscrowError::InvalidMilestones)
+        );
+        let mut e = deadline_escrow();
+        assert_eq!(
+            e.amend_milestone_claim_deadline(ALICE, BOB, 2, DEADLINE + 1000),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(e.milestone_claim_deadline_at(0), Some(DEADLINE));
+        // Dual signature: one party alone cannot move the other's window.
+        assert_eq!(
+            e.amend_milestone_claim_deadline(ALICE, ALICE, 0, DEADLINE + 1000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_milestone_claim_deadline([0xCC; 32], BOB, 0, DEADLINE + 1000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.milestone_claim_deadline_at(0), Some(DEADLINE));
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap()
+            .with_milestone_claim_deadline(0, DEADLINE)
+            .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_milestone_claim_deadline(ALICE, BOB, 0, DEADLINE + 1000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.milestone_claim_deadline_at(0), Some(DEADLINE));
     }
 }

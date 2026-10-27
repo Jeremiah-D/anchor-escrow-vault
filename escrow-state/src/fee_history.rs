@@ -262,6 +262,10 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // funds — a live announced intent is re-measured against
         // the new window; a vetoed intent stays vetoed.
         | EscrowEventKind::ReleaseCoolingAmended
+        // AV-247: a revised milestone claim deadline moves no
+        // funds — the claim gate re-reads the deadline live;
+        // already-claimed or skipped tranches keep settlements.
+        | EscrowEventKind::MilestoneClaimDeadlineAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -966,6 +970,10 @@ mod fee_history_tests {
         // funds — a live announced intent is re-measured against
         // the new window; a vetoed intent stays vetoed.
         | EscrowEventKind::ReleaseCoolingAmended
+        // AV-247: a revised milestone claim deadline moves no
+        // funds — the claim gate re-reads the deadline live;
+        // already-claimed or skipped tranches keep settlements.
+        | EscrowEventKind::MilestoneClaimDeadlineAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
