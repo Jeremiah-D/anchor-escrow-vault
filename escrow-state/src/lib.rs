@@ -13075,6 +13075,86 @@ let fee = self.charge_protocol_fee(net_amount)?;
         Ok(())
     }
 
+    /// Revise the slot timelock after funding (AV-251): both
+    /// parties may renegotiate the slot-count window, measured
+    /// from the funding slot, before which taker payouts stay
+    /// locked, without redeploying or refunding the escrow.
+    ///
+    /// Why: the lock duration set before funding assumes a deal
+    /// pace the parties may no longer face — a slipped schedule
+    /// can make the original window trap funds past their need, or
+    /// a fast-moving one can make it meaningless. A dual-signed
+    /// revision lets the parties move the unlock slot without
+    /// touching the other lock shapes or the amounts. Slots, not
+    /// seconds, are the clock no validator can skew, so a slot
+    /// lock stays meaningful where wall-clock locks drift.
+    ///
+    /// Governance: dual signature — both the initializer and the
+    /// taker must authorize, paralleling
+    /// [`Escrow::amend_relative_timelock`]. `Funded`-only: the
+    /// builder [`Escrow::with_slot_timelock`] owns the initial set.
+    /// A paused escrow fails fast ([`EscrowError::Paused`]).
+    ///
+    /// Rejections, reusing the builder's one-clock rule: a nonzero
+    /// `slots` together with a configured absolute lock
+    /// ([`Escrow::with_timelock`]) or relative lock
+    /// ([`Escrow::with_relative_timelock`]) is
+    /// [`EscrowError::InvalidTimelock`] — one clock per escrow, in
+    /// either order, exactly as the builders enforce it. The zero
+    /// sentinels stay order-independent no-ops: `0` is legal even
+    /// beside an absolute or relative lock, and it cancels the
+    /// slot lock (the builder's `0` means "no lock"), so the
+    /// parties can drop a slot lock they no longer want.
+    /// All checks run before any write, so a failed amendment
+    /// leaves the lock untouched.
+    ///
+    /// Scope: only `slot_timelock_slots` changes — `timelock`
+    /// and `relative_timelock_secs` are untouched, and `fund_slot`
+    /// (the lock's anchor) and amounts already released are never
+    /// restated. The slot gates read the lock live:
+    /// [`Escrow::slot_unlock_slot`] is `fund_slot + slots`
+    /// (saturating, along AV-116: a near-`u64::MAX` anchor plus a
+    /// long lock never wraps into an early unlock — the escrow
+    /// simply stays locked), so lengthening the window pushes a
+    /// payout out, shortening it pulls a payout in, and clearing
+    /// it unlocks immediately — while the unilateral exits
+    /// (`cancel`, `cancel_expired`) and the arbiter's `resolve`
+    /// stay ungated, exactly as before. On a tranched-funding
+    /// escrow (AV-111) the anchor is `0`, so the lock opens at
+    /// slot `slots` itself, along AV-116's documented semantics.
+    /// Orthogonal to [`Escrow::with_slot_timelock`]
+    /// (`Uninitialized`-only initial configuration), to AV-116's
+    /// slot-lock gate itself (this item is the post-funding
+    /// revision), and to AV-249/AV-250's absolute and relative
+    /// locks (different clocks, untouched here). Emits
+    /// `SlotTimelockAmended` on the event layer.
+    pub fn amend_slot_timelock(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        slots: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_relative_timelock`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // One clock per escrow, the builder's rule: a nonzero
+        // slot lock beside a nonzero absolute or relative lock is
+        // `InvalidTimelock`; the zero sentinels stay no-ops.
+        if slots != 0 && (self.timelock != 0 || self.relative_timelock_secs != 0) {
+            return Err(EscrowError::InvalidTimelock);
+        }
+        self.slot_timelock_slots = slots;
+        Ok(())
+    }
+
     /// The taker confirms receipt with a timestamp (AV-216): the
     /// timed twin of [`Escrow::confirm_delivery`] — same
     /// authority (taker-only), same state window (`Funded` or
@@ -46359,7 +46439,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(115), None); // AV-251: 114 is SlotTimelockAmended
     }
 
     #[test]
@@ -62592,7 +62672,12 @@ mod event_history_tests {
             Some(EscrowEventKind::RelativeTimelockAmended),
             "AV-250: appended after TimelockAmended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
+        assert_eq!(
+            EscrowEventKind::from_discriminant(114),
+            Some(EscrowEventKind::SlotTimelockAmended),
+            "AV-251: appended after RelativeTimelockAmended"
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(115), None); // AV-251: 114 is SlotTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -62788,9 +62873,10 @@ mod event_history_tests {
         // `MilestoneClaimDeadlineAmended` (AV-247), 111 is
         // `MaxExtensionAmended` (AV-248), 112 is
         // `TimelockAmended` (AV-249), 113 is
-        // `RelativeTimelockAmended` (AV-250) and 114 is the
+        // `RelativeTimelockAmended` (AV-250), 114 is
+        // `SlotTimelockAmended` (AV-251) and 115 is the
         // first still-unknown byte.
-        for bad in [114u8, 255] {
+        for bad in [115u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -76067,5 +76153,192 @@ mod relative_timelock_amend_tests {
             Err(EscrowError::Paused)
         );
         assert_eq!(paused.relative_timelock_secs(), LOCK_SECS);
+    }
+}
+
+#[cfg(test)]
+mod slot_timelock_amend_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const FUND_AT: u64 = EXPIRES_AT - 3_600;
+    const FUND_SLOT: u64 = 1_000;
+    const SLOT_LOCK: u64 = 100;
+    const UNLOCK_AT: u64 = 1_900_000_000;
+
+    fn locked() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slot_timelock(SLOT_LOCK)
+            .unwrap();
+        e.fund_with_slot(ALICE, FUND_AT, FUND_SLOT).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_slot_timelock_pushes_release_out() {
+        // Lengthening the window pushes a payout out: a release at
+        // the old unlock slot is refused once the lock moves.
+        let mut e = locked();
+        let early = StaticSlotClock::new(FUND_SLOT + SLOT_LOCK - 1);
+        assert_eq!(
+            e.release_slot_gated(ALICE, FUND_AT, 1_000_000, None, BOB, &early),
+            Err(EscrowError::TimelockNotReached)
+        );
+        e.amend_slot_timelock(ALICE, BOB, SLOT_LOCK + 100).unwrap();
+        assert_eq!(e.slot_timelock_slots(), SLOT_LOCK + 100);
+        assert_eq!(e.fund_slot(), FUND_SLOT, "the anchor never moves");
+        assert_eq!(e.slot_unlock_slot(), FUND_SLOT + SLOT_LOCK + 100);
+        let at_old = StaticSlotClock::new(FUND_SLOT + SLOT_LOCK);
+        assert_eq!(
+            e.release_slot_gated(ALICE, FUND_AT, 1_000_000, None, BOB, &at_old),
+            Err(EscrowError::TimelockNotReached)
+        );
+        let at_new = StaticSlotClock::new(FUND_SLOT + SLOT_LOCK + 100);
+        e.release_slot_gated(ALICE, FUND_AT, 1_000_000, None, BOB, &at_new)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_slot_timelock_pulls_release_in() {
+        // Shortening the window pulls a payout in: a release at the
+        // new unlock slot settles even though the old window
+        // would still bind.
+        let mut e = locked();
+        e.amend_slot_timelock(ALICE, BOB, 50).unwrap();
+        let at = StaticSlotClock::new(FUND_SLOT + 50);
+        e.release_slot_gated(ALICE, FUND_AT, 1_000_000, None, BOB, &at)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_slot_timelock_to_zero_unlocks_immediately() {
+        // Zero cancels the lock (the builder's "no lock"
+        // sentinel): a release at the funding slot settles at once.
+        let mut e = locked();
+        e.amend_slot_timelock(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.slot_timelock_slots(), 0);
+        assert!(e.is_slot_unlock_eligible(FUND_SLOT));
+        let at = StaticSlotClock::new(FUND_SLOT);
+        e.release_slot_gated(ALICE, FUND_AT, 1_000_000, None, BOB, &at)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_slot_timelock_gives_an_unconfigured_escrow_a_lock() {
+        // An escrow with no lock gains one on first amendment.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund_with_slot(ALICE, FUND_AT, FUND_SLOT).unwrap();
+        assert_eq!(e.slot_timelock_slots(), 0);
+        e.amend_slot_timelock(ALICE, BOB, SLOT_LOCK).unwrap();
+        let early = StaticSlotClock::new(FUND_SLOT + SLOT_LOCK - 1);
+        assert_eq!(
+            e.release_slot_gated(ALICE, FUND_AT, 1_000_000, None, BOB, &early),
+            Err(EscrowError::TimelockNotReached)
+        );
+        let at = StaticSlotClock::new(FUND_SLOT + SLOT_LOCK);
+        e.release_slot_gated(ALICE, FUND_AT, 1_000_000, None, BOB, &at)
+            .unwrap();
+    }
+
+    #[test]
+    fn amend_slot_timelock_leaves_released_amounts_untouched() {
+        // A payout already made keeps its amount; the amendment
+        // rewrites the window only, and the remainder settles at
+        // the new unlock slot.
+        let mut e = locked();
+        let at_old = StaticSlotClock::new(FUND_SLOT + SLOT_LOCK);
+        e.release_slot_gated(ALICE, FUND_AT, 400_000, None, BOB, &at_old)
+            .unwrap();
+        assert_eq!(e.released_amount(), 400_000);
+        e.amend_slot_timelock(ALICE, BOB, SLOT_LOCK + 100).unwrap();
+        assert_eq!(e.released_amount(), 400_000);
+        let at_new = StaticSlotClock::new(FUND_SLOT + SLOT_LOCK + 100);
+        e.release_slot_gated(ALICE, FUND_AT, 600_000, None, BOB, &at_new)
+            .unwrap();
+        assert_eq!(e.released_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn amend_slot_timelock_refuses_a_second_clock() {
+        // One clock per escrow, the builder's rule: a nonzero
+        // slot lock beside an absolute lock is InvalidTimelock,
+        // and the absolute lock keeps binding afterwards.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            e.amend_slot_timelock(ALICE, BOB, SLOT_LOCK),
+            Err(EscrowError::InvalidTimelock)
+        );
+        assert_eq!(e.unlock_at(), UNLOCK_AT);
+        assert_eq!(e.slot_timelock_slots(), 0);
+        // The zero sentinel stays a no-op beside an absolute lock.
+        e.amend_slot_timelock(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.slot_timelock_slots(), 0);
+        assert_eq!(
+            e.release(ALICE, UNLOCK_AT - 1, 1_000_000, None, BOB),
+            Err(EscrowError::TimelockNotReached)
+        );
+        e.release(ALICE, UNLOCK_AT, 1_000_000, None, BOB)
+            .unwrap();
+        // A relative lock likewise refuses a second clock.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_relative_timelock(3_600)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            e.amend_slot_timelock(ALICE, BOB, SLOT_LOCK),
+            Err(EscrowError::InvalidTimelock)
+        );
+        assert_eq!(e.unlock_at(), 0);
+        assert_eq!(e.relative_timelock_secs(), 3_600);
+    }
+
+    #[test]
+    fn amend_slot_timelock_rejects_state_authority_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slot_timelock(SLOT_LOCK)
+            .unwrap();
+        assert_eq!(
+            bare.amend_slot_timelock(ALICE, BOB, SLOT_LOCK + 100),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.slot_timelock_slots(), SLOT_LOCK);
+        // Dual signature: one party alone cannot move the other's lock.
+        let mut e = locked();
+        assert_eq!(
+            e.amend_slot_timelock(ALICE, ALICE, SLOT_LOCK + 100),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_slot_timelock([0xCC; 32], BOB, SLOT_LOCK + 100),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.slot_timelock_slots(), SLOT_LOCK);
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_slot_timelock(SLOT_LOCK)
+            .unwrap();
+        paused.fund_with_slot(ALICE, FUND_AT, FUND_SLOT).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_slot_timelock(ALICE, BOB, SLOT_LOCK + 100),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.slot_timelock_slots(), SLOT_LOCK);
     }
 }
