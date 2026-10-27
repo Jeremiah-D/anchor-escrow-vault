@@ -270,6 +270,10 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // funds — the next extension is judged against the live
         // cap; already-made extensions keep deadline and count.
         | EscrowEventKind::MaxExtensionAmended
+        // AV-249: a revised absolute timelock moves no
+        // funds — the payout gates re-read the live lock;
+        // already-released amounts are never restated.
+        | EscrowEventKind::TimelockAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -982,6 +986,10 @@ mod fee_history_tests {
         // funds — the next extension is judged against the live
         // cap; already-made extensions keep deadline and count.
         | EscrowEventKind::MaxExtensionAmended
+        // AV-249: a revised absolute timelock moves no
+        // funds — the payout gates re-read the live lock;
+        // already-released amounts are never restated.
+        | EscrowEventKind::TimelockAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

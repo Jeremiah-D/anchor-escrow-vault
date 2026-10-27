@@ -228,6 +228,10 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // funds — the next extension is judged against the live
         // cap; already-made extensions keep deadline and count.
         | EscrowEventKind::MaxExtensionAmended
+        // AV-249: a revised absolute timelock moves no
+        // funds — the payout gates re-read the live lock;
+        // already-released amounts are never restated.
+        | EscrowEventKind::TimelockAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -936,6 +940,10 @@ mod event_sourcing_tests {
         // funds — the next extension is judged against the live
         // cap; already-made extensions keep deadline and count.
         | EscrowEventKind::MaxExtensionAmended
+        // AV-249: a revised absolute timelock moves no
+        // funds — the payout gates re-read the live lock;
+        // already-released amounts are never restated.
+        | EscrowEventKind::TimelockAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
