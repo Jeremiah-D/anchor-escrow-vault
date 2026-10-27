@@ -174,6 +174,14 @@
 //!   against the new deadline (`confirm_delivery_at` reads the
 //!   live field; a delivery already confirmed keeps its first-won
 //!   stamp). A failed amendment emits nothing.
+//! - `amend_late_delivery_penalty_bps` emits
+//!   [`EscrowEventKind::LateDeliveryPenaltyAmended`] on every
+//!   successful amendment (AV-245) — `from == to ==` the current
+//!   state, all amounts zero; the amended rate is read from the
+//!   vault, and a late-stamped but not-yet-released delivery
+//!   reprices at the new rate, while amounts already released and
+//!   penalties already banked are never restated. A failed
+//!   amendment emits nothing.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -374,6 +382,7 @@
 //! | ArbitrationDeadlineAmended (AV-242) | 0 | 0 | 0 | 0 — amending moves no funds; later disputes measure their default-judgment window from the amended deadline |
 //! | ClaimCooldownAmended (AV-243) | 0 | 0 | 0 | 0 — amending moves no funds; the next claim's eligibility is recomputed from the amended cooldown |
 //! | DeliveryDeadlineAmended (AV-244) | 0 | 0 | 0 | 0 — amending moves no funds; confirmations after the amendment are judged against the new deadline, while an already-confirmed delivery keeps its first-won stamp |
+//! | LateDeliveryPenaltyAmended (AV-245) | 0 | 0 | 0 | 0 — amending moves no funds; a late-stamped but unreleased delivery reprices at the new rate, while already-released amounts and banked penalties are never restated |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1420,6 +1429,19 @@ pub enum EscrowEventKind {
     /// lateness). The amended deadline is read from the vault,
     /// so the event needs no extra field.
     DeliveryDeadlineAmended,
+    /// AV-245: the late-delivery penalty rate was revised by
+    /// dual-signed governance
+    /// ([`Escrow::amend_late_delivery_penalty_bps`](crate::Escrow::amend_late_delivery_penalty_bps)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::GracePeriodAmended`]); all amounts are
+    /// zero — amending moves no funds (a late-stamped but
+    /// not-yet-released delivery reprices at the new rate, since
+    /// `release` / `release_milestone` price from the live field;
+    /// amounts already released and penalties already banked are
+    /// never restated). The amended rate is read from the vault,
+    /// so the event needs no extra field.
+    LateDeliveryPenaltyAmended,
 }
 
 impl EscrowEventKind {
@@ -1719,6 +1741,10 @@ impl EscrowEventKind {
             // discriminants 0–106 stay stable for already-serialized
             // histories.
             107 => Self::DeliveryDeadlineAmended,
+            // AV-245: appended after DeliveryDeadlineAmended so
+            // discriminants 0–107 stay stable for already-serialized
+            // histories.
+            108 => Self::LateDeliveryPenaltyAmended,
             _ => return None,
         })
     }
@@ -1902,6 +1928,7 @@ impl EscrowEventKind {
             Self::ArbitrationDeadlineAmended => "arbitration_deadline_amended",
             Self::ClaimCooldownAmended => "claim_cooldown_amended",
             Self::DeliveryDeadlineAmended => "delivery_deadline_amended",
+            Self::LateDeliveryPenaltyAmended => "late_delivery_penalty_amended",
         }
     }
 
@@ -2089,6 +2116,7 @@ impl EscrowEventKind {
             "arbitration_deadline_amended" => Self::ArbitrationDeadlineAmended,
             "claim_cooldown_amended" => Self::ClaimCooldownAmended,
             "delivery_deadline_amended" => Self::DeliveryDeadlineAmended,
+            "late_delivery_penalty_amended" => Self::LateDeliveryPenaltyAmended,
             _ => return None,
         })
     }
@@ -6954,6 +6982,42 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the late-delivery penalty rate after funding (mirrors
+    /// [`Escrow::amend_late_delivery_penalty_bps`]). Emits
+    /// `LateDeliveryPenaltyAmended` (`from == to ==` the current
+    /// state — the rate, not the lifecycle state, is what changed;
+    /// all amounts zero, since amending moves no funds — a
+    /// late-stamped but not-yet-released delivery reprices at the
+    /// new rate, while amounts already released and penalties
+    /// already banked are never restated). The amended rate is read
+    /// from the vault, so the event needs no extra field. A failed
+    /// amendment emits nothing: the core call returns before any
+    /// event is pushed.
+    pub fn amend_late_delivery_penalty_bps(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        bps: u16,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner
+            .amend_late_delivery_penalty_bps(initializer, taker, bps)?;
+        self.push_event(
+            EscrowEventKind::LateDeliveryPenaltyAmended,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// The live milestone tranche table as a fixed
     /// `MAX_MILESTONES` array (entries past the plan's count are
     /// zero): the shape the `MilestonesReallocated` event carries
@@ -11578,7 +11642,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -11681,7 +11745,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12218,7 +12282,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12233,7 +12297,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12245,7 +12309,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12257,7 +12321,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12269,7 +12333,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12284,7 +12348,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12299,7 +12363,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12311,7 +12375,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12323,7 +12387,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12335,7 +12399,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12347,7 +12411,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12359,7 +12423,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12371,7 +12435,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12387,7 +12451,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12402,7 +12466,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12417,7 +12481,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12432,7 +12496,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12447,7 +12511,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_reallocated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12463,7 +12527,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_claim_expired"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12479,7 +12543,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_tranche_appended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12495,7 +12559,7 @@ mod event_tests {
             EscrowEventKind::from_name("claimant_roster_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12510,7 +12574,7 @@ mod event_tests {
             EscrowEventKind::from_name("delivery_confirmed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]
@@ -12542,7 +12606,7 @@ mod event_tests {
             EscrowEventKind::from_name("governance_cancelled"),
             Some(cancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(108), None); // AV-244: 107 is DeliveryDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(109), None); // AV-245: 108 is LateDeliveryPenaltyAmended
     }
 
     #[test]

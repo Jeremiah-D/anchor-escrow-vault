@@ -254,6 +254,10 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // the new deadline; an already-confirmed delivery keeps
         // its first-won stamp.
         | EscrowEventKind::DeliveryDeadlineAmended
+        // AV-245: a revised late-delivery penalty rate moves no
+        // funds — a late-stamped but unreleased delivery reprices
+        // at the new rate; already-released amounts are untouched.
+        | EscrowEventKind::LateDeliveryPenaltyAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -950,6 +954,10 @@ mod fee_history_tests {
         // the new deadline; an already-confirmed delivery keeps
         // its first-won stamp.
         | EscrowEventKind::DeliveryDeadlineAmended
+        // AV-245: a revised late-delivery penalty rate moves no
+        // funds — a late-stamped but unreleased delivery reprices
+        // at the new rate; already-released amounts are untouched.
+        | EscrowEventKind::LateDeliveryPenaltyAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
