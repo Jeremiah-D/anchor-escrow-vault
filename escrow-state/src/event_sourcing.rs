@@ -203,6 +203,10 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // the new deadline gates only the later disputes'
         // default judgments.
         | EscrowEventKind::ArbitrationDeadlineAmended
+        // AV-243: a revised claim cooldown moves no funds —
+        // the next claim's eligibility is recomputed from the
+        // amended cooldown.
+        | EscrowEventKind::ClaimCooldownAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -886,6 +890,10 @@ mod event_sourcing_tests {
         // the new deadline gates only the later disputes'
         // default judgments.
         | EscrowEventKind::ArbitrationDeadlineAmended
+        // AV-243: a revised claim cooldown moves no funds —
+        // the next claim's eligibility is recomputed from the
+        // amended cooldown.
+        | EscrowEventKind::ClaimCooldownAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

@@ -159,6 +159,13 @@
 //!   the vault, and only disputes escalated after the amendment
 //!   measure their default-judgment window from the new value. A
 //!   failed amendment emits nothing.
+//! - `amend_claim_cooldown` emits
+//!   [`EscrowEventKind::ClaimCooldownAmended`] on every
+//!   successful amendment (AV-243) — `from == to ==` the current
+//!   state, all amounts zero; the amended cooldown is read from
+//!   the vault, and the next claim's eligibility is recomputed
+//!   from the new value (`last_claim_slot` is untouched). A
+//!   failed amendment emits nothing.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -357,6 +364,7 @@
 //! | GracePeriodAmended (AV-240) | 0 | 0 | 0 | 0 — amending moves no funds; later expiry determinations follow the amended grace |
 //! | EvidenceDeadlineAmended (AV-241) | 0 | 0 | 0 | 0 — amending moves no funds; later disputes measure their disclosure window from the amended deadline |
 //! | ArbitrationDeadlineAmended (AV-242) | 0 | 0 | 0 | 0 — amending moves no funds; later disputes measure their default-judgment window from the amended deadline |
+//! | ClaimCooldownAmended (AV-243) | 0 | 0 | 0 | 0 — amending moves no funds; the next claim's eligibility is recomputed from the amended cooldown |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1377,6 +1385,18 @@ pub enum EscrowEventKind {
     /// `Funded`). The amended deadline is read from the vault,
     /// so the event needs no extra field.
     ArbitrationDeadlineAmended,
+    /// AV-243: the per-taker claim cooldown was revised by
+    /// dual-signed governance
+    /// ([`Escrow::amend_claim_cooldown`](crate::Escrow::amend_claim_cooldown)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::GracePeriodAmended`]); all amounts are
+    /// zero — amending moves no funds (the next claim's eligibility
+    /// is recomputed live from the new cooldown, since
+    /// `last_claim_slot` is untouched and the eligibility predicate
+    /// adds the live field). The amended cooldown is read from the
+    /// vault, so the event needs no extra field.
+    ClaimCooldownAmended,
 }
 
 impl EscrowEventKind {
@@ -1668,6 +1688,10 @@ impl EscrowEventKind {
             // discriminants 0–104 stay stable for already-serialized
             // histories.
             105 => Self::ArbitrationDeadlineAmended,
+            // AV-243: appended after ArbitrationDeadlineAmended so
+            // discriminants 0–105 stay stable for already-serialized
+            // histories.
+            106 => Self::ClaimCooldownAmended,
             _ => return None,
         })
     }
@@ -1849,6 +1873,7 @@ impl EscrowEventKind {
             Self::GracePeriodAmended => "grace_period_amended",
             Self::EvidenceDeadlineAmended => "evidence_deadline_amended",
             Self::ArbitrationDeadlineAmended => "arbitration_deadline_amended",
+            Self::ClaimCooldownAmended => "claim_cooldown_amended",
         }
     }
 
@@ -2034,6 +2059,7 @@ impl EscrowEventKind {
             "grace_period_amended" => Self::GracePeriodAmended,
             "evidence_deadline_amended" => Self::EvidenceDeadlineAmended,
             "arbitration_deadline_amended" => Self::ArbitrationDeadlineAmended,
+            "claim_cooldown_amended" => Self::ClaimCooldownAmended,
             _ => return None,
         })
     }
@@ -6829,6 +6855,41 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the per-taker claim cooldown after funding (mirrors
+    /// [`Escrow::amend_claim_cooldown`]). Emits
+    /// `ClaimCooldownAmended` (`from == to ==` the current state —
+    /// the cooldown, not the lifecycle state, is what changed; all
+    /// amounts zero, since amending moves no funds — the next
+    /// claim's eligibility is recomputed from the new cooldown,
+    /// since `last_claim_slot` is untouched). The amended cooldown
+    /// is read from the vault, so the event needs no extra field.
+    /// A failed amendment emits nothing: the core call returns
+    /// before any event is pushed.
+    pub fn amend_claim_cooldown(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        slots: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner
+            .amend_claim_cooldown(initializer, taker, slots)?;
+        self.push_event(
+            EscrowEventKind::ClaimCooldownAmended,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// The live milestone tranche table as a fixed
     /// `MAX_MILESTONES` array (entries past the plan's count are
     /// zero): the shape the `MilestonesReallocated` event carries
@@ -11453,7 +11514,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -11556,7 +11617,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12093,7 +12154,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12108,7 +12169,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12120,7 +12181,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12132,7 +12193,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12144,7 +12205,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12159,7 +12220,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12174,7 +12235,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12186,7 +12247,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12198,7 +12259,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12210,7 +12271,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12222,7 +12283,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12234,7 +12295,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12246,7 +12307,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12262,7 +12323,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12277,7 +12338,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12292,7 +12353,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12307,7 +12368,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12322,7 +12383,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_reallocated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12338,7 +12399,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_claim_expired"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12354,7 +12415,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_tranche_appended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12370,7 +12431,7 @@ mod event_tests {
             EscrowEventKind::from_name("claimant_roster_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12385,7 +12446,7 @@ mod event_tests {
             EscrowEventKind::from_name("delivery_confirmed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
@@ -12417,7 +12478,7 @@ mod event_tests {
             EscrowEventKind::from_name("governance_cancelled"),
             Some(cancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(107), None); // AV-243: 106 is ClaimCooldownAmended
     }
 
     #[test]
