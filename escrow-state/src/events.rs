@@ -196,6 +196,13 @@
 //!   the vault, and the claim gate re-reads it live, while a
 //!   tranche already claimed or skipped keeps its settlement. A
 //!   failed amendment emits nothing.
+//! - `amend_max_extension_secs` emits
+//!   [`EscrowEventKind::MaxExtensionAmended`] on every
+//!   successful amendment (AV-248) — `from == to ==` the current
+//!   state, all amounts zero; the amended cap is read from the
+//!   vault, and the next extension is judged against the live cap,
+//!   while extensions already made keep their deadline and count.
+//!   A failed amendment emits nothing.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -399,6 +406,7 @@
 //! | LateDeliveryPenaltyAmended (AV-245) | 0 | 0 | 0 | 0 — amending moves no funds; a late-stamped but unreleased delivery reprices at the new rate, while already-released amounts and banked penalties are never restated |
 //! | ReleaseCoolingAmended (AV-246) | 0 | 0 | 0 | 0 — amending moves no funds; a live announced intent is re-measured against the new window, while a vetoed intent stays vetoed |
 //! | MilestoneClaimDeadlineAmended (AV-247) | 0 | 0 | 0 | 0 — amending moves no funds; the claim gate re-reads the deadline live, while already-claimed or skipped tranches keep their settlements |
+//! | MaxExtensionAmended (AV-248) | 0 | 0 | 0 | 0 — amending moves no funds; the next extension is judged against the live cap, while already-made extensions keep their deadline and count |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1485,6 +1493,20 @@ pub enum EscrowEventKind {
     /// deadline with `0` removes the gate). The amended deadline
     /// is read from the vault, so the event needs no extra field.
     MilestoneClaimDeadlineAmended,
+    /// AV-248: the per-extension expiry-increase cap was revised
+    /// by dual-signed governance
+    /// ([`Escrow::amend_max_extension_secs`](crate::Escrow::amend_max_extension_secs)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::GracePeriodAmended`]); all amounts are
+    /// zero — amending moves no funds (the next extension is
+    /// judged against the live cap, so tightening rejects
+    /// increments that fit the old bound, loosening admits
+    /// increments the old bound refused, and closing with `0`
+    /// refuses every increment; extensions already made keep
+    /// their deadline moves and their count). The amended cap is
+    /// read from the vault, so the event needs no extra field.
+    MaxExtensionAmended,
 }
 
 impl EscrowEventKind {
@@ -1796,6 +1818,10 @@ impl EscrowEventKind {
             // discriminants 0–109 stay stable for already-serialized
             // histories.
             110 => Self::MilestoneClaimDeadlineAmended,
+            // AV-248: appended after MilestoneClaimDeadlineAmended so
+            // discriminants 0–110 stay stable for already-serialized
+            // histories.
+            111 => Self::MaxExtensionAmended,
             _ => return None,
         })
     }
@@ -1982,6 +2008,7 @@ impl EscrowEventKind {
             Self::LateDeliveryPenaltyAmended => "late_delivery_penalty_amended",
             Self::ReleaseCoolingAmended => "release_cooling_amended",
             Self::MilestoneClaimDeadlineAmended => "milestone_claim_deadline_amended",
+            Self::MaxExtensionAmended => "max_extension_amended",
         }
     }
 
@@ -2172,6 +2199,7 @@ impl EscrowEventKind {
             "late_delivery_penalty_amended" => Self::LateDeliveryPenaltyAmended,
             "release_cooling_amended" => Self::ReleaseCoolingAmended,
             "milestone_claim_deadline_amended" => Self::MilestoneClaimDeadlineAmended,
+            "max_extension_amended" => Self::MaxExtensionAmended,
             _ => return None,
         })
     }
@@ -7144,6 +7172,41 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the per-extension expiry-increase cap after funding
+    /// (mirrors [`Escrow::amend_max_extension_secs`]). Emits
+    /// `MaxExtensionAmended` (`from == to ==` the current
+    /// state — the cap, not the lifecycle state, is what
+    /// changed; all amounts zero, since amending moves no funds —
+    /// the next extension is judged against the live cap, while
+    /// extensions already made keep their deadline and count).
+    /// The amended cap is read from the vault, so the event needs
+    /// no extra field. A failed amendment emits nothing: the core
+    /// call returns before any event is pushed.
+    pub fn amend_max_extension_secs(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        max_extension_secs: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner
+            .amend_max_extension_secs(initializer, taker, max_extension_secs)?;
+        self.push_event(
+            EscrowEventKind::MaxExtensionAmended,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// The live milestone tranche table as a fixed
     /// `MAX_MILESTONES` array (entries past the plan's count are
     /// zero): the shape the `MilestonesReallocated` event carries
@@ -11768,7 +11831,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -11871,7 +11934,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12408,7 +12471,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12423,7 +12486,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12435,7 +12498,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12447,7 +12510,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12459,7 +12522,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12474,7 +12537,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12489,7 +12552,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12501,7 +12564,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12513,7 +12576,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12525,7 +12588,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12537,7 +12600,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12549,7 +12612,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12561,7 +12624,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12577,7 +12640,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12592,7 +12655,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12607,7 +12670,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12622,7 +12685,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12637,7 +12700,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_reallocated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12653,7 +12716,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_claim_expired"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12669,7 +12732,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_tranche_appended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12685,7 +12748,7 @@ mod event_tests {
             EscrowEventKind::from_name("claimant_roster_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12700,7 +12763,7 @@ mod event_tests {
             EscrowEventKind::from_name("delivery_confirmed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -12732,7 +12795,7 @@ mod event_tests {
             EscrowEventKind::from_name("governance_cancelled"),
             Some(cancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]

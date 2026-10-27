@@ -266,6 +266,10 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // funds — the claim gate re-reads the deadline live;
         // already-claimed or skipped tranches keep settlements.
         | EscrowEventKind::MilestoneClaimDeadlineAmended
+        // AV-248: a revised per-extension cap moves no
+        // funds — the next extension is judged against the live
+        // cap; already-made extensions keep deadline and count.
+        | EscrowEventKind::MaxExtensionAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -974,6 +978,10 @@ mod fee_history_tests {
         // funds — the claim gate re-reads the deadline live;
         // already-claimed or skipped tranches keep settlements.
         | EscrowEventKind::MilestoneClaimDeadlineAmended
+        // AV-248: a revised per-extension cap moves no
+        // funds — the next extension is judged against the live
+        // cap; already-made extensions keep deadline and count.
+        | EscrowEventKind::MaxExtensionAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

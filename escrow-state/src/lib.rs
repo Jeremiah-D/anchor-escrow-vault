@@ -12861,6 +12861,72 @@ let fee = self.charge_protocol_fee(net_amount)?;
         Ok(())
     }
 
+    /// Revise the per-extension expiry-increase cap after funding
+    /// (AV-248): both parties may renegotiate the bound
+    /// [`Escrow::extend_expiry`] may move the deadline in a single
+    /// call, without redeploying or refunding the escrow.
+    ///
+    /// Why: the cap set before funding assumes an extension pace
+    /// the parties may no longer face — a slipped schedule can
+    /// make the original bound impossibly tight, or a fast-moving
+    /// deal can make it meaninglessly loose. A dual-signed
+    /// revision lets the parties retune the bound without
+    /// touching the deadline itself or the count of extensions
+    /// already made.
+    ///
+    /// Governance: dual signature — both the initializer and the
+    /// taker must authorize, paralleling
+    /// [`Escrow::amend_release_cooling`]. `Funded`-only: the
+    /// builder [`Escrow::with_max_extension_secs`] owns the
+    /// initial set. A paused escrow fails fast
+    /// ([`EscrowError::Paused`]).
+    ///
+    /// No value rejection: any `u64` is a legal cap. `0` closes
+    /// future extensions — [`Escrow::extend_expiry`] rejects on a
+    /// zero cap ([`EscrowError::InvalidExpiryExtension`]), the
+    /// same semantics as an escrow that never opted in — so
+    /// unlike the builder, which rejects a zero bound, this item
+    /// can switch extension off. A positive value is the new
+    /// per-call bound from the next extension on.
+    ///
+    /// Scope: only `max_extension_secs` changes — `expires_at`
+    /// and `extension_count` are untouched, so extensions already
+    /// made keep their deadline moves and their count, and the
+    /// next extension is judged against the live cap:
+    /// [`Escrow::extend_expiry`] reads the field at call time, so
+    /// tightening the cap rejects increments that fit the old
+    /// bound, loosening it admits increments the old bound
+    /// refused, and closing it refuses every increment. Orthogonal
+    /// to [`Escrow::with_max_extension_secs`]
+    /// (`Uninitialized`-only initial configuration), to AV-59's
+    /// extension mechanism itself (this item is the post-funding
+    /// revision of its bound), and to AV-240's grace-period
+    /// amendment (a different window). Emits
+    /// `MaxExtensionAmended` on the event layer.
+    pub fn amend_max_extension_secs(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        max_extension_secs: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_release_cooling`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // No value rejection: any u64 is a legal cap, and 0
+        // closes future extensions (the `extend_expiry` zero-cap
+        // rejection); a positive value is the new per-call bound.
+        self.max_extension_secs = max_extension_secs;
+        Ok(())
+    }
+
     /// The taker confirms receipt with a timestamp (AV-216): the
     /// timed twin of [`Escrow::confirm_delivery`] — same
     /// authority (taker-only), same state window (`Funded` or
@@ -46145,7 +46211,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
     }
 
     #[test]
@@ -62363,7 +62429,12 @@ mod event_history_tests {
             Some(EscrowEventKind::MilestoneClaimDeadlineAmended),
             "AV-247: appended after ReleaseCoolingAmended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(111), None); // AV-247: 110 is MilestoneClaimDeadlineAmended
+        assert_eq!(
+            EscrowEventKind::from_discriminant(111),
+            Some(EscrowEventKind::MaxExtensionAmended),
+            "AV-248: appended after MilestoneClaimDeadlineAmended"
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(112), None); // AV-248: 111 is MaxExtensionAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -62556,9 +62627,10 @@ mod event_history_tests {
         // `DeliveryDeadlineAmended` (AV-244), 108 is
         // `LateDeliveryPenaltyAmended` (AV-245), 109 is
         // `ReleaseCoolingAmended` (AV-246), 110 is
-        // `MilestoneClaimDeadlineAmended` (AV-247) and 111 is the
+        // `MilestoneClaimDeadlineAmended` (AV-247), 111 is
+        // `MaxExtensionAmended` (AV-248) and 112 is the
         // first still-unknown byte.
-        for bad in [111u8, 255] {
+        for bad in [112u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -75351,5 +75423,141 @@ mod milestone_claim_deadline_amend_tests {
             Err(EscrowError::Paused)
         );
         assert_eq!(paused.milestone_claim_deadline_at(0), Some(DEADLINE));
+    }
+}
+
+#[cfg(test)]
+mod max_extension_amend_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+    const CAP: u64 = 86_400; // one day per extension
+
+    fn capped_with(cap: u64) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_max_extension_secs(cap)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    fn capped() -> Escrow {
+        capped_with(CAP)
+    }
+
+    #[test]
+    fn amend_max_extension_secs_tightens_the_live_cap() {
+        // Tightening to 3_600 rejects an increment that fit the
+        // old one-day cap, while an increment inside the new cap
+        // still moves the deadline.
+        let mut e = capped();
+        e.amend_max_extension_secs(ALICE, BOB, 3_600).unwrap();
+        assert_eq!(e.max_extension_secs(), 3_600);
+        assert_eq!(
+            e.extend_expiry(ALICE, EXPIRES_AT + 3_601, NOW),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        assert_eq!(e.expires_at(), EXPIRES_AT);
+        assert_eq!(e.extension_count(), 0);
+        e.extend_expiry(ALICE, EXPIRES_AT + 3_600, NOW).unwrap();
+        assert_eq!(e.expires_at(), EXPIRES_AT + 3_600);
+        assert_eq!(e.extension_count(), 1);
+    }
+
+    #[test]
+    fn amend_max_extension_secs_loosens_the_live_cap() {
+        // Loosening admits an increment the old cap refused.
+        let mut e = capped_with(3_600);
+        assert_eq!(
+            e.extend_expiry(ALICE, EXPIRES_AT + 3_601, NOW),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        e.amend_max_extension_secs(ALICE, BOB, CAP).unwrap();
+        e.extend_expiry(ALICE, EXPIRES_AT + CAP, NOW).unwrap();
+        assert_eq!(e.expires_at(), EXPIRES_AT + CAP);
+        assert_eq!(e.extension_count(), 1);
+    }
+
+    #[test]
+    fn amend_max_extension_secs_to_zero_closes_future_extensions() {
+        // Zero closes extension: every increment is refused, and
+        // the deadline and count stand exactly where they were.
+        let mut e = capped();
+        e.amend_max_extension_secs(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.max_extension_secs(), 0);
+        assert_eq!(
+            e.extend_expiry(ALICE, EXPIRES_AT + 1, NOW),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        assert_eq!(e.expires_at(), EXPIRES_AT);
+        assert_eq!(e.extension_count(), 0);
+    }
+
+    #[test]
+    fn amend_max_extension_secs_gives_an_unconfigured_escrow_a_cap() {
+        // An escrow that never opted in gains a cap on first
+        // amendment, exactly like AV-246's cooling window.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.max_extension_secs(), 0);
+        e.amend_max_extension_secs(ALICE, BOB, 3_600).unwrap();
+        e.extend_expiry(ALICE, EXPIRES_AT + 3_600, NOW).unwrap();
+        assert_eq!(e.expires_at(), EXPIRES_AT + 3_600);
+        assert_eq!(e.extension_count(), 1);
+    }
+
+    #[test]
+    fn amend_max_extension_secs_leaves_expiry_and_count_untouched() {
+        // An extension already made keeps its deadline move and
+        // its count; the amendment rewrites the cap only.
+        let mut e = capped();
+        e.extend_expiry(ALICE, EXPIRES_AT + 3_600, NOW).unwrap();
+        assert_eq!(e.extension_count(), 1);
+        e.amend_max_extension_secs(ALICE, BOB, 3_600).unwrap();
+        assert_eq!(e.expires_at(), EXPIRES_AT + 3_600);
+        assert_eq!(e.extension_count(), 1);
+    }
+
+    #[test]
+    fn amend_max_extension_secs_rejects_state_authority_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_max_extension_secs(CAP)
+            .unwrap();
+        assert_eq!(
+            bare.amend_max_extension_secs(ALICE, BOB, 3_600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.max_extension_secs(), CAP);
+        // Dual signature: one party alone cannot move the other's cap.
+        let mut e = capped();
+        assert_eq!(
+            e.amend_max_extension_secs(ALICE, ALICE, 3_600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_max_extension_secs([0xCC; 32], BOB, 3_600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.max_extension_secs(), CAP);
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_max_extension_secs(CAP)
+            .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_max_extension_secs(ALICE, BOB, 3_600),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.max_extension_secs(), CAP);
     }
 }
