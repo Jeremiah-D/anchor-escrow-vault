@@ -20801,6 +20801,87 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Revise the pre-agreed arbitration default judgment's deadline
+    /// after funding (AV-242): both parties may renegotiate how long
+    /// the arbiter gets — measured from `disputed_at` — before either
+    /// party may trigger the fallback split, without redeploying or
+    /// refunding the escrow.
+    ///
+    /// Why: the window set before funding assumes a dispute pace the
+    /// parties may no longer face — a complex claim can need a longer
+    /// ruling window than the optimistic one negotiated at setup, or
+    /// a fast-moving dispute can make a long window an invitation to
+    /// stall. A dual-signed revision lets the parties retune the bar
+    /// to the dispute climate they actually face.
+    ///
+    /// Governance: dual signature — both the initializer and the
+    /// taker must authorize, paralleling
+    /// [`Escrow::amend_evidence_deadline`]. `Funded`-only: the builder
+    /// [`Escrow::with_arbitration_deadline`] owns the initial set. A
+    /// paused escrow fails fast ([`EscrowError::Paused`]).
+    ///
+    /// Rejections, reusing the builder's checks in the builder's
+    /// order: no default judgment configured is
+    /// [`EscrowError::DefaultJudgmentNotDue`] — there is nothing to
+    /// revise; a zero `deadline_secs` is the same error (code 129 —
+    /// the builder's rejection: a judgment due immediately would fire
+    /// on the very first trigger call, before the arbiter had any
+    /// chance to rule). All checks run before any write, so a failed
+    /// amendment leaves the configured judgment untouched.
+    ///
+    /// Scope: only `deadline_secs` changes — `default_taker_amount`
+    /// and `default_confirmed` are untouched, and the amendment's own
+    /// dual signature is the bilateral agreement for the revised
+    /// terms, so it does not depend on the pre-existing confirmation:
+    /// a confirmed judgment stays confirmed, and an unconfirmed one
+    /// still needs the taker's confirmation before it can trigger.
+    /// The deadline is read live: [`Escrow::trigger_default_judgment`]
+    /// reads `default_judgment.deadline_secs` at call time. An
+    /// in-progress dispute can never be amended, because
+    /// [`Escrow::escalate`] moves the state `Funded` -> `Disputed` —
+    /// a distinct [`EscrowState`] — and this method is `Funded`-only,
+    /// so the amendment is rejected with `InvalidStateTransition` and
+    /// the live dispute's trigger window is untouched. Conversely a
+    /// dispute escalated after the amendment measures its window from
+    /// the new value, because `escalate` stamps a fresh `disputed_at`
+    /// and the trigger adds the live field. There is no stamped
+    /// per-dispute deadline field to preserve, and none is added.
+    /// Orthogonal to [`Escrow::with_arbitration_deadline`]
+    /// (`Uninitialized`-only initial configuration) and to AV-241's
+    /// [`Escrow::amend_evidence_deadline`] (a different deadline, a
+    /// different governance consequence). Emits
+    /// `ArbitrationDeadlineAmended` on the event layer.
+    pub fn amend_arbitration_deadline(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        deadline_secs: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_evidence_deadline`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Builder-order value checks, all before any write: the
+        // judgment must exist first (mirroring `with_arbitration_deadline`
+        // owning the initial set), then the zero rejection.
+        let judgment = self
+            .default_judgment
+            .as_mut()
+            .ok_or(EscrowError::DefaultJudgmentNotDue)?;
+        if deadline_secs == 0 {
+            return Err(EscrowError::DefaultJudgmentNotDue);
+        }
+        judgment.deadline_secs = deadline_secs;
+        Ok(())
+    }
+
     /// The dispute-evidence disclosure deadline in seconds (AV-68), or
     /// `0` when no deadline was configured (backward compatible). Set
     /// once via [`Escrow::with_evidence_deadline`].
@@ -45717,7 +45798,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(105), None); // AV-241: 104 is EvidenceDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
     }
 
     #[test]
@@ -60684,6 +60765,145 @@ mod default_judgment_tests {
         assert_eq!(e.events().len(), 4);
         assert_eq!(ev.seq, 3);
     }
+    // ----- AV-242: post-funding arbitration-deadline amendment -----
+
+    /// Funded escrow with a configured + taker-confirmed default
+    /// judgment: deadline 3_600s, taker share 600_000 of 1_000_000.
+    fn funded_with_judgment() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap();
+        e.confirm_default_judgment(BOB).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_arbitration_deadline_retunes_only_future_disputes() {
+        // The amendment rewrites only the deadline: the taker share
+        // and the confirmation survive, and the state stays Funded.
+        let mut e = funded_with_judgment();
+        e.amend_arbitration_deadline(ALICE, BOB, 7_200).unwrap();
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: 7_200,
+                default_taker_amount: TAKER_SHARE,
+            })
+        );
+        assert!(e.default_judgment_confirmed());
+        assert_eq!(e.state(), EscrowState::Funded);
+        // The trigger reads the deadline live: at the OLD deadline
+        // the judgment is still not due, at the NEW deadline it fires
+        // on the amended split.
+        let disputed_at = EXPIRES_AT - 10_000;
+        e.escalate(ALICE, disputed_at, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(
+            e.trigger_default_judgment(BOB, disputed_at + DEADLINE, None, BOB),
+            Err(EscrowError::DefaultJudgmentNotDue)
+        );
+        let (payout, fee, refund) = e
+            .trigger_default_judgment(BOB, disputed_at + 7_200, None, BOB)
+            .unwrap();
+        assert_eq!((payout, fee, refund), (TAKER_SHARE, 0, 400_000));
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn amend_arbitration_deadline_cannot_move_a_live_dispute() {
+        // A live dispute is Disputed, not Funded: the amendment is
+        // rejected and the live trigger window is untouched.
+        let (mut e, disputed_at) = disputed_with_judgment();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(
+            e.amend_arbitration_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.default_judgment().unwrap().deadline_secs,
+            DEADLINE,
+            "rejected amend writes nothing"
+        );
+        assert_eq!(
+            e.trigger_default_judgment(BOB, disputed_at + DEADLINE, None, BOB)
+                .unwrap()
+                .0,
+            TAKER_SHARE,
+            "live dispute still triggers on the original deadline"
+        );
+    }
+
+    #[test]
+    fn amend_arbitration_deadline_rejects_state_authority_unconfigured_zero_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap();
+        assert_eq!(
+            bare.amend_arbitration_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.default_judgment().unwrap().deadline_secs, DEADLINE);
+        // Dual signature: one party alone cannot move the other's
+        // fallback window.
+        let mut e = funded_with_judgment();
+        assert_eq!(
+            e.amend_arbitration_deadline(ALICE, ALICE, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_arbitration_deadline([0xCC; 32], BOB, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.default_judgment().unwrap().deadline_secs, DEADLINE);
+        // No judgment configured: there is nothing to revise.
+        let mut no_judgment = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        no_judgment.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            no_judgment.amend_arbitration_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::DefaultJudgmentNotDue)
+        );
+        assert_eq!(no_judgment.default_judgment(), None);
+        // Zero: a judgment due immediately would fire on the very
+        // first trigger call — the builder's rejection, reused.
+        assert_eq!(
+            e.amend_arbitration_deadline(ALICE, BOB, 0),
+            Err(EscrowError::DefaultJudgmentNotDue)
+        );
+        assert_eq!(EscrowError::DefaultJudgmentNotDue.code(), 129);
+        assert_eq!(
+            e.default_judgment().unwrap().deadline_secs,
+            DEADLINE,
+            "failed amendment writes nothing"
+        );
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap();
+        paused.confirm_default_judgment(BOB).unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_arbitration_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.default_judgment().unwrap().deadline_secs, DEADLINE);
+    }
 }
 
 #[cfg(test)]
@@ -61766,7 +61986,12 @@ mod event_history_tests {
             Some(EscrowEventKind::ClaimantRosterAmended),
             "AV-227: appended after MilestoneTrancheAppended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(105), None); // AV-241: 104 is EvidenceDeadlineAmended
+        assert_eq!(
+            EscrowEventKind::from_discriminant(105),
+            Some(EscrowEventKind::ArbitrationDeadlineAmended),
+            "AV-242: appended after EvidenceDeadlineAmended"
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(106), None); // AV-242: 105 is ArbitrationDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -61953,9 +62178,10 @@ mod event_history_tests {
         // `SlashLadderAmended` (AV-237), 102 is
         // `AppealBondAmended` (AV-238), 103 is
         // `GracePeriodAmended` (AV-240), 104 is
-        // `EvidenceDeadlineAmended` (AV-241) and 105 is the
+        // `EvidenceDeadlineAmended` (AV-241), 105 is
+        // `ArbitrationDeadlineAmended` (AV-242) and 106 is the
         // first still-unknown byte.
-        for bad in [105u8, 255] {
+        for bad in [106u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

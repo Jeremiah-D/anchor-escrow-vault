@@ -199,6 +199,10 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // the new deadline gates only the later disputes'
         // disclosure windows.
         | EscrowEventKind::EvidenceDeadlineAmended
+        // AV-242: a revised arbitration deadline moves no funds —
+        // the new deadline gates only the later disputes'
+        // default judgments.
+        | EscrowEventKind::ArbitrationDeadlineAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -878,6 +882,10 @@ mod event_sourcing_tests {
         | EscrowEventKind::GracePeriodAmended
         // AV-241: a revised evidence deadline moves no funds.
         | EscrowEventKind::EvidenceDeadlineAmended
+        // AV-242: a revised arbitration deadline moves no funds —
+        // the new deadline gates only the later disputes'
+        // default judgments.
+        | EscrowEventKind::ArbitrationDeadlineAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
