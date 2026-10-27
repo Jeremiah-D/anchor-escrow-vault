@@ -210,6 +210,13 @@
 //!   vault, and the payout gates re-read it live, while amounts
 //!   already released are never restated. A failed amendment emits
 //!   nothing.
+//! - `amend_relative_timelock` emits
+//!   [`EscrowEventKind::RelativeTimelockAmended`] on every
+//!   successful amendment (AV-250) — `from == to ==` the current
+//!   state, all amounts zero; the amended window is read from the
+//!   vault, and the payout gates re-read it live against the
+//!   unchanged `fund_at` anchor, while amounts already released
+//!   are never restated. A failed amendment emits nothing.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -415,6 +422,7 @@
 //! | MilestoneClaimDeadlineAmended (AV-247) | 0 | 0 | 0 | 0 — amending moves no funds; the claim gate re-reads the deadline live, while already-claimed or skipped tranches keep their settlements |
 //! | MaxExtensionAmended (AV-248) | 0 | 0 | 0 | 0 — amending moves no funds; the next extension is judged against the live cap, while already-made extensions keep their deadline and count |
 //! | TimelockAmended (AV-249) | 0 | 0 | 0 | 0 — amending moves no funds; the payout gates re-read the live lock, while already-released amounts are never restated |
+//! | RelativeTimelockAmended (AV-250) | 0 | 0 | 0 | 0 — amending moves no funds; the payout gates re-read the live window against the unchanged funding anchor, while already-released amounts are never restated |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1529,6 +1537,20 @@ pub enum EscrowEventKind {
     /// lock is read from the vault, so the event needs no extra
     /// field.
     TimelockAmended,
+    /// AV-250: the relative timelock was revised by dual-signed
+    /// governance
+    /// ([`Escrow::amend_relative_timelock`](crate::Escrow::amend_relative_timelock)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::GracePeriodAmended`]); all amounts are
+    /// zero — amending moves no funds (the payout gates re-read
+    /// the window live against the unchanged `fund_at` anchor, so
+    /// lengthening pushes a payout out, shortening pulls it in,
+    /// and clearing with `0` unlocks immediately; amounts already
+    /// released are never restated, and the absolute and slot
+    /// locks are untouched). The amended window is read from the
+    /// vault, so the event needs no extra field.
+    RelativeTimelockAmended,
 }
 
 impl EscrowEventKind {
@@ -1848,6 +1870,10 @@ impl EscrowEventKind {
             // discriminants 0–111 stay stable for already-serialized
             // histories.
             112 => Self::TimelockAmended,
+            // AV-250: appended after TimelockAmended so
+            // discriminants 0–112 stay stable for already-serialized
+            // histories.
+            113 => Self::RelativeTimelockAmended,
             _ => return None,
         })
     }
@@ -2036,6 +2062,7 @@ impl EscrowEventKind {
             Self::MilestoneClaimDeadlineAmended => "milestone_claim_deadline_amended",
             Self::MaxExtensionAmended => "max_extension_amended",
             Self::TimelockAmended => "timelock_amended",
+            Self::RelativeTimelockAmended => "relative_timelock_amended",
         }
     }
 
@@ -2228,6 +2255,7 @@ impl EscrowEventKind {
             "milestone_claim_deadline_amended" => Self::MilestoneClaimDeadlineAmended,
             "max_extension_amended" => Self::MaxExtensionAmended,
             "timelock_amended" => Self::TimelockAmended,
+            "relative_timelock_amended" => Self::RelativeTimelockAmended,
             _ => return None,
         })
     }
@@ -7269,6 +7297,41 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the relative timelock after funding (mirrors
+    /// [`Escrow::amend_relative_timelock`]). Emits
+    /// `RelativeTimelockAmended` (`from == to ==` the current state
+    /// — the window, not the lifecycle state, is what changed; all
+    /// amounts zero, since amending moves no funds — the payout
+    /// gates re-read the window live against the unchanged
+    /// `fund_at` anchor, while amounts already released are never
+    /// restated). The amended window is read from the vault, so the
+    /// event needs no extra field. A failed amendment emits
+    /// nothing: the core call returns before any event is pushed.
+    pub fn amend_relative_timelock(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        secs: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner
+            .amend_relative_timelock(initializer, taker, secs)?;
+        self.push_event(
+            EscrowEventKind::RelativeTimelockAmended,
+            from,
+            self.inner.state(),
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// The live milestone tranche table as a fixed
     /// `MAX_MILESTONES` array (entries past the plan's count are
     /// zero): the shape the `MilestonesReallocated` event carries
@@ -11893,7 +11956,7 @@ mod event_tests {
         // AV-148: discriminant 76, appended after EscrowsNetted —
         // 0–75 stay stable for already-serialized histories.
         assert_eq!(EscrowEventKind::from_discriminant(76), Some(EscrowEventKind::TakerFunded));
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -11996,7 +12059,7 @@ mod event_tests {
             EscrowEventKind::from_name("template_applied"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12533,7 +12596,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(42), Some(kind));
         assert_eq!(kind.name(), "escrow_slashed");
         assert_eq!(EscrowEventKind::from_name("escrow_slashed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12548,7 +12611,7 @@ mod event_tests {
             EscrowEventKind::from_name("cpi_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12560,7 +12623,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(44), Some(kind));
         assert_eq!(kind.name(), "appeal_filed");
         assert_eq!(EscrowEventKind::from_name("appeal_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12572,7 +12635,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(45), Some(kind));
         assert_eq!(kind.name(), "appeal_resolved");
         assert_eq!(EscrowEventKind::from_name("appeal_resolved"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12584,7 +12647,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(52), Some(kind));
         assert_eq!(kind.name(), "appeal_expired");
         assert_eq!(EscrowEventKind::from_name("appeal_expired"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12599,7 +12662,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_granted"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12614,7 +12677,7 @@ mod event_tests {
             EscrowEventKind::from_name("delegation_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12626,7 +12689,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(55), Some(kind));
         assert_eq!(kind.name(), "swap_linked");
         assert_eq!(EscrowEventKind::from_name("swap_linked"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12638,7 +12701,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(46), Some(kind));
         assert_eq!(kind.name(), "evidence_filed");
         assert_eq!(EscrowEventKind::from_name("evidence_filed"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12650,7 +12713,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(47), Some(kind));
         assert_eq!(kind.name(), "released_split");
         assert_eq!(EscrowEventKind::from_name("released_split"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12662,7 +12725,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(66), Some(kind));
         assert_eq!(kind.name(), "release_via_intent");
         assert_eq!(EscrowEventKind::from_name("release_via_intent"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12674,7 +12737,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(67), Some(kind));
         assert_eq!(kind.name(), "keeper_bounty_paid");
         assert_eq!(EscrowEventKind::from_name("keeper_bounty_paid"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12686,7 +12749,7 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(68), Some(kind));
         assert_eq!(kind.name(), "partial_refunded");
         assert_eq!(EscrowEventKind::from_name("partial_refunded"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12702,7 +12765,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_committed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12717,7 +12780,7 @@ mod event_tests {
             EscrowEventKind::from_name("judgment_revealed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12732,7 +12795,7 @@ mod event_tests {
             EscrowEventKind::from_name("attestor_replaced"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12747,7 +12810,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12762,7 +12825,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestones_reallocated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12778,7 +12841,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_claim_expired"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12794,7 +12857,7 @@ mod event_tests {
             EscrowEventKind::from_name("milestone_tranche_appended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12810,7 +12873,7 @@ mod event_tests {
             EscrowEventKind::from_name("claimant_roster_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12825,7 +12888,7 @@ mod event_tests {
             EscrowEventKind::from_name("delivery_confirmed"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -12857,7 +12920,7 @@ mod event_tests {
             EscrowEventKind::from_name("governance_cancelled"),
             Some(cancelled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]

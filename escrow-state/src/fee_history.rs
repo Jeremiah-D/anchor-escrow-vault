@@ -274,6 +274,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // funds — the payout gates re-read the live lock;
         // already-released amounts are never restated.
         | EscrowEventKind::TimelockAmended
+        // AV-250: a revised relative timelock moves no
+        // funds — the payout gates re-read the live window
+        // against the unchanged funding anchor; already-released
+        // amounts are never restated.
+        | EscrowEventKind::RelativeTimelockAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -990,6 +995,11 @@ mod fee_history_tests {
         // funds — the payout gates re-read the live lock;
         // already-released amounts are never restated.
         | EscrowEventKind::TimelockAmended
+        // AV-250: a revised relative timelock moves no
+        // funds — the payout gates re-read the live window
+        // against the unchanged funding anchor; already-released
+        // amounts are never restated.
+        | EscrowEventKind::RelativeTimelockAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

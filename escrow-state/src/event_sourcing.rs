@@ -232,6 +232,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // funds — the payout gates re-read the live lock;
         // already-released amounts are never restated.
         | EscrowEventKind::TimelockAmended
+        // AV-250: a revised relative timelock moves no
+        // funds — the payout gates re-read the live window
+        // against the unchanged funding anchor; already-released
+        // amounts are never restated.
+        | EscrowEventKind::RelativeTimelockAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -944,6 +949,11 @@ mod event_sourcing_tests {
         // funds — the payout gates re-read the live lock;
         // already-released amounts are never restated.
         | EscrowEventKind::TimelockAmended
+        // AV-250: a revised relative timelock moves no
+        // funds — the payout gates re-read the live window
+        // against the unchanged funding anchor; already-released
+        // amounts are never restated.
+        | EscrowEventKind::RelativeTimelockAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

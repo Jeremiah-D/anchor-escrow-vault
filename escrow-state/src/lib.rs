@@ -13001,6 +13001,80 @@ let fee = self.charge_protocol_fee(net_amount)?;
         Ok(())
     }
 
+    /// Revise the relative timelock after funding (AV-250): both
+    /// parties may renegotiate the seconds-long window, measured
+    /// from funding, before which taker payouts stay locked,
+    /// without redeploying or refunding the escrow.
+    ///
+    /// Why: the lock duration set before funding assumes a deal
+    /// pace the parties may no longer face — a slipped schedule
+    /// can make the original window trap funds past their need, or
+    /// a fast-moving one can make it meaningless. A dual-signed
+    /// revision lets the parties move the unlock moment without
+    /// touching the other lock shapes or the amounts.
+    ///
+    /// Governance: dual signature — both the initializer and the
+    /// taker must authorize, paralleling
+    /// [`Escrow::amend_timelock`]. `Funded`-only: the builder
+    /// [`Escrow::with_relative_timelock`] owns the initial set. A
+    /// paused escrow fails fast ([`EscrowError::Paused`]).
+    ///
+    /// Rejections, reusing the builder's one-clock rule: a nonzero
+    /// `secs` together with a configured absolute lock
+    /// ([`Escrow::with_timelock`]) or slot lock
+    /// ([`Escrow::with_slot_timelock`]) is
+    /// [`EscrowError::InvalidTimelock`] — one clock per escrow, in
+    /// either order, exactly as the builders enforce it. The zero
+    /// sentinels stay order-independent no-ops: `0` is legal even
+    /// beside an absolute or slot lock, and it cancels the
+    /// relative lock (the builder's `0` means "no lock"), so the
+    /// parties can drop a relative lock they no longer want.
+    /// All checks run before any write, so a failed amendment
+    /// leaves the lock untouched.
+    ///
+    /// Scope: only `relative_timelock_secs` changes — `timelock`
+    /// and `slot_timelock_slots` are untouched, and `fund_at`
+    /// (the lock's anchor) and amounts already released are never
+    /// restated. The payout gates read the lock live:
+    /// [`Escrow::is_unlock_eligible`] consults the field at call
+    /// time, so lengthening the window pushes a payout out,
+    /// shortening it pulls a payout in, and clearing it unlocks
+    /// immediately — while the unilateral exits
+    /// (`cancel`, `cancel_expired`) and the arbiter's `resolve`
+    /// stay ungated, exactly as before. Orthogonal to
+    /// [`Escrow::with_relative_timelock`] (`Uninitialized`-only
+    /// initial configuration), to AV-64's relative-lock gate itself
+    /// (this item is the post-funding revision), and to AV-249 /
+    /// AV-116's absolute and slot locks (different clocks,
+    /// untouched here). Emits `RelativeTimelockAmended` on the
+    /// event layer.
+    pub fn amend_relative_timelock(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        secs: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_timelock`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // One clock per escrow, the builder's rule: a nonzero
+        // relative lock beside a nonzero absolute or slot lock is
+        // `InvalidTimelock`; the zero sentinels stay no-ops.
+        if secs != 0 && (self.timelock != 0 || self.slot_timelock_slots != 0) {
+            return Err(EscrowError::InvalidTimelock);
+        }
+        self.relative_timelock_secs = secs;
+        Ok(())
+    }
+
     /// The taker confirms receipt with a timestamp (AV-216): the
     /// timed twin of [`Escrow::confirm_delivery`] — same
     /// authority (taker-only), same state window (`Funded` or
@@ -46285,7 +46359,7 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(92),
             Some(EscrowEventKind::ClaimantRosterAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
     }
 
     #[test]
@@ -62513,7 +62587,12 @@ mod event_history_tests {
             Some(EscrowEventKind::TimelockAmended),
             "AV-249: appended after MaxExtensionAmended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(113), None); // AV-249: 112 is TimelockAmended
+        assert_eq!(
+            EscrowEventKind::from_discriminant(113),
+            Some(EscrowEventKind::RelativeTimelockAmended),
+            "AV-250: appended after TimelockAmended"
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(114), None); // AV-250: 113 is RelativeTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -62708,9 +62787,10 @@ mod event_history_tests {
         // `ReleaseCoolingAmended` (AV-246), 110 is
         // `MilestoneClaimDeadlineAmended` (AV-247), 111 is
         // `MaxExtensionAmended` (AV-248), 112 is
-        // `TimelockAmended` (AV-249) and 113 is the
+        // `TimelockAmended` (AV-249), 113 is
+        // `RelativeTimelockAmended` (AV-250) and 114 is the
         // first still-unknown byte.
-        for bad in [113u8, 255] {
+        for bad in [114u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -75810,5 +75890,182 @@ mod timelock_amend_tests {
             Err(EscrowError::Paused)
         );
         assert_eq!(paused.unlock_at(), UNLOCK_AT);
+    }
+}
+
+#[cfg(test)]
+mod relative_timelock_amend_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const FUND_AT: u64 = EXPIRES_AT - 3_600;
+    const LOCK_SECS: u64 = 3_600;
+    const UNLOCK_AT: u64 = 1_900_000_000;
+
+    fn locked() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_relative_timelock(LOCK_SECS)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_relative_timelock_pushes_release_out() {
+        // Lengthening the window pushes a payout out: a release at
+        // the old unlock moment is refused once the lock moves.
+        let mut e = locked();
+        assert_eq!(
+            e.release(ALICE, FUND_AT + LOCK_SECS - 1, 1_000_000, None, BOB),
+            Err(EscrowError::TimelockNotReached)
+        );
+        e.amend_relative_timelock(ALICE, BOB, LOCK_SECS + 1000)
+            .unwrap();
+        assert_eq!(e.relative_timelock_secs(), LOCK_SECS + 1000);
+        assert_eq!(e.fund_at(), FUND_AT, "the anchor never moves");
+        assert_eq!(
+            e.release(ALICE, FUND_AT + LOCK_SECS, 1_000_000, None, BOB),
+            Err(EscrowError::TimelockNotReached)
+        );
+        e.release(ALICE, FUND_AT + LOCK_SECS + 1000, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_relative_timelock_pulls_release_in() {
+        // Shortening the window pulls a payout in: a release at the
+        // new unlock moment settles even though the old window
+        // would still bind.
+        let mut e = locked();
+        e.amend_relative_timelock(ALICE, BOB, 1000).unwrap();
+        e.release(ALICE, FUND_AT + 1000, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_relative_timelock_to_zero_unlocks_immediately() {
+        // Zero cancels the lock (the builder's "no lock"
+        // sentinel): a release at funding time settles at once.
+        let mut e = locked();
+        e.amend_relative_timelock(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.relative_timelock_secs(), 0);
+        assert!(e.is_unlock_eligible(FUND_AT));
+        e.release(ALICE, FUND_AT, 1_000_000, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_relative_timelock_gives_an_unconfigured_escrow_a_lock() {
+        // An escrow with no lock gains one on first amendment.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(e.relative_timelock_secs(), 0);
+        e.amend_relative_timelock(ALICE, BOB, LOCK_SECS).unwrap();
+        assert_eq!(
+            e.release(ALICE, FUND_AT + LOCK_SECS - 1, 1_000_000, None, BOB),
+            Err(EscrowError::TimelockNotReached)
+        );
+        e.release(ALICE, FUND_AT + LOCK_SECS, 1_000_000, None, BOB)
+            .unwrap();
+    }
+
+    #[test]
+    fn amend_relative_timelock_leaves_released_amounts_untouched() {
+        // A payout already made keeps its amount; the amendment
+        // rewrites the window only, and the remainder settles at
+        // the new unlock moment.
+        let mut e = locked();
+        e.release(ALICE, FUND_AT + LOCK_SECS, 400_000, None, BOB)
+            .unwrap();
+        assert_eq!(e.released_amount(), 400_000);
+        e.amend_relative_timelock(ALICE, BOB, LOCK_SECS + 1000)
+            .unwrap();
+        assert_eq!(e.released_amount(), 400_000);
+        e.release(ALICE, FUND_AT + LOCK_SECS + 1000, 600_000, None, BOB)
+            .unwrap();
+        assert_eq!(e.released_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn amend_relative_timelock_refuses_a_second_clock() {
+        // One clock per escrow, the builder's rule: a nonzero
+        // relative lock beside an absolute lock is InvalidTimelock,
+        // and the absolute lock keeps binding afterwards.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            e.amend_relative_timelock(ALICE, BOB, LOCK_SECS),
+            Err(EscrowError::InvalidTimelock)
+        );
+        assert_eq!(e.unlock_at(), UNLOCK_AT);
+        assert_eq!(e.relative_timelock_secs(), 0);
+        // The zero sentinel stays a no-op beside an absolute lock.
+        e.amend_relative_timelock(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.relative_timelock_secs(), 0);
+        assert_eq!(
+            e.release(ALICE, UNLOCK_AT - 1, 1_000_000, None, BOB),
+            Err(EscrowError::TimelockNotReached)
+        );
+        e.release(ALICE, UNLOCK_AT, 1_000_000, None, BOB)
+            .unwrap();
+        // A slot lock likewise refuses a second clock.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slot_timelock(100)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            e.amend_relative_timelock(ALICE, BOB, LOCK_SECS),
+            Err(EscrowError::InvalidTimelock)
+        );
+        assert_eq!(e.unlock_at(), 0);
+        assert_eq!(e.slot_timelock_slots(), 100);
+    }
+
+    #[test]
+    fn amend_relative_timelock_rejects_state_authority_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_relative_timelock(LOCK_SECS)
+            .unwrap();
+        assert_eq!(
+            bare.amend_relative_timelock(ALICE, BOB, LOCK_SECS + 1000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.relative_timelock_secs(), LOCK_SECS);
+        // Dual signature: one party alone cannot move the other's lock.
+        let mut e = locked();
+        assert_eq!(
+            e.amend_relative_timelock(ALICE, ALICE, LOCK_SECS + 1000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_relative_timelock([0xCC; 32], BOB, LOCK_SECS + 1000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.relative_timelock_secs(), LOCK_SECS);
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_relative_timelock(LOCK_SECS)
+            .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_relative_timelock(ALICE, BOB, LOCK_SECS + 1000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.relative_timelock_secs(), LOCK_SECS);
     }
 }
