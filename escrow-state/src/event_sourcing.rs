@@ -294,6 +294,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // live gate at every release / claim; a payout
         // already settled keeps its gate.
         | EscrowEventKind::PriceGateAmended
+        // AV-262: a revised TWAP gate moves no
+        // funds — the gated payout paths re-read the
+        // live gate at every release / claim (including
+        // the full-window history coverage requirement);
+        // a payout already settled keeps its gate.
+        | EscrowEventKind::TwapGateAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1068,6 +1074,12 @@ mod event_sourcing_tests {
         // live gate at every release / claim; a payout
         // already settled keeps its gate.
         | EscrowEventKind::PriceGateAmended
+        // AV-262: a revised TWAP gate moves no
+        // funds — the gated payout paths re-read the
+        // live gate at every release / claim (including
+        // the full-window history coverage requirement);
+        // a payout already settled keeps its gate.
+        | EscrowEventKind::TwapGateAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

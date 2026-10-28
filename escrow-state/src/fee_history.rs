@@ -336,6 +336,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // live gate at every release / claim; a payout
         // already settled keeps its gate.
         | EscrowEventKind::PriceGateAmended
+        // AV-262: a revised TWAP gate moves no
+        // funds — the gated payout paths re-read the
+        // live gate at every release / claim (including
+        // the full-window history coverage requirement);
+        // a payout already settled keeps its gate.
+        | EscrowEventKind::TwapGateAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1114,6 +1120,12 @@ mod fee_history_tests {
         // live gate at every release / claim; a payout
         // already settled keeps its gate.
         | EscrowEventKind::PriceGateAmended
+        // AV-262: a revised TWAP gate moves no
+        // funds — the gated payout paths re-read the
+        // live gate at every release / claim (including
+        // the full-window history coverage requirement);
+        // a payout already settled keeps its gate.
+        | EscrowEventKind::TwapGateAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
