@@ -299,6 +299,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // against the unchanged fund_at anchor; fees
         // already charged are never clawed back.
         | EscrowEventKind::StreamingFeeRateAmended
+        // AV-255: a revised rent payer moves no
+        // funds — the close reads the recipient live
+        // through the amended payer; the close
+        // authority is untouched and no rent is
+        // recomputed.
+        | EscrowEventKind::RentPayerAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1040,6 +1046,12 @@ mod fee_history_tests {
         // against the unchanged fund_at anchor; fees
         // already charged are never clawed back.
         | EscrowEventKind::StreamingFeeRateAmended
+        // AV-255: a revised rent payer moves no
+        // funds — the close reads the recipient live
+        // through the amended payer; the close
+        // authority is untouched and no rent is
+        // recomputed.
+        | EscrowEventKind::RentPayerAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

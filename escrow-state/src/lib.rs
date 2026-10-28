@@ -13439,6 +13439,60 @@ let fee = self.charge_protocol_fee(net_amount)?;
         rent_recipient(self.rent_payer, self.initializer)
     }
 
+    /// Revise the bound rent payer after funding (AV-255): the
+    /// post-funding counterpart to [`Escrow::with_rent_payer`]
+    /// (`Uninitialized`-only initial configuration). Dual-signed
+    /// governance, `Funded`-only, pause first — paralleling
+    /// [`Escrow::amend_fee_schedule`]. Only `rent_payer` changes:
+    /// the close authority is untouched (only the initializer may
+    /// call `close_vault`), no closed state is touched, and no
+    /// rent is recomputed — the payer field is already resident,
+    /// so the revision rewrites it in place with no layout change.
+    /// A zero key is refused with
+    /// [`EscrowError::InvalidRentPayer`] (the builder's gate,
+    /// unchanged — a bound payer must be a real key, or the close
+    /// would have nowhere to send the rent). Re-affirming the
+    /// current payer is a no-op: it succeeds and writes nothing,
+    /// so the event layer emits nothing for it (paralleling
+    /// `amend_milestones`' no-op rule). There is deliberately no
+    /// unbind-to-`None` path here: an unbound escrow keeps the
+    /// initializer-reclaims default, and this item only moves a
+    /// bound payer from one key to another (or binds the first
+    /// one). `close_vault` reads the recipient live through
+    /// [`Escrow::rent_recipient`], so a close after the amendment
+    /// pays the new payer while a close before it paid the old
+    /// one — the amendment never rewrites a close already made.
+    /// Orthogonal to AV-222's initial binding (this item is the
+    /// post-funding revision) and to AV-34's close itself (this
+    /// item is the close's payee). Emits `RentPayerAmended` on
+    /// the event layer, except for the no-op re-affirmation.
+    pub fn amend_rent_payer(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_payer: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_fee_schedule`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // The builder's gate, unchanged: a bound payer must be a
+        // real key. Checked after state so a failed amendment
+        // never writes, and the stored payer stays as it was.
+        if new_payer == [0u8; 32] {
+            return Err(EscrowError::InvalidRentPayer);
+        }
+        self.rent_payer = Some(new_payer);
+        Ok(())
+    }
+
     /// The partial-funding progress view (AV-220): how much has
     /// arrived, the declared amount, and what is still missing.
     /// `None` for classic single-shot escrows — progress is only
@@ -46643,7 +46697,8 @@ mod funding_tranche_tests {
             Some(EscrowEventKind::FeeScheduleAmended)
         );
         assert_eq!(EscrowEventKind::from_discriminant(117), Some(EscrowEventKind::StreamingFeeRateAmended)); // AV-254: 117 is StreamingFeeRateAmended
-        assert_eq!(EscrowEventKind::from_discriminant(118), None); // AV-254: 117 is StreamingFeeRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(118), Some(EscrowEventKind::RentPayerAmended)); // AV-255: 118 is RentPayerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(119), None); // AV-255: 118 is RentPayerAmended
     }
 
     #[test]
@@ -62892,7 +62947,8 @@ mod event_history_tests {
             "AV-253: appended after RentSweepGraceAmended"
         );
         assert_eq!(EscrowEventKind::from_discriminant(117), Some(EscrowEventKind::StreamingFeeRateAmended)); // AV-254: 117 is StreamingFeeRateAmended
-        assert_eq!(EscrowEventKind::from_discriminant(118), None); // AV-254: 117 is StreamingFeeRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(118), Some(EscrowEventKind::RentPayerAmended)); // AV-255: 118 is RentPayerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(119), None); // AV-255: 118 is RentPayerAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -63092,9 +63148,10 @@ mod event_history_tests {
         // `SlotTimelockAmended` (AV-251), 115 is
         // `RentSweepGraceAmended` (AV-252), 116 is
         // `FeeScheduleAmended` (AV-253), 117 is
-        // `StreamingFeeRateAmended` (AV-254) and 118 is the
+        // `StreamingFeeRateAmended` (AV-254), 118 is
+        // `RentPayerAmended` (AV-255) and 119 is the
         // first still-unknown byte.
-        for bad in [118u8, 255] {
+        for bad in [119u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -77047,5 +77104,174 @@ mod streaming_fee_rate_amend_tests {
         assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
         assert_eq!(ev.amounts.payout, 0);
         assert_eq!(ev.amounts.fee, 0);
+    }
+}
+
+#[cfg(test)]
+mod rent_payer_amend_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const CAROL: [u8; 32] = [0xCC; 32]; // first payer
+    const DAVE: [u8; 32] = [0xDD; 32]; // new payer
+    const NOW: u64 = 1_700_000_000;
+
+    fn funded_with_payer(payer: [u8; 32]) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000)
+            .unwrap()
+            .with_rent_payer(payer)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_rebinds_payer_and_close_pays_the_new_payer() {
+        // The bound payer moves CAROL -> DAVE in place, the close
+        // authority is untouched, and the close at the end pays
+        // the live recipient — the amended payer, not the original.
+        let mut e = funded_with_payer(CAROL);
+        assert_eq!(e.rent_recipient(), CAROL);
+        e.amend_rent_payer(ALICE, BOB, DAVE).unwrap();
+        assert_eq!(e.rent_payer(), Some(DAVE));
+        assert_eq!(e.rent_recipient(), DAVE);
+        assert_eq!(e.state(), EscrowState::Funded, "amending moves no state");
+        e.cancel(ALICE, None, ALICE, NOW).unwrap();
+        assert_eq!(e.rent_recipient(), DAVE, "close reads the live payer");
+        e.close_vault(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Closed);
+    }
+
+    #[test]
+    fn close_before_amend_pays_the_old_payer() {
+        // The mirror image: a vault closed before any amendment
+        // pays whoever was bound at close time, and the amendment
+        // never rewrites a close already made.
+        let mut closed_first = funded_with_payer(CAROL);
+        closed_first.cancel(ALICE, None, ALICE, NOW).unwrap();
+        assert_eq!(closed_first.rent_recipient(), CAROL);
+        closed_first.close_vault(ALICE).unwrap();
+        assert_eq!(
+            closed_first.amend_rent_payer(ALICE, BOB, DAVE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(closed_first.rent_payer(), Some(CAROL));
+        assert_eq!(closed_first.state(), EscrowState::Closed);
+    }
+
+    #[test]
+    fn amend_binds_first_payer_on_an_unbound_escrow() {
+        // An escrow that never bound a payer (initializer reclaims
+        // by default) gains its first payer on amendment, and the
+        // recipient flips from the initializer to the new payer.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000).unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.rent_payer(), None);
+        assert_eq!(e.rent_recipient(), ALICE);
+        e.amend_rent_payer(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.rent_payer(), Some(CAROL));
+        assert_eq!(e.rent_recipient(), CAROL);
+    }
+
+    #[test]
+    fn amend_same_payer_is_a_noop() {
+        // Re-affirming the current payer succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = funded_with_payer(CAROL);
+        e.amend_rent_payer(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.rent_payer(), Some(CAROL));
+        assert_eq!(e.rent_recipient(), CAROL);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_rejects_zero_state_authority_and_paused() {
+        // A zero key is refused with the builder's error, and the
+        // stored payer stays as it was.
+        let mut e = funded_with_payer(CAROL);
+        assert_eq!(
+            e.amend_rent_payer(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::InvalidRentPayer)
+        );
+        assert_eq!(e.rent_payer(), Some(CAROL));
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000)
+            .unwrap()
+            .with_rent_payer(CAROL)
+            .unwrap();
+        assert_eq!(
+            bare.amend_rent_payer(ALICE, BOB, DAVE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.rent_payer(), Some(CAROL));
+        // Dual signature: one party alone cannot re-point the rent.
+        assert_eq!(
+            e.amend_rent_payer(ALICE, ALICE, DAVE),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_rent_payer([0xEE; 32], BOB, DAVE),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.rent_payer(), Some(CAROL));
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_rent_payer(CAROL)
+            .unwrap();
+        paused.fund(ALICE, NOW).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_rent_payer(ALICE, BOB, DAVE),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.rent_payer(), Some(CAROL));
+    }
+
+    #[test]
+    fn amend_on_terminal_and_closed_vaults_changes_nothing() {
+        // A terminal vault cannot be amended, and a closed vault
+        // cannot be reopened by amending: the payer stays as it was.
+        let mut e = funded_with_payer(CAROL);
+        e.cancel(ALICE, None, ALICE, NOW).unwrap();
+        assert_eq!(
+            e.amend_rent_payer(ALICE, BOB, DAVE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.rent_payer(), Some(CAROL));
+        e.close_vault(ALICE).unwrap();
+        assert_eq!(
+            e.amend_rent_payer(ALICE, BOB, DAVE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.rent_payer(), Some(CAROL));
+        assert_eq!(e.state(), EscrowState::Closed);
+    }
+
+    #[test]
+    fn amend_rent_payer_indexed_emits_event_noop_and_failed_emit_nothing() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, NOW + 10_000, [0x1D; 32], NOW)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_rent_payer(ALICE, ALICE, CAROL, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_rent_payer(ALICE, BOB, CAROL, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::RentPayerAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same payer is a no-op: no new event.
+        e.amend_rent_payer(ALICE, BOB, CAROL, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
     }
 }
