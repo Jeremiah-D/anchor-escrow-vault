@@ -291,6 +291,16 @@
 //!   while a cancel already settled keeps the penalty it
 //!   charged. A failed amendment emits nothing, and a no-op
 //!   re-affirmation of the current rate emits nothing either.
+//! - `amend_interest_rate` emits
+//!   [`EscrowEventKind::InterestRateAmended`] on every
+//!   successful amendment that actually changes the rate
+//!   (AV-260) — `from == to ==` the current state, all amounts
+//!   zero; the amended rate is read from the vault, and the
+//!   accrual clock re-reads it live at every settlement, while
+//!   a slice already settled keeps the rate it settled at and
+//!   already-accrued yield is never clawed back. A failed
+//!   amendment emits nothing, and a no-op re-affirmation of
+//!   the current rate emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -506,6 +516,7 @@
 //! | PenaltyEscalationAmended (AV-257) | 0 | 0 | 0 | 0 — amending moves no funds; the cancel gate re-reads the live schedule at every `cancel_expired`, while a cancel already settled keeps the penalty it charged |
 //! | RefundAddressAmended (AV-258) | 0 | 0 | 0 | 0 — amending moves no funds; the cancel paths re-read the live address at every `cancel` / `cancel_expired`, while a refund already settled keeps the destination it paid |
 //! | BasePenaltyAmended (AV-259) | 0 | 0 | 0 | 0 — amending moves no funds; the cancel gate re-reads the live base rate at every `cancel_expired`, while a cancel already settled keeps the penalty it charged |
+//! | InterestRateAmended (AV-260) | 0 | 0 | 0 | 0 — amending moves no funds; the accrual clock re-reads the live rate at every settlement, while a slice already settled keeps the rate it settled at and already-accrued yield is never clawed back |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1759,6 +1770,22 @@ pub enum EscrowEventKind {
     /// field. A no-op re-affirmation of the current rate emits
     /// nothing.
     BasePenaltyAmended,
+    /// AV-260: the interest rate was revised by
+    /// dual-signed governance
+    /// ([`Escrow::amend_interest_rate`](crate::Escrow::amend_interest_rate)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::ProtocolFeeAmended`]); all amounts are
+    /// zero — amending moves no funds (the accrual clock
+    /// re-reads the live rate at every settlement, so a slice
+    /// after the amendment prices from the new rate while a
+    /// slice already settled keeps the rate it settled at;
+    /// already-accrued yield is never clawed back, and in
+    /// compound mode the folded yield stays principal). The
+    /// amended rate is read from the vault, so the event needs
+    /// no extra field. A no-op re-affirmation of the current
+    /// rate emits nothing.
+    InterestRateAmended,
 }
 
 impl EscrowEventKind {
@@ -2118,6 +2145,10 @@ impl EscrowEventKind {
             // discriminants 0–121 stay stable for already-serialized
             // histories.
             122 => Self::BasePenaltyAmended,
+            // AV-260: appended after BasePenaltyAmended so
+            // discriminants 0–122 stay stable for already-serialized
+            // histories.
+            123 => Self::InterestRateAmended,
             _ => return None,
         })
     }
@@ -2316,6 +2347,7 @@ impl EscrowEventKind {
             Self::PenaltyEscalationAmended => "penalty_escalation_amended",
             Self::RefundAddressAmended => "refund_address_amended",
             Self::BasePenaltyAmended => "base_penalty_amended",
+            Self::InterestRateAmended => "interest_rate_amended",
         }
     }
 
@@ -2518,6 +2550,7 @@ impl EscrowEventKind {
             "penalty_escalation_amended" => Self::PenaltyEscalationAmended,
             "refund_address_amended" => Self::RefundAddressAmended,
             "base_penalty_amended" => Self::BasePenaltyAmended,
+            "interest_rate_amended" => Self::InterestRateAmended,
             _ => return None,
         })
     }
@@ -7946,6 +7979,46 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the interest rate after funding
+    /// (mirrors [`Escrow::amend_interest_rate`]). Emits
+    /// `InterestRateAmended` when the rate actually changes
+    /// (`from == to ==` the current state — the clock, not the
+    /// lifecycle state, is what changed; all amounts zero,
+    /// since amending moves no funds — the accrual clock
+    /// re-reads the live rate at every settlement, while a
+    /// slice already settled keeps the rate it settled at and
+    /// already-accrued yield is never clawed back). The amended
+    /// rate is read from the vault, so the event needs no extra
+    /// field. A failed amendment emits nothing, and a no-op
+    /// re-affirmation of the current rate emits nothing either,
+    /// paralleling `amend_penalty_bps`'s no-op rule.
+    pub fn amend_interest_rate(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        rate_bps: u16,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let before = self.inner.interest_rate_bps();
+        self.inner.amend_interest_rate(initializer, taker, rate_bps)?;
+        if self.inner.interest_rate_bps() != before {
+            self.push_event(
+                EscrowEventKind::InterestRateAmended,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// The live milestone tranche table as a fixed
     /// `MAX_MILESTONES` array (entries past the plan's count are
     /// zero): the shape the `MilestonesReallocated` event carries
@@ -12578,7 +12651,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -12689,7 +12763,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13234,7 +13309,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13257,7 +13333,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13277,7 +13354,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13297,7 +13375,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13317,7 +13396,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13340,7 +13420,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13363,7 +13444,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13383,7 +13465,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13403,7 +13486,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13423,7 +13507,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13443,7 +13528,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13463,7 +13549,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13483,7 +13570,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13507,7 +13595,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13530,7 +13619,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13553,7 +13643,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13576,7 +13667,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13599,7 +13691,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13623,7 +13716,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13647,7 +13741,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13671,7 +13766,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13694,7 +13790,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -13734,7 +13831,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]

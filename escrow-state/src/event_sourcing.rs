@@ -283,6 +283,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // rate at every cancel_expired; a cancel already
         // settled keeps its penalty.
         | EscrowEventKind::BasePenaltyAmended
+        // AV-260: a revised interest rate moves no
+        // funds — the accrual clock re-reads the live
+        // rate at every settlement; a slice already
+        // settled keeps its rate and accrued yield is
+        // never clawed back.
+        | EscrowEventKind::InterestRateAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1046,6 +1052,12 @@ mod event_sourcing_tests {
         // rate at every cancel_expired; a cancel already
         // settled keeps its penalty.
         | EscrowEventKind::BasePenaltyAmended
+        // AV-260: a revised interest rate moves no
+        // funds — the accrual clock re-reads the live
+        // rate at every settlement; a slice already
+        // settled keeps its rate and accrued yield is
+        // never clawed back.
+        | EscrowEventKind::InterestRateAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

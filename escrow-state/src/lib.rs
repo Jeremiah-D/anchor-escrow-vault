@@ -23272,6 +23272,85 @@ let fee = self.charge_protocol_fee(claimable)?;
     }
 
 
+    /// Revise the interest rate after funding
+    /// (AV-260): the post-funding counterpart to
+    /// [`Escrow::with_interest`] (`Uninitialized`-only
+    /// initial configuration). Dual-signed governance,
+    /// `Funded`-only, pause first — paralleling
+    /// [`Escrow::amend_penalty_bps`]. Only `interest_rate_bps`
+    /// changes — `interest_accrued`, `interest_paid`,
+    /// `interest_compounded` and `interest_accrual_base` are
+    /// never restated, so a rate cut can never claw back yield
+    /// already accrued, and a rate hike never reprices it. The
+    /// accrual clock reads the rate live
+    /// ([`Escrow::settle_interest`] prices each slice from the
+    /// live rate at settlement time), so a new rate prices the
+    /// next slice the moment the amendment lands, while slices
+    /// already settled keep the rate they settled at. In
+    /// compound mode the yield already folded into the principal
+    /// stays principal — the next accrual prices the grown
+    /// principal at the new rate (interest earns interest on the
+    /// folded balance, exactly as before, only faster or slower).
+    /// A `Disputed` escrow is refused
+    /// ([`EscrowError::InvalidStateTransition`]): the dispute
+    /// window settles at the frozen rate (see
+    /// [`Escrow::settle_dispute_interest`]), so a mid-dispute
+    /// retune would rewrite the adjudicated yield. A rate above
+    /// `10_000` is refused with
+    /// [`EscrowError::InvalidInterestRate`] (the builder's gate,
+    /// unchanged — the rate can never exceed 100% APR); `0` is
+    /// legal and pauses all future accrual (the builder's `0`
+    /// semantics, not a forfeiture). Pinned pause semantics, do
+    /// not silently change: [`Escrow::settle_interest`] returns
+    /// early while the rate is `0` without advancing
+    /// `interest_accrual_base`, so a paused window is not
+    /// skipped — it is repriced at the resumed rate on the next
+    /// settlement (a claim attempted while paused fails with
+    /// [`EscrowError::InterestNotEnabled`] and settles nothing,
+    /// leaving the base where it was). Re-affirming the current
+    /// rate is a no-op: it succeeds and writes nothing, so the
+    /// event layer emits nothing for it (paralleling
+    /// `amend_penalty_bps`'s no-op rule). Orthogonal to
+    /// [`Escrow::with_interest`] (that is the initial opt-in,
+    /// this item is the post-funding revision), to AV-107 (that
+    /// is the accrual mechanism itself, this item is the rate)
+    /// and to AV-117 (that is the compounding mode, this item
+    /// is the rate). Emits `InterestRateAmended` on the event
+    /// layer, except for the no-op re-affirmation.
+    pub fn amend_interest_rate(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        rate_bps: u16,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_penalty_bps`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // The builder's gate, unchanged: the rate can never
+        // exceed 100% APR. Checked after state so a failed
+        // amendment never writes, and the stored rate stays as
+        // it was.
+        if rate_bps > 10_000 {
+            return Err(EscrowError::InvalidInterestRate);
+        }
+        // No-op: re-affirming the current rate writes nothing,
+        // so the event layer emits nothing for it.
+        if rate_bps == self.interest_rate_bps {
+            return Ok(());
+        }
+        self.interest_rate_bps = rate_bps;
+        Ok(())
+    }
+
+
     /// Opt in to a timelock (AV-27). Builder-style: only valid on an
     /// `Uninitialized` escrow, so the unlock timestamp is fixed before
     /// any funds move — mirroring [`Escrow::with_grace_period`] and the
@@ -46948,7 +47027,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
     }
 
     #[test]
@@ -63600,7 +63680,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
-        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -63805,9 +63886,10 @@ mod event_history_tests {
         // `ReferrerAmended` (AV-256), 120 is
         // `PenaltyEscalationAmended` (AV-257), 121 is
         // `RefundAddressAmended` (AV-258), 122 is
-        // `BasePenaltyAmended` (AV-259) and 123 is the
+        // `BasePenaltyAmended` (AV-259), 123 is
+        // `InterestRateAmended` (AV-260) and 124 is the
         // first still-unknown byte.
-        for bad in [123u8, 255] {
+        for bad in [124u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -72546,6 +72628,171 @@ mod interest_tests {
     fn error_codes_are_pinned() {
         assert_eq!(EscrowError::InvalidInterestRate.code(), 165);
         assert_eq!(EscrowError::InterestNotEnabled.code(), 166);
+    }
+
+    #[test]
+    fn amend_retunes_rate_and_next_slice_prices_live() {
+        // First half-year settles at 5%: 25_000 booked, base
+        // advanced to the harvest.
+        let mut e = interest_escrow(500);
+        assert_eq!(e.claim_interest(BOB, FUND_AT + YEAR / 2).unwrap(), 25_000);
+        assert_eq!(e.interest_paid(), 25_000);
+        e.amend_interest_rate(ALICE, BOB, 1_000).unwrap();
+        assert_eq!(e.interest_rate_bps(), 1_000);
+        assert_eq!(e.interest_accrued(), 0, "amending books no yield");
+        assert_eq!(e.interest_paid(), 25_000, "settled yield is never repriced");
+        assert_eq!(e.state(), EscrowState::Funded, "amending moves no state");
+        // Second half-year at 10%: 50_000 — the new rate prices
+        // only the next slice, never the settled one.
+        assert_eq!(e.claim_interest(BOB, FUND_AT + YEAR).unwrap(), 50_000);
+    }
+
+    #[test]
+    fn amend_to_zero_pauses_and_resumed_rate_reprices_paused_window() {
+        // Pinned AV-260 pause semantics: `settle_interest`
+        // returns early at rate 0 without advancing the accrual
+        // base, so a paused window is repriced at the resumed
+        // rate — it is never skipped or forfeited.
+        let mut e = interest_escrow(500);
+        e.amend_interest_rate(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.interest_rate_bps(), 0);
+        // A harvest attempted while paused fails and settles
+        // nothing, leaving the base where funding left it.
+        assert_eq!(
+            e.claim_interest(BOB, FUND_AT + YEAR / 2),
+            Err(EscrowError::InterestNotEnabled)
+        );
+        assert_eq!(e.interest_accrued(), 0);
+        e.amend_interest_rate(ALICE, BOB, 1_000).unwrap();
+        // The whole year prices at the resumed 10%: 100_000 —
+        // the paused half-year is included at the new rate.
+        assert_eq!(e.claim_interest(BOB, FUND_AT + YEAR).unwrap(), 100_000);
+    }
+
+    #[test]
+    fn amend_rejects_out_of_range_state_authority_disputed_and_paused() {
+        let mut e = interest_escrow(500);
+        // The builder's gate, unchanged.
+        assert_eq!(
+            e.amend_interest_rate(ALICE, BOB, 10_001),
+            Err(EscrowError::InvalidInterestRate)
+        );
+        assert_eq!(e.interest_rate_bps(), 500);
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        assert_eq!(
+            bare.amend_interest_rate(ALICE, BOB, 1_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Dual signature: one party alone cannot retune the clock.
+        assert_eq!(
+            e.amend_interest_rate(ALICE, ALICE, 1_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_interest_rate(MALLORY, BOB, 1_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.interest_rate_bps(), 500);
+        // Disputed: the dispute window settles at the frozen rate.
+        let mut disputed = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        disputed.fund(ALICE, FUND_AT).unwrap();
+        disputed
+            .escalate(ALICE, FUND_AT + 3_153_600, disputed.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(disputed.state(), EscrowState::Disputed);
+        assert_eq!(
+            disputed.amend_interest_rate(ALICE, BOB, 1_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(disputed.interest_rate_bps(), 500);
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_interest_rate(ALICE, BOB, 1_000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.interest_rate_bps(), 500);
+    }
+
+    #[test]
+    fn amend_same_rate_is_a_noop() {
+        // Re-affirming the current rate succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = interest_escrow(500);
+        e.amend_interest_rate(ALICE, BOB, 500).unwrap();
+        assert_eq!(e.interest_rate_bps(), 500);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_compound_fold_stays_principal_and_next_slice_prices_grown_balance() {
+        // Compound mode: one year at 5% folds 50_000 into the
+        // principal on a partial release (1_050_000, 500_000 paid
+        // out, 550_000 still locked, still Funded).
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_interest(500)
+            .unwrap()
+            .with_compound_interest()
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e.settle_interest(FUND_AT + YEAR);
+        assert_eq!(e.interest_accrued(), 50_000);
+        let (payout, fee) = e.release(ALICE, FUND_AT + YEAR, 500_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (500_000, 0));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_050_000);
+        assert_eq!(e.interest_compounded(), 50_000);
+        assert_eq!(e.interest_accrued(), 0);
+        // The amendment moves only the rate: the folded yield
+        // stays principal and the counters never move.
+        e.amend_interest_rate(ALICE, BOB, 1_000).unwrap();
+        assert_eq!(e.interest_rate_bps(), 1_000);
+        assert_eq!(e.amount(), 1_050_000, "folded yield stays principal");
+        assert_eq!(e.interest_compounded(), 50_000);
+        // Next year prices the grown remainder (550_000) at the
+        // new 10%: 55_000.
+        e.settle_interest(FUND_AT + 2 * YEAR);
+        assert_eq!(e.interest_accrued(), 55_000);
+    }
+
+    #[test]
+    fn amend_interest_rate_indexed_emits_event_noop_and_failed_emit_nothing() {
+        let funded = interest_escrow(500);
+        let mut e = IndexedEscrow::wrap([0x1D; 32], funded);
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_interest_rate(ALICE, ALICE, 1_000, FUND_AT),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_interest_rate(ALICE, BOB, 1_000, FUND_AT).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::InterestRateAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same rate is a no-op: no new event.
+        e.amend_interest_rate(ALICE, BOB, 1_000, FUND_AT).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
     }
 }
 
