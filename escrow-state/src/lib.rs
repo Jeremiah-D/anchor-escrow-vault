@@ -14359,6 +14359,93 @@ let fee = self.charge_protocol_fee(net_amount)?;
         Ok(())
     }
 
+    /// Rotate the dual-control checker after funding
+    /// (AV-263): the post-funding counterpart to
+    /// [`Escrow::with_dual_control`] (`Uninitialized`-only initial
+    /// configuration). Dual-signed governance, `Funded`-only, pause
+    /// first — paralleling [`Escrow::amend_twap_gate`]. Only an
+    /// escrow that already opted into dual control may rotate its
+    /// checker: a never-opted-in escrow is refused with
+    /// [`EscrowError::InvalidDualControl`] (fail-closed —
+    /// post-funding installation would turn a single-step release
+    /// into a two-step protocol the taker never funded under, so
+    /// it is not a rotation, it is a new deal). A zero
+    /// `new_checker` is refused with
+    /// [`EscrowError::InvalidDualControl`] (the builder's gate,
+    /// unchanged — a zero key can never be a legitimate checker).
+    /// The critical guard: a live dual-control intent
+    /// (`dual_control_intent` is `Some`) refuses the rotation
+    /// with [`EscrowError::DualControlIntentExists`] — the intent
+    /// itself stores no checker key, and
+    /// [`Escrow::confirm_release`] authenticates against the live
+    /// checker, so rotating mid-flight would hand approval power
+    /// over an unseen declaration to a checker who never saw it;
+    /// the declaration must be confirmed, cancelled, or expired
+    /// first. Because a live intent is excluded, the new checker
+    /// governs from the next `initiate` / `confirm` cycle with no
+    /// approval-power transfer ever in flight. The checker region
+    /// is already resident (33 bytes: 1-byte `Option`
+    /// discriminant + 32-byte key), so the rotation rewrites it in
+    /// place with no layout change. Rotating to the current checker
+    /// is a no-op: it succeeds and writes nothing, so the event
+    /// layer emits nothing for it (paralleling `rotate_arbiter`'s
+    /// no-op rule). Orthogonal to [`Escrow::with_dual_control`]
+    /// (that is the initial opt-in, this item is the post-funding
+    /// rotation), to [`Escrow::rotate_arbiter`] /
+    /// [`Escrow::rotate_milestone_verifier`] (those are other roles,
+    /// this item is the dual-control checker) and to
+    /// [`Escrow::initiate_release`] / [`Escrow::confirm_release`]
+    /// (those are the two-step protocol itself, this item is the
+    /// checker's identity). Emits `DualControlCheckerRotated` on
+    /// the event layer, except for the no-op re-affirmation.
+    /// Rotation moves no funds, so no AV-36 reentrancy lock is
+    /// needed (the lock only guards the fund-moving paths, the
+    /// `rotate_arbiter` precedent).
+    pub fn rotate_dual_control_checker(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_checker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the rotation, paralleling `amend_twap_gate`. The checker
+        // itself does not sign: a lost checker key must not block
+        // its own replacement (the `rotate_arbiter` reasoning).
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow that opted into dual control
+        // may rotate its checker — post-funding installation would
+        // change the release protocol the taker funded under.
+        if self.dual_control_checker.is_none() {
+            return Err(EscrowError::InvalidDualControl);
+        }
+        // The builder's gate, unchanged: a zero key can never be
+        // a legitimate checker.
+        if new_checker == [0u8; 32] {
+            return Err(EscrowError::InvalidDualControl);
+        }
+        // A live intent pins the approver: rotating now would hand
+        // an unseen declaration to a checker who never saw it.
+        // Confirm, cancel, or let it expire first.
+        if self.dual_control_intent.is_some() {
+            return Err(EscrowError::DualControlIntentExists);
+        }
+        // No-op: re-affirming the current checker writes nothing,
+        // so the event layer emits nothing for it.
+        if Some(new_checker) == self.dual_control_checker {
+            return Ok(());
+        }
+        self.dual_control_checker = Some(new_checker);
+        Ok(())
+    }
+
     /// Opt into the permissionless-crank keeper bounty (AV-124).
     /// Builder-style: only valid on an `Uninitialized` escrow, so the
     /// bounty terms are fixed before any funds move — mirroring
@@ -47205,7 +47292,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
-        assert_eq!(EscrowEventKind::from_discriminant(126), None); // AV-262: 125 is TwapGateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
     }
 
     #[test]
@@ -64204,7 +64292,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
-        assert_eq!(EscrowEventKind::from_discriminant(126), None); // AV-262: 125 is TwapGateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -64412,9 +64501,10 @@ mod event_history_tests {
         // `BasePenaltyAmended` (AV-259), 123 is
         // `InterestRateAmended` (AV-260), 124 is
         // `PriceGateAmended` (AV-261), 125 is
-        // `TwapGateAmended` (AV-262) and 126 is the
+        // `TwapGateAmended` (AV-262), 126 is
+        // `DualControlCheckerRotated` (AV-263) and 127 is the
         // first still-unknown byte.
-        for bad in [126u8, 255] {
+        for bad in [127u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -74533,6 +74623,170 @@ mod dual_control_tests {
             EscrowError::DualControlNotInitiated
         );
         assert_eq!(e.event_count(), before);
+    }
+
+    // ----- rotate_dual_control_checker (AV-263) -----
+
+    #[test]
+    fn rotate_moves_checker_and_next_cycle_authenticates_new_checker() {
+        // The checker key moves, nothing else: the 33-byte region
+        // is already resident, so the rotation rewrites it in
+        // place with no layout change and no state move.
+        let mut e = funded_dc();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        let new_checker = [0xC1; 32];
+        e.rotate_dual_control_checker(ALICE, BOB, new_checker)
+            .unwrap();
+        assert_eq!(e.dual_control_checker(), Some(new_checker));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "checker region rewritten in place, no layout change"
+        );
+        // The old checker can no longer approve: the next cycle
+        // authenticates against the live checker only.
+        e.initiate_release(ALICE, NOW, 400_000, None, BOB, TTL)
+            .unwrap();
+        assert_eq!(
+            e.confirm_release(CHECKER, NOW + 100),
+            Err(EscrowError::Unauthorized)
+        );
+        assert!(e.dual_control_intent().is_some());
+        // Cancel and redeclare: the new checker settles it.
+        e.cancel_release(ALICE, NOW + 100).unwrap();
+        e.initiate_release(ALICE, NOW + 100, 400_000, None, BOB, TTL)
+            .unwrap();
+        let (payout, fee) = e.confirm_release(new_checker, NOW + 200).unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.dual_control_intent(), None);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn rotate_rejects_unopted_zero_live_intent_state_authority_and_paused() {
+        // Fail-closed: a never-opted-in escrow can never acquire
+        // dual control after funding, and a failed rotation leaves
+        // it without a checker.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(plain.dual_control_checker(), None);
+        assert_eq!(
+            plain.rotate_dual_control_checker(ALICE, BOB, CHECKER),
+            Err(EscrowError::InvalidDualControl)
+        );
+        assert_eq!(plain.dual_control_checker(), None);
+        // Zero checker: the builder's gate, unchanged.
+        let mut e = funded_dc();
+        assert_eq!(
+            e.rotate_dual_control_checker(ALICE, BOB, ZERO_KEY),
+            Err(EscrowError::InvalidDualControl)
+        );
+        assert_eq!(e.dual_control_checker(), Some(CHECKER));
+        // A live intent pins the approver: confirm, cancel, or let
+        // it expire before rotating.
+        let mut live = declared(400_000, NOW);
+        assert_eq!(
+            live.rotate_dual_control_checker(ALICE, BOB, [0xC1; 32]),
+            Err(EscrowError::DualControlIntentExists)
+        );
+        assert_eq!(live.dual_control_checker(), Some(CHECKER));
+        assert!(live.dual_control_intent().is_some());
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_control(CHECKER)
+            .unwrap();
+        assert_eq!(
+            bare.rotate_dual_control_checker(ALICE, BOB, [0xC1; 32]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Dual signature: one party alone cannot rotate the checker.
+        assert_eq!(
+            e.rotate_dual_control_checker(ALICE, ALICE, [0xC1; 32]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.rotate_dual_control_checker(MALLORY, BOB, [0xC1; 32]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.dual_control_checker(), Some(CHECKER));
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSE_AUTH)
+            .unwrap()
+            .with_dual_control(CHECKER)
+            .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(PAUSE_AUTH, None).unwrap();
+        assert_eq!(
+            paused.rotate_dual_control_checker(ALICE, BOB, [0xC1; 32]),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.dual_control_checker(), Some(CHECKER));
+    }
+
+    #[test]
+    fn rotate_same_checker_is_a_noop() {
+        // Re-affirming the current checker succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = funded_dc();
+        e.rotate_dual_control_checker(ALICE, BOB, CHECKER).unwrap();
+        assert_eq!(e.dual_control_checker(), Some(CHECKER));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn rotate_dual_control_checker_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], NOW)
+            .unwrap()
+            .with_dual_control(CHECKER)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let before = e.event_count();
+        let new_checker = [0xC1; 32];
+        assert_eq!(
+            e.rotate_dual_control_checker(ALICE, ALICE, new_checker, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        // A rotation blocked by a live intent emits nothing either
+        // (the initiate itself emits DualControlInitiated, so the
+        // baseline moves by one before the blocked rotation).
+        e.initiate_release(ALICE, 400_000, None, BOB, TTL, NOW)
+            .unwrap();
+        let declared_count = e.event_count();
+        assert_eq!(
+            e.rotate_dual_control_checker(ALICE, BOB, new_checker, NOW),
+            Err(EscrowError::DualControlIntentExists)
+        );
+        assert_eq!(
+            e.event_count(),
+            declared_count,
+            "intent-blocked calls emit nothing"
+        );
+        e.cancel_release(ALICE, NOW).unwrap();
+        let before_rotate = e.event_count();
+        e.rotate_dual_control_checker(ALICE, BOB, new_checker, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before_rotate + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::DualControlCheckerRotated);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same checker is a no-op: no new event.
+        e.rotate_dual_control_checker(ALICE, BOB, new_checker, NOW)
+            .unwrap();
+        assert_eq!(
+            e.event_count(),
+            before_rotate + 1,
+            "no-op emits nothing"
+        );
     }
 }
 

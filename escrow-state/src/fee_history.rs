@@ -342,6 +342,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // the full-window history coverage requirement);
         // a payout already settled keeps its gate.
         | EscrowEventKind::TwapGateAmended
+        // AV-263: a rotated dual-control checker moves no
+        // funds — the two-step protocol authenticates the
+        // next confirm against the live checker; a live
+        // intent blocks the rotation, so no approval power
+        // is ever transferred mid-flight.
+        | EscrowEventKind::DualControlCheckerRotated
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1126,6 +1132,12 @@ mod fee_history_tests {
         // the full-window history coverage requirement);
         // a payout already settled keeps its gate.
         | EscrowEventKind::TwapGateAmended
+        // AV-263: a rotated dual-control checker moves no
+        // funds — the two-step protocol authenticates the
+        // next confirm against the live checker; a live
+        // intent blocks the rotation, so no approval power
+        // is ever transferred mid-flight.
+        | EscrowEventKind::DualControlCheckerRotated
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
