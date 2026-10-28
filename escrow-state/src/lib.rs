@@ -23351,6 +23351,94 @@ let fee = self.charge_protocol_fee(claimable)?;
     }
 
 
+    /// Revise the oracle price gate after funding
+    /// (AV-261): the post-funding counterpart to
+    /// [`Escrow::with_price_gate`] (`Uninitialized`-only
+    /// initial configuration). Dual-signed governance,
+    /// `Funded`-only, pause first — paralleling
+    /// [`Escrow::amend_interest_rate`]. Only a gate already
+    /// configured may be revised: an ungated escrow is refused
+    /// with [`EscrowError::InvalidPriceGate`] (fail-closed —
+    /// funding under a gate the taker never agreed to would add
+    /// a release restriction after the fact, so post-funding
+    /// installation is not a revision, it is a new deal). There
+    /// is deliberately no clearing path: the signature takes a
+    /// [`PriceGate`] by value, never an `Option`, so a
+    /// configured gate cannot be removed to `None` either
+    /// (removing the market condition the initializer funded
+    /// under would be the same one-sided rewrite in reverse).
+    /// The revision replaces the gate wholesale — `direction`,
+    /// `target` and `max_staleness_secs` together, never
+    /// partially (a half-revised gate would mix an old threshold
+    /// with a new staleness bound the parties never jointly
+    /// approved). The gate region is already resident (18 bytes:
+    /// 1-byte `Option` discriminant + 1-byte direction + 8-byte
+    /// target + 8-byte staleness bound), so the revision rewrites
+    /// it in place with no layout change. The gated payout paths
+    /// read the gate live ([`Escrow::require_price_gate`] checks
+    /// the live gate at every `release_price_gated` /
+    /// `claim_price_gated`), so a new gate governs the next
+    /// gated payout the moment the amendment lands, while a
+    /// payout already settled keeps the gate it settled under —
+    /// and the gated routing itself never changes (an ungated
+    /// plain `release` / `claim` stays ungated; only the gate's
+    /// parameters move). A `target == 0` is refused with
+    /// [`EscrowError::InvalidPriceGate`] (the builder's gate,
+    /// unchanged — a zero threshold can never be a deliberate
+    /// policy). Re-affirming the current gate is a no-op: it
+    /// succeeds and writes nothing, so the event layer emits
+    /// nothing for it (paralleling `amend_interest_rate`'s
+    /// no-op rule). Orthogonal to [`Escrow::with_price_gate`]
+    /// (that is the initial opt-in, this item is the
+    /// post-funding revision), to AV-113 (that is the gate
+    /// mechanism itself, this item is its parameters) and to
+    /// AV-128 (that is the TWAP gate — a separate gate struct
+    /// and region, untouched by this revision). Emits
+    /// `PriceGateAmended` on the event layer, except for the
+    /// no-op re-affirmation.
+    pub fn amend_price_gate(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        gate: PriceGate,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_interest_rate`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only a gate already configured may be
+        // revised — post-funding installation would add a
+        // restriction the taker never funded under. Checked
+        // before the target gate so an ungated escrow never
+        // acquires a gate through this path, whatever the
+        // proposed threshold.
+        if self.price_gate.is_none() {
+            return Err(EscrowError::InvalidPriceGate);
+        }
+        // The builder's gate, unchanged: a zero threshold can
+        // never be a deliberate policy. Checked after the
+        // gate-presence gate so a failed amendment never writes,
+        // and the stored gate stays as it was.
+        if gate.target == 0 {
+            return Err(EscrowError::InvalidPriceGate);
+        }
+        // No-op: re-affirming the current gate writes nothing,
+        // so the event layer emits nothing for it.
+        if Some(gate) == self.price_gate {
+            return Ok(());
+        }
+        self.price_gate = Some(gate);
+        Ok(())
+    }
+
+
     /// Opt in to a timelock (AV-27). Builder-style: only valid on an
     /// `Uninitialized` escrow, so the unlock timestamp is fixed before
     /// any funds move — mirroring [`Escrow::with_grace_period`] and the
@@ -47028,7 +47116,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
         assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
-        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(125), None); // AV-261: 124 is PriceGateAmended
     }
 
     #[test]
@@ -48579,6 +48668,164 @@ mod price_gate_tests {
             .map(|s| &s.name)
             .collect();
         assert!(names.contains(&&"initialize_price_gate"));
+    }
+
+    #[test]
+    fn amend_retunes_gate_whole_and_next_release_reads_live_gate() {
+        // Floor 100_000 / 300s replaced wholesale by ceiling
+        // 50_000 / 60s: direction, target and staleness all move
+        // at once — there is no partial revision that could mix
+        // an old threshold with a new staleness bound.
+        let mut e = gated_escrow(floor_gate());
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        let new_gate = PriceGate {
+            direction: PriceDirection::AtOrBelow,
+            target: 50_000,
+            max_staleness_secs: 60,
+        };
+        e.amend_price_gate(ALICE, BOB, new_gate).unwrap();
+        assert_eq!(e.price_gate(), Some(new_gate));
+        assert_eq!(e.state(), EscrowState::Funded, "amending moves no state");
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "gate region rewritten in place, no layout change"
+        );
+        // Under the old floor, 40_000 would have failed; under
+        // the new ceiling it passes — the live gate governs.
+        let cheap = StaticPriceFeed::new(40_000, T0);
+        e.require_price_gate(&cheap, T0).unwrap();
+        // Above the new ceiling fails, and a quote older than
+        // the new 60s bound fails even at a passing price.
+        let expensive = StaticPriceFeed::new(60_000, T0);
+        assert_eq!(
+            e.require_price_gate(&expensive, T0),
+            Err(EscrowError::PriceGateNotSatisfied)
+        );
+        let stale = StaticPriceFeed::new(40_000, T0 - 61);
+        assert_eq!(
+            e.require_price_gate(&stale, T0),
+            Err(EscrowError::PriceGateNotSatisfied)
+        );
+        // The gated payout path itself follows the new gate.
+        let (payout, fee) = e
+            .release_price_gated(ALICE, T0, AMOUNT, None, BOB, &cheap)
+            .unwrap();
+        assert_eq!((payout, fee), (AMOUNT, 0));
+    }
+
+    #[test]
+    fn amend_leaves_twap_gate_untouched() {
+        // AV-128 orthogonality: revising the single-point gate
+        // never restates the TWAP gate's window, target or
+        // direction — a separate gate struct and region.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_price_gate(floor_gate())
+            .unwrap()
+            .with_twap_gate(100, 100_000, PriceDirection::AtOrAbove)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        let twap_before = e.twap_gate();
+        assert!(twap_before.is_some());
+        e.amend_price_gate(ALICE, BOB, ceiling_gate()).unwrap();
+        assert_eq!(e.price_gate(), Some(ceiling_gate()));
+        assert_eq!(e.twap_gate(), twap_before);
+    }
+
+    #[test]
+    fn amend_rejects_ungated_zero_target_state_authority_and_paused() {
+        // Fail-closed: an ungated escrow can never acquire a gate
+        // after funding, and a failed amendment leaves it ungated.
+        let mut ungated = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        ungated.fund(ALICE, T0).unwrap();
+        assert_eq!(ungated.price_gate(), None);
+        assert_eq!(
+            ungated.amend_price_gate(ALICE, BOB, floor_gate()),
+            Err(EscrowError::InvalidPriceGate)
+        );
+        assert_eq!(ungated.price_gate(), None, "no gate installed by the refusal");
+        // Zero target: the builder's gate, unchanged.
+        let mut e = gated_escrow(floor_gate());
+        assert_eq!(
+            e.amend_price_gate(
+                ALICE,
+                BOB,
+                PriceGate {
+                    direction: PriceDirection::AtOrAbove,
+                    target: 0,
+                    max_staleness_secs: 300,
+                }
+            ),
+            Err(EscrowError::InvalidPriceGate)
+        );
+        assert_eq!(e.price_gate(), Some(floor_gate()));
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_price_gate(floor_gate())
+            .unwrap();
+        assert_eq!(
+            bare.amend_price_gate(ALICE, BOB, ceiling_gate()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Dual signature: one party alone cannot retune the gate.
+        assert_eq!(
+            e.amend_price_gate(ALICE, ALICE, ceiling_gate()),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_price_gate(MALLORY, BOB, ceiling_gate()),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.price_gate(), Some(floor_gate()));
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_price_gate(floor_gate())
+            .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_price_gate(ALICE, BOB, ceiling_gate()),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.price_gate(), Some(floor_gate()));
+    }
+
+    #[test]
+    fn amend_same_gate_is_a_noop() {
+        // Re-affirming the current gate succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = gated_escrow(floor_gate());
+        e.amend_price_gate(ALICE, BOB, floor_gate()).unwrap();
+        assert_eq!(e.price_gate(), Some(floor_gate()));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_price_gate_indexed_emits_event_noop_and_failed_emit_nothing() {
+        let funded = gated_escrow(floor_gate());
+        let mut e = IndexedEscrow::wrap([0x1D; 32], funded);
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_price_gate(ALICE, ALICE, ceiling_gate(), T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_price_gate(ALICE, BOB, ceiling_gate(), T0).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::PriceGateAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same gate is a no-op: no new event.
+        e.amend_price_gate(ALICE, BOB, ceiling_gate(), T0).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
     }
 
     #[test]
@@ -63681,7 +63928,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
         assert_eq!(EscrowEventKind::from_discriminant(123), Some(EscrowEventKind::InterestRateAmended)); // AV-260: 123 is InterestRateAmended
-        assert_eq!(EscrowEventKind::from_discriminant(124), None); // AV-260: 123 is InterestRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(125), None); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -63887,9 +64135,10 @@ mod event_history_tests {
         // `PenaltyEscalationAmended` (AV-257), 121 is
         // `RefundAddressAmended` (AV-258), 122 is
         // `BasePenaltyAmended` (AV-259), 123 is
-        // `InterestRateAmended` (AV-260) and 124 is the
+        // `InterestRateAmended` (AV-260), 124 is
+        // `PriceGateAmended` (AV-261) and 125 is the
         // first still-unknown byte.
-        for bad in [124u8, 255] {
+        for bad in [125u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
