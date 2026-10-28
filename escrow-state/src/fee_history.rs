@@ -310,6 +310,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // binding at every payout; referral already
         // charged is never clawed back.
         | EscrowEventKind::ReferrerAmended
+        // AV-257: a revised escalation schedule moves
+        // no funds — the cancel gate re-reads the live
+        // schedule at every cancel_expired; a cancel
+        // already settled keeps its penalty.
+        | EscrowEventKind::PenaltyEscalationAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1062,6 +1067,11 @@ mod fee_history_tests {
         // binding at every payout; referral already
         // charged is never clawed back.
         | EscrowEventKind::ReferrerAmended
+        // AV-257: a revised escalation schedule moves
+        // no funds — the cancel gate re-reads the live
+        // schedule at every cancel_expired; a cancel
+        // already settled keeps its penalty.
+        | EscrowEventKind::PenaltyEscalationAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
