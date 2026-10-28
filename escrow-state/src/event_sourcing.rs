@@ -263,6 +263,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // authority is untouched and no rent is
         // recomputed.
         | EscrowEventKind::RentPayerAmended
+        // AV-256: a revised referrer moves no
+        // funds — the release gate re-reads the live
+        // binding at every payout; referral already
+        // charged is never clawed back.
+        | EscrowEventKind::ReferrerAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1006,6 +1011,11 @@ mod event_sourcing_tests {
         // authority is untouched and no rent is
         // recomputed.
         | EscrowEventKind::RentPayerAmended
+        // AV-256: a revised referrer moves no
+        // funds — the release gate re-reads the live
+        // binding at every payout; referral already
+        // charged is never clawed back.
+        | EscrowEventKind::ReferrerAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

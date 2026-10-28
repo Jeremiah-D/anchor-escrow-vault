@@ -19790,6 +19790,66 @@ let fee = self.charge_protocol_fee(claimable)?;
         self.referral_bps
     }
 
+    /// Revise the bound referrer after funding (AV-256): the
+    /// post-funding counterpart to [`Escrow::with_referrer`]
+    /// (`Uninitialized`-only initial configuration). Dual-signed
+    /// governance, `Funded`-only, pause first — paralleling
+    /// [`Escrow::amend_rent_payer`]. Only `referrer` and
+    /// `referral_bps` change — `referral_paid` is never rewritten,
+    /// so a rate cut can never claw back referral already charged.
+    /// The release gate reads both fields live
+    /// ([`Escrow::referral_for`] / [`Escrow::charge_referral`]
+    /// compute from the live binding at every payout), so a new
+    /// referrer / rate prices the next release the moment the
+    /// amendment lands, while releases already made keep the
+    /// referral they charged. A zero referrer is refused with
+    /// [`EscrowError::InvalidReferral`] and a rate above
+    /// [`MAX_REFERRAL_BPS`] likewise (the builder's gates,
+    /// unchanged — a bound referrer must be a real key, and the
+    /// 20% cap keeps the incentive from silently rerouting the
+    /// whole payout). Re-affirming the current (referrer, rate)
+    /// pair is a no-op: it succeeds and writes nothing, so the
+    /// event layer emits nothing for it (paralleling
+    /// `amend_rent_payer`'s no-op rule). There is deliberately no
+    /// unbind-to-`None` path here: an unbound escrow keeps the
+    /// no-referrer default, and this item only moves a bound
+    /// referrer from one key/rate to another (or binds the first
+    /// one). Orthogonal to AV-191's referral mechanism itself
+    /// (this item is the post-funding revision) and to AV-253's
+    /// `amend_fee_schedule` (protocol fee, not referrer revenue).
+    /// Emits `ReferrerAmended` on the event layer, except for
+    /// the no-op re-affirmation.
+    pub fn amend_referrer(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        referrer: [u8; 32],
+        referral_bps: u16,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_rent_payer`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // The builder's gates, unchanged: a bound referrer must be
+        // a real key and the rate must stay within the 20% cap.
+        // Checked after state so a failed amendment never writes,
+        // and the stored binding stays as it was.
+        if referrer == [0u8; 32] || referral_bps > MAX_REFERRAL_BPS {
+            return Err(EscrowError::InvalidReferral);
+        }
+        self.referrer = Some(referrer);
+        self.referral_bps = referral_bps;
+        Ok(())
+    }
+
+
     /// Cumulative referral share charged across all releases (AV-191).
     /// Always `<= released_amount()`: the referral is a routing slice
     /// of the gross payouts, and it folds into the `fee` leg of the
@@ -46698,7 +46758,8 @@ mod funding_tranche_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(117), Some(EscrowEventKind::StreamingFeeRateAmended)); // AV-254: 117 is StreamingFeeRateAmended
         assert_eq!(EscrowEventKind::from_discriminant(118), Some(EscrowEventKind::RentPayerAmended)); // AV-255: 118 is RentPayerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(119), None); // AV-255: 118 is RentPayerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(120), None); // AV-256: 119 is ReferrerAmended
     }
 
     #[test]
@@ -62948,7 +63009,8 @@ mod event_history_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(117), Some(EscrowEventKind::StreamingFeeRateAmended)); // AV-254: 117 is StreamingFeeRateAmended
         assert_eq!(EscrowEventKind::from_discriminant(118), Some(EscrowEventKind::RentPayerAmended)); // AV-255: 118 is RentPayerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(119), None); // AV-255: 118 is RentPayerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(120), None); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -63149,9 +63211,10 @@ mod event_history_tests {
         // `RentSweepGraceAmended` (AV-252), 116 is
         // `FeeScheduleAmended` (AV-253), 117 is
         // `StreamingFeeRateAmended` (AV-254), 118 is
-        // `RentPayerAmended` (AV-255) and 119 is the
+        // `RentPayerAmended` (AV-255), 119 is
+        // `ReferrerAmended` (AV-256) and 120 is the
         // first still-unknown byte.
-        for bad in [119u8, 255] {
+        for bad in [120u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -75172,6 +75235,129 @@ mod referral_tests {
         );
         // The preview charges nothing.
         assert_eq!(e.referral_paid(), 0);
+    }
+
+    #[test]
+    fn amend_rebinds_referrer_and_next_release_charges_new_rate() {
+        // A partial release first charges the old rate, then the
+        // amendment reprices the remainder live — and the referral
+        // already charged is never rewritten.
+        let mut e = funded_referral_escrow(1_000);
+        let (payout, fee) = e.release(ALICE, NOW, 400_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (360_000, 40_000));
+        assert_eq!(e.referral_paid(), 40_000);
+        let new_referrer = [0xDD; 32];
+        e.amend_referrer(ALICE, BOB, new_referrer, 500).unwrap();
+        assert_eq!(e.referrer(), Some(new_referrer));
+        assert_eq!(e.referral_bps(), 500);
+        assert_eq!(e.referral_paid(), 40_000, "amending rewrites no history");
+        assert_eq!(e.state(), EscrowState::Funded, "amending moves no state");
+        assert_eq!(e.referral_for(600_000), 30_000, "live rate prices the next release");
+        let (payout, fee) = e.release(ALICE, NOW, 600_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (570_000, 30_000));
+        assert_eq!(e.referral_paid(), 70_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_binds_first_referrer_on_an_unbound_escrow() {
+        // An escrow that never bound a referrer gains its first one
+        // on amendment, and the next release charges it.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.referrer(), None);
+        assert_eq!(e.referral_for(1_000_000), 0);
+        e.amend_referrer(ALICE, BOB, REFERRER, 1_000).unwrap();
+        assert_eq!(e.referrer(), Some(REFERRER));
+        assert_eq!(e.referral_bps(), 1_000);
+        let (payout, fee) = e.release(ALICE, NOW, 1_000_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (900_000, 100_000));
+        assert_eq!(e.referral_paid(), 100_000);
+    }
+
+    #[test]
+    fn amend_same_pair_is_a_noop() {
+        // Re-affirming the current (referrer, rate) pair succeeds
+        // but changes nothing observable; the event layer (tested
+        // below) emits nothing for it.
+        let mut e = funded_referral_escrow(1_000);
+        e.amend_referrer(ALICE, BOB, REFERRER, 1_000).unwrap();
+        assert_eq!(e.referrer(), Some(REFERRER));
+        assert_eq!(e.referral_bps(), 1_000);
+        assert_eq!(e.referral_paid(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_rejects_zero_cap_state_authority_and_paused() {
+        let mut e = funded_referral_escrow(1_000);
+        // The builder's gates, unchanged.
+        assert_eq!(
+            e.amend_referrer(ALICE, BOB, [0u8; 32], 1_000),
+            Err(EscrowError::InvalidReferral)
+        );
+        assert_eq!(
+            e.amend_referrer(ALICE, BOB, REFERRER, MAX_REFERRAL_BPS + 1),
+            Err(EscrowError::InvalidReferral)
+        );
+        assert_eq!(e.referrer(), Some(REFERRER));
+        assert_eq!(e.referral_bps(), 1_000);
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_referrer(REFERRER, 1_000)
+            .unwrap();
+        assert_eq!(
+            bare.amend_referrer(ALICE, BOB, REFERRER, 500),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Dual signature: one party alone cannot re-point the referral.
+        assert_eq!(
+            e.amend_referrer(ALICE, ALICE, REFERRER, 500),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_referrer([0xEE; 32], BOB, REFERRER, 500),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.referral_bps(), 1_000);
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_referrer(REFERRER, 1_000)
+            .unwrap();
+        paused.fund(ALICE, NOW).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_referrer(ALICE, BOB, REFERRER, 500),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.referral_bps(), 1_000);
+    }
+
+    #[test]
+    fn amend_referrer_indexed_emits_event_noop_and_failed_emit_nothing() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0x1D; 32], NOW)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_referrer(ALICE, ALICE, REFERRER, 1_000, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_referrer(ALICE, BOB, REFERRER, 1_000, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::ReferrerAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same pair is a no-op: no new event.
+        e.amend_referrer(ALICE, BOB, REFERRER, 1_000, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
     }
 }
 
