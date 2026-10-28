@@ -23144,6 +23144,73 @@ let fee = self.charge_protocol_fee(claimable)?;
     }
 
 
+    /// Revise the refund address after funding
+    /// (AV-258): the post-funding counterpart to
+    /// [`Escrow::with_refund_address`] (`Uninitialized`-only
+    /// initial configuration). Dual-signed governance,
+    /// `Funded`-only, pause first — paralleling
+    /// [`Escrow::amend_referrer`]. Only `refund_to` changes —
+    /// the initializer/taker identities are never restated and
+    /// no settled refund is ever rewritten, so a refund already
+    /// paid keeps the destination it paid. The cancel paths read
+    /// the address live ([`Escrow::refund_recipient`] is
+    /// `refund_to.unwrap_or(initializer)` and
+    /// [`Escrow::require_refund_recipient`] checks the live
+    /// address at every `cancel`/`cancel_expired`), so a new
+    /// address routes the next cancel the moment the amendment
+    /// lands, while a cancel already settled keeps its
+    /// destination. A zero address is refused with
+    /// [`EscrowError::RefundAddressMismatch`] (the builder's
+    /// gate, unchanged — a zero key can never be a legitimate
+    /// refund destination). Re-affirming the current effective
+    /// recipient is a no-op: it succeeds and writes nothing, so
+    /// the event layer emits nothing for it (paralleling
+    /// `amend_referrer`'s no-op rule). There is deliberately no
+    /// unbind-to-`None` path: clearing the whitelist is a
+    /// re-point to the initializer, not a removal — callers
+    /// that want the default route pass the initializer's key.
+    /// Orthogonal to [`Escrow::update_payout_allowlist`] (that
+    /// is the taker-payout direction; this item is the
+    /// initializer-refund direction) and to
+    /// [`Escrow::rotate_fee_recipient`] (that is the protocol-fee
+    /// recipient; this item is the refund address). Emits
+    /// `RefundAddressAmended` on the event layer, except for
+    /// the no-op re-affirmation.
+    pub fn amend_refund_address(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_refund_to: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_referrer`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // The builder's gate, unchanged: a bound refund address
+        // must be a real key. Checked after state so a failed
+        // amendment never writes, and the stored address stays
+        // as it was.
+        if new_refund_to == [0u8; 32] {
+            return Err(EscrowError::RefundAddressMismatch);
+        }
+        // No-op: re-affirming the current effective recipient
+        // (the whitelist when set, else the initializer) writes
+        // nothing, so the event layer emits nothing for it.
+        if new_refund_to == self.refund_recipient() {
+            return Ok(());
+        }
+        self.refund_to = Some(new_refund_to);
+        Ok(())
+    }
+
+
     /// Opt in to a timelock (AV-27). Builder-style: only valid on an
     /// `Uninitialized` escrow, so the unlock timestamp is fixed before
     /// any funds move — mirroring [`Escrow::with_grace_period`] and the
@@ -46818,7 +46885,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(118), Some(EscrowEventKind::RentPayerAmended)); // AV-255: 118 is RentPayerAmended
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
-        assert_eq!(EscrowEventKind::from_discriminant(121), None); // AV-257: 120 is PenaltyEscalationAmended
+        assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
     }
 
     #[test]
@@ -57056,6 +57124,141 @@ mod refund_tests {
         assert_eq!(bytes[652], 1, "refund_to: Some discriminant");
         assert_eq!(&bytes[653..685], &CAROL, "refund_to bytes");
     }
+
+    #[test]
+    fn amend_repoints_whitelist_and_next_cancel_follows_live_address() {
+        // The cancel gate reads the whitelist live, so a
+        // re-pointed address routes the next cancel while the
+        // old address stops working at once.
+        const DAVE: [u8; 32] = [0xDD; 32];
+        let mut e = funded_whitelisted();
+        e.amend_refund_address(ALICE, BOB, DAVE).unwrap();
+        assert_eq!(e.refund_to(), Some(DAVE));
+        assert_eq!(e.refund_recipient(), DAVE);
+        assert_eq!(e.state(), EscrowState::Funded, "amending moves no state");
+        assert_eq!(
+            e.cancel(ALICE, None, CAROL, 0),
+            Err(EscrowError::RefundAddressMismatch),
+            "the old whitelist stops working at once"
+        );
+        e.cancel(ALICE, None, DAVE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        // The expiry path follows the live address too.
+        let mut e = funded_whitelisted();
+        e.amend_refund_address(ALICE, BOB, DAVE).unwrap();
+        assert_eq!(
+            e.cancel_expired(BOB, EXPIRES_AT, None, CAROL),
+            Err(EscrowError::RefundAddressMismatch)
+        );
+        e.cancel_expired(BOB, EXPIRES_AT, None, DAVE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn amend_installs_first_whitelist_on_unwhitelisted_escrow() {
+        // An escrow that never opted into a whitelist gains its
+        // first binding on amendment, and the next cancel is
+        // pinned to it — the initializer's own key stops working.
+        let mut e = funded(1_000_000, EXPIRES_AT);
+        assert_eq!(e.refund_to(), None);
+        assert_eq!(e.refund_recipient(), ALICE);
+        e.amend_refund_address(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.refund_to(), Some(CAROL));
+        assert_eq!(e.refund_recipient(), CAROL);
+        assert_eq!(
+            e.cancel(ALICE, None, ALICE, 0),
+            Err(EscrowError::RefundAddressMismatch)
+        );
+        e.cancel(ALICE, None, CAROL, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn amend_same_recipient_is_a_noop() {
+        // Re-affirming the current effective recipient succeeds
+        // but changes nothing observable; the event layer
+        // (tested below) emits nothing for it.
+        let mut e = funded_whitelisted();
+        e.amend_refund_address(ALICE, BOB, CAROL).unwrap();
+        assert_eq!(e.refund_to(), Some(CAROL));
+        assert_eq!(e.state(), EscrowState::Funded);
+        // An unwhitelisted escrow re-affirming its default
+        // recipient (the initializer) stays unwhitelisted.
+        let mut e = funded(1_000_000, EXPIRES_AT);
+        e.amend_refund_address(ALICE, BOB, ALICE).unwrap();
+        assert_eq!(e.refund_to(), None);
+        assert_eq!(e.refund_recipient(), ALICE);
+    }
+
+    #[test]
+    fn amend_rejects_zero_state_authority_and_paused() {
+        const DAVE: [u8; 32] = [0xDD; 32];
+        let mut e = funded_whitelisted();
+        // The builder's gate, unchanged.
+        assert_eq!(
+            e.amend_refund_address(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::RefundAddressMismatch)
+        );
+        assert_eq!(e.refund_to(), Some(CAROL));
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_refund_address(CAROL)
+            .unwrap();
+        assert_eq!(
+            bare.amend_refund_address(ALICE, BOB, DAVE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Dual signature: one party alone cannot re-point the refund.
+        assert_eq!(
+            e.amend_refund_address(ALICE, ALICE, DAVE),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_refund_address(MALLORY, BOB, DAVE),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.refund_to(), Some(CAROL));
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_refund_address(CAROL)
+            .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_refund_address(ALICE, BOB, DAVE),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.refund_to(), Some(CAROL));
+    }
+
+    #[test]
+    fn amend_refund_address_indexed_emits_event_noop_and_failed_emit_nothing() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0x1D; 32], EXPIRES_AT - 3_600)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_refund_address(ALICE, ALICE, CAROL, EXPIRES_AT - 3_600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_refund_address(ALICE, BOB, CAROL, EXPIRES_AT - 3_600)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::RefundAddressAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same recipient is a no-op: no new event.
+        e.amend_refund_address(ALICE, BOB, CAROL, EXPIRES_AT - 3_600)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
 }
 
 // ---------- AV-24: anti-griefing penalty on taker-initiated cancel_expired ----------
@@ -63199,7 +63402,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(118), Some(EscrowEventKind::RentPayerAmended)); // AV-255: 118 is RentPayerAmended
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
-        assert_eq!(EscrowEventKind::from_discriminant(121), None); // AV-257: 120 is PenaltyEscalationAmended
+        assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -63402,9 +63606,10 @@ mod event_history_tests {
         // `StreamingFeeRateAmended` (AV-254), 118 is
         // `RentPayerAmended` (AV-255), 119 is
         // `ReferrerAmended` (AV-256), 120 is
-        // `PenaltyEscalationAmended` (AV-257) and 121 is the
+        // `PenaltyEscalationAmended` (AV-257), 121 is
+        // `RefundAddressAmended` (AV-258) and 122 is the
         // first still-unknown byte.
-        for bad in [121u8, 255] {
+        for bad in [122u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

@@ -315,6 +315,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // schedule at every cancel_expired; a cancel
         // already settled keeps its penalty.
         | EscrowEventKind::PenaltyEscalationAmended
+        // AV-258: a revised refund address moves
+        // no funds — the cancel paths re-read the live
+        // address at every cancel / cancel_expired; a refund
+        // already settled keeps its destination.
+        | EscrowEventKind::RefundAddressAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1072,6 +1077,11 @@ mod fee_history_tests {
         // schedule at every cancel_expired; a cancel
         // already settled keeps its penalty.
         | EscrowEventKind::PenaltyEscalationAmended
+        // AV-258: a revised refund address moves
+        // no funds — the cancel paths re-read the live
+        // address at every cancel / cancel_expired; a refund
+        // already settled keeps its destination.
+        | EscrowEventKind::RefundAddressAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
