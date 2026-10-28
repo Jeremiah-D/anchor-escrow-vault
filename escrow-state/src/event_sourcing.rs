@@ -252,6 +252,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // schedule; fees already charged or withdrawn are never
         // restated.
         | EscrowEventKind::FeeScheduleAmended
+        // AV-254: a revised streaming fee rate moves no
+        // funds — the charge gate re-reads the live rate
+        // against the unchanged fund_at anchor; fees
+        // already charged are never clawed back.
+        | EscrowEventKind::StreamingFeeRateAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -984,6 +989,11 @@ mod event_sourcing_tests {
         // schedule; fees already charged or withdrawn are never
         // restated.
         | EscrowEventKind::FeeScheduleAmended
+        // AV-254: a revised streaming fee rate moves no
+        // funds — the charge gate re-reads the live rate
+        // against the unchanged fund_at anchor; fees
+        // already charged are never clawed back.
+        | EscrowEventKind::StreamingFeeRateAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

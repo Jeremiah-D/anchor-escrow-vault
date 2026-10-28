@@ -17775,6 +17775,50 @@ let fee = self.charge_protocol_fee(claimable)?;
         self.streaming_fees_accrued
     }
 
+    /// Revise the streaming fee rate after funding (AV-254): the
+    /// post-funding counterpart to [`Escrow::with_streaming_fee`]
+    /// (`Uninitialized`-only initial configuration). Dual-signed
+    /// governance, `Funded`-only, pause first — paralleling
+    /// [`Escrow::amend_fee_schedule`]. Any u64 rate is legal:
+    /// `0` disables further accrual (the builder's `0` semantics,
+    /// matching [`Escrow::charge_streaming_fee`]'s early return),
+    /// it does not refund anything. Only `streaming_fee_rate`
+    /// changes — `fund_at` is never restated and
+    /// `streaming_fees_accrued` / `fees_paid` are never rewritten,
+    /// so a rate cut can never claw back fees already charged.
+    /// The charge gate reads the rate live
+    /// ([`Escrow::charge_streaming_fee`] recomputes
+    /// `theoretical = rate * (accrue_upto - fund_at)` at every
+    /// payout and bills only the saturating excess over what was
+    /// already accrued), so lowering the rate makes the next
+    /// settlement bill `0` (theoretical falls back below the
+    /// accrued counter, saturating — never negative), while
+    /// raising it bills the difference on the next settlement.
+    /// Orthogonal to AV-100's accrual mechanism itself (this item
+    /// is the post-funding revision) and to AV-233/AV-253 (flat /
+    /// tiered payout fees, not the per-second streaming rate).
+    /// Emits `StreamingFeeRateAmended` on the event layer.
+    pub fn amend_streaming_fee(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        rate: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_fee_schedule`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        self.streaming_fee_rate = rate;
+        Ok(())
+    }
+
     /// Charge the streaming fee newly accrued up to `accrue_upto`
     /// (AV-100). `net_payout` is the payout *after* the AV-17 bps fee
     /// — the streaming fee slices the remainder. Returns the charged
@@ -46598,7 +46642,8 @@ mod funding_tranche_tests {
             EscrowEventKind::from_discriminant(116),
             Some(EscrowEventKind::FeeScheduleAmended)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), Some(EscrowEventKind::StreamingFeeRateAmended)); // AV-254: 117 is StreamingFeeRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(118), None); // AV-254: 117 is StreamingFeeRateAmended
     }
 
     #[test]
@@ -62846,7 +62891,8 @@ mod event_history_tests {
             Some(EscrowEventKind::FeeScheduleAmended),
             "AV-253: appended after RentSweepGraceAmended"
         );
-        assert_eq!(EscrowEventKind::from_discriminant(117), None); // AV-253: 116 is FeeScheduleAmended
+        assert_eq!(EscrowEventKind::from_discriminant(117), Some(EscrowEventKind::StreamingFeeRateAmended)); // AV-254: 117 is StreamingFeeRateAmended
+        assert_eq!(EscrowEventKind::from_discriminant(118), None); // AV-254: 117 is StreamingFeeRateAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -63045,9 +63091,10 @@ mod event_history_tests {
         // `RelativeTimelockAmended` (AV-250), 114 is
         // `SlotTimelockAmended` (AV-251), 115 is
         // `RentSweepGraceAmended` (AV-252), 116 is
-        // `FeeScheduleAmended` (AV-253) and 117 is the
+        // `FeeScheduleAmended` (AV-253), 117 is
+        // `StreamingFeeRateAmended` (AV-254) and 118 is the
         // first still-unknown byte.
-        for bad in [117u8, 255] {
+        for bad in [118u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -76854,6 +76901,149 @@ mod fee_schedule_amend_tests {
         assert_eq!(e.event_count(), before + 1);
         let ev = e.events().last().copied().expect("event pushed");
         assert_eq!(ev.kind, EscrowEventKind::FeeScheduleAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+    }
+}
+
+#[cfg(test)]
+mod streaming_fee_rate_amend_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const FUND_AT: u64 = 1_700_000_000;
+
+    fn streaming_escrow(rate: u64) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_streaming_fee(rate)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_raises_rate_and_next_release_bills_the_difference() {
+        // rate 10/s: 100s bills 1_000. Raising to 20/s reprices the
+        // whole funded window live (20 * 200 = 4_000 theoretical),
+        // so the next settlement bills only the 3_000 difference.
+        let mut e = streaming_escrow(10);
+        let (_, fee1) = e.release(ALICE, FUND_AT + 100, 600_000, None, BOB).unwrap();
+        assert_eq!(fee1, 1_000);
+        assert_eq!(e.streaming_fees_accrued(), 1_000);
+        e.amend_streaming_fee(ALICE, BOB, 20).unwrap();
+        assert_eq!(e.streaming_fee_rate(), 20);
+        assert_eq!(e.fund_at(), FUND_AT, "amending restates no anchor");
+        assert_eq!(e.streaming_fees_accrued(), 1_000, "amending bills nothing");
+        assert_eq!(e.fees_paid(), 1_000);
+        let (_, fee2) = e.release(ALICE, FUND_AT + 200, 400_000, None, BOB).unwrap();
+        assert_eq!(fee2, 3_000);
+        assert_eq!(e.streaming_fees_accrued(), 4_000);
+        assert_eq!(e.fees_paid(), 4_000);
+    }
+
+    #[test]
+    fn amend_lowers_rate_and_accrued_is_never_clawed_back() {
+        // rate 10/s bills 1_000 over 100s. Cutting to 5/s drops the
+        // theoretical for 200s to 1_000 — exactly what was already
+        // billed — so the next settlement bills 0, and the 1_000
+        // already charged is never refunded or restated.
+        let mut e = streaming_escrow(10);
+        let (_, fee1) = e.release(ALICE, FUND_AT + 100, 600_000, None, BOB).unwrap();
+        assert_eq!(fee1, 1_000);
+        e.amend_streaming_fee(ALICE, BOB, 5).unwrap();
+        let (payout, fee2) = e.release(ALICE, FUND_AT + 200, 400_000, None, BOB).unwrap();
+        assert_eq!(fee2, 0);
+        assert_eq!(payout, 400_000);
+        assert_eq!(e.streaming_fees_accrued(), 1_000);
+        assert_eq!(e.fees_paid(), 1_000);
+    }
+
+    #[test]
+    fn amend_to_zero_stops_future_accrual() {
+        // Zero is the builder's off-switch, not a refund: past
+        // accrual stays billed, later seconds bill nothing.
+        let mut e = streaming_escrow(10);
+        let (_, fee1) = e.release(ALICE, FUND_AT + 100, 600_000, None, BOB).unwrap();
+        assert_eq!(fee1, 1_000);
+        e.amend_streaming_fee(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.streaming_fee_rate(), 0);
+        let (payout, fee2) = e.release(ALICE, FUND_AT + 1_100, 400_000, None, BOB).unwrap();
+        assert_eq!(fee2, 0);
+        assert_eq!(payout, 400_000);
+        assert_eq!(e.streaming_fees_accrued(), 1_000);
+    }
+
+    #[test]
+    fn amend_installs_first_rate_on_a_rate_free_escrow() {
+        // Like AV-253's first schedule, an escrow that never set a
+        // streaming rate gains one on amendment, and the next
+        // payout bills live from it.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX).unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(e.streaming_fee_rate(), 0);
+        e.amend_streaming_fee(ALICE, BOB, 10).unwrap();
+        let (_, fee) = e.release(ALICE, FUND_AT + 100, 1_000_000, None, BOB).unwrap();
+        assert_eq!(fee, 1_000);
+        assert_eq!(e.streaming_fees_accrued(), 1_000);
+    }
+
+    #[test]
+    fn amend_rejects_state_authority_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_streaming_fee(10)
+            .unwrap();
+        assert_eq!(
+            bare.amend_streaming_fee(ALICE, BOB, 20),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.streaming_fee_rate(), 10);
+        // Dual signature: one party alone cannot move the other's rate.
+        let mut e = streaming_escrow(10);
+        assert_eq!(
+            e.amend_streaming_fee(ALICE, ALICE, 20),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_streaming_fee([0xCC; 32], BOB, 20),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.streaming_fee_rate(), 10);
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_streaming_fee(10)
+            .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_streaming_fee(ALICE, BOB, 20),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.streaming_fee_rate(), 10);
+    }
+
+    #[test]
+    fn amend_streaming_fee_indexed_emits_event_and_failed_emits_nothing() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, u64::MAX, [0x1D; 32], FUND_AT)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_streaming_fee(ALICE, ALICE, 20, FUND_AT),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_streaming_fee(ALICE, BOB, 20, FUND_AT).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::StreamingFeeRateAmended);
         assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
         assert_eq!(ev.amounts.payout, 0);
         assert_eq!(ev.amounts.fee, 0);
