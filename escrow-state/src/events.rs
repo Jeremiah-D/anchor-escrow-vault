@@ -282,6 +282,15 @@
 //!   the destination it paid. A failed amendment emits
 //!   nothing, and a no-op re-affirmation of the current
 //!   recipient emits nothing either.
+//! - `amend_penalty_bps` emits
+//!   [`EscrowEventKind::BasePenaltyAmended`] on every
+//!   successful amendment that actually changes the rate
+//!   (AV-259) — `from == to ==` the current state, all amounts
+//!   zero; the amended rate is read from the vault, and the
+//!   cancel gate re-reads it live at every `cancel_expired`,
+//!   while a cancel already settled keeps the penalty it
+//!   charged. A failed amendment emits nothing, and a no-op
+//!   re-affirmation of the current rate emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -496,6 +505,7 @@
 //! | ReferrerAmended (AV-256) | 0 | 0 | 0 | 0 — amending moves no funds; the release gate re-reads the live binding at every payout, while referral already charged is never clawed back |
 //! | PenaltyEscalationAmended (AV-257) | 0 | 0 | 0 | 0 — amending moves no funds; the cancel gate re-reads the live schedule at every `cancel_expired`, while a cancel already settled keeps the penalty it charged |
 //! | RefundAddressAmended (AV-258) | 0 | 0 | 0 | 0 — amending moves no funds; the cancel paths re-read the live address at every `cancel` / `cancel_expired`, while a refund already settled keeps the destination it paid |
+//! | BasePenaltyAmended (AV-259) | 0 | 0 | 0 | 0 — amending moves no funds; the cancel gate re-reads the live base rate at every `cancel_expired`, while a cancel already settled keeps the penalty it charged |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1734,6 +1744,21 @@ pub enum EscrowEventKind {
     /// needs no extra field. A no-op re-affirmation of the
     /// current recipient emits nothing.
     RefundAddressAmended,
+    /// AV-259: the base anti-griefing penalty rate was revised
+    /// by dual-signed governance
+    /// ([`Escrow::amend_penalty_bps`](crate::Escrow::amend_penalty_bps)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::ProtocolFeeAmended`]); all amounts are
+    /// zero — amending moves no funds (the cancel gate re-reads
+    /// the live base rate at every `cancel_expired`, so a cancel
+    /// after the amendment prices from the new rate while a
+    /// cancel before it priced from the old one; the escalation
+    /// schedule and the meter origin never move). The amended
+    /// rate is read from the vault, so the event needs no extra
+    /// field. A no-op re-affirmation of the current rate emits
+    /// nothing.
+    BasePenaltyAmended,
 }
 
 impl EscrowEventKind {
@@ -2089,6 +2114,10 @@ impl EscrowEventKind {
             // discriminants 0–120 stay stable for already-serialized
             // histories.
             121 => Self::RefundAddressAmended,
+            // AV-259: appended after RefundAddressAmended so
+            // discriminants 0–121 stay stable for already-serialized
+            // histories.
+            122 => Self::BasePenaltyAmended,
             _ => return None,
         })
     }
@@ -2286,6 +2315,7 @@ impl EscrowEventKind {
             Self::ReferrerAmended => "referrer_amended",
             Self::PenaltyEscalationAmended => "penalty_escalation_amended",
             Self::RefundAddressAmended => "refund_address_amended",
+            Self::BasePenaltyAmended => "base_penalty_amended",
         }
     }
 
@@ -2487,6 +2517,7 @@ impl EscrowEventKind {
             "referrer_amended" => Self::ReferrerAmended,
             "penalty_escalation_amended" => Self::PenaltyEscalationAmended,
             "refund_address_amended" => Self::RefundAddressAmended,
+            "base_penalty_amended" => Self::BasePenaltyAmended,
             _ => return None,
         })
     }
@@ -7875,6 +7906,46 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the base penalty rate after funding
+    /// (mirrors [`Escrow::amend_penalty_bps`]). Emits
+    /// `BasePenaltyAmended` when the rate actually changes
+    /// (`from == to ==` the current state — the meter, not the
+    /// lifecycle state, is what changed; all amounts zero,
+    /// since amending moves no funds — the cancel gate
+    /// re-reads the live base rate at every `cancel_expired`,
+    /// while a cancel already settled keeps the penalty it
+    /// charged). The amended rate is read from the vault, so
+    /// the event needs no extra field. A failed amendment emits
+    /// nothing, and a no-op re-affirmation of the current rate
+    /// emits nothing either, paralleling
+    /// `amend_penalty_escalation`'s no-op rule.
+    pub fn amend_penalty_bps(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        penalty_bps: u16,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let before = self.inner.penalty_bps();
+        self.inner.amend_penalty_bps(initializer, taker, penalty_bps)?;
+        if self.inner.penalty_bps() != before {
+            self.push_event(
+                EscrowEventKind::BasePenaltyAmended,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// The live milestone tranche table as a fixed
     /// `MAX_MILESTONES` array (entries past the plan's count are
     /// zero): the shape the `MilestonesReallocated` event carries
@@ -12506,7 +12577,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -12616,7 +12688,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13160,7 +13233,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13182,7 +13256,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13201,7 +13276,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13220,7 +13296,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13239,7 +13316,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13261,7 +13339,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13283,7 +13362,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13302,7 +13382,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13321,7 +13402,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13340,7 +13422,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13359,7 +13442,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13378,7 +13462,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13397,7 +13482,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13420,7 +13506,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13442,7 +13529,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13464,7 +13552,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13486,7 +13575,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13508,7 +13598,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13531,7 +13622,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13554,7 +13646,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13577,7 +13670,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13599,7 +13693,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -13638,7 +13733,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]

@@ -278,6 +278,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // address at every cancel / cancel_expired; a refund
         // already settled keeps its destination.
         | EscrowEventKind::RefundAddressAmended
+        // AV-259: a revised base penalty rate moves
+        // no funds — the cancel gate re-reads the live base
+        // rate at every cancel_expired; a cancel already
+        // settled keeps its penalty.
+        | EscrowEventKind::BasePenaltyAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1036,6 +1041,11 @@ mod event_sourcing_tests {
         // address at every cancel / cancel_expired; a refund
         // already settled keeps its destination.
         | EscrowEventKind::RefundAddressAmended
+        // AV-259: a revised base penalty rate moves
+        // no funds — the cancel gate re-reads the live base
+        // rate at every cancel_expired; a cancel already
+        // settled keeps its penalty.
+        | EscrowEventKind::BasePenaltyAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

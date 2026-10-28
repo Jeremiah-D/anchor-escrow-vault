@@ -23211,6 +23211,67 @@ let fee = self.charge_protocol_fee(claimable)?;
     }
 
 
+    /// Revise the base anti-griefing penalty rate after funding
+    /// (AV-259): the post-funding counterpart to
+    /// [`Escrow::with_penalty_bps`] (`Uninitialized`-only
+    /// initial configuration). Dual-signed governance,
+    /// `Funded`-only, pause first — paralleling
+    /// [`Escrow::amend_penalty_escalation`]. Only `penalty_bps`
+    /// changes — the AV-115 escalation rate/cap and the expiry
+    /// gate itself (`expires_at` + grace) are never restated, so
+    /// the meter keeps its original origin. The cancel gate
+    /// reads the base rate live ([`Escrow::effective_penalty_bps`]
+    /// / [`Escrow::expiry_cancel_penalty_at`] compute from the
+    /// live base at every `cancel_expired`), so a new rate
+    /// prices the next expiry cancel the moment the amendment
+    /// lands, while a cancel already settled keeps the penalty
+    /// it charged. A rate above `10_000` is refused with
+    /// [`EscrowError::InvalidPenalty`] (the builder's gate,
+    /// unchanged — the rate can never exceed 100%, even in
+    /// theory); `0` is legal (it switches the penalty off, the
+    /// builder's `0` semantics, not a refund). Re-affirming the
+    /// current rate is a no-op: it succeeds and writes nothing,
+    /// so the event layer emits nothing for it (paralleling
+    /// `amend_penalty_escalation`'s no-op rule). Orthogonal to
+    /// AV-257 (that is the escalation schedule, this item is the
+    /// base rate) and to AV-216 (that is the late-delivery
+    /// penalty, this item is the expiry-cancel penalty). Emits
+    /// `BasePenaltyAmended` on the event layer, except for the
+    /// no-op re-affirmation.
+    pub fn amend_penalty_bps(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        penalty_bps: u16,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_penalty_escalation`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // The builder's gate, unchanged: the rate can never
+        // exceed 100%. Checked after state so a failed
+        // amendment never writes, and the stored rate stays as
+        // it was.
+        if penalty_bps > 10_000 {
+            return Err(EscrowError::InvalidPenalty);
+        }
+        // No-op: re-affirming the current rate writes nothing,
+        // so the event layer emits nothing for it.
+        if penalty_bps == self.penalty_bps {
+            return Ok(());
+        }
+        self.penalty_bps = penalty_bps;
+        Ok(())
+    }
+
+
     /// Opt in to a timelock (AV-27). Builder-style: only valid on an
     /// `Uninitialized` escrow, so the unlock timestamp is fixed before
     /// any funds move — mirroring [`Escrow::with_grace_period`] and the
@@ -46886,7 +46947,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
     }
 
     #[test]
@@ -57433,6 +57495,140 @@ mod penalty_tests {
             "penalty_bps tail offset"
         );
     }
+
+    #[test]
+    fn amend_retunes_base_and_next_cancel_prices_live() {
+        // 250 bps of 1_000_000 = 25_000 penalty before the
+        // amendment; 500 bps = 50_000 after it — and the
+        // escalation schedule and expiry gate never move.
+        let mut e = funded_with_penalty(1_000_000, 250);
+        assert_eq!(e.effective_penalty_bps(EXPIRES_AT), 250);
+        e.amend_penalty_bps(ALICE, BOB, 500).unwrap();
+        assert_eq!(e.penalty_bps(), 500);
+        assert_eq!(e.effective_penalty_bps(EXPIRES_AT), 500);
+        assert_eq!(e.state(), EscrowState::Funded, "amending moves no state");
+        let (refund, _, penalty) = e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!((refund, penalty), (950_000, 50_000));
+    }
+
+    #[test]
+    fn amend_to_zero_switches_penalty_off() {
+        // The builder's `0` semantics, not a refund: a
+        // zeroed rate prices the next expiry cancel at a full
+        // refund, with no penalty leg at all.
+        let mut e = funded_with_penalty(1_000_000, 250);
+        e.amend_penalty_bps(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.penalty_bps(), 0);
+        let (refund, _, penalty) = e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!((refund, penalty), (1_000_000, 0));
+    }
+
+    #[test]
+    fn amend_base_reprices_escalated_meter_with_live_headroom() {
+        // Base 250 + 100/day capped at 5000: 30 days late the
+        // meter is at 3250 bps. Raising the base to 500 lifts
+        // the next cancel to 3500 bps — the escalation headroom
+        // is `cap - new base`, recomputed live — while the
+        // rate, the cap and the meter origin never move.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap()
+            .with_penalty_escalation(100, 5_000)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.effective_penalty_bps(EXPIRES_AT + 30 * 86_400), 3_250);
+        e.amend_penalty_bps(ALICE, BOB, 500).unwrap();
+        assert_eq!(e.penalty_bps(), 500);
+        assert_eq!(e.penalty_escalation_rate_bps(), 100, "the schedule is untouched");
+        assert_eq!(e.penalty_escalation_cap_bps(), 5_000, "the cap is untouched");
+        assert_eq!(e.penalty_escalation_base(), EXPIRES_AT, "the meter origin never moves");
+        assert_eq!(e.effective_penalty_bps(EXPIRES_AT + 30 * 86_400), 3_500);
+        assert_eq!(
+            e.expiry_cancel_penalty_at(1_000_000, EXPIRES_AT + 30 * 86_400),
+            350_000
+        );
+    }
+
+    #[test]
+    fn amend_same_rate_is_a_noop() {
+        // Re-affirming the current rate succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = funded_with_penalty(1_000_000, 250);
+        e.amend_penalty_bps(ALICE, BOB, 250).unwrap();
+        assert_eq!(e.penalty_bps(), 250);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_rejects_out_of_range_state_authority_and_paused() {
+        let mut e = funded_with_penalty(1_000_000, 250);
+        // The builder's gate, unchanged.
+        assert_eq!(
+            e.amend_penalty_bps(ALICE, BOB, 10_001),
+            Err(EscrowError::InvalidPenalty)
+        );
+        assert_eq!(e.penalty_bps(), 250);
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap();
+        assert_eq!(
+            bare.amend_penalty_bps(ALICE, BOB, 500),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Dual signature: one party alone cannot retune the meter.
+        assert_eq!(
+            e.amend_penalty_bps(ALICE, ALICE, 500),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_penalty_bps(MALLORY, BOB, 500),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.penalty_bps(), 250);
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_penalty_bps(ALICE, BOB, 500),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.penalty_bps(), 250);
+    }
+
+    #[test]
+    fn amend_penalty_bps_indexed_emits_event_noop_and_failed_emit_nothing() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0x1D; 32], EXPIRES_AT - 3_600)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_penalty_bps(ALICE, ALICE, 500, EXPIRES_AT - 3_600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_penalty_bps(ALICE, BOB, 500, EXPIRES_AT - 3_600)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::BasePenaltyAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same rate is a no-op: no new event.
+        e.amend_penalty_bps(ALICE, BOB, 500, EXPIRES_AT - 3_600)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
 }
 
 // ---------- AV-115: time-weighted penalty escalation ----------
@@ -63403,7 +63599,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(119), Some(EscrowEventKind::ReferrerAmended)); // AV-256: 119 is ReferrerAmended
         assert_eq!(EscrowEventKind::from_discriminant(120), Some(EscrowEventKind::PenaltyEscalationAmended)); // AV-257: 120 is PenaltyEscalationAmended
         assert_eq!(EscrowEventKind::from_discriminant(121), Some(EscrowEventKind::RefundAddressAmended)); // AV-258: 121 is RefundAddressAmended
-        assert_eq!(EscrowEventKind::from_discriminant(122), None); // AV-258: 121 is RefundAddressAmended
+        assert_eq!(EscrowEventKind::from_discriminant(122), Some(EscrowEventKind::BasePenaltyAmended)); // AV-259: 122 is BasePenaltyAmended
+        assert_eq!(EscrowEventKind::from_discriminant(123), None); // AV-259: 122 is BasePenaltyAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -63607,9 +63804,10 @@ mod event_history_tests {
         // `RentPayerAmended` (AV-255), 119 is
         // `ReferrerAmended` (AV-256), 120 is
         // `PenaltyEscalationAmended` (AV-257), 121 is
-        // `RefundAddressAmended` (AV-258) and 122 is the
+        // `RefundAddressAmended` (AV-258), 122 is
+        // `BasePenaltyAmended` (AV-259) and 123 is the
         // first still-unknown byte.
-        for bad in [122u8, 255] {
+        for bad in [123u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
