@@ -323,6 +323,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // pays min(new per_crank, pool) from the live amount,
         // while a crank already settled keeps its amount.
         | EscrowEventKind::KeeperBountyPerCrankAmended
+        // AV-267: a revised flat slash deadline moves no funds
+        // and never restates a settled penalty — the slash path
+        // reads the live deadline at the next eligibility check,
+        // while a slash already settled keeps its deadline.
+        | EscrowEventKind::SlashDeadlineAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1126,6 +1131,11 @@ mod event_sourcing_tests {
         // pays min(new per_crank, pool) from the live amount,
         // while a crank already settled keeps its amount.
         | EscrowEventKind::KeeperBountyPerCrankAmended
+        // AV-267: a revised flat slash deadline moves no funds
+        // and never restates a settled penalty — the slash path
+        // reads the live deadline at the next eligibility check,
+        // while a slash already settled keeps its deadline.
+        | EscrowEventKind::SlashDeadlineAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

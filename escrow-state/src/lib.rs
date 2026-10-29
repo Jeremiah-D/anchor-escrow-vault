@@ -19521,6 +19521,106 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Revise the flat slash deadline after funding (AV-267):
+    /// the post-funding counterpart to the deadline leg of
+    /// [`Escrow::with_slash_terms`] (`Uninitialized`-only initial
+    /// configuration). Dual-signed governance, `Funded`-only,
+    /// pause first — paralleling
+    /// [`Escrow::amend_keeper_bounty_per_crank`]. Only an escrow
+    /// carrying flat slash terms may revise its deadline: an
+    /// escrow with no terms at all is refused with
+    /// [`EscrowError::SlashNotEligible`] (fail-closed —
+    /// post-funding installation would add a penalty clause the
+    /// taker never funded under, so it is not a revision, it is
+    /// a new deal). A ladder escrow is refused with
+    /// [`EscrowError::InvalidSlashLadder`] — its deadlines live
+    /// in the rung table and belong to
+    /// [`Escrow::amend_slash_ladder`], so a flat-deadline
+    /// revision here would create a second, competing deadline
+    /// (two sources of truth for when a slash may fire).
+    /// An escrow whose one-shot slash already executed
+    /// (`penalty_paid > 0`, or `pool_slashed > 0` on the AV-106
+    /// insurance-pool path, where the penalty lands in the pool
+    /// and `penalty_paid` stays zero) is refused with
+    /// [`EscrowError::SlashNotEligible`] — the one-shot is
+    /// consumed, so a revised deadline has no slash left to
+    /// govern. A zero `deadline` is a legal revision: it makes
+    /// the escrow immediately slashable (the builder's semantics,
+    /// unchanged — `now >= 0` always holds). Revising to the
+    /// current deadline is a no-op: it succeeds and writes
+    /// nothing, so the event layer emits nothing for it
+    /// (paralleling `rotate_arbiter`'s no-op rule). Only
+    /// `slash_terms.slash_deadline` changes — `penalty_account`
+    /// is untouched, and `penalty_paid` already banked is
+    /// untouched too (a revision never restates a settled
+    /// penalty). The new deadline governs from the next slash
+    /// eligibility check: the slash path reads the live
+    /// deadline (`now >= slash_deadline`), so tightening can
+    /// make an unexecuted default slashable at once, while
+    /// loosening can defer an already-satisfied but unexecuted
+    /// eligibility. A slash already settled keeps the deadline
+    /// it settled under, since the slash is terminal for the
+    /// flat clause. Revising moves no funds, so no AV-36
+    /// reentrancy lock is needed (the lock only guards the
+    /// fund-moving paths, the `rotate_arbiter` precedent).
+    /// Orthogonal to AV-82 (that is the slash mechanism itself,
+    /// this item is its deadline) and to AV-237 (that is the
+    /// ladder-table revision, this item is the flat deadline).
+    /// Emits `SlashDeadlineAmended` on the event layer, except
+    /// for the no-op re-affirmation.
+    pub fn amend_slash_deadline(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        deadline: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_keeper_bounty_per_crank`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // A ladder escrow's deadlines live in the rung table and
+        // belong to `amend_slash_ladder` — checked before the
+        // flat-terms gate, since a ladder escrow carries no flat
+        // terms and would otherwise report the generic
+        // not-configured error for what is really a wrong-path
+        // call.
+        if self.slash_ladder.is_some() {
+            return Err(EscrowError::InvalidSlashLadder);
+        }
+        // Fail-closed: only an escrow carrying flat slash terms
+        // may revise the flat deadline — post-funding
+        // installation would add a penalty clause the taker never
+        // funded under.
+        let terms = match self.slash_terms {
+            Some(terms) => terms,
+            None => return Err(EscrowError::SlashNotEligible),
+        };
+        // One-shot consumed: a slash already executed (directly
+        // into `penalty_paid`, or into the AV-106 pool as
+        // `pool_slashed`) leaves no future slash for a revised
+        // deadline to govern.
+        if self.penalty_paid > 0 || self.pool_slashed > 0 {
+            return Err(EscrowError::SlashNotEligible);
+        }
+        // No-op: re-affirming the current deadline writes
+        // nothing, so the event layer emits nothing for it.
+        if deadline == terms.slash_deadline {
+            return Ok(());
+        }
+        self.slash_terms = Some(SlashTerms {
+            penalty_account: terms.penalty_account,
+            slash_deadline: deadline,
+        });
+        Ok(())
+    }
+
     /// The dead-man's switch inactivity threshold in seconds, `0`
     /// when the switch is not configured (AV-109).
     pub fn deadman_inactivity_secs(&self) -> u64 {
@@ -47566,7 +47666,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
-        assert_eq!(EscrowEventKind::from_discriminant(130), None); // AV-266: 129 is KeeperBountyPerCrankAmended
+        assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
     }
 
     #[test]
@@ -64577,7 +64678,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
-        assert_eq!(EscrowEventKind::from_discriminant(130), None); // AV-266: 129 is KeeperBountyPerCrankAmended
+        assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -64789,9 +64891,10 @@ mod event_history_tests {
         // `DualControlCheckerRotated` (AV-263), 127 is
         // `CredentialIssuerRotated` (AV-264), 128 is
         // `DeadmanInactivityAmended` (AV-265), 129 is
-        // `KeeperBountyPerCrankAmended` (AV-266) and 130 is the
+        // `KeeperBountyPerCrankAmended` (AV-266), 130 is
+        // `SlashDeadlineAmended` (AV-267) and 131 is the
         // first still-unknown byte.
-        for bad in [130u8, 255] {
+        for bad in [131u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -75644,6 +75747,237 @@ mod amend_keeper_bounty_per_crank_tests {
         assert_eq!(ev.amounts.fee, 0);
         // Re-affirming the same amount is a no-op: no new event.
         e.amend_keeper_bounty_per_crank(ALICE, BOB, 25_000, NOW)
+            .unwrap();
+        assert_eq!(
+            e.event_count(),
+            before + 1,
+            "no-op emits nothing"
+        );
+    }
+}
+
+// ---------- AV-267: amend flat slash deadline after funding ----------
+mod amend_slash_deadline_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PENALTY: [u8; 32] = [0x50; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_750_000_000;
+    const DEADLINE: u64 = 1_700_000_000;
+    const FUND_AT: u64 = 1_600_000_000;
+
+    fn flat(deadline: u64) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, deadline)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_moves_deadline_only_and_penalty_untouched() {
+        // Only the deadline moves: the penalty account, the
+        // banked penalty and the state are untouched, and the
+        // terms region is already resident, so the revision
+        // rewrites it in place with no layout change.
+        let mut e = flat(DEADLINE);
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000).unwrap();
+        let terms = e.slash_terms().expect("terms still attached");
+        assert_eq!(terms.slash_deadline, DEADLINE + 100_000);
+        assert_eq!(terms.penalty_account, PENALTY, "penalty account untouched");
+        assert_eq!(e.penalty_paid(), 0, "no penalty banked yet");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "terms region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn tightening_advances_eligibility_and_loosening_defers_it() {
+        // Deadline 1_700_000_000, at 1_650_000_000 the default has
+        // not occurred yet — not eligible, slash refused.
+        let mut e = flat(DEADLINE);
+        let early = DEADLINE - 50_000;
+        assert!(!e.is_slash_eligible(early));
+        assert_eq!(
+            e.slash(ALICE, 100_000, None, early),
+            Err(EscrowError::SlashNotEligible)
+        );
+        // Tighten to 1_600_000_000: the same instant now clears
+        // the bar — the new deadline governs from the next
+        // eligibility check, no restatement of anything else.
+        e.amend_slash_deadline(ALICE, BOB, 1_600_000_000).unwrap();
+        assert!(e.is_slash_eligible(early));
+        assert_eq!(e.slash(ALICE, 100_000, None, early).unwrap(), 100_000);
+        assert_eq!(e.penalty_paid(), 100_000);
+        // Loosening defers an already-satisfied but unexecuted
+        // eligibility: deadline 1_700_000_000 is satisfied at
+        // 1_750_000_000, but moving it to 1_800_000_000 revokes
+        // that eligibility until the new deadline arrives.
+        let mut e = flat(DEADLINE);
+        let late = DEADLINE + 50_000;
+        assert!(e.is_slash_eligible(late));
+        e.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000).unwrap();
+        assert!(!e.is_slash_eligible(late));
+        assert_eq!(
+            e.slash(ALICE, 100_000, None, late),
+            Err(EscrowError::SlashNotEligible)
+        );
+        assert!(e.is_slash_eligible(DEADLINE + 100_000));
+        assert_eq!(
+            e.slash(ALICE, 100_000, None, DEADLINE + 100_000).unwrap(),
+            100_000
+        );
+    }
+
+    #[test]
+    fn amend_to_zero_makes_slash_immediately_eligible() {
+        // 0 is a legal revision: it makes the escrow slashable at
+        // once (now >= 0 always holds), matching the builder's
+        // zero-deadline semantics.
+        let mut e = flat(DEADLINE);
+        assert!(!e.is_slash_eligible(FUND_AT));
+        e.amend_slash_deadline(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.slash_terms().unwrap().slash_deadline, 0);
+        assert!(e.is_slash_eligible(FUND_AT));
+        assert_eq!(e.slash(ALICE, 100_000, None, FUND_AT).unwrap(), 100_000);
+    }
+
+    #[test]
+    fn amend_rejects_unconfigured_ladder_slashed_state_authority_and_paused() {
+        // Fail-closed: a never-configured escrow can never acquire
+        // slash terms after funding, and a failed revision leaves
+        // it term-less.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        assert!(plain.slash_terms().is_none());
+        assert_eq!(
+            plain.amend_slash_deadline(ALICE, BOB, DEADLINE),
+            Err(EscrowError::SlashNotEligible)
+        );
+        assert!(plain.slash_terms().is_none());
+        // A ladder escrow's deadlines live in the rung table and
+        // belong to `amend_slash_ladder` — the flat path refuses
+        // with the ladder's own error, not the generic one.
+        let mut ladder = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_ladder(PENALTY, &[(1_000, 500), (2_000, 1_000)])
+            .unwrap();
+        ladder.fund(ALICE, FUND_AT).unwrap();
+        assert!(ladder.slash_ladder().is_some());
+        assert_eq!(
+            ladder.amend_slash_deadline(ALICE, BOB, DEADLINE),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        assert!(ladder.slash_ladder().is_some());
+        assert!(ladder.slash_terms().is_none());
+        // One-shot consumed: a slash already executed (penalty
+        // banked) leaves no future slash for a revised deadline
+        // to govern.
+        let mut slashed = flat(DEADLINE);
+        slashed.slash(ALICE, 100_000, None, DEADLINE).unwrap();
+        assert_eq!(slashed.penalty_paid(), 100_000);
+        assert_eq!(
+            slashed.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000),
+            Err(EscrowError::SlashNotEligible)
+        );
+        assert_eq!(
+            slashed.slash_terms().unwrap().slash_deadline,
+            DEADLINE,
+            "failed revision writes nothing"
+        );
+        // The AV-106 pooled path counts as consumed too: the
+        // penalty lands in the pool (`pool_slashed`), while
+        // `penalty_paid` stays zero — still a spent one-shot.
+        let mut pooled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_insurance_pool()
+            .unwrap();
+        pooled.fund(ALICE, FUND_AT).unwrap();
+        pooled.slash(ALICE, 100_000, None, DEADLINE).unwrap();
+        assert_eq!(pooled.penalty_paid(), 0);
+        assert!(pooled.pool_slashed() > 0);
+        assert_eq!(
+            pooled.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000),
+            Err(EscrowError::SlashNotEligible)
+        );
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        assert_eq!(
+            bare.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Dual signature: one party alone cannot move the deadline.
+        let mut e = flat(DEADLINE);
+        assert_eq!(
+            e.amend_slash_deadline(ALICE, ALICE, DEADLINE + 100_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_slash_deadline(MALLORY, BOB, DEADLINE + 100_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.slash_terms().unwrap().slash_deadline, DEADLINE);
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's revision on a paused escrow is `Paused`.
+        let mut paused = flat(DEADLINE);
+        paused.pause([0xDD; 32], None).unwrap();
+        assert_eq!(
+            paused.amend_slash_deadline(MALLORY, BOB, DEADLINE + 100_000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.slash_terms().unwrap().slash_deadline, DEADLINE);
+    }
+
+    #[test]
+    fn amend_same_deadline_is_a_noop() {
+        // Re-affirming the current deadline succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = flat(DEADLINE);
+        e.amend_slash_deadline(ALICE, BOB, DEADLINE).unwrap();
+        assert_eq!(e.slash_terms().unwrap().slash_deadline, DEADLINE);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_slash_deadline_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], NOW)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_slash_deadline(ALICE, ALICE, DEADLINE + 100_000, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::SlashDeadlineAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same deadline is a no-op: no new event.
+        e.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000, NOW)
             .unwrap();
         assert_eq!(
             e.event_count(),

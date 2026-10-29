@@ -365,6 +365,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // pays min(new per_crank, pool) from the live amount,
         // while a crank already settled keeps its amount.
         | EscrowEventKind::KeeperBountyPerCrankAmended
+        // AV-267: a revised flat slash deadline moves no funds
+        // and never restates a settled penalty — the slash path
+        // reads the live deadline at the next eligibility check,
+        // while a slash already settled keeps its deadline.
+        | EscrowEventKind::SlashDeadlineAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1172,6 +1177,11 @@ mod fee_history_tests {
         // pays min(new per_crank, pool) from the live amount,
         // while a crank already settled keeps its amount.
         | EscrowEventKind::KeeperBountyPerCrankAmended
+        // AV-267: a revised flat slash deadline moves no funds
+        // and never restates a settled penalty — the slash path
+        // reads the live deadline at the next eligibility check,
+        // while a slash already settled keeps its deadline.
+        | EscrowEventKind::SlashDeadlineAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
