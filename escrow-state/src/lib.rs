@@ -19967,6 +19967,129 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Rotate the flat slash penalty account after funding (AV-272):
+    /// the post-funding counterpart to the penalty-account leg of
+    /// [`Escrow::with_slash_terms`] (`Uninitialized`-only initial
+    /// configuration). Dual-signed governance, `Funded`-only,
+    /// pause first — paralleling
+    /// [`Escrow::amend_slash_deadline`]. Only an escrow carrying
+    /// flat slash terms may rotate its penalty account: an escrow
+    /// with no terms at all is refused with
+    /// [`EscrowError::SlashNotEligible`] (fail-closed —
+    /// post-funding installation would add a penalty clause the
+    /// taker never funded under, so it is not a rotation, it is
+    /// a new deal). A ladder escrow is refused with
+    /// [`EscrowError::InvalidSlashLadder`] — its penalty account
+    /// lives in the independent ladder structure and belongs to
+    /// the future ladder-specific rotation, so a flat rotation
+    /// here would create a second, competing penalty account
+    /// (two sources of truth for where a slash lands). An
+    /// insurance-pool escrow is refused with
+    /// [`EscrowError::SlashNotEligible`] — its slash routes to
+    /// the neutral pool custody, so the flat `penalty_account`
+    /// is a dead field there and rotating it has no semantics
+    /// (fail-closed, not a silent no-op). An escrow whose
+    /// one-shot slash already executed (`penalty_paid > 0`, or
+    /// `pool_slashed > 0` on the AV-106 insurance-pool path,
+    /// where the penalty lands in the pool and `penalty_paid`
+    /// stays zero) is refused with
+    /// [`EscrowError::SlashNotEligible`] — the one-shot is
+    /// consumed, so a rotated account has no slash left to
+    /// govern. A zero `new_penalty_account` is refused with
+    /// [`EscrowError::SlashNotEligible`] (the builder's gate,
+    /// unchanged — a zero key can never be a legitimate penalty
+    /// account), leaving the original account untouched.
+    /// Rotating to the current account is a no-op: it succeeds
+    /// and writes nothing, so the event layer emits nothing for
+    /// it (paralleling `rotate_arbiter`'s no-op rule). Only
+    /// `slash_terms.penalty_account` changes —
+    /// `slash_terms.slash_deadline` is untouched, and
+    /// `penalty_paid` already banked is untouched too (a
+    /// rotation never restates a settled penalty). The new
+    /// account governs from the next slash: the Anchor layer
+    /// transfers to the live `penalty_account` read from the
+    /// terms at slash time, so a default penalized after the
+    /// rotation pays the new account, while the pool path is
+    /// unaffected (a pooled slash still lands in the pool, never
+    /// in any flat account). A slash already settled keeps the
+    /// account it settled under, since the slash is terminal
+    /// for the flat clause. Rotating moves no funds, so no AV-36
+    /// reentrancy lock is needed (the lock only guards the
+    /// fund-moving paths, the `rotate_arbiter` precedent).
+    /// Orthogonal to AV-82 (that is the slash mechanism itself,
+    /// this item is its recipient) and to AV-237 (that is the
+    /// ladder-table revision, this item is the flat account) and
+    /// to [`Escrow::amend_slash_ladder`] (that is the ladder
+    /// table, this item is the flat account). Emits
+    /// `SlashPenaltyAccountRotated` on the event layer, except
+    /// for the no-op re-affirmation.
+    pub fn rotate_slash_penalty_account(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_penalty_account: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the rotation, paralleling `amend_slash_deadline`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // A ladder escrow's penalty account lives in the rung
+        // table's own structure and belongs to the ladder path —
+        // checked before the flat-terms gate, since a ladder
+        // escrow carries no flat terms and would otherwise
+        // report the generic not-configured error for what is
+        // really a wrong-path call.
+        if self.slash_ladder.is_some() {
+            return Err(EscrowError::InvalidSlashLadder);
+        }
+        // Fail-closed: only an escrow carrying flat slash terms
+        // may rotate the flat penalty account — post-funding
+        // installation would add a penalty clause the taker never
+        // funded under.
+        let terms = match self.slash_terms {
+            Some(terms) => terms,
+            None => return Err(EscrowError::SlashNotEligible),
+        };
+        // An insurance-pool escrow's slash routes to the neutral
+        // pool custody, so the flat penalty account is a dead
+        // field there — rotating it has no semantics, and a
+        // silent success would pretend otherwise.
+        if self.insurance_pool {
+            return Err(EscrowError::SlashNotEligible);
+        }
+        // One-shot consumed: a slash already executed (directly
+        // into `penalty_paid`, or into the AV-106 pool as
+        // `pool_slashed`) leaves no future slash for a rotated
+        // account to govern.
+        if self.penalty_paid > 0 || self.pool_slashed > 0 {
+            return Err(EscrowError::SlashNotEligible);
+        }
+        // The builder's gate, unchanged: a zero key can never be
+        // a legitimate penalty account. Checked after the
+        // configuration gates so a failed rotation never writes,
+        // and the stored account stays as it was.
+        if new_penalty_account == [0u8; 32] {
+            return Err(EscrowError::SlashNotEligible);
+        }
+        // No-op: re-affirming the current account writes nothing,
+        // so the event layer emits nothing for it.
+        if new_penalty_account == terms.penalty_account {
+            return Ok(());
+        }
+        self.slash_terms = Some(SlashTerms {
+            penalty_account: new_penalty_account,
+            slash_deadline: terms.slash_deadline,
+        });
+        Ok(())
+    }
+
     /// The dead-man's switch inactivity threshold in seconds, `0`
     /// when the switch is not configured (AV-109).
     pub fn deadman_inactivity_secs(&self) -> u64 {
@@ -48017,7 +48140,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
-        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
     }
 
     #[test]
@@ -65033,7 +65157,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
-        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -65250,9 +65375,10 @@ mod event_history_tests {
         // `AmountBoundsAmended` (AV-268), 132 is
         // `MilestoneLatePenaltyBpsAmended` (AV-269), 133 is
         // `FundingPlanMaxTranchesAmended` (AV-270), 134 is
-        // `DeadmanHeirRotated` (AV-271) and 135 is the
+        // `DeadmanHeirRotated` (AV-271), 135 is
+        // `SlashPenaltyAccountRotated` (AV-272) and 136 is the
         // first still-unknown byte.
-        for bad in [135u8, 255] {
+        for bad in [136u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -77127,6 +77253,236 @@ mod rotate_deadman_heir_tests {
         // Re-affirming the same heir is a no-op: no new event.
         e.rotate_deadman_heir(ALICE, BOB, NEW_HEIR, NOW).unwrap();
         assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+}
+
+mod rotate_slash_penalty_account_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PENALTY: [u8; 32] = [0x50; 32];
+    const NEW_PENALTY: [u8; 32] = [0x51; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_750_000_000;
+    const DEADLINE: u64 = 1_700_000_000;
+    const FUND_AT: u64 = 1_600_000_000;
+
+    fn flat(deadline: u64) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, deadline)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e
+    }
+
+    #[test]
+    fn rotate_changes_only_penalty_account() {
+        // Only the penalty account moves: the deadline, the
+        // banked penalty and the state are untouched, and the
+        // terms region is already resident, so the rotation
+        // rewrites it in place with no layout change.
+        let mut e = flat(DEADLINE);
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.rotate_slash_penalty_account(ALICE, BOB, NEW_PENALTY).unwrap();
+        let terms = e.slash_terms().expect("terms still attached");
+        assert_eq!(terms.penalty_account, NEW_PENALTY);
+        assert_eq!(terms.slash_deadline, DEADLINE, "deadline untouched");
+        assert_eq!(e.penalty_paid(), 0, "no penalty banked yet");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "terms region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn rotate_new_account_governs_next_slash() {
+        // The rotated account governs from the next slash: the
+        // deadline is unchanged, so the same eligibility that
+        // held before still holds, and the slash settles against
+        // the live terms — the penalty the new account receives.
+        // (The state machine prices and banks the penalty; the
+        // Anchor layer transfers it to `slash_terms`'
+        // live `penalty_account`, which is exactly the field the
+        // rotation rewrote.)
+        let mut e = flat(DEADLINE);
+        assert!(e.is_slash_eligible(DEADLINE));
+        e.rotate_slash_penalty_account(ALICE, BOB, NEW_PENALTY).unwrap();
+        assert_eq!(
+            e.slash_terms().unwrap().penalty_account,
+            NEW_PENALTY
+        );
+        assert!(e.is_slash_eligible(DEADLINE), "deadline untouched");
+        assert_eq!(e.slash(ALICE, 100_000, None, DEADLINE).unwrap(), 100_000);
+        assert_eq!(e.penalty_paid(), 100_000);
+        assert_eq!(
+            e.slash_terms().unwrap().penalty_account,
+            NEW_PENALTY,
+            "settled slash keeps the account it settled under"
+        );
+    }
+
+    #[test]
+    fn rotate_rejects_unconfigured_ladder_slashed_pool_state_authority_and_paused() {
+        // Fail-closed: a never-configured escrow can never acquire
+        // slash terms after funding, and a failed rotation leaves
+        // it term-less.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        assert!(plain.slash_terms().is_none());
+        assert_eq!(
+            plain.rotate_slash_penalty_account(ALICE, BOB, NEW_PENALTY),
+            Err(EscrowError::SlashNotEligible)
+        );
+        assert!(plain.slash_terms().is_none());
+        // A ladder escrow's penalty account lives in the ladder
+        // structure and belongs to the ladder path — the flat
+        // path refuses with the ladder's own error, not the
+        // generic one.
+        let mut ladder = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_ladder(PENALTY, &[(1_000, 500), (2_000, 1_000)])
+            .unwrap();
+        ladder.fund(ALICE, FUND_AT).unwrap();
+        assert!(ladder.slash_ladder().is_some());
+        assert_eq!(
+            ladder.rotate_slash_penalty_account(ALICE, BOB, NEW_PENALTY),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        assert!(ladder.slash_ladder().is_some());
+        assert!(ladder.slash_terms().is_none());
+        // One-shot consumed: a slash already executed (penalty
+        // banked) leaves no future slash for a rotated account
+        // to govern.
+        let mut slashed = flat(DEADLINE);
+        slashed.slash(ALICE, 100_000, None, DEADLINE).unwrap();
+        assert_eq!(slashed.penalty_paid(), 100_000);
+        assert_eq!(
+            slashed.rotate_slash_penalty_account(ALICE, BOB, NEW_PENALTY),
+            Err(EscrowError::SlashNotEligible)
+        );
+        assert_eq!(
+            slashed.slash_terms().unwrap().penalty_account,
+            PENALTY,
+            "failed rotation writes nothing"
+        );
+        // An insurance-pool escrow's slash routes to the neutral
+        // pool custody, so the flat penalty account is a dead
+        // field — rotating it is refused even before any slash,
+        // and the refused rotation leaves the pool path working
+        // exactly as before: the slash still lands in the pool.
+        let mut pooled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_insurance_pool()
+            .unwrap();
+        pooled.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            pooled.rotate_slash_penalty_account(ALICE, BOB, NEW_PENALTY),
+            Err(EscrowError::SlashNotEligible)
+        );
+        assert_eq!(
+            pooled.slash_terms().unwrap().penalty_account,
+            PENALTY,
+            "failed rotation writes nothing"
+        );
+        pooled.slash(ALICE, 100_000, None, DEADLINE).unwrap();
+        assert_eq!(pooled.penalty_paid(), 0);
+        assert!(pooled.pool_slashed() > 0, "pool path unaffected");
+        // The AV-106 pooled path counts as consumed too: the
+        // penalty lands in the pool (`pool_slashed`), while
+        // `penalty_paid` stays zero — still a spent one-shot.
+        assert_eq!(
+            pooled.rotate_slash_penalty_account(ALICE, BOB, NEW_PENALTY),
+            Err(EscrowError::SlashNotEligible)
+        );
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        assert_eq!(
+            bare.rotate_slash_penalty_account(ALICE, BOB, NEW_PENALTY),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // A zero account is refused via the builder's gate and the
+        // original account survives.
+        let mut e = flat(DEADLINE);
+        assert_eq!(
+            e.rotate_slash_penalty_account(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::SlashNotEligible)
+        );
+        assert_eq!(e.slash_terms().unwrap().penalty_account, PENALTY);
+        // Dual signature: one party alone cannot move the account.
+        assert_eq!(
+            e.rotate_slash_penalty_account(ALICE, ALICE, NEW_PENALTY),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.rotate_slash_penalty_account(MALLORY, BOB, NEW_PENALTY),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.slash_terms().unwrap().penalty_account, PENALTY);
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's rotation on a paused escrow is `Paused`.
+        let mut paused = flat(DEADLINE);
+        paused.pause([0xDD; 32], None).unwrap();
+        assert_eq!(
+            paused.rotate_slash_penalty_account(MALLORY, BOB, NEW_PENALTY),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.slash_terms().unwrap().penalty_account, PENALTY);
+    }
+
+    #[test]
+    fn rotate_same_account_is_a_noop() {
+        // Re-affirming the current account succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = flat(DEADLINE);
+        e.rotate_slash_penalty_account(ALICE, BOB, PENALTY).unwrap();
+        assert_eq!(e.slash_terms().unwrap().penalty_account, PENALTY);
+        assert_eq!(e.slash_terms().unwrap().slash_deadline, DEADLINE);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn rotate_slash_penalty_account_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], NOW)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.rotate_slash_penalty_account(ALICE, ALICE, NEW_PENALTY, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.rotate_slash_penalty_account(ALICE, BOB, NEW_PENALTY, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::SlashPenaltyAccountRotated);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same account is a no-op: no new event.
+        e.rotate_slash_penalty_account(ALICE, BOB, NEW_PENALTY, NOW)
+            .unwrap();
+        assert_eq!(
+            e.event_count(),
+            before + 1,
+            "no-op emits nothing"
+        );
     }
 }
 

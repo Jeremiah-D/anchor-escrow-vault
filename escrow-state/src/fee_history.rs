@@ -394,6 +394,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // last-activity clock are untouched, while the next
         // claim_deadman call is judged against the live heir.
         | EscrowEventKind::DeadmanHeirRotated
+        // AV-272: a rotated flat slash penalty account moves no
+        // funds and never restates a settled penalty — only
+        // slash_terms.penalty_account changes, so the deadline
+        // and penalty_paid already banked are untouched, while
+        // the next slash transfers to the live account.
+        | EscrowEventKind::SlashPenaltyAccountRotated
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1230,6 +1236,12 @@ mod fee_history_tests {
         // last-activity clock are untouched, while the next
         // claim_deadman call is judged against the live heir.
         | EscrowEventKind::DeadmanHeirRotated
+        // AV-272: a rotated flat slash penalty account moves no
+        // funds and never restates a settled penalty — only
+        // slash_terms.penalty_account changes, so the deadline
+        // and penalty_paid already banked are untouched, while
+        // the next slash transfers to the live account.
+        | EscrowEventKind::SlashPenaltyAccountRotated
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

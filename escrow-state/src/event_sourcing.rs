@@ -352,6 +352,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // last-activity clock are untouched, while the next
         // claim_deadman call is judged against the live heir.
         | EscrowEventKind::DeadmanHeirRotated
+        // AV-272: a rotated flat slash penalty account moves no
+        // funds and never restates a settled penalty — only
+        // slash_terms.penalty_account changes, so the deadline
+        // and penalty_paid already banked are untouched, while
+        // the next slash transfers to the live account.
+        | EscrowEventKind::SlashPenaltyAccountRotated
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1184,6 +1190,12 @@ mod event_sourcing_tests {
         // last-activity clock are untouched, while the next
         // claim_deadman call is judged against the live heir.
         | EscrowEventKind::DeadmanHeirRotated
+        // AV-272: a rotated flat slash penalty account moves no
+        // funds and never restates a settled penalty — only
+        // slash_terms.penalty_account changes, so the deadline
+        // and penalty_paid already banked are untouched, while
+        // the next slash transfers to the live account.
+        | EscrowEventKind::SlashPenaltyAccountRotated
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
