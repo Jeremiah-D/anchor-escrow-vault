@@ -391,6 +391,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // are untouched, while the next request arms and executes
         // under the live threshold.
         | EscrowEventKind::SocialRecoveryThresholdAmended
+        // AV-279: an amended recovery timelock moves no funds and
+        // never restates a settled request — only the timelock
+        // changes, so the guardians, the count and the threshold
+        // are untouched, while the next request's veto window runs
+        // under the live timelock.
+        | EscrowEventKind::SocialRecoveryTimelockAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1262,6 +1268,12 @@ mod event_sourcing_tests {
                 // are untouched, while the next request arms and executes
                 // under the live threshold.
                 | EscrowEventKind::SocialRecoveryThresholdAmended
+                // AV-279: an amended recovery timelock moves no funds and
+                // never restates a settled request — only the timelock
+                // changes, so the guardians, the count and the threshold
+                // are untouched, while the next request's veto window runs
+                // under the live timelock.
+                | EscrowEventKind::SocialRecoveryTimelockAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

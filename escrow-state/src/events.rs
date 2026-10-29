@@ -517,6 +517,19 @@
 //!   already settled keeps the threshold it settled under. A
 //!   failed revision emits nothing, and a no-op re-affirmation
 //!   of the current threshold emits nothing either.
+//! - `amend_social_recovery_timelock` emits
+//!   [`EscrowEventKind::SocialRecoveryTimelockAmended`] on every
+//!   successful revision that actually changes the timelock
+//!   (AV-279) — `from == to ==` the current state, all amounts
+//!   zero; only the timelock changes, so the guardians, the
+//!   guardian count and the threshold are untouched, and the
+//!   recovery path compares the live timelock against the
+//!   request's opening timestamp at the next `request_recovery` /
+//!   `execute_recovery`, so a request opened after the amendment
+//!   arms and executes under the new veto window while a request
+//!   already settled keeps the window it settled under. A
+//!   failed revision emits nothing, and a no-op re-affirmation
+//!   of the current timelock emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -751,6 +764,7 @@
 //! | SettlementMintAllowlistUpdated (AV-276) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a settled release; only the allowlist changes, so the bound settlement mint is untouched, and the settled-release path reads the live list at the next `release_with_settlement_rate`, so a mint removed here is refused at once while a mint added here settles from the next quote, and plain `release` is unaffected |
 //! | DutchAuctionReserveBpsAmended (AV-277) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a claim already priced; only the floor changes, so the window is untouched, and claim prices through the live floor at the next call, so a claim after the amendment prices against the new floor while a claim already settled keeps the cap it settled under |
 //! | SocialRecoveryThresholdAmended (AV-278) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the threshold changes, so the guardians, the guardian count and the timelock are untouched, and the recovery path compares the live approval count against the live threshold at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new threshold while a request already settled keeps the threshold it settled under |
+//! | SocialRecoveryTimelockAmended (AV-279) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the timelock changes, so the guardians, the guardian count and the threshold are untouched, and the recovery path compares the live timelock against the request's opening timestamp at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new veto window while a request already settled keeps the window it settled under |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2320,6 +2334,24 @@ pub enum EscrowEventKind {
     /// the vault, so the event needs no extra field. A no-op
     /// re-affirmation of the current threshold emits nothing.
     SocialRecoveryThresholdAmended,
+    /// AV-279: the social-recovery veto-window timelock was amended
+    /// by governed post-funding amendment
+    /// ([`Escrow::amend_social_recovery_timelock`](crate::Escrow::amend_social_recovery_timelock)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::SocialRecoveryThresholdAmended`]); all amounts are
+    /// zero — amending moves no funds and never restates a request
+    /// already settled; only the timelock changes, so the
+    /// guardians, the guardian count and the threshold are
+    /// untouched — the recovery path compares the live timelock
+    /// against the request's opening timestamp at the next
+    /// `request_recovery` / `execute_recovery`, so a request
+    /// opened after the amendment arms and executes under the new
+    /// veto window while a request already settled keeps the
+    /// window it settled under. The new timelock is read from
+    /// the vault, so the event needs no extra field. A no-op
+    /// re-affirmation of the current timelock emits nothing.
+    SocialRecoveryTimelockAmended,
 }
 
 impl EscrowEventKind {
@@ -2755,6 +2787,10 @@ impl EscrowEventKind {
             // discriminants 0–140 stay stable for already-serialized
             // histories.
             141 => Self::SocialRecoveryThresholdAmended,
+            // AV-279: appended after SocialRecoveryThresholdAmended so
+            // discriminants 0–141 stay stable for already-serialized
+            // histories.
+            142 => Self::SocialRecoveryTimelockAmended,
             _ => return None,
         })
     }
@@ -2972,6 +3008,7 @@ impl EscrowEventKind {
             Self::SettlementMintAllowlistUpdated => "settlement_mint_allowlist_updated",
             Self::DutchAuctionReserveBpsAmended => "dutch_auction_reserve_bps_amended",
             Self::SocialRecoveryThresholdAmended => "social_recovery_threshold_amended",
+            Self::SocialRecoveryTimelockAmended => "social_recovery_timelock_amended",
         }
     }
 
@@ -3193,6 +3230,7 @@ impl EscrowEventKind {
             "settlement_mint_allowlist_updated" => Self::SettlementMintAllowlistUpdated,
             "dutch_auction_reserve_bps_amended" => Self::DutchAuctionReserveBpsAmended,
             "social_recovery_threshold_amended" => Self::SocialRecoveryThresholdAmended,
+            "social_recovery_timelock_amended" => Self::SocialRecoveryTimelockAmended,
             _ => return None,
         })
     }
@@ -6737,6 +6775,43 @@ impl IndexedEscrow {
             let state = self.inner.state();
             self.push_event(
             EscrowEventKind::SocialRecoveryThresholdAmended,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
+    /// Amend the social-recovery veto-window timelock after funding (mirrors
+    /// [`Escrow::amend_social_recovery_timelock`]). Emits
+    /// `SocialRecoveryTimelockAmended` only when the timelock actually
+    /// changes; `from == to ==` the current state. `at` is the
+    /// caller-supplied event timestamp.
+    pub fn amend_social_recovery_timelock(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_timelock_secs: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.recovery().map(|p| p.timelock_secs());
+        self.inner
+            .amend_social_recovery_timelock(initializer, taker, new_timelock_secs)?;
+        let after = self.inner.recovery().map(|p| p.timelock_secs());
+        // The inner call rejects bad input, strangers, and wrong states,
+        // so a changed timelock here always means real governance — and a
+        // same-timelock no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+            EscrowEventKind::SocialRecoveryTimelockAmended,
             state,
             state,
             EventAmounts::none(),
@@ -14135,7 +14210,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -14265,7 +14341,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -14829,7 +14906,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -14871,7 +14949,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -14910,7 +14989,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -14949,7 +15029,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -14988,7 +15069,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15030,7 +15112,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15072,7 +15155,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15111,7 +15195,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15150,7 +15235,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15189,7 +15275,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15228,7 +15315,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15267,7 +15355,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15306,7 +15395,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15349,7 +15439,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15391,7 +15482,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15433,7 +15525,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15475,7 +15568,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15517,7 +15611,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15560,7 +15655,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15603,7 +15699,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15646,7 +15743,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15688,7 +15786,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -15747,7 +15846,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]

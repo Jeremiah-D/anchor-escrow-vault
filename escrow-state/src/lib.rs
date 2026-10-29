@@ -20492,6 +20492,89 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Amend the social-recovery veto-window timelock after funding
+    /// (AV-279): the post-funding counterpart to the timelock leg
+    /// of [`Escrow::with_social_recovery`] (`Uninitialized`-only
+    /// initial configuration). `Funded`-only, pause first —
+    /// paralleling [`Escrow::amend_social_recovery_threshold`]
+    /// (AV-278). Governance follows the AV-276 signature gate:
+    /// on a dual-sig escrow ([`Escrow::with_dual_sig`]) *both*
+    /// parties must sign — one party alone cannot move the
+    /// key-loss veto window on the other's funds — while on a
+    /// plain escrow the initializer alone authorizes, paralleling
+    /// [`Escrow::update_settlement_mint_allowlist`]. Only an
+    /// escrow with a configured social recovery policy (`recovery`
+    /// is `Some`) may amend: an unconfigured escrow is refused
+    /// with [`EscrowError::RecoveryNotConfigured`] (fail-closed —
+    /// post-funding installation would add a recovery path the
+    /// taker never funded under, so it is not an amendment, it
+    /// is a new deal). A pending recovery request is refused
+    /// with [`EscrowError::RecoveryRequestPending`] — the
+    /// in-flight request's veto window already started under the
+    /// old timelock, so changing it would re-time the remaining
+    /// wait. The new timelock reuses the [`SocialRecovery::new`]
+    /// gate (any value is valid, including zero — the veto
+    /// window is then only the approval latency, the initializer
+    /// opting out of the delay deliberately, per the `new`
+    /// comment), leaving the original timelock untouched on
+    /// rejection. Amending to the current timelock is a no-op:
+    /// it succeeds and writes nothing, so the event layer emits
+    /// nothing for it (paralleling `rotate_arbiter`'s no-op
+    /// rule). Only the timelock changes — `guardians`,
+    /// `guardian_count` and `threshold` are untouched, and
+    /// `pending` stays empty (already enforced by the
+    /// pending-request rejection). The new timelock governs from
+    /// the next [`Escrow::request_recovery`]: the recovery path
+    /// compares the live timelock against the request's opening
+    /// timestamp at every [`Escrow::execute_recovery`], so a
+    /// request opened after the amendment arms and executes
+    /// under the new veto window while a request already settled
+    /// keeps the window it settled under, since a settled
+    /// request is consumed. Amending moves no funds, so no AV-36
+    /// reentrancy lock is needed (the lock only guards the
+    /// fund-moving paths, the `rotate_arbiter` precedent).
+    /// Orthogonal to AV-278 (that is the threshold, this item
+    /// is the veto window) and to [`Escrow::with_social_recovery`]
+    /// (that is the initial configuration, this item is the
+    /// post-funding revision). Emits
+    /// `SocialRecoveryTimelockAmended` on the event layer,
+    /// except for the no-op re-affirmation.
+    pub fn amend_social_recovery_timelock(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_timelock_secs: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // AV-276 signature gate: both parties on a dual-sig
+        // escrow, the initializer alone otherwise.
+        if self.dual_sig_required() {
+            if initializer != self.initializer || taker != self.taker {
+                return Err(EscrowError::Unauthorized);
+            }
+        } else if initializer != self.initializer {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow with a configured policy
+        // may amend a timelock — post-funding installation
+        // would add a recovery path the taker never funded
+        // under. Checked before the timelock gates so an
+        // unconfigured escrow never acquires a policy through
+        // this path, whatever the proposed timelock.
+        let mut policy = self.recovery.ok_or(EscrowError::RecoveryNotConfigured)?;
+        // The timelock gates (pending, no-op) live in
+        // `SocialRecovery::amend_timelock`; a failed amendment
+        // never writes, and the stored policy stays as it was.
+        policy.amend_timelock(new_timelock_secs)?;
+        self.recovery = Some(policy);
+        Ok(())
+    }
+
     /// The dead-man's switch inactivity threshold in seconds, `0`
     /// when the switch is not configured (AV-109).
     pub fn deadman_inactivity_secs(&self) -> u64 {
@@ -48721,7 +48804,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
     }
 
     #[test]
@@ -65744,7 +65828,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
-        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
+        assert_eq!(EscrowEventKind::from_discriminant(143), None); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -65968,9 +66053,10 @@ mod event_history_tests {
         // `SocialRecoveryGuardianRotated` (AV-275), 139 is
         // `SettlementMintAllowlistUpdated` (AV-276), 140 is
         // `DutchAuctionReserveBpsAmended` (AV-277), 141 is
-        // `SocialRecoveryThresholdAmended` (AV-278) and 142 is the
+        // `SocialRecoveryThresholdAmended` (AV-278), 142 is
+        // `SocialRecoveryTimelockAmended` (AV-279) and 143 is the
         // first still-unknown byte.
-        for bad in [142u8, 255] {
+        for bad in [143u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -78973,6 +79059,248 @@ mod amend_social_recovery_threshold_tests {
         assert_eq!(ev.amounts.fee, 0);
         // Re-affirming the same threshold is a no-op: no new event.
         e.amend_social_recovery_threshold(ALICE, BOB, 3, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+}
+
+mod amend_social_recovery_timelock_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const G1: [u8; 32] = [0x11; 32];
+    const G2: [u8; 32] = [0x22; 32];
+    const G3: [u8; 32] = [0x33; 32];
+    const NEW_KEY: [u8; 32] = [0x99; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn dual_sig_configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        // A dual-sig escrow activates only once both parties sign.
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn amend_changes_only_the_timelock() {
+        // Only the timelock moves: the guardians, the count,
+        // the threshold and the state are untouched, and the
+        // policy region is already resident, so the amendment
+        // rewrites it in place with no layout change.
+        let mut e = configured();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.amend_social_recovery_timelock(ALICE, BOB, 7_200).unwrap();
+        let policy = e.recovery().expect("policy still configured");
+        assert_eq!(policy.timelock_secs(), 7_200, "timelock moved");
+        assert_eq!(policy.guardians(), &[G1, G2, G3], "guardians untouched");
+        assert_eq!(policy.guardian_count(), 3, "count untouched");
+        assert_eq!(policy.threshold(), 2, "threshold untouched");
+        assert!(policy.pending().is_none(), "pending stays empty");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "policy region rewritten in place, no layout change"
+        );
+        // Zero is valid: the initializer opting out of the
+        // delay deliberately, per the `SocialRecovery::new`
+        // comment — and the other fields still do not move.
+        e.amend_social_recovery_timelock(ALICE, BOB, 0).unwrap();
+        let policy = e.recovery().expect("policy still configured");
+        assert_eq!(policy.timelock_secs(), 0, "zero timelock accepted");
+        assert_eq!(policy.threshold(), 2, "threshold untouched");
+        assert_eq!(policy.guardians(), &[G1, G2, G3], "guardians untouched");
+    }
+
+    #[test]
+    fn amend_new_timelock_governs_next_request_veto_window() {
+        // Shortened to 60s: a request opened after the amendment
+        // executes once the new, shorter window elapses — the old
+        // 3_600s window no longer applies.
+        let mut e = configured();
+        e.amend_social_recovery_timelock(ALICE, BOB, 60).unwrap();
+        e.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        e.approve_recovery(G2).unwrap();
+        assert_eq!(
+            e.execute_recovery(NOW + 59),
+            Err(EscrowError::RecoveryTimelockNotElapsed)
+        );
+        e.execute_recovery(NOW + 60).unwrap();
+        assert_eq!(e.initializer(), NEW_KEY);
+        // Lengthened to 7_200s: the old 3_600s window no longer
+        // suffices, and the new window gates execution.
+        let mut f = configured();
+        f.amend_social_recovery_timelock(ALICE, BOB, 7_200).unwrap();
+        f.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        f.approve_recovery(G2).unwrap();
+        assert_eq!(
+            f.execute_recovery(NOW + 3_600),
+            Err(EscrowError::RecoveryTimelockNotElapsed)
+        );
+        f.execute_recovery(NOW + 7_200).unwrap();
+        assert_eq!(f.initializer(), NEW_KEY);
+        // Zero timelock: the veto window is only the approval
+        // latency — execution succeeds at the request timestamp
+        // itself once the threshold is met.
+        let mut g = configured();
+        g.amend_social_recovery_timelock(ALICE, BOB, 0).unwrap();
+        g.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        g.approve_recovery(G2).unwrap();
+        g.execute_recovery(NOW).unwrap();
+        assert_eq!(g.initializer(), NEW_KEY);
+    }
+
+    #[test]
+    fn amend_rejects_unconfigured_state_authority_and_paused() {
+        // Fail-closed: a never-configured escrow can never acquire
+        // a recovery policy after funding, and a failed amendment
+        // leaves it unconfigured.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        plain.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            plain.amend_social_recovery_timelock(ALICE, BOB, 7_200),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert!(plain.recovery().is_none());
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        assert_eq!(
+            bare.amend_social_recovery_timelock(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.recovery().unwrap().timelock_secs(), 3_600);
+        // AV-276 signature gate: on a plain escrow the
+        // initializer alone authorizes, so a stranger taker key
+        // does not block the amendment — but a stranger
+        // initializer does.
+        let mut e = configured();
+        e.amend_social_recovery_timelock(ALICE, MALLORY, 7_200).unwrap();
+        assert_eq!(e.recovery().unwrap().timelock_secs(), 7_200);
+        assert_eq!(
+            e.amend_social_recovery_timelock(MALLORY, BOB, 60),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.recovery().unwrap().timelock_secs(), 7_200);
+        // On a dual-sig escrow one party alone cannot move the
+        // timelock, and a stranger pair cannot either.
+        let mut dual = dual_sig_configured();
+        assert_eq!(
+            dual.amend_social_recovery_timelock(ALICE, ALICE, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            dual.amend_social_recovery_timelock(MALLORY, BOB, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(dual.recovery().unwrap().timelock_secs(), 3_600);
+        dual.amend_social_recovery_timelock(ALICE, BOB, 7_200).unwrap();
+        assert_eq!(dual.recovery().unwrap().timelock_secs(), 7_200);
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's amendment on a paused escrow is `Paused`.
+        let mut paused = configured();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_social_recovery_timelock(MALLORY, BOB, 7_200),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.recovery().unwrap().timelock_secs(), 3_600);
+    }
+
+    #[test]
+    fn amend_rejects_pending_request_and_preserves_its_window() {
+        // A live request blocks the amendment: its veto window
+        // already started under the old timelock, so changing it
+        // would re-time the remaining wait.
+        let mut e = configured();
+        e.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        e.approve_recovery(G2).unwrap();
+        assert_eq!(e.recovery().unwrap().approval_count(), 2);
+        assert_eq!(
+            e.amend_social_recovery_timelock(ALICE, BOB, 7_200),
+            Err(EscrowError::RecoveryRequestPending)
+        );
+        let policy = e.recovery().unwrap();
+        assert_eq!(policy.timelock_secs(), 3_600, "original timelock untouched");
+        assert_eq!(policy.approval_count(), 2);
+        assert_eq!(policy.pending().unwrap().new_authority, NEW_KEY);
+        // The refused amendment changed nothing, so the request
+        // still executes under its original 3_600s window — not
+        // the refused 7_200s one.
+        assert_eq!(
+            e.execute_recovery(NOW + 3_599),
+            Err(EscrowError::RecoveryTimelockNotElapsed)
+        );
+        e.execute_recovery(NOW + 3_600).unwrap();
+        assert_eq!(e.initializer(), NEW_KEY);
+    }
+
+    #[test]
+    fn amend_same_timelock_is_a_noop() {
+        // Re-affirming the current timelock succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = configured();
+        e.amend_social_recovery_timelock(ALICE, BOB, 3_600).unwrap();
+        let policy = e.recovery().unwrap();
+        assert_eq!(policy.timelock_secs(), 3_600);
+        assert_eq!(policy.guardians(), &[G1, G2, G3]);
+        assert_eq!(policy.guardian_count(), 3);
+        assert_eq!(policy.threshold(), 2);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_social_recovery_timelock_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::wrap([0xE0; 32], configured());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_social_recovery_timelock(MALLORY, BOB, 7_200, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_social_recovery_timelock(ALICE, BOB, 7_200, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::SocialRecoveryTimelockAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same timelock is a no-op: no new event.
+        e.amend_social_recovery_timelock(ALICE, BOB, 7_200, NOW)
             .unwrap();
         assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
     }

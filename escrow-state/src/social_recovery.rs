@@ -320,6 +320,42 @@ impl SocialRecovery {
         Ok(true)
     }
 
+    /// Amend the veto-window timelock after funding (AV-279): the
+    /// post-funding counterpart to the timelock leg of
+    /// [`SocialRecovery::new`]. Returns `true` when the timelock
+    /// actually changes, `false` for a same-value re-affirmation.
+    /// Rejected while a request is live
+    /// ([`EscrowError::RecoveryRequestPending`]) — the in-flight
+    /// request's veto window already started under the old
+    /// timelock, and changing it would re-time the remaining
+    /// wait. The new timelock is rebuilt through
+    /// [`SocialRecovery::new`], so — like the initial set — any
+    /// value is valid, including zero (the initializer opting
+    /// out of the delay deliberately, per the `new` comment
+    /// above), and the original timelock is untouched on
+    /// rejection. Only the timelock moves: the guardians, the
+    /// count and the threshold are carried over verbatim, and
+    /// the pending request (already refused above) stays empty.
+    /// The new timelock governs the veto window of the next
+    /// request opened after the amendment, since
+    /// [`SocialRecovery::executable`] reads the live timelock
+    /// against the request's opening timestamp on every call.
+    pub fn amend_timelock(&mut self, new_timelock_secs: u64) -> Result<bool, EscrowError> {
+        if self.pending.is_some() {
+            return Err(EscrowError::RecoveryRequestPending);
+        }
+        if new_timelock_secs == self.timelock_secs {
+            return Ok(false);
+        }
+        let rebuilt = Self::new(
+            &self.guardians[..self.guardian_count as usize],
+            self.threshold,
+            new_timelock_secs,
+        )?;
+        *self = rebuilt;
+        Ok(true)
+    }
+
     /// Whether the live request may execute at `now`: the approval
     /// threshold is met and the timelock has elapsed. The timelock
     /// origin is the request opening (not the threshold moment), so
@@ -565,6 +601,44 @@ mod social_recovery_tests {
         // Same value is a no-op, not an error.
         assert_eq!(q.amend_threshold(2), Ok(false));
         assert_eq!(q.threshold(), 2);
+    }
+
+    #[test]
+    fn amend_timelock_changes_only_the_timelock() {
+        // Only the timelock moves: the guardians, the count and
+        // the threshold are carried over verbatim, and pending
+        // stays empty. Zero is valid — the initializer opting
+        // out of the delay deliberately, per `new`.
+        let mut p = policy();
+        assert_eq!(p.amend_timelock(7_200), Ok(true));
+        assert_eq!(p.timelock_secs(), 7_200);
+        assert_eq!(p.guardians(), &[G1, G2, G3]);
+        assert_eq!(p.guardian_count(), 3);
+        assert_eq!(p.threshold(), 2);
+        assert!(p.pending().is_none());
+        assert_eq!(p.amend_timelock(0), Ok(true));
+        assert_eq!(p.timelock_secs(), 0);
+        assert_eq!(p.amend_timelock(3_600), Ok(true));
+        assert_eq!(p.timelock_secs(), 3_600);
+    }
+
+    #[test]
+    fn amend_timelock_rejects_pending_and_noops_same() {
+        // A live request blocks the amendment: its veto window
+        // already started under the old timelock.
+        let mut p = policy();
+        p.open_request(G1, NEW_KEY, 1_000).unwrap();
+        p.approve(G2).unwrap();
+        assert_eq!(p.amend_timelock(7_200), Err(EscrowError::RecoveryRequestPending));
+        assert_eq!(p.timelock_secs(), 3_600);
+        assert_eq!(p.approval_count(), 2);
+        // Same value is a no-op, not an error — and every
+        // timelock value, including zero, is valid through `new`.
+        let mut q = policy();
+        assert_eq!(q.amend_timelock(3_600), Ok(false));
+        assert_eq!(q.timelock_secs(), 3_600);
+        assert_eq!(q.amend_timelock(0), Ok(true));
+        assert_eq!(q.timelock_secs(), 0);
     }
 
     #[test]
