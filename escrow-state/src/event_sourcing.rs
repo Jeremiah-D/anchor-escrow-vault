@@ -306,6 +306,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // intent blocks the rotation, so no approval power
         // is ever transferred mid-flight.
         | EscrowEventKind::DualControlCheckerRotated
+        // AV-264: a rotated credential-gate issuer moves no
+        // funds — the gate verifies the next credentialed
+        // release against the live issuer; an old-issuer
+        // credential stops verifying at rotation, while a
+        // release already settled keeps its issuer.
+        | EscrowEventKind::CredentialIssuerRotated
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1092,6 +1098,12 @@ mod event_sourcing_tests {
         // intent blocks the rotation, so no approval power
         // is ever transferred mid-flight.
         | EscrowEventKind::DualControlCheckerRotated
+        // AV-264: a rotated credential-gate issuer moves no
+        // funds — the gate verifies the next credentialed
+        // release against the live issuer; an old-issuer
+        // credential stops verifying at rotation, while a
+        // release already settled keeps its issuer.
+        | EscrowEventKind::CredentialIssuerRotated
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

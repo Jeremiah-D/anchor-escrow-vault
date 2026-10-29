@@ -333,6 +333,17 @@
 //!   a rotation blocked by a live intent emits nothing, and a
 //!   no-op re-affirmation of the current checker emits nothing
 //!   either.
+//! - `rotate_credential_issuer` emits
+//!   [`EscrowEventKind::CredentialIssuerRotated`] on every
+//!   successful rotation that actually changes the issuer
+//!   (AV-264) — `from == to ==` the current state, all amounts
+//!   zero; the new issuer is read from the vault, and the
+//!   credential gate verifies the next `release_with_credential`
+//!   against it, so a credential minted by the old issuer stops
+//!   verifying the moment the rotation lands while a release
+//!   already settled keeps the issuer it settled under. A failed
+//!   rotation emits nothing, and a no-op re-affirmation of the
+//!   current issuer emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -552,6 +563,7 @@
 //! | PriceGateAmended (AV-261) | 0 | 0 | 0 | 0 — amending moves no funds; the gated payout paths re-read the live gate at every `release_price_gated` / `claim_price_gated`, while a payout already settled keeps the gate it settled under |
 //! | TwapGateAmended (AV-262) | 0 | 0 | 0 | 0 — amending moves no funds; the gated payout paths re-read the live gate at every `release_twap_gated` / `claim_twap_gated` (including the full-window history coverage requirement), while a payout already settled keeps the gate it settled under |
 //! | DualControlCheckerRotated (AV-263) | 0 | 0 | 0 | 0 — rotating moves no funds; the two-step protocol authenticates the next `confirm_release` against the live checker, while a declaration already settled keeps the checker it settled under |
+//! | CredentialIssuerRotated (AV-264) | 0 | 0 | 0 | 0 — rotating moves no funds; the credential gate verifies the next `release_with_credential` against the live issuer, so an old-issuer credential stops verifying the moment the rotation lands, while a release already settled keeps the issuer it settled under |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1869,6 +1881,23 @@ pub enum EscrowEventKind {
     /// vault, so the event needs no extra field. A no-op
     /// re-affirmation of the current checker emits nothing.
     DualControlCheckerRotated,
+    /// AV-264: the credential-gate issuer was rotated by
+    /// dual-signed governance
+    /// ([`Escrow::rotate_credential_issuer`](crate::Escrow::rotate_credential_issuer)).
+    /// `from == to ==` the current state (a governance rotation,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::ArbiterRotated`]); all amounts are
+    /// zero — rotating moves no funds (the credential gate
+    /// verifies the next `release_with_credential` against the
+    /// live issuer, so a credential minted by the old issuer
+    /// stops verifying the moment the rotation lands — even one
+    /// never used, since verification reads the stored issuer,
+    /// not the credential's history — while a release already
+    /// settled keeps the issuer it settled under, the release
+    /// being terminal). The new issuer is read from the vault,
+    /// so the event needs no extra field. A no-op
+    /// re-affirmation of the current issuer emits nothing.
+    CredentialIssuerRotated,
 }
 
 impl EscrowEventKind {
@@ -2244,6 +2273,10 @@ impl EscrowEventKind {
             // discriminants 0–125 stay stable for already-serialized
             // histories.
             126 => Self::DualControlCheckerRotated,
+            // AV-264: appended after DualControlCheckerRotated so
+            // discriminants 0–126 stay stable for already-serialized
+            // histories.
+            127 => Self::CredentialIssuerRotated,
             _ => return None,
         })
     }
@@ -2446,6 +2479,7 @@ impl EscrowEventKind {
             Self::PriceGateAmended => "price_gate_amended",
             Self::TwapGateAmended => "twap_gate_amended",
             Self::DualControlCheckerRotated => "dual_control_checker_rotated",
+            Self::CredentialIssuerRotated => "credential_issuer_rotated",
         }
     }
 
@@ -2652,6 +2686,7 @@ impl EscrowEventKind {
             "price_gate_amended" => Self::PriceGateAmended,
             "twap_gate_amended" => Self::TwapGateAmended,
             "dual_control_checker_rotated" => Self::DualControlCheckerRotated,
+            "credential_issuer_rotated" => Self::CredentialIssuerRotated,
             _ => return None,
         })
     }
@@ -4175,6 +4210,14 @@ impl IndexedEscrow {
     /// emits no event.
     pub fn with_dual_control(mut self, checker: [u8; 32]) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_dual_control(checker)?;
+        Ok(self)
+    }
+
+    /// Bind the credential gate (mirrors
+    /// [`Escrow::with_credential_gate`], AV-212). Configuration:
+    /// emits no event.
+    pub fn with_credential_gate(mut self, issuer: [u8; 32]) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_credential_gate(issuer)?;
         Ok(self)
     }
 
@@ -8229,6 +8272,49 @@ impl IndexedEscrow {
         if self.inner.dual_control_checker() != before {
             self.push_event(
                 EscrowEventKind::DualControlCheckerRotated,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// Rotate the credential-gate issuer after funding
+    /// (mirrors [`Escrow::rotate_credential_issuer`]). Emits
+    /// `CredentialIssuerRotated` when the issuer actually
+    /// changes (`from == to ==` the current state — the issuer,
+    /// not the lifecycle state, is what changed; all amounts
+    /// zero, since rotating moves no funds — the credential
+    /// gate verifies the next `release_with_credential` against
+    /// the live issuer, so a credential minted by the old issuer
+    /// stops verifying the moment the rotation lands, while a
+    /// release already settled keeps the issuer it settled
+    /// under). The new issuer is read from the vault, so the
+    /// event needs no extra field. A failed rotation emits
+    /// nothing, and a no-op re-affirmation of the current issuer
+    /// emits nothing either, paralleling
+    /// `rotate_arbiter`'s no-op rule.
+    pub fn rotate_credential_issuer(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_issuer: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let before = self.inner.credential_issuer();
+        self.inner
+            .rotate_credential_issuer(initializer, taker, new_issuer)?;
+        if self.inner.credential_issuer() != before {
+            self.push_event(
+                EscrowEventKind::CredentialIssuerRotated,
                 from,
                 self.inner.state(),
                 EventAmounts::none(),
@@ -12879,7 +12965,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -12994,7 +13081,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13543,7 +13631,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13570,7 +13659,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13594,7 +13684,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13618,7 +13709,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13642,7 +13734,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13669,7 +13762,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13696,7 +13790,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13720,7 +13815,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13744,7 +13840,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13768,7 +13865,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13792,7 +13890,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13816,7 +13915,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13840,7 +13940,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13868,7 +13969,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13895,7 +13997,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13922,7 +14025,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13949,7 +14053,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -13976,7 +14081,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -14004,7 +14110,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -14032,7 +14139,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -14060,7 +14168,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -14087,7 +14196,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -14131,7 +14241,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]

@@ -14137,6 +14137,83 @@ let fee = self.charge_protocol_fee(net_amount)?;
         Ok(self)
     }
 
+    /// Rotate the credential-gate issuer after funding
+    /// (AV-264): the post-funding counterpart to
+    /// [`Escrow::with_credential_gate`] (`Uninitialized`-only initial
+    /// binding). Dual-signed governance, `Funded`-only, pause
+    /// first — paralleling [`Escrow::rotate_dual_control_checker`].
+    /// Only an escrow that already bound a credential gate may
+    /// rotate its issuer: a never-bound escrow is refused with
+    /// [`EscrowError::CredentialGateNotBound`] (fail-closed —
+    /// post-funding installation would add a release qualification
+    /// the taker never funded under, so it is not a rotation, it
+    /// is a new deal). A zero `new_issuer` is refused with
+    /// [`EscrowError::InvalidCredentialIssuer`] (the builder's gate,
+    /// unchanged — a zero key can never be a legitimate issuer).
+    /// Rotating to the current issuer is a no-op: it succeeds and
+    /// writes nothing, so the event layer emits nothing for it
+    /// (paralleling `rotate_arbiter`'s no-op rule). The issuer
+    /// region is already resident (32 bytes, always present —
+    /// zeroed when no gate is bound), so the rotation rewrites it
+    /// in place with no layout change. The credential gate reads
+    /// the issuer live: [`Escrow::release_with_credential`] checks
+    /// the credential against the stored issuer at release time
+    /// (see [`verify_release_credential`]), so the new issuer
+    /// governs from the next credentialed release — and a
+    /// credential minted by the old issuer stops verifying the
+    /// moment the rotation lands, even if it was never used: the
+    /// old issuer must re-sign under the new key for the taker to
+    /// be released. A release already settled keeps the issuer it
+    /// settled under, since the release is terminal. Rotation
+    /// moves no funds, so no AV-36 reentrancy lock is needed (the
+    /// lock only guards the fund-moving paths, the
+    /// `rotate_arbiter` precedent). Orthogonal to
+    /// [`Escrow::with_credential_gate`] (that is the initial
+    /// binding, this item is the post-funding rotation) and to
+    /// AV-212 (that is the credential-gate mechanism itself, this
+    /// item is the issuer's identity). Emits
+    /// `CredentialIssuerRotated` on the event layer, except for
+    /// the no-op re-affirmation.
+    pub fn rotate_credential_issuer(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_issuer: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the rotation, paralleling `rotate_dual_control_checker`.
+        // The issuer itself does not sign: a lost issuer key must
+        // not block its own replacement (the `rotate_arbiter`
+        // reasoning).
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow that bound a credential gate
+        // may rotate its issuer — post-funding installation would
+        // add a qualification the taker never funded under.
+        if self.credential_issuer == [0u8; 32] {
+            return Err(EscrowError::CredentialGateNotBound);
+        }
+        // The builder's gate, unchanged: a zero key can never be
+        // a legitimate issuer.
+        if new_issuer == [0u8; 32] {
+            return Err(EscrowError::InvalidCredentialIssuer);
+        }
+        // No-op: re-affirming the current issuer writes nothing,
+        // so the event layer emits nothing for it.
+        if new_issuer == self.credential_issuer {
+            return Ok(());
+        }
+        self.credential_issuer = new_issuer;
+        Ok(())
+    }
+
 
     /// Declare a release for checker approval (AV-130 — the *maker*
     /// half of the maker-checker protocol). Freezes the exact payout
@@ -47293,7 +47370,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
     }
 
     #[test]
@@ -64293,7 +64371,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(124), Some(EscrowEventKind::PriceGateAmended)); // AV-261: 124 is PriceGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(127), None); // AV-263: 126 is DualControlCheckerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -64502,9 +64581,10 @@ mod event_history_tests {
         // `InterestRateAmended` (AV-260), 124 is
         // `PriceGateAmended` (AV-261), 125 is
         // `TwapGateAmended` (AV-262), 126 is
-        // `DualControlCheckerRotated` (AV-263) and 127 is the
+        // `DualControlCheckerRotated` (AV-263), 127 is
+        // `CredentialIssuerRotated` (AV-264) and 128 is the
         // first still-unknown byte.
-        for bad in [127u8, 255] {
+        for bad in [128u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -74785,6 +74865,175 @@ mod dual_control_tests {
         assert_eq!(
             e.event_count(),
             before_rotate + 1,
+            "no-op emits nothing"
+        );
+    }
+}
+
+// ---------- AV-264: rotate credential issuer after funding ----------
+mod rotate_credential_issuer_tests {
+    use super::*;
+    use crate::credential_gate::sign_release_credential;
+    use crate::ed25519::SigningKey;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_750_000_000;
+
+    fn old_key() -> SigningKey {
+        SigningKey::from_seed([0x77; 32])
+    }
+
+    fn new_key() -> SigningKey {
+        SigningKey::from_seed([0x88; 32])
+    }
+
+    fn not_revoked(_: &crate::ReleaseCredential) -> bool {
+        false
+    }
+
+    fn gated() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_credential_gate(old_key().public_key())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn rotate_moves_issuer_and_new_issuer_credential_releases_old_fails() {
+        // The issuer key moves, nothing else: the 32-byte region
+        // is already resident, so the rotation rewrites it in
+        // place with no layout change and no state move.
+        let mut e = gated();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        let new_issuer = new_key().public_key();
+        e.rotate_credential_issuer(ALICE, BOB, new_issuer).unwrap();
+        assert_eq!(e.credential_issuer(), new_issuer);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "issuer region rewritten in place, no layout change"
+        );
+        // A credential minted by the old issuer — never used —
+        // stops verifying the moment the rotation lands: the gate
+        // reads the live issuer at release time.
+        let stale = sign_release_credential(&old_key(), BOB, EXPIRES_AT);
+        assert_eq!(
+            e.release_with_credential(ALICE, NOW, 1_000_000, None, BOB, &stale, &not_revoked),
+            Err(EscrowError::CredentialInvalid)
+        );
+        assert_eq!(e.released_amount(), 0, "a refused release moves nothing");
+        // The new issuer's credential releases in full.
+        let fresh = sign_release_credential(&new_key(), BOB, EXPIRES_AT);
+        let (payout, fee) = e
+            .release_with_credential(ALICE, NOW, 1_000_000, None, BOB, &fresh, &not_revoked)
+            .unwrap();
+        assert_eq!((payout, fee), (1_000_000, 0));
+        assert_eq!(e.released_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn rotate_rejects_unbound_zero_state_authority_and_paused() {
+        // Fail-closed: a never-bound escrow can never acquire a
+        // credential gate after funding, and a failed rotation
+        // leaves it unbound.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(plain.credential_issuer(), [0u8; 32]);
+        assert_eq!(
+            plain.rotate_credential_issuer(ALICE, BOB, new_key().public_key()),
+            Err(EscrowError::CredentialGateNotBound)
+        );
+        assert_eq!(plain.credential_issuer(), [0u8; 32]);
+        // Zero issuer: the builder's gate, unchanged.
+        let mut e = gated();
+        assert_eq!(
+            e.rotate_credential_issuer(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::InvalidCredentialIssuer)
+        );
+        assert_eq!(e.credential_issuer(), old_key().public_key());
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_credential_gate(old_key().public_key())
+            .unwrap();
+        assert_eq!(
+            bare.rotate_credential_issuer(ALICE, BOB, new_key().public_key()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Dual signature: one party alone cannot rotate the issuer.
+        assert_eq!(
+            e.rotate_credential_issuer(ALICE, ALICE, new_key().public_key()),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.rotate_credential_issuer(MALLORY, BOB, new_key().public_key()),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.credential_issuer(), old_key().public_key());
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's rotation on a paused escrow is `Paused`.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap()
+            .with_credential_gate(old_key().public_key())
+            .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause([0xDD; 32], None).unwrap();
+        assert_eq!(
+            paused.rotate_credential_issuer(MALLORY, BOB, new_key().public_key()),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.credential_issuer(), old_key().public_key());
+    }
+
+    #[test]
+    fn rotate_same_issuer_is_a_noop() {
+        // Re-affirming the current issuer succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = gated();
+        e.rotate_credential_issuer(ALICE, BOB, old_key().public_key())
+            .unwrap();
+        assert_eq!(e.credential_issuer(), old_key().public_key());
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn rotate_credential_issuer_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], NOW)
+            .unwrap()
+            .with_credential_gate(old_key().public_key())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let before = e.event_count();
+        let new_issuer = new_key().public_key();
+        assert_eq!(
+            e.rotate_credential_issuer(ALICE, ALICE, new_issuer, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.rotate_credential_issuer(ALICE, BOB, new_issuer, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::CredentialIssuerRotated);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same issuer is a no-op: no new event.
+        e.rotate_credential_issuer(ALICE, BOB, new_issuer, NOW)
+            .unwrap();
+        assert_eq!(
+            e.event_count(),
+            before + 1,
             "no-op emits nothing"
         );
     }
