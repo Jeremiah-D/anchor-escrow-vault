@@ -344,6 +344,19 @@
 //!   already settled keeps the issuer it settled under. A failed
 //!   rotation emits nothing, and a no-op re-affirmation of the
 //!   current issuer emits nothing either.
+//! - `amend_deadman_inactivity` emits
+//!   [`EscrowEventKind::DeadmanInactivityAmended`] on every
+//!   successful revision that actually changes the threshold
+//!   (AV-265) — `from == to ==` the current state, all amounts
+//!   zero; the new threshold is read from the vault, and the
+//!   eligibility gate judges the unchanged elapsed time against
+//!   it at the next `claim_deadman`, so tightening can make an
+//!   already-idle escrow eligible at once while loosening can
+//!   revoke an already-satisfied but unexecuted eligibility,
+//!   and a claim already settled keeps the threshold it settled
+//!   under. A failed revision emits nothing, and a no-op
+//!   re-affirmation of the current threshold emits nothing
+//!   either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -564,6 +577,7 @@
 //! | TwapGateAmended (AV-262) | 0 | 0 | 0 | 0 — amending moves no funds; the gated payout paths re-read the live gate at every `release_twap_gated` / `claim_twap_gated` (including the full-window history coverage requirement), while a payout already settled keeps the gate it settled under |
 //! | DualControlCheckerRotated (AV-263) | 0 | 0 | 0 | 0 — rotating moves no funds; the two-step protocol authenticates the next `confirm_release` against the live checker, while a declaration already settled keeps the checker it settled under |
 //! | CredentialIssuerRotated (AV-264) | 0 | 0 | 0 | 0 — rotating moves no funds; the credential gate verifies the next `release_with_credential` against the live issuer, so an old-issuer credential stops verifying the moment the rotation lands, while a release already settled keeps the issuer it settled under |
+//! | DeadmanInactivityAmended (AV-265) | 0 | 0 | 0 | 0 — revising moves no funds; the eligibility gate judges the unchanged elapsed time against the live threshold at the next `claim_deadman`, so tightening can make an already-idle escrow eligible at once while loosening can revoke an already-satisfied but unexecuted eligibility, and a claim already settled keeps the threshold it settled under |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1898,6 +1912,23 @@ pub enum EscrowEventKind {
     /// so the event needs no extra field. A no-op
     /// re-affirmation of the current issuer emits nothing.
     CredentialIssuerRotated,
+    /// AV-265: the dead-man's switch inactivity threshold was
+    /// revised by dual-signed governance
+    /// ([`Escrow::amend_deadman_inactivity`](crate::Escrow::amend_deadman_inactivity)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::ProtocolFeeAmended`]); all amounts are
+    /// zero — revising moves no funds (the eligibility gate
+    /// judges the unchanged elapsed time against the live
+    /// threshold at the next `claim_deadman`, so tightening can
+    /// make an already-idle escrow eligible at once while
+    /// loosening can revoke an already-satisfied but unexecuted
+    /// eligibility, and a claim already settled keeps the
+    /// threshold it settled under, the claim being terminal).
+    /// The new threshold is read from the vault, so the event
+    /// needs no extra field. A no-op re-affirmation of the
+    /// current threshold emits nothing.
+    DeadmanInactivityAmended,
 }
 
 impl EscrowEventKind {
@@ -2277,6 +2308,10 @@ impl EscrowEventKind {
             // discriminants 0–126 stay stable for already-serialized
             // histories.
             127 => Self::CredentialIssuerRotated,
+            // AV-265: appended after CredentialIssuerRotated so
+            // discriminants 0–127 stay stable for already-serialized
+            // histories.
+            128 => Self::DeadmanInactivityAmended,
             _ => return None,
         })
     }
@@ -2480,6 +2515,7 @@ impl EscrowEventKind {
             Self::TwapGateAmended => "twap_gate_amended",
             Self::DualControlCheckerRotated => "dual_control_checker_rotated",
             Self::CredentialIssuerRotated => "credential_issuer_rotated",
+            Self::DeadmanInactivityAmended => "deadman_inactivity_amended",
         }
     }
 
@@ -2687,6 +2723,7 @@ impl EscrowEventKind {
             "twap_gate_amended" => Self::TwapGateAmended,
             "dual_control_checker_rotated" => Self::DualControlCheckerRotated,
             "credential_issuer_rotated" => Self::CredentialIssuerRotated,
+            "deadman_inactivity_amended" => Self::DeadmanInactivityAmended,
             _ => return None,
         })
     }
@@ -4218,6 +4255,18 @@ impl IndexedEscrow {
     /// emits no event.
     pub fn with_credential_gate(mut self, issuer: [u8; 32]) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_credential_gate(issuer)?;
+        Ok(self)
+    }
+
+    /// Configure the dead-man's switch (mirrors
+    /// [`Escrow::with_deadman_switch`], AV-109). Configuration:
+    /// emits no event.
+    pub fn with_deadman_switch(
+        mut self,
+        inactivity_secs: u64,
+        heir: [u8; 32],
+    ) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_deadman_switch(inactivity_secs, heir)?;
         Ok(self)
     }
 
@@ -8315,6 +8364,50 @@ impl IndexedEscrow {
         if self.inner.credential_issuer() != before {
             self.push_event(
                 EscrowEventKind::CredentialIssuerRotated,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// Revise the dead-man's switch inactivity threshold after
+    /// funding (mirrors [`Escrow::amend_deadman_inactivity`]).
+    /// Emits `DeadmanInactivityAmended` when the threshold
+    /// actually changes (`from == to ==` the current state — the
+    /// threshold, not the lifecycle state, is what changed; all
+    /// amounts zero, since revising moves no funds — the
+    /// eligibility gate judges the unchanged elapsed time
+    /// against the live threshold at the next `claim_deadman`,
+    /// so tightening can make an already-idle escrow eligible at
+    /// once while loosening can revoke an already-satisfied but
+    /// unexecuted eligibility, and a claim already settled keeps
+    /// the threshold it settled under). The new threshold is
+    /// read from the vault, so the event needs no extra field.
+    /// A failed revision emits nothing, and a no-op
+    /// re-affirmation of the current threshold emits nothing
+    /// either, paralleling `rotate_arbiter`'s no-op rule.
+    pub fn amend_deadman_inactivity(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        inactivity_secs: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let before = self.inner.deadman_inactivity_secs();
+        self.inner
+            .amend_deadman_inactivity(initializer, taker, inactivity_secs)?;
+        if self.inner.deadman_inactivity_secs() != before {
+            self.push_event(
+                EscrowEventKind::DeadmanInactivityAmended,
                 from,
                 self.inner.state(),
                 EventAmounts::none(),
@@ -12966,7 +13059,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13082,7 +13176,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13632,7 +13727,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13660,7 +13756,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13685,7 +13782,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13710,7 +13808,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13735,7 +13834,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13763,7 +13863,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13791,7 +13892,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13816,7 +13918,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13841,7 +13944,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13866,7 +13970,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13891,7 +13996,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13916,7 +14022,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13941,7 +14048,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13970,7 +14078,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -13998,7 +14107,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -14026,7 +14136,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -14054,7 +14165,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -14082,7 +14194,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -14111,7 +14224,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -14140,7 +14254,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -14169,7 +14284,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -14197,7 +14313,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]
@@ -14242,7 +14359,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(125), Some(EscrowEventKind::TwapGateAmended)); // AV-262: 125 is TwapGateAmended
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
-        assert_eq!(EscrowEventKind::from_discriminant(128), None); // AV-264: 127 is CredentialIssuerRotated
+        assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
     }
 
     #[test]

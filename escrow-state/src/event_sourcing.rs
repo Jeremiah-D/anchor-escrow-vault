@@ -312,6 +312,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // credential stops verifying at rotation, while a
         // release already settled keeps its issuer.
         | EscrowEventKind::CredentialIssuerRotated
+        // AV-265: a revised dead-man's inactivity threshold
+        // moves no funds — the eligibility gate judges the
+        // unchanged elapsed time against the live threshold
+        // at the next claim; a claim already settled keeps
+        // the threshold it settled under.
+        | EscrowEventKind::DeadmanInactivityAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1104,6 +1110,12 @@ mod event_sourcing_tests {
         // credential stops verifying at rotation, while a
         // release already settled keeps its issuer.
         | EscrowEventKind::CredentialIssuerRotated
+        // AV-265: a revised dead-man's inactivity threshold
+        // moves no funds — the eligibility gate judges the
+        // unchanged elapsed time against the live threshold
+        // at the next claim; a claim already settled keeps
+        // the threshold it settled under.
+        | EscrowEventKind::DeadmanInactivityAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
