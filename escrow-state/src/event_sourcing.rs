@@ -402,6 +402,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // changes, so the wrapped base policy is untouched,
         // while the next release clears under the live table.
         | EscrowEventKind::TieredQuorumUpdated
+        // AV-281: a replaced jury size moves no funds and
+        // never restates a settled verdict — only the size
+        // changes, so the arbiter slot, the panel and the
+        // registry are untouched, while the next dispute draws
+        // under the live size.
+        | EscrowEventKind::JuryPanelSizeAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1284,6 +1290,12 @@ mod event_sourcing_tests {
                 // changes, so the wrapped base policy is untouched,
                 // while the next release clears under the live table.
                 | EscrowEventKind::TieredQuorumUpdated
+                // AV-281: a replaced jury size moves no funds and
+                // never restates a settled verdict — only the size
+                // changes, so the arbiter slot, the panel and the
+                // registry are untouched, while the next dispute draws
+                // under the live size.
+                | EscrowEventKind::JuryPanelSizeAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

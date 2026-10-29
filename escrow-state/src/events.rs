@@ -543,6 +543,18 @@
 //!   the table it settled under. A failed revision emits
 //!   nothing, and a no-op re-affirmation of the current table
 //!   emits nothing either.
+//! - `amend_jury_panel_size` emits
+//!   [`EscrowEventKind::JuryPanelSizeAmended`] on every successful
+//!   revision that actually changes the jury size (AV-281) —
+//!   `from == to ==` the current state, all amounts zero; only
+//!   the size changes, so the arbiter slot, the arbiter panel,
+//!   and the juror registry are untouched, and the draw reads
+//!   the live size at the next dispute, so a panel drawn after
+//!   the amendment seats the new size while no panel is ever
+//!   re-drawn in flight (the draw runs only on a `Disputed`
+//!   escrow, and this revision is `Funded`-only). A failed
+//!   revision emits nothing, and a no-op re-affirmation of the
+//!   current size emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -779,6 +791,7 @@
 //! | SocialRecoveryThresholdAmended (AV-278) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the threshold changes, so the guardians, the guardian count and the timelock are untouched, and the recovery path compares the live approval count against the live threshold at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new threshold while a request already settled keeps the threshold it settled under |
 //! | SocialRecoveryTimelockAmended (AV-279) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the timelock changes, so the guardians, the guardian count and the threshold are untouched, and the recovery path compares the live timelock against the request's opening timestamp at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new veto window while a request already settled keeps the window it settled under |
 //! | TieredQuorumUpdated (AV-280) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a release already settled; only the tier table changes, so the wrapped base policy (attestor registry, weights, accumulated attestations) is untouched, and the release path compares the live accumulated weight against the live tier threshold at the next `release`, so a release after the amendment clears under the new table while a release already settled keeps the table it settled under |
+//! | JuryPanelSizeAmended (AV-281) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a verdict already settled; only the jury size changes, so the arbiter slot, the arbiter panel and the juror registry are untouched, and the draw reads the live size at the next dispute, so a panel drawn after the amendment seats the new size while no panel is ever re-drawn in flight (the draw runs only on a `Disputed` escrow, and this revision is `Funded`-only) |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2383,6 +2396,23 @@ pub enum EscrowEventKind {
     /// the vault, so the event needs no extra field. A no-op
     /// re-affirmation of the current table emits nothing.
     TieredQuorumUpdated,
+    /// AV-281: the dispute jury size was replaced by governed
+    /// post-funding amendment
+    /// ([`Escrow::amend_jury_panel_size`](crate::Escrow::amend_jury_panel_size)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::TieredQuorumUpdated`]); all amounts are
+    /// zero — amending moves no funds and never restates a verdict
+    /// already settled; only the size changes, so the arbiter slot,
+    /// the arbiter panel, and the juror registry are untouched —
+    /// the draw reads the live size at the next dispute, so a
+    /// panel drawn after the amendment seats the new size while
+    /// no panel is ever re-drawn in flight (the draw runs only
+    /// on a `Disputed` escrow, and this revision is
+    /// `Funded`-only). The new size is read from the vault, so
+    /// the event needs no extra field. A no-op re-affirmation of
+    /// the current size emits nothing.
+    JuryPanelSizeAmended,
 }
 
 impl EscrowEventKind {
@@ -2826,6 +2856,10 @@ impl EscrowEventKind {
             // discriminants 0–142 stay stable for already-serialized
             // histories.
             143 => Self::TieredQuorumUpdated,
+            // AV-281: appended after TieredQuorumUpdated so
+            // discriminants 0–143 stay stable for already-serialized
+            // histories.
+            144 => Self::JuryPanelSizeAmended,
             _ => return None,
         })
     }
@@ -3045,6 +3079,7 @@ impl EscrowEventKind {
             Self::SocialRecoveryThresholdAmended => "social_recovery_threshold_amended",
             Self::SocialRecoveryTimelockAmended => "social_recovery_timelock_amended",
             Self::TieredQuorumUpdated => "tiered_quorum_updated",
+            Self::JuryPanelSizeAmended => "jury_panel_size_amended",
         }
     }
 
@@ -3268,6 +3303,7 @@ impl EscrowEventKind {
             "social_recovery_threshold_amended" => Self::SocialRecoveryThresholdAmended,
             "social_recovery_timelock_amended" => Self::SocialRecoveryTimelockAmended,
             "tiered_quorum_updated" => Self::TieredQuorumUpdated,
+            "jury_panel_size_amended" => Self::JuryPanelSizeAmended,
             _ => return None,
         })
     }
@@ -6886,6 +6922,43 @@ impl IndexedEscrow {
             let state = self.inner.state();
             self.push_event(
             EscrowEventKind::TieredQuorumUpdated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
+    /// Revise the dispute jury size after funding (mirrors
+    /// [`Escrow::amend_jury_panel_size`]). Emits
+    /// `JuryPanelSizeAmended` only when the size actually
+    /// changes; `from == to ==` the current state. `at` is the
+    /// caller-supplied event timestamp.
+    pub fn amend_jury_panel_size(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_panel_size: u8,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.jury_panel_size();
+        self.inner
+            .amend_jury_panel_size(initializer, taker, new_panel_size)?;
+        let after = self.inner.jury_panel_size();
+        // The inner call rejects bad input, strangers, and wrong states,
+        // so a changed size here always means real governance — and a
+        // same-size no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+            EscrowEventKind::JuryPanelSizeAmended,
             state,
             state,
             EventAmounts::none(),
@@ -14286,7 +14359,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -14418,7 +14492,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -14984,7 +15059,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15028,7 +15104,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15069,7 +15146,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15110,7 +15188,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15151,7 +15230,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15195,7 +15275,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15239,7 +15320,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15280,7 +15362,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15321,7 +15404,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15362,7 +15446,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15403,7 +15488,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15444,7 +15530,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15485,7 +15572,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15530,7 +15618,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15574,7 +15663,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15618,7 +15708,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15662,7 +15753,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15706,7 +15798,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15751,7 +15844,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15796,7 +15890,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15841,7 +15936,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15885,7 +15981,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]
@@ -15946,7 +16043,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(142), Some(EscrowEventKind::SocialRecoveryTimelockAmended)); // AV-279: 142 is SocialRecoveryTimelockAmended
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(144), None); // AV-280: 143 is TieredQuorumUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
+        assert_eq!(EscrowEventKind::from_discriminant(145), None); // AV-281: 144 is JuryPanelSizeAmended
     }
 
     #[test]

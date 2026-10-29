@@ -444,6 +444,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // changes, so the wrapped base policy is untouched,
         // while the next release clears under the live table.
         | EscrowEventKind::TieredQuorumUpdated
+        // AV-281: a replaced jury size moves no funds and
+        // never restates a settled verdict — only the size
+        // changes, so the arbiter slot, the panel and the
+        // registry are untouched, while the next dispute draws
+        // under the live size.
+        | EscrowEventKind::JuryPanelSizeAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1330,6 +1336,12 @@ mod fee_history_tests {
                 // changes, so the wrapped base policy is untouched,
                 // while the next release clears under the live table.
                 | EscrowEventKind::TieredQuorumUpdated
+                // AV-281: a replaced jury size moves no funds and
+                // never restates a settled verdict — only the size
+                // changes, so the arbiter slot, the panel and the
+                // registry are untouched, while the next dispute draws
+                // under the live size.
+                | EscrowEventKind::JuryPanelSizeAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
