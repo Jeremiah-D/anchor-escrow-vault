@@ -400,6 +400,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // and penalty_paid already banked are untouched, while
         // the next slash transfers to the live account.
         | EscrowEventKind::SlashPenaltyAccountRotated
+        // AV-273: a revised protocol-fee ceiling moves no funds
+        // and never restates a fee already charged — only fee_cap
+        // changes, so the rate, the tier schedule and fees_paid
+        // already banked are untouched, while the next taker
+        // payout prices at the live ceiling.
+        | EscrowEventKind::FeeCapAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1242,6 +1248,12 @@ mod fee_history_tests {
         // and penalty_paid already banked are untouched, while
         // the next slash transfers to the live account.
         | EscrowEventKind::SlashPenaltyAccountRotated
+        // AV-273: a revised protocol-fee ceiling moves no funds
+        // and never restates a fee already charged — only fee_cap
+        // changes, so the rate, the tier schedule and fees_paid
+        // already banked are untouched, while the next taker
+        // payout prices at the live ceiling.
+        | EscrowEventKind::FeeCapAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

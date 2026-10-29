@@ -20608,6 +20608,88 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Revise the absolute protocol-fee ceiling after funding (AV-273 —
+    /// Solana / fee governance / payment fintech): the post-funding
+    /// counterpart of [`Escrow::with_fee_cap`], which stays
+    /// `Uninitialized`-only — this is the revision path, not a second
+    /// initial set. When the deal's economics change mid-deal — a
+    /// whale-sized payout makes the original ceiling meaningless, or
+    /// a tighter ceiling is agreed to protect the taker — the cap can
+    /// follow without cancelling and re-locking the escrow.
+    ///
+    /// Check order mirrors [`Escrow::amend_protocol_fee`]:
+    /// pause, then dual-signature authority (both parties must
+    /// authorize — one party alone cannot move the ceiling on the
+    /// other's payouts), then `Funded` state, then the
+    /// already-configured gate. Validation completes before any
+    /// write, so a failed amendment leaves the original cap
+    /// untouched (fail-closed, zero-write).
+    ///
+    /// Fail-closed: only an escrow already carrying a ceiling
+    /// (`fee_cap != 0`) may revise it — an uncapped escrow is refused
+    /// with [`EscrowError::InvalidProtocolFee`] (code 114, the fee
+    /// configuration error, no new code), so a ceiling can never be
+    /// installed after funding (post-funding installation would add
+    /// a fee term the taker never funded under). Any `u64` is a legal
+    /// new ceiling, and `0` is legal: it removes the cap outright, so
+    /// later bps fees are no longer floored — and removing it is
+    /// one-way post-funding, since a cap-less escrow can never amend
+    /// again (the same fail-closed gate refuses the re-installation).
+    /// Revising to the current ceiling is a no-op: it succeeds and
+    /// writes nothing, so the event layer emits nothing for it
+    /// (paralleling `rotate_arbiter`).
+    ///
+    /// Only `fee_cap` changes — `fee_bps`, `fee_schedule` and
+    /// `fees_paid` / `fees_withdrawn` are untouched, and fees already
+    /// charged are never restated. The new ceiling governs from the
+    /// next fee pricing: [`Escrow::protocol_fee_for`] reads the live
+    /// `fee_cap` at every computation (`min(bps fee, cap)`), so every
+    /// taker-payout path ([`Escrow::release`], [`Escrow::claim`],
+    /// [`Escrow::release_milestone`], the taker's share of
+    /// [`Escrow::resolve`], [`Escrow::release_period`]) and the
+    /// keeper / batch / settlement-plan previews that call
+    /// `protocol_fee_for` directly all price at the new ceiling the
+    /// moment the amendment lands — flat-rate and tiered-schedule
+    /// escrows alike, since the cap floors the tiered fee too.
+    /// Orthogonal to [`Escrow::amend_protocol_fee`] (that moves the
+    /// flat rate, this moves the absolute ceiling), to
+    /// [`Escrow::amend_fee_schedule`] (that moves the tier table,
+    /// this moves the ceiling that floors it), and to
+    /// [`Escrow::rotate_fee_recipient`] (that moves the fee's
+    /// destination, this moves its ceiling). Emits `FeeCapAmended`
+    /// on the event layer, except for the no-op re-affirmation.
+    pub fn amend_fee_cap(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        fee_cap: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_protocol_fee`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow already carrying a ceiling
+        // may revise it — amendment never installs a cap after
+        // funding.
+        if self.fee_cap == 0 {
+            return Err(EscrowError::InvalidProtocolFee);
+        }
+        // No-op: re-affirming the current ceiling writes nothing,
+        // so the event layer emits nothing for it.
+        if fee_cap == self.fee_cap {
+            return Ok(());
+        }
+        self.fee_cap = fee_cap;
+        Ok(())
+    }
+
     /// Cumulative protocol fee charged across all payouts (AV-17).
     /// Always `<= released_amount()`: the fee is a routing slice of the
     /// gross payouts, and `payout + fee == gross` for every payout.
@@ -48141,7 +48223,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -65158,7 +65241,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -65376,9 +65460,10 @@ mod event_history_tests {
         // `MilestoneLatePenaltyBpsAmended` (AV-269), 133 is
         // `FundingPlanMaxTranchesAmended` (AV-270), 134 is
         // `DeadmanHeirRotated` (AV-271), 135 is
-        // `SlashPenaltyAccountRotated` (AV-272) and 136 is the
+        // `SlashPenaltyAccountRotated` (AV-272), 136 is
+        // `FeeCapAmended` (AV-273) and 137 is the
         // first still-unknown byte.
-        for bad in [136u8, 255] {
+        for bad in [137u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -77485,6 +77570,235 @@ mod rotate_slash_penalty_account_tests {
         );
     }
 }
+
+mod amend_fee_cap_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const FUND_AT: u64 = 1_600_000_000;
+    const NOW: u64 = 1_750_000_000;
+
+    const AMOUNT: u64 = 1_000_000;
+
+    /// A `Funded` escrow at 5% with a 10,000 ceiling: a 1,000,000
+    /// payout prices at min(50,000, 10,000) = 10,000.
+    fn funded_capped() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(500)
+            .unwrap()
+            .with_fee_cap(10_000)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    /// A `Funded` milestone escrow at 5% with a 10,000 ceiling, for
+    /// the release-path repricing test.
+    fn funded_capped_milestone() -> Escrow {
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap()
+            .with_protocol_fee(500)
+            .unwrap()
+            .with_fee_cap(10_000)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    fn release_tranche(e: &mut Escrow, index: u8) -> (u64, u64) {
+        e.confirm_milestone(ALICE, index).unwrap();
+        e.confirm_milestone(BOB, index).unwrap();
+        e.release_milestone(ALICE, EXPIRES_AT - 1_800, index, None, BOB)
+            .unwrap()
+    }
+
+    #[test]
+    fn amend_changes_only_cap_and_next_pricing_uses_new_cap() {
+        // Only the ceiling moves: the rate, the schedule slot and
+        // the paid counters are untouched, and the already-resident
+        // field is rewritten in place, so the layout is unchanged.
+        let mut e = funded_capped();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.protocol_fee_for(AMOUNT), 10_000);
+        e.amend_fee_cap(ALICE, BOB, 25_000).unwrap();
+        assert_eq!(e.fee_cap(), 25_000);
+        assert_eq!(e.fee_bps(), 500, "rate untouched");
+        assert!(!e.fee_schedule().is_configured(), "schedule untouched");
+        assert_eq!(e.fees_paid(), 0, "amendment charges nothing");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "ceiling rewritten in place, no layout change"
+        );
+        // The new ceiling governs the next pricing: 5% of
+        // 1,000,000 is 50,000, floored at 25,000 now, and a small
+        // payout still prices at the raw bps fee below the ceiling.
+        assert_eq!(e.protocol_fee_for(AMOUNT), 25_000);
+        assert_eq!(e.protocol_fee_for(200_000), 10_000);
+    }
+
+    #[test]
+    fn amend_to_zero_removes_cap_and_removal_is_one_way() {
+        // 0 is a legal new ceiling meaning "uncapped": the bps fee
+        // is no longer floored — and the removal cannot be undone
+        // post-funding, because a cap-less escrow fails the
+        // already-configured gate on any later amendment.
+        let mut e = funded_capped();
+        e.amend_fee_cap(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.fee_cap(), 0);
+        assert_eq!(e.fee_bps(), 500, "rate untouched by the removal");
+        assert_eq!(e.protocol_fee_for(AMOUNT), 50_000);
+        assert_eq!(
+            e.amend_fee_cap(ALICE, BOB, 10_000),
+            Err(EscrowError::InvalidProtocolFee)
+        );
+        assert_eq!(e.fee_cap(), 0, "re-installation refused, cap stays removed");
+    }
+
+    #[test]
+    fn amend_reprices_only_later_milestone_payouts() {
+        // Tranche 0 prices at the original ceiling: 400,000 gross
+        // pays min(20,000, 10,000) = 10,000. Raising the ceiling to
+        // 25,000 then prices tranche 1 at min(30,000, 25,000) —
+        // and the fee already charged on tranche 0 is never repriced.
+        let mut e = funded_capped_milestone();
+        let (payout0, fee0) = release_tranche(&mut e, 0);
+        assert_eq!(fee0, 10_000);
+        assert_eq!(payout0, 390_000);
+        assert_eq!(e.fees_paid(), 10_000);
+        e.amend_fee_cap(ALICE, BOB, 25_000).unwrap();
+        assert_eq!(e.fee_cap(), 25_000);
+        assert_eq!(e.fees_paid(), 10_000, "amendment charges nothing");
+        let (payout1, fee1) = release_tranche(&mut e, 1);
+        assert_eq!(fee1, 25_000);
+        assert_eq!(payout1, 575_000);
+        assert_eq!(e.fees_paid(), 35_000);
+        assert_eq!(e.released_amount(), AMOUNT);
+    }
+
+    #[test]
+    fn amend_on_scheduled_escrow_floors_tiered_fee() {
+        // The ceiling floors the tiered fee too, so a scheduled
+        // escrow may revise its ceiling even though its rate lives
+        // in the tier table — only the ceiling moves.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_fee_schedule(&[(0, 500)])
+            .unwrap()
+            .with_fee_cap(10_000)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(e.protocol_fee_for(800_000), 10_000);
+        e.amend_fee_cap(ALICE, BOB, 30_000).unwrap();
+        assert_eq!(e.fee_cap(), 30_000);
+        assert_eq!(e.fee_schedule().tier_count, 1, "tier table untouched");
+        assert_eq!(e.fee_bps(), 0, "no flat rate installed");
+        assert_eq!(e.protocol_fee_for(800_000), 30_000);
+    }
+
+    #[test]
+    fn amend_rejects_uncapped_state_authority_and_paused() {
+        // Fail-closed: a funded escrow that never configured a
+        // ceiling can never acquire one after funding, and a failed
+        // revision leaves it uncapped.
+        let mut plain = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(500)
+            .unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(plain.fee_cap(), 0);
+        assert_eq!(
+            plain.amend_fee_cap(ALICE, BOB, 10_000),
+            Err(EscrowError::InvalidProtocolFee)
+        );
+        assert_eq!(plain.fee_cap(), 0);
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(500)
+            .unwrap()
+            .with_fee_cap(10_000)
+            .unwrap();
+        assert_eq!(
+            bare.amend_fee_cap(ALICE, BOB, 25_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.fee_cap(), 10_000);
+        // Dual signature: one party alone cannot move the ceiling.
+        let mut e = funded_capped();
+        assert_eq!(
+            e.amend_fee_cap(ALICE, ALICE, 25_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_fee_cap(MALLORY, BOB, 25_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.fee_cap(), 10_000);
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's revision on a paused escrow is `Paused`.
+        let mut paused = funded_capped();
+        paused.pause([0xDD; 32], None).unwrap();
+        assert_eq!(
+            paused.amend_fee_cap(MALLORY, BOB, 25_000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.fee_cap(), 10_000);
+    }
+
+    #[test]
+    fn amend_same_cap_is_a_noop() {
+        // Re-affirming the current ceiling succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = funded_capped();
+        e.amend_fee_cap(ALICE, BOB, 10_000).unwrap();
+        assert_eq!(e.fee_cap(), 10_000);
+        assert_eq!(e.fee_bps(), 500);
+        assert_eq!(e.fees_paid(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT, [0xE0; 32], NOW)
+            .unwrap()
+            .with_protocol_fee(500)
+            .unwrap()
+            .with_fee_cap(10_000)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_fee_cap(ALICE, ALICE, 25_000, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_fee_cap(ALICE, BOB, 25_000, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::FeeCapAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same ceiling is a no-op: no new event.
+        e.amend_fee_cap(ALICE, BOB, 25_000, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+}
+
 
 // ---------- AV-134: vault funding amount bounds ----------
 

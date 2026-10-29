@@ -444,6 +444,17 @@
 //!   it settled under. A failed rotation emits nothing, and a
 //!   no-op re-affirmation of the current account emits nothing
 //!   either.
+//! - `amend_fee_cap` emits
+//!   [`EscrowEventKind::FeeCapAmended`] on every
+//!   successful revision that actually changes the ceiling
+//!   (AV-273) — `from == to ==` the current state, all amounts
+//!   zero; only `fee_cap` changes, so the rate, the tier schedule
+//!   and `fees_paid` already banked are untouched, and
+//!   `protocol_fee_for` reads the live ceiling at every pricing,
+//!   so a new ceiling governs the next taker payout while a payout
+//!   already settled keeps the fee it settled under. A failed
+//!   revision emits nothing, and a no-op re-affirmation of the
+//!   current ceiling emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -672,6 +683,7 @@
 //! | FundingPlanMaxTranchesAmended (AV-270) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a funded tranche; only the budget field changes, so the plan total stays pinned to the escrow's amount and `funded_total` and `tranches_used` are untouched, and the tranche path reads the live budget at the next `fund_tranche` call, so a new budget governs the next deposit while tranches already funded keep the budget they funded under |
 //! | DeadmanHeirRotated (AV-271) | 0 | 0 | 0 | 0 — rotating moves no funds and never resets the inactivity timer; only the heir field changes, so the threshold and the last-activity clock are untouched, and the claim path reads the live heir at the next `claim_deadman` call, so the old heir stops claiming the moment the rotation lands while the new heir may claim once the inactivity period has elapsed, and a claim already settled keeps the heir it settled under |
 //! | SlashPenaltyAccountRotated (AV-272) | 0 | 0 | 0 | 0 — rotating moves no funds and never restates a settled penalty; only `slash_terms.penalty_account` changes, so the deadline and `penalty_paid` already banked are untouched, and the Anchor layer transfers the next slash to the live account read from the terms, so a default penalized after the rotation pays the new account while the pool path is unaffected, and a slash already settled keeps the account it settled under |
+//! | FeeCapAmended (AV-273) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a fee already charged; only `fee_cap` changes, so the rate, the tier schedule and `fees_paid` already banked are untouched, and `protocol_fee_for` reads the live ceiling at every pricing, so a new ceiling governs the next taker payout while a payout already settled keeps the fee it settled under |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2138,6 +2150,22 @@ pub enum EscrowEventKind {
     /// A no-op re-affirmation of the current account emits
     /// nothing.
     SlashPenaltyAccountRotated,
+    /// AV-273: the absolute protocol-fee ceiling was revised by
+    /// dual-signed governance
+    /// ([`Escrow::amend_fee_cap`](crate::Escrow::amend_fee_cap)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::ProtocolFeeAmended`]); all amounts are
+    /// zero — revising moves no funds and never restates a fee
+    /// already charged (only `fee_cap` changes; the rate, the tier
+    /// schedule and `fees_paid` already banked are untouched —
+    /// [`Escrow::protocol_fee_for`] reads the live ceiling at every
+    /// pricing, so the next taker payout prices at the new ceiling
+    /// while a payout already settled keeps the fee it settled
+    /// under). The new ceiling is read from the vault, so the event
+    /// needs no extra field. A no-op re-affirmation of the current
+    /// ceiling emits nothing.
+    FeeCapAmended,
 }
 
 impl EscrowEventKind {
@@ -2549,6 +2577,10 @@ impl EscrowEventKind {
             // discriminants 0–134 stay stable for already-serialized
             // histories.
             135 => Self::SlashPenaltyAccountRotated,
+            // AV-273: appended after SlashPenaltyAccountRotated so
+            // discriminants 0–135 stay stable for already-serialized
+            // histories.
+            136 => Self::FeeCapAmended,
             _ => return None,
         })
     }
@@ -2760,6 +2792,7 @@ impl EscrowEventKind {
             Self::FundingPlanMaxTranchesAmended => "funding_plan_max_tranches_amended",
             Self::DeadmanHeirRotated => "deadman_heir_rotated",
             Self::SlashPenaltyAccountRotated => "slash_penalty_account_rotated",
+            Self::FeeCapAmended => "fee_cap_amended",
         }
     }
 
@@ -2975,6 +3008,7 @@ impl EscrowEventKind {
             "funding_plan_max_tranches_amended" => Self::FundingPlanMaxTranchesAmended,
             "deadman_heir_rotated" => Self::DeadmanHeirRotated,
             "slash_penalty_account_rotated" => Self::SlashPenaltyAccountRotated,
+            "fee_cap_amended" => Self::FeeCapAmended,
             _ => return None,
         })
     }
@@ -4104,6 +4138,13 @@ impl IndexedEscrow {
     /// [`Escrow::with_protocol_fee`]). Configuration: emits no event.
     pub fn with_protocol_fee(mut self, fee_bps: u16) -> Result<Self, EscrowError> {
         self.inner = self.inner.with_protocol_fee(fee_bps)?;
+        Ok(self)
+    }
+
+    /// Opt in to an absolute protocol-fee ceiling (mirrors
+    /// [`Escrow::with_fee_cap`], AV-63). Configuration: emits no event.
+    pub fn with_fee_cap(mut self, max_fee_cents: u64) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_fee_cap(max_fee_cents)?;
         Ok(self)
     }
 
@@ -8184,6 +8225,48 @@ impl IndexedEscrow {
             None,
             None,
         );
+        Ok(())
+    }
+
+    /// Revise the absolute protocol-fee ceiling after funding
+    /// (mirrors [`Escrow::amend_fee_cap`]). Emits
+    /// `FeeCapAmended` when the ceiling actually changes
+    /// (`from == to ==` the current state — the ceiling, not the
+    /// lifecycle state, is what changed; all amounts zero, since
+    /// revising moves no funds and never restates a fee already
+    /// charged — only `fee_cap` changes, so the rate, the tier
+    /// schedule and `fees_paid` already banked are untouched, and
+    /// `protocol_fee_for` reads the live ceiling at every pricing,
+    /// so a new ceiling governs the next taker payout while a payout
+    /// already settled keeps the fee it settled under). The new
+    /// ceiling is read from the vault, so the event needs no extra
+    /// field. A failed revision emits nothing, and a no-op
+    /// re-affirmation of the current ceiling emits nothing either,
+    /// paralleling `rotate_arbiter`'s no-op rule.
+    pub fn amend_fee_cap(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        fee_cap: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let before = self.inner.fee_cap();
+        self.inner.amend_fee_cap(initializer, taker, fee_cap)?;
+        if self.inner.fee_cap() != before {
+            self.push_event(
+                EscrowEventKind::FeeCapAmended,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
         Ok(())
     }
 
@@ -13639,7 +13722,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -13763,7 +13847,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14321,7 +14406,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14357,7 +14443,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14390,7 +14477,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14423,7 +14511,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14456,7 +14545,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14492,7 +14582,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14528,7 +14619,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14561,7 +14653,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14594,7 +14687,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14627,7 +14721,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14660,7 +14755,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14693,7 +14789,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14726,7 +14823,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14763,7 +14861,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14799,7 +14898,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14835,7 +14935,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14871,7 +14972,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14907,7 +15009,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14944,7 +15047,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -14981,7 +15085,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -15018,7 +15123,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -15054,7 +15160,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
@@ -15107,7 +15214,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(136), None); // AV-272: 135 is SlashPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
     }
 
     #[test]
