@@ -20410,6 +20410,88 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Amend the social-recovery approval threshold after funding
+    /// (AV-278): the post-funding counterpart to the threshold leg
+    /// of [`Escrow::with_social_recovery`] (`Uninitialized`-only
+    /// initial configuration). `Funded`-only, pause first —
+    /// paralleling [`Escrow::rotate_social_recovery_guardian`]
+    /// (AV-275). Governance follows the AV-276 signature gate:
+    /// on a dual-sig escrow ([`Escrow::with_dual_sig`]) *both*
+    /// parties must sign — one party alone cannot move the
+    /// key-loss quorum on the other's funds — while on a plain
+    /// escrow the initializer alone authorizes, paralleling
+    /// [`Escrow::update_settlement_mint_allowlist`]. Only an
+    /// escrow with a configured social recovery policy (`recovery`
+    /// is `Some`) may amend: an unconfigured escrow is refused
+    /// with [`EscrowError::RecoveryNotConfigured`] (fail-closed —
+    /// post-funding installation would add a recovery path the
+    /// taker never funded under, so it is not an amendment, it
+    /// is a new deal). A pending recovery request is refused
+    /// with [`EscrowError::RecoveryRequestPending`] — in-flight
+    /// requests count under the old threshold, so changing it
+    /// would reinterpret already-cast approval votes. The new
+    /// threshold reuses the [`SocialRecovery::new`] gate
+    /// (`1..=guardian_count`, otherwise
+    /// [`EscrowError::InvalidSocialRecovery`]), leaving the
+    /// original threshold untouched on rejection. Amending to the
+    /// current threshold is a no-op: it succeeds and writes
+    /// nothing, so the event layer emits nothing for it
+    /// (paralleling `rotate_arbiter`'s no-op rule). Only the
+    /// threshold changes — `guardians`, `guardian_count` and
+    /// `timelock_secs` are untouched, and `pending` stays empty
+    /// (already enforced by the pending-request rejection). The
+    /// new threshold governs from the next
+    /// [`Escrow::request_recovery`]: the recovery path compares
+    /// the live approval count against the live threshold at
+    /// every [`Escrow::execute_recovery`], so a request opened
+    /// after the amendment arms and executes under the new
+    /// threshold while a request already settled keeps the
+    /// threshold it settled under, since a settled request is
+    /// consumed. Amending moves no funds, so no AV-36 reentrancy
+    /// lock is needed (the lock only guards the fund-moving
+    /// paths, the `rotate_arbiter` precedent). Orthogonal to
+    /// AV-275 (that is the guardian slots, this item is the
+    /// threshold) and to [`Escrow::with_social_recovery`] (that
+    /// is the initial configuration, this item is the post-funding
+    /// revision). Emits `SocialRecoveryThresholdAmended` on the
+    /// event layer, except for the no-op re-affirmation.
+    pub fn amend_social_recovery_threshold(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_threshold: u8,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // AV-276 signature gate: both parties on a dual-sig
+        // escrow, the initializer alone otherwise.
+        if self.dual_sig_required() {
+            if initializer != self.initializer || taker != self.taker {
+                return Err(EscrowError::Unauthorized);
+            }
+        } else if initializer != self.initializer {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow with a configured policy
+        // may amend a threshold — post-funding installation
+        // would add a recovery path the taker never funded
+        // under. Checked before the threshold gates so an
+        // unconfigured escrow never acquires a policy through
+        // this path, whatever the proposed threshold.
+        let mut policy = self.recovery.ok_or(EscrowError::RecoveryNotConfigured)?;
+        // The threshold gates (pending, out-of-range, no-op)
+        // live in `SocialRecovery::amend_threshold`; a failed
+        // amendment never writes, and the stored policy stays as
+        // it was.
+        policy.amend_threshold(new_threshold)?;
+        self.recovery = Some(policy);
+        Ok(())
+    }
+
     /// The dead-man's switch inactivity threshold in seconds, `0`
     /// when the switch is not configured (AV-109).
     pub fn deadman_inactivity_secs(&self) -> u64 {
@@ -48638,7 +48720,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
     }
 
     #[test]
@@ -65660,7 +65743,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), Some(EscrowEventKind::SocialRecoveryThresholdAmended)); // AV-278: 141 is SocialRecoveryThresholdAmended
+        assert_eq!(EscrowEventKind::from_discriminant(142), None); // AV-278: 141 is SocialRecoveryThresholdAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -65883,9 +65967,10 @@ mod event_history_tests {
         // `SlashLadderPenaltyAccountRotated` (AV-274), 138 is
         // `SocialRecoveryGuardianRotated` (AV-275), 139 is
         // `SettlementMintAllowlistUpdated` (AV-276), 140 is
-        // `DutchAuctionReserveBpsAmended` (AV-277) and 141 is the
+        // `DutchAuctionReserveBpsAmended` (AV-277), 141 is
+        // `SocialRecoveryThresholdAmended` (AV-278) and 142 is the
         // first still-unknown byte.
-        for bad in [141u8, 255] {
+        for bad in [142u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -78660,6 +78745,234 @@ mod amend_dutch_auction_reserve_bps_tests {
         assert_eq!(ev.amounts.fee, 0);
         // Re-affirming the same floor is a no-op: no new event.
         e.amend_dutch_auction_reserve_bps(ALICE, BOB, 9_000, NOW, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+}
+
+mod amend_social_recovery_threshold_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const G1: [u8; 32] = [0x11; 32];
+    const G2: [u8; 32] = [0x22; 32];
+    const G3: [u8; 32] = [0x33; 32];
+    const NEW_KEY: [u8; 32] = [0x99; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn dual_sig_configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        // A dual-sig escrow activates only once both parties sign.
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn amend_changes_only_the_threshold() {
+        // Only the threshold moves: the guardians, the count,
+        // the timelock and the state are untouched, and the
+        // policy region is already resident, so the amendment
+        // rewrites it in place with no layout change.
+        let mut e = configured();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.amend_social_recovery_threshold(ALICE, BOB, 3).unwrap();
+        let policy = e.recovery().expect("policy still configured");
+        assert_eq!(policy.threshold(), 3, "threshold moved");
+        assert_eq!(policy.guardians(), &[G1, G2, G3], "guardians untouched");
+        assert_eq!(policy.guardian_count(), 3, "count untouched");
+        assert_eq!(policy.timelock_secs(), 3_600, "timelock untouched");
+        assert!(policy.pending().is_none(), "pending stays empty");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "policy region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_new_threshold_governs_next_request() {
+        // Lowered to 1-of-3: a single guardian's request arms
+        // and executes once the timelock elapses.
+        let mut e = configured();
+        e.amend_social_recovery_threshold(ALICE, BOB, 1).unwrap();
+        e.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        e.execute_recovery(NOW + 3_600).unwrap();
+        assert_eq!(e.initializer(), NEW_KEY);
+        // Raised to 3-of-3: two approvals no longer arm the
+        // timelock, and the third approval does.
+        let mut f = configured();
+        f.amend_social_recovery_threshold(ALICE, BOB, 3).unwrap();
+        f.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        f.approve_recovery(G2).unwrap();
+        assert_eq!(f.recovery().unwrap().approval_count(), 2);
+        assert_eq!(
+            f.execute_recovery(NOW + 3_600),
+            Err(EscrowError::RecoveryThresholdNotReached)
+        );
+        f.approve_recovery(G3).unwrap();
+        f.execute_recovery(NOW + 3_600).unwrap();
+        assert_eq!(f.initializer(), NEW_KEY);
+    }
+
+    #[test]
+    fn amend_rejects_unconfigured_out_of_range_state_authority_and_paused() {
+        // Fail-closed: a never-configured escrow can never acquire
+        // a recovery policy after funding, and a failed amendment
+        // leaves it unconfigured.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        plain.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            plain.amend_social_recovery_threshold(ALICE, BOB, 2),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert!(plain.recovery().is_none());
+        // Out of range in both directions is refused via the
+        // `new` gate and the original threshold survives.
+        let mut e = configured();
+        assert_eq!(
+            e.amend_social_recovery_threshold(ALICE, BOB, 0),
+            Err(EscrowError::InvalidSocialRecovery)
+        );
+        assert_eq!(
+            e.amend_social_recovery_threshold(ALICE, BOB, 4),
+            Err(EscrowError::InvalidSocialRecovery)
+        );
+        assert_eq!(e.recovery().unwrap().threshold(), 2);
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        assert_eq!(
+            bare.amend_social_recovery_threshold(ALICE, BOB, 3),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.recovery().unwrap().threshold(), 2);
+        // AV-276 signature gate: on a plain escrow the
+        // initializer alone authorizes, so a stranger taker key
+        // does not block the amendment — but a stranger
+        // initializer does.
+        let mut e = configured();
+        e.amend_social_recovery_threshold(ALICE, MALLORY, 3).unwrap();
+        assert_eq!(e.recovery().unwrap().threshold(), 3);
+        assert_eq!(
+            e.amend_social_recovery_threshold(MALLORY, BOB, 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.recovery().unwrap().threshold(), 3);
+        // On a dual-sig escrow one party alone cannot move the
+        // threshold, and a stranger pair cannot either.
+        let mut dual = dual_sig_configured();
+        assert_eq!(
+            dual.amend_social_recovery_threshold(ALICE, ALICE, 3),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            dual.amend_social_recovery_threshold(MALLORY, BOB, 3),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(dual.recovery().unwrap().threshold(), 2);
+        dual.amend_social_recovery_threshold(ALICE, BOB, 3).unwrap();
+        assert_eq!(dual.recovery().unwrap().threshold(), 3);
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's amendment on a paused escrow is `Paused`.
+        let mut paused = configured();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_social_recovery_threshold(MALLORY, BOB, 3),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.recovery().unwrap().threshold(), 2);
+    }
+
+    #[test]
+    fn amend_rejects_pending_request_and_preserves_its_votes() {
+        // A live request blocks the amendment: in-flight
+        // requests count under the old threshold, so changing it
+        // would reinterpret G2's already-cast approval vote.
+        let mut e = configured();
+        e.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        e.approve_recovery(G2).unwrap();
+        assert_eq!(e.recovery().unwrap().approval_count(), 2);
+        assert_eq!(
+            e.amend_social_recovery_threshold(ALICE, BOB, 3),
+            Err(EscrowError::RecoveryRequestPending)
+        );
+        let policy = e.recovery().unwrap();
+        assert_eq!(policy.threshold(), 2, "original threshold untouched");
+        assert_eq!(policy.approval_count(), 2);
+        assert_eq!(policy.pending().unwrap().new_authority, NEW_KEY);
+        // The refused amendment changed nothing, so the request
+        // still executes under its original 2-of-3 threshold.
+        e.execute_recovery(NOW + 3_600).unwrap();
+        assert_eq!(e.initializer(), NEW_KEY);
+    }
+
+    #[test]
+    fn amend_same_threshold_is_a_noop() {
+        // Re-affirming the current threshold succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = configured();
+        e.amend_social_recovery_threshold(ALICE, BOB, 2).unwrap();
+        let policy = e.recovery().unwrap();
+        assert_eq!(policy.threshold(), 2);
+        assert_eq!(policy.guardians(), &[G1, G2, G3]);
+        assert_eq!(policy.guardian_count(), 3);
+        assert_eq!(policy.timelock_secs(), 3_600);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_social_recovery_threshold_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::wrap([0xE0; 32], configured());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_social_recovery_threshold(MALLORY, BOB, 3, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_social_recovery_threshold(ALICE, BOB, 3, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::SocialRecoveryThresholdAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same threshold is a no-op: no new event.
+        e.amend_social_recovery_threshold(ALICE, BOB, 3, NOW)
             .unwrap();
         assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
     }

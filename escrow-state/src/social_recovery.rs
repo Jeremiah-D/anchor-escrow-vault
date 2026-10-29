@@ -289,6 +289,37 @@ impl SocialRecovery {
         Ok(true)
     }
 
+    /// Amend the approval threshold after funding (AV-278): the
+    /// post-funding counterpart to the threshold leg of
+    /// [`SocialRecovery::new`]. Returns `true` when the threshold
+    /// actually changes, `false` for a same-value re-affirmation.
+    /// Rejected while a request is live
+    /// ([`EscrowError::RecoveryRequestPending`]) — in-flight
+    /// requests count under the old threshold, and changing it
+    /// would reinterpret already-cast approval votes. The new
+    /// threshold is rebuilt through [`SocialRecovery::new`], so a
+    /// value outside `1..=guardian_count` is
+    /// [`EscrowError::InvalidSocialRecovery`] and the original
+    /// threshold is untouched. Only the threshold moves: the
+    /// guardians, the count and the timelock are carried over
+    /// verbatim, and the pending request (already refused above)
+    /// stays empty.
+    pub fn amend_threshold(&mut self, new_threshold: u8) -> Result<bool, EscrowError> {
+        if self.pending.is_some() {
+            return Err(EscrowError::RecoveryRequestPending);
+        }
+        if new_threshold == self.threshold {
+            return Ok(false);
+        }
+        let rebuilt = Self::new(
+            &self.guardians[..self.guardian_count as usize],
+            new_threshold,
+            self.timelock_secs,
+        )?;
+        *self = rebuilt;
+        Ok(true)
+    }
+
     /// Whether the live request may execute at `now`: the approval
     /// threshold is met and the timelock has elapsed. The timelock
     /// origin is the request opening (not the threshold moment), so
@@ -494,6 +525,46 @@ mod social_recovery_tests {
         assert_eq!(req.new_authority, NEW_KEY);
         assert!(p.pending().is_none());
         assert!(p.take_request().is_none());
+    }
+
+    #[test]
+    fn amend_threshold_changes_only_the_threshold() {
+        // Only the threshold moves: the guardians, the count and
+        // the timelock are carried over verbatim, and pending
+        // stays empty.
+        let mut p = policy();
+        assert_eq!(p.amend_threshold(3), Ok(true));
+        assert_eq!(p.threshold(), 3);
+        assert_eq!(p.guardians(), &[G1, G2, G3]);
+        assert_eq!(p.guardian_count(), 3);
+        assert_eq!(p.timelock_secs(), 3600);
+        assert!(p.pending().is_none());
+        // Boundary-valid: 1-of-3 and back to 2-of-3.
+        assert_eq!(p.amend_threshold(1), Ok(true));
+        assert_eq!(p.threshold(), 1);
+        assert_eq!(p.amend_threshold(2), Ok(true));
+        assert_eq!(p.threshold(), 2);
+    }
+
+    #[test]
+    fn amend_threshold_rejects_pending_and_out_of_range_and_noops_same() {
+        // A live request blocks the amendment: in-flight requests
+        // count under the old threshold.
+        let mut p = policy();
+        p.open_request(G1, NEW_KEY, 1_000).unwrap();
+        p.approve(G2).unwrap();
+        assert_eq!(p.amend_threshold(3), Err(EscrowError::RecoveryRequestPending));
+        assert_eq!(p.threshold(), 2);
+        assert_eq!(p.approval_count(), 2);
+        // Out of range in both directions: 0 and above the count.
+        // The original threshold survives each refusal.
+        let mut q = policy();
+        assert_eq!(q.amend_threshold(0), Err(EscrowError::InvalidSocialRecovery));
+        assert_eq!(q.amend_threshold(4), Err(EscrowError::InvalidSocialRecovery));
+        assert_eq!(q.threshold(), 2);
+        // Same value is a no-op, not an error.
+        assert_eq!(q.amend_threshold(2), Ok(false));
+        assert_eq!(q.threshold(), 2);
     }
 
     #[test]

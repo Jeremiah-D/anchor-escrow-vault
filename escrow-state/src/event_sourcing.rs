@@ -385,6 +385,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // so the window is untouched, while the next claim prices
         // through the live floor.
         | EscrowEventKind::DutchAuctionReserveBpsAmended
+        // AV-278: an amended recovery threshold moves no funds and
+        // never restates a settled request — only the threshold
+        // changes, so the guardians, the count and the timelock
+        // are untouched, while the next request arms and executes
+        // under the live threshold.
+        | EscrowEventKind::SocialRecoveryThresholdAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1250,6 +1256,12 @@ mod event_sourcing_tests {
         // so the window is untouched, while the next claim prices
         // through the live floor.
         | EscrowEventKind::DutchAuctionReserveBpsAmended
+                // AV-278: an amended recovery threshold moves no funds and
+                // never restates a settled request — only the threshold
+                // changes, so the guardians, the count and the timelock
+                // are untouched, while the next request arms and executes
+                // under the live threshold.
+                | EscrowEventKind::SocialRecoveryThresholdAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
