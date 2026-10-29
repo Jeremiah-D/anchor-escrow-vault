@@ -439,6 +439,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // are untouched, while the next request's veto window runs
         // under the live timelock.
         | EscrowEventKind::SocialRecoveryTimelockAmended
+        // AV-280: a replaced tier table moves no funds and
+        // never restates a settled release — only the table
+        // changes, so the wrapped base policy is untouched,
+        // while the next release clears under the live table.
+        | EscrowEventKind::TieredQuorumUpdated
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1320,6 +1325,11 @@ mod fee_history_tests {
                 // are untouched, while the next request's veto window runs
                 // under the live timelock.
                 | EscrowEventKind::SocialRecoveryTimelockAmended
+                // AV-280: a replaced tier table moves no funds and
+                // never restates a settled release — only the table
+                // changes, so the wrapped base policy is untouched,
+                // while the next release clears under the live table.
+                | EscrowEventKind::TieredQuorumUpdated
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

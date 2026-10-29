@@ -397,6 +397,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // are untouched, while the next request's veto window runs
         // under the live timelock.
         | EscrowEventKind::SocialRecoveryTimelockAmended
+        // AV-280: a replaced tier table moves no funds and
+        // never restates a settled release — only the table
+        // changes, so the wrapped base policy is untouched,
+        // while the next release clears under the live table.
+        | EscrowEventKind::TieredQuorumUpdated
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1274,6 +1279,11 @@ mod event_sourcing_tests {
                 // are untouched, while the next request's veto window runs
                 // under the live timelock.
                 | EscrowEventKind::SocialRecoveryTimelockAmended
+                // AV-280: a replaced tier table moves no funds and
+                // never restates a settled release — only the table
+                // changes, so the wrapped base policy is untouched,
+                // while the next release clears under the live table.
+                | EscrowEventKind::TieredQuorumUpdated
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
