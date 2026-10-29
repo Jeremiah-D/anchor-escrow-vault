@@ -20203,6 +20203,92 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Rotate one social-recovery guardian after funding (AV-275):
+    /// the post-funding counterpart to the guardian leg of
+    /// [`Escrow::with_social_recovery`] (`Uninitialized`-only
+    /// initial configuration). Dual-signed governance,
+    /// `Funded`-only, pause first — paralleling
+    /// [`Escrow::rotate_deadman_heir`] (AV-271): the guardian
+    /// being replaced does not sign, so a lost guardian key must
+    /// not block its own replacement (the `rotate_arbiter`
+    /// reasoning). Only an escrow with a configured social
+    /// recovery policy (`recovery` is `Some`) may rotate: an
+    /// unconfigured escrow is refused with
+    /// [`EscrowError::RecoveryNotConfigured`] (fail-closed —
+    /// post-funding installation would add a recovery path the
+    /// taker never funded under, so it is not a rotation, it
+    /// is a new deal). A pending recovery request is refused
+    /// with [`EscrowError::RecoveryRequestPending`] — the
+    /// approval bitmap is indexed by slot, so swapping a slot
+    /// would re-attribute already-cast approval votes. An
+    /// unknown `old_guardian` is
+    /// [`EscrowError::RecoveryNotGuardian`]. A zero
+    /// `new_guardian`, or one duplicating another slot, is
+    /// refused via the [`SocialRecovery::new`] gate with
+    /// [`EscrowError::InvalidSocialRecovery`], leaving the
+    /// original guardian untouched. Rotating to the current
+    /// guardian is a no-op: it succeeds and writes nothing, so
+    /// the event layer emits nothing for it (paralleling
+    /// `rotate_arbiter`'s no-op rule). Only that one slot
+    /// changes — `guardian_count`, `threshold` and
+    /// `timelock_secs` are untouched, and `pending` is empty
+    /// (already enforced by the pending-request rejection).
+    /// The new guardian governs from the next
+    /// [`Escrow::request_recovery`] / [`Escrow::approve_recovery`]:
+    /// both paths compare against the live slot guardian
+    /// identity on every call, so the old guardian is
+    /// `RecoveryNotGuardian` from the moment the rotation lands
+    /// while the new guardian may open and approve requests, and
+    /// a request already settled keeps the guardians it settled
+    /// under, since a settled request is consumed. Rotating
+    /// moves no funds, so no AV-36 reentrancy lock is needed
+    /// (the lock only guards the fund-moving paths, the
+    /// `rotate_arbiter` precedent). Orthogonal to
+    /// [`Escrow::with_social_recovery`] (that is the initial
+    /// configuration, this item is the post-funding rotation),
+    /// to AV-195 (that is the recovery mechanism itself, this
+    /// item is one of its guardians), and to
+    /// [`Escrow::rotate_initializer`] (that is the parties
+    /// themselves, not guardians). Emits
+    /// `SocialRecoveryGuardianRotated` on the event layer,
+    /// except for the no-op re-affirmation.
+    pub fn rotate_social_recovery_guardian(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        old_guardian: [u8; 32],
+        new_guardian: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the rotation, paralleling `rotate_deadman_heir`. The
+        // guardian being replaced does not sign: a lost guardian
+        // key must not block its own replacement (the
+        // `rotate_arbiter` reasoning).
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow with a configured policy
+        // may rotate a guardian — post-funding installation
+        // would add a recovery path the taker never funded
+        // under. Checked before the slot gates so an
+        // unconfigured escrow never acquires a policy through
+        // this path, whatever the proposed guardian.
+        let mut policy = self.recovery.ok_or(EscrowError::RecoveryNotConfigured)?;
+        // The slot gate (pending, unknown old guardian, zero /
+        // duplicate new guardian, no-op) lives in
+        // `SocialRecovery::replace_guardian`; a failed rotation
+        // never writes, and the stored policy stays as it was.
+        policy.replace_guardian(old_guardian, new_guardian)?;
+        self.recovery = Some(policy);
+        Ok(())
+    }
+
     /// The dead-man's switch inactivity threshold in seconds, `0`
     /// when the switch is not configured (AV-109).
     pub fn deadman_inactivity_secs(&self) -> u64 {
@@ -48338,7 +48424,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -65357,7 +65444,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -65577,9 +65665,10 @@ mod event_history_tests {
         // `DeadmanHeirRotated` (AV-271), 135 is
         // `SlashPenaltyAccountRotated` (AV-272), 136 is
         // `FeeCapAmended` (AV-273), 137 is
-        // `SlashLadderPenaltyAccountRotated` (AV-274) and 138 is the
+        // `SlashLadderPenaltyAccountRotated` (AV-274), 138 is
+        // `SocialRecoveryGuardianRotated` (AV-275) and 139 is the
         // first still-unknown byte.
-        for bad in [138u8, 255] {
+        for bad in [139u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -77684,6 +77773,226 @@ mod rotate_slash_penalty_account_tests {
             before + 1,
             "no-op emits nothing"
         );
+    }
+}
+
+mod rotate_social_recovery_guardian_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const G1: [u8; 32] = [0x11; 32];
+    const G2: [u8; 32] = [0x22; 32];
+    const G3: [u8; 32] = [0x33; 32];
+    const G4: [u8; 32] = [0x44; 32];
+    const NEW_KEY: [u8; 32] = [0x99; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn rotate_changes_only_that_slot() {
+        // Only the replaced slot moves: the count, threshold,
+        // timelock and state are untouched, and the policy region
+        // is already resident, so the rotation rewrites it in
+        // place with no layout change.
+        let mut e = configured();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.rotate_social_recovery_guardian(ALICE, BOB, G2, G4)
+            .unwrap();
+        let policy = e.recovery().expect("policy still configured");
+        assert_eq!(policy.guardians(), &[G1, G4, G3]);
+        assert_eq!(policy.guardian_count(), 3, "count untouched");
+        assert_eq!(policy.threshold(), 2, "threshold untouched");
+        assert_eq!(policy.timelock_secs(), 3_600, "timelock untouched");
+        assert!(policy.pending().is_none(), "pending stays empty");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "policy region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn rotate_new_guardian_approves_old_guardian_rejected() {
+        // Before the rotation only the configured guardians may
+        // open or approve: the successor is a stranger.
+        let mut e = configured();
+        assert_eq!(
+            e.request_recovery(G4, NEW_KEY, NOW),
+            Err(EscrowError::RecoveryNotGuardian)
+        );
+        // Rotate: the new guardian governs from the next request
+        // / approve, and the old guardian loses both at once —
+        // both paths compare against the live slot identity.
+        e.rotate_social_recovery_guardian(ALICE, BOB, G2, G4)
+            .unwrap();
+        assert_eq!(
+            e.request_recovery(G2, NEW_KEY, NOW),
+            Err(EscrowError::RecoveryNotGuardian)
+        );
+        assert!(e.recovery().unwrap().pending().is_none());
+        e.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        assert_eq!(e.recovery().unwrap().approval_count(), 1);
+        // The old guardian cannot approve the live request, and
+        // the new guardian's approval is the second, threshold
+        // -reaching vote (slot-indexed: G4 took G2's slot, so
+        // the bitmap still counts exactly one vote per slot).
+        assert_eq!(
+            e.approve_recovery(G2),
+            Err(EscrowError::RecoveryNotGuardian)
+        );
+        e.approve_recovery(G4).unwrap();
+        assert_eq!(e.recovery().unwrap().approval_count(), 2);
+        e.execute_recovery(NOW + 3_600).unwrap();
+        assert_eq!(e.initializer(), NEW_KEY);
+    }
+
+    #[test]
+    fn rotate_rejects_unconfigured_zero_duplicate_unknown_state_authority_and_paused() {
+        // Fail-closed: a never-configured escrow can never acquire
+        // a recovery policy after funding, and a failed rotation
+        // leaves it unconfigured.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        plain.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            plain.rotate_social_recovery_guardian(ALICE, BOB, G1, G4),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert!(plain.recovery().is_none());
+        // A zero new guardian is refused via the `new` gate and
+        // the original slot survives.
+        let mut e = configured();
+        assert_eq!(
+            e.rotate_social_recovery_guardian(ALICE, BOB, G2, [0u8; 32]),
+            Err(EscrowError::InvalidSocialRecovery)
+        );
+        assert_eq!(e.recovery().unwrap().guardians(), &[G1, G2, G3]);
+        // A new guardian duplicating another slot is refused the
+        // same way, original untouched.
+        assert_eq!(
+            e.rotate_social_recovery_guardian(ALICE, BOB, G2, G1),
+            Err(EscrowError::InvalidSocialRecovery)
+        );
+        assert_eq!(e.recovery().unwrap().guardians(), &[G1, G2, G3]);
+        // An unknown old guardian is not a slot to replace.
+        assert_eq!(
+            e.rotate_social_recovery_guardian(ALICE, BOB, MALLORY, G4),
+            Err(EscrowError::RecoveryNotGuardian)
+        );
+        assert_eq!(e.recovery().unwrap().guardians(), &[G1, G2, G3]);
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        assert_eq!(
+            bare.rotate_social_recovery_guardian(ALICE, BOB, G2, G4),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.recovery().unwrap().guardians(), &[G1, G2, G3]);
+        // Dual signature: one party alone cannot rotate a
+        // guardian, and the guardian being replaced need not sign
+        // — a lost guardian key must not block its own replacement.
+        let mut e = configured();
+        assert_eq!(
+            e.rotate_social_recovery_guardian(ALICE, ALICE, G2, G4),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.rotate_social_recovery_guardian(MALLORY, BOB, G2, G4),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.recovery().unwrap().guardians(), &[G1, G2, G3]);
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's rotation on a paused escrow is `Paused`.
+        let mut paused = configured();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.rotate_social_recovery_guardian(MALLORY, BOB, G2, G4),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.recovery().unwrap().guardians(), &[G1, G2, G3]);
+    }
+
+    #[test]
+    fn rotate_rejects_pending_request_and_preserves_its_votes() {
+        // A live request blocks the rotation: the approval bitmap
+        // is indexed by slot, so swapping a slot would
+        // re-attribute G2's already-cast vote to G4.
+        let mut e = configured();
+        e.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        e.approve_recovery(G2).unwrap();
+        assert_eq!(e.recovery().unwrap().approval_count(), 2);
+        assert_eq!(
+            e.rotate_social_recovery_guardian(ALICE, BOB, G2, G4),
+            Err(EscrowError::RecoveryRequestPending)
+        );
+        let policy = e.recovery().unwrap();
+        assert_eq!(policy.guardians(), &[G1, G2, G3]);
+        assert_eq!(policy.approval_count(), 2);
+        assert_eq!(policy.pending().unwrap().new_authority, NEW_KEY);
+        // The refused rotation changed nothing, so the request
+        // still executes on its original guardians.
+        e.execute_recovery(NOW + 3_600).unwrap();
+        assert_eq!(e.initializer(), NEW_KEY);
+    }
+
+    #[test]
+    fn rotate_same_guardian_is_a_noop() {
+        // Re-affirming the current guardian succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = configured();
+        e.rotate_social_recovery_guardian(ALICE, BOB, G2, G2)
+            .unwrap();
+        let policy = e.recovery().unwrap();
+        assert_eq!(policy.guardians(), &[G1, G2, G3]);
+        assert_eq!(policy.guardian_count(), 3);
+        assert_eq!(policy.threshold(), 2);
+        assert_eq!(policy.timelock_secs(), 3_600);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn rotate_social_recovery_guardian_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::wrap([0xE0; 32], configured());
+        let before = e.event_count();
+        assert_eq!(
+            e.rotate_social_recovery_guardian(ALICE, ALICE, G2, G4, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.rotate_social_recovery_guardian(ALICE, BOB, G2, G4, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::SocialRecoveryGuardianRotated);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same guardian is a no-op: no new event.
+        e.rotate_social_recovery_guardian(ALICE, BOB, G4, G4, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
     }
 }
 

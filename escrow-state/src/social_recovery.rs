@@ -246,6 +246,49 @@ impl SocialRecovery {
         Ok(true)
     }
 
+    /// Replace one guardian slot after funding (AV-275): the
+    /// post-funding counterpart to naming a guardian in
+    /// [`SocialRecovery::new`]. Returns `true` when the slot
+    /// actually changes, `false` for a same-value re-affirmation.
+    /// Rejected while a request is live
+    /// ([`EscrowError::RecoveryRequestPending`]) — the approval
+    /// bitmap is indexed by slot, so swapping a slot would
+    /// re-attribute already-cast approval votes. An unknown
+    /// `old_guardian` is [`EscrowError::RecoveryNotGuardian`].
+    /// The candidate set is rebuilt through
+    /// [`SocialRecovery::new`], so a zero `new_guardian` or one
+    /// duplicating another slot is
+    /// [`EscrowError::InvalidSocialRecovery`] and the original
+    /// slot is untouched. Only that one slot moves: the count,
+    /// threshold and timelock are carried over verbatim, and the
+    /// pending request (already refused above) stays empty.
+    pub fn replace_guardian(
+        &mut self,
+        old_guardian: [u8; 32],
+        new_guardian: [u8; 32],
+    ) -> Result<bool, EscrowError> {
+        if self.pending.is_some() {
+            return Err(EscrowError::RecoveryRequestPending);
+        }
+        let idx = self
+            .guardian_index(old_guardian)
+            .ok_or(EscrowError::RecoveryNotGuardian)?;
+        if new_guardian == old_guardian {
+            return Ok(false);
+        }
+        let mut guardians = [[0u8; 32]; MAX_RECOVERY_GUARDIANS];
+        guardians[..self.guardian_count as usize]
+            .copy_from_slice(self.guardians());
+        guardians[idx] = new_guardian;
+        let rebuilt = Self::new(
+            &guardians[..self.guardian_count as usize],
+            self.threshold,
+            self.timelock_secs,
+        )?;
+        *self = rebuilt;
+        Ok(true)
+    }
+
     /// Whether the live request may execute at `now`: the approval
     /// threshold is met and the timelock has elapsed. The timelock
     /// origin is the request opening (not the threshold moment), so

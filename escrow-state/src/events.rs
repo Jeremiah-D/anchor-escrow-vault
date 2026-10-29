@@ -469,6 +469,19 @@
 //!   the top rung is reused and future slashes still have real
 //!   semantics. A failed rotation emits nothing, and a no-op
 //!   re-affirmation of the current account emits nothing either.
+//! - `rotate_social_recovery_guardian` emits
+//!   [`EscrowEventKind::SocialRecoveryGuardianRotated`] on every
+//!   successful rotation that actually changes a guardian slot
+//!   (AV-275) — `from == to ==` the current state, all amounts
+//!   zero; only that one slot changes, so the guardian count, the
+//!   threshold and the timelock are untouched, and the recovery
+//!   path compares against the live slot guardian at the next
+//!   `request_recovery` / `approve_recovery`, so the old guardian
+//!   stops opening and approving the moment the rotation lands
+//!   while the new guardian may open and approve, and a request
+//!   already settled keeps the guardians it settled under. A
+//!   failed rotation emits nothing, and a no-op re-affirmation
+//!   of the current guardian emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -699,6 +712,7 @@
 //! | SlashPenaltyAccountRotated (AV-272) | 0 | 0 | 0 | 0 — rotating moves no funds and never restates a settled penalty; only `slash_terms.penalty_account` changes, so the deadline and `penalty_paid` already banked are untouched, and the Anchor layer transfers the next slash to the live account read from the terms, so a default penalized after the rotation pays the new account while the pool path is unaffected, and a slash already settled keeps the account it settled under |
 //! | FeeCapAmended (AV-273) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a fee already charged; only `fee_cap` changes, so the rate, the tier schedule and `fees_paid` already banked are untouched, and `protocol_fee_for` reads the live ceiling at every pricing, so a new ceiling governs the next taker payout while a payout already settled keeps the fee it settled under |
 //! | SlashLadderPenaltyAccountRotated (AV-274) | 0 | 0 | 0 | 0 — rotating moves no funds and never restates a settled penalty; only `slash_ladder.penalty_account` changes, so the rung table, the rung count and the consumption cursor are untouched, and the Anchor layer transfers the next ladder slash to the live account read from the ladder, so a default penalized after the rotation pays the new account while a slash already settled keeps the account it settled under, and a ladder already slashed stays rotatable since the top rung is reused |
+//! | SocialRecoveryGuardianRotated (AV-275) | 0 | 0 | 0 | 0 — rotating moves no funds; only one guardian slot changes, so the guardian count, the threshold and the timelock are untouched, and the recovery path compares against the live slot guardian at the next `request_recovery` / `approve_recovery`, so the old guardian stops opening and approving the moment the rotation lands while the new guardian may open and approve, and a request already settled keeps the guardians it settled under |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2200,6 +2214,25 @@ pub enum EscrowEventKind {
     /// extra field. A no-op re-affirmation of the current account
     /// emits nothing.
     SlashLadderPenaltyAccountRotated,
+    /// AV-275: one social-recovery guardian slot was rotated by
+    /// dual-signed governance
+    /// ([`Escrow::rotate_social_recovery_guardian`](crate::Escrow::rotate_social_recovery_guardian)).
+    /// `from == to ==` the current state (a governance rotation,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::SlashLadderPenaltyAccountRotated`]); all amounts are
+    /// zero — rotating moves no funds and never restarts a live
+    /// request (a pending request refuses the rotation outright);
+    /// only that one slot changes, so the guardian count, the
+    /// threshold and the timelock are untouched — the recovery
+    /// path compares against the live slot guardian at the next
+    /// `request_recovery` / `approve_recovery`, so the old
+    /// guardian stops opening and approving the moment the
+    /// rotation lands while the new guardian may open and
+    /// approve, and a request already settled keeps the guardians
+    /// it settled under. The new guardian is read from the vault,
+    /// so the event needs no extra field. A no-op re-affirmation
+    /// of the current guardian emits nothing.
+    SocialRecoveryGuardianRotated,
 }
 
 impl EscrowEventKind {
@@ -2619,6 +2652,10 @@ impl EscrowEventKind {
             // discriminants 0–136 stay stable for already-serialized
             // histories.
             137 => Self::SlashLadderPenaltyAccountRotated,
+            // AV-275: appended after SlashLadderPenaltyAccountRotated so
+            // discriminants 0–137 stay stable for already-serialized
+            // histories.
+            138 => Self::SocialRecoveryGuardianRotated,
             _ => return None,
         })
     }
@@ -2832,6 +2869,7 @@ impl EscrowEventKind {
             Self::SlashPenaltyAccountRotated => "slash_penalty_account_rotated",
             Self::FeeCapAmended => "fee_cap_amended",
             Self::SlashLadderPenaltyAccountRotated => "slash_ladder_penalty_account_rotated",
+            Self::SocialRecoveryGuardianRotated => "social_recovery_guardian_rotated",
         }
     }
 
@@ -3049,6 +3087,7 @@ impl EscrowEventKind {
             "slash_penalty_account_rotated" => Self::SlashPenaltyAccountRotated,
             "fee_cap_amended" => Self::FeeCapAmended,
             "slash_ladder_penalty_account_rotated" => Self::SlashLadderPenaltyAccountRotated,
+            "social_recovery_guardian_rotated" => Self::SocialRecoveryGuardianRotated,
             _ => return None,
         })
     }
@@ -9042,6 +9081,58 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Rotate one social-recovery guardian after funding
+    /// (mirrors [`Escrow::rotate_social_recovery_guardian`]).
+    /// Emits `SocialRecoveryGuardianRotated` when a slot
+    /// actually changes (`from == to ==` the current state — the
+    /// guardian, not the lifecycle state, is what changed; all
+    /// amounts zero, since rotating moves no funds and never
+    /// restarts a live request — a pending request refuses the
+    /// rotation outright, so only that one slot changes, the
+    /// guardian count, the threshold and the timelock are
+    /// untouched, and the recovery path compares against the live
+    /// slot guardian at the next `request_recovery` /
+    /// `approve_recovery`, so the old guardian stops opening and
+    /// approving the moment the rotation lands while the new
+    /// guardian may open and approve, and a request already
+    /// settled keeps the guardians it settled under). The new
+    /// guardian is read from the vault, so the event needs no
+    /// extra field. A failed rotation emits nothing, and a
+    /// no-op re-affirmation of the current guardian emits nothing
+    /// either, paralleling `rotate_arbiter`'s no-op rule.
+    pub fn rotate_social_recovery_guardian(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        old_guardian: [u8; 32],
+        new_guardian: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let before = self.inner.recovery();
+        self.inner.rotate_social_recovery_guardian(
+            initializer,
+            taker,
+            old_guardian,
+            new_guardian,
+        )?;
+        if self.inner.recovery() != before {
+            self.push_event(
+                EscrowEventKind::SocialRecoveryGuardianRotated,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Revise the funding amount window after funding (mirrors
     /// [`Escrow::amend_amount_bounds`]). Emits
     /// `AmountBoundsAmended` when the window actually changes
@@ -13822,7 +13913,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -13948,7 +14040,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -14508,7 +14601,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -14546,7 +14640,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -14581,7 +14676,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -14616,7 +14712,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -14651,7 +14748,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -14689,7 +14787,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -14727,7 +14826,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -14762,7 +14862,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -14797,7 +14898,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -14832,7 +14934,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -14867,7 +14970,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -14902,7 +15006,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -14937,7 +15042,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -14976,7 +15082,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -15014,7 +15121,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -15052,7 +15160,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -15090,7 +15199,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -15128,7 +15238,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -15167,7 +15278,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -15206,7 +15318,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -15245,7 +15358,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -15283,7 +15397,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]
@@ -15338,7 +15453,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
-        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
     }
 
     #[test]

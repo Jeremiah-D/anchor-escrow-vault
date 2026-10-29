@@ -370,6 +370,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // the rung count and the consumption cursor are untouched,
         // while the next ladder slash transfers to the live account.
         | EscrowEventKind::SlashLadderPenaltyAccountRotated
+        // AV-275: a rotated social-recovery guardian slot moves no
+        // funds and never restarts a live request — only that one
+        // slot changes, so the count, threshold and timelock are
+        // untouched, while the next request/approval reads the live slot.
+        | EscrowEventKind::SocialRecoveryGuardianRotated
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1220,6 +1225,11 @@ mod event_sourcing_tests {
         // the rung count and the consumption cursor are untouched,
         // while the next ladder slash transfers to the live account.
         | EscrowEventKind::SlashLadderPenaltyAccountRotated
+        // AV-275: a rotated social-recovery guardian slot moves no
+        // funds and never restarts a live request — only that one
+        // slot changes, so the count, threshold and timelock are
+        // untouched, while the next request/approval reads the live slot.
+        | EscrowEventKind::SocialRecoveryGuardianRotated
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
