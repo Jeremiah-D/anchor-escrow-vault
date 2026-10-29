@@ -20090,6 +20090,119 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Rotate the ladder slash penalty account after funding
+    /// (AV-274): the post-funding counterpart to the
+    /// penalty-account leg of [`Escrow::with_slash_ladder`]
+    /// (`Uninitialized`-only initial configuration). Dual-signed
+    /// governance, `Funded`-only, pause first — paralleling
+    /// [`Escrow::rotate_slash_penalty_account`] (AV-272), but for
+    /// the ladder clause, not the flat clause. Only an escrow
+    /// carrying a ladder may rotate: an escrow with no ladder at
+    /// all — plain, or flat-terms — is refused with
+    /// [`EscrowError::InvalidSlashLadder`] (fail-closed —
+    /// post-funding installation would add a penalty clause the
+    /// taker never funded under, so it is not a rotation, it is
+    /// a new deal; and a flat escrow's penalty account lives in
+    /// the independent flat terms, governed by AV-272, so a
+    /// ladder rotation here would create a second, competing
+    /// penalty account). An insurance-pool escrow is refused
+    /// with [`EscrowError::SlashNotEligible`] — its slash routes
+    /// to the neutral pool custody, so the ladder
+    /// `penalty_account` is a dead field there and rotating it
+    /// has no semantics (fail-closed, along the AV-272
+    /// precedent, not a silent no-op). A zero
+    /// `new_penalty_account` is refused with
+    /// [`EscrowError::InvalidSlashLadder`] (the builder's gate,
+    /// unchanged — a zero key can never be a legitimate penalty
+    /// account), leaving the original account untouched.
+    /// Rotating to the current account is a no-op: it succeeds
+    /// and writes nothing, so the event layer emits nothing for
+    /// it (paralleling `rotate_arbiter`'s no-op rule). Only
+    /// `slash_ladder.penalty_account` changes — the rung table
+    /// (`rungs` / `rung_count`) and the consumption cursor
+    /// (`slash_ladder_index`) are untouched. The cursor is
+    /// deliberately not reset: the ladder is the repeated-slash
+    /// path, so a slash already banked (`penalty_paid > 0`, or
+    /// `pool_slashed > 0` on a pooled path) is *not* a refusal
+    /// here — unlike AV-272's one-shot, a consumed ladder still
+    /// has future slashes (the top rung is reused once the
+    /// ladder is exhausted), so a rotated account still governs
+    /// real future enforcement, and the banked amounts are
+    /// never restated (a rotation never rewrites settled
+    /// penalties). The new account governs from the next ladder
+    /// slash: the Anchor layer transfers to the live
+    /// `penalty_account` read from the ladder at slash time,
+    /// while the pool path is unaffected (a pooled slash still
+    /// lands in the pool — and pooled ladder escrows are refused
+    /// outright, above). A slash already settled keeps the
+    /// account it settled under. Rotating moves no funds, so no
+    /// AV-36 reentrancy lock is needed (the lock only guards the
+    /// fund-moving paths, the `rotate_arbiter` precedent).
+    /// Orthogonal to AV-272 (that is the flat account, this item
+    /// is the ladder account) and to
+    /// [`Escrow::amend_slash_ladder`] (that is the ladder table
+    /// — it expressly preserves `old.penalty_account` — this
+    /// item is the ladder's recipient account). Emits
+    /// `SlashLadderPenaltyAccountRotated` on the event layer,
+    /// except for the no-op re-affirmation.
+    pub fn rotate_slash_ladder_penalty_account(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_penalty_account: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the rotation, paralleling `rotate_slash_penalty_account`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow carrying a ladder may
+        // rotate the ladder penalty account — post-funding
+        // installation would add a penalty clause the taker never
+        // funded under, and a flat escrow's account belongs to
+        // the AV-272 path, not this one.
+        let ladder = match self.slash_ladder {
+            Some(ladder) => ladder,
+            None => return Err(EscrowError::InvalidSlashLadder),
+        };
+        // An insurance-pool escrow's slash routes to the neutral
+        // pool custody, so the ladder penalty account is a dead
+        // field there — rotating it has no semantics, and a
+        // silent success would pretend otherwise.
+        if self.insurance_pool {
+            return Err(EscrowError::SlashNotEligible);
+        }
+        // The builder's gate, unchanged: a zero key can never be
+        // a legitimate penalty account. Checked after the
+        // configuration gates so a failed rotation never writes,
+        // and the stored account stays as it was.
+        if new_penalty_account == [0u8; 32] {
+            return Err(EscrowError::InvalidSlashLadder);
+        }
+        // No-op: re-affirming the current account writes nothing,
+        // so the event layer emits nothing for it.
+        if new_penalty_account == ladder.penalty_account {
+            return Ok(());
+        }
+        // Only the recipient moves: the rung table, the rung
+        // count and the consumption cursor are carried over
+        // verbatim — the cursor is not reset, so the next slash
+        // still draws on the rung it would have drawn on before
+        // the rotation, at the new account.
+        self.slash_ladder = Some(SlashLadder {
+            penalty_account: new_penalty_account,
+            rungs: ladder.rungs,
+            rung_count: ladder.rung_count,
+        });
+        Ok(())
+    }
+
     /// The dead-man's switch inactivity threshold in seconds, `0`
     /// when the switch is not configured (AV-109).
     pub fn deadman_inactivity_secs(&self) -> u64 {
@@ -48224,7 +48337,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
-        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
     }
 
     #[test]
@@ -65242,7 +65356,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(135), Some(EscrowEventKind::SlashPenaltyAccountRotated)); // AV-272: 135 is SlashPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
-        assert_eq!(EscrowEventKind::from_discriminant(137), None); // AV-273: 136 is FeeCapAmended
+        assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
+        assert_eq!(EscrowEventKind::from_discriminant(138), None); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -65461,9 +65576,10 @@ mod event_history_tests {
         // `FundingPlanMaxTranchesAmended` (AV-270), 134 is
         // `DeadmanHeirRotated` (AV-271), 135 is
         // `SlashPenaltyAccountRotated` (AV-272), 136 is
-        // `FeeCapAmended` (AV-273) and 137 is the
+        // `FeeCapAmended` (AV-273), 137 is
+        // `SlashLadderPenaltyAccountRotated` (AV-274) and 138 is the
         // first still-unknown byte.
-        for bad in [137u8, 255] {
+        for bad in [138u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -77562,6 +77678,264 @@ mod rotate_slash_penalty_account_tests {
         assert_eq!(ev.amounts.fee, 0);
         // Re-affirming the same account is a no-op: no new event.
         e.rotate_slash_penalty_account(ALICE, BOB, NEW_PENALTY, NOW)
+            .unwrap();
+        assert_eq!(
+            e.event_count(),
+            before + 1,
+            "no-op emits nothing"
+        );
+    }
+}
+
+mod rotate_slash_ladder_penalty_account_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PENALTY: [u8; 32] = [0x50; 32];
+    const NEW_PENALTY: [u8; 32] = [0x51; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_750_000_000;
+    const FUND_AT: u64 = 1_600_000_000;
+    const RUNG0_DEADLINE: u64 = 1_700_000_000;
+    const RUNG1_DEADLINE: u64 = 1_700_000_001;
+    const RUNGS: [(u64, u16); 2] = [(RUNG0_DEADLINE, 500), (RUNG1_DEADLINE, 1000)];
+
+    fn ladder() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_ladder(PENALTY, &RUNGS)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e
+    }
+
+    #[test]
+    fn rotate_changes_only_penalty_account() {
+        // Only the recipient moves: the rung table, the rung
+        // count, the cursor and the state are untouched, and the
+        // ladder region is already resident, so the rotation
+        // rewrites it in place with no layout change.
+        let mut e = ladder();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        let before = e.slash_ladder().expect("ladder attached");
+        e.rotate_slash_ladder_penalty_account(ALICE, BOB, NEW_PENALTY)
+            .unwrap();
+        let after = e.slash_ladder().expect("ladder still attached");
+        assert_eq!(after.penalty_account, NEW_PENALTY);
+        assert_eq!(after.rungs, before.rungs, "rung table untouched");
+        assert_eq!(after.rung_count, before.rung_count, "rung count untouched");
+        assert_eq!(e.slash_ladder_index(), 0, "cursor untouched");
+        assert_eq!(e.penalty_paid(), 0, "no penalty banked yet");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "ladder region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn rotate_after_slash_keeps_banked_and_cursor_and_next_slash_still_works() {
+        // The ladder is the repeated-slash path, so unlike
+        // AV-272's one-shot a banked slash is not a refusal:
+        // the first rung is consumed, the cursor sits at the top
+        // rung, and the rotation still lands — banked amounts and
+        // cursor untouched — and the next slashes still enforce,
+        // including a third slash reusing the saturated top rung.
+        let mut e = ladder();
+        assert_eq!(e.slash(ALICE, 10_000, None, RUNG0_DEADLINE).unwrap(), 10_000);
+        assert_eq!(e.penalty_paid(), 10_000);
+        assert_eq!(e.slash_ladder_index(), 1, "cursor at top rung");
+        e.rotate_slash_ladder_penalty_account(ALICE, BOB, NEW_PENALTY)
+            .unwrap();
+        let after = e.slash_ladder().expect("ladder still attached");
+        assert_eq!(after.penalty_account, NEW_PENALTY);
+        assert_eq!(e.slash_ladder_index(), 1, "cursor not reset");
+        assert_eq!(e.penalty_paid(), 10_000, "banked penalty never restated");
+        assert_eq!(
+            e.slash(ALICE, 10_000, None, RUNG1_DEADLINE).unwrap(),
+            10_000,
+            "next slash still enforces after rotation"
+        );
+        assert_eq!(e.penalty_paid(), 20_000);
+        assert_eq!(e.slash_ladder_index(), 1, "top rung saturated");
+        assert_eq!(
+            e.slash(ALICE, 10_000, None, RUNG1_DEADLINE).unwrap(),
+            10_000,
+            "top rung reused after rotation"
+        );
+        assert_eq!(e.penalty_paid(), 30_000);
+        assert_eq!(
+            e.slash_ladder().unwrap().penalty_account,
+            NEW_PENALTY,
+            "settled slashes keep the rotated account"
+        );
+    }
+
+    #[test]
+    fn amend_slash_ladder_keeps_rotated_penalty_account() {
+        // Orthogonality: amending the ladder table preserves the
+        // (rotated) recipient — the table revision never moves
+        // the account, and the account rotation never moves the
+        // table.
+        let mut e = ladder();
+        e.rotate_slash_ladder_penalty_account(ALICE, BOB, NEW_PENALTY)
+            .unwrap();
+        e.amend_slash_ladder(
+            ALICE,
+            BOB,
+            &[(1_700_000_002, 600), (1_700_000_003, 1200)],
+            RUNG0_DEADLINE,
+        )
+        .unwrap();
+        let after = e.slash_ladder().expect("ladder still attached");
+        assert_eq!(
+            after.penalty_account, NEW_PENALTY,
+            "table amendment preserves the rotated account"
+        );
+        assert_eq!(after.rungs[0], SlashRung { deadline: 1_700_000_002, bps: 600 });
+        assert_eq!(after.rungs[1], SlashRung { deadline: 1_700_000_003, bps: 1200 });
+    }
+
+    #[test]
+    fn rotate_rejects_unladdered_flat_pool_state_authority_and_paused() {
+        // Fail-closed: a never-laddered escrow can never acquire
+        // a ladder after funding, and a failed rotation leaves it
+        // ladder-less.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        assert!(plain.slash_ladder().is_none());
+        assert_eq!(
+            plain.rotate_slash_ladder_penalty_account(ALICE, BOB, NEW_PENALTY),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        assert!(plain.slash_ladder().is_none());
+        // A flat escrow's penalty account lives in the flat terms
+        // and belongs to the AV-272 path — the ladder path
+        // refuses with the ladder's own error, not the flat one.
+        let mut flat = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, RUNG0_DEADLINE)
+            .unwrap();
+        flat.fund(ALICE, FUND_AT).unwrap();
+        assert!(flat.slash_ladder().is_none());
+        assert!(flat.slash_terms().is_some());
+        assert_eq!(
+            flat.rotate_slash_ladder_penalty_account(ALICE, BOB, NEW_PENALTY),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        assert_eq!(
+            flat.slash_terms().unwrap().penalty_account,
+            PENALTY,
+            "failed rotation writes nothing"
+        );
+        // An insurance-pool ladder escrow's slash routes to the
+        // neutral pool custody, so the ladder penalty account is
+        // a dead field — rotating it is refused even before any
+        // slash, and the refused rotation leaves the pool path
+        // working exactly as before: the slash still lands in
+        // the pool, never in any penalty account.
+        let mut pooled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_ladder(PENALTY, &RUNGS)
+            .unwrap()
+            .with_insurance_pool()
+            .unwrap();
+        pooled.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            pooled.rotate_slash_ladder_penalty_account(ALICE, BOB, NEW_PENALTY),
+            Err(EscrowError::SlashNotEligible)
+        );
+        assert_eq!(
+            pooled.slash_ladder().unwrap().penalty_account,
+            PENALTY,
+            "failed rotation writes nothing"
+        );
+        pooled.slash(ALICE, 10_000, None, RUNG0_DEADLINE).unwrap();
+        assert_eq!(pooled.penalty_paid(), 0);
+        assert!(pooled.pool_slashed() > 0, "pool path unaffected");
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_ladder(PENALTY, &RUNGS)
+            .unwrap();
+        assert_eq!(
+            bare.rotate_slash_ladder_penalty_account(ALICE, BOB, NEW_PENALTY),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // A zero account is refused via the builder's gate and the
+        // original account survives.
+        let mut e = ladder();
+        assert_eq!(
+            e.rotate_slash_ladder_penalty_account(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        assert_eq!(e.slash_ladder().unwrap().penalty_account, PENALTY);
+        // Dual signature: one party alone cannot move the account.
+        assert_eq!(
+            e.rotate_slash_ladder_penalty_account(ALICE, ALICE, NEW_PENALTY),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.rotate_slash_ladder_penalty_account(MALLORY, BOB, NEW_PENALTY),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.slash_ladder().unwrap().penalty_account, PENALTY);
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's rotation on a paused escrow is `Paused`.
+        let mut paused = ladder();
+        paused.pause([0xDD; 32], None).unwrap();
+        assert_eq!(
+            paused.rotate_slash_ladder_penalty_account(MALLORY, BOB, NEW_PENALTY),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.slash_ladder().unwrap().penalty_account, PENALTY);
+    }
+
+    #[test]
+    fn rotate_same_account_is_a_noop() {
+        // Re-affirming the current account succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = ladder();
+        e.rotate_slash_ladder_penalty_account(ALICE, BOB, PENALTY)
+            .unwrap();
+        let after = e.slash_ladder().expect("ladder still attached");
+        assert_eq!(after.penalty_account, PENALTY);
+        assert_eq!(after.rungs[0], SlashRung { deadline: RUNG0_DEADLINE, bps: 500 });
+        assert_eq!(after.rungs[1], SlashRung { deadline: RUNG1_DEADLINE, bps: 1000 });
+        assert_eq!(after.rung_count, 2);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn rotate_slash_ladder_penalty_account_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], NOW)
+            .unwrap()
+            .with_slash_ladder(PENALTY, &RUNGS)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.rotate_slash_ladder_penalty_account(ALICE, ALICE, NEW_PENALTY, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.rotate_slash_ladder_penalty_account(ALICE, BOB, NEW_PENALTY, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::SlashLadderPenaltyAccountRotated);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same account is a no-op: no new event.
+        e.rotate_slash_ladder_penalty_account(ALICE, BOB, NEW_PENALTY, NOW)
             .unwrap();
         assert_eq!(
             e.event_count(),

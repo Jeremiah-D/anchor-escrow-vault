@@ -364,6 +364,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // already banked are untouched, while the next taker
         // payout prices at the live ceiling.
         | EscrowEventKind::FeeCapAmended
+        // AV-274: a rotated ladder slash penalty account moves no
+        // funds and never restates a settled penalty — only
+        // slash_ladder.penalty_account changes, so the rung table,
+        // the rung count and the consumption cursor are untouched,
+        // while the next ladder slash transfers to the live account.
+        | EscrowEventKind::SlashLadderPenaltyAccountRotated
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1208,6 +1214,12 @@ mod event_sourcing_tests {
         // already banked are untouched, while the next taker
         // payout prices at the live ceiling.
         | EscrowEventKind::FeeCapAmended
+        // AV-274: a rotated ladder slash penalty account moves no
+        // funds and never restates a settled penalty — only
+        // slash_ladder.penalty_account changes, so the rung table,
+        // the rung count and the consumption cursor are untouched,
+        // while the next ladder slash transfers to the live account.
+        | EscrowEventKind::SlashLadderPenaltyAccountRotated
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
