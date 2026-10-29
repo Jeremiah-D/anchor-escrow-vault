@@ -19695,6 +19695,93 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Rotate the dead-man's switch heir after funding (AV-271):
+    /// the post-funding counterpart to the heir leg of
+    /// [`Escrow::with_deadman_switch`] (`Uninitialized`-only initial
+    /// configuration). Dual-signed governance, `Funded`-only,
+    /// pause first — paralleling
+    /// [`Escrow::rotate_dual_control_checker`]: the heir itself
+    /// does not sign, so a lost heir key must not block its own
+    /// replacement (the `rotate_arbiter` reasoning). Only an escrow
+    /// whose switch is already configured (see
+    /// [`Escrow::is_deadman_configured`]: a non-zero threshold
+    /// *and* a set heir) may rotate its heir: an unconfigured
+    /// escrow is refused with [`EscrowError::InvalidDeadmanConfig`]
+    /// (fail-closed — post-funding installation would add a
+    /// recovery path the taker never funded under, so it is not a
+    /// rotation, it is a new deal). A zero `new_heir` is refused
+    /// with [`EscrowError::InvalidDeadmanConfig`] (the builder's
+    /// gate, unchanged — a zero key can never be a legitimate
+    /// heir), leaving the original heir untouched. Rotating to the
+    /// current heir is a no-op: it succeeds and writes nothing, so
+    /// the event layer emits nothing for it (paralleling
+    /// `rotate_arbiter`'s no-op rule). Only `deadman_heir`
+    /// changes — `deadman_inactivity_secs` is untouched, and
+    /// `deadman_last_activity` is untouched too: the rotation
+    /// takes no clock parameter and touches no activity clock, so
+    /// it never resets the inactivity timer — the elapsed time
+    /// since the last real activity is preserved and simply
+    /// re-judged against the same threshold under the new heir.
+    /// The new heir governs from the next [`Escrow::claim_deadman`]:
+    /// that path reads the live `configured_heir` on every call,
+    /// so the old heir is `Unauthorized` from the moment the
+    /// rotation lands while the new heir may claim once the
+    /// inactivity period has elapsed, and a claim already settled
+    /// keeps the heir it settled under, since the claim is
+    /// terminal. Revising moves no funds, so no AV-36 reentrancy
+    /// lock is needed (the lock only guards the fund-moving paths,
+    /// the `rotate_arbiter` precedent). Orthogonal to
+    /// [`Escrow::with_deadman_switch`] (that is the initial
+    /// configuration, this item is the post-funding rotation) and
+    /// to [`Escrow::amend_deadman_inactivity`] (that is the
+    /// inactivity threshold, this item is the heir). Emits
+    /// `DeadmanHeirRotated` on the event layer, except for the
+    /// no-op re-affirmation.
+    pub fn rotate_deadman_heir(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_heir: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the rotation, paralleling `rotate_dual_control_checker`.
+        // The heir itself does not sign: a lost heir key must not
+        // block its own replacement (the `rotate_arbiter`
+        // reasoning).
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow whose switch is already
+        // configured may rotate its heir — post-funding
+        // installation would add a recovery path the taker never
+        // funded under. Checked before the proposed heir's shape
+        // so an unconfigured escrow never acquires a switch
+        // through this path, whatever the proposed heir.
+        if !self.is_deadman_configured() {
+            return Err(EscrowError::InvalidDeadmanConfig);
+        }
+        // The builder's gate, unchanged: a zero key can never be
+        // a legitimate heir. Checked after the configuration gate
+        // so a failed rotation never writes, and the stored heir
+        // stays as it was.
+        if new_heir == [0u8; 32] {
+            return Err(EscrowError::InvalidDeadmanConfig);
+        }
+        // No-op: re-affirming the current heir writes nothing, so
+        // the event layer emits nothing for it.
+        if Some(new_heir) == self.deadman_heir {
+            return Ok(());
+        }
+        self.deadman_heir = Some(new_heir);
+        Ok(())
+    }
+
     /// Revise the keeper-bounty per-crank amount after funding
     /// (AV-266): the post-funding counterpart to the per-crank
     /// leg of [`Escrow::with_keeper_bounty`] (`Uninitialized`-only
@@ -47929,7 +48016,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -64944,7 +65032,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -65160,9 +65249,10 @@ mod event_history_tests {
         // `SlashDeadlineAmended` (AV-267), 131 is
         // `AmountBoundsAmended` (AV-268), 132 is
         // `MilestoneLatePenaltyBpsAmended` (AV-269), 133 is
-        // `FundingPlanMaxTranchesAmended` (AV-270) and 134 is the
+        // `FundingPlanMaxTranchesAmended` (AV-270), 134 is
+        // `DeadmanHeirRotated` (AV-271) and 135 is the
         // first still-unknown byte.
-        for bad in [134u8, 255] {
+        for bad in [135u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -76859,6 +76949,186 @@ mod amend_funding_plan_max_tranches_tests {
     }
 }
 
+
+mod rotate_deadman_heir_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const HEIR: [u8; 32] = [0xEE; 32];
+    const NEW_HEIR: [u8; 32] = [0xE1; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_750_000_000;
+    // `fund` anchors the activity clock here; every elapsed-time
+    // figure below measures from this instant.
+    const FUND_AT: u64 = EXPIRES_AT - 3_600;
+
+    fn configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap()
+            .with_deadman_switch(3_600, HEIR)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn rotate_changes_only_heir_and_clock_untouched() {
+        // Only the heir moves: the threshold, the activity clock
+        // and the state are untouched, and the heir region is
+        // already resident, so the rotation rewrites it in place
+        // with no layout change.
+        let mut e = configured();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.deadman_last_activity(), FUND_AT);
+        e.rotate_deadman_heir(ALICE, BOB, NEW_HEIR).unwrap();
+        assert_eq!(e.deadman_heir(), Some(NEW_HEIR));
+        assert_eq!(e.deadman_inactivity_secs(), 3_600, "threshold untouched");
+        assert_eq!(
+            e.deadman_last_activity(),
+            FUND_AT,
+            "the rotation takes no clock and never resets the timer"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "heir region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn rotate_new_heir_claims_old_heir_refused_timer_not_reset() {
+        // Before the rotation only the configured heir may claim:
+        // the successor is a stranger to the switch.
+        let mut e = configured();
+        let idle_at = FUND_AT + 3_600;
+        assert_eq!(
+            e.claim_deadman(NEW_HEIR, idle_at),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        // Rotate: the new heir governs from the next claim, and
+        // the old heir loses the claim at once — `claim_deadman`
+        // reads the live configured heir on every call.
+        e.rotate_deadman_heir(ALICE, BOB, NEW_HEIR).unwrap();
+        assert_eq!(
+            e.claim_deadman(HEIR, idle_at),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        // The timer was not reset by the rotation: at half the
+        // threshold the new heir is still too early, and at the
+        // full threshold the new heir claims the whole lockup.
+        let mut e = configured();
+        e.rotate_deadman_heir(ALICE, BOB, NEW_HEIR).unwrap();
+        assert_eq!(
+            e.claim_deadman(NEW_HEIR, FUND_AT + 1_800),
+            Err(EscrowError::DeadmanNotElapsed)
+        );
+        let payout = e.claim_deadman(NEW_HEIR, idle_at).unwrap();
+        assert_eq!(payout, 1_000_000);
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn rotate_rejects_unconfigured_zero_state_authority_and_paused() {
+        // Fail-closed: a never-configured escrow can never acquire
+        // a dead-man's switch after funding, and a failed rotation
+        // leaves it unconfigured.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        assert!(!plain.is_deadman_configured());
+        assert_eq!(
+            plain.rotate_deadman_heir(ALICE, BOB, NEW_HEIR),
+            Err(EscrowError::InvalidDeadmanConfig)
+        );
+        assert!(!plain.is_deadman_configured());
+        // A zero heir is refused via the builder's gate and the
+        // original heir survives.
+        let mut e = configured();
+        assert_eq!(
+            e.rotate_deadman_heir(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::InvalidDeadmanConfig)
+        );
+        assert_eq!(e.deadman_heir(), Some(HEIR));
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_deadman_switch(3_600, HEIR)
+            .unwrap();
+        assert_eq!(
+            bare.rotate_deadman_heir(ALICE, BOB, NEW_HEIR),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.deadman_heir(), Some(HEIR));
+        // Dual signature: one party alone cannot rotate the heir,
+        // and the heir itself need not sign — a lost heir key must
+        // not block its own replacement.
+        let mut e = configured();
+        assert_eq!(
+            e.rotate_deadman_heir(ALICE, ALICE, NEW_HEIR),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.rotate_deadman_heir(MALLORY, BOB, NEW_HEIR),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.deadman_heir(), Some(HEIR));
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's rotation on a paused escrow is `Paused`.
+        let mut paused = configured();
+        paused.pause([0xDD; 32], None).unwrap();
+        assert_eq!(
+            paused.rotate_deadman_heir(MALLORY, BOB, NEW_HEIR),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.deadman_heir(), Some(HEIR));
+    }
+
+    #[test]
+    fn rotate_same_heir_is_a_noop() {
+        // Re-affirming the current heir succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = configured();
+        e.rotate_deadman_heir(ALICE, BOB, HEIR).unwrap();
+        assert_eq!(e.deadman_heir(), Some(HEIR));
+        assert_eq!(e.deadman_inactivity_secs(), 3_600);
+        assert_eq!(e.deadman_last_activity(), FUND_AT);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn rotate_deadman_heir_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], NOW)
+            .unwrap()
+            .with_deadman_switch(3_600, HEIR)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.rotate_deadman_heir(ALICE, ALICE, NEW_HEIR, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.rotate_deadman_heir(ALICE, BOB, NEW_HEIR, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::DeadmanHeirRotated);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same heir is a no-op: no new event.
+        e.rotate_deadman_heir(ALICE, BOB, NEW_HEIR, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+}
 
 // ---------- AV-134: vault funding amount bounds ----------
 

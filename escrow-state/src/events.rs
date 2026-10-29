@@ -419,6 +419,18 @@
 //!   the budget they funded under. A failed revision emits nothing,
 //!   and a no-op re-affirmation of the current budget emits
 //!   nothing either.
+//! - `rotate_deadman_heir` emits
+//!   [`EscrowEventKind::DeadmanHeirRotated`] on every
+//!   successful rotation that actually changes the heir
+//!   (AV-271) — `from == to ==` the current state, all amounts
+//!   zero; only `deadman_heir` changes, so the threshold and the
+//!   last-activity clock are untouched, and the claim path reads
+//!   the live heir at the next `claim_deadman`, so the old heir
+//!   stops claiming the moment the rotation lands while the new
+//!   heir may claim once the inactivity period has elapsed, and
+//!   a claim already settled keeps the heir it settled under.
+//!   A failed rotation emits nothing, and a no-op
+//!   re-affirmation of the current heir emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -645,6 +657,7 @@
 //! | AmountBoundsAmended (AV-268) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a funded tranche; only the window fields change, so `funded_total` and the funding plan's total and tranche budget are untouched, and the tranche path reads the live window at the next `fund_tranche` call, so a new window governs the next deposit while tranches already funded keep the window they funded under |
 //! | MilestoneLatePenaltyBpsAmended (AV-269) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a settled penalty; only the rate field changes, so the due-date table is untouched and `penalty_paid` already banked is never repriced, and the release path reads the live rate at the next `release_milestone` call, so a new rate governs the next late release while tranches already settled keep the rate they settled under |
 //! | FundingPlanMaxTranchesAmended (AV-270) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a funded tranche; only the budget field changes, so the plan total stays pinned to the escrow's amount and `funded_total` and `tranches_used` are untouched, and the tranche path reads the live budget at the next `fund_tranche` call, so a new budget governs the next deposit while tranches already funded keep the budget they funded under |
+//! | DeadmanHeirRotated (AV-271) | 0 | 0 | 0 | 0 — rotating moves no funds and never resets the inactivity timer; only the heir field changes, so the threshold and the last-activity clock are untouched, and the claim path reads the live heir at the next `claim_deadman` call, so the old heir stops claiming the moment the rotation lands while the new heir may claim once the inactivity period has elapsed, and a claim already settled keeps the heir it settled under |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2076,6 +2089,23 @@ pub enum EscrowEventKind {
     /// the vault, so the event needs no extra field. A no-op
     /// re-affirmation of the current budget emits nothing.
     FundingPlanMaxTranchesAmended,
+    /// AV-271: the dead-man's switch heir was rotated by
+    /// dual-signed governance
+    /// ([`Escrow::rotate_deadman_heir`](crate::Escrow::rotate_deadman_heir)).
+    /// `from == to ==` the current state (a governance rotation,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::ProtocolFeeAmended`]); all amounts are
+    /// zero — rotating moves no funds and never resets the
+    /// inactivity timer (only `deadman_heir` changes; the
+    /// threshold and the last-activity clock are untouched — the
+    /// claim path reads the live heir at the next `claim_deadman`
+    /// call, so the old heir stops claiming the moment the
+    /// rotation lands while the new heir may claim once the
+    /// inactivity period has elapsed, and a claim already settled
+    /// keeps the heir it settled under). The new heir is read from
+    /// the vault, so the event needs no extra field. A no-op
+    /// re-affirmation of the current heir emits nothing.
+    DeadmanHeirRotated,
 }
 
 impl EscrowEventKind {
@@ -2479,6 +2509,10 @@ impl EscrowEventKind {
             // discriminants 0–132 stay stable for already-serialized
             // histories.
             133 => Self::FundingPlanMaxTranchesAmended,
+            // AV-271: appended after FundingPlanMaxTranchesAmended so
+            // discriminants 0–133 stay stable for already-serialized
+            // histories.
+            134 => Self::DeadmanHeirRotated,
             _ => return None,
         })
     }
@@ -2688,6 +2722,7 @@ impl EscrowEventKind {
             Self::AmountBoundsAmended => "amount_bounds_amended",
             Self::MilestoneLatePenaltyBpsAmended => "milestone_late_penalty_bps_amended",
             Self::FundingPlanMaxTranchesAmended => "funding_plan_max_tranches_amended",
+            Self::DeadmanHeirRotated => "deadman_heir_rotated",
         }
     }
 
@@ -2901,6 +2936,7 @@ impl EscrowEventKind {
             "amount_bounds_amended" => Self::AmountBoundsAmended,
             "milestone_late_penalty_bps_amended" => Self::MilestoneLatePenaltyBpsAmended,
             "funding_plan_max_tranches_amended" => Self::FundingPlanMaxTranchesAmended,
+            "deadman_heir_rotated" => Self::DeadmanHeirRotated,
             _ => return None,
         })
     }
@@ -8611,6 +8647,50 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Rotate the dead-man's switch heir after funding (mirrors
+    /// [`Escrow::rotate_deadman_heir`]). Emits
+    /// `DeadmanHeirRotated` when the heir actually changes
+    /// (`from == to ==` the current state — the heir, not the
+    /// lifecycle state, is what changed; all amounts zero,
+    /// since rotating moves no funds and never resets the
+    /// inactivity timer — the threshold and the last-activity
+    /// clock are untouched, and the claim path reads the live
+    /// heir at the next `claim_deadman`, so the old heir stops
+    /// claiming the moment the rotation lands while the new heir
+    /// may claim once the inactivity period has elapsed, and a
+    /// claim already settled keeps the heir it settled under).
+    /// The new heir is read from the vault, so the event needs
+    /// no extra field. A failed rotation emits nothing, and a
+    /// no-op re-affirmation of the current heir emits nothing
+    /// either, paralleling `rotate_arbiter`'s no-op rule.
+    pub fn rotate_deadman_heir(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_heir: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let before = self.inner.deadman_heir();
+        self.inner
+            .rotate_deadman_heir(initializer, taker, new_heir)?;
+        if self.inner.deadman_heir() != before {
+            self.push_event(
+                EscrowEventKind::DeadmanHeirRotated,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Revise the keeper-bounty per-crank amount after funding
     /// (mirrors [`Escrow::amend_keeper_bounty_per_crank`]).
     /// Emits `KeeperBountyPerCrankAmended` when the amount
@@ -13474,7 +13554,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -13596,7 +13677,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14152,7 +14234,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14186,7 +14269,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14217,7 +14301,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14248,7 +14333,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14279,7 +14365,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14313,7 +14400,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14347,7 +14435,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14378,7 +14467,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14409,7 +14499,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14440,7 +14531,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14471,7 +14563,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14502,7 +14595,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14533,7 +14627,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14568,7 +14663,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14602,7 +14698,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14636,7 +14733,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14670,7 +14768,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14704,7 +14803,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14739,7 +14839,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14774,7 +14875,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14809,7 +14911,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14843,7 +14946,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]
@@ -14894,7 +14998,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), Some(EscrowEventKind::DeadmanHeirRotated)); // AV-271: 134 is DeadmanHeirRotated
+        assert_eq!(EscrowEventKind::from_discriminant(135), None); // AV-271: 134 is DeadmanHeirRotated
     }
 
     #[test]

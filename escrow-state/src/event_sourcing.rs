@@ -346,6 +346,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // untouched, while the next fund_tranche call is judged
         // against the live budget.
         | EscrowEventKind::FundingPlanMaxTranchesAmended
+        // AV-271: a rotated dead-man's heir moves no funds
+        // and never resets the inactivity timer — only
+        // deadman_heir changes, so the threshold and the
+        // last-activity clock are untouched, while the next
+        // claim_deadman call is judged against the live heir.
+        | EscrowEventKind::DeadmanHeirRotated
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1172,6 +1178,12 @@ mod event_sourcing_tests {
         // untouched, while the next fund_tranche call is judged
         // against the live budget.
         | EscrowEventKind::FundingPlanMaxTranchesAmended
+        // AV-271: a rotated dead-man's heir moves no funds
+        // and never resets the inactivity timer — only
+        // deadman_heir changes, so the threshold and the
+        // last-activity clock are untouched, while the next
+        // claim_deadman call is judged against the live heir.
+        | EscrowEventKind::DeadmanHeirRotated
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
