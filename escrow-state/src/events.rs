@@ -494,6 +494,16 @@
 //!   quote, and plain `release` is unaffected. A failed revision
 //!   emits nothing, and a no-op re-affirmation of the current list
 //!   emits nothing either.
+//! - `amend_dutch_auction_reserve_bps` emits
+//!   [`EscrowEventKind::DutchAuctionReserveBpsAmended`] on every
+//!   successful revision that actually changes the floor (AV-277) —
+//!   `from == to ==` the current state, all amounts zero; only the
+//!   floor changes, so the window is untouched, and claim prices
+//!   through the live floor at the next call, so a claim after the
+//!   amendment prices against the new floor while a claim already
+//!   settled keeps the cap it settled under. A failed revision
+//!   emits nothing, and a no-op re-affirmation of the current floor
+//!   emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -726,6 +736,7 @@
 //! | SlashLadderPenaltyAccountRotated (AV-274) | 0 | 0 | 0 | 0 — rotating moves no funds and never restates a settled penalty; only `slash_ladder.penalty_account` changes, so the rung table, the rung count and the consumption cursor are untouched, and the Anchor layer transfers the next ladder slash to the live account read from the ladder, so a default penalized after the rotation pays the new account while a slash already settled keeps the account it settled under, and a ladder already slashed stays rotatable since the top rung is reused |
 //! | SocialRecoveryGuardianRotated (AV-275) | 0 | 0 | 0 | 0 — rotating moves no funds; only one guardian slot changes, so the guardian count, the threshold and the timelock are untouched, and the recovery path compares against the live slot guardian at the next `request_recovery` / `approve_recovery`, so the old guardian stops opening and approving the moment the rotation lands while the new guardian may open and approve, and a request already settled keeps the guardians it settled under |
 //! | SettlementMintAllowlistUpdated (AV-276) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a settled release; only the allowlist changes, so the bound settlement mint is untouched, and the settled-release path reads the live list at the next `release_with_settlement_rate`, so a mint removed here is refused at once while a mint added here settles from the next quote, and plain `release` is unaffected |
+//! | DutchAuctionReserveBpsAmended (AV-277) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a claim already priced; only the floor changes, so the window is untouched, and claim prices through the live floor at the next call, so a claim after the amendment prices against the new floor while a claim already settled keeps the cap it settled under |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2262,6 +2273,21 @@ pub enum EscrowEventKind {
     /// is read from the vault, so the event needs no extra field.
     /// A no-op re-affirmation of the current list emits nothing.
     SettlementMintAllowlistUpdated,
+    /// AV-277: a Dutch auction's reserve floor was revised by
+    /// governed post-funding amendment
+    /// ([`Escrow::amend_dutch_auction_reserve_bps`](crate::Escrow::amend_dutch_auction_reserve_bps)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::SettlementMintAllowlistUpdated`]); all amounts are
+    /// zero — revising moves no funds and never restates a claim
+    /// already priced; only the floor changes, so the window is
+    /// untouched — claim prices through the live floor at the next
+    /// call, so a claim after the amendment prices against the new
+    /// floor while a claim already settled keeps the cap it settled
+    /// under. The new floor is read from the vault, so the event
+    /// needs no extra field. A no-op re-affirmation of the current
+    /// floor emits nothing.
+    DutchAuctionReserveBpsAmended,
 }
 
 impl EscrowEventKind {
@@ -2689,6 +2715,10 @@ impl EscrowEventKind {
             // discriminants 0–138 stay stable for already-serialized
             // histories.
             139 => Self::SettlementMintAllowlistUpdated,
+            // AV-277: appended after SettlementMintAllowlistUpdated so
+            // discriminants 0–139 stay stable for already-serialized
+            // histories.
+            140 => Self::DutchAuctionReserveBpsAmended,
             _ => return None,
         })
     }
@@ -2904,6 +2934,7 @@ impl EscrowEventKind {
             Self::SlashLadderPenaltyAccountRotated => "slash_ladder_penalty_account_rotated",
             Self::SocialRecoveryGuardianRotated => "social_recovery_guardian_rotated",
             Self::SettlementMintAllowlistUpdated => "settlement_mint_allowlist_updated",
+            Self::DutchAuctionReserveBpsAmended => "dutch_auction_reserve_bps_amended",
         }
     }
 
@@ -3123,6 +3154,7 @@ impl EscrowEventKind {
             "slash_ladder_penalty_account_rotated" => Self::SlashLadderPenaltyAccountRotated,
             "social_recovery_guardian_rotated" => Self::SocialRecoveryGuardianRotated,
             "settlement_mint_allowlist_updated" => Self::SettlementMintAllowlistUpdated,
+            "dutch_auction_reserve_bps_amended" => Self::DutchAuctionReserveBpsAmended,
             _ => return None,
         })
     }
@@ -6591,6 +6623,45 @@ impl IndexedEscrow {
             let state = self.inner.state();
             self.push_event(
             EscrowEventKind::SettlementMintAllowlistUpdated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
+    /// Revise a Dutch auction's reserve floor after funding (mirrors
+    /// [`Escrow::amend_dutch_auction_reserve_bps`]). Emits
+    /// `DutchAuctionReserveBpsAmended` only when the floor actually
+    /// changes; `from == to ==` the current state. `now` is the
+    /// amendment time (pre-open only); `at` is the caller-supplied
+    /// event timestamp.
+    pub fn amend_dutch_auction_reserve_bps(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_reserve_bps: u16,
+        now: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.auction().map(|a| a.reserve_bps());
+        self.inner
+            .amend_dutch_auction_reserve_bps(initializer, taker, new_reserve_bps, now)?;
+        let after = self.inner.auction().map(|a| a.reserve_bps());
+        // The inner call rejects bad input, strangers, and wrong states,
+        // so a changed floor here always means real governance — and a
+        // same-floor no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+            EscrowEventKind::DutchAuctionReserveBpsAmended,
             state,
             state,
             EventAmounts::none(),
@@ -13987,7 +14058,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -14115,7 +14187,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -14677,7 +14750,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -14717,7 +14791,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -14754,7 +14829,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -14791,7 +14867,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -14828,7 +14905,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -14868,7 +14946,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -14908,7 +14987,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -14945,7 +15025,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -14982,7 +15063,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -15019,7 +15101,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -15056,7 +15139,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -15093,7 +15177,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -15130,7 +15215,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -15171,7 +15257,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -15211,7 +15298,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -15251,7 +15339,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -15291,7 +15380,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -15331,7 +15421,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -15372,7 +15463,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -15413,7 +15505,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -15454,7 +15547,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -15494,7 +15588,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]
@@ -15551,7 +15646,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
         assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), Some(EscrowEventKind::DutchAuctionReserveBpsAmended)); // AV-277: 140 is DutchAuctionReserveBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(141), None); // AV-277: 140 is DutchAuctionReserveBpsAmended
     }
 
     #[test]

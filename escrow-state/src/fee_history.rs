@@ -422,6 +422,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // changes, so the bound settlement mint is untouched, while
         // the next settled release reads the live list.
         | EscrowEventKind::SettlementMintAllowlistUpdated
+        // AV-277: a revised auction floor moves no funds and never
+        // restates a claim already priced — only the floor changes,
+        // so the window is untouched, while the next claim prices
+        // through the live floor.
+        | EscrowEventKind::DutchAuctionReserveBpsAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1286,6 +1291,11 @@ mod fee_history_tests {
         // changes, so the bound settlement mint is untouched, while
         // the next settled release reads the live list.
         | EscrowEventKind::SettlementMintAllowlistUpdated
+        // AV-277: a revised auction floor moves no funds and never
+        // restates a claim already priced — only the floor changes,
+        // so the window is untouched, while the next claim prices
+        // through the live floor.
+        | EscrowEventKind::DutchAuctionReserveBpsAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
