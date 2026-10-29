@@ -414,6 +414,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // total are untouched, while the next record lands
         // under the live capacity.
         | EscrowEventKind::EventCapacityAmended
+        // AV-283: a replaced panel roster moves no funds and
+        // never restates a cast vote — only the roster changes,
+        // so the threshold, the blind mode and the reveal window
+        // are untouched, while the next dispute seats the live
+        // roster.
+        | EscrowEventKind::ArbiterPanelMembersUpdated
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1308,6 +1314,12 @@ mod event_sourcing_tests {
                 // total are untouched, while the next record lands
                 // under the live capacity.
                 | EscrowEventKind::EventCapacityAmended
+                // AV-283: a replaced panel roster moves no funds and
+                // never restates a cast vote — only the roster changes,
+                // so the threshold, the blind mode and the reveal window
+                // are untouched, while the next dispute seats the live
+                // roster.
+                | EscrowEventKind::ArbiterPanelMembersUpdated
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

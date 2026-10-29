@@ -567,6 +567,17 @@
 //!   capacity once it fills. A failed revision emits nothing,
 //!   and a no-op re-affirmation of the current capacity emits
 //!   nothing either.
+//! - `update_arbiter_panel_members` emits
+//!   [`EscrowEventKind::ArbiterPanelMembersUpdated`] on every successful
+//!   revision that actually changes the panel roster (AV-283) —
+//!   `from == to ==` the current state, all amounts zero; only
+//!   the members and the count change, so the threshold, the blind
+//!   mode, and the reveal window are untouched, and the vote state
+//!   is necessarily zero on a `Funded` escrow — the new roster
+//!   governs from the next dispute, so a removed member is refused
+//!   and a seated member votes. A failed revision emits nothing,
+//!   and a no-op re-affirmation of the identical roster in the
+//!   identical slot order emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -805,6 +816,7 @@
 //! | TieredQuorumUpdated (AV-280) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a release already settled; only the tier table changes, so the wrapped base policy (attestor registry, weights, accumulated attestations) is untouched, and the release path compares the live accumulated weight against the live tier threshold at the next `release`, so a release after the amendment clears under the new table while a release already settled keeps the table it settled under |
 //! | JuryPanelSizeAmended (AV-281) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a verdict already settled; only the jury size changes, so the arbiter slot, the arbiter panel and the juror registry are untouched, and the draw reads the live size at the next dispute, so a panel drawn after the amendment seats the new size while no panel is ever re-drawn in flight (the draw runs only on a `Disputed` escrow, and this revision is `Funded`-only) |
 //! | EventCapacityAmended (AV-282) | 0 | 0 | 0 | 0 — amending moves no funds and never restates an entry already recorded; only the capacity changes, so the slots, the head, the count and the total are untouched, and the retained entries survive verbatim — the new capacity governs from the next `record_history` call, so a ring amended while filling keeps filling under the new bound and wraps modulo the new capacity once it fills, while a wrapped ring never revises at all |
+//! | ArbiterPanelMembersUpdated (AV-283) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a vote already cast; only the roster changes, so the threshold, the blind mode and the reveal window are untouched, and the vote state is necessarily zero on a `Funded` escrow — the new roster governs from the next dispute, so a removed member is refused and a seated member votes, while no vote is ever re-attributed in flight (a reordering is a revision precisely because slot order is vote identity) |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2444,6 +2456,20 @@ pub enum EscrowEventKind {
     /// A no-op re-affirmation of the current capacity emits
     /// nothing.
     EventCapacityAmended,
+    /// AV-283: the arbiter panel's member list was replaced by
+    /// governed post-funding amendment
+    /// ([`Escrow::update_arbiter_panel_members`](crate::Escrow::update_arbiter_panel_members)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::EventCapacityAmended`]); all amounts are
+    /// zero — amending moves no funds and never restates a vote
+    /// already cast; only the members and the count change, so the
+    /// threshold, the blind mode, and the reveal window are
+    /// untouched — the new roster is read from the vault, so the
+    /// event needs no extra field. A no-op re-affirmation of the
+    /// identical roster in the identical slot order emits nothing,
+    /// while a reordering emits (slot order is vote identity).
+    ArbiterPanelMembersUpdated,
 }
 
 impl EscrowEventKind {
@@ -2895,6 +2921,10 @@ impl EscrowEventKind {
             // discriminants 0–144 stay stable for already-serialized
             // histories.
             145 => Self::EventCapacityAmended,
+            // AV-283: appended after EventCapacityAmended so
+            // discriminants 0–145 stay stable for already-serialized
+            // histories.
+            146 => Self::ArbiterPanelMembersUpdated,
             _ => return None,
         })
     }
@@ -3116,6 +3146,7 @@ impl EscrowEventKind {
             Self::TieredQuorumUpdated => "tiered_quorum_updated",
             Self::JuryPanelSizeAmended => "jury_panel_size_amended",
             Self::EventCapacityAmended => "event_capacity_amended",
+            Self::ArbiterPanelMembersUpdated => "arbiter_panel_members_updated",
         }
     }
 
@@ -3341,6 +3372,7 @@ impl EscrowEventKind {
             "tiered_quorum_updated" => Self::TieredQuorumUpdated,
             "jury_panel_size_amended" => Self::JuryPanelSizeAmended,
             "event_capacity_amended" => Self::EventCapacityAmended,
+            "arbiter_panel_members_updated" => Self::ArbiterPanelMembersUpdated,
             _ => return None,
         })
     }
@@ -7033,6 +7065,45 @@ impl IndexedEscrow {
             let state = self.inner.state();
             self.push_event(
             EscrowEventKind::EventCapacityAmended,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
+    /// Revise the arbiter panel roster after funding (mirrors
+    /// [`Escrow::update_arbiter_panel_members`]). Emits
+    /// `ArbiterPanelMembersUpdated` only when the roster actually
+    /// changes; `from == to ==` the current state. `at` is the
+    /// caller-supplied event timestamp.
+    pub fn update_arbiter_panel_members(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        members: &[[u8; 32]],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.arbiter_panel();
+        self.inner
+            .update_arbiter_panel_members(initializer, taker, members)?;
+        let after = self.inner.arbiter_panel();
+        // The inner call rejects bad input, strangers, and wrong states,
+        // so a changed roster here always means real governance — and a
+        // same-roster no-op (identical list, identical slot order) stays
+        // silent. Comparing whole panels also catches a pure reorder,
+        // which is a revision because slot order is vote identity.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+            EscrowEventKind::ArbiterPanelMembersUpdated,
             state,
             state,
             EventAmounts::none(),
@@ -14435,7 +14506,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -14569,7 +14641,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15137,7 +15210,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15183,7 +15257,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15226,7 +15301,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15269,7 +15345,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15312,7 +15389,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15358,7 +15436,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15404,7 +15483,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15447,7 +15527,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15490,7 +15571,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15533,7 +15615,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15576,7 +15659,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15619,7 +15703,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15662,7 +15747,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15709,7 +15795,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15755,7 +15842,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15801,7 +15889,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15847,7 +15936,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15893,7 +15983,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15940,7 +16031,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -15987,7 +16079,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -16034,7 +16127,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -16080,7 +16174,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -16143,7 +16238,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]

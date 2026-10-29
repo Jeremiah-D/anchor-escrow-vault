@@ -16582,6 +16582,155 @@ let fee = self.charge_protocol_fee(amount)?;
         Ok(())
     }
 
+    /// Revise the arbiter panel's member list after funding
+    /// (AV-283 — Solana dispute-arbitration governance): both the
+    /// initializer and the taker must authorize the change
+    /// (dual-signature governance, reusing the AV-12 / AV-25
+    /// concept), on an escrow that is `Funded`.
+    ///
+    /// Why: the panel roster is fixed before funding
+    /// ([`Escrow::with_arbiter_panel`]), but a member key can be
+    /// compromised, lost, or rotated out of service — a panel
+    /// that cannot seat a replacement member would otherwise
+    /// stall every future dispute on a dead key. One party
+    /// alone cannot reshape the electorate: swapping the roster
+    /// for sockpuppets would be a unilateral weakening of the
+    /// adjudication gate, so the change needs both parties,
+    /// exactly like AV-25's threshold move.
+    ///
+    /// Check order is deliberate: pause first (AV-46), then dual
+    /// authority, then the AV-158 governance-delay routing gate,
+    /// then state, then panel configuration, then the new-list
+    /// validity, then the no-op check — mirroring
+    /// [`Escrow::amend_jury_panel_size`], so a stranger learns
+    /// nothing about the panel from the error alone. Only a
+    /// `Funded` escrow may amend: the `Uninitialized` builder
+    /// owns the initial roster. Only an escrow with a configured
+    /// panel may amend — post-funding installation would add a
+    /// settlement mechanism the taker never funded under, and
+    /// single-arbiter mode revises through
+    /// [`Escrow::rotate_arbiter`] instead, so an unconfigured
+    /// escrow fails closed with `InvalidArbiterPanel`.
+    /// The new list reuses [`ArbiterPanel::new`] against the
+    /// current threshold (an empty list, more than
+    /// [`MAX_PANEL_MEMBERS`] members, a zero member key, a
+    /// duplicate member, or a new count below the current
+    /// threshold is `InvalidArbiterPanel`), and a rejected list
+    /// leaves the original roster exactly as it was, since the
+    /// new value is validated before any write. Only the roster
+    /// changes: the threshold, the blind mode, and the reveal
+    /// window are carried over verbatim — the fresh builder
+    /// value defaults to plain voting (`blind = false`, reveal
+    /// window `0`) and must never be stored whole, or a blind
+    /// panel would silently lose its commit-reveal mode.
+    /// `Funded`-only means no dispute is in flight, so the
+    /// vote state (`voted`, `commitments`, `committed_at`,
+    /// `commit_disputed_at`, `revealed`) is necessarily zero —
+    /// preserving the panel struct is exactly a no-reset, and
+    /// the tests pin that zero premise rather than trusting it.
+    /// Slot order is vote identity: re-affirming the identical
+    /// list in the identical order succeeds as a no-op (it
+    /// writes nothing, so the event layer emits nothing for
+    /// it, paralleling `update_quorum`'s no-op rule), while a
+    /// reordering IS a revision — slot `i`'s vote belongs to
+    /// whoever sits in slot `i`. The new roster governs from
+    /// the next dispute: `escalate` then
+    /// [`Escrow::submit_panel_judgment`] checks membership
+    /// against the live list, so a removed member is refused
+    /// and a seated member votes. Amending moves no funds, so
+    /// no AV-36 reentrancy lock is needed (the lock only
+    /// guards the fund-moving paths, the `rotate_arbiter`
+    /// precedent). Orthogonal to
+    /// [`Escrow::update_panel_threshold`] (that is the
+    /// `Uninitialized`-only threshold move, this item is the
+    /// post-funding roster revision), to
+    /// [`Escrow::amend_jury_panel_size`] (that is the jury size,
+    /// this item is the arbiter panel roster), and to AV-65
+    /// (that is the panel mechanism itself, this item is its
+    /// roster revision). Emits `ArbiterPanelMembersUpdated` on
+    /// the event layer, except for the no-op re-affirmation.
+    pub fn update_arbiter_panel_members(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        members: &[[u8; 32]],
+    ) -> Result<(), EscrowError> {
+        // AV-158: the direct entry always takes `via_delayed = false`
+        // — on a delay-opted-in escrow the roster moves only
+        // through the propose/execute protocol. Thin by design: one
+        // roster implementation, zero gate drift (see
+        // `update_quorum_impl`).
+        self.update_arbiter_panel_members_impl(initializer, taker, members, false)
+    }
+
+    /// The roster engine behind
+    /// [`Escrow::update_arbiter_panel_members`]. The `via_delayed`
+    /// parameter carries the AV-158 routing gate: the direct
+    /// entry always passes `false`, so on a delay-opted-in
+    /// escrow the roster moves only through the two-step
+    /// propose/execute protocol and a direct call is refused —
+    /// mirroring `amend_jury_panel_size_impl` (AV-281), which
+    /// likewise stages no new proposal variant and simply
+    /// refuses the direct path on delay-opted escrows.
+    fn update_arbiter_panel_members_impl(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        members: &[[u8; 32]],
+        via_delayed: bool,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Both parties must sign: either key alone (or a stranger)
+        // is Unauthorized. Independent `==` checks (not `||`): the
+        // degenerate initializer == taker self-escrow authorizes with
+        // one key passed twice, like AV-12's activation.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        // AV-158: the governance-delay routing gate — on a
+        // delay-opted-in escrow the roster moves only through the
+        // two-step propose/execute protocol, never a direct call
+        // (see `update_quorum_impl` for the placement rationale).
+        if !via_delayed && self.governance_delay_secs != 0 {
+            return Err(EscrowError::GovernanceActionNotProposed);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow with a configured panel may
+        // revise a roster — post-funding installation would add a
+        // settlement mechanism the taker never funded under.
+        let mut panel = self.arbiter_panel.ok_or(EscrowError::InvalidArbiterPanel)?;
+        // The roster gate lives in `ArbiterPanel::new`, run against
+        // the CURRENT threshold: a new count below it, an empty or
+        // over-long list, a zero key, or a duplicate is
+        // `InvalidArbiterPanel`, and the stored roster stays as it
+        // was — the new value is validated before any write.
+        let validated = ArbiterPanel::new(members, panel.threshold)?;
+        // No-op: re-affirming the identical list in the identical
+        // slot order writes nothing, so the event layer emits
+        // nothing for it. Slot order is vote identity, so a
+        // reordering is deliberately NOT a no-op.
+        if validated.n == panel.n
+            && validated.members[..validated.n as usize] == panel.members[..panel.n as usize]
+        {
+            return Ok(());
+        }
+        // Only the roster moves: the threshold, the blind mode, and
+        // the reveal window are carried over verbatim from the live
+        // panel — the fresh builder value is never stored whole,
+        // or blind mode would silently reset to plain voting. The
+        // vote state is untouched too; `Funded`-only means it is
+        // necessarily zero (pinned by test), so preserving it is
+        // exactly a no-reset.
+        panel.members = validated.members;
+        panel.n = validated.n;
+        self.arbiter_panel = Some(panel);
+        Ok(())
+    }
+
     /// Replace the quorum's attestor set by mutual agreement (AV-39 —
     /// Solana quorum governance, AV-45 weighted): both the initializer
     /// and the taker must authorize the change (dual-signature
@@ -49224,7 +49373,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
     }
 
     #[test]
@@ -66251,7 +66401,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(143), Some(EscrowEventKind::TieredQuorumUpdated)); // AV-280: 143 is TieredQuorumUpdated
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(146), None); // AV-282: 145 is EventCapacityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -66479,9 +66630,10 @@ mod event_history_tests {
         // `SocialRecoveryTimelockAmended` (AV-279), 143 is
         // `TieredQuorumUpdated` (AV-280), 144 is
         // `JuryPanelSizeAmended` (AV-281), 145 is
-        // `EventCapacityAmended` (AV-282) and 146 is the
+        // `EventCapacityAmended` (AV-282), 146 is
+        // `ArbiterPanelMembersUpdated` (AV-283) and 147 is the
         // first still-unknown byte.
-        for bad in [146u8, 255] {
+        for bad in [147u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -80487,6 +80639,232 @@ mod amend_event_capacity_tests {
         // Re-affirming the new capacity is a no-op: no new event.
         e.amend_event_capacity(ALICE, BOB, 4, NOW).unwrap();
         assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+}
+
+mod update_arbiter_panel_members_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const M1: [u8; 32] = [0x01; 32];
+    const M2: [u8; 32] = [0x02; 32];
+    const M3: [u8; 32] = [0x03; 32];
+    const M4: [u8; 32] = [0x04; 32];
+    const M5: [u8; 32] = [0x05; 32];
+    const M6: [u8; 32] = [0x06; 32];
+    const M7: [u8; 32] = [0x07; 32];
+    const M8: [u8; 32] = [0x08; 32];
+    const M9: [u8; 32] = [0x09; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const FUNDED_AT: u64 = EXPIRES_AT - 3_600;
+    const NOW: u64 = 1_750_000_000;
+
+    fn configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, FUNDED_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn blind_configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_blind_panel(&[M1, M2, M3], 2, 600)
+            .unwrap();
+        e.fund(ALICE, FUNDED_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn delay_configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, FUNDED_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn members_of(e: &Escrow) -> Vec<[u8; 32]> {
+        let panel = e.arbiter_panel().unwrap();
+        panel.members[..panel.n as usize].to_vec()
+    }
+
+    #[test]
+    fn amend_changes_only_members_and_preserves_threshold_and_blind_mode() {
+        // Only the roster moves: the threshold, the blind mode, and
+        // the reveal window are carried over verbatim — the fresh
+        // builder value defaults to plain voting, so storing it
+        // whole would silently drop blind mode. The vote state is
+        // necessarily zero on a Funded escrow (no dispute in
+        // flight), and stays zero: preserving the panel struct is
+        // exactly a no-reset.
+        let mut e = blind_configured();
+        let panel_before = e.arbiter_panel().unwrap();
+        assert!(panel_before.blind, "blind mode configured");
+        assert_eq!(panel_before.reveal_window_secs, 600);
+        assert_eq!(panel_before.voted, 0, "Funded-only: no votes yet");
+        assert!(panel_before.commitments.iter().all(|c| *c == [0u8; 32]));
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.update_arbiter_panel_members(ALICE, BOB, &[M1, M3, M4])
+            .unwrap();
+        let panel = e.arbiter_panel().unwrap();
+        assert_eq!(members_of(&e), vec![M1, M3, M4], "roster replaced");
+        assert_eq!(panel.n, 3);
+        assert_eq!(panel.threshold, 2, "threshold untouched");
+        assert!(panel.blind, "blind mode carried over, not reset");
+        assert_eq!(panel.reveal_window_secs, 600, "reveal window carried over");
+        assert_eq!(panel.voted, 0, "vote state untouched (still zero)");
+        assert!(panel.commitments.iter().all(|c| *c == [0u8; 32]));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "panel region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_rejects_invalid_lists_and_keeps_original() {
+        // Every `ArbiterPanel::new` gate, run against the current
+        // threshold of 2: an empty list, an over-long list, a zero
+        // key, a duplicate, and a new count below the threshold
+        // are all `InvalidArbiterPanel` — and a rejected list
+        // leaves the original roster exactly as it was.
+        let mut e = configured();
+        let zero = [0u8; 32];
+        let cases: Vec<Vec<[u8; 32]>> = vec![
+            vec![],
+            vec![M1, M2, M3, M4, M5, M6, M7, M8, M9],
+            vec![M1, zero, M3],
+            vec![M1, M2, M2],
+            vec![M1],
+        ];
+        for members in cases {
+            assert_eq!(
+                e.update_arbiter_panel_members(ALICE, BOB, &members),
+                Err(EscrowError::InvalidArbiterPanel),
+                "members {members:?} must be rejected"
+            );
+            assert_eq!(members_of(&e), vec![M1, M2, M3], "original roster untouched");
+        }
+    }
+
+    #[test]
+    fn amend_same_order_is_noop_but_reorder_is_revision() {
+        // Slot order is vote identity: re-affirming the identical
+        // list in the identical order writes nothing, while a
+        // reordering is a real revision — slot `i`'s vote belongs
+        // to whoever sits in slot `i`.
+        let mut e = configured();
+        e.update_arbiter_panel_members(ALICE, BOB, &[M1, M2, M3])
+            .unwrap();
+        assert_eq!(members_of(&e), vec![M1, M2, M3], "no-op keeps roster");
+        e.update_arbiter_panel_members(ALICE, BOB, &[M2, M1, M3])
+            .unwrap();
+        assert_eq!(members_of(&e), vec![M2, M1, M3], "reorder is a revision");
+        assert_eq!(e.arbiter_panel().unwrap().threshold, 2);
+    }
+
+    #[test]
+    fn amend_requires_dual_auth_pause_state_and_delay_routing() {
+        // Dual authority: either party alone, or a stranger pair,
+        // learns nothing beyond Unauthorized.
+        let mut e = configured();
+        assert_eq!(
+            e.update_arbiter_panel_members(ALICE, MALLORY, &[M1, M3, M4]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.update_arbiter_panel_members(MALLORY, BOB, &[M1, M3, M4]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.update_arbiter_panel_members(MALLORY, MALLORY, &[M1, M3, M4]),
+            Err(EscrowError::Unauthorized)
+        );
+        // Pause first: a paused escrow fails fast.
+        e.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            e.update_arbiter_panel_members(ALICE, BOB, &[M1, M3, M4]),
+            Err(EscrowError::Paused)
+        );
+        // Wrong state: the Uninitialized builder owns the roster.
+        let mut fresh = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        assert_eq!(
+            fresh.update_arbiter_panel_members(ALICE, BOB, &[M1, M3, M4]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // AV-158: on a delay-opted-in escrow the direct call is
+        // refused — the roster moves only via propose/execute.
+        let mut delayed = delay_configured();
+        assert_eq!(
+            delayed.update_arbiter_panel_members(ALICE, BOB, &[M1, M3, M4]),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(members_of(&delayed), vec![M1, M2, M3]);
+    }
+
+    #[test]
+    fn amend_rejects_unconfigured_panel() {
+        // Post-funding installation is not a revision: an escrow
+        // with no panel at all fails closed, and single-arbiter
+        // mode revises through `rotate_arbiter`, not here.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        e.fund(ALICE, FUNDED_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            e.update_arbiter_panel_members(ALICE, BOB, &[M1, M2, M3]),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(e.arbiter_panel(), None);
+    }
+
+    #[test]
+    fn amend_new_roster_governs_next_dispute() {
+        // The new roster governs from the next dispute: after an
+        // escalate, a removed member is refused and a seated
+        // member votes — membership is checked against the live
+        // list, not the list the escrow funded under.
+        let mut e = configured();
+        e.update_arbiter_panel_members(ALICE, BOB, &[M1, M3, M4])
+            .unwrap();
+        e.escalate(ALICE, NOW, 400_000, None, None, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(
+            e.submit_panel_judgment(M2, 400_000, NOW + 10, None, None, BOB),
+            Err(EscrowError::Unauthorized),
+            "removed member no longer votes"
+        );
+        let vote = e
+            .submit_panel_judgment(M4, 400_000, NOW + 10, None, None, BOB)
+            .unwrap();
+        assert_eq!(vote, None, "one vote below the threshold of 2 settles nothing");
+        assert_eq!(
+            e.arbiter_panel().unwrap().voted, 0b100,
+            "the seated member's vote lands in its new slot"
+        );
     }
 }
 
