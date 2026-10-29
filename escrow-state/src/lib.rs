@@ -19117,6 +19117,95 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Revise the milestone late-penalty rate after funding (AV-269 —
+    /// Solana / payment fintech: the lateness price that stays
+    /// renegotiable after funds land). Dual-signed governance,
+    /// paralleling [`Escrow::amend_milestone_due_dates`]:
+    /// both parties must authorize the revision, the escrow must
+    /// be `Funded`, and a paused escrow fails fast (`Paused`,
+    /// checked before the authority and state gates).
+    ///
+    /// Fail-closed: only an escrow that already has a milestone
+    /// due-date table may revise the rate — it must carry a
+    /// milestone plan and every tranche must already have a due
+    /// date attached (a stored `0` means "never attached", the
+    /// AV-206 sentinel). A plan-less or table-less escrow is
+    /// refused with [`EscrowError::InvalidMilestones`] (the
+    /// [`Escrow::amend_milestone_due_dates`] gate, unchanged), so
+    /// penalty semantics can never be installed after funding on
+    /// an escrow whose tranches have no deadlines to miss (a rate
+    /// without deadlines prices nothing, and installing one
+    /// mid-deal would add a forfeiture term the taker never
+    /// funded under; it is a new deal, not a revision). The new
+    /// rate reuses [`validate_late_penalty_bps`] (the
+    /// [`Escrow::with_late_penalty_bps`] gate, unchanged): above
+    /// 10_000 bps is [`EscrowError::InvalidPenalty`], and `0` is
+    /// legal (it switches future late penalties off). All checks
+    /// run before any write, so a refused revision leaves the
+    /// original rate untouched. Revising to the current rate is a
+    /// no-op: it succeeds and writes nothing, so the event layer
+    /// emits nothing for it (paralleling `rotate_arbiter`).
+    /// Only `milestone_late_penalty_bps` changes — the
+    /// `milestone_due_dates` table is untouched and
+    /// `penalty_paid` already banked is never restated (a settled
+    /// tranche keeps the rate it settled under). The new rate
+    /// governs from the next [`Escrow::release_milestone`]: that
+    /// path reads the live rate at release time
+    /// (`late_penalty_for`), so raising it raises the next late
+    /// tranche's forfeiture and lowering it lowers it. Revising
+    /// moves no funds, so no AV-36 reentrancy lock is needed (the
+    /// lock only guards the fund-moving paths, the
+    /// `rotate_arbiter` precedent). Orthogonal to
+    /// [`Escrow::with_late_penalty_bps`] (that is the
+    /// `Uninitialized`-only initial set, this item is the
+    /// post-funding revision), to
+    /// [`Escrow::amend_milestone_due_dates`] (that is the
+    /// deadline table, this item is the rate priced against it),
+    /// to [`Escrow::amend_late_delivery_penalty_bps`] (that is the
+    /// delivery-confirmation late penalty, priced after this one),
+    /// and to [`Escrow::amend_penalty_bps`] (that is the generic
+    /// expiry penalty rate, not the milestone lateness price).
+    /// Emits `MilestoneLatePenaltyBpsAmended` on the event layer,
+    /// except for the no-op re-affirmation.
+    pub fn amend_milestone_late_penalty_bps(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        bps: u16,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_milestone_due_dates`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow already carrying a deadline
+        // table may revise the rate — amendment never installs
+        // penalty semantics on a table-less escrow.
+        let plan = self.milestones.ok_or(EscrowError::InvalidMilestones)?;
+        let count = plan.count as usize;
+        for i in 0..count {
+            if self.milestone_due_dates[i] == 0 {
+                return Err(EscrowError::InvalidMilestones);
+            }
+        }
+        // The builder's rate gate, before any write, so a refused
+        // revision leaves the original rate untouched.
+        validate_late_penalty_bps(bps)?;
+        // No-op: re-affirming the current rate writes nothing, so
+        // the event layer emits nothing for it.
+        if bps == self.milestone_late_penalty_bps {
+            return Ok(());
+        }
+        self.milestone_late_penalty_bps = bps;
+        Ok(())
+    }
+
     /// The multi-taker claimant roster attached via
     /// [`Escrow::with_claimants`] (AV-149). `None` on a plain
     /// bilateral escrow.
@@ -47751,7 +47840,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -64764,7 +64854,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -64978,9 +65069,10 @@ mod event_history_tests {
         // `DeadmanInactivityAmended` (AV-265), 129 is
         // `KeeperBountyPerCrankAmended` (AV-266), 130 is
         // `SlashDeadlineAmended` (AV-267), 131 is
-        // `AmountBoundsAmended` (AV-268) and 132 is the
+        // `AmountBoundsAmended` (AV-268), 132 is
+        // `MilestoneLatePenaltyBpsAmended` (AV-269) and 133 is the
         // first still-unknown byte.
-        for bad in [132u8, 255] {
+        for bad in [133u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -76259,6 +76351,232 @@ mod amend_amount_bounds_tests {
         );
     }
 }
+
+mod amend_milestone_late_penalty_bps_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const FUND_AT: u64 = EXPIRES_AT - 3_600;
+    const NOW: u64 = 1_740_000_000;
+
+    const AMOUNT: u64 = 1_000_000;
+
+    /// A `Funded` milestone escrow with due dates
+    /// [1_750_000_000, 1_760_000_000] and a 10% late rate: the
+    /// revision's starting point.
+    fn dated_penalty_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap()
+            .with_milestone_due_dates(&[1_750_000_000, 1_760_000_000])
+            .unwrap()
+            .with_late_penalty_bps(1_000)
+            .unwrap();
+        e = e.with_pause_authority([0xDD; 32]).unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn confirm_both(e: &mut Escrow, index: u8) {
+        e.confirm_milestone(ALICE, index).unwrap();
+        e.confirm_milestone(BOB, index).unwrap();
+    }
+
+    #[test]
+    fn amend_changes_live_rate_and_next_release_prices_with_it() {
+        // Only the rate moves: the due table is untouched, and
+        // the next late release prices at the new rate.
+        let mut e = dated_penalty_escrow();
+        assert_eq!(e.milestone_late_penalty_bps(), 1_000);
+        e.amend_milestone_late_penalty_bps(ALICE, BOB, 2_000)
+            .unwrap();
+        assert_eq!(e.milestone_late_penalty_bps(), 2_000);
+        assert_eq!(e.milestone_due_at(0), Some(1_750_000_000));
+        assert_eq!(e.milestone_due_at(1), Some(1_760_000_000));
+        // Tranche 0, one second past its due: 20% of 400k = 80k.
+        confirm_both(&mut e, 0);
+        let (payout, fee) = e
+            .release_milestone(ALICE, 1_750_000_001, 0, None, BOB)
+            .unwrap();
+        assert_eq!((payout, fee), (320_000, 0));
+        assert_eq!(e.released_amount(), 320_000);
+        assert_eq!(e.penalty_paid(), 80_000);
+        // Cutting the rate to 0 switches future late penalties
+        // off: tranche 1 releases past its due in full.
+        e.amend_milestone_late_penalty_bps(ALICE, BOB, 0)
+            .unwrap();
+        confirm_both(&mut e, 1);
+        let (payout, _) = e
+            .release_milestone(ALICE, 1_760_000_001, 1, None, BOB)
+            .unwrap();
+        assert_eq!(payout, 600_000);
+        assert_eq!(e.penalty_paid(), 80_000, "no new penalty banked");
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_leaves_settled_tranche_penalty_untouched() {
+        // Tranche 0 settles late under the original 10% rate.
+        let mut e = dated_penalty_escrow();
+        confirm_both(&mut e, 0);
+        e.release_milestone(ALICE, 1_750_000_001, 0, None, BOB)
+            .unwrap();
+        assert_eq!(e.penalty_paid(), 40_000, "10% of 400k");
+        assert_eq!(e.released_amount(), 360_000);
+        // Raising the rate to 50% must not restate it.
+        e.amend_milestone_late_penalty_bps(ALICE, BOB, 5_000)
+            .unwrap();
+        assert_eq!(e.penalty_paid(), 40_000, "settled penalty never restated");
+        assert_eq!(e.released_amount(), 360_000);
+        // Only the open tranche reprices: 50% of 600k = 300k.
+        confirm_both(&mut e, 1);
+        e.release_milestone(ALICE, 1_760_000_001, 1, None, BOB)
+            .unwrap();
+        assert_eq!(e.penalty_paid(), 340_000);
+        assert_eq!(e.released_amount(), 660_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_rejects_tableless_planless_and_bad_rate_untouched() {
+        // Funded, plan + rate, but no deadline table: amendment
+        // never installs penalty semantics on a table-less escrow.
+        let mut tableless = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap()
+            .with_late_penalty_bps(1_000)
+            .unwrap();
+        tableless.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            tableless.amend_milestone_late_penalty_bps(ALICE, BOB, 2_000),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(tableless.milestone_late_penalty_bps(), 1_000);
+        // Funded, plan, neither table nor rate: still table-less.
+        let mut bare_plan = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        bare_plan.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            bare_plan.amend_milestone_late_penalty_bps(ALICE, BOB, 2_000),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(bare_plan.milestone_late_penalty_bps(), 0);
+        // Funded but plan-less: nothing to price against.
+        let mut no_plan = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        no_plan.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            no_plan.amend_milestone_late_penalty_bps(ALICE, BOB, 2_000),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // A rate above 100% is refused and the original rate
+        // survives; exactly 10_000 bps is the legal boundary.
+        let mut e = dated_penalty_escrow();
+        assert_eq!(
+            e.amend_milestone_late_penalty_bps(ALICE, BOB, 10_001),
+            Err(EscrowError::InvalidPenalty)
+        );
+        assert_eq!(e.milestone_late_penalty_bps(), 1_000);
+        e.amend_milestone_late_penalty_bps(ALICE, BOB, 10_000)
+            .unwrap();
+        assert_eq!(e.milestone_late_penalty_bps(), 10_000);
+        // Uninitialized: the builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap()
+            .with_milestone_due_dates(&[1_750_000_000, 1_760_000_000])
+            .unwrap()
+            .with_late_penalty_bps(1_000)
+            .unwrap();
+        assert_eq!(
+            bare.amend_milestone_late_penalty_bps(ALICE, BOB, 2_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.milestone_late_penalty_bps(), 1_000);
+    }
+
+    #[test]
+    fn amend_rejects_state_authority_and_paused() {
+        // Dual signature: one party alone cannot move the rate.
+        let mut e = dated_penalty_escrow();
+        assert_eq!(
+            e.amend_milestone_late_penalty_bps(ALICE, ALICE, 2_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_milestone_late_penalty_bps(MALLORY, BOB, 2_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.milestone_late_penalty_bps(), 1_000);
+        // The pause guard fires before the authority and state
+        // gates: even a stranger's revision on a paused escrow
+        // is `Paused`.
+        let mut paused = dated_penalty_escrow();
+        paused.pause([0xDD; 32], None).unwrap();
+        assert_eq!(
+            paused.amend_milestone_late_penalty_bps(MALLORY, BOB, 2_000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.milestone_late_penalty_bps(), 1_000);
+    }
+
+    #[test]
+    fn amend_same_rate_is_a_noop() {
+        // Re-affirming the current rate succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = dated_penalty_escrow();
+        e.amend_milestone_late_penalty_bps(ALICE, BOB, 1_000)
+            .unwrap();
+        assert_eq!(e.milestone_late_penalty_bps(), 1_000);
+        assert_eq!(e.milestone_due_at(0), Some(1_750_000_000));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        // No `with_late_penalty_bps` forward exists on
+        // `IndexedEscrow`, so this indexed escrow starts at the
+        // default rate 0 with a deadline table attached — the
+        // table gate, not the rate, is what qualifies it.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT, [0xE0; 32], NOW)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap()
+            .with_milestone_due_dates(&[1_750_000_000, 1_760_000_000])
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_milestone_late_penalty_bps(ALICE, ALICE, 2_000, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_milestone_late_penalty_bps(ALICE, BOB, 2_000, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::MilestoneLatePenaltyBpsAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same rate is a no-op: no new event.
+        e.amend_milestone_late_penalty_bps(ALICE, BOB, 2_000, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+}
+
+// ---------- AV-134: vault funding amount bounds ----------
 
 // ---------- AV-134: vault funding amount bounds ----------
 mod amount_bounds_tests {

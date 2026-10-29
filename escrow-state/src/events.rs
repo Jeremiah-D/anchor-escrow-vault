@@ -395,6 +395,18 @@
 //!   deposit while tranches already funded keep the window they
 //!   funded under. A failed revision emits nothing, and a no-op
 //!   re-affirmation of the current window emits nothing either.
+//! - `amend_milestone_late_penalty_bps` emits
+//!   [`EscrowEventKind::MilestoneLatePenaltyBpsAmended`] on every
+//!   successful revision that actually changes the rate
+//!   (AV-269) — `from == to ==` the current state, all amounts
+//!   zero; only the rate field changes, so the due-date table
+//!   is untouched and `penalty_paid` already banked is never
+//!   restated, and the release path reads the live rate at the
+//!   next `release_milestone` call, so a new rate governs the
+//!   next late release while tranches already settled keep the
+//!   rate they settled under. A failed revision emits nothing,
+//!   and a no-op re-affirmation of the current rate emits
+//!   nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -619,6 +631,7 @@
 //! | KeeperBountyPerCrankAmended (AV-266) | 0 | 0 | 0 | 0 — revising moves no funds and never tops the pool up; the next `crank_expired` pays `min(new per_crank, pool)` from the live amount, so a closed (`0`) bounty pays `0` and an exhausted pool still pays `0`, while a crank already settled keeps the amount it settled under |
 //! | SlashDeadlineAmended (AV-267) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a settled penalty; the slash path reads the live deadline at the next eligibility check, so tightening can make an unexecuted default slashable at once while loosening can defer an already-satisfied but unexecuted eligibility, and a slash already settled keeps the deadline it settled under |
 //! | AmountBoundsAmended (AV-268) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a funded tranche; only the window fields change, so `funded_total` and the funding plan's total and tranche budget are untouched, and the tranche path reads the live window at the next `fund_tranche` call, so a new window governs the next deposit while tranches already funded keep the window they funded under |
+//! | MilestoneLatePenaltyBpsAmended (AV-269) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a settled penalty; only the rate field changes, so the due-date table is untouched and `penalty_paid` already banked is never repriced, and the release path reads the live rate at the next `release_milestone` call, so a new rate governs the next late release while tranches already settled keep the rate they settled under |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2018,6 +2031,22 @@ pub enum EscrowEventKind {
     /// the event needs no extra field. A no-op re-affirmation of
     /// the current window emits nothing.
     AmountBoundsAmended,
+    /// AV-269: the milestone late-penalty rate was revised by
+    /// dual-signed governance
+    /// ([`Escrow::amend_milestone_late_penalty_bps`](crate::Escrow::amend_milestone_late_penalty_bps)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::ProtocolFeeAmended`]); all amounts are
+    /// zero — revising moves no funds and never restates a
+    /// settled penalty (only the rate field changes; the due-date
+    /// table is untouched and `penalty_paid` already banked is
+    /// never repriced — the release path reads the live rate at
+    /// the next `release_milestone` call, so a new rate governs
+    /// the next late release while tranches already settled keep
+    /// the rate they settled under). The new rate is read from
+    /// the vault, so the event needs no extra field. A no-op
+    /// re-affirmation of the current rate emits nothing.
+    MilestoneLatePenaltyBpsAmended,
 }
 
 impl EscrowEventKind {
@@ -2413,6 +2442,10 @@ impl EscrowEventKind {
             // discriminants 0–130 stay stable for already-serialized
             // histories.
             131 => Self::AmountBoundsAmended,
+            // AV-269: appended after AmountBoundsAmended so
+            // discriminants 0–131 stay stable for already-serialized
+            // histories.
+            132 => Self::MilestoneLatePenaltyBpsAmended,
             _ => return None,
         })
     }
@@ -2620,6 +2653,7 @@ impl EscrowEventKind {
             Self::KeeperBountyPerCrankAmended => "keeper_bounty_per_crank_amended",
             Self::SlashDeadlineAmended => "slash_deadline_amended",
             Self::AmountBoundsAmended => "amount_bounds_amended",
+            Self::MilestoneLatePenaltyBpsAmended => "milestone_late_penalty_bps_amended",
         }
     }
 
@@ -2831,6 +2865,7 @@ impl EscrowEventKind {
             "keeper_bounty_per_crank_amended" => Self::KeeperBountyPerCrankAmended,
             "slash_deadline_amended" => Self::SlashDeadlineAmended,
             "amount_bounds_amended" => Self::AmountBoundsAmended,
+            "milestone_late_penalty_bps_amended" => Self::MilestoneLatePenaltyBpsAmended,
             _ => return None,
         })
     }
@@ -8673,6 +8708,50 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the milestone late-penalty rate after funding
+    /// (mirrors [`Escrow::amend_milestone_late_penalty_bps`]).
+    /// Emits `MilestoneLatePenaltyBpsAmended` when the rate
+    /// actually changes (`from == to ==` the current state — the
+    /// rate, not the lifecycle state, is what changed; all amounts
+    /// zero, since revising moves no funds and never restates a
+    /// settled penalty — only the rate field changes, so the
+    /// due-date table is untouched and `penalty_paid` already
+    /// banked is never repriced, and the release path reads the
+    /// live rate at the next `release_milestone` call, so a new
+    /// rate governs the next late release while tranches already
+    /// settled keep the rate they settled under). The new rate is
+    /// read from the vault, so the event needs no extra field. A
+    /// failed revision emits nothing, and a no-op re-affirmation
+    /// of the current rate emits nothing either, paralleling
+    /// `rotate_arbiter`'s no-op rule.
+    pub fn amend_milestone_late_penalty_bps(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        bps: u16,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let before = self.inner.milestone_late_penalty_bps();
+        self.inner
+            .amend_milestone_late_penalty_bps(initializer, taker, bps)?;
+        if self.inner.milestone_late_penalty_bps() != before {
+            self.push_event(
+                EscrowEventKind::MilestoneLatePenaltyBpsAmended,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// The live milestone tranche table as a fixed
     /// `MAX_MILESTONES` array (entries past the plan's count are
     /// zero): the shape the `MilestonesReallocated` event carries
@@ -13314,7 +13393,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -13434,7 +13514,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -13988,7 +14069,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14020,7 +14102,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14049,7 +14132,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14078,7 +14162,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14107,7 +14192,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14139,7 +14225,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14171,7 +14258,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14200,7 +14288,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14229,7 +14318,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14258,7 +14348,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14287,7 +14378,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14316,7 +14408,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14345,7 +14438,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14378,7 +14472,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14410,7 +14505,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14442,7 +14538,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14474,7 +14571,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14506,7 +14604,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14539,7 +14638,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14572,7 +14672,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14605,7 +14706,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14637,7 +14739,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]
@@ -14686,7 +14789,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
     }
 
     #[test]

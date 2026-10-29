@@ -334,6 +334,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // total and tranche budget are untouched, while the next
         // fund_tranche call is judged against the live window.
         | EscrowEventKind::AmountBoundsAmended
+        // AV-269: a revised milestone late-penalty rate moves no funds
+        // and never restates a settled penalty — only the rate field
+        // changes, so the due-date table is untouched and penalty_paid
+        // already banked is never repriced, while the next
+        // release_milestone call prices at the live rate.
+        | EscrowEventKind::MilestoneLatePenaltyBpsAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1148,6 +1154,12 @@ mod event_sourcing_tests {
         // total and tranche budget are untouched, while the next
         // fund_tranche call is judged against the live window.
         | EscrowEventKind::AmountBoundsAmended
+        // AV-269: a revised milestone late-penalty rate moves no funds
+        // and never restates a settled penalty — only the rate field
+        // changes, so the due-date table is untouched and penalty_paid
+        // already banked is never repriced, while the next
+        // release_milestone call prices at the live rate.
+        | EscrowEventKind::MilestoneLatePenaltyBpsAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
