@@ -9774,6 +9774,89 @@ impl Escrow {
         self.max_funding_amount
     }
 
+    /// Revise the funding amount window after funding (AV-268 —
+    /// Solana / payment fintech: deposit guardrails that stay
+    /// renegotiable after the first tranche lands). Dual-signed
+    /// governance, paralleling [`Escrow::amend_slash_deadline`]:
+    /// both parties must authorize the revision, the escrow must
+    /// be `Funded`, and a paused escrow fails fast (`Paused`,
+    /// checked before the authority and state gates).
+    ///
+    /// Fail-closed: only an escrow that already carries a window
+    /// ([`Escrow::amount_bounds`] is `Some`) may revise it — an
+    /// escrow with no window is refused with
+    /// [`EscrowError::InvalidAmountBounds`], so a window can never
+    /// be installed after funding (post-funding installation
+    /// would add a deposit gate the taker never funded under; it
+    /// is a new deal, not a revision). The revision replaces the
+    /// whole pair at once (`min` and `max` move together — there
+    /// is no partial revision), and `min_amount > max_amount` is
+    /// refused with [`EscrowError::InvalidAmountBounds`] (the
+    /// [`Escrow::with_amount_bounds`] gate, unchanged), leaving
+    /// the original window untouched. Revising to the current
+    /// window is a no-op: it succeeds and writes nothing, so the
+    /// event layer emits nothing for it (paralleling
+    /// `rotate_arbiter`'s no-op rule). Only
+    /// `min_funding_amount` / `max_funding_amount` change —
+    /// `funded_total`, the funding plan's total and tranche
+    /// budget are untouched (the window caps each tranche, it
+    /// never reschedules the plan). The new window governs from
+    /// the next [`Escrow::fund_tranche`] call: the tranche path
+    /// reads the live window on every deposit
+    /// (`require_amount_within_bounds`), while tranches already
+    /// funded keep the window they funded under (no restatement).
+    /// Revising moves no funds, so no AV-36 reentrancy lock is
+    /// needed (the lock only guards the fund-moving paths, the
+    /// `rotate_arbiter` precedent). Orthogonal to
+    /// [`Escrow::with_amount_bounds`] (that is the
+    /// `Uninitialized`-only initial set, this item is the
+    /// post-funding revision), to `update_release_cap` (that is
+    /// the single-release ceiling, this item is the funding
+    /// window), and to the funding plan itself (that is the
+    /// tranche schedule, this item is the per-tranche amount
+    /// window). Emits `AmountBoundsAmended` on the event layer,
+    /// except for the no-op re-affirmation.
+    pub fn amend_amount_bounds(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        min_amount: u64,
+        max_amount: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_slash_deadline`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow already carrying a window
+        // may revise it — post-funding installation would add a
+        // deposit gate the taker never funded under.
+        let current = match self.amount_bounds() {
+            Some(window) => window,
+            None => return Err(EscrowError::InvalidAmountBounds),
+        };
+        // An inverted window is a configuration error, not a
+        // funding error — fail here, before any write, so the
+        // original window survives a refused revision.
+        if min_amount > max_amount {
+            return Err(EscrowError::InvalidAmountBounds);
+        }
+        // No-op: re-affirming the current window writes
+        // nothing, so the event layer emits nothing for it.
+        if (min_amount, max_amount) == current {
+            return Ok(());
+        }
+        self.min_funding_amount = Some(min_amount);
+        self.max_funding_amount = Some(max_amount);
+        Ok(())
+    }
+
     /// Opt in to an arbiter adjudication fee (AV-135 — Solana
     /// governance / payment fintech): every dispute settlement
     /// (`resolve`, the panel's settling vote,
@@ -47667,7 +47750,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -64679,7 +64763,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -64892,9 +64977,10 @@ mod event_history_tests {
         // `CredentialIssuerRotated` (AV-264), 128 is
         // `DeadmanInactivityAmended` (AV-265), 129 is
         // `KeeperBountyPerCrankAmended` (AV-266), 130 is
-        // `SlashDeadlineAmended` (AV-267) and 131 is the
+        // `SlashDeadlineAmended` (AV-267), 131 is
+        // `AmountBoundsAmended` (AV-268) and 132 is the
         // first still-unknown byte.
-        for bad in [131u8, 255] {
+        for bad in [132u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -75978,6 +76064,193 @@ mod amend_slash_deadline_tests {
         assert_eq!(ev.amounts.fee, 0);
         // Re-affirming the same deadline is a no-op: no new event.
         e.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000, NOW)
+            .unwrap();
+        assert_eq!(
+            e.event_count(),
+            before + 1,
+            "no-op emits nothing"
+        );
+    }
+}
+
+// ---------- AV-268: amend funding amount bounds after funding ----------
+mod amend_amount_bounds_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const FUND_AT: u64 = 1_600_000_000;
+    const NOW: u64 = 1_750_000_000;
+
+    const AMOUNT: u64 = 1_000_000;
+    const MIN: u64 = 100_000;
+    const MAX: u64 = 900_000;
+    const FIRST: u64 = 200_000;
+
+    /// A `Funded` plan escrow carrying the AV-134 window, one
+    /// tranche already funded: the revision's starting point.
+    fn bounded_plan() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_amount_bounds(MIN, MAX)
+            .unwrap();
+        e.with_funding_plan(AMOUNT, 3).unwrap();
+        e = e.with_pause_authority([0xDD; 32]).unwrap();
+        e.fund_tranche(ALICE, FIRST, FUND_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn amend_replaces_whole_window_and_touches_nothing_else() {
+        // Only the window moves: funded_total, the plan's total
+        // and tranche budget, and the deal size are untouched,
+        // and the already-resident window fields are rewritten
+        // in place, so the layout is unchanged.
+        let mut e = bounded_plan();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        let plan_before = e.funding_plan().expect("plan attached");
+        e.amend_amount_bounds(ALICE, BOB, 300_000, 600_000).unwrap();
+        assert_eq!(e.amount_bounds(), Some((300_000, 600_000)));
+        assert_eq!(e.min_funding_amount(), Some(300_000));
+        assert_eq!(e.max_funding_amount(), Some(600_000));
+        assert_eq!(e.funded_total(), FIRST, "funded total untouched");
+        let plan_after = e.funding_plan().expect("plan still attached");
+        assert_eq!(plan_after.total_amount(), plan_before.total_amount());
+        assert_eq!(plan_after.max_tranches(), plan_before.max_tranches());
+        assert_eq!(plan_after.tranches_used(), plan_before.tranches_used());
+        assert_eq!(e.amount(), AMOUNT, "deal size untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "window fields rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn new_window_governs_next_tranche_and_old_tranche_is_not_restated() {
+        // The first tranche funded under [100k, 900k]; tightening
+        // to [300k, 600k] must not restate it (funded_total still
+        // carries it), but the next tranche is judged against the
+        // live window: 200k is now below the floor, 400k passes.
+        let mut e = bounded_plan();
+        e.amend_amount_bounds(ALICE, BOB, 300_000, 600_000).unwrap();
+        assert_eq!(e.funded_total(), FIRST, "old tranche not restated");
+        assert_eq!(
+            e.fund_tranche(ALICE, 200_000, FUND_AT),
+            Err(EscrowError::AmountOutOfBounds)
+        );
+        assert_eq!(e.funded_total(), FIRST, "rejected tranche funds nothing");
+        e.fund_tranche(ALICE, 400_000, FUND_AT).unwrap();
+        assert_eq!(e.funded_total(), FIRST + 400_000);
+        // Loosening re-opens amounts the tight window refused: the
+        // live window, not the funding history, governs each call.
+        e.amend_amount_bounds(ALICE, BOB, 50_000, 950_000).unwrap();
+        e.fund_tranche(ALICE, 200_000, FUND_AT).unwrap();
+        assert_eq!(e.funded_total(), FIRST + 400_000 + 200_000);
+    }
+
+    #[test]
+    fn amend_rejects_unconfigured_inverted_state_authority_and_paused() {
+        // Fail-closed: a never-configured escrow can never acquire
+        // a window after funding, and a failed revision leaves it
+        // window-less — both the plain-fund and the plan path.
+        let mut plain = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(plain.amount_bounds(), None);
+        assert_eq!(
+            plain.amend_amount_bounds(ALICE, BOB, MIN, MAX),
+            Err(EscrowError::InvalidAmountBounds)
+        );
+        assert_eq!(plain.amount_bounds(), None);
+        let mut unwindowed_plan = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        unwindowed_plan.with_funding_plan(AMOUNT, 3).unwrap();
+        unwindowed_plan.fund_tranche(ALICE, FIRST, FUND_AT).unwrap();
+        assert_eq!(
+            unwindowed_plan.amend_amount_bounds(ALICE, BOB, MIN, MAX),
+            Err(EscrowError::InvalidAmountBounds)
+        );
+        assert_eq!(unwindowed_plan.amount_bounds(), None);
+        // An inverted window is refused and the original window
+        // survives the refused revision untouched.
+        let mut e = bounded_plan();
+        assert_eq!(
+            e.amend_amount_bounds(ALICE, BOB, MAX, MIN),
+            Err(EscrowError::InvalidAmountBounds)
+        );
+        assert_eq!(e.amount_bounds(), Some((MIN, MAX)));
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_amount_bounds(MIN, MAX)
+            .unwrap();
+        assert_eq!(
+            bare.amend_amount_bounds(ALICE, BOB, 300_000, 600_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Dual signature: one party alone cannot move the window.
+        let mut e = bounded_plan();
+        assert_eq!(
+            e.amend_amount_bounds(ALICE, ALICE, 300_000, 600_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_amount_bounds(MALLORY, BOB, 300_000, 600_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.amount_bounds(), Some((MIN, MAX)));
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's revision on a paused escrow is `Paused`.
+        let mut paused = bounded_plan();
+        paused.pause([0xDD; 32], None).unwrap();
+        assert_eq!(
+            paused.amend_amount_bounds(MALLORY, BOB, 300_000, 600_000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.amount_bounds(), Some((MIN, MAX)));
+    }
+
+    #[test]
+    fn amend_same_window_is_a_noop() {
+        // Re-affirming the current window succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = bounded_plan();
+        e.amend_amount_bounds(ALICE, BOB, MIN, MAX).unwrap();
+        assert_eq!(e.amount_bounds(), Some((MIN, MAX)));
+        assert_eq!(e.funded_total(), FIRST);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_amount_bounds_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT, [0xE0; 32], NOW)
+            .unwrap()
+            .with_amount_bounds(MIN, MAX)
+            .unwrap()
+            .with_funding_plan(AMOUNT, 3)
+            .unwrap();
+        e.fund_tranche(ALICE, FIRST, FUND_AT, NOW).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_amount_bounds(ALICE, ALICE, 300_000, 600_000, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_amount_bounds(ALICE, BOB, 300_000, 600_000, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::AmountBoundsAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same window is a no-op: no new event.
+        e.amend_amount_bounds(ALICE, BOB, 300_000, 600_000, NOW)
             .unwrap();
         assert_eq!(
             e.event_count(),

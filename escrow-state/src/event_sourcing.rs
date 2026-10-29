@@ -328,6 +328,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // reads the live deadline at the next eligibility check,
         // while a slash already settled keeps its deadline.
         | EscrowEventKind::SlashDeadlineAmended
+        // AV-268: a revised funding amount window moves no funds
+        // and never restates a funded tranche — only the window
+        // fields change, so funded_total and the funding plan's
+        // total and tranche budget are untouched, while the next
+        // fund_tranche call is judged against the live window.
+        | EscrowEventKind::AmountBoundsAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1136,6 +1142,12 @@ mod event_sourcing_tests {
         // reads the live deadline at the next eligibility check,
         // while a slash already settled keeps its deadline.
         | EscrowEventKind::SlashDeadlineAmended
+        // AV-268: a revised funding amount window moves no funds
+        // and never restates a funded tranche — only the window
+        // fields change, so funded_total and the funding plan's
+        // total and tranche budget are untouched, while the next
+        // fund_tranche call is judged against the live window.
+        | EscrowEventKind::AmountBoundsAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

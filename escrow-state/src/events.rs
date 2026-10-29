@@ -384,6 +384,17 @@
 //!   the deadline it settled under. A failed revision emits
 //!   nothing, and a no-op re-affirmation of the current
 //!   deadline emits nothing either.
+//! - `amend_amount_bounds` emits
+//!   [`EscrowEventKind::AmountBoundsAmended`] on every
+//!   successful revision that actually changes the window
+//!   (AV-268) — `from == to ==` the current state, all amounts
+//!   zero; only the window fields change, so `funded_total`,
+//!   the funding plan's total and tranche budget are untouched,
+//!   and the tranche path reads the live window at the next
+//!   `fund_tranche` call, so a new window governs the next
+//!   deposit while tranches already funded keep the window they
+//!   funded under. A failed revision emits nothing, and a no-op
+//!   re-affirmation of the current window emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -607,6 +618,7 @@
 //! | DeadmanInactivityAmended (AV-265) | 0 | 0 | 0 | 0 — revising moves no funds; the eligibility gate judges the unchanged elapsed time against the live threshold at the next `claim_deadman`, so tightening can make an already-idle escrow eligible at once while loosening can revoke an already-satisfied but unexecuted eligibility, and a claim already settled keeps the threshold it settled under |
 //! | KeeperBountyPerCrankAmended (AV-266) | 0 | 0 | 0 | 0 — revising moves no funds and never tops the pool up; the next `crank_expired` pays `min(new per_crank, pool)` from the live amount, so a closed (`0`) bounty pays `0` and an exhausted pool still pays `0`, while a crank already settled keeps the amount it settled under |
 //! | SlashDeadlineAmended (AV-267) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a settled penalty; the slash path reads the live deadline at the next eligibility check, so tightening can make an unexecuted default slashable at once while loosening can defer an already-satisfied but unexecuted eligibility, and a slash already settled keeps the deadline it settled under |
+//! | AmountBoundsAmended (AV-268) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a funded tranche; only the window fields change, so `funded_total` and the funding plan's total and tranche budget are untouched, and the tranche path reads the live window at the next `fund_tranche` call, so a new window governs the next deposit while tranches already funded keep the window they funded under |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -1990,6 +2002,22 @@ pub enum EscrowEventKind {
     /// event needs no extra field. A no-op re-affirmation of the
     /// current deadline emits nothing.
     SlashDeadlineAmended,
+    /// AV-268: the funding amount window was revised by
+    /// dual-signed governance
+    /// ([`Escrow::amend_amount_bounds`](crate::Escrow::amend_amount_bounds)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::ProtocolFeeAmended`]); all amounts are
+    /// zero — revising moves no funds and never restates a funded
+    /// tranche (only the window fields change; `funded_total`
+    /// and the funding plan's total and tranche budget are
+    /// untouched — the tranche path reads the live window at the
+    /// next `fund_tranche` call, so a new window governs the next
+    /// deposit while tranches already funded keep the window they
+    /// funded under). The new window is read from the vault, so
+    /// the event needs no extra field. A no-op re-affirmation of
+    /// the current window emits nothing.
+    AmountBoundsAmended,
 }
 
 impl EscrowEventKind {
@@ -2381,6 +2409,10 @@ impl EscrowEventKind {
             // discriminants 0–129 stay stable for already-serialized
             // histories.
             130 => Self::SlashDeadlineAmended,
+            // AV-268: appended after SlashDeadlineAmended so
+            // discriminants 0–130 stay stable for already-serialized
+            // histories.
+            131 => Self::AmountBoundsAmended,
             _ => return None,
         })
     }
@@ -2587,6 +2619,7 @@ impl EscrowEventKind {
             Self::DeadmanInactivityAmended => "deadman_inactivity_amended",
             Self::KeeperBountyPerCrankAmended => "keeper_bounty_per_crank_amended",
             Self::SlashDeadlineAmended => "slash_deadline_amended",
+            Self::AmountBoundsAmended => "amount_bounds_amended",
         }
     }
 
@@ -2797,6 +2830,7 @@ impl EscrowEventKind {
             "deadman_inactivity_amended" => Self::DeadmanInactivityAmended,
             "keeper_bounty_per_crank_amended" => Self::KeeperBountyPerCrankAmended,
             "slash_deadline_amended" => Self::SlashDeadlineAmended,
+            "amount_bounds_amended" => Self::AmountBoundsAmended,
             _ => return None,
         })
     }
@@ -4021,6 +4055,18 @@ impl IndexedEscrow {
         self.inner = self
             .inner
             .with_slash_terms(penalty_account, slash_deadline)?;
+        Ok(self)
+    }
+
+    /// Opt in to funding amount bounds (mirrors
+    /// [`Escrow::with_amount_bounds`](crate::Escrow::with_amount_bounds),
+    /// AV-134). Configuration: emits no event.
+    pub fn with_amount_bounds(
+        mut self,
+        min_amount: u64,
+        max_amount: u64,
+    ) -> Result<Self, EscrowError> {
+        self.inner = self.inner.with_amount_bounds(min_amount, max_amount)?;
         Ok(self)
     }
 
@@ -8568,6 +8614,51 @@ impl IndexedEscrow {
         if self.inner.slash_terms().map(|terms| terms.slash_deadline) != before {
             self.push_event(
                 EscrowEventKind::SlashDeadlineAmended,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// Revise the funding amount window after funding (mirrors
+    /// [`Escrow::amend_amount_bounds`]). Emits
+    /// `AmountBoundsAmended` when the window actually changes
+    /// (`from == to ==` the current state — the window, not
+    /// the lifecycle state, is what changed; all amounts zero,
+    /// since revising moves no funds and never restates a funded
+    /// tranche — only the window fields change, so `funded_total`
+    /// and the funding plan's total and tranche budget are
+    /// untouched, and the tranche path reads the live window at
+    /// the next `fund_tranche` call, so a new window governs the
+    /// next deposit while tranches already funded keep the window
+    /// they funded under). The new window is read from the vault,
+    /// so the event needs no extra field. A failed revision emits
+    /// nothing, and a no-op re-affirmation of the current window
+    /// emits nothing either, paralleling
+    /// `rotate_arbiter`'s no-op rule.
+    pub fn amend_amount_bounds(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        min_amount: u64,
+        max_amount: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let before = self.inner.amount_bounds();
+        self.inner
+            .amend_amount_bounds(initializer, taker, min_amount, max_amount)?;
+        if self.inner.amount_bounds() != before {
+            self.push_event(
+                EscrowEventKind::AmountBoundsAmended,
                 from,
                 self.inner.state(),
                 EventAmounts::none(),
@@ -13222,7 +13313,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -13341,7 +13433,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -13894,7 +13987,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -13925,7 +14019,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -13953,7 +14048,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -13981,7 +14077,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14009,7 +14106,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14040,7 +14138,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14071,7 +14170,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14099,7 +14199,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14127,7 +14228,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14155,7 +14257,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14183,7 +14286,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14211,7 +14315,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14239,7 +14344,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14271,7 +14377,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14302,7 +14409,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14333,7 +14441,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14364,7 +14473,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14395,7 +14505,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14427,7 +14538,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14459,7 +14571,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14491,7 +14604,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14522,7 +14636,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
@@ -14570,7 +14685,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
         assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
-        assert_eq!(EscrowEventKind::from_discriminant(131), None); // AV-267: 130 is SlashDeadlineAmended
+        assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(132), None); // AV-268: 131 is AmountBoundsAmended
     }
 
     #[test]
