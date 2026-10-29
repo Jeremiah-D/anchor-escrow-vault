@@ -417,6 +417,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // slot changes, so the count, threshold and timelock are
         // untouched, while the next request/approval reads the live slot.
         | EscrowEventKind::SocialRecoveryGuardianRotated
+        // AV-276: a revised settlement-mint allowlist moves no funds
+        // and never restates a settled release — only the list
+        // changes, so the bound settlement mint is untouched, while
+        // the next settled release reads the live list.
+        | EscrowEventKind::SettlementMintAllowlistUpdated
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1276,6 +1281,11 @@ mod fee_history_tests {
         // slot changes, so the count, threshold and timelock are
         // untouched, while the next request/approval reads the live slot.
         | EscrowEventKind::SocialRecoveryGuardianRotated
+        // AV-276: a revised settlement-mint allowlist moves no funds
+        // and never restates a settled release — only the list
+        // changes, so the bound settlement mint is untouched, while
+        // the next settled release reads the live list.
+        | EscrowEventKind::SettlementMintAllowlistUpdated
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

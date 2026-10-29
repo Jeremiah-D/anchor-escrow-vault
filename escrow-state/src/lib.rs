@@ -13452,6 +13452,127 @@ let fee = self.charge_protocol_fee(net_amount)?;
         self.settlement_mint_allowlist
     }
 
+    /// Revise the settlement-mint allowlist after funding (AV-276):
+    /// the post-funding counterpart to
+    /// [`Escrow::with_settlement_mint_allowlist`] (`Uninitialized`-only
+    /// initial configuration). A deal's settlement currencies may
+    /// need to change mid-deal — a mint may be delisted, or a new
+    /// stablecoin adopted — without cancelling and re-locking the
+    /// escrow.
+    ///
+    /// Governance mirrors [`Escrow::update_payout_allowlist`]: on a
+    /// dual-sig escrow ([`Escrow::with_dual_sig`]) *both* parties
+    /// must sign — one party alone cannot unilaterally reshape
+    /// which currencies the other's share may settle in; on a plain
+    /// escrow the initializer alone authorizes. Valid on `Funded`
+    /// only (the builder owns the initial set, and terminal states
+    /// have no future settled release left to gate). Check order is
+    /// pause, then authority, then the governance-delay routing
+    /// gate, then state, then the list validity — the AV-46 /
+    /// AV-49 convention. Replaces the whole list, or clears it back
+    /// to `None` (no restriction) when `mints` is empty — the
+    /// AV-157 empty-list convention, mirroring
+    /// [`Escrow::with_settlement_mint_allowlist`]. A non-empty list
+    /// is validated by [`SettlementMintAllowlist::new`]: more than
+    /// [`MAX_SETTLEMENT_MINT_ALLOWLIST`] entries, a zero address,
+    /// or a duplicate are all
+    /// [`EscrowError::InvalidSettlementMintAllowlist`], and a failed
+    /// revision leaves the original list untouched.
+    ///
+    /// Allowlist rules, not scalar rules: under governance the list
+    /// may be set, replaced, or cleared alike — no
+    /// "already configured" gate (unlike the scalar amends, where
+    /// post-funding installation would add a term the taker never
+    /// funded under). An escrow that never configured a list may
+    /// set its first one here; the bound settlement mint is never
+    /// checked against the list (the release-time gate stays the
+    /// single enforcement point, as on the builder — a list that
+    /// excludes the bound mint simply means no settled release can
+    /// pass until the list is revised again).
+    ///
+    /// Only `settlement_mint_allowlist` changes — the bound
+    /// `settlement_mint` and any settled release already made are
+    /// untouched, and plain `release` is unaffected (no conversion,
+    /// no settlement mint to gate). The new list governs from the
+    /// next [`Escrow::release_with_settlement_rate`]: that path
+    /// reads the live list before rate verification and conversion
+    /// pricing, so a mint removed here is refused at once while a
+    /// mint added here settles from the next quote. Revising to
+    /// the current list is a no-op: it succeeds and writes
+    /// nothing, so the event layer emits nothing for it
+    /// (paralleling `rotate_arbiter`). Orthogonal to
+    /// [`Escrow::with_settlement_mint_allowlist`] (that is the
+    /// initial configuration, this item is the post-funding
+    /// revision), to AV-218 (that is the allowlist mechanism
+    /// itself, this item is the list's revision), and to
+    /// [`Escrow::update_payout_allowlist`] / [`Escrow::update_cpi_allowlist`]
+    /// (those are the taker-payout and CPI-target allowlists, this
+    /// item is the settlement-currency allowlist). Emits
+    /// `SettlementMintAllowlistUpdated` on the event layer,
+    /// except for the no-op re-affirmation.
+    pub fn update_settlement_mint_allowlist(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        mints: &[[u8; 32]],
+    ) -> Result<(), EscrowError> {
+        // AV-158: the direct entry always takes `via_delayed = false`
+        // — on a delay-opted-in escrow the allowlist moves only
+        // through the propose/execute protocol. Thin by design: one
+        // allowlist implementation, zero gate drift (see
+        // `update_quorum_impl`).
+        self.update_settlement_mint_allowlist_impl(initializer, taker, mints, false)
+    }
+
+    /// The shared settlement-mint-allowlist engine behind
+    /// [`Escrow::update_settlement_mint_allowlist`] (AV-276). Same
+    /// guard chain and clear-on-empty semantics as the direct call;
+    /// `via_delayed` is `true` only when the AV-158 two-step
+    /// protocol drives the call after the delay elapsed.
+    fn update_settlement_mint_allowlist_impl(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        mints: &[[u8; 32]],
+        via_delayed: bool,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        if self.dual_sig_required() {
+            // Both parties must sign: either key alone (or a stranger)
+            // is Unauthorized — paralleling `update_quorum`'s
+            // dual-signature governance.
+            if initializer != self.initializer || taker != self.taker {
+                return Err(EscrowError::Unauthorized);
+            }
+        } else if initializer != self.initializer {
+            return Err(EscrowError::Unauthorized);
+        }
+        // AV-158: the governance-delay routing gate — on a
+        // delay-opted-in escrow the allowlist moves only through the
+        // two-step propose/execute protocol, never a direct call
+        // (see `update_quorum_impl` for the placement rationale).
+        if !via_delayed && self.governance_delay_secs != 0 {
+            return Err(EscrowError::GovernanceActionNotProposed);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let next = if mints.is_empty() {
+            None
+        } else {
+            Some(SettlementMintAllowlist::new(mints)?)
+        };
+        // No-op: re-affirming the current list writes nothing, so
+        // the event layer emits nothing for it.
+        if next == self.settlement_mint_allowlist {
+            return Ok(());
+        }
+        self.settlement_mint_allowlist = next;
+        Ok(())
+    }
+
     /// Opt in to partial funding (AV-220 — Solana / payment
     /// fintech: installment deposits toward the declared amount).
     /// Builder-style: only valid on an `Uninitialized` escrow, like
@@ -48425,7 +48546,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
-        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
     }
 
     #[test]
@@ -65445,7 +65567,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(136), Some(EscrowEventKind::FeeCapAmended)); // AV-273: 136 is FeeCapAmended
         assert_eq!(EscrowEventKind::from_discriminant(137), Some(EscrowEventKind::SlashLadderPenaltyAccountRotated)); // AV-274: 137 is SlashLadderPenaltyAccountRotated
         assert_eq!(EscrowEventKind::from_discriminant(138), Some(EscrowEventKind::SocialRecoveryGuardianRotated)); // AV-275: 138 is SocialRecoveryGuardianRotated
-        assert_eq!(EscrowEventKind::from_discriminant(139), None); // AV-275: 138 is SocialRecoveryGuardianRotated
+        assert_eq!(EscrowEventKind::from_discriminant(139), Some(EscrowEventKind::SettlementMintAllowlistUpdated)); // AV-276: 139 is SettlementMintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(140), None); // AV-276: 139 is SettlementMintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -65666,9 +65789,10 @@ mod event_history_tests {
         // `SlashPenaltyAccountRotated` (AV-272), 136 is
         // `FeeCapAmended` (AV-273), 137 is
         // `SlashLadderPenaltyAccountRotated` (AV-274), 138 is
-        // `SocialRecoveryGuardianRotated` (AV-275) and 139 is the
+        // `SocialRecoveryGuardianRotated` (AV-275), 139 is
+        // `SettlementMintAllowlistUpdated` (AV-276) and 140 is the
         // first still-unknown byte.
-        for bad in [139u8, 255] {
+        for bad in [140u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -77993,6 +78117,283 @@ mod rotate_social_recovery_guardian_tests {
         e.rotate_social_recovery_guardian(ALICE, BOB, G4, G4, NOW)
             .unwrap();
         assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+}
+
+mod update_settlement_mint_allowlist_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+    use crate::settlement_allowlist::require_settlement_mint_allowlisted;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const M1: [u8; 32] = [0x11; 32];
+    const M2: [u8; 32] = [0x22; 32];
+    const M3: [u8; 32] = [0x33; 32];
+    const M4: [u8; 32] = [0x44; 32];
+    const M5: [u8; 32] = [0x55; 32];
+    const M6: [u8; 32] = [0x66; 32];
+    const M7: [u8; 32] = [0x77; 32];
+    const M8: [u8; 32] = [0x88; 32];
+    const M9: [u8; 32] = [0x99; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_settlement_mint(M1)
+            .unwrap()
+            .with_settlement_mint_allowlist(&[M1, M2])
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn dual_sig_configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_settlement_mint_allowlist(&[M1, M2])
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn update_replaces_list_and_bound_mint_untouched() {
+        // Only the allowlist moves: the bound settlement mint, the
+        // state, and the encoded length are untouched — the list
+        // region is already resident, so the revision rewrites it
+        // in place with no layout change.
+        let mut e = configured();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.update_settlement_mint_allowlist(ALICE, BOB, &[M3])
+            .unwrap();
+        assert_eq!(
+            e.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M3],
+            "list replaced"
+        );
+        assert_eq!(e.settlement_mint(), Some(M1), "bound mint untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "list region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn update_clears_on_empty_and_sets_first_list_on_unconfigured() {
+        // Empty clears back to None (the AV-157 convention).
+        let mut e = configured();
+        e.update_settlement_mint_allowlist(ALICE, BOB, &[]).unwrap();
+        assert!(e.settlement_mint_allowlist().is_none());
+        // Allowlist rules, not scalar rules: an escrow that never
+        // configured a list may set its first one here — no
+        // "already configured" gate — and clearing an already
+        // empty list is a no-op success.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        plain.fund(ALICE, NOW).unwrap();
+        plain
+            .update_settlement_mint_allowlist(ALICE, BOB, &[M1])
+            .unwrap();
+        assert_eq!(
+            plain.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M1]
+        );
+        let mut never = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap();
+        never.fund(ALICE, NOW).unwrap();
+        never
+            .update_settlement_mint_allowlist(ALICE, BOB, &[])
+            .unwrap();
+        assert!(never.settlement_mint_allowlist().is_none());
+    }
+
+    #[test]
+    fn update_rejects_invalid_lists_and_preserves_original() {
+        // The `SettlementMintAllowlist::new` gate, unchanged: more
+        // than 8 entries, a zero address, or a duplicate are all
+        // refused, and a failed revision never writes.
+        let mut e = configured();
+        assert_eq!(
+            e.update_settlement_mint_allowlist(
+                ALICE,
+                BOB,
+                &[M1, M2, M3, M4, M5, M6, M7, M8, M9]
+            ),
+            Err(EscrowError::InvalidSettlementMintAllowlist)
+        );
+        assert_eq!(
+            e.update_settlement_mint_allowlist(ALICE, BOB, &[M3, [0u8; 32]]),
+            Err(EscrowError::InvalidSettlementMintAllowlist)
+        );
+        assert_eq!(
+            e.update_settlement_mint_allowlist(ALICE, BOB, &[M3, M3]),
+            Err(EscrowError::InvalidSettlementMintAllowlist)
+        );
+        assert_eq!(
+            e.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M1, M2],
+            "original list untouched by failed revisions"
+        );
+    }
+
+    #[test]
+    fn update_rejects_wrong_state_authority_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_settlement_mint_allowlist(&[M1, M2])
+            .unwrap();
+        assert_eq!(
+            bare.update_settlement_mint_allowlist(ALICE, BOB, &[M3]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            bare.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M1, M2]
+        );
+        // Dual-sig escrow: one party alone, or a stranger, is
+        // Unauthorized — paralleling `update_payout_allowlist`.
+        let mut dual = dual_sig_configured();
+        assert_eq!(
+            dual.update_settlement_mint_allowlist(ALICE, ALICE, &[M3]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            dual.update_settlement_mint_allowlist(MALLORY, BOB, &[M3]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            dual.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M1, M2]
+        );
+        // Plain escrow: the initializer alone authorizes — the taker
+        // argument is not consulted when dual-sig is off.
+        let mut plain = configured();
+        plain
+            .update_settlement_mint_allowlist(ALICE, MALLORY, &[M3])
+            .unwrap();
+        assert_eq!(
+            plain.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M3]
+        );
+        assert_eq!(
+            plain.update_settlement_mint_allowlist(MALLORY, BOB, &[M4]),
+            Err(EscrowError::Unauthorized)
+        );
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's revision on a paused escrow is `Paused`.
+        let mut paused = configured();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.update_settlement_mint_allowlist(MALLORY, BOB, &[M3]),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M1, M2]
+        );
+    }
+
+    #[test]
+    fn update_refuses_direct_call_on_delay_opted_in() {
+        // AV-158 routing: on a delay-opted-in escrow the direct call
+        // is refused — the allowlist moves only through the
+        // propose/execute protocol, never a direct call.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap()
+            .with_settlement_mint_allowlist(&[M1, M2])
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            e.update_settlement_mint_allowlist(ALICE, BOB, &[M3]),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(
+            e.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M1, M2]
+        );
+    }
+
+    #[test]
+    fn update_same_list_is_a_noop() {
+        // Re-affirming the current list succeeds but changes nothing
+        // observable; the event layer (tested below) emits nothing.
+        let mut e = configured();
+        e.update_settlement_mint_allowlist(ALICE, BOB, &[M1, M2])
+            .unwrap();
+        assert_eq!(
+            e.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M1, M2]
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn update_governs_next_settled_release_gate() {
+        // The settled-release path reads the live list before rate
+        // verification: a mint removed here is refused at once,
+        // while a mint added here passes the same gate.
+        let mut e = configured();
+        e.update_settlement_mint_allowlist(ALICE, BOB, &[M3])
+            .unwrap();
+        let live = e.settlement_mint_allowlist();
+        assert_eq!(
+            require_settlement_mint_allowlisted(live.as_ref(), &M1),
+            Err(EscrowError::SettlementMintNotAllowlisted)
+        );
+        require_settlement_mint_allowlisted(live.as_ref(), &M3).unwrap();
+    }
+
+    #[test]
+    fn update_indexed_emits_event_noop_and_failed_emit_nothing() {
+        let mut e = IndexedEscrow::wrap([0xE0; 32], configured());
+        let before = e.event_count();
+        assert_eq!(
+            e.update_settlement_mint_allowlist(MALLORY, BOB, &[M3], NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.update_settlement_mint_allowlist(ALICE, BOB, &[M3], NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::SettlementMintAllowlistUpdated);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same list is a no-op: no new event.
+        e.update_settlement_mint_allowlist(ALICE, BOB, &[M3], NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        // Clearing is a real change: it emits again.
+        e.update_settlement_mint_allowlist(ALICE, BOB, &[], NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 2);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::SettlementMintAllowlistUpdated);
     }
 }
 
