@@ -1330,14 +1330,14 @@ fn idl_errors_pin_enum() {
             // AV-194 with 282-285; AV-195 with 286-292; AV-196 with
             // 293-298; AV-197 with 299-303; AV-200 with 313; AV-201
             // with 314; AV-203 with 315; AV-205 with 316; AV-207 with
-            // 317; AV-208 with 318; AV-209 with 319-322; AV-210 with 323-328; AV-211 with 329-332; AV-212 with 333-338; AV-214 with 339-344; AV-215 with 345; AV-217 with 346-348; AV-218 with 349-350; AV-220 with 351; AV-222 with 352; AV-223 with 353-354; AV-225 with 355; AV-228 with 356; AV-266 with 357 (never renumbered; each extension
+            // 317; AV-208 with 318; AV-209 with 319-322; AV-210 with 323-328; AV-211 with 329-332; AV-212 with 333-338; AV-214 with 339-344; AV-215 with 345; AV-217 with 346-348; AV-218 with 349-350; AV-220 with 351; AV-222 with 352; AV-223 with 353-354; AV-225 with 355; AV-228 with 356; AV-266 with 357; AV-284 with 358 (never renumbered; each extension
             // widens this bound).
-            (100..358).contains(&e.code()),
+            (100..359).contains(&e.code()),
             "error code out of pinned range: {name} = {}",
             e.code()
         );
     }
-    assert_eq!(errors.len(), 249, "error variant count drift"); // AV-223: +2 chain-link errors; AV-225: +1 claim-expiry error; AV-228: +1 funding-window error; AV-266: +1 keeper-bounty error
+    assert_eq!(errors.len(), 250, "error variant count drift"); // AV-223: +2 chain-link errors; AV-225: +1 claim-expiry error; AV-228: +1 funding-window error; AV-266: +1 keeper-bounty error; AV-284: +1 collection-allowlist error
     // Spot-pin the code table ends so a renumber breaks loudly.
     assert_eq!(EscrowError::Unauthorized.code(), 100);
     assert_eq!(EscrowError::CpiExecutionFailed.code(), 121);

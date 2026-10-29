@@ -4617,6 +4617,12 @@ pub enum EscrowError {
     /// future payouts). Never renumbered (see
     /// [`EscrowError::code`]).
     InvalidKeeperBounty,
+    /// AV-284: [`NftEscrow::update_collection_allowlist`] with more
+    /// than [`MAX_COLLECTION_ALLOWLIST`] distinct collections — the
+    /// revision is refused fail-closed and the original collection
+    /// gate is left untouched. Never renumbered (see
+    /// [`EscrowError::code`]).
+    InvalidCollectionAllowlist,
 }
 
 impl EscrowError {
@@ -5028,6 +5034,8 @@ impl EscrowError {
             EscrowError::FundingNotStarted => 356,
             // AV-266: appended, never renumbered.
             EscrowError::InvalidKeeperBounty => 357,
+            // AV-284: appended, never renumbered.
+            EscrowError::InvalidCollectionAllowlist => 358,
         }
     }
 
@@ -5421,6 +5429,8 @@ impl EscrowError {
             EscrowError::FundingNotStarted,
             // AV-266: appended, never renumbered.
             EscrowError::InvalidKeeperBounty,
+            // AV-284: appended, never renumbered.
+            EscrowError::InvalidCollectionAllowlist,
         ]
     }
 }
@@ -41825,6 +41835,12 @@ mod error_code_tests {
             357,
             "amend_keeper_bounty_per_crank on an escrow with keeper_bounty_per_crank == 0 — no bounty was ever configured, so there is nothing to revise (AV-266)",
         ),
+        // AV-284: appended, never renumbered.
+        (
+            EscrowError::InvalidCollectionAllowlist,
+            358,
+            "update_collection_allowlist with more than MAX_COLLECTION_ALLOWLIST distinct collections — the revision is refused and the original collection gate is untouched (AV-284)",
+        ),
     ];
 
     #[test]
@@ -70274,7 +70290,7 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceStale));
         assert_eq!(EscrowError::OraclePriceUnreliable.code(), 281);
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceUnreliable));
-        assert_eq!(EscrowError::all().len(), 249); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1
+        assert_eq!(EscrowError::all().len(), 250); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1; AV-284: +1
     }
 
     #[test]

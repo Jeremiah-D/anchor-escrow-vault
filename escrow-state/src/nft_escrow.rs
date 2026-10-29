@@ -297,6 +297,89 @@ impl NftEscrow {
         Ok(NFT_PIECE_AMOUNT)
     }
 
+    /// The collection gate, if one is installed (`None` = ungated).
+    pub fn collection_gate(&self) -> Option<CollectionAllowlist> {
+        self.collection_gate
+    }
+
+    /// Revise the collection allowlist on a `Created` escrow
+    /// (AV-284 — Solana NFT-escrow risk control): the initializer
+    /// alone authorizes the change (the single-party authority
+    /// precedent of `release`/`cancel` — `NftEscrow` has no taker
+    /// dual-signature). Check order is authority → state, mirroring
+    /// `release`/`cancel`, so a stranger learns nothing about the
+    /// gate from the error alone.
+    ///
+    /// Why: the gate is fixed at build time
+    /// ([`NftEscrow::with_collection_allowlist`]), but a collection
+    /// can be compromised, delisted, or newly verified — a gate that
+    /// cannot be revised would either strand the piece behind a dead
+    /// collection or force a fresh escrow (and a fresh custody
+    /// transfer) for a legitimate new collection. Only a `Created`
+    /// escrow may revise: a `Released`/`Cancelled` escrow is
+    /// terminal, so revising it could never govern a future release.
+    ///
+    /// An empty list clears the gate back to `None` (the AV-157 /
+    /// AV-276 empty-clears precedent): after clearing, release no
+    /// longer checks collections at all. A non-empty list is built
+    /// with [`CollectionAllowlist::new`] + `add` per entry, reusing
+    /// the build-time path exactly — duplicates collapse
+    /// idempotently, and more than [`MAX_COLLECTION_ALLOWLIST`]
+    /// distinct collections fail closed with
+    /// [`EscrowError::InvalidCollectionAllowlist`] (code 358),
+    /// leaving the original gate untouched, because the new table
+    /// is validated before any write. Set equality is
+    /// order-independent (`contains` membership, not slot order):
+    /// re-affirming the current set in any order is a no-op that
+    /// writes nothing, and clearing an already-ungated escrow is
+    /// likewise a no-op. Only `collection_gate` changes — the
+    /// mint, the observed collection, and the state are untouched —
+    /// and `cancel` stays ungated throughout (the standing
+    /// invariant that gating must never trap the piece). The new
+    /// table governs from the next `release`, which reads the live
+    /// gate; a release already executed is unaffected. There is no
+    /// event layer on `NftEscrow`, so no event is emitted for the
+    /// revision or its no-op. Orthogonal to
+    /// [`NftEscrow::with_collection_allowlist`] (that installs the
+    /// gate at build time, this revises it while `Created`) and to
+    /// AV-276 (that is the fungible settlement-mint allowlist,
+    /// this is the NFT collection allowlist).
+    pub fn update_collection_allowlist(
+        &mut self,
+        authority: [u8; 32],
+        collections: &[[u8; 32]],
+    ) -> Result<(), EscrowError> {
+        if authority != self.initializer {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != NftEscrowState::Created {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        if collections.is_empty() {
+            // Empty clears back to ungated; already-ungated is a no-op.
+            self.collection_gate = None;
+            return Ok(());
+        }
+        // Build first: over-capacity fails closed, original gate intact.
+        let mut built = CollectionAllowlist::new();
+        for c in collections {
+            if !built.add(*c) {
+                return Err(EscrowError::InvalidCollectionAllowlist);
+            }
+        }
+        // Set-equality no-op (order-independent): re-affirming the
+        // current set writes nothing.
+        if let Some(gate) = &self.collection_gate {
+            if gate.len() == built.len()
+                && collections.iter().all(|c| gate.contains(c))
+            {
+                return Ok(());
+            }
+        }
+        self.collection_gate = Some(built);
+        Ok(())
+    }
+
     /// Cancel the escrow before release. Check order: authority →
     /// state. The collection gate never blocks a cancel — gating must
     /// never trap the piece.
@@ -533,13 +616,160 @@ mod tests {
         // per variant and off-chain clients match on these numbers.
         assert_eq!(EscrowError::InvalidNftMint.code(), 256);
         assert_eq!(EscrowError::CollectionNotAllowlisted.code(), 257);
+        assert_eq!(EscrowError::InvalidCollectionAllowlist.code(), 358);
         for e in [
             EscrowError::InvalidNftMint,
             EscrowError::CollectionNotAllowlisted,
+            EscrowError::InvalidCollectionAllowlist,
         ] {
             assert!(EscrowError::all().contains(&e));
         }
         // Count covers the whole table; AV-190 bumps it to 171.
-        assert_eq!(EscrowError::all().len(), 249); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1
+        assert_eq!(EscrowError::all().len(), 250); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1; AV-284: +1
+    }
+
+    #[test]
+    fn revised_gate_governs_next_release() {
+        // Gated on CC: revise to DD and the CC piece can no longer
+        // release; revise back to CC and it releases.
+        let mut gate = CollectionAllowlist::new();
+        gate.add([0xCC; 32]);
+        let mut e = NftEscrow::new(alice(), &nft_desc())
+            .unwrap()
+            .with_collection_allowlist(gate);
+        e.update_collection_allowlist(alice(), &[[0xDD; 32]])
+            .unwrap();
+        assert_eq!(
+            e.release(alice()).unwrap_err(),
+            EscrowError::CollectionNotAllowlisted
+        );
+        e.update_collection_allowlist(alice(), &[[0xCC; 32]])
+            .unwrap();
+        e.release(alice()).unwrap();
+        assert_eq!(e.state(), NftEscrowState::Released);
+    }
+
+    #[test]
+    fn revision_can_install_a_gate_on_ungated_escrow() {
+        // Ungated escrows release freely; installing a gate that
+        // excludes the observed collection blocks the next release.
+        let mut e = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        assert_eq!(e.collection_gate(), None);
+        e.update_collection_allowlist(alice(), &[[0xDD; 32]])
+            .unwrap();
+        assert_eq!(
+            e.release(alice()).unwrap_err(),
+            EscrowError::CollectionNotAllowlisted
+        );
+    }
+
+    #[test]
+    fn revision_empty_clears_gate() {
+        let mut gate = CollectionAllowlist::new();
+        gate.add([0xDD; 32]);
+        let mut e = NftEscrow::new(alice(), &nft_desc())
+            .unwrap()
+            .with_collection_allowlist(gate);
+        assert_eq!(
+            e.release(alice()).unwrap_err(),
+            EscrowError::CollectionNotAllowlisted
+        );
+        e.update_collection_allowlist(alice(), &[]).unwrap();
+        assert_eq!(e.collection_gate(), None);
+        e.release(alice()).unwrap();
+    }
+
+    #[test]
+    fn revision_rejects_stranger_and_terminal_states() {
+        let mut gate = CollectionAllowlist::new();
+        gate.add([0xCC; 32]);
+        let mut e = NftEscrow::new(alice(), &nft_desc())
+            .unwrap()
+            .with_collection_allowlist(gate);
+        // Authority before state: a stranger on a terminal escrow
+        // still gets Unauthorized, not a state error.
+        assert_eq!(
+            e.update_collection_allowlist(bob(), &[[0xDD; 32]])
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        e.release(alice()).unwrap();
+        assert_eq!(
+            e.update_collection_allowlist(bob(), &[[0xDD; 32]])
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(
+            e.update_collection_allowlist(alice(), &[[0xDD; 32]])
+                .unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        let mut c = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        c.cancel(alice()).unwrap();
+        assert_eq!(
+            c.update_collection_allowlist(alice(), &[[0xDD; 32]])
+                .unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+    }
+
+    #[test]
+    fn revision_over_capacity_fails_closed() {
+        // Nine distinct collections exceed MAX (8): the error is the
+        // new code 358 and the original gate is untouched.
+        let mut gate = CollectionAllowlist::new();
+        gate.add([0xCC; 32]);
+        let mut e = NftEscrow::new(alice(), &nft_desc())
+            .unwrap()
+            .with_collection_allowlist(gate);
+        let mut over: [[u8; 32]; 9] = [[0u8; 32]; 9];
+        for (i, slot) in over.iter_mut().enumerate() {
+            *slot = [i as u8 + 1; 32];
+        }
+        let err = e
+            .update_collection_allowlist(alice(), &over)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidCollectionAllowlist);
+        assert_eq!(err.code(), 358);
+        // Original gate intact: the CC piece still releases.
+        e.release(alice()).unwrap();
+    }
+
+    #[test]
+    fn revision_same_set_in_any_order_is_noop() {
+        let mut gate = CollectionAllowlist::new();
+        gate.add([0xCC; 32]);
+        gate.add([0xDD; 32]);
+        let mut e = NftEscrow::new(alice(), &nft_desc())
+            .unwrap()
+            .with_collection_allowlist(gate);
+        // Reordered re-affirmation: succeeds, gate unchanged, and
+        // duplicates in the input collapse idempotently.
+        e.update_collection_allowlist(alice(), &[[0xDD; 32], [0xCC; 32], [0xCC; 32]])
+            .unwrap();
+        assert_eq!(e.collection_gate(), Some(gate));
+        e.release(alice()).unwrap();
+        // Clearing an already-ungated escrow is also a no-op.
+        let mut u = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        u.update_collection_allowlist(alice(), &[]).unwrap();
+        assert_eq!(u.collection_gate(), None);
+    }
+
+    #[test]
+    fn revision_changes_only_the_gate() {
+        let mut gate = CollectionAllowlist::new();
+        gate.add([0xCC; 32]);
+        let mut e = NftEscrow::new(alice(), &nft_desc())
+            .unwrap()
+            .with_collection_allowlist(gate);
+        e.update_collection_allowlist(alice(), &[[0xDD; 32], [0xEE; 32]])
+            .unwrap();
+        assert_eq!(e.mint(), [0x11; 32]);
+        assert_eq!(e.collection(), Some([0xCC; 32]));
+        assert_eq!(e.state(), NftEscrowState::Created);
+        assert_eq!(e.initializer(), alice());
+        // Cancel stays ungated after a revision.
+        e.cancel(alice()).unwrap();
+        assert_eq!(e.state(), NftEscrowState::Cancelled);
     }
 }

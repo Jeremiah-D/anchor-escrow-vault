@@ -7398,9 +7398,23 @@ audit-JSON vocabulary, none of the amount machinery).
   trap the piece.
 - **Check order** is authority → state → collection gate, so a
   stranger learns nothing about the escrow's state or its collection.
+- **Revising the gate (AV-284)**: `update_collection_allowlist`
+  revises the collection gate on a `Created` escrow, authorized by
+  the initializer alone (the single-party precedent of
+  `release`/`cancel` — there is no taker dual-signature on
+  `NftEscrow`). An empty list clears the gate back to ungated; a
+  non-empty list is rebuilt through the same `new` + `add` path as
+  build time, and more than 8 distinct collections fail closed
+  (`InvalidCollectionAllowlist`, code 358) with the original gate
+  untouched. Re-affirming the current set in any order is a no-op,
+  only the gate changes (mint, observed collection, and state are
+  untouched), `cancel` stays ungated, and the new table governs
+  from the next `release`. No event is emitted — `NftEscrow` has no
+  event layer.
 
 New error codes (never renumbered): `InvalidNftMint` (256),
-`CollectionNotAllowlisted` (257). Pure logic: no Vault layout change,
+`CollectionNotAllowlisted` (257), `InvalidCollectionAllowlist`
+(358). Pure logic: no Vault layout change,
 no `VAULT_SPACE` bump (the layout pin tests still hold). (Solana: NFT
 custody.)
 
