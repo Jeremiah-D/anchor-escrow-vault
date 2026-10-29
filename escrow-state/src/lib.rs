@@ -4608,6 +4608,15 @@ pub enum EscrowError {
     /// with no window (`funding_start == 0`) never reports this
     /// error. Never renumbered (see [`EscrowError::code`]).
     FundingNotStarted,
+    /// AV-266: [`Escrow::amend_keeper_bounty_per_crank`] on an
+    /// escrow whose keeper bounty was never configured
+    /// (`keeper_bounty_per_crank == 0`) — post-funding
+    /// installation of a bounty the taker never funded under is
+    /// refused fail-closed; only an already-configured per-crank
+    /// amount may be revised (including to `0`, which closes
+    /// future payouts). Never renumbered (see
+    /// [`EscrowError::code`]).
+    InvalidKeeperBounty,
 }
 
 impl EscrowError {
@@ -5017,6 +5026,8 @@ impl EscrowError {
             EscrowError::MilestoneClaimExpired => 355,
             // AV-228: appended, never renumbered.
             EscrowError::FundingNotStarted => 356,
+            // AV-266: appended, never renumbered.
+            EscrowError::InvalidKeeperBounty => 357,
         }
     }
 
@@ -5408,6 +5419,8 @@ impl EscrowError {
             EscrowError::MilestoneClaimExpired,
             // AV-228: appended, never renumbered.
             EscrowError::FundingNotStarted,
+            // AV-266: appended, never renumbered.
+            EscrowError::InvalidKeeperBounty,
         ]
     }
 }
@@ -19420,6 +19433,91 @@ let fee = self.charge_protocol_fee(claimable)?;
             return Ok(());
         }
         self.deadman_inactivity_secs = inactivity_secs;
+        Ok(())
+    }
+
+    /// Revise the keeper-bounty per-crank amount after funding
+    /// (AV-266): the post-funding counterpart to the per-crank
+    /// leg of [`Escrow::with_keeper_bounty`] (`Uninitialized`-only
+    /// initial configuration). Dual-signed governance, `Funded`-only,
+    /// pause first — paralleling
+    /// [`Escrow::amend_deadman_inactivity`]. Only an escrow whose
+    /// bounty is already configured — `keeper_bounty_per_crank` is
+    /// non-zero — may revise its per-crank amount: an escrow with
+    /// a zero per-crank amount is refused with
+    /// [`EscrowError::InvalidKeeperBounty`] (code 357)
+    /// (fail-closed — post-funding installation would add a
+    /// bounty the taker never funded under, so it is not a
+    /// revision, it is a new deal; this also covers the
+    /// `with_keeper_bounty(pool, 0)` shape, where a pool exists
+    /// but payouts were deliberately disabled). A zero
+    /// `per_crank` is a legal revision — it closes future bounty
+    /// payouts (the `with_keeper_bounty` 0-means-no-bounty
+    /// semantics, unchanged). Closing is final through this
+    /// path: the configured-ness gate reads the *current*
+    /// per-crank amount, so once closed to `0` the escrow reads
+    /// as unconfigured and a later revision back to a non-zero
+    /// amount is refused with the same fail-closed error —
+    /// reopening would be a new bounty installation, not a
+    /// revision, and this path never installs. Revising
+    /// to the current per-crank amount is a no-op: it succeeds
+    /// and writes nothing, so the event layer emits nothing for
+    /// it (paralleling `rotate_arbiter`'s no-op rule). Only
+    /// `keeper_bounty_per_crank` changes — `keeper_bounty_pool`
+    /// is untouched, and bounty already paid is untouched too:
+    /// the pool is a consumable balance (each successful
+    /// [`Escrow::crank_expired`] debits exactly what it paid),
+    /// so a revision never tops the pool up, and a pool already
+    /// exhausted stays exhausted — `payable` is still `0` after
+    /// any revision, the revision itself never revives the
+    /// bounty. The new amount governs from the next
+    /// [`Escrow::crank_expired`]: [`Escrow::keeper_bounty_payable`]
+    /// reads the live per-crank amount at payment time
+    /// (`min(per_crank, pool)`), so raising the amount raises
+    /// the next payout up to the pool, lowering it lowers the
+    /// next payout, and closing it to `0` pays `0` on the next
+    /// crank while the pool sits untouched. A crank already
+    /// settled keeps the amount it settled under, since the
+    /// crank is terminal. Revising moves no funds, so no AV-36
+    /// reentrancy lock is needed (the lock only guards the
+    /// fund-moving paths, the `rotate_arbiter` precedent).
+    /// Orthogonal to AV-124 (that is the bounty mechanism
+    /// itself, this item is its per-crank amount) and to AV-48
+    /// (that is `crank_expired` itself, this item is the
+    /// amount). Emits `KeeperBountyPerCrankAmended` on the event
+    /// layer, except for the no-op re-affirmation.
+    pub fn amend_keeper_bounty_per_crank(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        per_crank: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_deadman_inactivity`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow with a non-zero per-crank
+        // amount may revise it — post-funding installation would
+        // add a bounty the taker never funded under. Checked
+        // before the no-op gate so a zero-per-crank escrow can
+        // never acquire a bounty through this path, whatever the
+        // proposed amount.
+        if self.keeper_bounty_per_crank == 0 {
+            return Err(EscrowError::InvalidKeeperBounty);
+        }
+        // No-op: re-affirming the current amount writes nothing,
+        // so the event layer emits nothing for it.
+        if per_crank == self.keeper_bounty_per_crank {
+            return Ok(());
+        }
+        self.keeper_bounty_per_crank = per_crank;
         Ok(())
     }
 
@@ -39930,6 +40028,12 @@ mod error_code_tests {
             356,
             "fund or fund_with_slot while now < funding_start — the funding start window has not opened yet (AV-228)",
         ),
+        // AV-266: appended, never renumbered.
+        (
+            EscrowError::InvalidKeeperBounty,
+            357,
+            "amend_keeper_bounty_per_crank on an escrow with keeper_bounty_per_crank == 0 — no bounty was ever configured, so there is nothing to revise (AV-266)",
+        ),
     ];
 
     #[test]
@@ -47461,7 +47565,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
+        assert_eq!(EscrowEventKind::from_discriminant(130), None); // AV-266: 129 is KeeperBountyPerCrankAmended
     }
 
     #[test]
@@ -53021,6 +53126,14 @@ mod milestone_tests {
     fn funding_start_error_code_is_pinned() {
         assert_eq!(EscrowError::FundingNotStarted.code(), 356);
         assert!(EscrowError::all().contains(&EscrowError::FundingNotStarted));
+    }
+
+    // ----- AV-266: keeper bounty per-crank amendment -----
+
+    #[test]
+    fn keeper_bounty_error_code_is_pinned() {
+        assert_eq!(EscrowError::InvalidKeeperBounty.code(), 357);
+        assert!(EscrowError::all().contains(&EscrowError::InvalidKeeperBounty));
     }
 
     #[test]
@@ -64463,7 +64576,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(126), Some(EscrowEventKind::DualControlCheckerRotated)); // AV-263: 126 is DualControlCheckerRotated
         assert_eq!(EscrowEventKind::from_discriminant(127), Some(EscrowEventKind::CredentialIssuerRotated)); // AV-264: 127 is CredentialIssuerRotated
         assert_eq!(EscrowEventKind::from_discriminant(128), Some(EscrowEventKind::DeadmanInactivityAmended)); // AV-265: 128 is DeadmanInactivityAmended
-        assert_eq!(EscrowEventKind::from_discriminant(129), None); // AV-265: 128 is DeadmanInactivityAmended
+        assert_eq!(EscrowEventKind::from_discriminant(129), Some(EscrowEventKind::KeeperBountyPerCrankAmended)); // AV-266: 129 is KeeperBountyPerCrankAmended
+        assert_eq!(EscrowEventKind::from_discriminant(130), None); // AV-266: 129 is KeeperBountyPerCrankAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -64674,9 +64788,10 @@ mod event_history_tests {
         // `TwapGateAmended` (AV-262), 126 is
         // `DualControlCheckerRotated` (AV-263), 127 is
         // `CredentialIssuerRotated` (AV-264), 128 is
-        // `DeadmanInactivityAmended` (AV-265) and 129 is the
+        // `DeadmanInactivityAmended` (AV-265), 129 is
+        // `KeeperBountyPerCrankAmended` (AV-266) and 130 is the
         // first still-unknown byte.
-        for bad in [129u8, 255] {
+        for bad in [130u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -68317,7 +68432,7 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceStale));
         assert_eq!(EscrowError::OraclePriceUnreliable.code(), 281);
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceUnreliable));
-        assert_eq!(EscrowError::all().len(), 248); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1
+        assert_eq!(EscrowError::all().len(), 249); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1
     }
 
     #[test]
@@ -75314,6 +75429,221 @@ mod amend_deadman_inactivity_tests {
         assert_eq!(ev.amounts.fee, 0);
         // Re-affirming the same threshold is a no-op: no new event.
         e.amend_deadman_inactivity(ALICE, BOB, 1_800, NOW)
+            .unwrap();
+        assert_eq!(
+            e.event_count(),
+            before + 1,
+            "no-op emits nothing"
+        );
+    }
+}
+
+// ---------- AV-266: amend keeper bounty per crank after funding ----------
+mod amend_keeper_bounty_per_crank_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_750_000_000;
+
+    fn bounty_escrow(pool: u64, per_crank: u64) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_keeper_bounty(pool, per_crank)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_moves_per_crank_only_and_pool_untouched() {
+        // Only the per-crank amount moves: the pool, the state
+        // and the layout are untouched, and the field is already
+        // resident, so the revision rewrites it in place with no
+        // layout change.
+        let mut e = bounty_escrow(50_000, 10_000);
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.amend_keeper_bounty_per_crank(ALICE, BOB, 25_000).unwrap();
+        assert_eq!(e.keeper_bounty_per_crank(), 25_000);
+        assert_eq!(
+            e.keeper_bounty_pool(),
+            50_000,
+            "the revision never tops the pool up"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "per-crank region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn new_per_crank_governs_next_crank_payout() {
+        // Raising the amount raises the next payout up to the
+        // pool: payable is read live at payment time.
+        let mut e = bounty_escrow(50_000, 10_000);
+        assert_eq!(e.keeper_bounty_payable(), 10_000);
+        e.amend_keeper_bounty_per_crank(ALICE, BOB, 25_000).unwrap();
+        assert_eq!(e.keeper_bounty_payable(), 25_000);
+        let (_, _, _, bounty) = e.crank_expired(MALLORY, EXPIRES_AT + 1, None).unwrap();
+        assert_eq!(bounty, 25_000, "the crank pays the new amount");
+        assert_eq!(e.keeper_bounty_pool(), 25_000, "pool debited by exactly the payout");
+        // Lowering below the pool lowers the next payout.
+        let mut e = bounty_escrow(50_000, 10_000);
+        e.amend_keeper_bounty_per_crank(ALICE, BOB, 4_000).unwrap();
+        assert_eq!(e.keeper_bounty_payable(), 4_000);
+        let (_, _, _, bounty) = e.crank_expired(MALLORY, EXPIRES_AT + 1, None).unwrap();
+        assert_eq!(bounty, 4_000);
+        assert_eq!(e.keeper_bounty_pool(), 46_000);
+        // Raising past the pool still saturates at the pool.
+        let mut e = bounty_escrow(7_000, 10_000);
+        assert_eq!(e.keeper_bounty_payable(), 7_000);
+        e.amend_keeper_bounty_per_crank(ALICE, BOB, 100_000).unwrap();
+        assert_eq!(e.keeper_bounty_payable(), 7_000, "min(new, pool) caps at the pool");
+        let (_, _, _, bounty) = e.crank_expired(MALLORY, EXPIRES_AT + 1, None).unwrap();
+        assert_eq!(bounty, 7_000);
+        assert_eq!(e.keeper_bounty_pool(), 0);
+    }
+
+    #[test]
+    fn amend_to_zero_closes_bounty_and_pool_sits_untouched() {
+        // 0 is a legal revision: it closes future payouts, and
+        // the pool is not drained or refunded by the revision.
+        let mut e = bounty_escrow(50_000, 10_000);
+        e.amend_keeper_bounty_per_crank(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.keeper_bounty_per_crank(), 0);
+        assert_eq!(e.keeper_bounty_payable(), 0);
+        assert!(!e.keeper_bounty_enabled());
+        assert_eq!(e.keeper_bounty_pool(), 50_000, "closing moves no pool funds");
+        let (_, _, _, bounty) = e.crank_expired(MALLORY, EXPIRES_AT + 1, None).unwrap();
+        assert_eq!(bounty, 0, "the closed bounty pays nothing on the next crank");
+        assert_eq!(e.keeper_bounty_pool(), 50_000, "pool still untouched after the unpaid crank");
+        // Closing is final through this path: a closed escrow
+        // reads as unconfigured, so reopening is refused
+        // fail-closed — reopening would be a new installation.
+        let mut e = bounty_escrow(50_000, 10_000);
+        e.amend_keeper_bounty_per_crank(ALICE, BOB, 0).unwrap();
+        assert_eq!(
+            e.amend_keeper_bounty_per_crank(ALICE, BOB, 10_000),
+            Err(EscrowError::InvalidKeeperBounty)
+        );
+        assert_eq!(e.keeper_bounty_per_crank(), 0);
+    }
+
+    #[test]
+    fn exhausted_pool_stays_zero_after_revision() {
+        // A pool of zero pays zero whatever the per-crank amount
+        // is revised to — the revision itself never revives the
+        // bounty (the pool-exhausted shape: pool funded at zero,
+        // per-crank live, escrow still Funded).
+        let mut e = bounty_escrow(0, 10_000);
+        assert_eq!(e.keeper_bounty_payable(), 0);
+        e.amend_keeper_bounty_per_crank(ALICE, BOB, 100_000).unwrap();
+        assert_eq!(e.keeper_bounty_per_crank(), 100_000);
+        assert_eq!(e.keeper_bounty_payable(), 0, "min(new, 0) is still 0");
+        let (_, _, _, bounty) = e.crank_expired(MALLORY, EXPIRES_AT + 1, None).unwrap();
+        assert_eq!(bounty, 0);
+        assert_eq!(e.keeper_bounty_pool(), 0);
+    }
+
+    #[test]
+    fn amend_rejects_unconfigured_state_authority_and_paused() {
+        // Fail-closed: a never-configured escrow can never acquire
+        // a bounty after funding, and a failed revision leaves it
+        // bounty-less.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(plain.keeper_bounty_per_crank(), 0);
+        assert_eq!(
+            plain.amend_keeper_bounty_per_crank(ALICE, BOB, 10_000),
+            Err(EscrowError::InvalidKeeperBounty)
+        );
+        assert_eq!(plain.keeper_bounty_per_crank(), 0);
+        assert_eq!(plain.keeper_bounty_payable(), 0);
+        // A pool with a deliberately-zero per-crank amount is the
+        // same shape: payouts disabled at setup is not a bounty
+        // to revise.
+        let mut disabled = bounty_escrow(50_000, 0);
+        assert_eq!(
+            disabled.amend_keeper_bounty_per_crank(ALICE, BOB, 10_000),
+            Err(EscrowError::InvalidKeeperBounty)
+        );
+        assert_eq!(disabled.keeper_bounty_per_crank(), 0);
+        assert_eq!(disabled.keeper_bounty_payable(), 0);
+        // The new error's code is pinned.
+        assert_eq!(EscrowError::InvalidKeeperBounty.code(), 357);
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_keeper_bounty(50_000, 10_000)
+            .unwrap();
+        assert_eq!(
+            bare.amend_keeper_bounty_per_crank(ALICE, BOB, 25_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Dual signature: one party alone cannot move the bounty.
+        let mut e = bounty_escrow(50_000, 10_000);
+        assert_eq!(
+            e.amend_keeper_bounty_per_crank(ALICE, ALICE, 25_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_keeper_bounty_per_crank(MALLORY, BOB, 25_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.keeper_bounty_per_crank(), 10_000);
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's revision on a paused escrow is `Paused`.
+        let mut paused = bounty_escrow(50_000, 10_000);
+        paused.pause([0xDD; 32], None).unwrap();
+        assert_eq!(
+            paused.amend_keeper_bounty_per_crank(MALLORY, BOB, 25_000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.keeper_bounty_per_crank(), 10_000);
+    }
+
+    #[test]
+    fn amend_same_per_crank_is_a_noop() {
+        // Re-affirming the current amount succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = bounty_escrow(50_000, 10_000);
+        e.amend_keeper_bounty_per_crank(ALICE, BOB, 10_000).unwrap();
+        assert_eq!(e.keeper_bounty_per_crank(), 10_000);
+        assert_eq!(e.keeper_bounty_pool(), 50_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_keeper_bounty_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], NOW)
+            .unwrap()
+            .with_keeper_bounty(50_000, 10_000)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_keeper_bounty_per_crank(ALICE, ALICE, 25_000, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_keeper_bounty_per_crank(ALICE, BOB, 25_000, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::KeeperBountyPerCrankAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same amount is a no-op: no new event.
+        e.amend_keeper_bounty_per_crank(ALICE, BOB, 25_000, NOW)
             .unwrap();
         assert_eq!(
             e.event_count(),

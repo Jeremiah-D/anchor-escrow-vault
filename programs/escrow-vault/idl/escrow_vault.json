@@ -2096,7 +2096,8 @@
     {"code": 353, "name": "ChainLinkActive"},
     {"code": 354, "name": "InvalidChainLink"},
     {"code": 355, "name": "MilestoneClaimExpired"},
-    {"code": 356, "name": "FundingNotStarted"}
+    {"code": 356, "name": "FundingNotStarted"},
+    {"code": 357, "name": "InvalidKeeperBounty"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",

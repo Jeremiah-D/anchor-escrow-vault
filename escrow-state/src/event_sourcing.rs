@@ -318,6 +318,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // at the next claim; a claim already settled keeps
         // the threshold it settled under.
         | EscrowEventKind::DeadmanInactivityAmended
+        // AV-266: a revised keeper-bounty per-crank amount moves
+        // no funds and never tops the pool up — the next crank
+        // pays min(new per_crank, pool) from the live amount,
+        // while a crank already settled keeps its amount.
+        | EscrowEventKind::KeeperBountyPerCrankAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1116,6 +1121,11 @@ mod event_sourcing_tests {
         // at the next claim; a claim already settled keeps
         // the threshold it settled under.
         | EscrowEventKind::DeadmanInactivityAmended
+        // AV-266: a revised keeper-bounty per-crank amount moves
+        // no funds and never tops the pool up — the next crank
+        // pays min(new per_crank, pool) from the live amount,
+        // while a crank already settled keeps its amount.
+        | EscrowEventKind::KeeperBountyPerCrankAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
