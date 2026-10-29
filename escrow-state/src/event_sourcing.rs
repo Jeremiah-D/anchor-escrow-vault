@@ -340,6 +340,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // already banked is never repriced, while the next
         // release_milestone call prices at the live rate.
         | EscrowEventKind::MilestoneLatePenaltyBpsAmended
+        // AV-270: a revised funding-plan tranche budget moves no funds
+        // and never restates a funded tranche — only max_tranches
+        // changes, so the plan total and the consumed count are
+        // untouched, while the next fund_tranche call is judged
+        // against the live budget.
+        | EscrowEventKind::FundingPlanMaxTranchesAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1160,6 +1166,12 @@ mod event_sourcing_tests {
         // already banked is never repriced, while the next
         // release_milestone call prices at the live rate.
         | EscrowEventKind::MilestoneLatePenaltyBpsAmended
+        // AV-270: a revised funding-plan tranche budget moves no funds
+        // and never restates a funded tranche — only max_tranches
+        // changes, so the plan total and the consumed count are
+        // untouched, while the next fund_tranche call is judged
+        // against the live budget.
+        | EscrowEventKind::FundingPlanMaxTranchesAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

@@ -19206,6 +19206,93 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Revise the funding plan's tranche budget after funding (AV-270 —
+    /// Solana / payment fintech: the staged-deposit schedule that stays
+    /// renegotiable after the first tranche lands). Dual-signed governance,
+    /// paralleling [`Escrow::amend_amount_bounds`]:
+    /// both parties must authorize the revision, the escrow must
+    /// be `Funded`, and a paused escrow fails fast (`Paused`,
+    /// checked before the authority and state gates).
+    ///
+    /// Fail-closed: only an escrow that already carries a funding plan
+    /// may revise its budget — an escrow with no plan is refused with
+    /// [`EscrowError::InvalidFundingPlan`], so a tranched plan can never
+    /// be installed after funding (post-funding installation would add
+    /// a staged-deposit schedule the taker never funded under; it is a
+    /// new deal, not a revision — a plan-less escrow keeps funding
+    /// through `fund`). The new budget reuses the
+    /// [`FundingPlan::new`] gate, unchanged: `0` is
+    /// [`EscrowError::InvalidFundingPlan`], and a budget below the
+    /// tranches already consumed is refused with the same error
+    /// (shrinking below `tranches_used` would un-consume a funded
+    /// tranche). All checks run before any write, so a refused revision
+    /// leaves the original plan untouched. Revising to the current
+    /// budget is a no-op: it succeeds and writes nothing, so the event
+    /// layer emits nothing for it (paralleling `rotate_arbiter`).
+    /// Only `max_tranches` changes — `total_amount` is untouched (the
+    /// plan's total is pinned to the escrow's `amount` at initial set
+    /// and a post-funding total revision has no semantics: the deal
+    /// size never moves) and `funded_total` and `tranches_used` are
+    /// untouched (the plan is rebuilt with [`FundingPlan::from_parts`]
+    /// preserving the consumed count, exactly like `fund_tranche`
+    /// does when it consumes a slot). The new budget governs from the
+    /// next [`Escrow::fund_tranche`] call: that path reads the live
+    /// `max_tranches` on every deposit, so raising it opens further
+    /// tranches and shrinking it to `tranches_used` exhausts the plan
+    /// exactly like natural exhaustion (the next tranche is refused
+    /// with [`EscrowError::FundingTranchesExhausted`]), while tranches
+    /// already funded keep the budget they funded under (no
+    /// restatement). Revising moves no funds, so no AV-36 reentrancy
+    /// lock is needed (the lock only guards the fund-moving paths, the
+    /// `rotate_arbiter` precedent). Orthogonal to
+    /// [`Escrow::with_funding_plan`] (that is the `Uninitialized`-only
+    /// initial set, this item is the post-funding revision) and to
+    /// [`Escrow::amend_amount_bounds`] (that is the per-tranche amount
+    /// window, this item is the tranche budget). Emits
+    /// `FundingPlanMaxTranchesAmended` on the event layer, except for
+    /// the no-op re-affirmation.
+    pub fn amend_funding_plan_max_tranches(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        max_tranches: u8,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_amount_bounds`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow already carrying a plan may
+        // revise its budget — amendment never installs a plan
+        // after funding.
+        let plan = self.funding_plan.ok_or(EscrowError::InvalidFundingPlan)?;
+        // The builder's budget gate, before any write, so a refused
+        // revision leaves the original plan untouched:
+        // `FundingPlan::new` refuses a zero budget, and a budget
+        // below the consumed count would un-consume a funded tranche.
+        FundingPlan::new(plan.total_amount(), max_tranches)?;
+        if max_tranches < plan.tranches_used() {
+            return Err(EscrowError::InvalidFundingPlan);
+        }
+        // No-op: re-affirming the current budget writes nothing, so
+        // the event layer emits nothing for it.
+        if max_tranches == plan.max_tranches() {
+            return Ok(());
+        }
+        self.funding_plan = Some(FundingPlan::from_parts(
+            plan.total_amount(),
+            max_tranches,
+            plan.tranches_used(),
+        ));
+        Ok(())
+    }
+
     /// The multi-taker claimant roster attached via
     /// [`Escrow::with_claimants`] (AV-149). `None` on a plain
     /// bilateral escrow.
@@ -47841,7 +47928,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
     }
 
     #[test]
@@ -64855,7 +64943,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(130), Some(EscrowEventKind::SlashDeadlineAmended)); // AV-267: 130 is SlashDeadlineAmended
         assert_eq!(EscrowEventKind::from_discriminant(131), Some(EscrowEventKind::AmountBoundsAmended)); // AV-268: 131 is AmountBoundsAmended
         assert_eq!(EscrowEventKind::from_discriminant(132), Some(EscrowEventKind::MilestoneLatePenaltyBpsAmended)); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(133), None); // AV-269: 132 is MilestoneLatePenaltyBpsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(133), Some(EscrowEventKind::FundingPlanMaxTranchesAmended)); // AV-270: 133 is FundingPlanMaxTranchesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(134), None); // AV-270: 133 is FundingPlanMaxTranchesAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -65070,9 +65159,10 @@ mod event_history_tests {
         // `KeeperBountyPerCrankAmended` (AV-266), 130 is
         // `SlashDeadlineAmended` (AV-267), 131 is
         // `AmountBoundsAmended` (AV-268), 132 is
-        // `MilestoneLatePenaltyBpsAmended` (AV-269) and 133 is the
+        // `MilestoneLatePenaltyBpsAmended` (AV-269), 133 is
+        // `FundingPlanMaxTranchesAmended` (AV-270) and 134 is the
         // first still-unknown byte.
-        for bad in [133u8, 255] {
+        for bad in [134u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -76575,6 +76665,200 @@ mod amend_milestone_late_penalty_bps_tests {
         assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
     }
 }
+
+mod amend_funding_plan_max_tranches_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const FUND_AT: u64 = 1_600_000_000;
+    const NOW: u64 = 1_750_000_000;
+
+    const AMOUNT: u64 = 1_000_000;
+    const FIRST: u64 = 400_000;
+
+    /// A `Funded` plan escrow with a 3-tranche budget, one tranche
+    /// already funded: the revision's starting point.
+    fn funded_plan() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        e.with_funding_plan(AMOUNT, 3).unwrap();
+        e = e.with_pause_authority([0xDD; 32]).unwrap();
+        e.fund_tranche(ALICE, FIRST, FUND_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn plan_of(e: &Escrow) -> FundingPlan {
+        e.funding_plan().expect("plan attached")
+    }
+
+    #[test]
+    fn amend_changes_only_max_and_raised_budget_opens_further_tranches() {
+        // Only the budget moves: the plan total, the consumed count,
+        // the funded total and the deal size are untouched, and the
+        // already-resident plan bytes are rewritten in place, so the
+        // layout is unchanged.
+        let mut e = funded_plan();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.amend_funding_plan_max_tranches(ALICE, BOB, 5).unwrap();
+        let after = plan_of(&e);
+        assert_eq!(after.total_amount(), AMOUNT, "plan total pinned to deal size");
+        assert_eq!(after.max_tranches(), 5);
+        assert_eq!(after.tranches_used(), 1, "consumed count preserved");
+        assert_eq!(e.funded_total(), FIRST, "funded total untouched");
+        assert_eq!(e.amount(), AMOUNT, "deal size untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "budget rewritten in place, no layout change"
+        );
+        // The raised budget governs the next deposits: tranches 2, 3
+        // and 4 all land, where the original budget of 3 would have
+        // stopped after tranche 3.
+        e.fund_tranche(ALICE, 200_000, FUND_AT).unwrap();
+        e.fund_tranche(ALICE, 200_000, FUND_AT).unwrap();
+        e.fund_tranche(ALICE, 200_000, FUND_AT).unwrap();
+        assert_eq!(plan_of(&e).tranches_used(), 4);
+        assert_eq!(e.funded_total(), AMOUNT);
+        assert!(e.is_funding_complete());
+    }
+
+    #[test]
+    fn amend_shrinking_to_used_exhausts_like_natural_exhaustion() {
+        // Shrinking the budget to the consumed count exhausts the
+        // plan: the next tranche is refused exactly like natural
+        // exhaustion, and the funded tranche is not restated.
+        let mut e = funded_plan();
+        e.amend_funding_plan_max_tranches(ALICE, BOB, 1).unwrap();
+        assert_eq!(plan_of(&e).max_tranches(), 1);
+        assert_eq!(plan_of(&e).tranches_used(), 1);
+        assert_eq!(plan_of(&e).total_amount(), AMOUNT);
+        assert_eq!(e.funded_total(), FIRST, "funded tranche not restated");
+        assert_eq!(
+            e.fund_tranche(ALICE, 200_000, FUND_AT),
+            Err(EscrowError::FundingTranchesExhausted)
+        );
+        assert_eq!(e.funded_total(), FIRST, "refused tranche funds nothing");
+        assert_eq!(plan_of(&e).tranches_used(), 1);
+        // Parity with natural exhaustion: a 1-tranche plan that
+        // funded its single tranche refuses the next one the same way.
+        let mut natural = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        natural.with_funding_plan(AMOUNT, 1).unwrap();
+        natural.fund_tranche(ALICE, FIRST, FUND_AT).unwrap();
+        assert_eq!(
+            natural.fund_tranche(ALICE, 200_000, FUND_AT),
+            Err(EscrowError::FundingTranchesExhausted)
+        );
+    }
+
+    #[test]
+    fn amend_rejects_planless_zero_below_used_state_authority_and_paused() {
+        // Fail-closed: a plain funded escrow can never acquire a
+        // tranched plan after funding, and a failed revision leaves
+        // it plan-less.
+        let mut plain = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(plain.funding_plan(), None);
+        assert_eq!(
+            plain.amend_funding_plan_max_tranches(ALICE, BOB, 3),
+            Err(EscrowError::InvalidFundingPlan)
+        );
+        assert_eq!(plain.funding_plan(), None);
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        bare.with_funding_plan(AMOUNT, 3).unwrap();
+        assert_eq!(
+            bare.amend_funding_plan_max_tranches(ALICE, BOB, 5),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(plan_of(&bare).max_tranches(), 3);
+        // A zero budget is refused via the FundingPlan::new gate and
+        // the original budget survives.
+        let mut e = funded_plan();
+        assert_eq!(
+            e.amend_funding_plan_max_tranches(ALICE, BOB, 0),
+            Err(EscrowError::InvalidFundingPlan)
+        );
+        assert_eq!(plan_of(&e).max_tranches(), 3);
+        // A budget below the consumed count is refused the same way:
+        // two tranches consumed, so 1 is below used while 2 (== used)
+        // is the legal floor.
+        e.fund_tranche(ALICE, 200_000, FUND_AT).unwrap();
+        assert_eq!(plan_of(&e).tranches_used(), 2);
+        assert_eq!(
+            e.amend_funding_plan_max_tranches(ALICE, BOB, 1),
+            Err(EscrowError::InvalidFundingPlan)
+        );
+        assert_eq!(plan_of(&e).max_tranches(), 3, "original budget untouched");
+        assert_eq!(plan_of(&e).tranches_used(), 2);
+        assert_eq!(e.funded_total(), FIRST + 200_000);
+        // Dual signature: one party alone cannot move the budget.
+        let mut e = funded_plan();
+        assert_eq!(
+            e.amend_funding_plan_max_tranches(ALICE, ALICE, 5),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_funding_plan_max_tranches(MALLORY, BOB, 5),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(plan_of(&e).max_tranches(), 3);
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's revision on a paused escrow is `Paused`.
+        let mut paused = funded_plan();
+        paused.pause([0xDD; 32], None).unwrap();
+        assert_eq!(
+            paused.amend_funding_plan_max_tranches(MALLORY, BOB, 5),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(plan_of(&paused).max_tranches(), 3);
+    }
+
+    #[test]
+    fn amend_same_budget_is_a_noop() {
+        // Re-affirming the current budget succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = funded_plan();
+        e.amend_funding_plan_max_tranches(ALICE, BOB, 3).unwrap();
+        assert_eq!(plan_of(&e).max_tranches(), 3);
+        assert_eq!(plan_of(&e).tranches_used(), 1);
+        assert_eq!(e.funded_total(), FIRST);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT, [0xE0; 32], NOW)
+            .unwrap()
+            .with_funding_plan(AMOUNT, 3)
+            .unwrap();
+        e.fund_tranche(ALICE, FIRST, FUND_AT, NOW).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_funding_plan_max_tranches(ALICE, ALICE, 5, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_funding_plan_max_tranches(ALICE, BOB, 5, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::FundingPlanMaxTranchesAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same budget is a no-op: no new event.
+        e.amend_funding_plan_max_tranches(ALICE, BOB, 5, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+}
+
 
 // ---------- AV-134: vault funding amount bounds ----------
 
