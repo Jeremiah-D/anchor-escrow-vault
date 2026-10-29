@@ -450,6 +450,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // registry are untouched, while the next dispute draws
         // under the live size.
         | EscrowEventKind::JuryPanelSizeAmended
+        // AV-282: a replaced ring capacity moves no funds and
+        // never restates a recorded entry — only the capacity
+        // changes, so the slots, the head, the count and the
+        // total are untouched, while the next record lands
+        // under the live capacity.
+        | EscrowEventKind::EventCapacityAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1342,6 +1348,12 @@ mod fee_history_tests {
                 // registry are untouched, while the next dispute draws
                 // under the live size.
                 | EscrowEventKind::JuryPanelSizeAmended
+                // AV-282: a replaced ring capacity moves no funds and
+                // never restates a recorded entry — only the capacity
+                // changes, so the slots, the head, the count and the
+                // total are untouched, while the next record lands
+                // under the live capacity.
+                | EscrowEventKind::EventCapacityAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
