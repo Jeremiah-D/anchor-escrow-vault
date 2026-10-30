@@ -3268,6 +3268,21 @@ error they get.
   verifies the terms and returns the settlement legs for
   transfer sizing, and the premium's custody before
   construction is the caller's job.
+- **Revising the strike (AV-294)**: `amend_option_strike`
+  revises the strike on an `Active` option, authorized by
+  seller + buyer together — the strike is a bilateral price
+  term, so a unilateral rewrite would let one side reprice
+  the other's bargain alone. The new strike reuses the
+  construction gate (a zero strike fails closed with
+  `InvalidOptionTerms`, code 339, and the current strike is
+  untouched); an exercised option is `OptionAlreadySettled`
+  (code 343) and an expired option is `OptionExpired` (code
+  341). Re-affirming the current strike is a no-op. Only
+  `strike` changes, and `exercise` reads the live strike, so
+  the new strike governs the next exercise — an exercise
+  already settled keeps the strike it settled under. No
+  event is emitted — `OptionEscrow` has no event layer.
+  (Solana: option governance.)
 
 New error codes (never renumbered): `InvalidOptionTerms`
 (339), `OptionNotBuyer` (340), `OptionExpired` (341),
