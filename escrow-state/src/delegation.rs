@@ -47,6 +47,17 @@
 //! revoke it, and every grant replacement, revocation or party
 //! rotation clears the window with the grant, so a stale expiry can
 //! never attach itself to a grant it was not set for.
+//!
+//! AV-295: the spend cap itself may be revised in place
+//! ([`Escrow::amend_delegation_spend_cap`](crate::Escrow::amend_delegation_spend_cap)).
+//! Either party may move the cap — up, down, or to `0` (uncapped) —
+//! but never below the volume already settled under the live grant:
+//! a cap below live `spent` is refused fail-closed, so settled
+//! releases are never retroactively over-cap. Only the cap moves;
+//! the operator, the scopes, `spent` and the expiry window are
+//! untouched, and the operator spend path reads the live cap on
+//! every release, so the new bound governs from the next operator
+//! release onward.
 
 /// Scope bit: the operator may fund the escrow
 /// ([`Escrow::fund`](crate::Escrow::fund)).

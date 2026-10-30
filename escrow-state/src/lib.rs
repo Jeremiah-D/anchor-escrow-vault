@@ -11819,6 +11819,69 @@ impl Escrow {
         Ok(())
     }
 
+    /// Revise the live operator grant's spend cap (AV-295). Either
+    /// party may revise — the same party power as granting and
+    /// renewing — and the revision takes effect at the next operator
+    /// release: the operator spend path
+    /// ([`Escrow::record_operator_release`]) reads the live cap on
+    /// every call, so a release after the amendment is judged against
+    /// the new bound while a release already settled keeps the cap it
+    /// settled under. Only the cap moves: the operator, the scopes,
+    /// the settled `spent` counter and the expiry window are
+    /// untouched. Check order mirrors
+    /// [`Escrow::renew_delegation`]: pause → authority → state,
+    /// then [`EscrowError::InvalidDelegation`] when there is no grant
+    /// to revise or the new cap is below the live `spent`
+    /// (fail-closed — a cap below what the operator already settled
+    /// would retroactively breach the grant, so the original cap
+    /// stays). `0` is uncapped (the AV-208 storage meaning, not a
+    /// refusal — unlike the grant path, which rejects a zero cap so a
+    /// capped grant is never ambiguous with an AV-104 grant).
+    /// Revising to the current cap is a no-op success.
+    ///
+    /// No new event: like `renew_delegation`, the amendment emits
+    /// nothing — the [`IndexedEscrow`](crate::IndexedEscrow) wrapper
+    /// needs no new emission. Orthogonal to `renew_delegation` (that
+    /// is the expiry window, this item is the cap) and to AV-104
+    /// (that is the grant mechanism itself, this item is the cap
+    /// revision).
+    pub fn amend_delegation_spend_cap(
+        &mut self,
+        caller: [u8; 32],
+        new_cap: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        if caller != self.initializer && caller != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let grant = match self.delegation {
+            Some(grant) => grant,
+            None => return Err(EscrowError::InvalidDelegation),
+        };
+        // Fail-closed against retroactive breach: a cap below the
+        // volume already settled under the live grant would declare
+        // settled releases over-cap after the fact, so the original
+        // cap stays untouched. `0` is uncapped, never below spent.
+        if new_cap != 0 && new_cap < grant.spent() {
+            return Err(EscrowError::InvalidDelegation);
+        }
+        if grant.spend_cap() == new_cap {
+            return Ok(());
+        }
+        self.delegation = Some(Delegation::new_full(
+            grant.delegate(),
+            grant.scopes(),
+            new_cap,
+            grant.spent(),
+        ));
+        Ok(())
+    }
+
     /// Revoke the live operator grant (AV-104). Either party may revoke
     /// — the initializer can cut off a taker-appointed operator and
     /// vice versa, so a rogue operator has no protector. Check order
