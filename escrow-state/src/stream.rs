@@ -34,6 +34,16 @@
 //! Orthogonal to AV-190 rental escrow (day-granularity rent tranches):
 //! the stream accrues at second granularity and has no tranches.
 //! `Copy`, heap-free, `no_std`-friendly.
+//!
+//! AV-297: the payout cliff itself may be renegotiated mid-flight with
+//! `amend_stream_cliff_secs` — dual-signed like the rate, and likewise
+//! only *future* payouts change: the cliff gates payout, not accrual,
+//! so moving it never reprices anything and needs no checkpoint — the
+//! checkpoint stores the ungated accrued amount, and `earned`/`withdraw`
+//! read the live cliff on every call. Orthogonal to `update_stream_rate`
+//! (that is the per-second price, this item is the first-payout gate)
+//! and to `stream_cancel`/`pause` (those are lifecycle, this item is a
+//! parameter revision).
 
 use crate::EscrowError;
 
@@ -373,6 +383,68 @@ impl PaymentStream {
         s.push_str(&old_rate.to_string());
         s.push_str(",\"new_rate\":");
         s.push_str(&new_rate.to_string());
+        s.push_str(",\"at\":");
+        s.push_str(&at.to_string());
+        s.push('}');
+        s
+    }
+
+    /// Renegotiates the payout cliff mid-flight — dual-signed: *both*
+    /// the initializer and the recipient must present, so neither side
+    /// can move the first-payout gate alone. Either party absent, or a
+    /// stranger in either slot, is [`EscrowError::StreamUnauthorized`]
+    /// (code 305).
+    ///
+    /// Only *future* payouts change: the cliff gates payout, not
+    /// accrual, so moving it never reprices anything — the amount
+    /// already earned (and any amount already withdrawn) is untouched,
+    /// and `earned(now)` simply starts reporting the ungated accrual
+    /// from the new `start_ts + cliff_secs` onward. Raising the cliff
+    /// past `now` re-gates the stream (a withdraw then returns `0`
+    /// until the new cliff elapses, never a negative or a clawback of
+    /// what was already withdrawn); lowering it releases the gated
+    /// accrual at once. No checkpoint is needed — the checkpoint
+    /// stores the *ungated* accrued amount, so a cliff change cannot
+    /// erase pre-change accrual the way a rate change could.
+    ///
+    /// Check order is authority → state → config: the new cliff
+    /// reuses the [`Self::create_stream`] gate
+    /// (`new_cliff_secs <= duration_secs`, else
+    /// [`EscrowError::InvalidStream`] (code 304), the original cliff
+    /// untouched). A change to the current cliff is an idempotent
+    /// no-op. Allowed while paused — the cliff is a payout gate, not
+    /// an accrual input, so the change applies from resume exactly as
+    /// [`Self::update_stream_rate`] does.
+    pub fn amend_stream_cliff_secs(
+        &mut self,
+        initializer: [u8; 32],
+        recipient: [u8; 32],
+        new_cliff_secs: u64,
+    ) -> Result<(), EscrowError> {
+        // Authority first: dual signature — both parties must present.
+        if initializer != self.initializer || recipient != self.recipient {
+            return Err(EscrowError::StreamUnauthorized);
+        }
+        self.require_active()?;
+        // Same cliff-vs-duration bound as create_stream.
+        if new_cliff_secs > self.duration_secs {
+            return Err(EscrowError::InvalidStream);
+        }
+        if new_cliff_secs == self.cliff_secs {
+            return Ok(());
+        }
+        self.cliff_secs = new_cliff_secs;
+        Ok(())
+    }
+
+    /// Audit-event JSON for a cliff change (hand-written, no serde —
+    /// same convention as [`Self::rate_update_audit_json`]):
+    /// `{"event":"stream_cliff_updated","old_cliff_secs":0,"new_cliff_secs":50,"at":25}`.
+    pub fn cliff_update_audit_json(old_cliff_secs: u64, new_cliff_secs: u64, at: u64) -> String {
+        let mut s = String::from("{\"event\":\"stream_cliff_updated\",\"old_cliff_secs\":");
+        s.push_str(&old_cliff_secs.to_string());
+        s.push_str(",\"new_cliff_secs\":");
+        s.push_str(&new_cliff_secs.to_string());
         s.push_str(",\"at\":");
         s.push_str(&at.to_string());
         s.push('}');

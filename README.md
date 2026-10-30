@@ -7861,6 +7861,33 @@ intervals are tracked and permanently excluded from accrual.
   or `snapshot.rs` to pass through (both only mention streams in
   unrelated prose), and the Anchor IDL carries no standalone-stream
   instructions, so neither file changes in this item.
+- Cliff renegotiation (AV-297): `amend_stream_cliff_secs(initializer,
+  recipient, new_cliff_secs)` moves the first-payout gate mid-flight,
+  but only when *both* parties sign — either party absent, or a
+  stranger in either slot, is `StreamUnauthorized` (code 305). Only
+  future payouts change: the cliff gates payout, not accrual, so
+  moving it never reprices anything and needs no checkpoint — the
+  checkpoint stores the *ungated* accrued amount, and `earned` /
+  `stream_withdraw` read the live cliff on every call. Raising the
+  cliff past `now` re-gates the stream (a withdraw then returns `0`
+  until the new cliff elapses, never a clawback of what was already
+  withdrawn); lowering it releases the gated accrual at once. The new
+  cliff reuses the `create_stream` gate (`new_cliff_secs <=
+  duration_secs`, else `InvalidStream` (code 304), the original cliff
+  untouched); changing to the current cliff is an idempotent no-op;
+  terminal streams are `StreamNotActive` (code 306); a change while
+  paused is legal and applies from resume. Emits the
+  `stream_cliff_updated` audit event
+  (`PaymentStream::cliff_update_audit_json`, hand-written JSON, no new
+  error codes — 304–308 unchanged). `earned()` reads the live cliff on
+  every call, so any consumer of `earned()` sees the new gate with no
+  separate integration — same as the rate change, there is no
+  stored/scanned stream state in `keeper.rs` or `snapshot.rs` to pass
+  through (both only mention streams in unrelated prose), and the
+  Anchor IDL carries no standalone-stream instructions. Orthogonal to `update_stream_rate`
+  (that is the per-second price, this item is the first-payout gate)
+  and to `stream_cancel` / `pause` (those are lifecycle, this item is
+  a parameter revision).
 
 New error codes 304–308: `InvalidStream`, `StreamUnauthorized`,
 `StreamNotActive`, `StreamAlreadyPaused`, `StreamNotPaused`. Pure
